@@ -1,0 +1,519 @@
+"""Floating contextual inspector anchored above the selected entity."""
+from __future__ import annotations
+
+from PySide6.QtCore import Qt, Signal
+from PySide6.QtGui import QFontDatabase
+from PySide6.QtWidgets import (
+    QCheckBox, QComboBox, QDoubleSpinBox, QFormLayout, QFrame,
+    QGridLayout, QHBoxLayout, QInputDialog, QLabel, QLineEdit, QMessageBox, QPushButton,
+    QSlider, QToolButton, QVBoxLayout, QWidget,
+)
+
+from comic_editor.core.models import RasterObject, TextObject
+from comic_editor.core.settings import TextPreset
+
+
+class ContextInspector(QFrame):
+    changed = Signal()
+    pencilPresetSelected = Signal(str)
+    pencilSettingsRequested = Signal()
+    brushSizeSelected = Signal(str, str)
+    brushSizesRequested = Signal()
+    eraserShapeChanged = Signal(bool)
+
+    def __init__(self, canvas, settings, save_settings_callback, parent=None):
+        super().__init__(parent or canvas)
+        self.canvas = canvas
+        self.settings = settings
+        self._save_settings = save_settings_callback
+        self._updating = False
+        self._alignment_buttons: dict[tuple[str, str], QToolButton] = {}
+        self.setObjectName("contextInspector")
+        self.setStyleSheet(
+            "#contextInspector { background: rgba(28,28,32,238); "
+            "border: 1px solid #5d7d9c; border-radius: 8px; }"
+        )
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(8, 6, 8, 6)
+        outer.setSpacing(4)
+
+        header = QHBoxLayout()
+        self.title = QLabel("Selection")
+        self.title.setStyleSheet("font-weight: bold; color: #80c8ff")
+        header.addWidget(self.title, 1)
+        self.preset_controls = QWidget()
+        preset_row = QHBoxLayout(self.preset_controls)
+        preset_row.setContentsMargins(0, 0, 0, 0)
+        preset_row.setSpacing(2)
+        self.preset_combo = QComboBox()
+        self.preset_combo.setMinimumWidth(110)
+        preset_row.addWidget(self.preset_combo)
+        self.preset_save = self._small_button("S", "Overwrite selected preset")
+        self.preset_rename = self._small_button("R", "Rename selected preset")
+        self.preset_remove = self._small_button("X", "Remove selected preset")
+        self.preset_add = self._small_button("+", "Create preset")
+        for button in (
+            self.preset_save, self.preset_rename, self.preset_remove, self.preset_add,
+        ):
+            preset_row.addWidget(button)
+        header.addWidget(self.preset_controls)
+        outer.addLayout(header)
+
+        name_row = QHBoxLayout()
+        name_row.addWidget(QLabel("Name"))
+        self.name = QLineEdit()
+        name_row.addWidget(self.name, 1)
+        outer.addLayout(name_row)
+
+        common = QHBoxLayout()
+        self.visible = QCheckBox("Visible")
+        self.opacity_lock = QCheckBox("Lock opacity")
+        self.opacity = QSlider(Qt.Horizontal)
+        self.opacity.setRange(0, 100)
+        self.opacity.setFixedWidth(95)
+        common.addWidget(self.visible)
+        common.addWidget(self.opacity_lock)
+        common.addWidget(QLabel("Opacity"))
+        common.addWidget(self.opacity)
+        outer.addLayout(common)
+
+        self.text_panel = QWidget()
+        text_form = QFormLayout(self.text_panel)
+        text_form.setContentsMargins(0, 0, 0, 0)
+        self.font_family = QComboBox()
+        self.font_family.addItems(QFontDatabase.families())
+        self.font_size = QDoubleSpinBox()
+        self.font_size.setRange(6, 288)
+        self.bold = QCheckBox("Bold")
+        self.italic = QCheckBox("Italic")
+        style_row = QWidget()
+        style_layout = QHBoxLayout(style_row)
+        style_layout.setContentsMargins(0, 0, 0, 0)
+        style_layout.addWidget(self.bold)
+        style_layout.addWidget(self.italic)
+        self.kerning = QDoubleSpinBox()
+        self.kerning.setRange(-20, 100)
+        self.layout_mode = QComboBox()
+        self.layout_mode.addItem("Strict to parent", "strict")
+        self.layout_mode.addItem("Free transform", "free")
+        self.margin = QDoubleSpinBox()
+        self.margin.setRange(0, 500)
+        self.margin.setSuffix(" px")
+        self.alignment_widget = QWidget()
+        alignment_grid = QGridLayout(self.alignment_widget)
+        alignment_grid.setContentsMargins(0, 0, 0, 0)
+        alignment_grid.setSpacing(2)
+        for row, vertical in enumerate(("top", "middle", "bottom")):
+            for column, horizontal in enumerate(("left", "center", "right")):
+                button = QToolButton()
+                button.setText("●")
+                button.setCheckable(True)
+                button.setToolTip(f"{vertical.title()} / {horizontal.title()}")
+                button.clicked.connect(
+                    lambda checked=False, h=horizontal, v=vertical:
+                    self._set_alignment(h, v)
+                )
+                alignment_grid.addWidget(button, row, column)
+                self._alignment_buttons[(horizontal, vertical)] = button
+        text_form.addRow("Font", self.font_family)
+        text_form.addRow("Size", self.font_size)
+        text_form.addRow("Style", style_row)
+        text_form.addRow("Kerning", self.kerning)
+        text_form.addRow("Layout", self.layout_mode)
+        text_form.addRow("Align", self.alignment_widget)
+        text_form.addRow("Margin", self.margin)
+        outer.addWidget(self.text_panel)
+
+        self.transform_panel = QWidget()
+        transform_row = QHBoxLayout(self.transform_panel)
+        transform_row.setContentsMargins(0, 0, 0, 0)
+        transform_row.addWidget(QLabel("Transform"))
+        self.transform_mode = QComboBox()
+        self.transform_mode.addItem("Free Projective", "free")
+        self.transform_mode.addItem("Uniform", "uniform")
+        self.handle_snap = QCheckBox("Handle Snap")
+        self.undo_transform = QPushButton("Undo Transform")
+        transform_row.addWidget(self.transform_mode)
+        transform_row.addWidget(self.handle_snap)
+        transform_row.addWidget(self.undo_transform)
+        outer.addWidget(self.transform_panel)
+
+        self.raster_tool_panel = QWidget()
+        raster_layout = QVBoxLayout(self.raster_tool_panel)
+        raster_layout.setContentsMargins(0, 4, 0, 0)
+        raster_layout.setSpacing(4)
+        self.raster_tool_title = QLabel("Raster Pencil")
+        self.raster_tool_title.setStyleSheet(
+            "font-weight: bold; color: #80c8ff"
+        )
+        raster_layout.addWidget(self.raster_tool_title)
+        self.pencil_tool_controls = QWidget()
+        pencil_layout = QHBoxLayout(self.pencil_tool_controls)
+        pencil_layout.setContentsMargins(0, 0, 0, 0)
+        pencil_layout.addWidget(QLabel("Preset"))
+        self.pencil_preset_combo = QComboBox()
+        pencil_layout.addWidget(self.pencil_preset_combo, 1)
+        self.pencil_settings_button = QPushButton("Pressure / Presets…")
+        pencil_layout.addWidget(self.pencil_settings_button)
+        raster_layout.addWidget(self.pencil_tool_controls)
+        brush_row = QHBoxLayout()
+        brush_row.addWidget(QLabel("Size"))
+        self.brush_size_combo = QComboBox()
+        self.brush_size_combo.addItem("S", "small")
+        self.brush_size_combo.addItem("M", "medium")
+        self.brush_size_combo.addItem("L", "large")
+        brush_row.addWidget(self.brush_size_combo)
+        self.eraser_shape_label = QLabel("Shape")
+        self.eraser_shape = QComboBox()
+        self.eraser_shape.addItem("Circle", False)
+        self.eraser_shape.addItem("Square", True)
+        brush_row.addWidget(self.eraser_shape_label)
+        brush_row.addWidget(self.eraser_shape)
+        self.brush_sizes_button = QPushButton("Configure sizes…")
+        brush_row.addWidget(self.brush_sizes_button)
+        brush_row.addStretch(1)
+        raster_layout.addLayout(brush_row)
+        outer.addWidget(self.raster_tool_panel)
+        self.setFixedWidth(470)
+
+        for control, signal in (
+            (self.visible, self.visible.toggled),
+            (self.opacity_lock, self.opacity_lock.toggled),
+            (self.opacity, self.opacity.valueChanged),
+            (self.font_family, self.font_family.currentTextChanged),
+            (self.font_size, self.font_size.valueChanged),
+            (self.bold, self.bold.toggled),
+            (self.italic, self.italic.toggled),
+            (self.kerning, self.kerning.valueChanged),
+            (self.layout_mode, self.layout_mode.currentIndexChanged),
+            (self.margin, self.margin.valueChanged),
+        ):
+            signal.connect(self._apply)
+        self.name.editingFinished.connect(self._apply)
+        self.transform_mode.currentIndexChanged.connect(self._transform_settings_changed)
+        self.handle_snap.toggled.connect(self._transform_settings_changed)
+        self.undo_transform.clicked.connect(self._undo_raster_transform)
+        self.pencil_preset_combo.currentTextChanged.connect(
+            self.pencilPresetSelected.emit
+        )
+        self.pencil_settings_button.clicked.connect(
+            self.pencilSettingsRequested.emit
+        )
+        self.brush_size_combo.currentIndexChanged.connect(
+            self._brush_size_changed
+        )
+        self.brush_sizes_button.clicked.connect(
+            self.brushSizesRequested.emit
+        )
+        self.eraser_shape.currentIndexChanged.connect(
+            self._eraser_shape_changed
+        )
+        self.preset_combo.activated.connect(self._apply_preset)
+        self.preset_save.clicked.connect(self._save_preset)
+        self.preset_rename.clicked.connect(self._rename_preset)
+        self.preset_remove.clicked.connect(self._remove_preset)
+        self.preset_add.clicked.connect(self._add_preset)
+        self.hide()
+
+    @staticmethod
+    def _small_button(text: str, tooltip: str) -> QToolButton:
+        button = QToolButton()
+        button.setText(text)
+        button.setToolTip(tooltip)
+        button.setFixedWidth(24)
+        return button
+
+    def _text_entity(self) -> TextObject | None:
+        if self.canvas.chapter is None or not self.canvas.selected_object_id:
+            return None
+        entity = self.canvas.chapter.objects.get(self.canvas.selected_object_id)
+        return entity if isinstance(entity, TextObject) else None
+
+    def refresh_brush_controls(self) -> None:
+        self.pencil_preset_combo.blockSignals(True)
+        self.pencil_preset_combo.clear()
+        self.pencil_preset_combo.addItems([
+            item["name"] for item in self.settings.pencil_presets
+        ])
+        self.pencil_preset_combo.setCurrentText(
+            self.settings.active_pencil_preset
+        )
+        self.pencil_preset_combo.blockSignals(False)
+        pencil = self.canvas.tool.value == "raster_pencil"
+        size = (
+            self.settings.active_pencil_size
+            if pencil else self.settings.active_eraser_size
+        )
+        self.brush_size_combo.blockSignals(True)
+        self.brush_size_combo.setCurrentIndex(
+            max(0, self.brush_size_combo.findData(size))
+        )
+        self.brush_size_combo.blockSignals(False)
+        self.eraser_shape.blockSignals(True)
+        self.eraser_shape.setCurrentIndex(
+            max(0, self.eraser_shape.findData(self.settings.eraser_square))
+        )
+        self.eraser_shape.blockSignals(False)
+
+    def _brush_size_changed(self, *args) -> None:
+        if self._updating:
+            return
+        size = self.brush_size_combo.currentData()
+        if size:
+            self.brushSizeSelected.emit(self.canvas.tool.value, size)
+
+    def _eraser_shape_changed(self, *args) -> None:
+        if self._updating:
+            return
+        self.eraserShapeChanged.emit(bool(self.eraser_shape.currentData()))
+
+    def refresh(self) -> None:
+        chapter = self.canvas.chapter
+        if (
+            chapter is None or not self.canvas.selected_id
+            or self.canvas.tool.value == "object_select"
+            or self.canvas.selected_kind != "object"
+        ):
+            self.hide()
+            return
+        self._updating = True
+        entity = chapter.objects[self.canvas.selected_id]
+        self.title.setText(entity.object_type.title())
+        self.opacity_lock.show()
+        self.opacity_lock.setChecked(entity.opacity_locked)
+        self.text_panel.setVisible(isinstance(entity, TextObject))
+        self.preset_controls.setVisible(isinstance(entity, TextObject))
+        self.transform_panel.show()
+        if isinstance(entity, TextObject):
+            self._refresh_presets()
+            self.font_family.setCurrentText(entity.font_family)
+            self.font_size.setValue(entity.font_size)
+            self.bold.setChecked(entity.bold)
+            self.italic.setChecked(entity.italic)
+            self.kerning.setValue(entity.kerning)
+            self.layout_mode.setCurrentIndex(
+                max(0, self.layout_mode.findData(entity.layout_mode))
+            )
+            self.margin.setValue(entity.margin)
+            strict = entity.layout_mode == "strict"
+            self.alignment_widget.setVisible(strict)
+            self.margin.setVisible(strict)
+            for key, button in self._alignment_buttons.items():
+                button.setChecked(key == (
+                    entity.horizontal_alignment, entity.vertical_alignment
+                ))
+        self.undo_transform.setVisible(isinstance(entity, RasterObject))
+        self.undo_transform.setEnabled(self.canvas.can_undo_raster_transform())
+        raster_tool = (
+            isinstance(entity, RasterObject)
+            and self.canvas.tool.value in {
+                "raster_pencil", "raster_eraser",
+            }
+        )
+        self.raster_tool_panel.setVisible(raster_tool)
+        if raster_tool:
+            pencil = self.canvas.tool.value == "raster_pencil"
+            self.raster_tool_title.setText(
+                "Raster Pencil" if pencil else "Raster Eraser"
+            )
+            self.pencil_tool_controls.setVisible(pencil)
+            self.eraser_shape_label.setVisible(not pencil)
+            self.eraser_shape.setVisible(not pencil)
+            self.refresh_brush_controls()
+        self.name.setText(entity.name)
+        self.visible.setChecked(entity.visible)
+        self.opacity.setValue(round(entity.opacity * 100))
+        self.opacity.setEnabled(not getattr(entity, "opacity_locked", False))
+        self.transform_mode.setCurrentIndex(
+            max(0, self.transform_mode.findData(self.settings.transform_mode))
+        )
+        self.handle_snap.setChecked(self.settings.transform_snap_to_grid)
+        self._updating = False
+        self.adjustSize()
+        self.reposition()
+        self.show()
+        self.raise_()
+
+    def reposition(self) -> None:
+        if not self.isVisible() and not self.canvas.selected_id:
+            return
+        rect = self.canvas.selected_widget_rect()
+        if rect.isEmpty():
+            return
+        x = max(8, min(
+            self.canvas.width() - self.width() - 8,
+            rect.center().x() - self.width() // 2,
+        ))
+        y = rect.top() - self.height() - 10
+        if y < 8:
+            y = min(self.canvas.height() - self.height() - 8, rect.bottom() + 10)
+        self.move(x, max(8, y))
+
+    def _set_alignment(self, horizontal: str, vertical: str) -> None:
+        entity = self._text_entity()
+        if entity is None:
+            return
+        for key, button in self._alignment_buttons.items():
+            button.setChecked(key == (horizontal, vertical))
+        self._apply()
+
+    def _apply(self, *args) -> None:
+        if (
+            self._updating or self.canvas.chapter is None
+            or self.canvas.selected_kind != "object"
+            or not self.canvas.selected_id
+        ):
+            return
+        chapter = self.canvas.chapter
+        before = chapter.to_dict()
+        entity = chapter.objects[self.canvas.selected_id]
+        entity.name = self.name.text().strip() or entity.name
+        entity.visible = self.visible.isChecked()
+        entity.opacity_locked = self.opacity_lock.isChecked()
+        entity.opacity = (
+            chapter.layers[entity.parent_layer_id].opacity
+            if entity.opacity_locked else self.opacity.value() / 100
+        )
+        if isinstance(entity, TextObject):
+            entity.font_family = self.font_family.currentText()
+            entity.font_size = self.font_size.value()
+            entity.bold = self.bold.isChecked()
+            entity.italic = self.italic.isChecked()
+            entity.kerning = self.kerning.value()
+            entity.layout_mode = self.layout_mode.currentData()
+            entity.margin = self.margin.value()
+            checked = next(
+                (key for key, button in self._alignment_buttons.items()
+                 if button.isChecked()),
+                (entity.horizontal_alignment, entity.vertical_alignment),
+            )
+            entity.horizontal_alignment, entity.vertical_alignment = checked
+            if entity.layout_mode == "free" and entity.transform_quad is None:
+                entity.transform_quad = self.canvas._rect_quad(
+                    self.canvas._strict_text_rect(entity)
+                )
+        after = chapter.to_dict()
+        if before != after:
+            self.canvas.push_model_change(before, after, "Edit properties")
+            self.canvas.documentChanged.emit(None)
+            self.changed.emit()
+            self.canvas.update()
+        self.refresh()
+
+    def _transform_settings_changed(self, *args) -> None:
+        if self._updating:
+            return
+        self.settings.transform_mode = self.transform_mode.currentData()
+        self.settings.transform_snap_to_grid = self.handle_snap.isChecked()
+        self._save_settings(self.settings)
+        self.canvas.update()
+
+    def _current_preset(self) -> TextPreset | None:
+        entity = self._text_entity()
+        if entity is None:
+            return None
+        return TextPreset(
+            name=self.preset_combo.currentText() or "Default",
+            font_family=entity.font_family, font_size=entity.font_size,
+            bold=entity.bold, italic=entity.italic, kerning=entity.kerning,
+            layout_mode=entity.layout_mode,
+            horizontal_alignment=entity.horizontal_alignment,
+            vertical_alignment=entity.vertical_alignment, margin=entity.margin,
+            transform_snap=self.settings.transform_snap_to_grid,
+        )
+
+    def _refresh_presets(self) -> None:
+        current = self.settings.active_text_preset
+        self.preset_combo.blockSignals(True)
+        self.preset_combo.clear()
+        for item in self.settings.text_presets:
+            self.preset_combo.addItem(item["name"])
+        index = self.preset_combo.findText(current)
+        self.preset_combo.setCurrentIndex(max(0, index))
+        self.preset_combo.blockSignals(False)
+        protected = self.preset_combo.currentText() == "Default"
+        self.preset_rename.setEnabled(not protected)
+        self.preset_remove.setEnabled(not protected)
+
+    def _apply_preset(self, index: int) -> None:
+        entity = self._text_entity()
+        if entity is None or index < 0:
+            return
+        preset = TextPreset.from_dict(self.settings.text_presets[index])
+        before = self.canvas.chapter.to_dict()
+        for key in (
+            "font_family", "font_size", "bold", "italic", "kerning",
+            "layout_mode", "horizontal_alignment", "vertical_alignment", "margin",
+        ):
+            setattr(entity, key, getattr(preset, key))
+        self.settings.active_text_preset = preset.name
+        self.settings.transform_snap_to_grid = preset.transform_snap
+        self._save_settings(self.settings)
+        after = self.canvas.chapter.to_dict()
+        if before != after:
+            self.canvas.push_model_change(before, after, "Apply text preset")
+            self.canvas.documentChanged.emit(None)
+        self.refresh()
+
+    def _save_preset(self) -> None:
+        preset = self._current_preset()
+        if preset is None:
+            return
+        index = self.preset_combo.currentIndex()
+        if index < 0:
+            return
+        self.settings.text_presets[index] = preset.to_dict()
+        self.settings.active_text_preset = preset.name
+        self._save_settings(self.settings)
+        self.refresh()
+
+    def _add_preset(self) -> None:
+        preset = self._current_preset()
+        if preset is None:
+            return
+        name, accepted = QInputDialog.getText(self, "New text preset", "Preset name")
+        if not accepted or not name.strip():
+            return
+        if any(item["name"].casefold() == name.strip().casefold()
+               for item in self.settings.text_presets):
+            QMessageBox.warning(self, "Text preset", "That preset name already exists.")
+            return
+        preset.name = name.strip()
+        self.settings.text_presets.append(preset.to_dict())
+        self.settings.active_text_preset = preset.name
+        self._save_settings(self.settings)
+        self.refresh()
+
+    def _rename_preset(self) -> None:
+        index = self.preset_combo.currentIndex()
+        if index <= 0:
+            return
+        current = self.settings.text_presets[index]["name"]
+        name, accepted = QInputDialog.getText(
+            self, "Rename text preset", "Preset name", text=current
+        )
+        if not accepted or not name.strip():
+            return
+        if any(
+            item_index != index and item["name"].casefold() == name.strip().casefold()
+            for item_index, item in enumerate(self.settings.text_presets)
+        ):
+            QMessageBox.warning(self, "Text preset", "That preset name already exists.")
+            return
+        self.settings.text_presets[index]["name"] = name.strip()
+        self.settings.active_text_preset = name.strip()
+        self._save_settings(self.settings)
+        self.refresh()
+
+    def _remove_preset(self) -> None:
+        index = self.preset_combo.currentIndex()
+        if index <= 0:
+            return
+        self.settings.text_presets.pop(index)
+        self.settings.active_text_preset = "Default"
+        self._save_settings(self.settings)
+        self.refresh()
+
+    def _undo_raster_transform(self) -> None:
+        if self.canvas.undo_raster_transform():
+            self.refresh()

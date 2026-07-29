@@ -1,0 +1,707 @@
+from __future__ import annotations
+
+import json
+
+import pytest
+from PySide6.QtCore import QCoreApplication, QEvent, QPointF, Qt
+from PySide6.QtGui import (
+    QColor, QImage, QPointingDevice, QTabletEvent,
+)
+from PySide6.QtTest import QTest
+
+from comic_editor.core import settings as settings_module
+from comic_editor.core.models import (
+    BoundGeometry, ChapterDocument, PathNode, RasterObject, ShapeStyle,
+)
+from comic_editor.core.settings import EditorSettings, load_settings
+from comic_editor.core.tiles import TileStore
+from comic_editor.ui.canvas import CanvasWidget, ToolKind
+from comic_editor.ui.main_window import MainWindow
+
+
+def _canvas():
+    chapter = ChapterDocument(height=1080)
+    page = chapter.add_page(
+        "Page", BoundGeometry.rectangle(0, 0, 1080, 1080)
+    )
+    layer = chapter.add_layer(
+        page.layer_id, "Layer 1",
+        BoundGeometry.rectangle(40, 40, 700, 700),
+    )
+    canvas = CanvasWidget(EditorSettings(
+        snap_to_grid=False, transform_snap_to_grid=False
+    ))
+    canvas.resize(1000, 800)
+    canvas.set_document(chapter, TileStore())
+    canvas.set_selection("layer", layer.layer_id, False)
+    return canvas, chapter, page, layer
+
+
+def _send_tablet(
+    canvas, event_type, position, pressure,
+    button=Qt.NoButton, buttons=Qt.NoButton,
+):
+    global_position = QPointF(
+        canvas.mapToGlobal(position.toPoint())
+    )
+    event = QTabletEvent(
+        event_type, QPointingDevice.primaryPointingDevice(),
+        position, global_position, pressure,
+        0.0, 0.0, 0.0, 0.0, 0.0,
+        Qt.NoModifier, button, buttons,
+    )
+    QCoreApplication.sendEvent(canvas, event)
+
+
+def test_path_node_shape_style_round_trip_and_open_leaf_invariants():
+    chapter = ChapterDocument()
+    page = chapter.add_page()
+    path = BoundGeometry.path([
+        PathNode(x=10, y=20, width_multiplier=0.3),
+        PathNode(
+            x=100, y=80, point_type="bezier",
+            incoming=(70, 30), width_multiplier=2.4,
+        ),
+    ])
+    line = chapter.add_layer(
+        page.layer_id, "Line", path, layer_kind="open_shape",
+        style=ShapeStyle(
+            primary_color="#123456", base_thickness=14,
+            outline_color="#abcdef", outline_thickness=3,
+            start_cap="point", end_cap="square",
+        ),
+    )
+    loaded = ChapterDocument.from_dict(chapter.to_dict())
+    result = loaded.layers[line.layer_id]
+    assert loaded.schema_version == 4
+    assert result.layer_kind == "open_shape"
+    assert result.bound.closed is False
+    assert result.bound.nodes[1].incoming == (70, 30)
+    assert result.bound.nodes[1].width_multiplier == 2.4
+    assert result.shape_style.end_cap == "square"
+    with pytest.raises(ValueError, match="Leaf"):
+        loaded.add_layer(line.layer_id)
+    with pytest.raises(ValueError, match="directly"):
+        loaded.add_object(line.layer_id, RasterObject())
+
+
+def test_migrate_v3_rectangle_radius_fill_and_border():
+    chapter = ChapterDocument()
+    page = chapter.add_page()
+    layer = chapter.add_layer(page.layer_id)
+    data = chapter.to_dict()
+    data["schema_version"] = 3
+    item = next(
+        candidate for candidate in data["layers"]
+        if candidate["id"] == layer.layer_id
+    )
+    item["bound"] = {
+        "type": "rect", "points": [[10, 20], [310, 220]],
+    }
+    item.pop("shape_style")
+    item.update({
+        "fill_color": "#112233", "border_width": 7,
+        "border_color": "#445566", "vertex_radius": 18,
+    })
+    loaded = ChapterDocument.from_dict(data)
+    migrated = loaded.layers[layer.layer_id]
+    assert migrated.bound.primitive == "rectangle"
+    assert len(migrated.bound.nodes) == 4
+    assert {node.roundness for node in migrated.bound.nodes} == {18}
+    assert migrated.shape_style.primary_color == "#112233"
+    assert migrated.shape_style.outline_thickness == 7
+    assert migrated.shape_style.outline_color == "#445566"
+
+
+@pytest.mark.parametrize(
+    ("legacy", "primitive", "node_count", "roundness"),
+    [
+        (
+            {"type": "circle", "points": [[200, 200], [300, 200]]},
+            "ellipse", 4, 0,
+        ),
+        (
+            {
+                "type": "polygon",
+                "points": [[20, 20], [220, 40], [120, 240]],
+            },
+            "custom", 3, 16,
+        ),
+    ],
+)
+def test_migrate_v3_circle_and_polygon(
+    legacy, primitive, node_count, roundness,
+):
+    chapter = ChapterDocument()
+    page = chapter.add_page()
+    layer = chapter.add_layer(page.layer_id)
+    data = chapter.to_dict()
+    data["schema_version"] = 3
+    item = next(
+        candidate for candidate in data["layers"]
+        if candidate["id"] == layer.layer_id
+    )
+    item["bound"] = legacy
+    item.pop("shape_style")
+    item["vertex_radius"] = 16
+    loaded = ChapterDocument.from_dict(data)
+    bound = loaded.layers[layer.layer_id].bound
+    assert bound.primitive == primitive
+    assert len(bound.nodes) == node_count
+    assert max(node.roundness for node in bound.nodes) == roundness
+
+
+def test_reject_malformed_bezier_handles():
+    with pytest.raises(ValueError, match="incoming"):
+        BoundGeometry.path([
+            PathNode(x=0, y=0),
+            PathNode(
+                x=100, y=0, point_type="bezier",
+                outgoing=(120, 0),
+            ),
+        ])
+
+
+def test_variable_width_open_shape_outline_and_caps_render(qapp):
+    chapter = ChapterDocument(height=1080)
+    page = chapter.add_page(
+        bound=BoundGeometry.rectangle(0, 0, 1080, 1080)
+    )
+    line = chapter.add_layer(
+        page.layer_id, "Line",
+        BoundGeometry.path([
+            PathNode(x=100, y=500, width_multiplier=0.5),
+            PathNode(x=900, y=500, width_multiplier=2.0),
+        ]),
+        layer_kind="open_shape",
+        style=ShapeStyle(
+            primary_color="#ff0000", base_thickness=40,
+            outline_color="#0000ff", outline_thickness=10,
+            start_cap="point", end_cap="round",
+        ),
+    )
+    canvas = CanvasWidget(EditorSettings())
+    canvas.set_document(chapter, TileStore())
+    image = QImage(1080, 1080, QImage.Format_ARGB32_Premultiplied)
+    canvas.render_preview(image)
+    assert image.pixelColor(500, 500).red() > 200
+    assert image.pixelColor(500, 530).blue() > 200
+    start_height = sum(
+        image.pixelColor(120, y).alpha() > 0
+        and image.pixelColor(120, y).lightness() < 240
+        for y in range(440, 561)
+    )
+    end_height = sum(
+        image.pixelColor(850, y).alpha() > 0
+        and image.pixelColor(850, y).lightness() < 240
+        for y in range(400, 601)
+    )
+    assert end_height > start_height
+    assert line.bound.closed is False
+
+
+def test_open_bezier_with_unlocked_rounding_renders(qapp):
+    chapter = ChapterDocument(height=1080)
+    page = chapter.add_page()
+    path = BoundGeometry.path([
+        PathNode(x=100, y=400),
+        PathNode(
+            x=500, y=300, point_type="bezier",
+            incoming=(350, 550), outgoing=(650, 100),
+            handles_locked=False, roundness=30,
+        ),
+        PathNode(x=900, y=600),
+    ])
+    chapter.add_layer(
+        page.layer_id, "Curve", path, layer_kind="open_shape",
+        style=ShapeStyle(primary_color="#111111", base_thickness=12),
+    )
+    canvas = CanvasWidget(EditorSettings())
+    canvas.set_document(chapter, TileStore())
+    image = QImage(540, 540, QImage.Format_ARGB32_Premultiplied)
+    canvas.render_preview(image)
+    assert any(
+        image.pixelColor(x, y).lightness() < 80
+        for y in range(100, 400, 10)
+        for x in range(40, 500, 10)
+    )
+
+
+def test_shape_creation_open_close_and_bezier_drag(qapp):
+    canvas, chapter, page, layer = _canvas()
+    canvas.set_selection("layer", page.layer_id, False)
+    canvas.set_tool(ToolKind.SHAPE_CREATE)
+    for point in (QPointF(100, 100), QPointF(300, 100)):
+        widget = canvas.document_to_widget(point)
+        canvas._tool_press(widget, 1)
+        canvas._tool_release()
+    third = canvas.document_to_widget(QPointF(300, 300))
+    dragged = canvas.document_to_widget(QPointF(260, 260))
+    canvas._tool_press(third, 1)
+    canvas._tool_move(dragged, 1)
+    canvas._tool_release()
+    canvas._finish_shape(False)
+    open_layer = chapter.layers[canvas.selected_id]
+    assert open_layer.layer_kind == "open_shape"
+    assert open_layer.bound.nodes[-1].point_type == "bezier"
+    assert open_layer.bound.nodes[-1].incoming is not None
+    assert open_layer.bound.nodes[-1].outgoing is None
+
+    canvas.set_selection("layer", page.layer_id, False)
+    canvas.set_tool(ToolKind.SHAPE_CREATE)
+    for point in (
+        QPointF(400, 400), QPointF(600, 400), QPointF(500, 600),
+    ):
+        widget = canvas.document_to_widget(point)
+        canvas._tool_press(widget, 1)
+        canvas._tool_release()
+    canvas._tool_press(canvas.document_to_widget(QPointF(400, 400)), 1)
+    canvas._tool_release()
+    closed = chapter.layers[canvas.selected_id]
+    assert closed.layer_kind == "bounded"
+    assert closed.bound.closed is True
+    assert closed.fill_color == canvas.settings.brush_color
+
+
+def test_shape_edit_width_cap_insert_and_primitive_conversion(qapp):
+    canvas, chapter, page, layer = _canvas()
+    layer.bound = BoundGeometry.path([
+        PathNode(x=100, y=100),
+        PathNode(x=300, y=100),
+        PathNode(x=300, y=300),
+    ], False)
+    layer.layer_kind = "open_shape"
+    canvas.set_tool(ToolKind.SHAPE_EDIT)
+    selected = layer.bound.nodes[0]
+    canvas._selected_shape_node_id = selected.node_id
+    positions = canvas._shape_gizmo_positions(layer.bound, selected)
+    thickness = positions["thickness"]
+    canvas._tool_press(canvas.document_to_widget(thickness), 1)
+    direction = thickness - QPointF(selected.x, selected.y)
+    length = max(1.0, (direction.x() ** 2 + direction.y() ** 2) ** 0.5)
+    target = thickness + direction / length * (10 / canvas.scale)
+    canvas._tool_move(canvas.document_to_widget(target), 1)
+    canvas._tool_release()
+    assert selected.width_multiplier == pytest.approx(2.0)
+    cap = canvas._shape_gizmo_positions(layer.bound, selected)["cap"]
+    canvas._tool_press(canvas.document_to_widget(cap), 1)
+    assert layer.shape_style.start_cap == "point"
+
+    canvas._update_shape_hover(QPointF(200, 100))
+    assert canvas._shape_hover_insert is not None
+    canvas._tool_press(canvas.document_to_widget(QPointF(200, 100)), 1)
+    canvas._tool_release()
+    assert len(layer.bound.nodes) == 4
+
+    layer.layer_kind = "bounded"
+    layer.bound = BoundGeometry.rectangle(50, 50, 300, 200)
+    canvas._selected_shape_node_id = ""
+    canvas.primitiveConversionRequested.connect(
+        lambda _primitive: canvas.resolve_primitive_conversion(True)
+    )
+    canvas._update_shape_hover(QPointF(150, 50))
+    canvas._tool_press(canvas.document_to_widget(QPointF(150, 50)), 1)
+    canvas._tool_release()
+    assert layer.bound.primitive == "custom"
+    assert len(layer.bound.nodes) == 5
+
+
+def test_rectangle_mouse_resize_updates_connected_vertices(qapp):
+    canvas, chapter, page, layer = _canvas()
+    layer.bound = BoundGeometry.rectangle(50, 60, 300, 200)
+    canvas.set_tool(ToolKind.SHAPE_EDIT)
+    canvas.show()
+    qapp.processEvents()
+    start = canvas.document_to_widget(QPointF(50, 60)).toPoint()
+    target = canvas.document_to_widget(QPointF(90, 100)).toPoint()
+    QTest.mousePress(canvas, Qt.LeftButton, Qt.NoModifier, start)
+    QTest.mouseMove(canvas, target)
+    QTest.mouseRelease(canvas, Qt.LeftButton, Qt.NoModifier, target)
+    assert layer.bound.primitive == "rectangle"
+    assert layer.bound.points == pytest.approx([
+        (90, 100), (350, 100), (350, 260), (90, 260),
+    ])
+
+
+def test_rectangle_free_corner_and_edge_drags_are_undoable(qapp):
+    canvas, chapter, page, layer = _canvas()
+    canvas.settings.rectangle_edit_mode = "free"
+    layer.bound = BoundGeometry.rectangle(100, 100, 300, 200)
+    for index, node in enumerate(layer.bound.nodes):
+        node.roundness = 10 + index
+    canvas.set_tool(ToolKind.SHAPE_EDIT)
+
+    corner = canvas.document_to_widget(QPointF(100, 100))
+    canvas._tool_press(corner, 1)
+    canvas._tool_move(canvas.document_to_widget(QPointF(70, 80)), 1)
+    canvas._tool_release()
+    assert layer.bound.points == pytest.approx([
+        (70, 80), (400, 100), (400, 300), (100, 300),
+    ])
+    assert [node.roundness for node in layer.bound.nodes] == [10, 11, 12, 13]
+
+    top_midpoint = (
+        QPointF(*layer.bound.nodes[0].position)
+        + QPointF(*layer.bound.nodes[1].position)
+    ) / 2
+    canvas._tool_press(canvas.document_to_widget(top_midpoint), 1)
+    canvas._tool_move(
+        canvas.document_to_widget(top_midpoint + QPointF(40, 25)), 1
+    )
+    canvas._tool_release()
+    for actual, expected in zip(layer.bound.points, [
+        (110, 105), (440, 125), (400, 300), (100, 300),
+    ]):
+        assert actual == pytest.approx(expected)
+    assert layer.bound.primitive == "rectangle"
+    canvas.command_stack.undo()
+    restored = canvas.chapter.layers[layer.layer_id]
+    for actual, expected in zip(restored.bound.points, [
+        (70, 80), (400, 100), (400, 300), (100, 300),
+    ]):
+        assert actual == pytest.approx(expected)
+    canvas.command_stack.redo()
+    restored = canvas.chapter.layers[layer.layer_id]
+    for actual, expected in zip(restored.bound.points, [
+        (110, 105), (440, 125), (400, 300), (100, 300),
+    ]):
+        assert actual == pytest.approx(expected)
+
+
+@pytest.mark.parametrize("edge", range(4))
+def test_rectangle_free_midpoint_moves_only_attached_pair(qapp, edge):
+    canvas, chapter, page, layer = _canvas()
+    canvas.settings.rectangle_edit_mode = "free"
+    layer.bound = BoundGeometry.rectangle(100, 100, 300, 200)
+    canvas.set_tool(ToolKind.SHAPE_EDIT)
+    before = list(layer.bound.points)
+    first, second = edge, (edge + 1) % 4
+    midpoint = (
+        QPointF(*before[first]) + QPointF(*before[second])
+    ) / 2
+    canvas._tool_press(canvas.document_to_widget(midpoint), 1)
+    canvas._tool_move(
+        canvas.document_to_widget(midpoint + QPointF(30, -20)), 1
+    )
+    canvas._tool_release()
+    for index, point in enumerate(layer.bound.points):
+        expected = (
+            (before[index][0] + 30, before[index][1] - 20)
+            if index in {first, second} else before[index]
+        )
+        assert point == pytest.approx(expected)
+
+
+def test_rectangle_normal_mode_scales_a_skewed_free_quad(qapp):
+    canvas, chapter, page, layer = _canvas()
+    layer.bound = BoundGeometry.rectangle(100, 100, 300, 200)
+    layer.bound.nodes[0].position = (70, 80)
+    layer.bound.nodes[1].position = (430, 120)
+    layer.bound.nodes[2].position = (400, 320)
+    layer.bound.nodes[3].position = (90, 280)
+    canvas.settings.rectangle_edit_mode = "normal"
+    canvas.set_tool(ToolKind.SHAPE_EDIT)
+    left, top, width, height = layer.bound.bbox()
+    right_midpoint = QPointF(left + width, top + height / 2)
+    canvas._tool_press(canvas.document_to_widget(right_midpoint), 1)
+    canvas._tool_move(
+        canvas.document_to_widget(right_midpoint + QPointF(100, 0)), 1
+    )
+    canvas._tool_release()
+    assert layer.bound.primitive == "rectangle"
+    assert layer.bound.nodes[0].y == pytest.approx(80)
+    assert layer.bound.nodes[1].y == pytest.approx(120)
+    assert layer.bound.nodes[0].x == pytest.approx(70)
+    assert layer.bound.nodes[1].x > 430
+    assert layer.bound.nodes[2].x > 400
+    assert layer.bound.nodes[3].x > 90
+
+
+def test_rectangle_free_corner_and_edge_use_grid_snapping(qapp):
+    canvas, chapter, page, layer = _canvas()
+    canvas.settings.rectangle_edit_mode = "free"
+    canvas.settings.snap_to_grid = True
+    layer.bound = BoundGeometry.rectangle(90, 90, 300, 210)
+    canvas.set_tool(ToolKind.SHAPE_EDIT)
+
+    canvas._tool_press(canvas.document_to_widget(QPointF(90, 90)), 1)
+    canvas._tool_move(canvas.document_to_widget(QPointF(143, 167)), 1)
+    canvas._tool_release()
+    assert layer.bound.nodes[0].position == pytest.approx((150, 180))
+
+    midpoint = (
+        QPointF(*layer.bound.nodes[0].position)
+        + QPointF(*layer.bound.nodes[1].position)
+    ) / 2
+    original = list(layer.bound.points)
+    canvas._tool_press(canvas.document_to_widget(midpoint), 1)
+    canvas._tool_move(
+        canvas.document_to_widget(midpoint + QPointF(26, 34)), 1
+    )
+    canvas._tool_release()
+    moved_midpoint = (
+        QPointF(*layer.bound.nodes[0].position)
+        + QPointF(*layer.bound.nodes[1].position)
+    ) / 2
+    assert moved_midpoint.toTuple() == pytest.approx(
+        chapter.grid.snap(midpoint.x() + 26, midpoint.y() + 34)
+    )
+    first_delta = (
+        layer.bound.nodes[0].x - original[0][0],
+        layer.bound.nodes[0].y - original[0][1],
+    )
+    second_delta = (
+        layer.bound.nodes[1].x - original[1][0],
+        layer.bound.nodes[1].y - original[1][1],
+    )
+    assert first_delta == pytest.approx(second_delta)
+
+
+@pytest.mark.parametrize(
+    ("index", "target", "expected_bbox"),
+    [
+        (0, (-20, -10), (-20, -10, 320, 210)),
+        (1, (320, -10), (0, -10, 320, 210)),
+        (2, (320, 220), (0, 0, 320, 220)),
+        (3, (-20, 220), (-20, 0, 320, 220)),
+        (4, (150, -10), (0, -10, 300, 210)),
+        (5, (320, 100), (0, 0, 320, 200)),
+        (6, (150, 220), (0, 0, 300, 220)),
+        (7, (-20, 100), (-20, 0, 320, 200)),
+    ],
+)
+def test_every_rectangle_handle_preserves_primitive_and_ids(
+    qapp, index, target, expected_bbox,
+):
+    bound = BoundGeometry.rectangle(0, 0, 300, 200)
+    original = BoundGeometry.from_dict(bound.to_dict())
+    ids = [node.node_id for node in bound.nodes]
+    CanvasWidget._move_bound_handle(
+        bound, index, QPointF(*target), original
+    )
+    assert bound.primitive == "rectangle"
+    assert [node.node_id for node in bound.nodes] == ids
+    assert bound.bbox() == pytest.approx(expected_bbox)
+    left, top, width, height = bound.bbox()
+    assert bound.points == pytest.approx([
+        (left, top), (left + width, top),
+        (left + width, top + height), (left, top + height),
+    ])
+
+
+def test_rectangle_radius_gizmos_hit_drag_and_preserve_primitive(qapp):
+    canvas, chapter, page, layer = _canvas()
+    layer.bound = BoundGeometry.rectangle(50, 50, 300, 200)
+    canvas.set_tool(ToolKind.SHAPE_EDIT)
+    positions = canvas._rectangle_radius_positions(layer.bound)
+    assert len(positions) == 4
+    for index, position in enumerate(positions):
+        hit = canvas._shape_hit_test(layer.bound, position)
+        assert hit["kind"] == "radius"
+        assert hit["index"] == index
+    canvas.show()
+    qapp.processEvents()
+    start = canvas.document_to_widget(positions[0]).toPoint()
+    target = canvas.document_to_widget(QPointF(100, 100)).toPoint()
+    QTest.mousePress(canvas, Qt.LeftButton, Qt.NoModifier, start)
+    QTest.mouseMove(canvas, target)
+    QTest.mouseRelease(canvas, Qt.LeftButton, Qt.NoModifier, target)
+    assert layer.bound.primitive == "rectangle"
+    assert layer.bound.nodes[0].roundness == pytest.approx(50, abs=2)
+    assert [node.roundness for node in layer.bound.nodes[1:]] == [0, 0, 0]
+
+
+def test_rectangle_radius_gizmo_screen_offset_is_zoom_independent(qapp):
+    canvas, chapter, page, layer = _canvas()
+    layer.bound = BoundGeometry.rectangle(50, 50, 300, 200)
+    distances = []
+    for scale in (0.5, 1.0, 2.5):
+        canvas.scale = scale
+        position = canvas._rectangle_radius_positions(layer.bound)[0]
+        corner = QPointF(*layer.bound.nodes[0].position)
+        distances.append(
+            (canvas.document_to_widget(position)
+             - canvas.document_to_widget(corner)).manhattanLength()
+        )
+    assert distances[0] == pytest.approx(distances[1], abs=0.01)
+    assert distances[1] == pytest.approx(distances[2], abs=0.01)
+
+
+def test_point_hover_prevents_insertion_preview(qapp):
+    canvas, chapter, page, layer = _canvas()
+    layer.bound = BoundGeometry.path([
+        PathNode(x=100, y=100),
+        PathNode(x=300, y=100),
+        PathNode(x=300, y=300),
+    ], True)
+    canvas.set_tool(ToolKind.SHAPE_EDIT)
+    canvas._update_shape_hover(QPointF(100, 100))
+    assert canvas._shape_hover_target["kind"] == "node"
+    assert canvas._shape_hover_insert is None
+    canvas._tool_press(canvas.document_to_widget(QPointF(100, 100)), 1)
+    canvas._tool_release()
+    assert canvas._selected_shape_node_id == layer.bound.nodes[0].node_id
+    assert len(layer.bound.nodes) == 3
+
+
+def test_primitive_insert_waits_for_confirmation_and_undoes(qapp):
+    canvas, chapter, page, layer = _canvas()
+    layer.bound = BoundGeometry.circle(200, 150, 100)
+    canvas.set_tool(ToolKind.SHAPE_EDIT)
+    point = canvas.bound_path(layer.bound).pointAtPercent(0.12)
+    requested = []
+    canvas.primitiveConversionRequested.connect(requested.append)
+    canvas._tool_press(canvas.document_to_widget(point), 1)
+    assert requested == ["ellipse"]
+    assert layer.bound.primitive == "ellipse"
+    canvas.resolve_primitive_conversion(False)
+    assert layer.bound.primitive == "ellipse"
+
+    canvas._tool_press(canvas.document_to_widget(point), 1)
+    canvas.resolve_primitive_conversion(True)
+    canvas._tool_release()
+    assert layer.bound.primitive == "custom"
+    assert len(layer.bound.nodes) == 5
+    canvas.command_stack.undo()
+    restored = canvas.chapter.layers[layer.layer_id]
+    assert restored.bound.primitive == "ellipse"
+    assert len(restored.bound.nodes) == 4
+
+
+def test_tablet_buttonless_move_drags_draft_point(qapp):
+    canvas, chapter, page, layer = _canvas()
+    canvas.set_selection("layer", page.layer_id, False)
+    canvas.set_tool(ToolKind.SHAPE_CREATE)
+    canvas._creation_nodes = [
+        PathNode(x=100, y=100),
+        PathNode(x=300, y=100),
+        PathNode(x=300, y=300),
+    ]
+    canvas.show()
+    qapp.processEvents()
+    start = canvas.document_to_widget(QPointF(300, 100))
+    target = canvas.document_to_widget(QPointF(340, 140))
+    _send_tablet(
+        canvas, QEvent.TabletPress, start, 0.6,
+        Qt.LeftButton, Qt.LeftButton,
+    )
+    _send_tablet(canvas, QEvent.TabletMove, target, 0.6)
+    _send_tablet(
+        canvas, QEvent.TabletRelease, target, 0.0, Qt.LeftButton,
+    )
+    assert canvas._creation_nodes[1].position == pytest.approx((340, 140))
+    assert len(canvas._creation_nodes) == 3
+
+
+def test_mouse_drag_existing_draft_point_does_not_add_point(qapp):
+    canvas, chapter, page, layer = _canvas()
+    canvas.set_selection("layer", page.layer_id, False)
+    canvas.set_tool(ToolKind.SHAPE_CREATE)
+    canvas._creation_nodes = [
+        PathNode(x=100, y=100),
+        PathNode(x=300, y=100),
+        PathNode(x=300, y=300),
+    ]
+    canvas.show()
+    qapp.processEvents()
+    start = canvas.document_to_widget(QPointF(300, 100)).toPoint()
+    target = canvas.document_to_widget(QPointF(360, 140)).toPoint()
+    QTest.mousePress(canvas, Qt.LeftButton, Qt.NoModifier, start)
+    QTest.mouseMove(canvas, target)
+    QTest.mouseRelease(canvas, Qt.LeftButton, Qt.NoModifier, target)
+    assert canvas._creation_nodes[1].position == pytest.approx((360, 140))
+    assert len(canvas._creation_nodes) == 3
+
+
+def test_new_bound_sibling_and_page_child_placement(qapp):
+    canvas, chapter, page, first = _canvas()
+    second = chapter.add_layer(
+        page.layer_id, "Second",
+        BoundGeometry.rectangle(100, 100, 100, 100),
+    )
+    canvas.set_selection("layer", second.layer_id, False)
+    canvas._create_layer_from_world_bound(
+        BoundGeometry.rectangle(200, 200, 100, 100)
+    )
+    children = [
+        reference.entity_id for reference in page.children
+        if reference.kind == "layer"
+    ]
+    created = canvas.selected_id
+    assert children == [first.layer_id, created, second.layer_id]
+    canvas.set_selection("layer", page.layer_id, False)
+    canvas._create_layer_from_world_bound(
+        BoundGeometry.circle(400, 400, 50)
+    )
+    assert page.children[0].entity_id == canvas.selected_id
+
+
+def test_point_type_lock_roundness_and_constant_screen_gizmos(qapp):
+    canvas, chapter, page, layer = _canvas()
+    layer.bound = BoundGeometry.path([
+        PathNode(x=100, y=100),
+        PathNode(x=300, y=100),
+        PathNode(x=500, y=250),
+    ], False)
+    layer.layer_kind = "open_shape"
+    canvas.set_tool(ToolKind.SHAPE_EDIT)
+    node = layer.bound.nodes[1]
+    canvas._selected_shape_node_id = node.node_id
+    type_gizmo = canvas._shape_gizmo_positions(
+        layer.bound, node
+    )["type"]
+    canvas._tool_press(canvas.document_to_widget(type_gizmo), 1)
+    assert node.point_type == "bezier"
+    assert node.handles_locked
+    assert node.incoming is not None and node.outgoing is not None
+    lock_gizmo = canvas._shape_gizmo_positions(
+        layer.bound, node
+    )["lock"]
+    canvas._tool_press(canvas.document_to_widget(lock_gizmo), 1)
+    assert node.handles_locked is False
+    assert "roundness" in canvas._shape_gizmo_positions(layer.bound, node)
+
+    node.width_multiplier = 1.0
+    canvas.scale = 0.5
+    first = canvas._shape_gizmo_positions(layer.bound, node)["thickness"]
+    first_distance = (
+        canvas.document_to_widget(first)
+        - canvas.document_to_widget(QPointF(node.x, node.y))
+    ).manhattanLength()
+    canvas.scale = 2.0
+    second = canvas._shape_gizmo_positions(layer.bound, node)["thickness"]
+    second_distance = (
+        canvas.document_to_widget(second)
+        - canvas.document_to_widget(QPointF(node.x, node.y))
+    ).manhattanLength()
+    assert first_distance == pytest.approx(second_distance, abs=0.01)
+
+
+def test_shapes_category_stays_open_after_tool_choice(qapp):
+    window = MainWindow()
+    try:
+        assert not window.shapes_category.isExpanded()
+        window.shapes_category.header.click()
+        assert window.shapes_category.isExpanded()
+        assert not window.shapes_category.contents.isHidden()
+        window.shape_tool_buttons[ToolKind.SHAPE_CREATE].click()
+        assert window.shapes_category.isExpanded()
+        assert not window.shapes_category.contents.isHidden()
+        window.shapes_category.header.click()
+        assert not window.shapes_category.isExpanded()
+        assert window.shapes_category.contents.isHidden()
+    finally:
+        window.deleteLater()
+
+
+def test_bound_edit_hotkey_migrates_to_shape_edit(monkeypatch, tmp_path):
+    path = tmp_path / "settings.json"
+    path.write_text(json.dumps({
+        "settings_version": 3,
+        "hotkeys": {"bound_edit": "Ctrl+B"},
+    }), encoding="utf-8")
+    monkeypatch.setattr(settings_module, "settings_path", lambda: path)
+    loaded = load_settings()
+    assert loaded.settings_version == 5
+    assert loaded.hotkeys["shape_edit"] == "Ctrl+B"
+    assert "bound_edit" not in loaded.hotkeys
