@@ -47,8 +47,16 @@ class SeriesRepository:
         self.save_series(series)
         return series
 
-    def load_series(self) -> SeriesDocument:
+    def load_series(
+        self, legacy_primary_color: str | None = None,
+    ) -> SeriesDocument:
         data = json.loads(self.series_path.read_text(encoding="utf-8"))
+        if (
+            legacy_primary_color is not None
+            and "primary_color" not in data
+            and "brush_color" not in data
+        ):
+            data["primary_color"] = legacy_primary_color
         return SeriesDocument.from_dict(data)
 
     def save_series(self, series: SeriesDocument) -> None:
@@ -75,11 +83,15 @@ class SeriesRepository:
         self, chapter: ChapterDocument, tiles: TileStore, autosave: bool = False,
     ) -> None:
         chapter.validate()
+        raster_object_ids = {
+            object_id for object_id, obj in chapter.objects.items()
+            if isinstance(obj, RasterObject)
+        }
         chapter_root = self.chapter_root(chapter.chapter_id)
         if autosave:
             destination = chapter_root / "autosave"
             tile_root = destination / "raster"
-            tiles.save_directory(tile_root, set(chapter.objects), complete=True)
+            tiles.save_directory(tile_root, raster_object_ids, complete=True)
             atomic_json(destination / CHAPTER_FILE, chapter.to_dict())
             atomic_json(destination / "recovery.json", {"saved_at": time.time()})
             return
@@ -101,7 +113,7 @@ class SeriesRepository:
             # Tile files are published before the manifest. If the process is
             # interrupted, PENDING_FILE causes the previous complete revision
             # to be restored on the next open.
-            tiles.save_directory(tile_root, set(chapter.objects), complete=True)
+            tiles.save_directory(tile_root, raster_object_ids, complete=True)
             atomic_json(manifest, chapter.to_dict())
             pending.unlink(missing_ok=True)
             tiles.dirty.clear()

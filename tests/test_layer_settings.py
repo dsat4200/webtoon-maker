@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+from PySide6.QtWidgets import QSlider, QSpinBox
+
 from comic_editor.core.models import (
-    BoundGeometry, ChapterDocument, RasterObject, ShapeStyle,
+    BoundGeometry, ChapterDocument, PathNode, RasterObject, ShapeStyle,
 )
 from comic_editor.core.tiles import TileStore
 from comic_editor.ui.canvas import ToolKind
@@ -44,12 +46,22 @@ def test_layer_settings_follows_layer_page_and_object_parent(
         qapp.processEvents()
         assert window.canvas.active_layer_id == layer.layer_id
         assert window.layer_settings.name.text() == "Panel"
-        assert window.inspector.isVisible()
+        assert window.inspector.isHidden()
+        assert window.ribbon.is_page_visible(
+            "raster_object_settings"
+        )
 
         window.canvas.set_selection("layer", page.layer_id, False)
         qapp.processEvents()
         assert window.layer_settings.type_label.text() == "Page"
+        assert window.layer_settings.border_width.maximum() == 40
+        assert window.layer_settings.border_width_slider.maximum() == 40
         assert window.inspector.isHidden()
+
+        window.canvas.set_selection("layer", layer.layer_id, False)
+        qapp.processEvents()
+        assert window.layer_settings.border_width.maximum() == 500
+        assert window.layer_settings.border_width_slider.maximum() == 500
     finally:
         window.hide()
         window.deleteLater()
@@ -149,7 +161,44 @@ def test_layer_settings_preserves_all_bounded_layer_fields(
         window.deleteLater()
 
 
-def test_raster_tool_controls_live_in_object_popup(qapp, monkeypatch):
+def test_thickness_sliders_use_integers_sync_and_coalesce_undo(
+    qapp, monkeypatch,
+):
+    monkeypatch.setattr(main_window_module, "save_settings", lambda _value: None)
+    window = MainWindow()
+    chapter, page, layer, raster = _window_document(window)
+    layer.layer_kind = "open_shape"
+    layer.bound = BoundGeometry.path([
+        PathNode(x=100, y=100), PathNode(x=500, y=300),
+    ], False)
+    window.canvas.set_selection("layer", layer.layer_id, False)
+    panel = window.layer_settings
+    panel.refresh()
+    window.canvas.command_stack.clear()
+    try:
+        assert isinstance(panel.base_thickness_slider, QSlider)
+        assert isinstance(panel.base_thickness, QSpinBox)
+        assert isinstance(panel.border_width_slider, QSlider)
+        assert isinstance(panel.border_width, QSpinBox)
+
+        panel.base_thickness_slider.sliderPressed.emit()
+        panel.base_thickness_slider.setValue(12)
+        panel.base_thickness_slider.setValue(27)
+        panel.base_thickness_slider.setValue(43)
+        panel.base_thickness_slider.sliderReleased.emit()
+
+        assert panel.base_thickness.value() == 43
+        assert layer.shape_style.base_thickness == 43
+        assert len(window.canvas.command_stack._undo) == 1
+
+        panel.border_width.setValue(19)
+        assert panel.border_width_slider.value() == 19
+        assert layer.shape_style.outline_thickness == 19
+    finally:
+        window.deleteLater()
+
+
+def test_raster_tool_controls_live_in_tool_settings_ribbon(qapp, monkeypatch):
     monkeypatch.setattr(main_window_module, "save_settings", lambda _value: None)
     window = MainWindow()
     chapter, page, layer, raster = _window_document(window)
@@ -159,34 +208,34 @@ def test_raster_tool_controls_live_in_object_popup(qapp, monkeypatch):
     before = chapter.to_dict()
     try:
         assert window.canvas.tool == ToolKind.RASTER_PENCIL
-        assert window.inspector.raster_tool_panel.isVisible()
-        assert window.inspector.pencil_tool_controls.isVisible()
-        assert window.inspector.eraser_shape.isHidden()
-        assert not hasattr(window, "pencil_preset_combo")
-        assert not hasattr(window, "pencil_size_combo")
-        assert not hasattr(window, "eraser_size_combo")
+        assert window.inspector.isHidden()
+        assert window.ribbon.is_page_visible(
+            "raster_object_settings"
+        )
+        controls = window.tool_settings_controls
+        assert controls.stack.currentWidget() is controls.pencil_page
 
-        large = window.inspector.brush_size_combo.findData("large")
-        window.inspector.brush_size_combo.setCurrentIndex(large)
+        large = controls.pencil_size.findData("large")
+        controls.pencil_size.setCurrentIndex(large)
         assert window.settings.active_pencil_size == "large"
         assert window.canvas.tool == ToolKind.RASTER_PENCIL
         assert chapter.to_dict() == before
 
         window._activate_tool(ToolKind.RASTER_ERASER)
         qapp.processEvents()
-        assert window.inspector.raster_tool_panel.isVisible()
-        assert window.inspector.pencil_tool_controls.isHidden()
-        assert window.inspector.eraser_shape.isVisible()
-        square = window.inspector.eraser_shape.findData(True)
-        window.inspector.eraser_shape.setCurrentIndex(square)
+        assert window.inspector.isHidden()
+        assert controls.stack.currentWidget() is controls.eraser_page
+        square = controls.eraser_shape.findData(True)
+        controls.eraser_shape.setCurrentIndex(square)
         assert window.settings.eraser_square is True
         assert window.canvas.tool == ToolKind.RASTER_ERASER
         assert chapter.to_dict() == before
 
         window._activate_tool(ToolKind.TRANSFORM)
         qapp.processEvents()
-        assert window.inspector.raster_tool_panel.isHidden()
-        assert window.inspector.isVisible()
+        assert window.inspector.isHidden()
+        assert window.canvas.tool == ToolKind.RASTER_ERASER
+        assert window.ribbon.current_key() == "raster_object_settings"
     finally:
         window.hide()
         window.deleteLater()

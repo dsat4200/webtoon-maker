@@ -1,0 +1,693 @@
+from __future__ import annotations
+
+import math
+
+from PySide6.QtCore import QPointF, QRectF, Qt
+from PySide6.QtGui import QGuiApplication, QImage, QPainterPath
+import pytest
+
+from comic_editor.core.models import (
+    BoundGeometry, ChapterDocument, VectorDrawingObject, VectorFillObject,
+    VectorStroke, VectorStrokePoint,
+)
+from comic_editor.core.settings import EditorSettings
+from comic_editor.core.tiles import TileStore
+from comic_editor.core.vector_geometry import stroke_cubics
+from comic_editor.ui.canvas import CanvasWidget, ToolKind
+
+
+def _canvas_with_drawing(strokes=None):
+    chapter = ChapterDocument()
+    page = chapter.add_page()
+    drawing = chapter.add_object(
+        page.layer_id,
+        VectorDrawingObject(strokes=list(strokes or [])),
+    )
+    canvas = CanvasWidget(EditorSettings(predictive_ink=False))
+    canvas.resize(900, 700)
+    canvas.set_document(chapter, TileStore())
+    canvas.set_selection("object", drawing.object_id)
+    return canvas, chapter, drawing
+
+
+def _stroke(*points):
+    return VectorStroke(
+        points=[
+            VectorStrokePoint(x=x, y=y, width=width, opacity=opacity)
+            for x, y, width, opacity in points
+        ]
+    )
+
+
+def test_vector_pencil_creates_pressure_stroke_and_undoes(qapp):
+    canvas, chapter, drawing = _canvas_with_drawing()
+    canvas.set_active_colors("#80402010", "#FFFFFFFF")
+    canvas._tool_press(
+        canvas.document_to_widget(QPointF(100, 100)), 0.25
+    )
+    canvas._tool_move(
+        canvas.document_to_widget(QPointF(150, 120)), 0.6
+    )
+    canvas._tool_move(
+        canvas.document_to_widget(QPointF(220, 180)), 1.0
+    )
+    canvas._tool_release()
+
+    assert len(drawing.strokes) == 1
+    assert drawing.strokes[0].color == "#80402010"
+    assert len(drawing.strokes[0].points) >= 2
+    assert drawing.strokes[0].points[-1].width >= (
+        drawing.strokes[0].points[0].width
+    )
+    canvas.command_stack.undo()
+    assert not drawing.strokes
+    canvas.command_stack.redo()
+    assert len(drawing.strokes) == 1
+
+
+def test_vector_pencil_tap_creates_round_dot(qapp):
+    canvas, _chapter, drawing = _canvas_with_drawing()
+    canvas._tool_press(
+        canvas.document_to_widget(QPointF(160, 140)), 0.8
+    )
+    canvas._tool_release()
+    assert len(drawing.strokes) == 1
+    assert len(drawing.strokes[0].points) == 1
+    assert drawing.strokes[0].start_cap == "round"
+
+
+def test_vector_point_cap_renders_an_outward_tip(qapp):
+    stroke = _stroke((50, 50, 20, 1), (100, 50, 20, 1))
+    stroke.start_cap = "point"
+    canvas, _chapter, drawing = _canvas_with_drawing([stroke])
+    canvas.scale = 1.0
+    image, target = canvas._vector_stroke_image(drawing, stroke)
+
+    def alpha_at(x, y):
+        pixel_x = round((x - target.left()) * image.width() / target.width())
+        pixel_y = round((y - target.top()) * image.height() / target.height())
+        return image.pixelColor(pixel_x, pixel_y).alpha()
+
+    assert alpha_at(43, 50) > 0
+    assert alpha_at(37, 50) == 0
+
+
+def test_vector_drawing_renders_through_object_pipeline(qapp):
+    chapter = ChapterDocument(width=400, height=300)
+    page = chapter.add_page()
+    layer = chapter.add_layer(
+        page.layer_id,
+        "Vector clip",
+        BoundGeometry.rectangle(0, 0, 250, 240),
+    )
+    drawing = chapter.add_object(
+        layer.layer_id,
+            VectorDrawingObject(
+                x=20,
+                y=0,
+                opacity=0.5,
+                opacity_locked=False,
+                strokes=[
+                VectorStroke(
+                    color="#FFFF0000",
+                    points=[
+                        VectorStrokePoint(x=20, y=100, width=20),
+                        VectorStrokePoint(x=330, y=100, width=20),
+                    ],
+                ),
+                VectorStroke(
+                    color="#8000FF00",
+                    points=[
+                        VectorStrokePoint(x=20, y=170, width=20),
+                        VectorStrokePoint(x=180, y=170, width=20),
+                    ],
+                ),
+            ],
+        ),
+    )
+    chapter.add_vector_fill(
+        drawing.object_id,
+        VectorFillObject(
+            geometry=BoundGeometry.rectangle(20, 80, 160, 50),
+            fill_color="#FF0000FF",
+        ),
+    )
+    chapter.height = 300
+    canvas = CanvasWidget(EditorSettings(predictive_ink=False))
+    canvas.set_document(chapter, TileStore())
+    image = QImage(400, 300, QImage.Format_ARGB32_Premultiplied)
+
+    canvas.render_preview(image)
+
+    overlap = image.pixelColor(100, 100)
+    assert overlap.red() > overlap.blue()
+    translucent = image.pixelColor(100, 170)
+    assert translucent.green() > translucent.red()
+    assert 170 <= translucent.red() <= 225
+    assert image.pixelColor(300, 100).getRgb()[:3] == (255, 255, 255)
+
+
+def test_vector_edit_clears_render_cache(qapp):
+    stroke = _stroke((100, 100, 8, 1), (200, 100, 8, 1))
+    canvas, _chapter, drawing = _canvas_with_drawing([stroke])
+    canvas._vector_stroke_image(drawing, stroke)
+    assert canvas._vector_render_cache
+    canvas._set_vector_selection(
+        drawing, {stroke.stroke_id}, {stroke.points[0].point_id}
+    )
+    canvas._vector_drag_origin = QPointF(100, 100)
+    canvas._vector_drag_points = {
+        stroke.points[0].point_id: (
+            stroke.points[0].position,
+            stroke.points[0].incoming,
+            stroke.points[0].outgoing,
+        )
+    }
+
+    canvas._update_vector_anchor_drag(drawing, QPointF(120, 120))
+
+    assert not canvas._vector_render_cache
+
+
+def test_shape_edit_maps_to_vector_edit_and_selects_a_stroke(qapp):
+    stroke = _stroke(
+        (100, 100, 8, 1), (200, 100, 8, 1), (260, 160, 8, 1)
+    )
+    canvas, _chapter, _drawing = _canvas_with_drawing([stroke])
+    assert canvas.set_tool(ToolKind.SHAPE_EDIT)
+    assert canvas.tool == ToolKind.VECTOR_EDIT
+    canvas._tool_press(
+        canvas.document_to_widget(QPointF(150, 100)), 1.0
+    )
+    canvas._tool_release()
+    assert stroke.stroke_id in canvas.selected_vector_stroke_ids
+
+
+def test_object_select_prefers_vector_stroke_then_fill_interior(qapp):
+    stroke = VectorStroke(
+        closed=True,
+        points=[
+            VectorStrokePoint(x=100, y=100, width=8),
+            VectorStrokePoint(x=300, y=100, width=8),
+            VectorStrokePoint(x=300, y=300, width=8),
+            VectorStrokePoint(x=100, y=300, width=8),
+        ],
+    )
+    canvas, chapter, drawing = _canvas_with_drawing([stroke])
+    fill = chapter.add_vector_fill(
+        drawing.object_id,
+        VectorFillObject(
+            geometry=BoundGeometry.rectangle(100, 100, 200, 200),
+            fill_color="#FFFF0000",
+        ),
+    )
+    canvas.settings.page_scope_select = True
+    canvas.set_tool(ToolKind.OBJECT_SELECT)
+    assert canvas.hit_test_entities(QPointF(100, 180))[0] == {
+        "kind": "object", "id": drawing.object_id,
+    }
+    assert canvas.hit_test_entities(QPointF(200, 200))[0] == {
+        "kind": "object", "id": fill.object_id,
+    }
+
+
+def test_vector_stroke_eraser_removes_touched_stroke(qapp):
+    stroke = _stroke((100, 100, 10, 1), (300, 100, 10, 1))
+    canvas, _chapter, drawing = _canvas_with_drawing([stroke])
+    canvas.settings.vector_eraser_mode = "stroke"
+    assert canvas.set_tool(ToolKind.RASTER_ERASER)
+    canvas._tool_press(
+        canvas.document_to_widget(QPointF(180, 100)), 1.0
+    )
+    canvas._tool_release()
+    assert not drawing.strokes
+    canvas.command_stack.undo()
+    assert len(drawing.strokes) == 1
+
+
+def test_vector_fill_creates_owned_child_and_keeps_drawing_selected(qapp):
+    stroke = VectorStroke(
+        closed=True,
+        points=[
+            VectorStrokePoint(x=100, y=100, width=6),
+            VectorStrokePoint(x=300, y=100, width=6),
+            VectorStrokePoint(x=300, y=300, width=6),
+            VectorStrokePoint(x=100, y=300, width=6),
+        ],
+    )
+    canvas, chapter, drawing = _canvas_with_drawing([stroke])
+    canvas.set_active_colors("#FF336699", "#FFFFFFFF")
+    assert canvas.set_tool(ToolKind.FILL)
+    canvas._tool_press(
+        canvas.document_to_widget(QPointF(200, 200)), 1.0
+    )
+    canvas._tool_release()
+    fills = chapter.vector_fill_children(drawing.object_id)
+    assert len(fills) == 1
+    assert fills[0].fill_color == "#FF336699"
+    assert canvas.selected_id == drawing.object_id
+    canvas.command_stack.undo()
+    assert chapter.vector_fill_children(drawing.object_id) == []
+
+
+def test_intersection_eraser_uses_other_strokes_as_cuts(qapp):
+    horizontal = _stroke((40, 200, 6, 1), (360, 200, 6, 1))
+    vertical = _stroke((200, 40, 6, 1), (200, 360, 6, 1))
+    canvas, _chapter, drawing = _canvas_with_drawing([
+        horizontal, vertical,
+    ])
+    canvas.settings.vector_eraser_mode = "intersection"
+    canvas.settings.eraser_size_px["medium"] = 20
+    assert canvas.set_tool(ToolKind.RASTER_ERASER)
+    canvas._tool_press(
+        canvas.document_to_widget(QPointF(100, 200)), 1.0
+    )
+    canvas._tool_release()
+    assert len(drawing.strokes) == 2
+    remaining_horizontal = next(
+        stroke for stroke in drawing.strokes
+        if stroke.stroke_id == horizontal.stroke_id
+    )
+    assert remaining_horizontal.points[0].x == pytest.approx(200, abs=2)
+    assert remaining_horizontal.points[-1].x == pytest.approx(360, abs=2)
+
+
+def test_connect_sweeps_two_endpoints_and_keeps_first_style(qapp):
+    first = _stroke((60, 100, 5, 0.4), (160, 100, 7, 0.6))
+    first.color = "#FF112233"
+    second = _stroke((260, 160, 11, 0.8), (360, 160, 13, 1.0))
+    second.color = "#FFAA5500"
+    canvas, _chapter, drawing = _canvas_with_drawing([first, second])
+    assert canvas.set_tool(ToolKind.VECTOR_CONNECT)
+    canvas._tool_press(
+        canvas.document_to_widget(QPointF(160, 100)), 1.0
+    )
+    canvas._tool_move(
+        canvas.document_to_widget(QPointF(260, 160)), 1.0
+    )
+    canvas._tool_release()
+    assert len(drawing.strokes) == 1
+    connected = drawing.strokes[0]
+    assert connected.stroke_id == first.stroke_id
+    assert connected.color == "#FF112233"
+    assert connected.points[0].position == (60, 100)
+    assert connected.points[-1].position == (360, 160)
+    assert connected.points[1].outgoing is not None
+    assert connected.points[2].incoming is not None
+
+
+def test_redraw_apply_targets_points_before_strokes(qapp):
+    first = _stroke((60, 100, 5, 1), (160, 100, 7, 1))
+    second = _stroke((60, 200, 9, 1), (160, 200, 11, 1))
+    canvas, _chapter, drawing = _canvas_with_drawing([first, second])
+    canvas._set_vector_selection(
+        drawing,
+        {first.stroke_id, second.stroke_id},
+        {first.points[1].point_id},
+    )
+    assert canvas.apply_vector_redraw("thickness", "uniform", 25)
+    assert first.points[0].width == 5
+    assert first.points[1].width == 25
+    assert second.points[0].width == 9
+    canvas.command_stack.undo()
+    restored = next(
+        stroke for stroke in drawing.strokes
+        if stroke.stroke_id == first.stroke_id
+    )
+    assert restored.points[1].width == 7
+
+
+def test_shape_fill_changes_border_or_interior_contextually(qapp):
+    chapter = ChapterDocument()
+    page = chapter.add_page()
+    layer = chapter.add_layer(
+        page.layer_id, "Shape",
+        BoundGeometry.rectangle(100, 100, 240, 180),
+    )
+    canvas = CanvasWidget(EditorSettings())
+    canvas.resize(900, 700)
+    canvas.set_document(chapter, TileStore())
+    canvas.set_selection("layer", layer.layer_id)
+    canvas.set_active_colors("#FFCC3300", "#FFFFFFFF")
+    assert canvas.set_tool(ToolKind.FILL)
+    canvas._tool_press(
+        canvas.document_to_widget(QPointF(100, 180)), 1.0
+    )
+    assert layer.shape_style.outline_color == "#FFCC3300"
+    assert layer.shape_style.outline_thickness == 4
+    canvas._tool_press(
+        canvas.document_to_widget(QPointF(200, 180)), 1.0
+    )
+    assert layer.fill_color == "#FFCC3300"
+
+
+def test_square_vector_eraser_uses_square_hit_shape(qapp):
+    line = _stroke((50, 100, 1, 1), (150, 100, 1, 1))
+    canvas, _chapter, drawing = _canvas_with_drawing([line])
+    canvas.settings.vector_eraser_mode = "stroke"
+    canvas.settings.eraser_size_px["medium"] = 20
+    assert canvas.set_tool(ToolKind.RASTER_ERASER)
+
+    # This is inside the 10px square half-extent but outside the circle.
+    canvas.settings.eraser_square = False
+    canvas._tool_press(
+        canvas.document_to_widget(QPointF(160, 110)), 1.0
+    )
+    canvas._tool_release()
+    assert len(drawing.strokes) == 1
+
+    canvas.settings.eraser_square = True
+    canvas._tool_press(
+        canvas.document_to_widget(QPointF(160, 110)), 1.0
+    )
+    canvas._tool_release()
+    assert drawing.strokes == []
+
+
+def test_refill_updates_hidden_child_and_fill_selection_resolves_owner(qapp):
+    stroke = VectorStroke(
+        closed=True,
+        points=[
+            VectorStrokePoint(x=100, y=100, width=6),
+            VectorStrokePoint(x=300, y=100, width=6),
+            VectorStrokePoint(x=300, y=300, width=6),
+            VectorStrokePoint(x=100, y=300, width=6),
+        ],
+    )
+    canvas, chapter, drawing = _canvas_with_drawing([stroke])
+    fill = chapter.add_vector_fill(
+        drawing.object_id,
+        VectorFillObject(
+            geometry=BoundGeometry.rectangle(100, 100, 200, 200),
+            fill_color="#FF112233",
+            visible=False,
+        ),
+    )
+    canvas.set_selection("object", fill.object_id)
+    canvas.set_active_colors("#FF778899", "#FFFFFFFF")
+    assert canvas.tool == ToolKind.FILL
+    canvas._tool_press(
+        canvas.document_to_widget(QPointF(200, 200)), 1.0
+    )
+    canvas._tool_release()
+
+    children = chapter.vector_fill_children(drawing.object_id)
+    assert len(children) == 1
+    assert children[0].object_id == fill.object_id
+    assert children[0].fill_color == "#FF778899"
+    assert canvas.selected_id == drawing.object_id
+
+
+def test_object_select_ignores_fully_transparent_vector_content(qapp):
+    stroke = _stroke((100, 100, 10, 1), (300, 100, 10, 1))
+    stroke.color = "#00112233"
+    canvas, chapter, drawing = _canvas_with_drawing([stroke])
+    fill = chapter.add_vector_fill(
+        drawing.object_id,
+        VectorFillObject(
+            geometry=BoundGeometry.rectangle(100, 150, 200, 100),
+            fill_color="#00112233",
+        ),
+    )
+    canvas.settings.page_scope_select = True
+    canvas.set_tool(ToolKind.OBJECT_SELECT)
+
+    assert {
+        "kind": "object", "id": drawing.object_id,
+    } not in canvas.hit_test_entities(QPointF(200, 100))
+    assert {
+        "kind": "object", "id": fill.object_id,
+    } not in canvas.hit_test_entities(QPointF(200, 200))
+
+
+def test_disabling_fill_narrow_areas_removes_neck_not_whole_face(qapp):
+    canvas, _chapter, _drawing = _canvas_with_drawing()
+    canvas.settings.fill_narrow_areas = False
+    canvas.settings.fill_close_gaps = True
+    canvas.settings.fill_gap_threshold = 8
+    face = QPainterPath()
+    face.addRect(QRectF(0, 0, 40, 40))
+    face.addRect(QRectF(60, 0, 40, 40))
+    face.addRect(QRectF(40, 18, 20, 4))
+
+    processed = canvas._remove_narrow_vector_fill_areas(face)
+
+    assert processed.contains(QPointF(20, 20))
+    assert processed.contains(QPointF(80, 20))
+    assert not processed.contains(QPointF(50, 20))
+
+
+def test_drag_fill_resamples_between_pointer_events(qapp):
+    def rectangle(left):
+        return VectorStroke(
+            closed=True,
+            points=[
+                VectorStrokePoint(x=left, y=20, width=4),
+                VectorStrokePoint(x=left + 80, y=20, width=4),
+                VectorStrokePoint(x=left + 80, y=100, width=4),
+                VectorStrokePoint(x=left, y=100, width=4),
+            ],
+        )
+
+    canvas, chapter, drawing = _canvas_with_drawing([
+        rectangle(20), rectangle(120), rectangle(220),
+    ])
+    canvas.scale = 1.0
+    assert canvas.set_tool(ToolKind.FILL)
+    canvas._tool_press(
+        canvas.document_to_widget(QPointF(60, 60)), 1.0
+    )
+    canvas._tool_move(
+        canvas.document_to_widget(QPointF(260, 60)), 1.0
+    )
+    canvas._tool_release()
+
+    assert len(chapter.vector_fill_children(drawing.object_id)) == 3
+
+
+def test_vector_select_all_and_selection_translate_are_undoable(qapp):
+    stroke = _stroke((20, 30, 4, 1), (120, 80, 8, 1))
+    canvas, _chapter, drawing = _canvas_with_drawing([stroke])
+    assert canvas.set_tool(ToolKind.DRAW_SELECT_RECT)
+    assert canvas.select_all_drawing()
+    assert canvas.selected_vector_point_ids == {
+        point.point_id for point in stroke.points
+    }
+    quad = canvas._selection_transform_quad
+    center = QPointF(
+        sum(x for x, _ in quad) / 4,
+        sum(y for _, y in quad) / 4,
+    )
+    canvas._tool_press(canvas.document_to_widget(center), 1)
+    canvas._tool_move(
+        canvas.document_to_widget(center + QPointF(25, 10)), 1
+    )
+    canvas._tool_release()
+    assert drawing.strokes[0].points[0].position == pytest.approx((45, 40))
+    canvas.command_stack.undo()
+    restored = canvas.chapter.objects[drawing.object_id]
+    assert restored.strokes[0].points[0].position == pytest.approx((20, 30))
+
+
+def test_simplify_apply_targets_selected_point_incident_spans(qapp):
+    stroke = _stroke(
+        (20, 30, 4, 1), (120, 90, 4, 1), (220, 20, 4, 1),
+        (320, 100, 4, 1), (420, 30, 4, 1),
+    )
+    canvas, _chapter, drawing = _canvas_with_drawing([stroke])
+    canvas.settings.vector_simplify_amount = 100
+    original = stroke_cubics(stroke.points)
+    selected_id = stroke.points[2].point_id
+    canvas._set_vector_selection(
+        drawing, {stroke.stroke_id}, {selected_id}
+    )
+
+    assert canvas.apply_vector_simplify()
+
+    rebuilt = stroke_cubics(drawing.strokes[0].points)
+    assert original[0] in rebuilt
+    assert original[-1] in rebuilt
+    assert canvas.selected_vector_stroke_ids == {stroke.stroke_id}
+    assert len(canvas.selected_vector_point_ids) == 1
+
+
+def test_sweep_simplify_selects_anchor_points_and_returns_to_edit(qapp):
+    stroke = _stroke(
+        (100, 100, 4, 1), (200, 150, 4, 1), (300, 100, 4, 1),
+        (400, 150, 4, 1),
+    )
+    canvas, _chapter, drawing = _canvas_with_drawing([stroke])
+    canvas.scale = 1.0
+    assert canvas.set_tool(ToolKind.VECTOR_SIMPLIFY)
+    touched = stroke.points[1].point_id
+    untouched = stroke.points[3].point_id
+
+    canvas._tool_press(
+        canvas.document_to_widget(QPointF(200, 150)), 1.0
+    )
+    assert touched in canvas._vector_simplify_point_ids
+    assert untouched not in canvas._vector_simplify_point_ids
+    canvas._tool_release()
+
+    assert canvas.tool == ToolKind.VECTOR_EDIT
+    assert canvas.selected_vector_stroke_ids == {stroke.stroke_id}
+    assert canvas.selected_vector_point_ids
+    assert canvas._vector_simplify_point_ids == set()
+
+
+def test_lasso_remove_deselects_only_enclosed_vector_points(qapp):
+    stroke = _stroke(
+        (100, 100, 4, 1), (200, 100, 4, 1), (300, 100, 4, 1),
+    )
+    canvas, _chapter, drawing = _canvas_with_drawing([stroke])
+    all_points = {point.point_id for point in stroke.points}
+    canvas._set_vector_selection(drawing, {stroke.stroke_id}, all_points)
+    assert canvas.set_tool(ToolKind.DRAW_SELECT_LASSO)
+    canvas._drawing_selection_operation = "remove"
+    canvas._drawing_selection_gesture = [
+        QPointF(180, 80), QPointF(220, 80),
+        QPointF(220, 120), QPointF(180, 120),
+    ]
+
+    assert canvas._finish_drawing_selection()
+
+    assert canvas.selected_vector_point_ids == {
+        stroke.points[0].point_id, stroke.points[2].point_id,
+    }
+    assert canvas.selected_vector_stroke_ids == {stroke.stroke_id}
+
+
+def test_stroke_select_shift_toggles_ctrl_removes_and_lasso_selects_whole(
+    qapp, monkeypatch,
+):
+    first = _stroke((100, 100, 5, 1), (300, 100, 5, 1))
+    second = _stroke((100, 180, 5, 1), (300, 180, 5, 1))
+    canvas, _chapter, drawing = _canvas_with_drawing([first, second])
+    assert canvas.set_tool(ToolKind.DRAW_SELECT_STROKE)
+
+    monkeypatch.setattr(
+        QGuiApplication, "keyboardModifiers",
+        lambda: Qt.NoModifier,
+    )
+    canvas._begin_drawing_selection(QPointF(150, 100), QPointF(150, 100))
+    assert canvas.selected_vector_stroke_ids == {first.stroke_id}
+
+    monkeypatch.setattr(
+        QGuiApplication, "keyboardModifiers",
+        lambda: Qt.ShiftModifier,
+    )
+    canvas._begin_drawing_selection(QPointF(150, 180), QPointF(150, 180))
+    assert canvas.selected_vector_stroke_ids == {
+        first.stroke_id, second.stroke_id,
+    }
+    canvas._begin_drawing_selection(QPointF(150, 100), QPointF(150, 100))
+    assert canvas.selected_vector_stroke_ids == {second.stroke_id}
+
+    monkeypatch.setattr(
+        QGuiApplication, "keyboardModifiers",
+        lambda: Qt.ControlModifier,
+    )
+    canvas._begin_drawing_selection(QPointF(150, 180), QPointF(150, 180))
+    assert canvas.selected_vector_stroke_ids == set()
+
+    monkeypatch.setattr(
+        QGuiApplication, "keyboardModifiers",
+        lambda: Qt.NoModifier,
+    )
+    canvas._drawing_selection_operation = "replace"
+    canvas._drawing_selection_gesture = [
+        QPointF(80, 70), QPointF(320, 70),
+        QPointF(320, 210), QPointF(80, 210),
+    ]
+    assert canvas._finish_drawing_selection()
+    assert canvas.selected_vector_stroke_ids == {
+        first.stroke_id, second.stroke_id,
+    }
+    assert canvas.selected_vector_point_ids == {
+        point.point_id
+        for stroke in drawing.strokes
+        for point in stroke.points
+    }
+
+
+def test_drawing_selection_outside_tap_selects_but_drag_starts_gesture(qapp):
+    stroke = _stroke((100, 100, 5, 1), (300, 100, 5, 1))
+    canvas, chapter, drawing = _canvas_with_drawing([stroke])
+    page_id = chapter.root_page_ids[0]
+    assert canvas.set_tool(ToolKind.DRAW_SELECT_RECT)
+
+    outside = QPointF(0, 500)
+    outside_widget = canvas.document_to_widget(outside)
+    canvas._tool_press(outside_widget, 1)
+    assert canvas._pending_drawing_selection_press is not None
+    canvas._tool_release()
+    assert canvas.selected_id == page_id
+    assert canvas.tool == ToolKind.SHAPE_EDIT
+
+    canvas.set_selection("object", drawing.object_id)
+    assert canvas.set_tool(ToolKind.DRAW_SELECT_RECT)
+    canvas._tool_press(outside_widget, 1)
+    canvas._tool_move(
+        canvas.document_to_widget(QPointF(100, 550)), 1
+    )
+    assert canvas._pending_drawing_selection_press is None
+    assert canvas._drawing_selection_gesture
+    canvas._tool_release()
+    assert canvas.selected_id == drawing.object_id
+
+
+def test_rotated_vector_selection_quad_persists_and_undo_restores_it(qapp):
+    stroke = _stroke((100, 100, 4, 1), (260, 180, 4, 1))
+    canvas, _chapter, _drawing = _canvas_with_drawing([stroke])
+    canvas.scale = 1.0
+    assert canvas.set_tool(ToolKind.DRAW_SELECT_RECT)
+    assert canvas.select_all_drawing()
+    original = list(canvas._selection_transform_quad)
+    _handles, rotate, pivot = canvas._transform_control_points(
+        original, canvas._selection_pivot
+    )
+    start_angle = math.atan2(
+        rotate.y() - pivot.y(), rotate.x() - pivot.x()
+    )
+    radius = max(1.0, math.dist(
+        rotate.toTuple(), pivot.toTuple()
+    ))
+    target = QPointF(
+        pivot.x() + math.cos(start_angle + 0.7) * radius,
+        pivot.y() + math.sin(start_angle + 0.7) * radius,
+    )
+    canvas._begin_drawing_selection_transform(
+        canvas._drawing_selection_object(), rotate
+    )
+    canvas._update_drawing_selection_transform(
+        canvas._drawing_selection_object(), target
+    )
+    rotated = list(canvas._selection_transform_quad)
+    canvas._finish_drawing_selection_transform(
+        canvas._drawing_selection_object()
+    )
+    assert canvas._selection_transform_quad == pytest.approx(rotated)
+    assert rotated != pytest.approx(original)
+
+    canvas.command_stack.undo()
+    assert canvas._selection_transform_quad == pytest.approx(original)
+    canvas.command_stack.redo()
+    assert canvas._selection_transform_quad == pytest.approx(rotated)
+
+    center = QPointF(
+        sum(x for x, _ in rotated) / 4,
+        sum(y for _, y in rotated) / 4,
+    )
+    canvas._begin_drawing_selection_transform(
+        canvas._drawing_selection_object(), center
+    )
+    canvas._update_drawing_selection_transform(
+        canvas._drawing_selection_object(), center + QPointF(20, 15)
+    )
+    translated = list(canvas._selection_transform_quad)
+    canvas._finish_drawing_selection_transform(
+        canvas._drawing_selection_object()
+    )
+    assert translated == pytest.approx([
+        (x + 20, y + 15) for x, y in rotated
+    ])

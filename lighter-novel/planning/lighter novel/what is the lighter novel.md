@@ -37,7 +37,7 @@ how it works
 - objects
 	- parameterized objects such as boxes, lines, gradients, etc. those are a thing.
 	- dialogue boxes, closed shapes (like text boxes)
-		- like panels kind of under the hood, but only support having linear text, always have a text layer on top, with either gradient, solid, or repeating (or a combination of these) layers underneath as the background.
+		- like panels kind of under the hood, but only support having linear text, always have a text layer on top, with either gradient, solid, or repeating pattern (or a combination of these) layers underneath as the background.
 - "vector" layers - like csp
 	- different eraser types - intersect (which also creates points to make the appearance of a fill), whole line, or point-based.
 	- points can be edited directly but rarely ever are
@@ -146,7 +146,7 @@ raster object tweaks:
 - tool settings should still be selectable with the stylus.
 - it should be possible to make or move a raster or text layer such that it's the direct child of a page layer.
 
-more tweaks:
+## more tweaks:
 - snap to grid should apply to handles while translating them, if snap to grid is on
 - add a "delete point" gizmo to the selected point. it should be a circle with an X in it.
 - completing a shape or confirming a line when using the add shape tool should automatically select it and switch to shape edit tool.
@@ -156,23 +156,34 @@ more tweaks:
 - roundness on non-locked beziers doesn't look right. it should go between smooth and sharp, and clicking the gizmo should enable/disable roundness for that point.
 - ![[Pasted image 20260728173737.png]]
 
-new feature: compound bounds/shapes
-- since bounds are now shapes, i'll refer to them interchangably in this section.
-- compound bounds - a toggle for a bound that allows it to be able to be made of a composite of the bound shapes that are its children (also layers should be able to have children / new bound should work while a layer is already selected to create a child layer)
-	- can be any shape, including non-filled line/curve shapes.
-	- the full compound shape (parent of the compound-contributing children) still has visible toggle and fill, and other properties.
-	- each layer with bound child of a compound bound can either be additive, subtractive, or ignored by the overall shape (if ignore, its children should ignore their parent's parent compound bound too, that way nested compound bounds are possible)
-	- when in shape edit mode, clicking another shape should select it, exposing its own handles (handles of other shapes on the layer not visible by default - handles of only the selected shape should be visible).
-	- the full outline and fill are of the compound bound with addition and subtraction of the shapes. that means intersections shouldn't have outlines inside, only the outside the combined fill.
-	- for strict text objects, they still work as before, fitting to their parent. 
-		- note that text objects and raster objects can be children of the parent compound shape/bound, or any of their shape/bound children. however, include a toggle to switch between referencing the direct parent, or specifically the closest above compound bound layer parent in the heirarchy. default to just the direct parent, and hide this option if there is no compound bound parent.
-	- by default, a layer isn't a compound bound (unless enabled in bound edit options)
-	- if a compound bound/shape is selected and a new shape is made, it should be made as the child by default.
-	- if a compound-contributing shape child is selected, and a new shape is made, it should be a sibling by default.
-- include a new shape creation type - free shape
-	- this bound is a freely drawn bound, unlike the marquee tool.
-	- when released from the user-drawn lasso preview, creates a filled shape with calculated bezier and vector points that best estimate the shape the user drew. this includes sharp points and bezier points, and handles and lengths for them calculated as closely as possible, with a sensitivity slider visible on screen. also, include a toggle to switch between creating a filled shape or an open bezier (or auto, which closes it if the user ends the shape close to the start point of that free shape). remember which was chosen - that will be the default the next time the user makes a new free shape.
-	- points/handles do not snap to the grid during creation.
+
+## more tweaks
+- terminology note: a gizmo is a handle that only appears when a point is selected.
+- bezier roundness value still looks like shit. it has this "bubble look" when neighbors are also beziers. this should be a smoothing, ROUNDNESS value, not a "bubbliness value". fix this, even if it means under the hood roundness is calculated differently for beziers than for vectors (because it looks fine for vector points) see the attached image for help.
+- make the gizmos for bezier handles larger than the other gizmos, its getting confusing.
+- when i use add shape to create a filled shape, that filled shape's default fill should be white not black.
+- object select should be able to select shapes if the user clicks on or near one of their borders. this should select the layer.
+- when a shape is selected, it should switch to shape edit automatically.
+- for some reason, smoothness shows 2 gizmos that slide in and out, but only one does anything. the one that doesn't do anything should be hidden. what the fuck is it supposed to do?
+- smoothness/roundness gizmos should vanish entirely if the point selected is a locked bezier (as in, the mode where the handles move in sync as if on a continuous line)
+- raster layer's width/height box should always be visible and while the raster is active.
+	- in raster edit, a click drag outside the W/H should extend the box and draw, but a tap/click should be for selections.
+- in tablet mode, dragging horizontally is moving in the opposite horizontal direction
+- pinch zooming feels horrible. sometimes when i do it it jerks the canvas to a different position. zooming in or out always snaps and doesn't preserve how zoomed in i was before.
+- layer outliner isn't letting me drag a raster layer into being the child of a page. this is a bug.
+- the shapes dropdown works but it SHOULDN'T be a button. you know how the layers outliner has dropdowns for children? the shapes dropdown should look sorta like that - a plain text line with the dropdown icon that when clicked, expands. NOT like a button that glows when expanded.
+
+
+
+
+## even more tweaks:
+- releasing after erasing should re-calculate the width/height of the raster layer.
+- this recalc (and that of expanding the width/height) should have a safety margin around the "true" calculated bound, that way it's not pushing up against the strokes you're drawing.
+- changing the order of objects in the outliner shouldn't force collapse the layers like it currently does.
+- settings for hotkeys should include a check that lets you "hold". if this is enabled for that hotkey, holding it switches to that tool temporarily and goes back to the tool you were on when released. simply pressing the button and releasing without holding should switch to that tool still.
+	- additionally, hotkey mapping should allow modifier keys on their own, or combined with another key.
+	- currently, trying to add a hotkey adds an extra. Instead, it should replace the existing one.
+## UI tweaks
 - the text object popup is too big. move align stuff to a popup that appears if you press a button called "align" in the text settings popup instead.
 	- additionally, if strict to parent is selected, the transform options for the text should be hidden (since they don't do anything in that case)
 	- if in transform mode, double clicking inside the text bounds should re-activate text edit mode
@@ -180,17 +191,230 @@ new feature: compound bounds/shapes
 	- put layout setting and the align popup menu button in the same row
 	- aligning should still be possible in free transform mode, just that instead the aligning should be relative to the bounds of the text object's transform rect itself.
 		- instead of showing a row for name, the name of a text object should just be the first 16 characters.
+## New feature: Asset saving
+- "assets" are like prefabs in unity. they are presets made of a layer, its parameters, and its children and their parameters and so on, in a separate "library".
+- like prefabs, assets under the hood are just projects of their own, but only containing the relevant layers/objects that compose the prefab (instead of a full comic chapter or pages)
+- assets exist in this library with a thumbnail (a preview of what the asset looks like) and a name. they can be renamed, and double clicking them opens them up as if they were a project, letting the user modify the preset asset and save it (which also updates its thumbnail)
+- to aid in this, add project tabs (sort of like what you'd see in photoshop or clip studio paint). these "projects" can be actual projects, or assets. these project tabs should show the name of the project that's open, an x button to close it, an asterisk after the name if it hasn't been saved recently. clicking a tab should well, open that project. however, projects that already have open tabs shouldn't be fully opening - they should already be cached / in memory, etc such that they don't slow down the current project but also switching between them is fast, like in any image manipulation program.
+- additionally, add a top bar above the canvas, that, for now, only contains "asset view" (but will contain other menus, in the same fashion as the ribbon menu system from Microsoft office).
+	- this assets ribbon shows assets as thumbnails with a name below, in a row, that is scrolled horizontally.
+	- right clicking a layer/object in the outliner should bring up a new right click menu. one of the options should be rename, to rename the layer/object)
+	- another option should be "copy as asset". this brings up a popup asking you to name the asset. clicking OK then creates a folder for that asset which contains, essentially a project of its own, but with only that object and its children as they were when copied. this should also refresh the assets ribbon viewer and show its square thumbnail, which should have been rendered as a finished image, whose view is cropped to a fitted box around the bounds of the selected object
 
 
-## Gradient tool, colors:
-- add a gradient tool that exposes handles on the canvas the user can use so set key positions of gradient controls such as 
-	- radius, center, midpoint of a circular/ellipsoid gradient
-	- position of the start, end and midpoint for the curve of the transition between colors of a linear gradient
-- the popup tool settings for gradients should let the user create presets for and points for the gradient ramp of these gradients, along with saving, naming, etc.
-	- essentially, these are the gradients from clip studio paint.
-- add a a "color panel" that lets the user create a color palette with a color picker to modify colors or add colors. palettes can be saved, renamed, deleted, and selected
 
-- layer modifiers?
+
+## new feature: compound shapes
+- compound shapes - a toggle for a shape that allows it to be able to be made of a composite of the shapes that are its children
+	- can be any shape, including non-filled line/curve shapes.
+	- the full compound shape (parent of the compound-contributing children) still has visible toggle and fill, and other properties.
+	- each layer with shape child of a compound shape can either be additive, subtractive, or ignored by the overall shape (if ignore, its children should ignore their parent's parent compound shape too, that way nested compound shapes are possible)
+	- when in shape edit mode, clicking another shape should select it, exposing its own handles (handles of other shapes on the layer not visible by default - handles of only the selected shape should be visible).
+	- the full outline and fill are of the compound shape with addition and subtraction of the shapes. that means intersections shouldn't have outlines inside, only the outside the combined fill.
+	- for strict text objects, they still work as before, fitting to their parent. 
+		- note that text objects and raster objects can be children of the parent compound shape, or any of their shape/shape children. however, include a toggle to switch between referencing the direct parent, or specifically the closest above compound shape layer parent in the heirarchy. default to just the direct parent, and hide this option if there is no compound shape parent.
+	- by default, a layer isn't a compound shape (unless enabled in shape edit options)
+	- if a compound shape is selected and a new shape is made, it should be made as the child by default.
+	- if a compound-contributing shape child is selected, and a new shape is made, it should be a sibling by default.
+- in the a compound shape settings, there should be a "flatten" button. This button takes all that information from the child compound shape contributors and "flattens" them all such that their children become direct children of the compound shape, and the full compound shape gets "compiled" into one shape, made of beziers and vector points and whatnot. This single flattened shape is no longer compound, but looks exactly the same. the shape would have to be calculated from the compound, with new points made where intersections were and whatnot.
+	- if a child text object was previously strict positioned to one of the compound children, it's instead converted to free position, so its position is preserved.
+
+## More shape tweaks:
+1. stroke thickness and outline thickness should have sliders. their px values should be integers.
+2. when selecting an end point of an open shape, the other two gizmos besides handles and delete freeze up or error out when selected.
+3. the toggle gizmo should be labeled with text that shows what the handle type is currently for the selected handle.
+4. ![[Pasted image 20260729180630.png]]
+5. the round cap type is currently broken, displaying like the attached image.
+6. hovering over a gizmo should tell you what it does
+7. make all gizmos and handles for shapes 150 percent larger than they currently are
+8. selecting a bunch of gizmo options, especially for ends, is buggy, leading to issues where i can't modify handles or shapes once it occurs. below is an example of an error i'm getting:
+```
+ValueError: Error calling Python override of QOpenGLWidget::mousePressEvent(): Malformed incoming Bézier handle at contour 0, point 0 (b489dc4062a24c1c81c4c2e477b206f7)
+Error calling Python override of QOpenGLWidget::event(): Traceback (most recent call last):
+  File "C:\Users\hopper\Documents\webtoon-maker\comic_editor\ui\canvas.py", line 2819, in event
+    return super().event(event)
+           ~~~~~~~~~~~~~^^^^^^^
+  File "C:\Users\hopper\Documents\webtoon-maker\comic_editor\ui\canvas.py", line 2691, in mouseDoubleClickEvent
+    super().mouseDoubleClickEvent(event)
+    ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^
+  File "C:\Users\hopper\Documents\webtoon-maker\comic_editor\ui\canvas.py", line 2638, in mousePressEvent
+    self._tool_press(event.position(), 1.0)
+    ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\hopper\Documents\webtoon-maker\comic_editor\ui\canvas.py", line 3229, in _tool_press
+    and self._begin_shape_edit(point, allow_interior=False)
+        ~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\hopper\Documents\webtoon-maker\comic_editor\ui\canvas.py", line 3844, in _begin_shape_edit
+    self._model_before = self.chapter.to_dict()
+                         ~~~~~~~~~~~~~~~~~~~~^^
+  File "C:\Users\hopper\Documents\webtoon-maker\comic_editor\core\models.py", line 1229, in to_dict
+    "layers": [layer.to_dict() for layer in self.layers.values()],
+               ~~~~~~~~~~~~~^^
+  File "C:\Users\hopper\Documents\webtoon-maker\comic_editor\core\models.py", line 607, in to_dict
+    "bound": self.bound.to_dict() if self.bound is not None else None,
+             ~~~~~~~~~~~~~~~~~~^^
+  File "C:\Users\hopper\Documents\webtoon-maker\comic_editor\core\models.py", line 539, in to_dict
+    self.validate()
+    ~~~~~~~~~~~~~^^
+  File "C:\Users\hopper\Documents\webtoon-maker\comic_editor\core\models.py", line 468, in validate
+    raise ValueError(
+        f"Malformed incoming Bézier handle at {location}"
+    )
+ValueError: Error calling Python override of QOpenGLWidget::mouseDoubleClickEvent(): Error calling Python override of QOpenGLWidget::mousePressEvent(): Malformed incoming Bézier handle at contour 0, point 0 (b489dc4062a24c1c81c4c2e477b206f7)
+```
+
+
+## Vector object tweaks
+1. when i draw a vector shape, i can't see the strokes on screen. I think this is a visual bug, because shape edit still lets me select the strokes and points.
+2. the boundaries between tool and scroll bar, and between ribbon and canvas should be draggable to customize width/height of these UI elements.
+3. instead of being in the ribbon, color settings should be another tab of the color window in the bottom left.
+	1. speaking of which, the colors section in the left doesn't currently show the color picker we made - it's just blank
+	2. the boundary between this and the tool bar should also be draggable to scale up/down the windows in this column.
+
+
+more tweaks (not done)
+- stylus should be able to click popup menu options.
+- like in raster pencil, if you tap the stylus outside the width/height of the vector object (without dragging), it should instead select whatever object you clicked
+- raster/vector object layers should have a toggle in their floating settings menu that allows them to ignore the shape mask (lets them do stuff like pop out of the canvas, is useful for organization). 
+	- layers should also have this toggle.
+	- by default though, this toggle is disabled
+	- children of an object with this toggle are also affected.
+	- they still respect
+- in text edit, if mode is free transform, show 8 handles to change the text bounds manually.
+	- if a text object is a child of the main shape in a compound shape, and strict is on, there should be an option to strict fit to the main shape, or to strict fit to the full compound shape. the default should be to the main shape (currently its only doing it to the full compound shape)
+- in text edit, trying to transform both with line handles and point handles sometimes only lets me do one or the other.
+## New feature - Vector Layers
+- add vector layers from clip studio paint.
+- https://help.clip-studio.com/en-us/manual_en/180_layers/Vector_layers.htm
+- however, we only want certain core features for now.
+- these are the features we want
+	- vector layers - here, we'll call them "vector drawings" instead, since they are objects, not layers.
+	- rename raster pencil and raster eraser to just pencil and eraser. they act as vector pencil and vector eraser if the current layer is a vector layer.
+	- vector pencil
+		- like a normal pencil, but after releasing, creates the vector points (like in CSP)
+	- vector eraser
+		- has the erase modes - stroke, point, and intersection
+	- vector edit
+		- appears if you click "shape edit" tool while a vector drawing is selected, but is its own tool under the hood
+		- lets you select strokes in a vector drawing
+		- choosing this shows circle handles for each point in the selected stroke. dragging these lets you move them. vector tools ribbon menu shows options to adjust parameters.
+	- vector tools dropdown -  only shows when a vector object is active. contains the following. if i mention "tool settings" for a vector tool, those should appear in the vector tools ribbon page, in their own column labeled with what the name of what they do.
+		- redraw vector thickness/opacity (not the adjust opacity feature from the webpage. this is its own thing)
+			- lets you draw over strokes in the current vector drawing to use your pen pressure to set parameters for the closest points as you draw (doesn't change the position of anything though)
+			- tool settings should give you options to increase, decrease by flat amounts, or set them all to uniform
+			- toggle between either thickness mode or opacity mode, options stay the same but affect the select mode type.
+			- toggle between point select and manual redraw mode
+			- if using the vector edit tool, this redraw column of the ribbon should still be visible, and instead apply the adjustments from these tool settings to all selected strokes, or if none are selected, all strokes.
+		- connect vector line tool
+			- works like in clip studio paint
+			- no tool settings that i can think of for now
+		- simplify vector line tool
+			- tool settings should let you adjust how much simplification occurs
+			- again, tool settings should persist in shape mode and apply to either the selected stroke or all strokes.
+			- drawing over happens like in clip studio paint (when this tool is selected)
+			- 
+		- don't add any other features from the webpage.
+	- new fill tool
+		- fills using the currently active primary color.
+		- contextual. acts as a vector fill in a vector object, a shape fill that sets a shape background color or a shape outline color (if the user clicks the shape's border or near the shape's border using it)
+		- fill tool in vector mode is pretty complex. refer to the following for what it should support. https://help.clip-studio.com/en-us/manual_en/420_fill/Fill_Tool.htm?rhhlterm=fill%20tool&rhsearch=fill%20tool
+		- don't implement fill tools i havent explicitly mentioned below, even if they are in the CSP documentation. 
+			- new object type - vector fill object
+			- if a vector drawing is selected, and the user attempts to fill a space but there is no current vector fill shape underneath, create one as a child of the vector drawing, keeping the vector drawing selected
+			- treat vector fills as always "up to vector path"
+			- a vector fill object is essentially a vector filled shape, but as an object, that has no stroke but has a fill color. it's points / beziers are based on the vector drawing strokes around where the fill was attempted, with the "close gaps" and other options included.
+			- if the user attempts to fill a space and there is a vector fill object there already, instead of making a new one, change the color of it (as fill should) and also recalculate its fill shape again based on the current vector drawing strokes around it, with the current fill settings too.
+			- drag to fill multiple should work as usual
+			- clicking a vector drawing stroke with the fill tool should not change its color, in case you were wondering.
+			- include clip studio paint's "enclose and fill" tool (only for the currently active vector drawing object as usual)
+		- for now, fill should only refer to the currently active shape or object, for simplicity.
+		  
+	- color palette
+		- add a row window above the canvas, that acts like the ribbon from microsoft word (however, it's a long, horizontally scrolling one, if we end up adding enough features to require it). there will be "tabs" that let the user switch between different ribbons, such as one for color, and later one for other options, but just keep in mind for later that more will be added. when a tab is selected, the ribbon will change to showing its corresponding options.
+			- add a "color pallete" column to the color ribbon menu that lets the user create a color palette with a color picker to modify colors or add colors. palettes can be added (+ button), removed (- button), and selected. don't have a rename button. instead, show a text field that displays the name, and clicking it lets the user enter the new name or change the current one. palettes save automatically when modified.
+			- the palette should show each color as a square swatch in a grid.
+				- clicking a swatch brings up a popup color picker that lets the user change this color.
+				- see the attached image for what this color picker wheel should look like. additionally, include an alpha channel slider (vertical, showing to the right of the square but still inside the outer hue wheel) this alpha slider should look like a linear gradient rect where the top is the current color at 100 percent visibility and the bottom is at 0 percent opacity, with a grey and white checkered background behind said gradient. there should be a dark grey line 6px in width that marks the selected opacity, and lets the user drag it up and down this gradient slider to set the alpha of the color.
+				- create this swatch in such a way that we can reference and use it later.
+				- ![[Pasted image 20260729205056.png]]
+			- there should be a dropdown to let the user switch between their saved palettes.
+			- for now, this section should only take up bout 1/5th of the visible width of the ribbon menu (an estimate, not an actual dynamic scaling)
+	- color picker in the main window
+		- in its own row section under the tool picker, add the color picker wheel we described earlier. this color lets the user pick the currently active primary and secondary colors.
+		- by default, these are black and white
+			- as such, the new default initial colors for shape creation fills and outlines will be primary as the outline and secondary as the fill, instead of black and white.
+	- ribbon menu ribbons
+		- instead of a floating tool settings menu, make a "tool settings" ribbon tab that changes the ribbon menu to show contextual tool settings based on what's the current tool (currently just the pencil/eraser/fill)
+		- there should be a "vector tools" ribbon that shows vector tools if a vector drawing is selected. this vector tools ribbon tab is only visible when a vector drawing is selected, and doing so switches the ribbon to this tab automatically.
+
+
+## Brush size panel
+
+
+## Custom brushes
+- airbrush
+- paint brush
+- g pen vs pencil?
+- blend brush / blur?
+
+
+## new shape creation type - free shape
+- this shape is a freely drawn shape, unlike the marquee tool.
+	- when released from the user-drawn lasso preview, creates a filled shape with calculated bezier and vector points that best estimate the shape the user drew. this includes sharp points and bezier points, and handles and lengths for them calculated as closely as possible, with a sensitivity slider visible on screen. also, include a toggle to switch between creating a filled shape or an open bezier (or auto, which closes it if the user ends the shape close to the start point of that free shape). remember which was chosen - that will be the default the next time the user makes a new free shape.
+	- points/handles should not snap to the grid during free drawing or free drawing shape estimation.
+	- enable/disable pen pressure for stroke thickness
+
+
+
+
+
+
+
+## Layer Modifiers
+- have their own shape
+- apply to either a layer and its kids, or the whole canvas (how are we attaching these)
+- effects:
+	- fragment shader
+	- warp, twist, blur, noise maps, musgrave, stucci, voronoi, wood
+	- maps that affect how much the effect is applied to the pixels below
+	- brick texture?
+	- can have gradient for how much they apply (radial or otherwise) or solid fill
+	- film grain
+
+
+impact effects
+- shapes can do this
+
+
+
+
+## Down the Roadmap - 3D Questions
+Priorities
+- fast, intuitive, performant
+- easy to import, ideally with live sync from blender.
+- integrates with asset library
+- supports poses
+- has opacity function
+- supports warping / lenses, manga perspective
+- intuitive popup tools for common edits
+	- ex: hand one where each finger is a slider vertical for open close, but you can expose each slider for each sub-digit if you choose, can also splay
+	- lets you draw across the sliders to set FAST.
+- IK/ragdoll like transform mode (like cascadeur)
+- floor snapping
+- 3d scene importing
+- simple toon shader with shadow map support?, flat shader, outline support. (convert blender shaders to glsl?)
+	- color shadow map support for different scene colors, like evening night etc, instead of using colored lights for such things?
+	- do some more shader research
+- outline research
+	- semi transparent outlines, color outlines, outlines around invidividual objects, outlines that automatically get smaller the further away from the object they are, inverted hulls.
+	- 3d gizmo for distance ranges?
+	- custom 3d gizmos that map to shape keys on an object! like moho smart bones!
+- motionbuilder-style human and hand definitions
+
+
+
+
+## Symmetry Rulers?
+
 
 most important parts first
 - vector layers, raster layers, pencil and eraser

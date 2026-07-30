@@ -7,7 +7,10 @@ from dataclasses import dataclass, field
 from PySide6.QtCore import QAbstractItemModel, QMimeData, QModelIndex, Qt, Signal
 from PySide6.QtGui import QColor
 
-from comic_editor.core.models import ChapterDocument, LayerNode
+from comic_editor.core.models import (
+    ChapterDocument, LayerNode, TextObject, VectorDrawingObject,
+    VectorFillObject,
+)
 
 
 @dataclass
@@ -59,6 +62,18 @@ class HierarchyModel(QAbstractItemModel):
                     object_item = TreeItem("object", child.entity_id, item)
                     self._items[("object", child.entity_id)] = object_item
                     item.children.append(object_item)
+                    obj = self.chapter.objects[child.entity_id]
+                    if isinstance(obj, VectorDrawingObject):
+                        for fill in self.chapter.vector_fill_children(
+                            obj.object_id
+                        ):
+                            fill_item = TreeItem(
+                                "object", fill.object_id, object_item
+                            )
+                            self._items[
+                                ("object", fill.object_id)
+                            ] = fill_item
+                            object_item.children.append(fill_item)
             return item
 
         for page_id in self.chapter.root_page_ids:
@@ -107,13 +122,24 @@ class HierarchyModel(QAbstractItemModel):
         if not index.isValid() or self.chapter is None:
             return None
         item = self.item_for_index(index)
+        if (
+            item.kind == "layer"
+            and item.entity_id not in self.chapter.layers
+        ) or (
+            item.kind == "object"
+            and item.entity_id not in self.chapter.objects
+        ):
+            return None
         entity = (
             self.chapter.layers[item.entity_id]
             if item.kind == "layer" else self.chapter.objects[item.entity_id]
         )
         if role in (Qt.DisplayRole, Qt.EditRole):
             if index.column() == 0:
-                return entity.name
+                return (
+                    entity.display_name
+                    if isinstance(entity, TextObject) else entity.name
+                )
             if index.column() == 1:
                 if item.kind == "layer":
                     if entity.layer_kind == "fill":
@@ -126,6 +152,10 @@ class HierarchyModel(QAbstractItemModel):
                         "custom": "Shape",
                     }[entity.bound.primitive]
                     return "Page" if entity.is_page else f"{primitive} Layer"
+                if isinstance(entity, VectorDrawingObject):
+                    return "Vector Drawing"
+                if isinstance(entity, VectorFillObject):
+                    return "Vector Fill"
                 return entity.object_type.title()
             if index.column() == 2:
                 return f"{round(entity.opacity * 100)}%"
@@ -134,7 +164,14 @@ class HierarchyModel(QAbstractItemModel):
         if role == Qt.ToolTipRole:
             if item.kind == "layer":
                 return "Drag to reorder or nest. Page layers remain at the root."
-            return "Drag objects between non-page layers."
+            if isinstance(entity, VectorFillObject):
+                return "Drag to reorder this fill within its Vector Drawing."
+            if isinstance(entity, VectorDrawingObject):
+                return (
+                    "Editable vector strokes. Its Vector Fill objects are "
+                    "ordered beneath it."
+                )
+            return "Drag objects between page or container layers."
         if role == Qt.BackgroundRole:
             return QColor("#303238") if item.kind == "layer" else QColor("#050505")
         if role == Qt.ForegroundRole:
@@ -145,15 +182,30 @@ class HierarchyModel(QAbstractItemModel):
         if not index.isValid() or self.chapter is None:
             return False
         item = self.item_for_index(index)
+        if (
+            item.kind == "layer"
+            and item.entity_id not in self.chapter.layers
+        ) or (
+            item.kind == "object"
+            and item.entity_id not in self.chapter.objects
+        ):
+            return False
         entity = (
             self.chapter.layers[item.entity_id]
             if item.kind == "layer" else self.chapter.objects[item.entity_id]
         )
         before = self.chapter.to_dict()
         if role == Qt.CheckStateRole and index.column() == 0:
-            entity.visible = value == Qt.Checked
+            try:
+                check_state = Qt.CheckState(value)
+            except (TypeError, ValueError):
+                return False
+            entity.visible = check_state == Qt.Checked
             label = "Toggle visibility"
-        elif role == Qt.EditRole and index.column() == 0 and str(value).strip():
+        elif (
+            role == Qt.EditRole and index.column() == 0
+            and not isinstance(entity, TextObject) and str(value).strip()
+        ):
             entity.name = str(value).strip()
             label = "Rename entity"
         else:
@@ -167,17 +219,32 @@ class HierarchyModel(QAbstractItemModel):
         if not index.isValid():
             return Qt.ItemIsDropEnabled
         item = self.item_for_index(index)
+        if self.chapter is None or (
+            item.kind == "layer"
+            and item.entity_id not in self.chapter.layers
+        ) or (
+            item.kind == "object"
+            and item.entity_id not in self.chapter.objects
+        ):
+            return Qt.NoItemFlags
         flags = (
             Qt.ItemIsEnabled | Qt.ItemIsSelectable | Qt.ItemIsDragEnabled
             | Qt.ItemIsUserCheckable
         )
-        if index.column() == 0:
+        entity = (
+            self.chapter.objects.get(item.entity_id)
+            if item.kind == "object" else None
+        )
+        if index.column() == 0 and not isinstance(entity, TextObject):
             flags |= Qt.ItemIsEditable
         if (
             item.kind == "layer"
+            and self.chapter.layers.get(item.entity_id) is not None
             and self.chapter.layers[item.entity_id].layer_kind
-            not in {"fill", "open_shape"}
+            != "fill"
         ):
+            flags |= Qt.ItemIsDropEnabled
+        if isinstance(entity, VectorDrawingObject):
             flags |= Qt.ItemIsDropEnabled
         return flags
 
@@ -203,18 +270,29 @@ class HierarchyModel(QAbstractItemModel):
         payload = json.loads(bytes(data.data(self.MIME)).decode("utf-8"))
         item = self.item_for_index(parent)
         if item.kind == "object":
+            parent_object = self.chapter.objects.get(item.entity_id)
+            moving_object = self.chapter.objects.get(payload["id"])
+            return (
+                payload["kind"] == "object"
+                and isinstance(parent_object, VectorDrawingObject)
+                and isinstance(moving_object, VectorFillObject)
+                and moving_object.owner_drawing_id == parent_object.object_id
+            )
+        moving_object = (
+            self.chapter.objects.get(payload["id"])
+            if payload["kind"] == "object" else None
+        )
+        if isinstance(moving_object, VectorFillObject):
             return False
         if (
             item.kind == "layer"
             and self.chapter.layers[item.entity_id].layer_kind
-            in {"fill", "open_shape"}
+            == "fill"
         ):
             return False
         if payload["kind"] == "layer" and self.chapter.layers[payload["id"]].is_page:
             return item is self.root
         if item is self.root:
-            return False
-        if payload["kind"] == "object" and self.chapter.layers[item.entity_id].is_page:
             return False
         return True
 

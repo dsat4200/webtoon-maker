@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import pytest
-from PySide6.QtCore import QPointF, QRectF
+from PySide6.QtCore import QPointF, QRectF, Qt
 from PySide6.QtGui import QColor, QImage, QKeySequence
 
 from comic_editor.core.models import (
@@ -44,7 +44,7 @@ def test_fill_layer_is_a_boundless_leaf_and_round_trips():
     assert migrated.fill_color == "#ff0080"
     with pytest.raises(ValueError, match="cannot contain"):
         loaded.add_layer(fill.layer_id)
-    with pytest.raises(ValueError, match="directly"):
+    with pytest.raises(ValueError, match="container"):
         loaded.add_object(fill.layer_id, RasterObject())
 
 
@@ -104,8 +104,30 @@ def test_raster_box_creation_and_frame_outside_selection(qapp):
         ),
     )
     canvas._tool_press(canvas.document_to_widget(QPointF(450, 150)), 1)
+    assert canvas.selected_object_id == raster.object_id
+    canvas._tool_release()
     assert canvas.selected_object_id == text.object_id
     assert canvas.tool == ToolKind.TEXT_EDIT
+
+
+def test_raster_outside_drag_draws_and_expands_frame(qapp):
+    canvas, chapter, page, layer = _document_canvas()
+    raster = chapter.add_object(
+        layer.layer_id,
+        RasterObject(x=100, y=100, interaction_rect=(0, 0, 80, 80)),
+    )
+    canvas.set_selection("object", raster.object_id)
+    canvas.set_tool(ToolKind.RASTER_PENCIL)
+    start = canvas.document_to_widget(QPointF(220, 140))
+    end = canvas.document_to_widget(QPointF(260, 140))
+    canvas._tool_press(start, 1)
+    assert not canvas._drawing
+    canvas._tool_move(end, 1)
+    assert canvas._drawing
+    canvas._tool_release()
+    frame = QRectF(*raster.interaction_rect)
+    assert frame.right() >= 160
+    assert canvas.tiles.content_bounds(raster.object_id) is not None
 
 
 def test_raster_bound_edit_cannot_shrink_inside_alpha(qapp):
@@ -166,19 +188,17 @@ def test_text_edit_shortcut_suppression_targets_letters_and_shift(qapp):
     window = MainWindow()
     try:
         window._set_text_shortcut_suppression(True)
-        states = {
-            sequence.toString(QKeySequence.PortableText): shortcut.isEnabled()
-            for shortcut, sequence in window._shortcut_sequences
-        }
-        assert states["P"] is False
-        assert states["Ctrl+S"] is False
-        assert states["Ctrl+Shift+Z"] is False
-        assert states["Ctrl+0"] is True
-        assert states["Alt+Return"] is True
+        pencil = window._hotkey_bindings["raster_pencil"]
+        save = window._hotkey_bindings["save"]
+        reset = window._hotkey_bindings["reset_view"]
+        assert window._hotkey_is_suppressed("raster_pencil", pencil)
+        assert window._hotkey_is_suppressed("save", save)
+        assert not window._hotkey_is_suppressed("reset_view", reset)
+        before = window.canvas.tool
+        assert not window._hotkey_press(int(Qt.Key_P))
+        assert window.canvas.tool == before
+        window._hotkey_release(int(Qt.Key_P))
         window._set_text_shortcut_suppression(False)
-        assert all(
-            shortcut.isEnabled()
-            for shortcut, _ in window._shortcut_sequences
-        )
+        assert not window._hotkey_is_suppressed("raster_pencil", pencil)
     finally:
         window.deleteLater()

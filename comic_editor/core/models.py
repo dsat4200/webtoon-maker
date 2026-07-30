@@ -7,7 +7,7 @@ from dataclasses import dataclass, field
 from typing import Any, Iterable, Iterator, Literal
 
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 9
 CHAPTER_WIDTH = 1080
 DEFAULT_CHAPTER_HEIGHT = 3240
 GROWTH_MARGIN = 1080
@@ -20,6 +20,30 @@ def new_id() -> str:
 def _point(value: Iterable[float]) -> tuple[float, float]:
     x, y = value
     return float(x), float(y)
+
+
+def canonical_argb(value: object, fallback: str = "#FF000000") -> str:
+    """Return a color in Qt's canonical ``#AARRGGBB`` representation."""
+    text = str(value or "").strip()
+    if text.startswith("#"):
+        digits = text[1:]
+        if len(digits) == 3:
+            digits = "FF" + "".join(character * 2 for character in digits)
+        elif len(digits) == 4:
+            digits = "".join(character * 2 for character in digits)
+        elif len(digits) == 6:
+            digits = "FF" + digits
+        if len(digits) == 8:
+            try:
+                int(digits, 16)
+            except ValueError:
+                pass
+            else:
+                return f"#{digits.upper()}"
+    normalized_fallback = str(fallback).strip()
+    if normalized_fallback != text:
+        return canonical_argb(normalized_fallback, "#FF000000")
+    return "#FF000000"
 
 
 @dataclass
@@ -77,7 +101,12 @@ class PathNode:
     outgoing: tuple[float, float] | None = None
     handles_locked: bool = True
     roundness: float = 0.0
+    roundness_enabled: bool | None = None
     width_multiplier: float = 1.0
+
+    def __post_init__(self) -> None:
+        if self.roundness_enabled is None:
+            self.roundness_enabled = self.roundness > 0
 
     @property
     def position(self) -> tuple[float, float]:
@@ -97,7 +126,14 @@ class PathNode:
         else:
             self.incoming = _point(self.incoming) if self.incoming else None
             self.outgoing = _point(self.outgoing) if self.outgoing else None
-        self.roundness = max(0.0, float(self.roundness))
+        self.roundness = float(self.roundness)
+        if not math.isfinite(self.roundness) or self.roundness < 0:
+            self.roundness = 0.0
+        self.roundness_enabled = (
+            self.roundness > 0
+            if self.roundness_enabled is None
+            else bool(self.roundness_enabled)
+        )
         self.width_multiplier = round(max(
             0.1, min(10.0, float(self.width_multiplier))
         ) * 10) / 10
@@ -111,12 +147,14 @@ class PathNode:
             "outgoing": list(self.outgoing) if self.outgoing else None,
             "handles_locked": self.handles_locked,
             "roundness": self.roundness,
+            "roundness_enabled": self.roundness_enabled,
             "width_multiplier": self.width_multiplier,
         }
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "PathNode":
         position = data.get("position", [0, 0])
+        roundness = float(data.get("roundness", 0.0))
         result = cls(
             node_id=str(data.get("id") or new_id()),
             x=float(position[0]), y=float(position[1]),
@@ -130,8 +168,45 @@ class PathNode:
                 else None
             ),
             handles_locked=bool(data.get("handles_locked", True)),
-            roundness=float(data.get("roundness", 0.0)),
+            roundness=roundness,
+            roundness_enabled=bool(
+                data.get("roundness_enabled", roundness > 0)
+            ),
             width_multiplier=float(data.get("width_multiplier", 1.0)),
+        )
+        result.validate()
+        return result
+
+
+@dataclass
+class PathContour:
+    """An additional editable subpath in a custom bound."""
+
+    nodes: list[PathNode] = field(default_factory=list)
+    closed: bool = True
+
+    def validate(self) -> None:
+        minimum = 3 if self.closed else 2
+        if len(self.nodes) < minimum:
+            raise ValueError(
+                f"{'Closed contours' if self.closed else 'Open contours'} "
+                f"require at least {minimum} points"
+            )
+
+    def to_dict(self) -> dict[str, Any]:
+        self.validate()
+        return {
+            "closed": self.closed,
+            "nodes": [node.to_dict() for node in self.nodes],
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "PathContour":
+        result = cls(
+            nodes=[
+                PathNode.from_dict(item) for item in data.get("nodes", [])
+            ],
+            closed=bool(data.get("closed", True)),
         )
         result.validate()
         return result
@@ -147,9 +222,11 @@ class ShapeStyle:
     end_cap: Literal["point", "square", "round"] = "round"
 
     def validate(self) -> None:
-        self.base_thickness = max(0.1, min(1000.0, float(self.base_thickness)))
+        self.base_thickness = max(
+            1, min(1000, math.floor(float(self.base_thickness) + 0.5))
+        )
         self.outline_thickness = max(
-            0.0, min(500.0, float(self.outline_thickness))
+            0, min(500, math.floor(float(self.outline_thickness) + 0.5))
         )
         if self.start_cap not in {"point", "square", "round"}:
             self.start_cap = "round"
@@ -189,6 +266,7 @@ class BoundGeometry:
     nodes: list[PathNode]
     closed: bool
     primitive: Literal["rectangle", "ellipse", "custom"]
+    additional_contours: list[PathContour]
 
     def __init__(
         self, kind: str = "rect",
@@ -197,6 +275,7 @@ class BoundGeometry:
         nodes: list[PathNode] | None = None,
         closed: bool | None = None,
         primitive: str | None = None,
+        additional_contours: list[PathContour] | None = None,
     ):
         supplied = list(points or [])
         if nodes is not None:
@@ -226,6 +305,7 @@ class BoundGeometry:
         self.primitive = str(primitive or {
             "rect": "rectangle", "circle": "ellipse",
         }.get(kind, "custom"))
+        self.additional_contours = list(additional_contours or [])
         self.validate()
 
     @staticmethod
@@ -327,6 +407,81 @@ class BoundGeometry:
             self.nodes = [PathNode(x=x, y=y) for x, y in values]
             self.primitive = "custom"
 
+    def iter_contours(self) -> Iterator[PathContour]:
+        yield PathContour(self.nodes, self.closed)
+        yield from self.additional_contours
+
+    def contour_for_node(self, node_id: str) -> PathContour | None:
+        return next((
+            contour for contour in self.iter_contours()
+            if any(node.node_id == node_id for node in contour.nodes)
+        ), None)
+
+    def handle_requirements(
+        self, node: PathNode,
+    ) -> tuple[bool, bool]:
+        """Return whether this node may use incoming and outgoing handles."""
+        contour = self.contour_for_node(node.node_id)
+        if contour is None:
+            return False, False
+        index = next(
+            index for index, candidate in enumerate(contour.nodes)
+            if candidate.node_id == node.node_id
+        )
+        return (
+            contour.closed or index > 0,
+            contour.closed or index < len(contour.nodes) - 1,
+        )
+
+    @staticmethod
+    def _normalize_contour_handles(contour: PathContour) -> None:
+        nodes = contour.nodes
+        if not nodes:
+            return
+        last_index = len(nodes) - 1
+        for index, node in enumerate(nodes):
+            if node.point_type != "bezier":
+                node.incoming = node.outgoing = None
+                node.handles_locked = True
+                continue
+            needs_incoming = contour.closed or index > 0
+            needs_outgoing = contour.closed or index < last_index
+            if not (needs_incoming and needs_outgoing):
+                node.handles_locked = False
+            if not needs_incoming:
+                node.incoming = None
+            if not needs_outgoing:
+                node.outgoing = None
+            if needs_incoming and node.incoming is None:
+                if node.outgoing is not None:
+                    node.incoming = (
+                        node.x * 2 - node.outgoing[0],
+                        node.y * 2 - node.outgoing[1],
+                    )
+                else:
+                    previous = nodes[index - 1]
+                    node.incoming = (
+                        node.x + (previous.x - node.x) / 3,
+                        node.y + (previous.y - node.y) / 3,
+                    )
+            if needs_outgoing and node.outgoing is None:
+                if node.incoming is not None:
+                    node.outgoing = (
+                        node.x * 2 - node.incoming[0],
+                        node.y * 2 - node.incoming[1],
+                    )
+                else:
+                    following = nodes[(index + 1) % len(nodes)]
+                    node.outgoing = (
+                        node.x + (following.x - node.x) / 3,
+                        node.y + (following.y - node.y) / 3,
+                    )
+
+    def normalize_bezier_handles(self) -> None:
+        """Restore the handle topology required by this path after an edit."""
+        for contour in self.iter_contours():
+            self._normalize_contour_handles(contour)
+
     def validate(self) -> None:
         if self.primitive not in {"rectangle", "ellipse", "custom"}:
             raise ValueError("Unknown shape primitive")
@@ -337,37 +492,56 @@ class BoundGeometry:
                 f"require at least {minimum} points"
             )
         ids: set[str] = set()
-        for index, node in enumerate(self.nodes):
-            node.validate()
-            if node.node_id in ids:
-                raise ValueError("Duplicate shape point ID")
-            ids.add(node.node_id)
-            if node.point_type == "bezier":
-                needs_incoming = self.closed or index > 0
-                needs_outgoing = self.closed or index < len(self.nodes) - 1
-                if needs_incoming != (node.incoming is not None):
-                    raise ValueError("Malformed incoming Bézier handle")
-                if needs_outgoing != (node.outgoing is not None):
-                    raise ValueError("Malformed outgoing Bézier handle")
-                if (
-                    node.handles_locked
-                    and node.incoming is not None and node.outgoing is not None
-                    and math.dist(
-                        node.incoming,
-                        (
-                            node.x * 2 - node.outgoing[0],
-                            node.y * 2 - node.outgoing[1],
-                        ),
-                    ) > 1e-4
-                ):
-                    raise ValueError("Locked Bézier handles must be symmetric")
+        for contour_index, contour in enumerate(self.iter_contours()):
+            contour.validate()
+            for index, node in enumerate(contour.nodes):
+                node.validate()
+                if node.node_id in ids:
+                    raise ValueError("Duplicate shape point ID")
+                ids.add(node.node_id)
+                if node.point_type == "bezier":
+                    needs_incoming = contour.closed or index > 0
+                    needs_outgoing = (
+                        contour.closed or index < len(contour.nodes) - 1
+                    )
+                    location = (
+                        f"contour {contour_index}, point {index} "
+                        f"({node.node_id})"
+                    )
+                    if needs_incoming != (node.incoming is not None):
+                        raise ValueError(
+                            f"Malformed incoming Bézier handle at {location}"
+                        )
+                    if needs_outgoing != (node.outgoing is not None):
+                        raise ValueError(
+                            f"Malformed outgoing Bézier handle at {location}"
+                        )
+                    if (
+                        node.handles_locked
+                        and node.incoming is not None
+                        and node.outgoing is not None
+                        and math.dist(
+                            node.incoming,
+                            (
+                                node.x * 2 - node.outgoing[0],
+                                node.y * 2 - node.outgoing[1],
+                            ),
+                        ) > 1e-4
+                    ):
+                        raise ValueError(
+                            f"Locked Bézier handles must be symmetric at "
+                            f"{location}"
+                        )
         if self.primitive in {"rectangle", "ellipse"} and len(self.nodes) != 4:
             raise ValueError("Primitive shapes require four points")
+        if self.primitive in {"rectangle", "ellipse"} and self.additional_contours:
+            raise ValueError("Primitive shapes cannot have additional contours")
 
     def bbox(self) -> tuple[float, float, float, float]:
         values = [
             point
-            for node in self.nodes
+            for contour in self.iter_contours()
+            for node in contour.nodes
             for point in (node.position, node.incoming, node.outgoing)
             if point is not None
         ]
@@ -386,15 +560,23 @@ class BoundGeometry:
         # Exact curve containment belongs to the renderer. This polygon
         # fallback keeps the UI-independent model useful for validation.
         inside = False
-        previous = self.nodes[-1].position
-        for node in self.nodes:
-            current = node.position
-            x1, y1 = previous
-            x2, y2 = current
-            crosses = (y1 > y) != (y2 > y)
-            if crosses and x < (x2 - x1) * (y - y1) / (y2 - y1) + x1:
-                inside = not inside
-            previous = current
+        for contour in self.iter_contours():
+            if not contour.closed:
+                continue
+            previous = contour.nodes[-1].position
+            for node in contour.nodes:
+                current = node.position
+                x1, y1 = previous
+                x2, y2 = current
+                crosses = (y1 > y) != (y2 > y)
+                if (
+                    crosses
+                    and x < (
+                        (x2 - x1) * (y - y1) / (y2 - y1) + x1
+                    )
+                ):
+                    inside = not inside
+                previous = current
         return inside
 
     def to_dict(self) -> dict[str, Any]:
@@ -403,6 +585,9 @@ class BoundGeometry:
             "type": "path", "closed": self.closed,
             "primitive": self.primitive,
             "nodes": [node.to_dict() for node in self.nodes],
+            "additional_contours": [
+                contour.to_dict() for contour in self.additional_contours
+            ],
         }
 
     @classmethod
@@ -414,6 +599,10 @@ class BoundGeometry:
                 ],
                 closed=bool(data.get("closed", True)),
                 primitive=str(data.get("primitive", "custom")),
+                additional_contours=[
+                    PathContour.from_dict(item)
+                    for item in data.get("additional_contours", [])
+                ],
             )
         kind = str(data.get("type", "rect"))
         return cls(kind, [_point(point) for point in data.get("points", [])])
@@ -448,6 +637,9 @@ class LayerNode:
     shape_style: ShapeStyle = field(default_factory=ShapeStyle)
     grid_override: GridSettings | None = None
     last_raster_id: str | None = None
+    compound_enabled: bool = False
+    compound_operation: Literal["add", "subtract", "ignore"] = "add"
+    ignore_parent_mask: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -461,6 +653,9 @@ class LayerNode:
             "shape_style": self.shape_style.to_dict(),
             "grid_override": self.grid_override.to_dict() if self.grid_override else None,
             "last_raster_id": self.last_raster_id,
+            "compound_enabled": self.compound_enabled,
+            "compound_operation": self.compound_operation,
+            "ignore_parent_mask": self.ignore_parent_mask,
         }
 
     @classmethod
@@ -490,6 +685,9 @@ class LayerNode:
             grid_override=GridSettings.from_dict(data["grid_override"])
             if data.get("grid_override") else None,
             last_raster_id=data.get("last_raster_id"),
+            compound_enabled=bool(data.get("compound_enabled", False)),
+            compound_operation=str(data.get("compound_operation", "add")),
+            ignore_parent_mask=bool(data.get("ignore_parent_mask", False)),
         )
         legacy_radius = float(data.get("vertex_radius", 0.0))
         if legacy_radius and result.bound and result.bound.primitive != "ellipse":
@@ -526,7 +724,7 @@ class LayerNode:
             return 0.0
         values = [
             node.roundness for node in self.bound.nodes
-            if node.point_type == "vector"
+            if node.point_type == "vector" and node.roundness_enabled
         ]
         return max(values, default=0.0)
 
@@ -536,6 +734,7 @@ class LayerNode:
             for node in self.bound.nodes:
                 if node.point_type == "vector":
                     node.roundness = max(0.0, float(value))
+                    node.roundness_enabled = node.roundness > 0
 
 
 @dataclass
@@ -549,6 +748,9 @@ class DocumentObject:
     visible: bool = True
     opacity: float = 1.0
     opacity_locked: bool = True
+    geometry_reference: Literal["direct", "compound"] = "direct"
+    ignore_parent_mask: bool = False
+    underlay_opacity: float = 0.0
 
     def common_dict(self) -> dict[str, Any]:
         return {
@@ -556,6 +758,9 @@ class DocumentObject:
             "parent_layer_id": self.parent_layer_id, "position": [self.x, self.y],
             "visible": self.visible, "opacity": self.opacity,
             "opacity_locked": self.opacity_locked,
+            "geometry_reference": self.geometry_reference,
+            "ignore_parent_mask": self.ignore_parent_mask,
+            "underlay_opacity": self.underlay_opacity,
         }
 
     def to_dict(self) -> dict[str, Any]:
@@ -595,6 +800,11 @@ class TextObject(DocumentObject):
     transform_quad: list[tuple[float, float]] | None = None
     legacy_alignment: str | None = field(default=None, repr=False, compare=False)
 
+    @property
+    def display_name(self) -> str:
+        """Short content-derived label used by UI surfaces."""
+        return " ".join(self.text.split())[:16].rstrip() or "Text"
+
     def to_dict(self) -> dict[str, Any]:
         result = self.common_dict()
         result.update({
@@ -613,19 +823,301 @@ class TextObject(DocumentObject):
         return result
 
 
-ObjectEntity = RasterObject | TextObject | DocumentObject
+@dataclass
+class VectorStrokePoint:
+    """An editable anchor plus the hidden cubic controls for one vector stroke."""
+
+    point_id: str = field(default_factory=new_id)
+    x: float = 0.0
+    y: float = 0.0
+    incoming: tuple[float, float] | None = None
+    outgoing: tuple[float, float] | None = None
+    width: float = 1.0
+    opacity: float = 1.0
+
+    @property
+    def position(self) -> tuple[float, float]:
+        return self.x, self.y
+
+    @position.setter
+    def position(self, value: Iterable[float]) -> None:
+        self.x, self.y = _point(value)
+
+    def validate(self) -> None:
+        self.x, self.y = float(self.x), float(self.y)
+        if not math.isfinite(self.x) or not math.isfinite(self.y):
+            raise ValueError(f"Vector point {self.point_id} has a non-finite anchor")
+        self.incoming = _point(self.incoming) if self.incoming is not None else None
+        self.outgoing = _point(self.outgoing) if self.outgoing is not None else None
+        for label, control in (
+            ("incoming", self.incoming), ("outgoing", self.outgoing),
+        ):
+            if control is not None and not all(math.isfinite(value) for value in control):
+                raise ValueError(
+                    f"Vector point {self.point_id} has a non-finite {label} control"
+                )
+        self.width = max(1.0, min(1000.0, float(self.width)))
+        if not math.isfinite(self.width):
+            self.width = 1.0
+        self.opacity = max(0.0, min(1.0, float(self.opacity)))
+        if not math.isfinite(self.opacity):
+            self.opacity = 1.0
+
+    def to_dict(self) -> dict[str, Any]:
+        self.validate()
+        return {
+            "id": self.point_id,
+            "position": [self.x, self.y],
+            "incoming": list(self.incoming) if self.incoming is not None else None,
+            "outgoing": list(self.outgoing) if self.outgoing is not None else None,
+            "width": self.width,
+            "opacity": self.opacity,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "VectorStrokePoint":
+        position = data.get("position", [0.0, 0.0])
+        result = cls(
+            point_id=str(data.get("id") or new_id()),
+            x=float(position[0]),
+            y=float(position[1]),
+            incoming=(
+                _point(data["incoming"]) if data.get("incoming") is not None
+                else None
+            ),
+            outgoing=(
+                _point(data["outgoing"]) if data.get("outgoing") is not None
+                else None
+            ),
+            width=float(data.get("width", 1.0)),
+            opacity=float(data.get("opacity", 1.0)),
+        )
+        result.validate()
+        return result
+
+
+@dataclass
+class VectorStroke:
+    stroke_id: str = field(default_factory=new_id)
+    color: str = "#FF000000"
+    closed: bool = False
+    start_cap: Literal["point", "square", "round"] = "round"
+    end_cap: Literal["point", "square", "round"] = "round"
+    points: list[VectorStrokePoint] = field(default_factory=list)
+
+    def validate(self) -> None:
+        self.color = canonical_argb(self.color)
+        if self.start_cap not in {"point", "square", "round"}:
+            self.start_cap = "round"
+        if self.end_cap not in {"point", "square", "round"}:
+            self.end_cap = "round"
+        if not self.points:
+            raise ValueError(f"Vector stroke {self.stroke_id} has no points")
+        ids: set[str] = set()
+        for point in self.points:
+            point.validate()
+            if point.point_id in ids:
+                raise ValueError(
+                    f"Vector stroke {self.stroke_id} has duplicate point IDs"
+                )
+            ids.add(point.point_id)
+        if len(self.points) == 1:
+            self.closed = False
+
+    def derived_bounds(self) -> tuple[float, float, float, float]:
+        """Conservative local bounds including controls and variable width."""
+        if not self.points:
+            return 0.0, 0.0, 0.0, 0.0
+        coordinates: list[tuple[float, float]] = []
+        maximum_radius = 0.5
+        for point in self.points:
+            coordinates.append(point.position)
+            if point.incoming is not None:
+                coordinates.append(point.incoming)
+            if point.outgoing is not None:
+                coordinates.append(point.outgoing)
+            maximum_radius = max(maximum_radius, point.width / 2)
+        left = min(point[0] for point in coordinates) - maximum_radius
+        top = min(point[1] for point in coordinates) - maximum_radius
+        right = max(point[0] for point in coordinates) + maximum_radius
+        bottom = max(point[1] for point in coordinates) + maximum_radius
+        return left, top, right - left, bottom - top
+
+    def to_dict(self) -> dict[str, Any]:
+        self.validate()
+        return {
+            "id": self.stroke_id,
+            "color": self.color,
+            "closed": self.closed,
+            "start_cap": self.start_cap,
+            "end_cap": self.end_cap,
+            "points": [point.to_dict() for point in self.points],
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "VectorStroke":
+        result = cls(
+            stroke_id=str(data.get("id") or new_id()),
+            color=str(data.get("color", "#FF000000")),
+            closed=bool(data.get("closed", False)),
+            start_cap=str(data.get("start_cap", "round")),
+            end_cap=str(data.get("end_cap", "round")),
+            points=[
+                VectorStrokePoint.from_dict(item)
+                for item in data.get("points", [])
+            ],
+        )
+        result.validate()
+        return result
+
+
+@dataclass
+class VectorDrawingObject(DocumentObject):
+    object_type: str = "vector_drawing"
+    name: str = "Vector Drawing"
+    strokes: list[VectorStroke] = field(default_factory=list)
+    fill_child_ids: list[str] = field(default_factory=list)
+    drawing_revision: int = 0
+
+    def validate_vector(self) -> None:
+        ids: set[str] = set()
+        for stroke in self.strokes:
+            stroke.validate()
+            if stroke.stroke_id in ids:
+                raise ValueError(
+                    f"Vector drawing {self.object_id} has duplicate stroke IDs"
+                )
+            ids.add(stroke.stroke_id)
+        if len(set(self.fill_child_ids)) != len(self.fill_child_ids):
+            raise ValueError(
+                f"Vector drawing {self.object_id} references a fill more than once"
+            )
+        self.fill_child_ids = [str(item) for item in self.fill_child_ids]
+        self.drawing_revision = max(0, int(self.drawing_revision))
+
+    def derived_bounds(self) -> tuple[float, float, float, float]:
+        bounds = [
+            stroke.derived_bounds() for stroke in self.strokes
+            if stroke.points
+        ]
+        if not bounds:
+            return 0.0, 0.0, 0.0, 0.0
+        left = min(bound[0] for bound in bounds)
+        top = min(bound[1] for bound in bounds)
+        right = max(bound[0] + bound[2] for bound in bounds)
+        bottom = max(bound[1] + bound[3] for bound in bounds)
+        return left, top, right - left, bottom - top
+
+    def touch_revision(self) -> int:
+        self.drawing_revision += 1
+        return self.drawing_revision
+
+    def to_dict(self) -> dict[str, Any]:
+        self.validate_vector()
+        result = self.common_dict()
+        result.update({
+            "strokes": [stroke.to_dict() for stroke in self.strokes],
+            "fill_child_ids": list(self.fill_child_ids),
+            "drawing_revision": self.drawing_revision,
+        })
+        return result
+
+
+@dataclass
+class VectorFillObject(DocumentObject):
+    object_type: str = "vector_fill"
+    name: str = "Vector Fill"
+    owner_drawing_id: str = ""
+    geometry: BoundGeometry = field(
+        default_factory=lambda: BoundGeometry.rectangle(0, 0, 1, 1)
+    )
+    fill_color: str = "#FF000000"
+    source_seed: tuple[float, float] | None = None
+    source_lasso: list[tuple[float, float]] = field(default_factory=list)
+    fill_settings: dict[str, Any] = field(default_factory=dict)
+
+    def validate_vector_fill(self) -> None:
+        if not self.owner_drawing_id:
+            raise ValueError(f"Vector fill {self.object_id} has no owner")
+        self.geometry.validate()
+        if not self.geometry.closed or any(
+            not contour.closed for contour in self.geometry.additional_contours
+        ):
+            raise ValueError("Vector fills require closed contours")
+        self.fill_color = canonical_argb(self.fill_color)
+        self.source_seed = (
+            _point(self.source_seed) if self.source_seed is not None else None
+        )
+        self.source_lasso = [_point(point) for point in self.source_lasso]
+        self.fill_settings = dict(self.fill_settings)
+
+    def derived_bounds(self) -> tuple[float, float, float, float]:
+        return self.geometry.bbox()
+
+    def to_dict(self) -> dict[str, Any]:
+        self.validate_vector_fill()
+        result = self.common_dict()
+        result.update({
+            "owner_drawing_id": self.owner_drawing_id,
+            "geometry": self.geometry.to_dict(),
+            "fill_color": self.fill_color,
+            "source_seed": (
+                list(self.source_seed) if self.source_seed is not None else None
+            ),
+            "source_lasso": [list(point) for point in self.source_lasso],
+            "fill_settings": dict(self.fill_settings),
+        })
+        return result
+
+
+ObjectEntity = (
+    RasterObject | TextObject | VectorDrawingObject | VectorFillObject
+    | DocumentObject
+)
 
 
 def object_from_dict(data: dict[str, Any]) -> ObjectEntity:
     position = data.get("position", [0, 0])
     common = dict(
         object_id=str(data["id"]), name=str(data.get("name", "Object")),
-        parent_layer_id=str(data["parent_layer_id"]), x=float(position[0]),
+        parent_layer_id=str(data.get("parent_layer_id", "")), x=float(position[0]),
         y=float(position[1]), visible=bool(data.get("visible", True)),
         opacity=float(data.get("opacity", 1.0)),
         opacity_locked=bool(data.get("opacity_locked", True)),
+        geometry_reference=str(data.get("geometry_reference", "direct")),
+        ignore_parent_mask=bool(data.get("ignore_parent_mask", False)),
+        underlay_opacity=float(data.get("underlay_opacity", 0.0)),
     )
     object_type = str(data.get("type", "object"))
+    if object_type == "vector_drawing":
+        return VectorDrawingObject(
+            **common,
+            strokes=[
+                VectorStroke.from_dict(item)
+                for item in data.get("strokes", [])
+            ],
+            fill_child_ids=[
+                str(item) for item in data.get("fill_child_ids", [])
+            ],
+            drawing_revision=int(data.get("drawing_revision", 0)),
+        )
+    if object_type == "vector_fill":
+        return VectorFillObject(
+            **common,
+            owner_drawing_id=str(data.get("owner_drawing_id", "")),
+            geometry=BoundGeometry.from_dict(
+                data.get("geometry") or data.get("bound") or {}
+            ),
+            fill_color=str(data.get("fill_color", "#FF000000")),
+            source_seed=(
+                _point(data["source_seed"])
+                if data.get("source_seed") is not None else None
+            ),
+            source_lasso=[
+                _point(point) for point in data.get("source_lasso", [])
+            ],
+            fill_settings=dict(data.get("fill_settings") or {}),
+        )
     if object_type == "raster":
         raw_rect = data.get("interaction_rect", [0, 0, 120, 120])
         return RasterObject(
@@ -692,8 +1184,11 @@ class ChapterDocument:
                 raise ValueError("Root entries must be parentless page layers")
             referenced.add(("layer", page_id))
         for layer in self.layers.values():
+            layer.ignore_parent_mask = bool(layer.ignore_parent_mask)
             if layer.layer_kind not in {"bounded", "open_shape", "fill"}:
                 raise ValueError("Unknown layer kind")
+            if layer.compound_operation not in {"add", "subtract", "ignore"}:
+                raise ValueError("Unknown compound operation")
             if layer.layer_kind == "fill":
                 if layer.is_page or layer.parent_id is None:
                     raise ValueError("Fill layers require a parent")
@@ -704,30 +1199,33 @@ class ChapterDocument:
                 layer.grid_override = None
                 layer.border_width = 0.0
                 layer.vertex_radius = 0.0
+                layer.compound_enabled = False
+                layer.ignore_parent_mask = False
             elif layer.bound is None:
                 raise ValueError("Bounded layers require geometry")
             else:
                 layer.bound.validate()
                 if layer.layer_kind == "open_shape":
-                    if layer.is_page or layer.bound.closed or layer.children:
+                    if layer.is_page or layer.bound.closed:
                         raise ValueError(
-                            "Open shape layers are childless open paths"
+                            "Open shape layers require open paths"
                         )
                 elif not layer.bound.closed:
                     raise ValueError("Bounded layers require closed geometry")
             layer.shape_style.validate()
             layer.border_width = max(0.0, float(layer.border_width))
-            layer.vertex_radius = max(0.0, float(layer.vertex_radius))
             layer.opacity = max(0.0, min(1.0, float(layer.opacity)))
             if layer.is_page and layer.layer_id not in self.root_page_ids:
                 raise ValueError("Page layers must be chapter roots")
+            if layer.is_page:
+                layer.border_width = min(40.0, layer.border_width)
+                layer.compound_enabled = False
+                layer.ignore_parent_mask = False
             if not layer.is_page and layer.parent_id not in self.layers:
                 raise ValueError(f"Layer {layer.layer_id} has no valid parent")
             if (
                 layer.parent_id
-                and self.layers[layer.parent_id].layer_kind in {
-                    "fill", "open_shape"
-                }
+                and self.layers[layer.parent_id].layer_kind == "fill"
             ):
                 raise ValueError("Leaf layers cannot contain entities")
             if layer.parent_id and self.layers[layer.parent_id].is_page is False:
@@ -743,20 +1241,72 @@ class ChapterDocument:
                         raise ValueError("Invalid child layer")
                 elif child.kind == "object":
                     candidate_object = self.objects.get(child.entity_id)
-                    if candidate_object is None or candidate_object.parent_layer_id != layer.layer_id:
+                    if (
+                        candidate_object is None
+                        or isinstance(candidate_object, VectorFillObject)
+                        or candidate_object.parent_layer_id != layer.layer_id
+                    ):
                         raise ValueError("Invalid child object")
-                    if layer.is_page:
-                        raise ValueError("Objects cannot belong directly to page layers")
                 else:
                     raise ValueError(f"Unknown child kind: {child.kind}")
+        owned_fill_ids: set[str] = set()
+        for obj in self.objects.values():
+            try:
+                underlay = float(obj.underlay_opacity)
+            except (TypeError, ValueError):
+                underlay = 0.0
+            obj.underlay_opacity = (
+                max(0.0, min(1.0, underlay))
+                if math.isfinite(underlay) else 0.0
+            )
+            if not isinstance(obj, VectorDrawingObject):
+                continue
+            obj.validate_vector()
+            for fill_id in obj.fill_child_ids:
+                if fill_id in owned_fill_ids:
+                    raise ValueError(
+                        f"Vector fill {fill_id} is owned by more than one drawing"
+                    )
+                fill = self.objects.get(fill_id)
+                if not isinstance(fill, VectorFillObject):
+                    raise ValueError(
+                        f"Vector drawing {obj.object_id} references an invalid fill"
+                    )
+                if fill.owner_drawing_id != obj.object_id:
+                    raise ValueError(
+                        f"Vector fill {fill_id} has a mismatched owner"
+                    )
+                if fill.parent_layer_id != obj.parent_layer_id:
+                    raise ValueError(
+                        f"Vector fill {fill_id} does not inherit its owner's layer"
+                    )
+                owned_fill_ids.add(fill_id)
         for object_id, obj in self.objects.items():
-            parent = self.layers.get(obj.parent_layer_id)
+            if isinstance(obj, VectorFillObject):
+                obj.validate_vector_fill()
+                owner = self.objects.get(obj.owner_drawing_id)
+                if not isinstance(owner, VectorDrawingObject):
+                    raise ValueError(
+                        f"Vector fill {object_id} requires a Vector Drawing owner"
+                    )
+                parent = self.layers.get(owner.parent_layer_id)
+                if object_id not in owned_fill_ids:
+                    raise ValueError(
+                        f"Vector fill {object_id} is not referenced by its owner"
+                    )
+            else:
+                parent = self.layers.get(obj.parent_layer_id)
             if (
-                parent is None or parent.is_page
-                or parent.layer_kind in {"fill", "open_shape"}
+                parent is None
+                or parent.layer_kind == "fill"
             ):
-                raise ValueError(f"Object {object_id} requires a non-page parent layer")
+                raise ValueError(f"Object {object_id} requires a container layer")
             obj.opacity = max(0.0, min(1.0, float(obj.opacity)))
+            obj.ignore_parent_mask = bool(obj.ignore_parent_mask)
+            if isinstance(obj, VectorFillObject):
+                obj.ignore_parent_mask = bool(owner.ignore_parent_mask)
+            if obj.geometry_reference not in {"direct", "compound"}:
+                obj.geometry_reference = "direct"
             if isinstance(obj, RasterObject):
                 left, top, width, height = obj.interaction_rect
                 obj.interaction_rect = (
@@ -773,7 +1323,8 @@ class ChapterDocument:
                 if obj.transform_quad is not None and len(obj.transform_quad) != 4:
                     raise ValueError("Text transform quad must have four points")
         expected = {("layer", key) for key in self.layers} | {
-            ("object", key) for key in self.objects
+            ("object", key) for key, obj in self.objects.items()
+            if not isinstance(obj, VectorFillObject)
         }
         if referenced != expected:
             raise ValueError("Document contains unreachable entities")
@@ -798,14 +1349,27 @@ class ChapterDocument:
 
     def add_page(
         self, name: str = "Page", bound: BoundGeometry | None = None,
-        x: float = 0, y: float = 0,
+        x: float = 0, y: float = 0, index: int | None = None,
+        style: ShapeStyle | None = None,
     ) -> LayerNode:
+        page_style = style or ShapeStyle(outline_thickness=4.0)
+        page_style.validate()
+        page_style.outline_thickness = min(
+            40.0, page_style.outline_thickness
+        )
         layer = LayerNode(
             name=name, is_page=True, translate_x=x, translate_y=y,
             bound=bound or BoundGeometry.rectangle(0, 0, CHAPTER_WIDTH, 1080),
+            shape_style=page_style,
         )
         self.layers[layer.layer_id] = layer
-        self.root_page_ids.append(layer.layer_id)
+        if index is None:
+            self.root_page_ids.append(layer.layer_id)
+        else:
+            self.root_page_ids.insert(
+                max(0, min(int(index), len(self.root_page_ids))),
+                layer.layer_id,
+            )
         self.ensure_height_for(layer.layer_id)
         return layer
 
@@ -816,7 +1380,7 @@ class ChapterDocument:
         style: ShapeStyle | None = None,
     ) -> LayerNode:
         parent = self.layers[parent_id]
-        if parent.layer_kind in {"fill", "open_shape"}:
+        if parent.layer_kind == "fill":
             raise ValueError("Leaf layers cannot contain entities")
         layer = LayerNode(
             name=name, parent_id=parent_id, layer_kind=layer_kind,
@@ -837,7 +1401,7 @@ class ChapterDocument:
         self, parent_id: str, name: str = "Fill", color: str = "#111111",
     ) -> LayerNode:
         parent = self.layers[parent_id]
-        if parent.layer_kind in {"fill", "open_shape"}:
+        if parent.layer_kind == "fill":
             raise ValueError("Leaf layers cannot contain entities")
         layer = LayerNode(
             name=name, parent_id=parent_id, layer_kind="fill",
@@ -847,19 +1411,90 @@ class ChapterDocument:
         parent.children.insert(0, ChildRef("layer", layer.layer_id))
         return layer
 
-    def add_object(self, parent_id: str, obj: ObjectEntity) -> ObjectEntity:
+    def add_object(
+        self, parent_id: str, obj: ObjectEntity, index: int | None = None,
+    ) -> ObjectEntity:
+        if isinstance(obj, VectorFillObject):
+            return self.add_vector_fill(parent_id, obj, index)
         parent = self.layers[parent_id]
-        if parent.is_page or parent.layer_kind in {"fill", "open_shape"}:
-            raise ValueError("Objects cannot belong directly to page layers")
+        if parent.layer_kind == "fill":
+            raise ValueError("Objects require a container layer")
         obj.parent_layer_id = parent_id
         self.objects[obj.object_id] = obj
-        parent.children.append(ChildRef("object", obj.object_id))
+        reference = ChildRef("object", obj.object_id)
+        if index is None:
+            parent.children.append(reference)
+        else:
+            parent.children.insert(
+                max(0, min(int(index), len(parent.children))), reference
+            )
         if isinstance(obj, RasterObject):
             parent.last_raster_id = obj.object_id
         return obj
 
+    def add_vector_fill(
+        self, owner_id: str, fill: VectorFillObject,
+        index: int | None = None,
+    ) -> VectorFillObject:
+        """Attach a fill to a Vector Drawing without adding a layer child ref."""
+        owner = self.objects.get(owner_id)
+        if not isinstance(owner, VectorDrawingObject):
+            raise ValueError("Vector fills require a Vector Drawing owner")
+        if fill.object_id in self.objects:
+            raise ValueError(f"Duplicate object ID: {fill.object_id}")
+        fill.owner_drawing_id = owner_id
+        fill.parent_layer_id = owner.parent_layer_id
+        fill.validate_vector_fill()
+        self.objects[fill.object_id] = fill
+        if index is None:
+            owner.fill_child_ids.append(fill.object_id)
+        else:
+            owner.fill_child_ids.insert(
+                max(0, min(int(index), len(owner.fill_child_ids))),
+                fill.object_id,
+            )
+        owner.touch_revision()
+        return fill
+
+    def vector_fill_children(
+        self, drawing_id: str,
+    ) -> list[VectorFillObject]:
+        drawing = self.objects.get(drawing_id)
+        if not isinstance(drawing, VectorDrawingObject):
+            return []
+        return [
+            fill for fill_id in drawing.fill_child_ids
+            if isinstance((fill := self.objects.get(fill_id)), VectorFillObject)
+        ]
+
+    def reorder_vector_fill(
+        self, owner_id: str, fill_id: str, index: int,
+    ) -> None:
+        owner = self.objects.get(owner_id)
+        fill = self.objects.get(fill_id)
+        if (
+            not isinstance(owner, VectorDrawingObject)
+            or not isinstance(fill, VectorFillObject)
+            or fill.owner_drawing_id != owner_id
+            or fill_id not in owner.fill_child_ids
+        ):
+            raise ValueError("Vector fills can only reorder within their owner")
+        old_index = owner.fill_child_ids.index(fill_id)
+        owner.fill_child_ids.pop(old_index)
+        if old_index < index:
+            index -= 1
+        owner.fill_child_ids.insert(
+            max(0, min(int(index), len(owner.fill_child_ids))), fill_id
+        )
+        owner.touch_revision()
+
     def parent_ref_list(self, kind: str, entity_id: str) -> list[ChildRef] | None:
         if kind == "layer" and entity_id in self.root_page_ids:
+            return None
+        if (
+            kind == "object"
+            and isinstance(self.objects.get(entity_id), VectorFillObject)
+        ):
             return None
         parent_id = (
             self.layers[entity_id].parent_id if kind == "layer"
@@ -871,6 +1506,14 @@ class ChapterDocument:
         self, kind: Literal["layer", "object"], entity_id: str,
         new_parent_id: str | None, index: int,
     ) -> None:
+        if (
+            kind == "object"
+            and isinstance(self.objects.get(entity_id), VectorFillObject)
+        ):
+            if new_parent_id is None:
+                raise ValueError("Vector fills require their existing owner")
+            self.reorder_vector_fill(new_parent_id, entity_id, index)
+            return
         if kind == "layer" and self.layers[entity_id].is_page:
             if new_parent_id is not None:
                 raise ValueError("Page layers cannot be reparented")
@@ -883,10 +1526,8 @@ class ChapterDocument:
         if new_parent_id is None:
             raise ValueError("Only page layers can be roots")
         new_parent = self.layers[new_parent_id]
-        if new_parent.layer_kind in {"fill", "open_shape"}:
+        if new_parent.layer_kind == "fill":
             raise ValueError("Leaf layers cannot contain entities")
-        if kind == "object" and new_parent.is_page:
-            raise ValueError("Objects cannot belong directly to page layers")
         if kind == "layer":
             cursor: str | None = new_parent_id
             while cursor:
@@ -908,11 +1549,31 @@ class ChapterDocument:
             entity.parent_id = new_parent_id
         else:
             entity.parent_layer_id = new_parent_id
+            if isinstance(entity, VectorDrawingObject):
+                for fill in self.vector_fill_children(entity.object_id):
+                    fill.parent_layer_id = new_parent_id
 
     def delete_entity(self, kind: str, entity_id: str) -> set[str]:
         deleted_objects: set[str] = set()
         if kind == "object":
-            obj = self.objects.pop(entity_id)
+            obj = self.objects[entity_id]
+            if isinstance(obj, VectorFillObject):
+                owner = self.objects.get(obj.owner_drawing_id)
+                if isinstance(owner, VectorDrawingObject):
+                    owner.fill_child_ids = [
+                        item for item in owner.fill_child_ids
+                        if item != entity_id
+                    ]
+                    owner.touch_revision()
+                del self.objects[entity_id]
+                deleted_objects.add(entity_id)
+                return deleted_objects
+            if isinstance(obj, VectorDrawingObject):
+                for fill_id in list(obj.fill_child_ids):
+                    deleted_objects.update(
+                        self.delete_entity("object", fill_id)
+                    )
+            self.objects.pop(entity_id)
             parent = self.layers[obj.parent_layer_id]
             parent.children = [r for r in parent.children if r.entity_id != entity_id]
             deleted_objects.add(entity_id)
@@ -952,6 +1613,30 @@ class ChapterDocument:
             cursor = self.layers[cursor].parent_id
         return list(reversed(result))
 
+    def closest_compound_ancestor(
+        self, layer_id: str, include_self: bool = False,
+    ) -> LayerNode | None:
+        cursor: str | None = layer_id if include_self else self.layers[layer_id].parent_id
+        while cursor:
+            layer = self.layers[cursor]
+            if layer.compound_enabled:
+                return layer
+            cursor = layer.parent_id
+        return None
+
+    def contributing_compound_ancestor(
+        self, layer_id: str,
+    ) -> LayerNode | None:
+        cursor = self.layers[layer_id]
+        while cursor.parent_id:
+            if cursor.compound_operation == "ignore":
+                return None
+            parent = self.layers[cursor.parent_id]
+            if parent.compound_enabled:
+                return parent
+            cursor = parent
+        return None
+
     def effective_grid(self, layer_id: str) -> GridSettings:
         result = self.grid
         for layer in self.ancestor_layers(layer_id):
@@ -978,6 +1663,10 @@ class ChapterDocument:
                 obj = self.objects[child.entity_id]
                 if obj.opacity_locked:
                     obj.opacity = layer.opacity
+                if isinstance(obj, VectorDrawingObject):
+                    for fill in self.vector_fill_children(obj.object_id):
+                        if fill.opacity_locked:
+                            fill.opacity = layer.opacity
 
     def ensure_height_for(self, layer_id: str) -> bool:
         layer = self.layers[layer_id]
@@ -1024,7 +1713,11 @@ class ChapterDocument:
                 if child.kind == "layer":
                     yield from walk(self.layers[child.entity_id])
                 else:
-                    yield "object", self.objects[child.entity_id]
+                    obj = self.objects[child.entity_id]
+                    if isinstance(obj, VectorDrawingObject):
+                        for fill_id in reversed(obj.fill_child_ids):
+                            yield "object", self.objects[fill_id]
+                    yield "object", obj
         for page_id in reversed(self.root_page_ids):
             yield from walk(self.layers[page_id])
 
@@ -1033,7 +1726,7 @@ class ChapterDocument:
             "schema_version": self.schema_version, "id": self.chapter_id,
             "name": self.name, "size": [self.width, self.height],
             "background": self.background, "grid": self.grid.to_dict(),
-            "root_page_ids": self.root_page_ids,
+            "root_page_ids": list(self.root_page_ids),
             "layers": [layer.to_dict() for layer in self.layers.values()],
             "objects": [obj.to_dict() for obj in self.objects.values()],
         }
@@ -1102,16 +1795,109 @@ class ChapterReference:
 
 
 @dataclass
+class PaletteSwatch:
+    swatch_id: str = field(default_factory=new_id)
+    color: str = "#FF000000"
+
+    def to_dict(self) -> dict[str, str]:
+        self.color = canonical_argb(self.color)
+        return {"id": self.swatch_id, "color": self.color}
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any] | str) -> "PaletteSwatch":
+        if isinstance(data, str):
+            return cls(color=canonical_argb(data))
+        return cls(
+            swatch_id=str(data.get("id") or new_id()),
+            color=canonical_argb(data.get("color", "#FF000000")),
+        )
+
+
+@dataclass
+class ColorPalette:
+    palette_id: str = field(default_factory=new_id)
+    name: str = "Default"
+    swatches: list[PaletteSwatch] = field(default_factory=list)
+
+    def validate(self) -> None:
+        self.name = str(self.name).strip() or "Palette"
+        ids: set[str] = set()
+        for swatch in self.swatches:
+            if swatch.swatch_id in ids:
+                swatch.swatch_id = new_id()
+            ids.add(swatch.swatch_id)
+            swatch.color = canonical_argb(swatch.color)
+
+    def to_dict(self) -> dict[str, Any]:
+        self.validate()
+        return {
+            "id": self.palette_id,
+            "name": self.name,
+            "swatches": [swatch.to_dict() for swatch in self.swatches],
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "ColorPalette":
+        raw_swatches = data.get("swatches", data.get("colors", []))
+        result = cls(
+            palette_id=str(data.get("id") or new_id()),
+            name=str(data.get("name", "Palette")),
+            swatches=[
+                PaletteSwatch.from_dict(item) for item in raw_swatches
+            ],
+        )
+        result.validate()
+        return result
+
+
+def default_color_palette() -> ColorPalette:
+    return ColorPalette(
+        name="Default",
+        swatches=[
+            PaletteSwatch(color="#FF000000"),
+            PaletteSwatch(color="#FFFFFFFF"),
+        ],
+    )
+
+
+@dataclass
 class SeriesDocument:
     series_id: str = field(default_factory=new_id)
     name: str = "Untitled Series"
     chapters: list[ChapterReference] = field(default_factory=list)
+    primary_color: str = "#FF000000"
+    secondary_color: str = "#FFFFFFFF"
+    palettes: list[ColorPalette] = field(
+        default_factory=lambda: [default_color_palette()]
+    )
+    active_palette_id: str = ""
     schema_version: int = SCHEMA_VERSION
 
+    def validate(self) -> None:
+        self.primary_color = canonical_argb(self.primary_color)
+        self.secondary_color = canonical_argb(
+            self.secondary_color, "#FFFFFFFF"
+        )
+        if not self.palettes:
+            self.palettes = [default_color_palette()]
+        palette_ids: set[str] = set()
+        for palette in self.palettes:
+            if palette.palette_id in palette_ids:
+                palette.palette_id = new_id()
+            palette_ids.add(palette.palette_id)
+            palette.validate()
+        if self.active_palette_id not in palette_ids:
+            self.active_palette_id = self.palettes[0].palette_id
+
     def to_dict(self) -> dict[str, Any]:
+        self.validate()
         return {
             "schema_version": self.schema_version, "id": self.series_id,
             "name": self.name, "chapters": [item.to_dict() for item in self.chapters],
+            "primary_color": self.primary_color,
+            "secondary_color": self.secondary_color,
+            "active_palette_id": self.active_palette_id,
+            "palettes": [palette.to_dict() for palette in self.palettes],
         }
 
     @classmethod
@@ -1119,11 +1905,25 @@ class SeriesDocument:
         schema = int(data.get("schema_version", 1))
         if schema > SCHEMA_VERSION:
             raise ValueError(f"Unsupported future series schema: {schema}")
-        return cls(
+        palettes = [
+            ColorPalette.from_dict(item)
+            for item in data.get("palettes", [])
+        ]
+        result = cls(
             series_id=str(data["id"]), name=str(data.get("name", "Untitled Series")),
             chapters=[
                 ChapterReference(str(item["id"]), str(item.get("name", "Chapter")))
                 for item in data.get("chapters", [])
             ],
+            primary_color=canonical_argb(
+                data.get("primary_color", data.get("brush_color", "#FF000000"))
+            ),
+            secondary_color=canonical_argb(
+                data.get("secondary_color", "#FFFFFFFF"), "#FFFFFFFF"
+            ),
+            palettes=palettes or [default_color_palette()],
+            active_palette_id=str(data.get("active_palette_id", "")),
             schema_version=SCHEMA_VERSION,
         )
+        result.validate()
+        return result

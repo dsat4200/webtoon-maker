@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import pytest
-from PySide6.QtCore import QPointF, Qt
+from PySide6.QtCore import QPointF, QRectF, Qt
 from PySide6.QtGui import QColor, QInputMethodEvent
 from PySide6.QtTest import QTest
 
@@ -20,9 +20,7 @@ def _canvas_document(settings: EditorSettings | None = None):
     layer = chapter.add_layer(
         page.layer_id, "Layer 1", BoundGeometry.rectangle(40, 40, 500, 500)
     )
-    canvas = CanvasWidget(settings or EditorSettings(
-        snap_to_grid=False, transform_snap_to_grid=False
-    ))
+    canvas = CanvasWidget(settings or EditorSettings(snap_to_grid=False))
     canvas.resize(900, 700)
     canvas.set_document(chapter, TileStore())
     return canvas, chapter, page, layer
@@ -50,15 +48,48 @@ def test_bound_center_drag_translates_only_mask_and_is_undoable(qapp):
     assert canvas.chapter.layers[layer.layer_id].bound.points == original_points
 
 
-def test_tablet_horizontal_pan_is_opposite_desktop_grab_pan(qapp):
+def test_tablet_horizontal_pan_matches_canvas_grab_direction(qapp):
     canvas, chapter, page, layer = _canvas_document()
     canvas.scale = 1
     canvas.center_x = 500
     canvas._apply_touch_pan_delta(20, 0)
-    assert canvas.center_x == 520
+    assert canvas.center_x == 480
     canvas._begin_navigation("pan", QPointF(100, 100))
     canvas._update_navigation(QPointF(120, 100))
-    assert canvas.center_x == 500
+    assert canvas.center_x == 460
+
+
+def test_tablet_touch_pan_zoom_rotation_preserves_centroid_anchor(qapp):
+    canvas, chapter, page, layer = _canvas_document()
+    canvas.resize(600, 600)
+    canvas.center_x = 300
+    canvas.center_y = 300
+    canvas.scale = 1
+    canvas.rotation = 0
+
+    canvas._rebase_touch_navigation([QPointF(100, 100)])
+    canvas._apply_touch_navigation([QPointF(130, 120)])
+    assert (canvas.center_x, canvas.center_y) == pytest.approx((270, 280))
+
+    canvas.center_x = 300
+    canvas.center_y = 300
+    canvas.scale = 1
+    canvas.rotation = 0
+    start = [QPointF(100, 100), QPointF(200, 100)]
+    anchor = canvas.widget_to_document(QPointF(150, 100))
+    canvas._rebase_touch_navigation(start)
+    state = canvas._apply_touch_navigation([
+        QPointF(100, 100), QPointF(100, 300),
+    ])
+    assert state[2] == pytest.approx(90)
+    assert state[3] == pytest.approx(2)
+    assert canvas.document_to_widget(anchor) == QPointF(100, 200)
+
+    before = state
+    canvas._rebase_touch_navigation([QPointF(100, 200)])
+    assert (
+        canvas.center_x, canvas.center_y, canvas.rotation, canvas.scale
+    ) == before
 
 
 def test_free_text_transform_persists_quad_and_preserves_content(qapp):
@@ -86,10 +117,61 @@ def test_free_text_transform_persists_quad_and_preserves_content(qapp):
     assert canvas.chapter.objects[text.object_id].transform_quad[0] == (80, 80)
 
 
-def test_transform_handle_snap_is_independent_of_bound_snap(qapp):
-    settings = EditorSettings(
-        snap_to_grid=False, transform_snap_to_grid=True
+def test_free_text_alignment_uses_local_projective_transform_rect(qapp):
+    canvas, chapter, page, layer = _canvas_document()
+    text = chapter.add_object(
+        layer.layer_id,
+        TextObject(
+            text="Aligned",
+            layout_mode="free",
+            width=240,
+            height=180,
+            vertical_alignment="bottom",
+            horizontal_alignment="right",
+            transform_quad=[
+                (70, 60), (340, 80), (300, 280), (90, 230),
+            ],
+        ),
     )
+    source = QRectF(0, 0, text.width, text.height)
+    document = canvas._text_document(text, source.width())
+    offset = canvas._text_vertical_offset(text, document, source.height())
+    base = canvas._quad_transform(source, text.transform_quad)
+    _, origin, aligned = canvas._text_edit_layout(text)
+    assert origin == QPointF(0, 0)
+    assert offset > 0
+    assert aligned.map(QPointF(0, 0)) == base.map(QPointF(0, offset))
+    assert document.begin().blockFormat().alignment() & Qt.AlignRight
+
+
+def test_transform_double_click_reenters_text_edit_at_clicked_position(qapp):
+    canvas, chapter, page, layer = _canvas_document()
+    text = chapter.add_object(
+        layer.layer_id,
+        TextObject(
+            text="Double click me",
+            layout_mode="free",
+            width=240,
+            height=100,
+            transform_quad=[(80, 80), (320, 80), (320, 180), (80, 180)],
+        ),
+    )
+    canvas.set_selection("object", text.object_id)
+    canvas.set_tool(ToolKind.TRANSFORM)
+    canvas.show()
+    qapp.processEvents()
+    QTest.mouseDClick(
+        canvas, Qt.LeftButton,
+        pos=canvas.document_to_widget(QPointF(180, 110)).toPoint(),
+    )
+    assert canvas.tool == ToolKind.TEXT_EDIT
+    assert canvas._text_editing
+    assert 0 <= canvas._text_cursor_position <= len(text.text)
+    canvas.hide()
+
+
+def test_transform_handle_uses_global_grid_snap(qapp):
+    settings = EditorSettings(snap_to_grid=True)
     canvas, chapter, page, layer = _canvas_document(settings)
     text = chapter.add_object(
         layer.layer_id,
@@ -104,12 +186,16 @@ def test_transform_handle_snap_is_independent_of_bound_snap(qapp):
     canvas._tool_move(_widget(canvas, 61, 67), 1)
     canvas._tool_release()
     assert canvas.chapter.objects[text.object_id].transform_quad[0] == (60, 60)
+    canvas.command_stack.undo()
+    canvas.settings.snap_to_grid = False
+    canvas._tool_press(_widget(canvas, 80, 80), 1)
+    canvas._tool_move(_widget(canvas, 61, 67), 1)
+    canvas._tool_release()
+    assert canvas.chapter.objects[text.object_id].transform_quad[0] == (61, 67)
 
 
 def test_uniform_transform_preserves_quad_proportions(qapp):
-    settings = EditorSettings(
-        transform_mode="uniform", transform_snap_to_grid=False
-    )
+    settings = EditorSettings(transform_mode="uniform", snap_to_grid=False)
     canvas, chapter, page, layer = _canvas_document(settings)
     text = chapter.add_object(
         layer.layer_id,
@@ -129,26 +215,163 @@ def test_uniform_transform_preserves_quad_proportions(qapp):
     assert width / height == pytest.approx(2.5)
 
 
-def test_sparse_raster_transform_and_dedicated_restore(qapp):
+def test_sparse_raster_translation_preserves_tiles_and_uses_standard_undo(
+    qapp, monkeypatch,
+):
     canvas, chapter, page, layer = _canvas_document()
     raster = chapter.add_object(layer.layer_id, RasterObject(x=100, y=100))
     canvas.tiles.paint_dab(
         raster.object_id, QPointF(20, 20), 20, QColor("#111111")
     )
     original_bounds = canvas.tiles.content_bounds(raster.object_id)
+    original_tiles = {
+        key: image.cacheKey()
+        for key, image in canvas.tiles.iter_tiles(raster.object_id)
+    }
+    monkeypatch.setattr(
+        canvas.tiles,
+        "projective_transform",
+        lambda *args, **kwargs: pytest.fail(
+            "translation should not bake raster tiles"
+        ),
+    )
     canvas.set_selection("object", raster.object_id)
-    canvas.set_tool(ToolKind.TRANSFORM)
-    center = canvas.object_world_rect(raster.object_id).center()
-    canvas._tool_press(canvas.document_to_widget(center), 1)
-    canvas._tool_move(canvas.document_to_widget(center + QPointF(100, 50)), 1)
+    assert canvas.tool == ToolKind.RASTER_PENCIL
+    rect = canvas.object_world_rect(raster.object_id)
+    edge = QPointF(rect.left() + rect.width() * 0.25, rect.top())
+    canvas._tool_press(canvas.document_to_widget(edge), 1)
+    canvas._tool_move(canvas.document_to_widget(edge + QPointF(100, 50)), 1)
     canvas._tool_release()
-    moved_bounds = canvas.tiles.content_bounds(raster.object_id)
-    assert moved_bounds.left() > original_bounds.left() + 90
-    assert canvas.can_undo_raster_transform()
-    assert canvas.undo_raster_transform()
-    restored = canvas.tiles.content_bounds(raster.object_id)
-    assert restored == original_bounds
-    assert not canvas.can_undo_raster_transform()
+    moved = canvas.chapter.objects[raster.object_id]
+    assert (moved.x, moved.y) == pytest.approx((200, 150))
+    assert canvas.tiles.content_bounds(raster.object_id) == original_bounds
+    assert {
+        key: image.cacheKey()
+        for key, image in canvas.tiles.iter_tiles(raster.object_id)
+    } == original_tiles
+    canvas.command_stack.undo()
+    restored = canvas.chapter.objects[raster.object_id]
+    assert (restored.x, restored.y) == pytest.approx((100, 100))
+    canvas.command_stack.redo()
+    redone = canvas.chapter.objects[raster.object_id]
+    assert (redone.x, redone.y) == pytest.approx((200, 150))
+
+
+def test_raster_pencil_expands_frame_with_24px_content_margin(qapp):
+    canvas, chapter, page, layer = _canvas_document()
+    raster = chapter.add_object(
+        layer.layer_id,
+        RasterObject(interaction_rect=(0, 0, 40, 40)),
+    )
+    canvas.set_selection("object", raster.object_id)
+    canvas.set_tool(ToolKind.RASTER_PENCIL)
+    canvas._begin_stroke(QPointF(100, 90), 1)
+    canvas._end_stroke()
+
+    content = canvas.tiles.content_bounds(raster.object_id)
+    expected = content.adjusted(-24, -24, 24, 24)
+    frame = QRectF(*raster.interaction_rect)
+    assert frame.contains(QRectF(0, 0, 40, 40))
+    assert frame == frame.united(expected)
+    assert frame.left() <= content.left() - 24
+    assert frame.right() >= content.right() + 24
+
+
+def test_eraser_recalculates_exact_padded_bounds_and_undoes_frame(qapp):
+    canvas, chapter, page, layer = _canvas_document()
+    raster = chapter.add_object(
+        layer.layer_id,
+        RasterObject(interaction_rect=(-30, -30, 240, 240)),
+    )
+    canvas.tiles.paint_dab(
+        raster.object_id, QPointF(40, 40), 10, QColor("#111111")
+    )
+    canvas.tiles.paint_dab(
+        raster.object_id, QPointF(160, 160), 10, QColor("#111111")
+    )
+    original_bounds = canvas.tiles.content_bounds(raster.object_id)
+    original_frame = raster.interaction_rect
+    canvas.settings.eraser_size_px["medium"] = 40
+    canvas.settings.active_eraser_size = "medium"
+    canvas.set_selection("object", raster.object_id)
+    canvas.set_tool(ToolKind.RASTER_ERASER)
+    canvas._begin_stroke(QPointF(40, 40), 1)
+    canvas._end_stroke()
+
+    remaining = canvas.tiles.content_bounds(raster.object_id)
+    padded = remaining.adjusted(-24, -24, 24, 24)
+    assert QRectF(*raster.interaction_rect) == padded
+    canvas.command_stack.undo()
+    restored = canvas.chapter.objects[raster.object_id]
+    assert restored.interaction_rect == original_frame
+    assert canvas.tiles.content_bounds(raster.object_id) == original_bounds
+    canvas.command_stack.redo()
+    assert QRectF(*canvas.chapter.objects[raster.object_id].interaction_rect) == padded
+
+
+def test_erasing_all_raster_pixels_keeps_pre_stroke_frame(qapp):
+    canvas, chapter, page, layer = _canvas_document()
+    raster = chapter.add_object(
+        layer.layer_id,
+        RasterObject(interaction_rect=(-20, -10, 100, 90)),
+    )
+    canvas.tiles.paint_dab(
+        raster.object_id, QPointF(20, 20), 8, QColor("#111111")
+    )
+    original_frame = raster.interaction_rect
+    canvas.settings.eraser_size_px["medium"] = 40
+    canvas.set_selection("object", raster.object_id)
+    canvas.set_tool(ToolKind.RASTER_ERASER)
+    canvas._begin_stroke(QPointF(20, 20), 1)
+    canvas._end_stroke()
+    assert canvas.tiles.content_bounds(raster.object_id) is None
+    assert raster.interaction_rect == original_frame
+
+
+def test_raster_handle_transform_still_bakes_and_undoes(qapp):
+    canvas, chapter, page, layer = _canvas_document()
+    raster = chapter.add_object(
+        layer.layer_id,
+        RasterObject(
+            x=100, y=100, interaction_rect=(0, 0, 120, 120)
+        ),
+    )
+    canvas.tiles.paint_dab(
+        raster.object_id, QPointF(20, 20), 20, QColor("#111111")
+    )
+    original_bounds = canvas.tiles.content_bounds(raster.object_id)
+    canvas.set_selection("object", raster.object_id)
+    assert canvas.tool == ToolKind.RASTER_PENCIL
+    assert not canvas.set_tool(ToolKind.TRANSFORM)
+    canvas._tool_press(_widget(canvas, 100, 100), 1)
+    canvas._tool_move(_widget(canvas, 80, 80), 1)
+    canvas._tool_release()
+
+    transformed = canvas.chapter.objects[raster.object_id]
+    assert (transformed.x, transformed.y) == (0, 0)
+    assert transformed.interaction_rect[:2] == pytest.approx((80, 80))
+    canvas.command_stack.undo()
+    restored = canvas.chapter.objects[raster.object_id]
+    assert (restored.x, restored.y) == (100, 100)
+    assert canvas.tiles.content_bounds(raster.object_id) == original_bounds
+
+
+def test_raster_transform_controls_do_not_consume_interior_pencil(qapp):
+    canvas, chapter, page, layer = _canvas_document()
+    raster = chapter.add_object(
+        layer.layer_id,
+        RasterObject(
+            x=100, y=100, interaction_rect=(0, 0, 160, 160)
+        ),
+    )
+    canvas.set_selection("object", raster.object_id)
+    canvas.set_tool(ToolKind.RASTER_PENCIL)
+    center = _widget(canvas, 180, 180)
+    canvas._tool_press(center, 1)
+    assert canvas._drawing
+    assert canvas._transform_drag_mode is None
+    canvas._tool_release()
+    assert canvas.tiles.content_bounds(raster.object_id) is not None
 
 
 def test_live_text_session_commits_as_one_document_command(qapp):

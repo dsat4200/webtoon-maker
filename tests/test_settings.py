@@ -3,7 +3,9 @@ from __future__ import annotations
 import json
 
 from comic_editor.core import settings as settings_module
-from comic_editor.core.settings import default_hotkeys, load_settings
+from comic_editor.core.settings import (
+    default_hotkey_hold, default_hotkeys, load_settings,
+)
 from comic_editor.ui.main_window import MainWindow
 
 
@@ -49,12 +51,14 @@ def test_main_window_starts_with_clean_configuration(qapp, monkeypatch, tmp_path
     window = MainWindow()
     try:
         assert window.settings.hotkeys == default_hotkeys()
-        assert len(window._shortcuts) >= len(default_hotkeys())
+        assert set(window._hotkey_bindings) == {
+            key for key, value in default_hotkeys().items() if value
+        }
     finally:
         window.deleteLater()
 
 
-def test_settings_v5_migration_preserves_explicit_selection_choices(
+def test_settings_v8_migration_removes_transform_snap_and_disables_hold(
     monkeypatch, tmp_path,
 ):
     path = tmp_path / "settings.json"
@@ -62,15 +66,70 @@ def test_settings_v5_migration_preserves_explicit_selection_choices(
         "settings_version": 1,
         "page_scope_select": False,
         "transform_mode": "uniform",
+        "snap_to_grid": False,
         "transform_snap_to_grid": False,
+        "text_presets": [{"name": "Legacy", "transform_snap": True}],
     }), encoding="utf-8")
     _use_settings_file(monkeypatch, path)
     loaded = load_settings()
-    assert loaded.settings_version == 5
+    assert loaded.settings_version == 11
     assert loaded.page_scope_select is False
     assert loaded.transform_mode == "uniform"
-    assert loaded.transform_snap_to_grid is False
+    assert loaded.snap_to_grid is False
+    assert not hasattr(loaded, "transform_snap_to_grid")
+    assert "transform_snap" not in loaded.text_presets[1]
     assert loaded.rectangle_edit_mode == "normal"
+    assert loaded.hotkey_hold == default_hotkey_hold()
+
+
+def test_vector_and_fill_settings_are_normalized(monkeypatch, tmp_path):
+    path = tmp_path / "settings.json"
+    _use_settings_file(monkeypatch, path)
+    path.write_text(json.dumps({
+        "settings_version": 7,
+        "vector_eraser_mode": "unknown",
+        "vector_simplify_amount": 140,
+        "vector_redraw_opacity_max": -1,
+        "fill_gap_threshold": -4,
+        "fill_area_mode": "triangle",
+        "fill_mode": "other",
+    }), encoding="utf-8")
+    loaded = load_settings()
+    assert loaded.settings_version == 11
+    assert loaded.vector_eraser_mode == "stroke"
+    assert loaded.vector_simplify_amount == 100
+    assert loaded.vector_redraw_opacity_max == 0
+    assert loaded.fill_gap_threshold == 0
+    assert loaded.fill_area_mode == "round"
+    assert loaded.fill_mode == "normal"
+
+
+def test_settings_v9_normalizes_splitter_sizes(monkeypatch, tmp_path):
+    path = tmp_path / "settings.json"
+    _use_settings_file(monkeypatch, path)
+    path.write_text(json.dumps({
+        "settings_version": 8,
+        "ui_splitter_sizes": {
+            "sidebar_workspace": [260, 1100],
+            "tools_colors": [-20, 440],
+            "ribbon_canvas": ["180", "720"],
+            "unknown": [1, 2],
+        },
+    }), encoding="utf-8")
+
+    loaded = load_settings()
+
+    assert loaded.settings_version == 11
+    assert loaded.ui_splitter_sizes == {
+        "sidebar_workspace": [260, 1100],
+        "tools_colors": [0, 440],
+        "ribbon_canvas": [180, 720],
+    }
+    assert {"fill", "vector_redraw", "vector_connect", "vector_simplify"} <= (
+        loaded.hotkeys.keys()
+    )
+    assert loaded.hotkeys["insert_page_gap"] == ""
+    assert loaded.hotkey_hold["insert_page_gap"] is False
 
 
 def test_rectangle_edit_mode_preserves_valid_value_and_clamps_invalid(

@@ -4,12 +4,14 @@ from __future__ import annotations
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QFontDatabase
 from PySide6.QtWidgets import (
-    QCheckBox, QComboBox, QDoubleSpinBox, QFormLayout, QFrame,
-    QGridLayout, QHBoxLayout, QInputDialog, QLabel, QLineEdit, QMessageBox, QPushButton,
-    QSlider, QToolButton, QVBoxLayout, QWidget,
+    QCheckBox, QComboBox, QDoubleSpinBox, QFrame, QGridLayout, QHBoxLayout,
+    QInputDialog, QLabel, QLineEdit, QMenu, QMessageBox, QPushButton, QSlider,
+    QToolButton, QVBoxLayout, QWidget, QWidgetAction,
 )
 
-from comic_editor.core.models import RasterObject, TextObject
+from comic_editor.core.models import (
+    RasterObject, TextObject, VectorDrawingObject, VectorFillObject,
+)
 from comic_editor.core.settings import TextPreset
 
 
@@ -27,6 +29,8 @@ class ContextInspector(QFrame):
         self.settings = settings
         self._save_settings = save_settings_callback
         self._updating = False
+        self._underlay_drag_before: dict | None = None
+        self._underlay_drag_object_id = ""
         self._alignment_buttons: dict[tuple[str, str], QToolButton] = {}
         self.setObjectName("contextInspector")
         self.setStyleSheet(
@@ -59,11 +63,13 @@ class ContextInspector(QFrame):
         header.addWidget(self.preset_controls)
         outer.addLayout(header)
 
-        name_row = QHBoxLayout()
+        self.name_row = QWidget()
+        name_row = QHBoxLayout(self.name_row)
+        name_row.setContentsMargins(0, 0, 0, 0)
         name_row.addWidget(QLabel("Name"))
         self.name = QLineEdit()
         name_row.addWidget(self.name, 1)
-        outer.addLayout(name_row)
+        outer.addWidget(self.name_row)
 
         common = QHBoxLayout()
         self.visible = QCheckBox("Visible")
@@ -76,32 +82,96 @@ class ContextInspector(QFrame):
         common.addWidget(QLabel("Opacity"))
         common.addWidget(self.opacity)
         outer.addLayout(common)
+        self.ignore_parent_mask = QCheckBox("Ignore direct parent mask")
+        self.ignore_parent_mask.setToolTip(
+            "Allow this drawing and its children outside its direct parent "
+            "shape while retaining higher ancestor masks."
+        )
+        outer.addWidget(self.ignore_parent_mask)
+
+        self.underlay_row = QWidget()
+        underlay_layout = QHBoxLayout(self.underlay_row)
+        underlay_layout.setContentsMargins(0, 0, 0, 0)
+        underlay_layout.addWidget(QLabel("Show underlay"))
+        self.underlay = QSlider(Qt.Horizontal)
+        self.underlay.setRange(0, 100)
+        self.underlay.setToolTip(
+            "Reveal the complete selected drawing above shape masks while "
+            "reducing its normal in-place copy."
+        )
+        underlay_layout.addWidget(self.underlay, 1)
+        self.underlay_value = QLabel("0%")
+        self.underlay_value.setMinimumWidth(36)
+        self.underlay_value.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        underlay_layout.addWidget(self.underlay_value)
+        outer.addWidget(self.underlay_row)
 
         self.text_panel = QWidget()
-        text_form = QFormLayout(self.text_panel)
-        text_form.setContentsMargins(0, 0, 0, 0)
+        text_layout = QVBoxLayout(self.text_panel)
+        text_layout.setContentsMargins(0, 0, 0, 0)
+        text_layout.setSpacing(4)
+        font_row = QHBoxLayout()
+        font_row.addWidget(QLabel("Font"))
         self.font_family = QComboBox()
         self.font_family.addItems(QFontDatabase.families())
+        font_row.addWidget(self.font_family, 1)
+        text_layout.addLayout(font_row)
+
+        metrics_row = QHBoxLayout()
+        metrics_row.setSpacing(4)
+        metrics_row.addWidget(QLabel("Size"))
         self.font_size = QDoubleSpinBox()
         self.font_size.setRange(6, 288)
+        self.font_size.setMaximumWidth(72)
+        metrics_row.addWidget(self.font_size)
         self.bold = QCheckBox("Bold")
         self.italic = QCheckBox("Italic")
-        style_row = QWidget()
-        style_layout = QHBoxLayout(style_row)
-        style_layout.setContentsMargins(0, 0, 0, 0)
-        style_layout.addWidget(self.bold)
-        style_layout.addWidget(self.italic)
+        metrics_row.addWidget(self.bold)
+        metrics_row.addWidget(self.italic)
+        metrics_row.addWidget(QLabel("Kerning"))
         self.kerning = QDoubleSpinBox()
         self.kerning.setRange(-20, 100)
+        self.kerning.setMaximumWidth(72)
+        metrics_row.addWidget(self.kerning)
+        text_layout.addLayout(metrics_row)
+
+        layout_row = QHBoxLayout()
+        layout_row.addWidget(QLabel("Layout"))
         self.layout_mode = QComboBox()
         self.layout_mode.addItem("Strict to parent", "strict")
         self.layout_mode.addItem("Free transform", "free")
+        layout_row.addWidget(self.layout_mode, 1)
+        self.align_button = QToolButton()
+        self.align_button.setText("Align")
+        self.align_button.setPopupMode(QToolButton.InstantPopup)
+        self.align_menu = QMenu(self.align_button)
+        self.align_button.setMenu(self.align_menu)
+        layout_row.addWidget(self.align_button)
+        text_layout.addLayout(layout_row)
+
+        self.margin_row = QWidget()
+        margin_layout = QHBoxLayout(self.margin_row)
+        margin_layout.setContentsMargins(0, 0, 0, 0)
+        margin_layout.addWidget(QLabel("Margin"))
         self.margin = QDoubleSpinBox()
         self.margin.setRange(0, 500)
         self.margin.setSuffix(" px")
+        margin_layout.addWidget(self.margin, 1)
+        text_layout.addWidget(self.margin_row)
+
+        self.geometry_reference_row = QWidget()
+        reference_layout = QHBoxLayout(self.geometry_reference_row)
+        reference_layout.setContentsMargins(0, 0, 0, 0)
+        reference_layout.addWidget(QLabel("Shape reference"))
+        self.geometry_reference = QComboBox()
+        self.geometry_reference.addItem("Direct parent", "direct")
+        self.geometry_reference.addItem("Closest compound", "compound")
+        reference_layout.addWidget(self.geometry_reference, 1)
+        outer.addWidget(self.geometry_reference_row)
+
         self.alignment_widget = QWidget()
         alignment_grid = QGridLayout(self.alignment_widget)
-        alignment_grid.setContentsMargins(0, 0, 0, 0)
+        alignment_grid.setContentsMargins(5, 5, 5, 5)
         alignment_grid.setSpacing(2)
         for row, vertical in enumerate(("top", "middle", "bottom")):
             for column, horizontal in enumerate(("left", "center", "right")):
@@ -115,13 +185,9 @@ class ContextInspector(QFrame):
                 )
                 alignment_grid.addWidget(button, row, column)
                 self._alignment_buttons[(horizontal, vertical)] = button
-        text_form.addRow("Font", self.font_family)
-        text_form.addRow("Size", self.font_size)
-        text_form.addRow("Style", style_row)
-        text_form.addRow("Kerning", self.kerning)
-        text_form.addRow("Layout", self.layout_mode)
-        text_form.addRow("Align", self.alignment_widget)
-        text_form.addRow("Margin", self.margin)
+        alignment_action = QWidgetAction(self.align_menu)
+        alignment_action.setDefaultWidget(self.alignment_widget)
+        self.align_menu.addAction(alignment_action)
         outer.addWidget(self.text_panel)
 
         self.transform_panel = QWidget()
@@ -131,11 +197,7 @@ class ContextInspector(QFrame):
         self.transform_mode = QComboBox()
         self.transform_mode.addItem("Free Projective", "free")
         self.transform_mode.addItem("Uniform", "uniform")
-        self.handle_snap = QCheckBox("Handle Snap")
-        self.undo_transform = QPushButton("Undo Transform")
         transform_row.addWidget(self.transform_mode)
-        transform_row.addWidget(self.handle_snap)
-        transform_row.addWidget(self.undo_transform)
         outer.addWidget(self.transform_panel)
 
         self.raster_tool_panel = QWidget()
@@ -174,12 +236,13 @@ class ContextInspector(QFrame):
         brush_row.addStretch(1)
         raster_layout.addLayout(brush_row)
         outer.addWidget(self.raster_tool_panel)
-        self.setFixedWidth(470)
+        self.setFixedWidth(390)
 
         for control, signal in (
             (self.visible, self.visible.toggled),
             (self.opacity_lock, self.opacity_lock.toggled),
             (self.opacity, self.opacity.valueChanged),
+            (self.ignore_parent_mask, self.ignore_parent_mask.toggled),
             (self.font_family, self.font_family.currentTextChanged),
             (self.font_size, self.font_size.valueChanged),
             (self.bold, self.bold.toggled),
@@ -187,12 +250,15 @@ class ContextInspector(QFrame):
             (self.kerning, self.kerning.valueChanged),
             (self.layout_mode, self.layout_mode.currentIndexChanged),
             (self.margin, self.margin.valueChanged),
+            (self.geometry_reference,
+             self.geometry_reference.currentIndexChanged),
         ):
             signal.connect(self._apply)
         self.name.editingFinished.connect(self._apply)
+        self.underlay.sliderPressed.connect(self._begin_underlay_drag)
+        self.underlay.valueChanged.connect(self._underlay_changed)
+        self.underlay.sliderReleased.connect(self._finish_underlay_drag)
         self.transform_mode.currentIndexChanged.connect(self._transform_settings_changed)
-        self.handle_snap.toggled.connect(self._transform_settings_changed)
-        self.undo_transform.clicked.connect(self._undo_raster_transform)
         self.pencil_preset_combo.currentTextChanged.connect(
             self.pencilPresetSelected.emit
         )
@@ -278,12 +344,45 @@ class ContextInspector(QFrame):
             return
         self._updating = True
         entity = chapter.objects[self.canvas.selected_id]
-        self.title.setText(entity.object_type.title())
+        if isinstance(entity, RasterObject):
+            self._updating = False
+            self.hide()
+            return
+        self.title.setText(
+            entity.display_name
+            if isinstance(entity, TextObject)
+            else (
+                "Vector Drawing"
+                if isinstance(entity, VectorDrawingObject)
+                else "Vector Fill"
+                if isinstance(entity, VectorFillObject)
+                else entity.object_type.title()
+            )
+        )
         self.opacity_lock.show()
         self.opacity_lock.setChecked(entity.opacity_locked)
         self.text_panel.setVisible(isinstance(entity, TextObject))
         self.preset_controls.setVisible(isinstance(entity, TextObject))
-        self.transform_panel.show()
+        self.name_row.setVisible(not isinstance(entity, TextObject))
+        self.transform_panel.setVisible(
+            isinstance(entity, RasterObject)
+            or (
+                isinstance(entity, TextObject)
+                and entity.layout_mode == "free"
+            )
+        )
+        compound_parent = self.canvas.chapter.closest_compound_ancestor(
+            entity.parent_layer_id, include_self=True
+        )
+        self.geometry_reference_row.setVisible(
+            isinstance(entity, (RasterObject, TextObject))
+            and compound_parent is not None
+        )
+        self.geometry_reference.setCurrentIndex(max(
+            0, self.geometry_reference.findData(
+                entity.geometry_reference
+            )
+        ))
         if isinstance(entity, TextObject):
             self._refresh_presets()
             self.font_family.setCurrentText(entity.font_family)
@@ -296,20 +395,15 @@ class ContextInspector(QFrame):
             )
             self.margin.setValue(entity.margin)
             strict = entity.layout_mode == "strict"
-            self.alignment_widget.setVisible(strict)
-            self.margin.setVisible(strict)
+            self.margin_row.setVisible(strict)
             for key, button in self._alignment_buttons.items():
                 button.setChecked(key == (
                     entity.horizontal_alignment, entity.vertical_alignment
                 ))
-        self.undo_transform.setVisible(isinstance(entity, RasterObject))
-        self.undo_transform.setEnabled(self.canvas.can_undo_raster_transform())
-        raster_tool = (
-            isinstance(entity, RasterObject)
-            and self.canvas.tool.value in {
-                "raster_pencil", "raster_eraser",
-            }
-        )
+        # Drawing-tool controls live in the persistent ribbon.  Keep the old
+        # child widgets as compatibility signal sources for older settings
+        # tests/plugins, but never show them in the floating object inspector.
+        raster_tool = False
         self.raster_tool_panel.setVisible(raster_tool)
         if raster_tool:
             pencil = self.canvas.tool.value == "raster_pencil"
@@ -324,10 +418,21 @@ class ContextInspector(QFrame):
         self.visible.setChecked(entity.visible)
         self.opacity.setValue(round(entity.opacity * 100))
         self.opacity.setEnabled(not getattr(entity, "opacity_locked", False))
+        self.ignore_parent_mask.setVisible(
+            isinstance(entity, (RasterObject, VectorDrawingObject))
+        )
+        self.ignore_parent_mask.setChecked(
+            bool(getattr(entity, "ignore_parent_mask", False))
+        )
+        drawing = isinstance(entity, (RasterObject, VectorDrawingObject))
+        self.underlay_row.setVisible(drawing)
+        self.underlay.setValue(round(
+            float(getattr(entity, "underlay_opacity", 0.0)) * 100
+        ))
+        self.underlay_value.setText(f"{self.underlay.value()}%")
         self.transform_mode.setCurrentIndex(
             max(0, self.transform_mode.findData(self.settings.transform_mode))
         )
-        self.handle_snap.setChecked(self.settings.transform_snap_to_grid)
         self._updating = False
         self.adjustSize()
         self.reposition()
@@ -355,6 +460,7 @@ class ContextInspector(QFrame):
             return
         for key, button in self._alignment_buttons.items():
             button.setChecked(key == (horizontal, vertical))
+        self.align_menu.close()
         self._apply()
 
     def _apply(self, *args) -> None:
@@ -367,13 +473,23 @@ class ContextInspector(QFrame):
         chapter = self.canvas.chapter
         before = chapter.to_dict()
         entity = chapter.objects[self.canvas.selected_id]
-        entity.name = self.name.text().strip() or entity.name
+        if not isinstance(entity, TextObject):
+            entity.name = self.name.text().strip() or entity.name
         entity.visible = self.visible.isChecked()
+        if isinstance(entity, (RasterObject, VectorDrawingObject)):
+            entity.ignore_parent_mask = self.ignore_parent_mask.isChecked()
         entity.opacity_locked = self.opacity_lock.isChecked()
         entity.opacity = (
             chapter.layers[entity.parent_layer_id].opacity
             if entity.opacity_locked else self.opacity.value() / 100
         )
+        if isinstance(entity, (RasterObject, TextObject)):
+            reference = self.geometry_reference.currentData()
+            entity.geometry_reference = (
+                reference
+                if reference in {"direct", "compound"}
+                else "direct"
+            )
         if isinstance(entity, TextObject):
             entity.font_family = self.font_family.currentText()
             entity.font_size = self.font_size.value()
@@ -404,7 +520,6 @@ class ContextInspector(QFrame):
         if self._updating:
             return
         self.settings.transform_mode = self.transform_mode.currentData()
-        self.settings.transform_snap_to_grid = self.handle_snap.isChecked()
         self._save_settings(self.settings)
         self.canvas.update()
 
@@ -419,7 +534,6 @@ class ContextInspector(QFrame):
             layout_mode=entity.layout_mode,
             horizontal_alignment=entity.horizontal_alignment,
             vertical_alignment=entity.vertical_alignment, margin=entity.margin,
-            transform_snap=self.settings.transform_snap_to_grid,
         )
 
     def _refresh_presets(self) -> None:
@@ -447,7 +561,6 @@ class ContextInspector(QFrame):
         ):
             setattr(entity, key, getattr(preset, key))
         self.settings.active_text_preset = preset.name
-        self.settings.transform_snap_to_grid = preset.transform_snap
         self._save_settings(self.settings)
         after = self.canvas.chapter.to_dict()
         if before != after:
@@ -514,6 +627,56 @@ class ContextInspector(QFrame):
         self._save_settings(self.settings)
         self.refresh()
 
-    def _undo_raster_transform(self) -> None:
-        if self.canvas.undo_raster_transform():
-            self.refresh()
+    def _begin_underlay_drag(self) -> None:
+        if (
+            self._updating or self.canvas.chapter is None
+            or self.canvas.selected_kind != "object"
+        ):
+            return
+        entity = self.canvas.chapter.objects.get(self.canvas.selected_id)
+        if not isinstance(entity, (RasterObject, VectorDrawingObject)):
+            return
+        self._underlay_drag_before = self.canvas.chapter.to_dict()
+        self._underlay_drag_object_id = entity.object_id
+
+    def _underlay_changed(self, value: int) -> None:
+        self.underlay_value.setText(f"{int(value)}%")
+        if (
+            self._updating or self.canvas.chapter is None
+            or self.canvas.selected_kind != "object"
+        ):
+            return
+        entity = self.canvas.chapter.objects.get(self.canvas.selected_id)
+        if not isinstance(entity, (RasterObject, VectorDrawingObject)):
+            return
+        before = (
+            None if self._underlay_drag_before is not None
+            else self.canvas.chapter.to_dict()
+        )
+        entity.underlay_opacity = max(0.0, min(1.0, value / 100.0))
+        self.canvas.documentChanged.emit(None)
+        self.canvas.update()
+        if before is not None:
+            after = self.canvas.chapter.to_dict()
+            if before != after:
+                self.canvas.push_model_change(
+                    before, after, "Change drawing underlay"
+                )
+                self.changed.emit()
+
+    def _finish_underlay_drag(self) -> None:
+        before = self._underlay_drag_before
+        object_id = self._underlay_drag_object_id
+        self._underlay_drag_before = None
+        self._underlay_drag_object_id = ""
+        if before is None or self.canvas.chapter is None:
+            return
+        if object_id not in self.canvas.chapter.objects:
+            return
+        after = self.canvas.chapter.to_dict()
+        if before != after:
+            self.canvas.push_model_change(
+                before, after, "Change drawing underlay"
+            )
+            self.changed.emit()
+        self.canvas.interactionFinished.emit()

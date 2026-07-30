@@ -12,6 +12,13 @@ from comic_editor.ui.main_window import MainWindow
 
 def main() -> int:
     QCoreApplication.setAttribute(Qt.AA_CompressTabletEvents, False)
+    synthesize = getattr(
+        Qt.ApplicationAttribute,
+        "AA_SynthesizeMouseForUnhandledTabletEvents",
+        None,
+    )
+    if synthesize is not None:
+        QCoreApplication.setAttribute(synthesize, True)
     surface = QSurfaceFormat()
     surface.setRenderableType(QSurfaceFormat.OpenGL)
     surface.setVersion(3, 3)

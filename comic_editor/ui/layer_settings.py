@@ -5,7 +5,7 @@ from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (
     QCheckBox, QColorDialog, QComboBox, QDoubleSpinBox, QFormLayout,
-    QGroupBox, QHBoxLayout, QLabel, QLineEdit, QPushButton, QSlider,
+    QGroupBox, QHBoxLayout, QLabel, QLineEdit, QMessageBox, QPushButton, QSlider,
     QSpinBox, QWidget,
 )
 
@@ -21,6 +21,7 @@ class LayerSettingsPanel(QGroupBox):
         self.settings = settings
         self._save_settings = save_settings_callback
         self._updating = False
+        self._thickness_drag_before: dict | None = None
         self.form = QFormLayout(self)
         self.form.setContentsMargins(8, 8, 8, 8)
         self.form.setSpacing(5)
@@ -41,6 +42,25 @@ class LayerSettingsPanel(QGroupBox):
         common_layout.addWidget(QLabel("Opacity"))
         common_layout.addWidget(self.opacity, 1)
         self.form.addRow(common)
+        self.ignore_parent_mask = QCheckBox("Ignore direct parent mask")
+        self.ignore_parent_mask.setToolTip(
+            "Allow this layer and its descendants outside its direct parent "
+            "shape while retaining higher ancestor masks."
+        )
+        self.form.addRow(self.ignore_parent_mask)
+
+        self.compound_enabled = QCheckBox("Compound shape")
+        self.form.addRow(self.compound_enabled)
+        self.compound_operation = QComboBox()
+        self.compound_operation.addItem("Add", "add")
+        self.compound_operation.addItem("Subtract", "subtract")
+        self.compound_operation.addItem("Ignore", "ignore")
+        self.compound_operation_label = QLabel("Compound operation")
+        self.form.addRow(
+            self.compound_operation_label, self.compound_operation
+        )
+        self.flatten_compound = QPushButton("Flatten Compound")
+        self.form.addRow(self.flatten_compound)
 
         self.rectangle_mode = QComboBox()
         self.rectangle_mode.addItem("Normal transform", "normal")
@@ -59,17 +79,33 @@ class LayerSettingsPanel(QGroupBox):
         self.fill_row = fill_row
         self.form.addRow(fill_row)
 
-        self.base_thickness = QDoubleSpinBox()
-        self.base_thickness.setRange(0.1, 1000)
+        self.base_thickness_row = QWidget()
+        base_thickness_layout = QHBoxLayout(self.base_thickness_row)
+        base_thickness_layout.setContentsMargins(0, 0, 0, 0)
+        self.base_thickness_slider = QSlider(Qt.Horizontal)
+        self.base_thickness_slider.setRange(1, 1000)
+        self.base_thickness = QSpinBox()
+        self.base_thickness.setRange(1, 1000)
         self.base_thickness.setSuffix(" px")
+        base_thickness_layout.addWidget(self.base_thickness_slider, 1)
+        base_thickness_layout.addWidget(self.base_thickness)
         self.base_thickness_label = QLabel("Stroke thickness")
-        self.form.addRow(self.base_thickness_label, self.base_thickness)
+        self.form.addRow(
+            self.base_thickness_label, self.base_thickness_row
+        )
 
-        self.border_width = QDoubleSpinBox()
-        self.border_width.setRange(0, 200)
+        self.border_width_row = QWidget()
+        border_width_layout = QHBoxLayout(self.border_width_row)
+        border_width_layout.setContentsMargins(0, 0, 0, 0)
+        self.border_width_slider = QSlider(Qt.Horizontal)
+        self.border_width_slider.setRange(0, 500)
+        self.border_width = QSpinBox()
+        self.border_width.setRange(0, 500)
         self.border_width.setSuffix(" px")
+        border_width_layout.addWidget(self.border_width_slider, 1)
+        border_width_layout.addWidget(self.border_width)
         self.border_width_label = QLabel("Outline")
-        self.form.addRow(self.border_width_label, self.border_width)
+        self.form.addRow(self.border_width_label, self.border_width_row)
         self.border_color = QPushButton("Color")
         self.border_color.setProperty("color", "#111111")
         self.border_color_label = QLabel("Outline color")
@@ -107,10 +143,36 @@ class LayerSettingsPanel(QGroupBox):
             self.grid_size.valueChanged,
             self.grid_divisions.valueChanged,
             self.fill_enabled.toggled,
-            self.base_thickness.valueChanged,
-            self.border_width.valueChanged,
+            self.compound_enabled.toggled,
+            self.compound_operation.currentIndexChanged,
+            self.ignore_parent_mask.toggled,
         ):
             signal.connect(self._apply)
+        self.base_thickness.valueChanged.connect(
+            lambda value: self._thickness_spin_changed(
+                self.base_thickness_slider, value
+            )
+        )
+        self.border_width.valueChanged.connect(
+            lambda value: self._thickness_spin_changed(
+                self.border_width_slider, value
+            )
+        )
+        self.base_thickness_slider.valueChanged.connect(
+            lambda value: self._thickness_slider_changed(
+                self.base_thickness, value
+            )
+        )
+        self.border_width_slider.valueChanged.connect(
+            lambda value: self._thickness_slider_changed(
+                self.border_width, value
+            )
+        )
+        for slider in (
+            self.base_thickness_slider, self.border_width_slider,
+        ):
+            slider.sliderPressed.connect(self._begin_thickness_drag)
+            slider.sliderReleased.connect(self._finish_thickness_drag)
         self.name.editingFinished.connect(self._apply)
         self.rectangle_mode.currentIndexChanged.connect(
             self._rectangle_mode_changed
@@ -121,6 +183,7 @@ class LayerSettingsPanel(QGroupBox):
         self.border_color.clicked.connect(
             lambda: self._choose_color(self.border_color)
         )
+        self.flatten_compound.clicked.connect(self._flatten_compound)
         self.refresh()
 
     @staticmethod
@@ -144,6 +207,14 @@ class LayerSettingsPanel(QGroupBox):
     def _set_pair_visible(label: QWidget, field: QWidget, visible: bool) -> None:
         label.setVisible(visible)
         field.setVisible(visible)
+
+    @staticmethod
+    def _set_thickness_visible(
+        label: QWidget, row: QWidget, slider: QWidget, field: QWidget,
+        visible: bool,
+    ) -> None:
+        for widget in (label, row, slider, field):
+            widget.setVisible(visible)
 
     @staticmethod
     def _layer_title(layer) -> str:
@@ -170,9 +241,11 @@ class LayerSettingsPanel(QGroupBox):
             self.type_label.setText("No active layer")
             for widget in (
                 self.name, self.visible, self.opacity, self.rectangle_mode,
-                self.fill_row, self.base_thickness, self.border_width,
+                self.fill_row, self.base_thickness_row, self.border_width_row,
                 self.border_color, self.grid_override, self.grid_size,
-                self.grid_divisions,
+                self.grid_divisions, self.compound_enabled,
+                self.compound_operation, self.flatten_compound,
+                self.ignore_parent_mask,
             ):
                 widget.setEnabled(False)
             self._updating = False
@@ -180,18 +253,41 @@ class LayerSettingsPanel(QGroupBox):
 
         for widget in (
             self.name, self.visible, self.opacity, self.rectangle_mode,
-            self.fill_row, self.base_thickness, self.border_width,
+            self.fill_row, self.base_thickness_row, self.border_width_row,
             self.border_color, self.grid_override, self.grid_size,
-            self.grid_divisions,
+            self.grid_divisions, self.compound_enabled,
+            self.compound_operation, self.flatten_compound,
+            self.ignore_parent_mask,
         ):
             widget.setEnabled(True)
         self.type_label.setText(self._layer_title(layer))
         self.name.setText(layer.name)
         self.visible.setChecked(layer.visible)
         self.opacity.setValue(round(layer.opacity * 100))
+        self.ignore_parent_mask.setVisible(
+            not layer.is_page and layer.layer_kind != "fill"
+        )
+        self.ignore_parent_mask.setChecked(layer.ignore_parent_mask)
 
         is_fill = layer.layer_kind == "fill"
         is_open = layer.layer_kind == "open_shape"
+        compound_capable = not layer.is_page and not is_fill
+        self.compound_enabled.setVisible(compound_capable)
+        self.compound_enabled.setChecked(layer.compound_enabled)
+        compound_parent = (
+            chapter.closest_compound_ancestor(layer.layer_id)
+            if not layer.is_page else None
+        )
+        self._set_pair_visible(
+            self.compound_operation_label, self.compound_operation,
+            compound_parent is not None,
+        )
+        self.compound_operation.setCurrentIndex(max(
+            0, self.compound_operation.findData(layer.compound_operation)
+        ))
+        self.flatten_compound.setVisible(
+            compound_capable and layer.compound_enabled
+        )
         is_rectangle = (
             layer.bound is not None
             and layer.bound.primitive == "rectangle"
@@ -212,17 +308,26 @@ class LayerSettingsPanel(QGroupBox):
         self._set_color_button(
             self.fill_color, layer.fill_color or "#ffffff"
         )
-        self._set_pair_visible(
-            self.base_thickness_label, self.base_thickness, is_open
+        self._set_thickness_visible(
+            self.base_thickness_label, self.base_thickness_row,
+            self.base_thickness_slider, self.base_thickness, is_open,
         )
-        self.base_thickness.setValue(layer.shape_style.base_thickness)
-        self._set_pair_visible(
-            self.border_width_label, self.border_width, not is_fill
+        base_thickness = round(layer.shape_style.base_thickness)
+        self.base_thickness.setValue(base_thickness)
+        self.base_thickness_slider.setValue(base_thickness)
+        self._set_thickness_visible(
+            self.border_width_label, self.border_width_row,
+            self.border_width_slider, self.border_width, not is_fill,
         )
         self._set_pair_visible(
             self.border_color_label, self.border_color, not is_fill
         )
-        self.border_width.setValue(layer.border_width)
+        border_maximum = 40 if layer.is_page else 500
+        self.border_width_slider.setRange(0, border_maximum)
+        self.border_width.setRange(0, border_maximum)
+        border_width = round(layer.border_width)
+        self.border_width.setValue(border_width)
+        self.border_width_slider.setValue(border_width)
         self._set_color_button(self.border_color, layer.border_color)
 
         selected_node = (
@@ -268,7 +373,42 @@ class LayerSettingsPanel(QGroupBox):
         self._save_settings(self.settings)
         self.canvas.update()
 
-    def _apply(self, *args) -> None:
+    def _thickness_spin_changed(
+        self, slider: QSlider, value: int,
+    ) -> None:
+        if slider.value() != value:
+            slider.blockSignals(True)
+            slider.setValue(value)
+            slider.blockSignals(False)
+        self._apply()
+
+    def _thickness_slider_changed(
+        self, field: QSpinBox, value: int,
+    ) -> None:
+        if field.value() != value:
+            field.blockSignals(True)
+            field.setValue(value)
+            field.blockSignals(False)
+        self._apply(push_undo=self._thickness_drag_before is None)
+
+    def _begin_thickness_drag(self) -> None:
+        if self._updating or self.canvas.chapter is None:
+            return
+        self._thickness_drag_before = self.canvas.chapter.to_dict()
+
+    def _finish_thickness_drag(self) -> None:
+        before, self._thickness_drag_before = (
+            self._thickness_drag_before, None
+        )
+        if before is None or self.canvas.chapter is None:
+            return
+        after = self.canvas.chapter.to_dict()
+        if before != after:
+            self.canvas.push_model_change(
+                before, after, "Edit layer settings"
+            )
+
+    def _apply(self, *args, push_undo: bool = True) -> None:
         chapter = self.canvas.chapter
         if self._updating or chapter is None:
             return
@@ -278,6 +418,8 @@ class LayerSettingsPanel(QGroupBox):
         before = chapter.to_dict()
         layer.name = self.name.text().strip() or layer.name
         layer.visible = self.visible.isChecked()
+        if not layer.is_page and layer.layer_kind != "fill":
+            layer.ignore_parent_mask = self.ignore_parent_mask.isChecked()
         chapter.set_layer_opacity(layer.layer_id, self.opacity.value() / 100)
         layer.fill_color = (
             str(self.fill_color.property("color"))
@@ -289,6 +431,10 @@ class LayerSettingsPanel(QGroupBox):
             layer.shape_style.base_thickness = self.base_thickness.value()
             layer.border_width = self.border_width.value()
             layer.border_color = str(self.border_color.property("color"))
+            layer.compound_enabled = self.compound_enabled.isChecked()
+            operation = self.compound_operation.currentData()
+            if operation in {"add", "subtract", "ignore"}:
+                layer.compound_operation = operation
         if layer.layer_kind != "fill" and self.grid_override.isChecked():
             if layer.grid_override is None:
                 inherited = (
@@ -305,10 +451,35 @@ class LayerSettingsPanel(QGroupBox):
             layer.grid_override = None
         after = chapter.to_dict()
         if before != after:
-            self.canvas.push_model_change(
-                before, after, "Edit layer settings"
-            )
+            if push_undo:
+                self.canvas.push_model_change(
+                    before, after, "Edit layer settings"
+                )
             self.canvas.documentChanged.emit(None)
             self.canvas.hierarchyChanged.emit()
             self.changed.emit()
         self.canvas.update()
+
+    def _flatten_compound(self) -> None:
+        chapter = self.canvas.chapter
+        layer = (
+            chapter.layers.get(self.canvas.active_layer_id)
+            if chapter is not None else None
+        )
+        if layer is None or not layer.compound_enabled:
+            return
+        answer = QMessageBox.question(
+            self, "Flatten Compound Shape",
+            "Compile this compound and remove its contributing construction "
+            "layers? This can be undone.",
+        )
+        if answer != QMessageBox.Yes:
+            return
+        if not self.canvas.flatten_compound_layer(layer.layer_id):
+            QMessageBox.warning(
+                self, "Cannot Flatten",
+                "The calculated compound result is empty.",
+            )
+            return
+        self.changed.emit()
+        self.refresh()

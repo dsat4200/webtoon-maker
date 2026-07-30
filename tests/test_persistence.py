@@ -89,3 +89,25 @@ def test_interrupted_multifile_save_restores_last_good_revision(tmp_path):
     assert recovered.name == "Good"
     assert [key for key, _ in recovered_tiles.iter_tiles(raster.object_id)] == [(0, 0)]
     assert not (root / ".save_pending").exists()
+
+
+def test_legacy_series_can_seed_primary_from_global_brush_color(tmp_path):
+    repository = SeriesRepository(tmp_path / "legacy")
+    repository.root.mkdir()
+    repository.series_path.write_text(
+        json.dumps({
+            "schema_version": 6,
+            "id": "legacy-series",
+            "name": "Legacy",
+            "chapters": [],
+        }),
+        encoding="utf-8",
+    )
+
+    loaded = repository.load_series(legacy_primary_color="#80446688")
+
+    assert loaded.primary_color == "#80446688"
+    assert loaded.secondary_color == "#FFFFFFFF"
+    assert [swatch.color for swatch in loaded.palettes[0].swatches] == [
+        "#FF000000", "#FFFFFFFF",
+    ]

@@ -6,28 +6,42 @@ import time
 from pathlib import Path
 
 from PySide6.QtCore import (
-    QItemSelection, QItemSelectionModel, QModelIndex, QSignalBlocker, QTimer, Qt,
-    Signal,
+    QCoreApplication, QEvent, QItemSelection, QItemSelectionModel, QModelIndex,
+    QPointF, QSignalBlocker, QTimer, Qt, Signal,
 )
-from PySide6.QtGui import QAction, QCloseEvent, QCursor, QKeySequence, QShortcut
+from PySide6.QtGui import (
+    QAction, QCloseEvent, QCursor, QKeySequence, QMouseEvent, QShortcut,
+)
 from PySide6.QtWidgets import (
     QApplication, QCheckBox, QComboBox, QDockWidget, QFileDialog, QHBoxLayout,
     QDialog, QDialogButtonBox, QFormLayout, QHeaderView, QInputDialog, QLabel,
-    QMainWindow, QMenu, QMessageBox, QPushButton, QSpinBox, QToolBar, QToolButton,
-    QToolTip, QTreeView, QVBoxLayout, QWidget,
+    QLineEdit, QMainWindow, QMenu, QMessageBox, QPlainTextEdit, QPushButton,
+    QScrollArea, QSizePolicy, QSpinBox, QSplitter, QTabWidget, QTextEdit,
+    QToolBar, QToolButton, QToolTip, QTreeView, QVBoxLayout, QWidget, QFrame,
 )
 
 from comic_editor.core.models import (
-    BoundGeometry, ChapterDocument, RasterObject, TextObject,
+    BoundGeometry, ChapterDocument, ColorPalette, PaletteSwatch,
+    RasterObject, TextObject, VectorDrawingObject, VectorFillObject,
 )
 from comic_editor.core.persistence import SeriesRepository
 from comic_editor.core.settings import load_settings, save_settings
 from comic_editor.ui.canvas import ToolKind, create_canvas
 from comic_editor.ui.inspector import ContextInspector
+from comic_editor.ui.color_picker import (
+    PaletteEditorWidget, PrimarySecondaryColorPanel, canonical_argb,
+)
 from comic_editor.ui.layer_settings import LayerSettingsPanel
 from comic_editor.ui.hotkeys_dialog import HotkeysDialog
+from comic_editor.ui.hotkeys import (
+    MODIFIER_LABELS, chord_keys, chord_text,
+)
 from comic_editor.ui.pencil_settings_dialog import PencilSettingsDialog
 from comic_editor.ui.preview import ChapterPreview
+from comic_editor.ui.ribbon import RibbonWidget
+from comic_editor.ui.tool_ribbon_pages import (
+    RasterObjectControls, ToolSettingsControls, VectorToolsControls,
+)
 from comic_editor.ui.tree_model import HierarchyModel
 
 
@@ -42,8 +56,10 @@ class CollapsibleToolCategory(QWidget):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(2)
         self.header = QToolButton(self)
+        self.header.setObjectName("shapeCategoryHeader")
         self.header.setText(title)
-        self.header.setCheckable(True)
+        self.header.setCheckable(False)
+        self.header.setAutoRaise(True)
         self.header.setArrowType(Qt.RightArrow)
         self.header.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
         layout.addWidget(self.header)
@@ -53,7 +69,10 @@ class CollapsibleToolCategory(QWidget):
         self.contents_layout.setSpacing(2)
         self.contents.hide()
         layout.addWidget(self.contents)
-        self.header.toggled.connect(self.setExpanded)
+        self._expanded = False
+        self.header.clicked.connect(
+            lambda checked=False: self.setExpanded(not self._expanded)
+        )
 
     def addTool(self, text: str) -> QToolButton:
         button = QToolButton(self.contents)
@@ -63,18 +82,55 @@ class CollapsibleToolCategory(QWidget):
         return button
 
     def isExpanded(self) -> bool:
-        return self.header.isChecked()
+        return self._expanded
 
     def setExpanded(self, expanded: bool) -> None:
         expanded = bool(expanded)
-        if self.header.isChecked() != expanded:
-            blocker = QSignalBlocker(self.header)
-            self.header.setChecked(expanded)
-            del blocker
+        if self._expanded == expanded:
+            return
+        self._expanded = expanded
         self.contents.setVisible(expanded)
         self.header.setArrowType(Qt.DownArrow if expanded else Qt.RightArrow)
         self.updateGeometry()
         self.expandedChanged.emit(expanded)
+
+
+class ScrollableToolPanel(QWidget):
+    """A vertically scrolling tool column with toolbar-compatible helpers."""
+
+    def __init__(self, parent: QWidget | None = None):
+        super().__init__(parent)
+        self.setObjectName("toolPanel")
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        self.scroll_area = QScrollArea(self)
+        self.scroll_area.setObjectName("toolPanelScroll")
+        self.scroll_area.setWidgetResizable(True)
+        self.scroll_area.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+        )
+        self.contents = QWidget(self.scroll_area)
+        self.contents.setObjectName("toolPanelContents")
+        self.contents_layout = QVBoxLayout(self.contents)
+        self.contents_layout.setContentsMargins(6, 6, 6, 6)
+        self.contents_layout.setSpacing(4)
+        self.contents_layout.addStretch(1)
+        self.scroll_area.setWidget(self.contents)
+        outer.addWidget(self.scroll_area)
+
+    def addWidget(self, widget: QWidget) -> QWidget:  # noqa: N802
+        self.contents_layout.insertWidget(
+            self.contents_layout.count() - 1, widget
+        )
+        return widget
+
+    def addSeparator(self) -> QFrame:  # noqa: N802
+        separator = QFrame(self.contents)
+        separator.setObjectName("toolPanelSeparator")
+        separator.setFrameShape(QFrame.Shape.HLine)
+        separator.setFrameShadow(QFrame.Shadow.Plain)
+        self.addWidget(separator)
+        return separator
 
 
 class MainWindow(QMainWindow):
@@ -129,19 +185,24 @@ class MainWindow(QMainWindow):
             self.recent_combo.addItem(Path(path).name, path)
         self.file_toolbar.addWidget(self.recent_combo)
 
-        self.tool_toolbar = QToolBar("Tools", self)
-        self.tool_toolbar.setMovable(False)
-        self.addToolBar(Qt.LeftToolBarArea, self.tool_toolbar)
+        self.tool_toolbar = ScrollableToolPanel(self)
+        self.tool_toolbar.setMinimumHeight(120)
         self.tool_buttons: dict[ToolKind, QToolButton] = {}
-        labels = {
-            ToolKind.OBJECT_SELECT: "Object Select",
-            ToolKind.RASTER_PENCIL: "Raster Pencil",
-            ToolKind.RASTER_ERASER: "Raster Eraser",
-            ToolKind.TEXT_EDIT: "Text Edit",
-            ToolKind.TRANSFORM: "Transform",
-            ToolKind.SHAPE_EDIT: "Shape Edit",
-        }
-        for tool, label in labels.items():
+        labels = [
+            (ToolKind.OBJECT_SELECT, "Object Select"),
+            (ToolKind.RASTER_PENCIL, "Pencil"),
+            (ToolKind.RASTER_ERASER, "Eraser"),
+        ]
+        fill_tool = getattr(ToolKind, "FILL", None)
+        if fill_tool is not None:
+            labels.append((fill_tool, "Fill"))
+        labels.extend([
+            (ToolKind.TEXT_EDIT, "Text Edit"),
+            (ToolKind.TRANSFORM, "Transform"),
+            (ToolKind.SHAPE_EDIT, "Shape Edit"),
+            (ToolKind.INSERT_PAGE_GAP, "Insert Page Gap"),
+        ])
+        for tool, label in labels:
             button = QToolButton()
             button.setText(label)
             button.setCheckable(True)
@@ -149,6 +210,18 @@ class MainWindow(QMainWindow):
             button.clicked.connect(lambda checked=False, selected=tool: self._activate_tool(selected))
             self.tool_toolbar.addWidget(button)
             self.tool_buttons[tool] = button
+        if fill_tool is not None:
+            self.fill_tool_button = self.tool_buttons[fill_tool]
+        else:
+            # Keeps the UI importable while a renderer without vector/fill
+            # support is being upgraded in-place.
+            self.fill_tool_button = QToolButton()
+            self.fill_tool_button.setText("Fill")
+            self.fill_tool_button.setCheckable(True)
+            self.fill_tool_button.clicked.connect(
+                lambda checked=False: self._activate_named_tool("FILL")
+            )
+            self.tool_toolbar.addWidget(self.fill_tool_button)
         self.shapes_category = CollapsibleToolCategory("Shapes")
         self.tool_toolbar.addWidget(self.shapes_category)
         self.shape_tool_buttons: dict[ToolKind, QToolButton] = {}
@@ -163,16 +236,36 @@ class MainWindow(QMainWindow):
                 self._activate_tool(selected)
             )
             self.shape_tool_buttons[tool] = option
+        self.drawing_selection_category = CollapsibleToolCategory(
+            "Drawing Selection"
+        )
+        self.tool_toolbar.addWidget(self.drawing_selection_category)
+        self.drawing_selection_buttons: dict[ToolKind, QToolButton] = {}
+        for label, tool in (
+            ("Rectangle Select", ToolKind.DRAW_SELECT_RECT),
+            ("Lasso Select", ToolKind.DRAW_SELECT_LASSO),
+            ("Stroke Select", ToolKind.DRAW_SELECT_STROKE),
+        ):
+            option = self.drawing_selection_category.addTool(label)
+            option.setCheckable(True)
+            option.clicked.connect(
+                lambda checked=False, selected=tool:
+                self._activate_tool(selected)
+            )
+            self.drawing_selection_buttons[tool] = option
         self.tool_toolbar.addSeparator()
         self.add_text_button = QToolButton()
         self.add_text_button.setText("Add Text")
         self.add_raster_button = QToolButton()
         self.add_raster_button.setText("Add Raster")
+        self.add_vector_button = QToolButton()
+        self.add_vector_button.setText("Add Vector Drawing")
         self.add_fill_button = QToolButton()
         self.add_fill_button.setText("Add Fill")
         self.tool_toolbar.addWidget(self.add_fill_button)
         self.tool_toolbar.addWidget(self.add_text_button)
         self.tool_toolbar.addWidget(self.add_raster_button)
+        self.tool_toolbar.addWidget(self.add_vector_button)
         self.tool_toolbar.addSeparator()
         self.reset_view_button = QToolButton()
         self.reset_view_button.setText("Reset View")
@@ -182,20 +275,142 @@ class MainWindow(QMainWindow):
         self.tool_toolbar.addWidget(self.tablet_mode)
         self.page_scope = QCheckBox("Select in page")
         self.page_scope.setChecked(self.settings.page_scope_select)
-        self.tool_toolbar.addWidget(self.page_scope)
+        # Kept as an attribute for compatibility with older integrations;
+        # entity selection now always searches the complete chapter.
+        self.page_scope.hide()
         self.snap_grid = QCheckBox("Snap to grid")
         self.snap_grid.setChecked(self.settings.snap_to_grid)
         self.tool_toolbar.addWidget(self.snap_grid)
 
-        center = QWidget()
-        center_layout = QHBoxLayout(center)
-        center_layout.setContentsMargins(0, 0, 0, 0)
-        center_layout.setSpacing(0)
+        self.tool_toolbar.addSeparator()
+
+        self.color_tabs = QTabWidget(self)
+        self.color_tabs.setObjectName("colorTabs")
+        self.color_tabs.setMinimumHeight(225)
+        picker_page = QWidget(self.color_tabs)
+        picker_layout = QVBoxLayout(picker_page)
+        picker_layout.setContentsMargins(4, 4, 4, 4)
+        self.color_panel = PrimarySecondaryColorPanel(
+            "#FF000000", "#FFFFFFFF", picker_page
+        )
+        self.color_panel.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding
+        )
+        self.color_panel.picker.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding
+        )
+        picker_layout.addWidget(self.color_panel)
+        self.color_tabs.addTab(picker_page, "Picker")
+
+        palette_page = QWidget(self.color_tabs)
+        palette_layout = QVBoxLayout(palette_page)
+        palette_layout.setContentsMargins(4, 4, 4, 4)
+        self.palette_editor = PaletteEditorWidget(palette_page)
+        self.palette_editor.setMinimumWidth(0)
+        palette_layout.addWidget(self.palette_editor)
+        self.color_tabs.addTab(palette_page, "Palette")
+
+        self.ribbon = RibbonWidget(self)
+        self.ribbon.setMinimumHeight(105)
+
+        self.tool_settings_page = self.ribbon.add_page(
+            "tool_settings", "Tool Settings"
+        )
+        settings_group = self.tool_settings_page.add_group(
+            "Current tool", minimum_width=720
+        )
+        self.tool_settings_controls = ToolSettingsControls(
+            self.settings, self.ribbon
+        )
+        settings_group.add_widget(self.tool_settings_controls)
+
+        self.vector_tools_page = self.ribbon.add_page(
+            "vector_tools", "Vector Tools", visible=False
+        )
+        self.vector_tools_controls = VectorToolsControls(
+            self.settings, self.ribbon
+        )
+        redraw_group = self.vector_tools_page.add_group(
+            "Redraw thickness / opacity", minimum_width=280
+        )
+        redraw_group.add_widget(self.vector_tools_controls.redraw_widget)
+        connect_group = self.vector_tools_page.add_group(
+            "Connect vector line", minimum_width=190
+        )
+        connect_group.add_widget(self.vector_tools_controls.connect_widget)
+        simplify_group = self.vector_tools_page.add_group(
+            "Simplify vector line", minimum_width=260
+        )
+        simplify_group.add_widget(
+            self.vector_tools_controls.simplify_widget
+        )
+        transform_group = self.vector_tools_page.add_group(
+            "Transform Settings", minimum_width=180
+        )
+        transform_group.add_widget(
+            self.vector_tools_controls.transform_widget
+        )
+        self.raster_object_page = self.ribbon.add_page(
+            "raster_object_settings", "Raster Object Settings",
+            visible=False,
+        )
+        canvas_row = QWidget(self)
+        canvas_layout = QHBoxLayout(canvas_row)
+        canvas_layout.setContentsMargins(0, 0, 0, 0)
+        canvas_layout.setSpacing(0)
         self.canvas = create_canvas(self.settings)
+        self.raster_object_controls = RasterObjectControls(
+            self.canvas, self.settings, self.ribbon
+        )
+        raster_object_group = self.raster_object_page.add_group(
+            "Object Settings", minimum_width=310
+        )
+        raster_object_group.add_widget(
+            self.raster_object_controls.object_widget
+        )
+        raster_transform_group = self.raster_object_page.add_group(
+            "Transform Settings", minimum_width=190
+        )
+        raster_transform_group.add_widget(
+            self.raster_object_controls.transform_widget
+        )
         self.preview = ChapterPreview(self.canvas)
-        center_layout.addWidget(self.preview)
-        center_layout.addWidget(self.canvas, 1)
-        self.setCentralWidget(center)
+        canvas_layout.addWidget(self.preview)
+        canvas_layout.addWidget(self.canvas, 1)
+
+        self.sidebar_splitter = QSplitter(Qt.Orientation.Vertical, self)
+        self.sidebar_splitter.setObjectName("sidebarSplitter")
+        self.sidebar_splitter.setChildrenCollapsible(False)
+        self.sidebar_splitter.setHandleWidth(6)
+        self.sidebar_splitter.setMinimumWidth(190)
+        self.sidebar_splitter.addWidget(self.tool_toolbar)
+        self.sidebar_splitter.addWidget(self.color_tabs)
+        self.sidebar_splitter.setStretchFactor(0, 1)
+        self.sidebar_splitter.setStretchFactor(1, 1)
+
+        self.ribbon_canvas_splitter = QSplitter(
+            Qt.Orientation.Vertical, self
+        )
+        self.ribbon_canvas_splitter.setObjectName("ribbonCanvasSplitter")
+        self.ribbon_canvas_splitter.setChildrenCollapsible(False)
+        self.ribbon_canvas_splitter.setHandleWidth(6)
+        self.ribbon_canvas_splitter.addWidget(self.ribbon)
+        self.ribbon_canvas_splitter.addWidget(canvas_row)
+        self.ribbon_canvas_splitter.setStretchFactor(0, 0)
+        self.ribbon_canvas_splitter.setStretchFactor(1, 1)
+
+        self.workspace_splitter = QSplitter(
+            Qt.Orientation.Horizontal, self
+        )
+        self.workspace_splitter.setObjectName("workspaceSplitter")
+        self.workspace_splitter.setChildrenCollapsible(False)
+        self.workspace_splitter.setHandleWidth(6)
+        self.workspace_splitter.addWidget(self.sidebar_splitter)
+        self.workspace_splitter.addWidget(self.ribbon_canvas_splitter)
+        self.workspace_splitter.setStretchFactor(0, 0)
+        self.workspace_splitter.setStretchFactor(1, 1)
+        self.setCentralWidget(self.workspace_splitter)
+        self._restore_workspace_layout()
 
         self.hierarchy_dock = QDockWidget("Layers and Objects", self)
         self.hierarchy_dock.setAllowedAreas(Qt.RightDockWidgetArea)
@@ -217,6 +432,15 @@ class MainWindow(QMainWindow):
         )
         self.hierarchy_model = HierarchyModel()
         self.tree.setModel(self.hierarchy_model)
+        self._tablet_outliner_press: dict | None = None
+        self._hierarchy_reset_expanded: set[str] = set()
+        self._hierarchy_reset_selection: tuple[str, str] = ("", "")
+        self.hierarchy_model.modelAboutToBeReset.connect(
+            self._capture_hierarchy_view_state
+        )
+        self.hierarchy_model.modelReset.connect(
+            self._restore_hierarchy_view_state
+        )
         self.tree.header().setStretchLastSection(False)
         self.tree.header().setSectionResizeMode(0, QHeaderView.Stretch)
         hierarchy_layout.addWidget(self.tree, 1)
@@ -236,8 +460,99 @@ class MainWindow(QMainWindow):
         self.inspector = ContextInspector(
             self.canvas, self.settings, save_settings, self.canvas
         )
+        # Tool controls now live in the ribbon; retain the inspector object
+        # panel itself while collapsing its legacy embedded tool row.
+        self.inspector.raster_tool_panel.setMaximumHeight(0)
+        self.inspector.raster_tool_panel.setMinimumHeight(0)
+        self.page_gap_confirmation = QFrame(self.canvas)
+        self.page_gap_confirmation.setObjectName("pageGapConfirmation")
+        self.page_gap_confirmation.setStyleSheet(
+            "#pageGapConfirmation { background: rgba(28,28,32,242); "
+            "border: 1px solid #f2a23a; border-radius: 7px; }"
+        )
+        gap_layout = QHBoxLayout(self.page_gap_confirmation)
+        gap_layout.setContentsMargins(8, 6, 8, 6)
+        gap_layout.addWidget(QLabel("Adjust the orange page gap"))
+        self.confirm_page_gap_button = QPushButton("Confirm Page Gap")
+        self.cancel_page_gap_button = QPushButton("Cancel")
+        gap_layout.addWidget(self.confirm_page_gap_button)
+        gap_layout.addWidget(self.cancel_page_gap_button)
+        self.page_gap_confirmation.hide()
         self.autosave_timer = QTimer(self)
         self.autosave_timer.setSingleShot(True)
+        self.series_preferences_timer = QTimer(self)
+        self.series_preferences_timer.setSingleShot(True)
+        self.layout_settings_timer = QTimer(self)
+        self.layout_settings_timer.setSingleShot(True)
+        self._vector_ribbon_context = False
+        self._raster_ribbon_context = False
+        self._expanded_selected_vector_id = ""
+
+    def _restore_workspace_layout(self) -> None:
+        stored = self.settings.ui_splitter_sizes
+        width = max(600, self.width())
+        height = max(600, self.height())
+        sidebar = stored.get("sidebar_workspace", [230, width - 230])
+        sidebar_width = max(190, min(
+            int(sidebar[0]), max(190, width - 480)
+        ))
+        self.workspace_splitter.setSizes(
+            [sidebar_width, max(480, width - sidebar_width)]
+        )
+
+        tools_colors = stored.get(
+            "tools_colors",
+            [round(height * 0.55), round(height * 0.45)],
+        )
+        color_minimum = max(
+            225, self.color_tabs.minimumSizeHint().height()
+        )
+        tools_minimum = max(
+            90, self.tool_toolbar.minimumSizeHint().height()
+        )
+        available = max(
+            tools_minimum + color_minimum,
+            int(tools_colors[0]) + int(tools_colors[1]),
+        )
+        tools_size = max(
+            tools_minimum,
+            min(int(tools_colors[0]), available - color_minimum),
+        )
+        self.sidebar_splitter.setSizes(
+            [tools_size, available - tools_size]
+        )
+
+        ribbon_canvas = stored.get("ribbon_canvas", [180, height - 180])
+        ribbon_minimum = max(105, self.ribbon.minimumSizeHint().height())
+        canvas_minimum = max(300, self.canvas.minimumSizeHint().height())
+        vertical_available = max(
+            ribbon_minimum + canvas_minimum,
+            int(ribbon_canvas[0]) + int(ribbon_canvas[1]),
+        )
+        ribbon_size = max(
+            ribbon_minimum,
+            min(int(ribbon_canvas[0]), vertical_available - canvas_minimum),
+        )
+        self.ribbon_canvas_splitter.setSizes(
+            [ribbon_size, vertical_available - ribbon_size]
+        )
+
+    def _capture_workspace_layout(self) -> None:
+        self.settings.ui_splitter_sizes = {
+            "sidebar_workspace": self.workspace_splitter.sizes(),
+            "tools_colors": self.sidebar_splitter.sizes(),
+            "ribbon_canvas": self.ribbon_canvas_splitter.sizes(),
+        }
+        self.settings.clamp()
+
+    def _schedule_workspace_layout_save(self, *args) -> None:
+        del args
+        self._capture_workspace_layout()
+        self.layout_settings_timer.start(250)
+
+    def _save_workspace_layout(self) -> None:
+        self._capture_workspace_layout()
+        save_settings(self.settings)
 
     def _connect(self) -> None:
         self.new_series_action.triggered.connect(self._create_series)
@@ -254,7 +569,6 @@ class MainWindow(QMainWindow):
         self.reset_view_button.clicked.connect(self.canvas.reset_view)
         self.preview.scrollRequested.connect(self.canvas.scroll_to_fraction)
         self.tablet_mode.toggled.connect(self._settings_changed)
-        self.page_scope.toggled.connect(self._settings_changed)
         self.snap_grid.toggled.connect(self._settings_changed)
         self.canvas.documentChanged.connect(self._mark_dirty)
         self.canvas.hierarchyChanged.connect(self._hierarchy_changed)
@@ -273,6 +587,25 @@ class MainWindow(QMainWindow):
         self.canvas.textEditingChanged.connect(
             self._set_text_shortcut_suppression
         )
+        self.canvas.pageCreationFinished.connect(
+            self._finish_page_creation
+        )
+        self.canvas.pageCreationInvalid.connect(
+            lambda message: self.statusBar().showMessage(message, 5000)
+        )
+        self.canvas.pageGapConfirmationChanged.connect(
+            self._set_page_gap_confirmation_visible
+        )
+        self.confirm_page_gap_button.clicked.connect(
+            self._confirm_page_gap
+        )
+        self.cancel_page_gap_button.clicked.connect(
+            self._cancel_page_gap
+        )
+        if hasattr(self.canvas, "vectorSelectionChanged"):
+            self.canvas.vectorSelectionChanged.connect(
+                lambda strokes, points: self._sync_contextual_ribbon()
+            )
         self.canvas.command_stack.changed_callback = self._command_stack_changed
         self.inspector.changed.connect(self._hierarchy_changed)
         self.inspector.pencilPresetSelected.connect(
@@ -291,48 +624,523 @@ class MainWindow(QMainWindow):
         self.hierarchy_model.mutationCommitted.connect(self._tree_mutated)
         self.tree.selectionModel().selectionChanged.connect(self._tree_selection_changed)
         self.autosave_timer.timeout.connect(self._autosave)
+        self.series_preferences_timer.timeout.connect(
+            self._flush_series_preferences
+        )
+        self.layout_settings_timer.timeout.connect(
+            self._save_workspace_layout
+        )
+        for splitter in (
+            self.workspace_splitter,
+            self.sidebar_splitter,
+            self.ribbon_canvas_splitter,
+        ):
+            splitter.splitterMoved.connect(
+                self._schedule_workspace_layout_save
+            )
 
         self.add_page_button.clicked.connect(self._add_page)
         self.add_layer_button.clicked.connect(self._add_layer)
         self.add_raster_button.clicked.connect(self._add_raster)
+        self.add_vector_button.clicked.connect(self._add_vector_drawing)
         self.add_text_button.clicked.connect(self._add_text)
         self.add_fill_button.clicked.connect(self._add_fill)
         self.delete_button.clicked.connect(self._delete_selected)
 
+        self.tool_settings_controls.pencilPresetSelected.connect(
+            self._pencil_preset_selected
+        )
+        self.tool_settings_controls.pencilSettingsRequested.connect(
+            self._edit_pencil_settings
+        )
+        self.tool_settings_controls.brushSizeSelected.connect(
+            self._brush_size_selected
+        )
+        self.tool_settings_controls.brushSizesRequested.connect(
+            self._edit_brush_sizes
+        )
+        self.tool_settings_controls.eraserShapeChanged.connect(
+            self._eraser_shape_selected
+        )
+        self.tool_settings_controls.settingsChanged.connect(
+            self._ribbon_settings_changed
+        )
+        self.vector_tools_controls.settingsChanged.connect(
+            self._ribbon_settings_changed
+        )
+        self.raster_object_controls.settingsChanged.connect(
+            self._ribbon_settings_changed
+        )
+        self.raster_object_controls.objectChanged.connect(
+            self._hierarchy_changed
+        )
+        self.vector_tools_controls.redrawToolRequested.connect(
+            lambda: self._activate_named_tool("VECTOR_REDRAW")
+        )
+        self.vector_tools_controls.connectToolRequested.connect(
+            lambda: self._activate_named_tool("VECTOR_CONNECT")
+        )
+        self.vector_tools_controls.simplifyToolRequested.connect(
+            lambda: self._activate_named_tool("VECTOR_SIMPLIFY")
+        )
+        self.vector_tools_controls.redrawApplyRequested.connect(
+            self._apply_vector_redraw
+        )
+        self.vector_tools_controls.simplifyApplyRequested.connect(
+            self._apply_vector_simplify
+        )
+
+        self.color_panel.colorChanged.connect(self._series_color_changed)
+        self.color_panel.activeSlotChanged.connect(
+            lambda slot: self.palette_editor.set_new_swatch_color(
+                self.color_panel.active_color()
+            )
+        )
+        self.color_panel.picker.interactionFinished.connect(
+            lambda color: self._flush_series_preferences()
+        )
+        self.palette_editor.paletteSelectionChanged.connect(
+            self._palette_selected
+        )
+        self.palette_editor.addPaletteRequested.connect(
+            self._add_palette
+        )
+        self.palette_editor.removePaletteRequested.connect(
+            self._remove_palette
+        )
+        self.palette_editor.paletteNameChanged.connect(
+            self._rename_palette
+        )
+        self.palette_editor.swatchActivated.connect(
+            self._palette_swatch_activated
+        )
+        self.palette_editor.swatchColorChangeRequested.connect(
+            self._change_palette_swatch
+        )
+        self.palette_editor.addSwatchRequested.connect(
+            self._add_palette_swatch
+        )
+        self.palette_editor.removeSwatchRequested.connect(
+            self._remove_palette_swatch
+        )
+
     def _install_shortcuts(self) -> None:
-        shortcuts = {
+        self._tool_hotkey_actions = {
             "raster_pencil": ToolKind.RASTER_PENCIL,
             "raster_eraser": ToolKind.RASTER_ERASER,
             "object_select": ToolKind.OBJECT_SELECT,
             "transform": ToolKind.TRANSFORM,
             "shape_edit": ToolKind.SHAPE_EDIT,
         }
-        self._shortcuts = []
-        self._shortcut_sequences: list[tuple[QShortcut, QKeySequence]] = []
-        for action_id, tool in shortcuts.items():
-            shortcut = QShortcut(QKeySequence(self.settings.hotkeys[action_id]), self)
-            shortcut.activated.connect(lambda selected=tool: self._activate_tool(selected))
-            self._shortcuts.append(shortcut)
-            self._shortcut_sequences.append((shortcut, shortcut.key()))
-        save_shortcut = QShortcut(QKeySequence(self.settings.hotkeys["save"]), self)
-        save_shortcut.activated.connect(self.save)
-        undo_shortcut = QShortcut(QKeySequence(self.settings.hotkeys["undo"]), self)
-        undo_shortcut.activated.connect(self.canvas.command_stack.undo)
-        redo_shortcut = QShortcut(QKeySequence(self.settings.hotkeys["redo"]), self)
-        redo_shortcut.activated.connect(self.canvas.command_stack.redo)
-        fullscreen_shortcut = QShortcut(QKeySequence("Alt+Return"), self)
-        fullscreen_shortcut.activated.connect(self._toggle_fullscreen)
-        self._shortcuts.extend([save_shortcut, undo_shortcut, redo_shortcut, fullscreen_shortcut])
-        reset_shortcut = QShortcut(QKeySequence(self.settings.hotkeys["reset_view"]), self)
-        reset_shortcut.activated.connect(self.canvas.reset_view)
-        grid_shortcut = QShortcut(QKeySequence(self.settings.hotkeys["toggle_grid"]), self)
-        grid_shortcut.activated.connect(self._toggle_grid)
-        self._shortcuts.extend([reset_shortcut, grid_shortcut])
-        for shortcut in (
-            save_shortcut, undo_shortcut, redo_shortcut,
-            fullscreen_shortcut, reset_shortcut, grid_shortcut,
+        for action_id, enum_name in (
+            ("fill", "FILL"),
+            ("vector_redraw", "VECTOR_REDRAW"),
+            ("vector_connect", "VECTOR_CONNECT"),
+            ("vector_simplify", "VECTOR_SIMPLIFY"),
+            ("draw_select_rect", "DRAW_SELECT_RECT"),
+            ("draw_select_lasso", "DRAW_SELECT_LASSO"),
+            ("draw_select_stroke", "DRAW_SELECT_STROKE"),
+            ("insert_page_gap", "INSERT_PAGE_GAP"),
         ):
-            self._shortcut_sequences.append((shortcut, shortcut.key()))
+            tool = getattr(ToolKind, enum_name, None)
+            if tool is not None:
+                self._tool_hotkey_actions[action_id] = tool
+        self._command_hotkey_actions = {
+            "save": self.save,
+            "undo": self.canvas.command_stack.undo,
+            "redo": self.canvas.command_stack.redo,
+            "reset_view": self.canvas.reset_view,
+            "toggle_grid": self._toggle_grid,
+            "select_all": self.canvas.select_all_drawing,
+        }
+        self._hotkey_bindings = {
+            action_id: chord_keys(value)
+            for action_id, value in self.settings.hotkeys.items()
+            if chord_keys(value)
+        }
+        if not hasattr(self, "_hotkey_pressed"):
+            self._hotkey_pressed: set[int] = set()
+            self._hotkey_pending: dict | None = None
+            self._hotkey_active_hold: dict | None = None
+            self._hotkey_runtime_enabled = True
+            self._hotkey_text_editing = False
+            self._hotkey_internal_tool_change = False
+            self._hotkey_clock = time.monotonic
+            self._hotkey_prefix_timer = QTimer(self)
+            self._hotkey_prefix_timer.setSingleShot(True)
+            self._hotkey_prefix_timer.timeout.connect(
+                self._hotkey_prefix_timeout
+            )
+            QApplication.instance().installEventFilter(self)
+            self.canvas.toolChanged.connect(self._hotkey_tool_changed)
+            self._fullscreen_shortcut = QShortcut(
+                QKeySequence("Alt+Return"), self
+            )
+            self._fullscreen_shortcut.activated.connect(
+                self._toggle_fullscreen
+            )
+            self._shortcuts = [self._fullscreen_shortcut]
+            self._shortcut_sequences = [
+                (self._fullscreen_shortcut, self._fullscreen_shortcut.key())
+            ]
+        else:
+            self._hotkey_prefix_timer.stop()
+            self._hotkey_pending = None
+            self._hotkey_pressed.clear()
+            self._restore_active_hotkey_tool()
+
+    def _hotkey_action_for_chord(
+        self, chord: frozenset[int],
+    ) -> str | None:
+        return next((
+            action_id for action_id, candidate in self._hotkey_bindings.items()
+            if candidate == chord
+        ), None)
+
+    def _hotkey_is_prefix(self, chord: frozenset[int]) -> bool:
+        return any(
+            chord < candidate for candidate in self._hotkey_bindings.values()
+        )
+
+    def _hotkey_is_suppressed(
+        self, action_id: str, chord: frozenset[int],
+    ) -> bool:
+        if not self._hotkey_text_input_active():
+            return False
+        display = chord_text(chord)
+        regular = [key for key in chord if key not in MODIFIER_LABELS]
+        contains_letter = any(
+            len(QKeySequence(key).toString(QKeySequence.PortableText)) == 1
+            and QKeySequence(key).toString(
+                QKeySequence.PortableText
+            ).isalpha()
+            for key in regular
+        )
+        return contains_letter or int(Qt.Key_Shift) in chord
+
+    def _hotkey_text_input_active(self) -> bool:
+        focus = QApplication.focusWidget()
+        return self._hotkey_text_editing or isinstance(
+            focus, (QLineEdit, QPlainTextEdit, QTextEdit)
+        )
+
+    def _trigger_hotkey(
+        self, action_id: str, chord: frozenset[int],
+        started: float, tap: bool = False,
+    ) -> None:
+        if self._hotkey_is_suppressed(action_id, chord):
+            return
+        if action_id in self._tool_hotkey_actions:
+            tool = self._tool_hotkey_actions[action_id]
+            previous = self.canvas.tool
+            self._hotkey_internal_tool_change = True
+            try:
+                activated = self._activate_tool(tool)
+            finally:
+                self._hotkey_internal_tool_change = False
+            if (
+                activated and not tap
+                and self.settings.hotkey_hold.get(action_id, False)
+            ):
+                self._hotkey_active_hold = {
+                    "action": action_id,
+                    "chord": chord,
+                    "started": started,
+                    "previous": previous,
+                    "target": tool,
+                }
+            return
+        callback = self._command_hotkey_actions.get(action_id)
+        if callback is not None:
+            callback()
+
+    def _restore_active_hotkey_tool(self) -> None:
+        active, self._hotkey_active_hold = self._hotkey_active_hold, None
+        if active is None or self.canvas.tool != active["target"]:
+            return
+        self._hotkey_internal_tool_change = True
+        try:
+            self._activate_tool(active["previous"])
+        finally:
+            self._hotkey_internal_tool_change = False
+
+    def _hotkey_prefix_timeout(self) -> None:
+        pending = self._hotkey_pending
+        if (
+            pending is None
+            or frozenset(self._hotkey_pressed) != pending["chord"]
+        ):
+            return
+        self._hotkey_pending = None
+        self._trigger_hotkey(
+            pending["action"], pending["chord"], pending["started"]
+        )
+
+    def _hotkey_tool_changed(self, tool: ToolKind) -> None:
+        if (
+            self._hotkey_active_hold is not None
+            and not self._hotkey_internal_tool_change
+            and tool != self._hotkey_active_hold["target"]
+        ):
+            self._hotkey_active_hold = None
+
+    def _hotkey_press(self, key: int) -> bool:
+        if key in self._hotkey_pressed:
+            return False
+        self._hotkey_pressed.add(key)
+        chord = frozenset(self._hotkey_pressed)
+        if (
+            self._hotkey_active_hold is not None
+            and self._hotkey_active_hold["chord"] < chord
+        ):
+            self._restore_active_hotkey_tool()
+        if self._hotkey_pending is not None:
+            self._hotkey_prefix_timer.stop()
+            self._hotkey_pending = None
+        action_id = self._hotkey_action_for_chord(chord)
+        prefix = self._hotkey_is_prefix(chord)
+        text_conflict = (
+            self._hotkey_text_input_active()
+            and (
+                int(Qt.Key_Shift) in chord
+                or any(
+                    candidate not in MODIFIER_LABELS
+                    and len(QKeySequence(candidate).toString(
+                        QKeySequence.PortableText
+                    )) == 1
+                    and QKeySequence(candidate).toString(
+                        QKeySequence.PortableText
+                    ).isalpha()
+                    for candidate in chord
+                )
+            )
+        )
+        if text_conflict:
+            action_id = None
+            prefix = False
+        if action_id is not None and prefix:
+            self._hotkey_pending = {
+                "action": action_id,
+                "chord": chord,
+                "started": self._hotkey_clock(),
+            }
+            self._hotkey_prefix_timer.start(200)
+        elif action_id is not None:
+            self._trigger_hotkey(
+                action_id, chord, self._hotkey_clock()
+            )
+        return action_id is not None or prefix
+
+    def _hotkey_release(self, key: int) -> bool:
+        chord = frozenset(self._hotkey_pressed)
+        consumed = any(key in binding for binding in self._hotkey_bindings.values())
+        if self._hotkey_text_input_active() and (
+            int(Qt.Key_Shift) in chord
+            or any(
+                candidate not in MODIFIER_LABELS
+                and len(QKeySequence(candidate).toString(
+                    QKeySequence.PortableText
+                )) == 1
+                and QKeySequence(candidate).toString(
+                    QKeySequence.PortableText
+                ).isalpha()
+                for candidate in chord
+            )
+        ):
+            consumed = False
+        pending = self._hotkey_pending
+        if pending is not None and key in pending["chord"]:
+            self._hotkey_prefix_timer.stop()
+            self._hotkey_pending = None
+            self._trigger_hotkey(
+                pending["action"], pending["chord"],
+                pending["started"], tap=True,
+            )
+        active = self._hotkey_active_hold
+        self._hotkey_pressed.discard(key)
+        if (
+            active is not None
+            and key in active["chord"]
+            and not active["chord"].issubset(self._hotkey_pressed)
+        ):
+            elapsed = self._hotkey_clock() - active["started"]
+            if elapsed >= 0.2:
+                self._restore_active_hotkey_tool()
+            else:
+                self._hotkey_active_hold = None
+        return consumed
+
+    def _forward_popup_tablet_event(self, watched, event) -> bool:
+        if event.type() not in {
+            QEvent.TabletMove, QEvent.TabletPress, QEvent.TabletRelease,
+        }:
+            return False
+        global_position = QPointF(event.globalPosition())
+        target = QApplication.widgetAt(global_position.toPoint())
+        if target is None and isinstance(watched, QWidget):
+            target = watched
+        pressed = getattr(self, "_tablet_popup_pressed", None)
+        if event.type() == QEvent.TabletRelease and pressed is not None:
+            target = pressed
+        if target is None:
+            return False
+        popup = target.window()
+        if not (
+            isinstance(popup, QMenu)
+            or bool(popup.windowFlags() & Qt.Popup)
+        ):
+            return False
+        local = QPointF(target.mapFromGlobal(global_position.toPoint()))
+        if event.type() == QEvent.TabletPress:
+            mouse_type = QEvent.MouseButtonPress
+            button, buttons = Qt.LeftButton, Qt.LeftButton
+            self._tablet_popup_pressed = target
+        elif event.type() == QEvent.TabletRelease:
+            mouse_type = QEvent.MouseButtonRelease
+            button, buttons = Qt.LeftButton, Qt.NoButton
+            self._tablet_popup_pressed = None
+        else:
+            mouse_type = QEvent.MouseMove
+            button = Qt.NoButton
+            buttons = (
+                Qt.LeftButton if pressed is not None else Qt.NoButton
+            )
+        mouse = QMouseEvent(
+            mouse_type, local, local, global_position,
+            button, buttons, event.modifiers(), event.pointingDevice(),
+        )
+        QCoreApplication.sendEvent(target, mouse)
+        event.accept()
+        return True
+
+    def _send_outliner_mouse(
+        self, event_type, global_position: QPointF, button, buttons,
+        modifiers, device,
+    ) -> None:
+        viewport = self.tree.viewport()
+        local = QPointF(
+            viewport.mapFromGlobal(global_position.toPoint())
+        )
+        mouse = QMouseEvent(
+            event_type, local, local, global_position,
+            button, buttons, modifiers, device,
+        )
+        QCoreApplication.sendEvent(viewport, mouse)
+
+    def _forward_outliner_tablet_event(self, watched, event) -> bool:
+        if event.type() not in {
+            QEvent.TabletMove, QEvent.TabletPress, QEvent.TabletRelease,
+        }:
+            return False
+        viewport = self.tree.viewport()
+        global_position = QPointF(event.globalPosition())
+        local = viewport.mapFromGlobal(global_position.toPoint())
+        inside = viewport.rect().contains(local)
+        state = self._tablet_outliner_press
+        if event.type() == QEvent.TabletPress:
+            if not inside:
+                return False
+            self._tablet_outliner_press = {
+                "global": QPointF(global_position),
+                "forwarded": False,
+                "device": event.pointingDevice(),
+                "modifiers": event.modifiers(),
+            }
+            event.accept()
+            return True
+        if state is None:
+            if event.type() == QEvent.TabletMove and inside:
+                self._send_outliner_mouse(
+                    QEvent.MouseMove, global_position,
+                    Qt.NoButton, Qt.NoButton,
+                    event.modifiers(), event.pointingDevice(),
+                )
+                event.accept()
+                return True
+            return False
+        if event.type() == QEvent.TabletMove:
+            distance = (
+                global_position - state["global"]
+            ).manhattanLength()
+            if (
+                not state["forwarded"]
+                and distance >= QApplication.startDragDistance()
+            ):
+                self._send_outliner_mouse(
+                    QEvent.MouseButtonPress, state["global"],
+                    Qt.LeftButton, Qt.LeftButton,
+                    state["modifiers"], state["device"],
+                )
+                state["forwarded"] = True
+            if state["forwarded"]:
+                self._send_outliner_mouse(
+                    QEvent.MouseMove, global_position,
+                    Qt.NoButton, Qt.LeftButton,
+                    event.modifiers(), state["device"],
+                )
+            event.accept()
+            return True
+        if state["forwarded"]:
+            self._send_outliner_mouse(
+                QEvent.MouseButtonRelease, global_position,
+                Qt.LeftButton, Qt.NoButton,
+                event.modifiers(), state["device"],
+            )
+        else:
+            self._send_outliner_mouse(
+                QEvent.MouseButtonPress, state["global"],
+                Qt.LeftButton, Qt.LeftButton,
+                state["modifiers"], state["device"],
+            )
+            self._send_outliner_mouse(
+                QEvent.MouseButtonRelease, state["global"],
+                Qt.LeftButton, Qt.NoButton,
+                event.modifiers(), state["device"],
+            )
+        self._tablet_outliner_press = None
+        event.accept()
+        return True
+
+    def _cancel_outliner_tablet_press(self) -> None:
+        state = self._tablet_outliner_press
+        if state is not None and state.get("forwarded"):
+            self._send_outliner_mouse(
+                QEvent.MouseButtonRelease, state["global"],
+                Qt.LeftButton, Qt.NoButton,
+                state["modifiers"], state["device"],
+            )
+        self._tablet_outliner_press = None
+
+    def eventFilter(self, watched, event) -> bool:  # noqa: N802
+        if self._forward_popup_tablet_event(watched, event):
+            return True
+        if self._forward_outliner_tablet_event(watched, event):
+            return True
+        if event.type() == QEvent.ApplicationDeactivate:
+            self._cancel_outliner_tablet_press()
+            self._hotkey_prefix_timer.stop()
+            self._hotkey_pending = None
+            self._hotkey_pressed.clear()
+            self._restore_active_hotkey_tool()
+            return super().eventFilter(watched, event)
+        if (
+            not getattr(self, "_hotkey_runtime_enabled", False)
+            or event.type() not in {QEvent.KeyPress, QEvent.KeyRelease}
+        ):
+            return super().eventFilter(watched, event)
+        if int(event.key()) in {int(Qt.Key_Shift), int(Qt.Key_Control)}:
+            self.canvas.update()
+        widget = watched if isinstance(watched, QWidget) else None
+        if widget is not None and widget.window() is not self:
+            return super().eventFilter(watched, event)
+        if event.isAutoRepeat():
+            return False
+        handled = (
+            self._hotkey_press(int(event.key()))
+            if event.type() == QEvent.KeyPress
+            else self._hotkey_release(int(event.key()))
+        )
+        return handled or super().eventFilter(watched, event)
 
     # ---- series and chapters ------------------------------------------
     @staticmethod
@@ -369,7 +1177,9 @@ class MainWindow(QMainWindow):
             return False
         try:
             repository = SeriesRepository(root)
-            series = repository.load_series()
+            series = repository.load_series(
+                legacy_primary_color=self.settings.brush_color
+            )
         except (OSError, ValueError) as error:
             QMessageBox.critical(self, "Unable to open series", str(error))
             return False
@@ -388,12 +1198,14 @@ class MainWindow(QMainWindow):
         self.recent_combo.blockSignals(False)
 
     def _adopt_series(self, repository: SeriesRepository, series) -> None:
+        self._flush_series_preferences()
         self.repository, self.series = repository, series
         self.chapter_combo.blockSignals(True)
         self.chapter_combo.clear()
         for reference in series.chapters:
             self.chapter_combo.addItem(reference.name, reference.chapter_id)
         self.chapter_combo.blockSignals(False)
+        self._sync_series_color_ui()
         self.setWindowTitle(f"{series.name} — Vertical Comic Editor")
         self._refresh_actions()
 
@@ -453,12 +1265,16 @@ class MainWindow(QMainWindow):
         self._dirty = False
         self._last_autosave = 0
         self._sync_chapter_combo()
-        raster = next(
-            (obj for obj in chapter.objects.values() if isinstance(obj, RasterObject)),
+        initial_object = next(
+            (
+                obj for obj in chapter.objects.values()
+                if isinstance(obj, (RasterObject, VectorDrawingObject))
+            ),
             None,
         )
-        if raster:
-            self.canvas.set_selection("object", raster.object_id)
+        if initial_object:
+            self.canvas.set_selection("object", initial_object.object_id)
+        self._sync_contextual_ribbon()
         self._refresh_actions()
         self.statusBar().showMessage(f"{chapter.name} — {chapter.width} × {chapter.height}px")
 
@@ -482,52 +1298,292 @@ class MainWindow(QMainWindow):
         else:
             layer = None
         if (
-            layer and layer.layer_kind not in {"fill", "open_shape"}
+            layer and layer.layer_kind != "fill"
             and (allow_page or not layer.is_page)
         ):
             return layer
         return None
 
+    def _new_object_insertion_index(self, parent_id: str) -> int | None:
+        if (
+            self.chapter is None
+            or self.canvas.selected_kind != "object"
+            or self.canvas.selected_id not in self.chapter.objects
+        ):
+            return None
+        selected = self.chapter.objects[self.canvas.selected_id]
+        if isinstance(selected, VectorFillObject):
+            owner = self.chapter.objects.get(selected.owner_drawing_id)
+            if not isinstance(owner, VectorDrawingObject):
+                return None
+            selected = owner
+        if selected.parent_layer_id != parent_id:
+            return None
+        siblings = self.chapter.layers[parent_id].children
+        return next((
+            index for index, reference in enumerate(siblings)
+            if (
+                reference.kind == "object"
+                and reference.entity_id == selected.object_id
+            )
+        ), None)
+
     def _add_page(self) -> None:
-        if self.chapter is None:
+        if (
+            self.chapter is None
+            or not self.canvas.active_page_id
+            or self.canvas.active_page_id not in self.chapter.root_page_ids
+        ):
+            self.statusBar().showMessage(
+                "Select a page or one of its descendants first.", 5000
+            )
             return
-        before = self.chapter.to_dict()
-        y = self.chapter.minimum_safe_height() + (120 if self.chapter.root_page_ids else 0)
-        page = self.chapter.add_page(
-            f"Page {len(self.chapter.root_page_ids) + 1}",
-            BoundGeometry.rectangle(0, 0, 1080, 1080), y=y,
+        anchor_id = self.canvas.active_page_id
+        anchor_bounds = self.canvas.page_world_bounds(anchor_id)
+        lower_ids = [
+            page_id
+            for page_id in self.canvas.physically_ordered_pages()
+            if (
+                page_id != anchor_id
+                and self.canvas.page_world_bounds(page_id).top()
+                >= anchor_bounds.bottom()
+            )
+        ]
+        if lower_ids:
+            action = self._choose_add_page_gap_action()
+            if action == "cancel":
+                return
+            if action == "insert":
+                top_ids = [
+                    page_id for page_id in self.chapter.root_page_ids
+                    if page_id not in lower_ids
+                ]
+                if self.canvas.begin_page_gap_transaction(
+                    "add_page", anchor_id, top_ids, lower_ids,
+                    anchor_bounds.bottom(),
+                ):
+                    self.statusBar().showMessage(
+                        "Adjust the page gap, then confirm or cancel.", 7000
+                    )
+                return
+        self._begin_add_page_shape(anchor_id)
+
+    def _choose_add_page_gap_action(self) -> str:
+        dialog = QMessageBox(self)
+        dialog.setWindowTitle("Add Page")
+        dialog.setText(
+            "A page already exists below the active page. "
+            "Would you like to insert and adjust a page gap first?"
         )
+        insert = dialog.addButton(
+            "Insert Gap", QMessageBox.AcceptRole
+        )
+        proceed = dialog.addButton(
+            "Continue Without Gap", QMessageBox.DestructiveRole
+        )
+        dialog.addButton(QMessageBox.Cancel)
+        dialog.exec()
+        return (
+            "insert" if dialog.clickedButton() is insert
+            else "continue" if dialog.clickedButton() is proceed
+            else "cancel"
+        )
+
+    def _begin_add_page_shape(
+        self, anchor_id: str, *, before: dict | None = None,
+        gap_bounds: tuple[float, float] | None = None,
+    ) -> None:
+        kind = self._choose_page_shape()
+        if kind is None:
+            if self.canvas.page_gap_transaction() is not None:
+                self.canvas.cancel_page_gap_transaction()
+            return
+        if self.canvas.begin_page_creation(
+            anchor_id, kind, before=before, gap_bounds=gap_bounds
+        ):
+            self.statusBar().showMessage(
+                "Draw the closed page below the active page. Escape cancels.",
+                7000,
+            )
+        elif self.canvas.page_gap_transaction() is not None:
+            self.canvas.cancel_page_gap_transaction()
+
+    def _set_page_gap_confirmation_visible(self, visible: bool) -> None:
+        self.page_gap_confirmation.setVisible(bool(visible))
+        if visible:
+            self.page_gap_confirmation.adjustSize()
+            self.page_gap_confirmation.move(
+                max(
+                    8,
+                    (self.canvas.width()
+                     - self.page_gap_confirmation.width()) // 2,
+                ),
+                10,
+            )
+            self.page_gap_confirmation.raise_()
+
+    def resizeEvent(self, event) -> None:  # noqa: N802
+        super().resizeEvent(event)
+        if (
+            hasattr(self, "page_gap_confirmation")
+            and self.page_gap_confirmation.isVisible()
+        ):
+            QTimer.singleShot(
+                0, lambda: self._set_page_gap_confirmation_visible(True)
+            )
+
+    def _confirm_page_gap(self) -> None:
+        transaction = self.canvas.confirm_page_gap_transaction()
+        if transaction is None:
+            self._set_page_gap_confirmation_visible(False)
+            return
+        if transaction["origin"] != "add_page":
+            return
+        self._set_page_gap_confirmation_visible(False)
+        self._begin_add_page_shape(
+            str(transaction["anchor_id"]),
+            before=transaction["before"],
+            gap_bounds=(
+                float(transaction["top_y"]),
+                float(transaction["bottom_y"]),
+            ),
+        )
+
+    def _cancel_page_gap(self) -> None:
+        self.canvas.cancel_page_gap_transaction()
+        self._set_page_gap_confirmation_visible(False)
+
+    def _choose_page_shape(self) -> str | None:
+        dialog = QMessageBox(self)
+        dialog.setWindowTitle("Add Page")
+        dialog.setText("Choose the closed shape for the new page.")
+        rectangle = dialog.addButton(
+            "Rectangle", QMessageBox.AcceptRole
+        )
+        circle = dialog.addButton("Circle", QMessageBox.AcceptRole)
+        custom = dialog.addButton(
+            "Custom Shape", QMessageBox.AcceptRole
+        )
+        dialog.addButton(QMessageBox.Cancel)
+        dialog.exec()
+        return {
+            rectangle: "rectangle",
+            circle: "circle",
+            custom: "custom",
+        }.get(dialog.clickedButton())
+
+    def _next_page_name(self) -> str:
+        numbered: set[int] = set()
+        for page_id in self.chapter.root_page_ids:
+            name = self.chapter.layers[page_id].name
+            match = re.fullmatch(r"Page\s+(\d+)", name)
+            if match:
+                numbered.add(int(match.group(1)))
+        number = 1
+        while number in numbered:
+            number += 1
+        return f"Page {number}"
+
+    def _finish_page_creation(
+        self, bound: BoundGeometry, before: dict, anchor_id: str,
+    ) -> None:
+        if (
+            self.chapter is None
+            or anchor_id not in self.chapter.root_page_ids
+        ):
+            self.canvas.resolve_page_creation(
+                False, "The page used as the insertion anchor no longer exists."
+            )
+            return
+        try:
+            bound.validate()
+            base_height = self.canvas.page_creation_base_height()
+            self.chapter.height = base_height
+            insertion_index = (
+                self.chapter.root_page_ids.index(anchor_id) + 1
+            )
+            page = self.chapter.add_page(
+                self._next_page_name(), bound, index=insertion_index
+            )
+        except (KeyError, TypeError, ValueError) as error:
+            self.canvas.resolve_page_creation(False, str(error))
+            return
+        self.chapter.height = base_height
+        self.canvas._ensure_page_height_safety()
         after = self.chapter.to_dict()
         self.canvas.push_model_change(before, after, "Add page")
         self._after_structure(page.layer_id, "layer")
+        # Acknowledge before changing tools: changing away from a creation
+        # tool cancels any still-pending draft by design.
+        self.canvas.resolve_page_creation(True)
+        self.canvas.finish_page_gap_workflow()
+        self.canvas.set_tool(ToolKind.SHAPE_EDIT)
+        self.statusBar().showMessage(
+            f"Created {page.name}", 3000
+        )
 
     def _add_layer(self) -> None:
-        parent = self._selected_parent_layer()
-        if parent is None:
+        placement = self.canvas._target_placement_for_new_bound()
+        if placement is None:
             self.statusBar().showMessage("Select a page or layer first", 4000)
             return
+        parent_id, insertion_index = placement
+        parent = self.chapter.layers[parent_id]
         before = self.chapter.to_dict()
         x, y, width, height = parent.bound.bbox()
         layer = self.chapter.add_layer(
             parent.layer_id, self._next_layer_name(),
             BoundGeometry.rectangle(x, y, max(64, width), max(64, height)),
+            index=insertion_index,
         )
         after = self.chapter.to_dict()
         self.canvas.push_model_change(before, after, "Add layer")
         self._after_structure(layer.layer_id, "layer")
 
     def _add_raster(self) -> None:
-        parent = self._selected_parent_layer(allow_page=False)
+        parent = self._selected_parent_layer(allow_page=True)
         if parent is None:
-            self.statusBar().showMessage("Raster objects require a selected non-page layer", 4000)
+            self.statusBar().showMessage(
+                "Raster objects require a selected page or container layer",
+                4000,
+            )
             return
-        if self.canvas.begin_raster_creation(parent.layer_id):
+        insertion_index = self._new_object_insertion_index(parent.layer_id)
+        if self.canvas.begin_raster_creation(
+            parent.layer_id, insertion_index
+        ):
             message = (
                 "Drag a box on the canvas to set the raster width and height. "
                 "Escape cancels."
             )
             self.statusBar().showMessage(message, 7000)
             QToolTip.showText(QCursor.pos(), message, self)
+
+    def _add_vector_drawing(self) -> None:
+        parent = self._selected_parent_layer(allow_page=True)
+        if parent is None or self.chapter is None:
+            self.statusBar().showMessage(
+                "Vector Drawings require a selected page or container layer",
+                4000,
+            )
+            return
+        before = self.chapter.to_dict()
+        count = sum(
+            isinstance(item, VectorDrawingObject)
+            for item in self.chapter.objects.values()
+        ) + 1
+        drawing = VectorDrawingObject(name=f"Vector Drawing {count}")
+        self.chapter.add_object(
+            parent.layer_id,
+            drawing,
+            index=self._new_object_insertion_index(parent.layer_id),
+        )
+        after = self.chapter.to_dict()
+        self.canvas.push_model_change(
+            before, after, "Add Vector Drawing"
+        )
+        self._after_structure(drawing.object_id, "object")
+        self._activate_tool(ToolKind.RASTER_PENCIL)
 
     def _add_fill(self) -> None:
         parent = self._selected_parent_layer()
@@ -548,9 +1604,12 @@ class MainWindow(QMainWindow):
         self._after_structure(layer.layer_id, "layer")
 
     def _add_text(self) -> None:
-        parent = self._selected_parent_layer(allow_page=False)
+        parent = self._selected_parent_layer(allow_page=True)
         if parent is None:
-            self.statusBar().showMessage("Text objects require a selected non-page layer", 4000)
+            self.statusBar().showMessage(
+                "Text objects require a selected page or container layer",
+                4000,
+            )
             return
         before = self.chapter.to_dict()
         left, top, width, height = parent.bound.bbox()
@@ -575,7 +1634,10 @@ class MainWindow(QMainWindow):
                 (left + (width + obj.width) / 2, top + (height + obj.height) / 2),
                 (left + (width - obj.width) / 2, top + (height + obj.height) / 2),
             ]
-        self.chapter.add_object(parent.layer_id, obj)
+        self.chapter.add_object(
+            parent.layer_id, obj,
+            index=self._new_object_insertion_index(parent.layer_id),
+        )
         after = self.chapter.to_dict()
         self.canvas.push_model_change(before, after, "Add text object")
         self._after_structure(parent.layer_id, "layer")
@@ -604,8 +1666,7 @@ class MainWindow(QMainWindow):
         # Keep detached tiles in memory until the undo stack is discarded.
         # Persistence writes only referenced objects and removes stale folders.
         after = self.chapter.to_dict()
-        self.canvas.selected_id = ""
-        self.canvas.selected_kind = ""
+        self.canvas.clear_selection()
         self.canvas.push_model_change(before, after, "Delete entity")
         self._after_structure("", "")
 
@@ -643,22 +1704,68 @@ class MainWindow(QMainWindow):
         self.canvas.hierarchyChanged.emit()
         self._mark_dirty(None)
 
-    def _activate_tool(self, tool: ToolKind) -> None:
+    def _activate_tool(self, tool: ToolKind) -> bool:
+        selected_object = (
+            self.chapter.objects.get(self.canvas.selected_id)
+            if (
+                self.chapter is not None
+                and self.canvas.selected_kind == "object"
+            )
+            else None
+        )
+        vector_selected = isinstance(selected_object, VectorDrawingObject)
         if tool in {ToolKind.RASTER_PENCIL, ToolKind.RASTER_ERASER}:
-            if self.chapter and self.canvas.selected_kind == "layer":
+            if (
+                self.chapter and self.canvas.selected_kind == "layer"
+                and not vector_selected
+            ):
                 layer = self.chapter.layers[self.canvas.selected_id]
                 raster_id = layer.last_raster_id
                 if raster_id in self.chapter.objects:
                     self.canvas.set_selection("object", raster_id)
             if not self.canvas.set_tool(tool):
                 self.statusBar().showMessage(
-                    "Select a raster object, or create one in the selected layer", 4000
+                    "Select a Raster or Vector Drawing, or create one first",
+                    4000,
                 )
                 self._sync_tool_buttons()
-                return
+                return False
         else:
-            self.canvas.set_tool(tool)
+            target = tool
+            if (
+                tool == ToolKind.SHAPE_EDIT and vector_selected
+                and getattr(ToolKind, "VECTOR_EDIT", None) is not None
+            ):
+                target = ToolKind.VECTOR_EDIT
+            vector_only = {
+                candidate for name in (
+                    "VECTOR_EDIT", "VECTOR_REDRAW", "VECTOR_CONNECT",
+                    "VECTOR_SIMPLIFY",
+                    "DRAW_SELECT_STROKE",
+                )
+                if (candidate := getattr(ToolKind, name, None)) is not None
+            }
+            if target in vector_only and not vector_selected:
+                self.statusBar().showMessage(
+                    "Select a Vector Drawing first", 4000
+                )
+                self._sync_tool_buttons()
+                return False
+            if not self.canvas.set_tool(target):
+                return False
         self._sync_tool_buttons()
+        return True
+
+    def _activate_named_tool(self, enum_name: str) -> bool:
+        tool = getattr(ToolKind, enum_name, None)
+        if tool is None:
+            self.statusBar().showMessage(
+                f"{enum_name.replace('_', ' ').title()} is unavailable",
+                4000,
+            )
+            self._sync_tool_buttons()
+            return False
+        return self._activate_tool(tool)
 
     def _confirm_primitive_conversion(self, primitive: str) -> None:
         label = "Rectangle" if primitive == "rectangle" else "Circle"
@@ -676,28 +1783,181 @@ class MainWindow(QMainWindow):
         )
 
     def _sync_tool_buttons(self) -> None:
+        vector_edit = getattr(ToolKind, "VECTOR_EDIT", None)
         for tool, button in self.tool_buttons.items():
             button.blockSignals(True)
-            button.setChecked(tool == self.canvas.tool)
+            button.setChecked(
+                tool == self.canvas.tool
+                or (
+                    tool == ToolKind.SHAPE_EDIT
+                    and self.canvas.tool == vector_edit
+                )
+            )
             button.blockSignals(False)
-        raster_selected = (
-            self.chapter is not None and self.canvas.selected_kind == "object"
-            and isinstance(self.chapter.objects.get(self.canvas.selected_id), RasterObject)
+        selected_object = (
+            self.chapter.objects.get(self.canvas.selected_id)
+            if (
+                self.chapter is not None
+                and self.canvas.selected_kind == "object"
+            )
+            else None
         )
-        self.tool_buttons[ToolKind.RASTER_PENCIL].setEnabled(raster_selected)
-        self.tool_buttons[ToolKind.RASTER_ERASER].setEnabled(raster_selected)
-        self.tool_buttons[ToolKind.RASTER_PENCIL].setVisible(raster_selected)
-        self.tool_buttons[ToolKind.RASTER_ERASER].setVisible(raster_selected)
-        text_selected = (
-            self.chapter is not None and self.canvas.selected_kind == "object"
-            and isinstance(self.chapter.objects.get(self.canvas.selected_id), TextObject)
+        raster_selected = isinstance(selected_object, RasterObject)
+        vector_selected = isinstance(
+            selected_object, VectorDrawingObject
         )
+        drawable_selected = raster_selected or vector_selected
+        self.drawing_selection_category.setVisible(drawable_selected)
+        for tool, button in self.drawing_selection_buttons.items():
+            button.setVisible(
+                tool != ToolKind.DRAW_SELECT_STROKE or vector_selected
+            )
+            button.setEnabled(
+                drawable_selected
+                and (
+                    tool != ToolKind.DRAW_SELECT_STROKE or vector_selected
+                )
+            )
+            button.blockSignals(True)
+            button.setChecked(self.canvas.tool == tool)
+            button.blockSignals(False)
+        self.tool_buttons[ToolKind.RASTER_PENCIL].setEnabled(
+            drawable_selected
+        )
+        self.tool_buttons[ToolKind.RASTER_ERASER].setEnabled(
+            drawable_selected
+        )
+        self.tool_buttons[ToolKind.RASTER_PENCIL].setVisible(
+            drawable_selected
+        )
+        self.tool_buttons[ToolKind.RASTER_ERASER].setVisible(
+            drawable_selected
+        )
+        shape_selected = (
+            self.chapter is not None and self.canvas.selected_kind == "object"
+            and isinstance(
+                selected_object, (VectorDrawingObject, VectorFillObject)
+            )
+        ) or (
+            self.chapter is not None
+            and self.canvas.selected_kind == "layer"
+            and self.canvas.selected_id in self.chapter.layers
+            and not self.chapter.layers[self.canvas.selected_id].is_page
+            and self.chapter.layers[self.canvas.selected_id].layer_kind
+            != "fill"
+        )
+        self.fill_tool_button.setEnabled(bool(shape_selected))
+        self.fill_tool_button.setVisible(bool(shape_selected))
+        fill_tool = getattr(ToolKind, "FILL", None)
+        self.fill_tool_button.blockSignals(True)
+        self.fill_tool_button.setChecked(
+            fill_tool is not None and self.canvas.tool == fill_tool
+        )
+        self.fill_tool_button.blockSignals(False)
+        text_selected = isinstance(selected_object, TextObject)
         self.tool_buttons[ToolKind.TEXT_EDIT].setVisible(self.chapter is not None)
-        transform_available = raster_selected or (
+        transform_available = (
             text_selected
             and self.chapter.objects[self.canvas.selected_id].layout_mode == "free"
         )
         self.tool_buttons[ToolKind.TRANSFORM].setVisible(transform_available)
+        self._sync_contextual_ribbon()
+
+    def _active_vector_drawing(self) -> VectorDrawingObject | None:
+        if (
+            self.chapter is None
+            or self.canvas.selected_kind != "object"
+        ):
+            return None
+        candidate = self.chapter.objects.get(self.canvas.selected_id)
+        return (
+            candidate
+            if isinstance(candidate, VectorDrawingObject)
+            else None
+        )
+
+    def _sync_contextual_ribbon(self) -> None:
+        if not hasattr(self, "ribbon"):
+            return
+        drawing = self._active_vector_drawing()
+        active = drawing is not None
+        selected_object = (
+            self.chapter.objects.get(self.canvas.selected_id)
+            if (
+                self.chapter is not None
+                and self.canvas.selected_kind == "object"
+            )
+            else None
+        )
+        vector_tool_context = isinstance(
+            selected_object, (VectorDrawingObject, VectorFillObject)
+        )
+        raster_active = isinstance(selected_object, RasterObject)
+        entering = active and not self._vector_ribbon_context
+        entering_raster = (
+            raster_active and not self._raster_ribbon_context
+        )
+        self._vector_ribbon_context = active
+        self._raster_ribbon_context = raster_active
+        self.ribbon.set_page_visible("vector_tools", active)
+        self.ribbon.set_page_visible(
+            "raster_object_settings", raster_active
+        )
+        if entering:
+            self.ribbon.select_page("vector_tools")
+        elif entering_raster:
+            self.ribbon.select_page("raster_object_settings")
+        self.tool_settings_controls.set_context(
+            self.canvas.tool, vector_active=vector_tool_context
+        )
+        if drawing is not None:
+            selected_points = len(
+                getattr(
+                    self.canvas, "selected_vector_point_ids",
+                    getattr(self.canvas, "_selected_vector_point_ids", ()),
+                )
+            )
+            selected_strokes = len(
+                getattr(
+                    self.canvas, "selected_vector_stroke_ids",
+                    getattr(self.canvas, "_selected_vector_stroke_ids", ()),
+                )
+            )
+            self.vector_tools_controls.set_selection_summary(
+                selected_points, selected_strokes, len(drawing.strokes)
+            )
+        if raster_active:
+            self.raster_object_controls.refresh()
+
+    def _apply_vector_redraw(self) -> None:
+        method = getattr(self.canvas, "apply_vector_redraw", None)
+        if method is None:
+            self.statusBar().showMessage(
+                "Vector redraw is unavailable", 4000
+            )
+            return
+        changed = method(
+            self.settings.vector_redraw_parameter,
+            self.settings.vector_redraw_operation,
+            self.settings.vector_redraw_amount,
+        )
+        if changed is False:
+            self.statusBar().showMessage(
+                "No vector points matched the current selection", 3000
+            )
+
+    def _apply_vector_simplify(self) -> None:
+        method = getattr(self.canvas, "apply_vector_simplify", None)
+        if method is None:
+            self.statusBar().showMessage(
+                "Vector simplify is unavailable", 4000
+            )
+            return
+        changed = method(self.settings.vector_simplify_amount)
+        if changed is False:
+            self.statusBar().showMessage(
+                "No vector strokes matched the current selection", 3000
+            )
 
     # ---- selection and model synchronization --------------------------
     def _tree_selection_changed(self, selected: QItemSelection, deselected) -> None:
@@ -710,22 +1970,41 @@ class MainWindow(QMainWindow):
             item.kind, item.entity_id, activate_default_tool=True
         )
 
-    def _show_selection_candidates(self, object_ids, global_point) -> None:
+    def _show_selection_candidates(self, candidates, global_point) -> None:
         if self.chapter is None:
             return
         menu = QMenu(self)
-        for object_id in object_ids:
-            obj = self.chapter.objects.get(object_id)
-            if obj is None:
-                continue
-            parent = self.chapter.layers[obj.parent_layer_id]
-            action = menu.addAction(
-                f"{obj.name}  ·  {obj.object_type.title()}  ·  {parent.name}"
-            )
+        for candidate in candidates:
+            kind = candidate.get("kind", "")
+            entity_id = candidate.get("id", "")
+            if kind == "object":
+                entity = self.chapter.objects.get(entity_id)
+                if entity is None:
+                    continue
+                parent = self.chapter.layers[entity.parent_layer_id]
+                label = (
+                    f"{entity.display_name if isinstance(entity, TextObject) else entity.name}"
+                    f"  ·  {entity.object_type.replace('_', ' ').title()}"
+                    f"  ·  {parent.name}"
+                )
+            else:
+                entity = self.chapter.layers.get(entity_id)
+                if entity is None:
+                    continue
+                parent = (
+                    self.chapter.layers.get(entity.parent_id)
+                    if entity.parent_id else None
+                )
+                label = (
+                    f"{entity.name}  ·  Shape"
+                    + (f"  ·  {parent.name}" if parent else "")
+                )
+            action = menu.addAction(label)
             action.triggered.connect(
-                lambda checked=False, selected=object_id:
+                lambda checked=False, selected_kind=kind,
+                selected_id=entity_id:
                 self.canvas.set_selection(
-                    "object", selected, activate_default_tool=True
+                    selected_kind, selected_id, activate_default_tool=True
                 )
             )
         if not menu.isEmpty():
@@ -742,6 +2021,27 @@ class MainWindow(QMainWindow):
                 )
                 self.tree.scrollTo(index)
                 del blocker
+        new_vector_id = ""
+        if self.chapter is not None and kind == "object":
+            selected = self.chapter.objects.get(entity_id)
+            if isinstance(selected, VectorDrawingObject):
+                new_vector_id = selected.object_id
+            elif isinstance(selected, VectorFillObject):
+                new_vector_id = selected.owner_drawing_id
+        previous_vector_id = self._expanded_selected_vector_id
+        if previous_vector_id and previous_vector_id != new_vector_id:
+            old_index = self.hierarchy_model.index_for_entity(
+                "object", previous_vector_id
+            )
+            if old_index.isValid():
+                self.tree.setExpanded(old_index, False)
+        if new_vector_id:
+            vector_index = self.hierarchy_model.index_for_entity(
+                "object", new_vector_id
+            )
+            if vector_index.isValid():
+                self.tree.setExpanded(vector_index, True)
+        self._expanded_selected_vector_id = new_vector_id
         self.inspector.refresh()
         self.layer_settings.refresh()
         self._sync_tool_buttons()
@@ -787,15 +2087,61 @@ class MainWindow(QMainWindow):
             index = self.hierarchy_model.index_for_entity("layer", layer_id)
             if index.isValid() and self.tree.isExpanded(index):
                 result.add(layer_id)
+        for object_id, obj in self.chapter.objects.items():
+            if not isinstance(obj, VectorDrawingObject):
+                continue
+            index = self.hierarchy_model.index_for_entity(
+                "object", object_id
+            )
+            if index.isValid() and self.tree.isExpanded(index):
+                result.add(object_id)
         return result
+
+    def _capture_hierarchy_view_state(self) -> None:
+        self._hierarchy_reset_expanded = self._expanded_layer_ids()
+        current = self.tree.currentIndex()
+        if current.isValid():
+            item = self.hierarchy_model.item_for_index(current)
+            self._hierarchy_reset_selection = (item.kind, item.entity_id)
+        else:
+            self._hierarchy_reset_selection = (
+                self.canvas.selected_kind, self.canvas.selected_id
+            )
+
+    def _restore_hierarchy_view_state(self) -> None:
+        for entity_id in self._hierarchy_reset_expanded:
+            kind = (
+                "layer"
+                if self.chapter is not None
+                and entity_id in self.chapter.layers
+                else "object"
+            )
+            index = self.hierarchy_model.index_for_entity(kind, entity_id)
+            if index.isValid():
+                self.tree.setExpanded(index, True)
+        kind, entity_id = self._hierarchy_reset_selection
+        if entity_id:
+            index = self.hierarchy_model.index_for_entity(kind, entity_id)
+            if index.isValid():
+                blocker = QSignalBlocker(self.tree.selectionModel())
+                self.tree.selectionModel().select(
+                    index,
+                    QItemSelectionModel.ClearAndSelect
+                    | QItemSelectionModel.Rows,
+                )
+                self.tree.setCurrentIndex(index)
+                del blocker
 
     def _refresh_hierarchy(self) -> None:
         expanded = self._expanded_layer_ids()
         selected = (self.canvas.selected_kind, self.canvas.selected_id)
         blocker = QSignalBlocker(self.tree.selectionModel())
         self.hierarchy_model.set_chapter(self.chapter)
-        for layer_id in expanded:
-            index = self.hierarchy_model.index_for_entity("layer", layer_id)
+        for entity_id in expanded:
+            kind = (
+                "layer" if entity_id in self.chapter.layers else "object"
+            )
+            index = self.hierarchy_model.index_for_entity(kind, entity_id)
             if index.isValid():
                 self.tree.setExpanded(index, True)
         if selected[1]:
@@ -806,6 +2152,203 @@ class MainWindow(QMainWindow):
                     QItemSelectionModel.ClearAndSelect | QItemSelectionModel.Rows,
                 )
         del blocker
+
+    # ---- per-series colors and palettes -------------------------------
+    def _sync_series_color_ui(self) -> None:
+        if self.series is None:
+            primary, secondary = "#FF000000", "#FFFFFFFF"
+            palettes, active_palette = [], None
+        else:
+            self.series.validate()
+            primary = canonical_argb(self.series.primary_color)
+            secondary = canonical_argb(
+                self.series.secondary_color, "#FFFFFFFF"
+            )
+            palettes = self.series.palettes
+            active_palette = self.series.active_palette_id
+        self.color_panel.set_colors(primary, secondary, emit=False)
+        self.palette_editor.set_palettes(
+            palettes, active_palette, emit=False
+        )
+        self.palette_editor.set_new_swatch_color(
+            self.color_panel.active_color()
+        )
+        self._apply_series_colors_to_canvas(primary, secondary)
+
+    def _apply_series_colors_to_canvas(
+        self, primary: str, secondary: str
+    ) -> None:
+        primary = canonical_argb(primary)
+        secondary = canonical_argb(secondary, "#FFFFFFFF")
+        # brush_color remains the compatibility bridge for older canvas
+        # paths and legacy settings, while the canvas owns the two-slot state.
+        self.settings.brush_color = primary
+        setattr(self.settings, "primary_color", primary)
+        setattr(self.settings, "secondary_color", secondary)
+        method = getattr(self.canvas, "set_active_colors", None)
+        if method is not None:
+            method(primary, secondary)
+        else:
+            self.canvas.refresh_brush_settings()
+            self.canvas.update()
+
+    def _series_color_changed(self, slot: str, color: str) -> None:
+        color = canonical_argb(color)
+        if self.series is not None:
+            if slot == "primary":
+                self.series.primary_color = color
+            elif slot == "secondary":
+                self.series.secondary_color = color
+        primary = (
+            self.series.primary_color
+            if self.series is not None else self.color_panel.primary_color()
+        )
+        secondary = (
+            self.series.secondary_color
+            if self.series is not None else self.color_panel.secondary_color()
+        )
+        self._apply_series_colors_to_canvas(primary, secondary)
+        self.palette_editor.set_new_swatch_color(color)
+        self._schedule_series_preferences_save()
+
+    def _palette_by_id(self, palette_id: str) -> ColorPalette | None:
+        if self.series is None:
+            return None
+        return next(
+            (
+                palette for palette in self.series.palettes
+                if palette.palette_id == palette_id
+            ),
+            None,
+        )
+
+    def _palette_selected(self, palette_id: str) -> None:
+        if self.series is None or self._palette_by_id(palette_id) is None:
+            return
+        self.series.active_palette_id = palette_id
+        self._schedule_series_preferences_save()
+
+    def _add_palette(self) -> None:
+        if self.series is None:
+            return
+        used_names = {item.name.casefold() for item in self.series.palettes}
+        number = 1
+        while f"Palette {number}".casefold() in used_names:
+            number += 1
+        palette = ColorPalette(name=f"Palette {number}")
+        self.series.palettes.append(palette)
+        self.series.active_palette_id = palette.palette_id
+        self.palette_editor.set_palettes(
+            self.series.palettes, palette.palette_id
+        )
+        self._schedule_series_preferences_save(immediate=True)
+
+    def _remove_palette(self, palette_id: str) -> None:
+        if self.series is None or len(self.series.palettes) <= 1:
+            return
+        old_index = next(
+            (
+                index for index, palette in enumerate(self.series.palettes)
+                if palette.palette_id == palette_id
+            ),
+            -1,
+        )
+        if old_index < 0:
+            return
+        self.series.palettes.pop(old_index)
+        replacement = self.series.palettes[
+            min(old_index, len(self.series.palettes) - 1)
+        ]
+        self.series.active_palette_id = replacement.palette_id
+        self.palette_editor.set_palettes(
+            self.series.palettes, replacement.palette_id
+        )
+        self._schedule_series_preferences_save(immediate=True)
+
+    def _rename_palette(self, palette_id: str, name: str) -> None:
+        palette = self._palette_by_id(palette_id)
+        if palette is None:
+            return
+        palette.name = name.strip() or "Palette"
+        palette.validate()
+        self._schedule_series_preferences_save(immediate=True)
+
+    def _palette_swatch_activated(
+        self, palette_id: str, swatch_id: str, color: str
+    ) -> None:
+        del palette_id, swatch_id
+        self.color_panel.apply_color(color, emit=True)
+
+    def _change_palette_swatch(
+        self, palette_id: str, swatch_id: str, color: str
+    ) -> None:
+        palette = self._palette_by_id(palette_id)
+        if palette is None:
+            return
+        swatch = next(
+            (
+                item for item in palette.swatches
+                if item.swatch_id == swatch_id
+            ),
+            None,
+        )
+        if swatch is None:
+            return
+        swatch.color = canonical_argb(color)
+        self._schedule_series_preferences_save(immediate=True)
+
+    def _add_palette_swatch(
+        self, palette_id: str, color: str
+    ) -> None:
+        palette = self._palette_by_id(palette_id)
+        if palette is None:
+            return
+        palette.swatches.append(
+            PaletteSwatch(color=canonical_argb(color))
+        )
+        self.palette_editor.set_palettes(
+            self.series.palettes, palette_id
+        )
+        self._schedule_series_preferences_save(immediate=True)
+
+    def _remove_palette_swatch(
+        self, palette_id: str, swatch_id: str
+    ) -> None:
+        palette = self._palette_by_id(palette_id)
+        if palette is None:
+            return
+        before = len(palette.swatches)
+        palette.swatches = [
+            item for item in palette.swatches
+            if item.swatch_id != swatch_id
+        ]
+        if len(palette.swatches) == before:
+            return
+        self.palette_editor.set_palettes(
+            self.series.palettes, palette_id
+        )
+        self._schedule_series_preferences_save(immediate=True)
+
+    def _schedule_series_preferences_save(
+        self, *, immediate: bool = False
+    ) -> None:
+        if self.repository is None or self.series is None:
+            return
+        if immediate:
+            self._flush_series_preferences()
+        else:
+            self.series_preferences_timer.start(250)
+
+    def _flush_series_preferences(self) -> None:
+        self.series_preferences_timer.stop()
+        if self.repository is None or self.series is None:
+            return
+        try:
+            self.repository.save_series(self.series)
+        except (OSError, ValueError) as error:
+            self.statusBar().showMessage(
+                f"Unable to save color preferences: {error}", 7000
+            )
 
     # ---- saving, autosave, settings -----------------------------------
     def _mark_dirty(self, dirty_rect) -> None:
@@ -854,9 +2397,17 @@ class MainWindow(QMainWindow):
 
     def _settings_changed(self, *args) -> None:
         self.settings.tablet_mode = self.tablet_mode.isChecked()
-        self.settings.page_scope_select = self.page_scope.isChecked()
         self.settings.snap_to_grid = self.snap_grid.isChecked()
         save_settings(self.settings)
+        self.canvas.update()
+
+    def _ribbon_settings_changed(self) -> None:
+        self.settings.clamp()
+        save_settings(self.settings)
+        self.tool_settings_controls.refresh()
+        self.vector_tools_controls.refresh()
+        self.raster_object_controls.refresh()
+        self.canvas.refresh_brush_settings()
         self.canvas.update()
 
     def _pencil_preset_selected(self, name: str) -> None:
@@ -865,6 +2416,7 @@ class MainWindow(QMainWindow):
         self.settings.active_pencil_preset = name
         save_settings(self.settings)
         self.canvas.refresh_brush_settings()
+        self.tool_settings_controls.refresh()
 
     def _brush_size_selected(self, tool: str, size: str) -> None:
         if size not in {"small", "medium", "large"}:
@@ -877,11 +2429,13 @@ class MainWindow(QMainWindow):
             return
         save_settings(self.settings)
         self.canvas.refresh_brush_settings()
+        self.tool_settings_controls.refresh()
 
     def _eraser_shape_selected(self, square: bool) -> None:
         self.settings.eraser_square = bool(square)
         save_settings(self.settings)
         self.canvas.refresh_brush_settings()
+        self.tool_settings_controls.refresh()
 
     def _edit_pencil_settings(self) -> None:
         dialog = PencilSettingsDialog(
@@ -898,6 +2452,7 @@ class MainWindow(QMainWindow):
         self.settings.clamp()
         save_settings(self.settings)
         self.inspector.refresh_brush_controls()
+        self.tool_settings_controls.refresh()
         self.canvas.refresh_brush_settings()
 
     def _edit_brush_sizes(self) -> None:
@@ -959,16 +2514,10 @@ class MainWindow(QMainWindow):
         save_settings(self.settings)
         self.canvas.refresh_brush_settings()
         self.inspector.refresh_brush_controls()
+        self.tool_settings_controls.refresh()
 
     def _set_text_shortcut_suppression(self, editing: bool) -> None:
-        for shortcut, sequence in self._shortcut_sequences:
-            display = sequence.toString(QKeySequence.PortableText)
-            key_name = display.rsplit("+", 1)[-1].strip()
-            contains_letter = len(key_name) == 1 and key_name.isalpha()
-            contains_shift = "shift" in display.casefold()
-            shortcut.setEnabled(not (
-                editing and (contains_letter or contains_shift)
-            ))
+        self._hotkey_text_editing = editing
 
     def _toggle_grid(self) -> None:
         if self.chapter is None:
@@ -981,18 +2530,27 @@ class MainWindow(QMainWindow):
         self.canvas.update()
 
     def _edit_hotkeys(self) -> None:
-        dialog = HotkeysDialog(self.settings.hotkeys, self)
-        if dialog.exec() != dialog.Accepted:
+        dialog = HotkeysDialog(
+            self.settings.hotkeys, self.settings.hotkey_hold, self
+        )
+        self._hotkey_runtime_enabled = False
+        try:
+            result = dialog.exec()
+        finally:
+            self._hotkey_runtime_enabled = True
+            self._hotkey_prefix_timer.stop()
+            self._hotkey_pending = None
+            self._hotkey_pressed.clear()
+            self._restore_active_hotkey_tool()
+        if result != QDialog.DialogCode.Accepted:
             return
         try:
             self.settings.hotkeys = dialog.bindings()
         except ValueError as error:
             QMessageBox.warning(self, "Invalid hotkeys", str(error))
             return
+        self.settings.hotkey_hold = dialog.hold_bindings()
         save_settings(self.settings)
-        for shortcut in self._shortcuts:
-            shortcut.setParent(None)
-            shortcut.deleteLater()
         self._install_shortcuts()
 
     def _remember_series(self, path: Path) -> None:
@@ -1032,6 +2590,7 @@ class MainWindow(QMainWindow):
         self.add_page_button.setEnabled(active)
         self.add_layer_button.setEnabled(active)
         self.add_raster_button.setEnabled(active)
+        self.add_vector_button.setEnabled(active)
         self.add_text_button.setEnabled(active)
         self.add_fill_button.setEnabled(active)
         self._sync_tool_buttons()
@@ -1043,5 +2602,7 @@ class MainWindow(QMainWindow):
         if not self._confirm_discard_or_save():
             event.ignore()
             return
-        save_settings(self.settings)
+        self._flush_series_preferences()
+        self.layout_settings_timer.stop()
+        self._save_workspace_layout()
         event.accept()

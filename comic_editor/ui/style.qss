@@ -10,6 +10,38 @@ QToolBar {
     spacing: 4px;
     padding: 4px;
 }
+QWidget#toolPanel,
+QScrollArea#toolPanelScroll,
+QWidget#toolPanelContents {
+    background: #18181c;
+    border: none;
+}
+QFrame#toolPanelSeparator {
+    color: #33333a;
+    background: #33333a;
+    max-height: 1px;
+}
+QSplitter::handle {
+    background: #33333a;
+}
+QSplitter::handle:hover,
+QSplitter::handle:pressed {
+    background: #80c8ff;
+}
+QTabWidget#colorTabs::pane {
+    border: 1px solid #33333a;
+    background: #1c1c20;
+}
+QTabWidget#colorTabs QTabBar::tab {
+    background: #24242a;
+    border: none;
+    border-bottom: 2px solid transparent;
+    padding: 5px 12px;
+}
+QTabWidget#colorTabs QTabBar::tab:selected {
+    border-bottom-color: #80c8ff;
+    color: #ffffff;
+}
 QToolButton, QPushButton {
     background: #2e2e34;
     border: 1px solid #3a3a42;
@@ -22,6 +54,15 @@ QToolButton:checked, QPushButton:checked {
     border-color: #80c8ff;
 }
 QToolButton:disabled, QPushButton:disabled { color: #5a5a62; }
+QToolButton#shapeCategoryHeader {
+    background: transparent;
+    border: none;
+    border-radius: 0;
+    padding: 4px 2px;
+    text-align: left;
+}
+QToolButton#shapeCategoryHeader:hover { background: #29292f; }
+QToolButton#shapeCategoryHeader:pressed { background: #303038; }
 QTreeView, QLineEdit, QComboBox, QSpinBox, QDoubleSpinBox {
     background: #25252a;
     border: 1px solid #3a3a42;
@@ -48,4 +89,38 @@ QStatusBar { background: #18181c; color: #9ea0a8; }
 QSlider::groove:horizontal { background: #2a2a30; height: 5px; }
 QSlider::handle:horizontal {
     background: #80c8ff; width: 14px; margin: -5px 0; border-radius: 7px;
+}
+QWidget#ribbon {
+    background: #202026;
+    border-bottom: 1px solid #3a3a42;
+}
+QTabBar#ribbonTabs::tab {
+    background: transparent;
+    border: none;
+    border-bottom: 2px solid transparent;
+    padding: 5px 14px;
+    color: #b8bac2;
+}
+QTabBar#ribbonTabs::tab:hover { background: #2a2a31; color: #ffffff; }
+QTabBar#ribbonTabs::tab:selected {
+    color: #ffffff;
+    border-bottom-color: #80c8ff;
+}
+QScrollArea#ribbonPage, QWidget#ribbonPageGroups {
+    background: #202026;
+    border: none;
+}
+QFrame#ribbonGroup {
+    background: #25252b;
+    border: 1px solid #35353d;
+    border-radius: 4px;
+}
+QLabel#ribbonGroupTitle {
+    color: #92949d;
+    font-size: 10px;
+    padding-top: 2px;
+}
+QLabel#ribbonContextTitle {
+    color: #80c8ff;
+    font-weight: 600;
 }

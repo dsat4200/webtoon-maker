@@ -1,10 +1,13 @@
 """Undo/redo commands, including sparse raster tile patches."""
 from __future__ import annotations
 
+import copy
 from dataclasses import dataclass
-from typing import Callable, Protocol
+from typing import Any, Callable, Protocol
 
 from PySide6.QtGui import QImage
+
+from .models import object_from_dict
 
 
 class Command(Protocol):
@@ -34,10 +37,53 @@ class TilePatchCommand:
     before: dict[tuple[int, int], QImage | None]
     after: dict[tuple[int, int], QImage | None]
     changed_callback: Callable[[], None] | None = None
+    before_state: object | None = None
+    after_state: object | None = None
+    state_callback: Callable[[object], None] | None = None
 
-    def _apply(self, values: dict[tuple[int, int], QImage | None]) -> None:
+    def _apply(
+        self, values: dict[tuple[int, int], QImage | None], state: object,
+    ) -> None:
         for key, image in values.items():
             self.tile_store.set_tile(self.object_id, key, image)
+        if self.state_callback is not None:
+            self.state_callback(state)
+        if self.changed_callback:
+            self.changed_callback()
+
+    def redo(self) -> None:
+        self._apply(self.after, self.after_state)
+
+    def undo(self) -> None:
+        self._apply(self.before, self.before_state)
+
+
+@dataclass
+class ObjectPatchCommand:
+    """Undo a focused set of object records without snapshotting a chapter."""
+
+    label: str
+    chapter: object
+    before: dict[str, dict[str, Any] | None]
+    after: dict[str, dict[str, Any] | None]
+    changed_callback: Callable[[], None] | None = None
+
+    def __post_init__(self) -> None:
+        self.before = copy.deepcopy(self.before)
+        self.after = copy.deepcopy(self.after)
+
+    def _apply(self, values: dict[str, dict[str, Any] | None]) -> None:
+        for object_id, payload in values.items():
+            if payload is None:
+                self.chapter.objects.pop(object_id, None)
+                continue
+            replacement = object_from_dict(copy.deepcopy(payload))
+            current = self.chapter.objects.get(object_id)
+            if current is not None and type(current) is type(replacement):
+                current.__dict__.clear()
+                current.__dict__.update(replacement.__dict__)
+            else:
+                self.chapter.objects[object_id] = replacement
         if self.changed_callback:
             self.changed_callback()
 

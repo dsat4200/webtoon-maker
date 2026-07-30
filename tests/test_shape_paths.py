@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 import json
+import math
 
 import pytest
 from PySide6.QtCore import QCoreApplication, QEvent, QPointF, Qt
 from PySide6.QtGui import (
-    QColor, QImage, QPointingDevice, QTabletEvent,
+    QColor, QImage, QPainter, QPainterPath, QPointingDevice, QTabletEvent,
 )
 from PySide6.QtTest import QTest
 
@@ -28,9 +29,7 @@ def _canvas():
         page.layer_id, "Layer 1",
         BoundGeometry.rectangle(40, 40, 700, 700),
     )
-    canvas = CanvasWidget(EditorSettings(
-        snap_to_grid=False, transform_snap_to_grid=False
-    ))
+    canvas = CanvasWidget(EditorSettings(snap_to_grid=False))
     canvas.resize(1000, 800)
     canvas.set_document(chapter, TileStore())
     canvas.set_selection("layer", layer.layer_id, False)
@@ -73,16 +72,15 @@ def test_path_node_shape_style_round_trip_and_open_leaf_invariants():
     )
     loaded = ChapterDocument.from_dict(chapter.to_dict())
     result = loaded.layers[line.layer_id]
-    assert loaded.schema_version == 4
+    assert loaded.schema_version == 9
     assert result.layer_kind == "open_shape"
     assert result.bound.closed is False
     assert result.bound.nodes[1].incoming == (70, 30)
     assert result.bound.nodes[1].width_multiplier == 2.4
     assert result.shape_style.end_cap == "square"
-    with pytest.raises(ValueError, match="Leaf"):
-        loaded.add_layer(line.layer_id)
-    with pytest.raises(ValueError, match="directly"):
-        loaded.add_object(line.layer_id, RasterObject())
+    loaded.add_layer(line.layer_id)
+    loaded.add_object(line.layer_id, RasterObject())
+    loaded.validate()
 
 
 def test_migrate_v3_rectangle_radius_fill_and_border():
@@ -243,9 +241,13 @@ def test_shape_creation_open_close_and_bezier_drag(qapp):
     canvas._finish_shape(False)
     open_layer = chapter.layers[canvas.selected_id]
     assert open_layer.layer_kind == "open_shape"
+    assert canvas.tool == ToolKind.SHAPE_EDIT
     assert open_layer.bound.nodes[-1].point_type == "bezier"
     assert open_layer.bound.nodes[-1].incoming is not None
     assert open_layer.bound.nodes[-1].outgoing is None
+    assert open_layer.shape_style.outline_color == canvas.primary_color
+    assert open_layer.shape_style.primary_color == canvas.secondary_color
+    assert open_layer.shape_style.outline_thickness == 4
 
     canvas.set_selection("layer", page.layer_id, False)
     canvas.set_tool(ToolKind.SHAPE_CREATE)
@@ -260,7 +262,31 @@ def test_shape_creation_open_close_and_bezier_drag(qapp):
     closed = chapter.layers[canvas.selected_id]
     assert closed.layer_kind == "bounded"
     assert closed.bound.closed is True
-    assert closed.fill_color == canvas.settings.brush_color
+    assert closed.fill_color == canvas.secondary_color
+    assert closed.shape_style.outline_color == canvas.primary_color
+    assert closed.shape_style.outline_thickness == 4
+    assert canvas.tool == ToolKind.SHAPE_EDIT
+
+
+@pytest.mark.parametrize(
+    ("tool", "end"),
+    [
+        (ToolKind.BOX_BOUND, QPointF(260, 220)),
+        (ToolKind.CIRCLE_BOUND, QPointF(220, 100)),
+    ],
+)
+def test_primitive_creation_uses_active_primary_and_secondary(qapp, tool, end):
+    canvas, chapter, page, layer = _canvas()
+    canvas.set_selection("layer", page.layer_id, False)
+    canvas.set_tool(tool)
+    start = QPointF(100, 100)
+    canvas._tool_press(canvas.document_to_widget(start), 1)
+    canvas._tool_move(canvas.document_to_widget(end), 1)
+    canvas._tool_release()
+    created = chapter.layers[canvas.selected_id]
+    assert created.shape_style.outline_color == canvas.primary_color
+    assert created.fill_color == canvas.secondary_color
+    assert created.shape_style.outline_thickness == 4
 
 
 def test_shape_edit_width_cap_insert_and_primitive_conversion(qapp):
@@ -654,6 +680,9 @@ def test_point_type_lock_roundness_and_constant_screen_gizmos(qapp):
     assert node.point_type == "bezier"
     assert node.handles_locked
     assert node.incoming is not None and node.outgoing is not None
+    assert "roundness" not in canvas._shape_gizmo_positions(
+        layer.bound, node
+    )
     lock_gizmo = canvas._shape_gizmo_positions(
         layer.bound, node
     )["lock"]
@@ -677,10 +706,520 @@ def test_point_type_lock_roundness_and_constant_screen_gizmos(qapp):
     assert first_distance == pytest.approx(second_distance, abs=0.01)
 
 
+def test_closed_seam_bezier_has_undoable_unlock_and_smoothness_gizmo(qapp):
+    canvas, chapter, page, layer = _canvas()
+    seam = PathNode(
+        x=150, y=100, point_type="bezier",
+        incoming=(100, 150), outgoing=(200, 50),
+        handles_locked=True, roundness=32, roundness_enabled=True,
+    )
+    layer.bound = BoundGeometry.path([
+        seam,
+        PathNode(x=500, y=120),
+        PathNode(x=300, y=500),
+    ], True)
+    canvas.set_tool(ToolKind.SHAPE_EDIT)
+    canvas._selected_shape_node_id = seam.node_id
+    positions = canvas._shape_gizmo_positions(layer.bound, seam)
+    assert "lock" in positions
+    assert "roundness" not in positions
+    assert math.dist(
+        positions["lock"].toTuple(), positions["type"].toTuple()
+    ) > 45 / canvas.scale
+    lock_hit = canvas._shape_hit_test(
+        layer.bound, positions["lock"] + QPointF(14 / canvas.scale, 0)
+    )
+    assert lock_hit["name"] == "lock"
+    canvas._update_shape_hover(positions["lock"])
+    assert canvas.toolTip() == "Unlock Bézier handles"
+    original_handles = (seam.incoming, seam.outgoing)
+
+    canvas._tool_press(canvas.document_to_widget(positions["lock"]), 1)
+    assert seam.handles_locked is False
+    assert (seam.incoming, seam.outgoing) == original_handles
+    assert "roundness" in canvas._shape_gizmo_positions(layer.bound, seam)
+    assert seam.roundness == 32
+    canvas._update_shape_hover(
+        canvas._shape_gizmo_positions(layer.bound, seam)["lock"]
+    )
+    assert canvas.toolTip() == "Lock Bézier handles"
+    canvas.command_stack.undo()
+    restored = canvas.chapter.layers[layer.layer_id].bound.nodes[0]
+    assert restored.handles_locked is True
+
+
+def test_bezier_padlock_states_render_distinctly_and_screen_stably(qapp):
+    images = []
+    for locked in (True, False):
+        image = QImage(64, 64, QImage.Format_ARGB32_Premultiplied)
+        image.fill(Qt.transparent)
+        painter = QPainter(image)
+        CanvasWidget._draw_bezier_lock_gizmo(
+            painter, QPointF(32, 32), locked, 1.0
+        )
+        painter.end()
+        images.append(image)
+        assert any(
+            image.pixelColor(x, y).alpha() > 0
+            for y in range(image.height())
+            for x in range(image.width())
+        )
+    assert bytes(images[0].constBits()) != bytes(images[1].constBits())
+
+    canvas, chapter, page, layer = _canvas()
+    node = PathNode(
+        x=200, y=200, point_type="bezier",
+        incoming=(150, 200), outgoing=(250, 200),
+    )
+    layer.bound = BoundGeometry.path([
+        PathNode(x=50, y=100), node, PathNode(x=400, y=300),
+    ])
+    distances = []
+    for scale in (0.5, 2.0):
+        canvas.scale = scale
+        point = canvas._shape_gizmo_positions(layer.bound, node)["lock"]
+        distances.append((
+            canvas.document_to_widget(point)
+            - canvas.document_to_widget(QPointF(node.x, node.y))
+        ).manhattanLength())
+    assert distances[0] == pytest.approx(distances[1], abs=0.01)
+
+
+@pytest.mark.parametrize(
+    ("incoming_curve", "outgoing_curve"),
+    [(True, False), (False, True), (True, True)],
+)
+def test_vector_smoothness_matches_adjacent_curve_tangents(
+    incoming_curve, outgoing_curve,
+):
+    previous = (
+        PathNode(
+            x=0, y=150, point_type="bezier",
+            outgoing=(90, 20), handles_locked=False,
+        )
+        if incoming_curve else PathNode(x=0, y=150)
+    )
+    corner = PathNode(
+        x=150, y=150, roundness=60, roundness_enabled=True
+    )
+    following = (
+        PathNode(
+            x=300, y=150, point_type="bezier",
+            incoming=(210, 280), handles_locked=False,
+        )
+        if outgoing_curve else PathNode(x=300, y=150)
+    )
+    path = CanvasWidget.bound_path(
+        BoundGeometry.path([previous, corner, following], False)
+    )
+    elements = [path.elementAt(index) for index in range(path.elementCount())]
+    assert len(elements) == 10
+    points = [QPointF(element.x, element.y) for element in elements]
+    entry, fillet_in, fillet_out, exit_point = (
+        points[3], points[4], points[5], points[6]
+    )
+
+    def assert_same_tangent(first: QPointF, second: QPointF) -> None:
+        first_length = math.hypot(first.x(), first.y())
+        second_length = math.hypot(second.x(), second.y())
+        assert first_length > 1e-6 and second_length > 1e-6
+        cross = first.x() * second.y() - first.y() * second.x()
+        assert cross / (first_length * second_length) == pytest.approx(
+            0, abs=1e-6
+        )
+        assert QPointF.dotProduct(first, second) > 0
+
+    assert_same_tangent(entry - points[2], fillet_in - entry)
+    assert_same_tangent(
+        exit_point - fillet_out, points[7] - exit_point
+    )
+    assert math.dist(
+        (entry.x(), entry.y()), (fillet_in.x(), fillet_in.y())
+    ) <= math.dist(corner.position, (entry.x(), entry.y())) * 2 / 3 + 1e-6
+    assert math.dist(
+        (exit_point.x(), exit_point.y()),
+        (fillet_out.x(), fillet_out.y()),
+    ) <= math.dist(corner.position, (exit_point.x(), exit_point.y())) * 2 / 3 + 1e-6
+
+
+def test_vector_to_vector_smoothness_geometry_is_unchanged():
+    corner = PathNode(
+        x=100, y=0, roundness=20, roundness_enabled=True
+    )
+    path = CanvasWidget.bound_path(BoundGeometry.path([
+        PathNode(x=0, y=0), corner, PathNode(x=100, y=100),
+    ], False))
+    points = [
+        (path.elementAt(index).x, path.elementAt(index).y)
+        for index in range(path.elementCount())
+    ]
+    expected = [
+        (0, 0), (80, 0), (93.3333333333, 0),
+        (100, 6.6666666667), (100, 20), (100, 100),
+    ]
+    assert len(points) == len(expected)
+    for actual, target in zip(points, expected):
+        assert actual == pytest.approx(target)
+
+
+def test_bezier_controls_use_global_grid_snap_in_create_and_edit(qapp):
+    canvas, chapter, page, layer = _canvas()
+    canvas.settings.snap_to_grid = True
+    node = PathNode(
+        x=300, y=100, point_type="bezier",
+        incoming=(240, 160), outgoing=(360, 40),
+        handles_locked=False,
+    )
+    layer.bound = BoundGeometry.path([
+        PathNode(x=100, y=100), node, PathNode(x=500, y=200),
+    ])
+    layer.layer_kind = "open_shape"
+    canvas.set_tool(ToolKind.SHAPE_EDIT)
+    canvas._selected_shape_node_id = node.node_id
+    canvas._tool_press(canvas.document_to_widget(QPointF(*node.incoming)), 1)
+    canvas._tool_move(canvas.document_to_widget(QPointF(143, 167)), 1)
+    canvas._tool_release()
+    assert node.incoming == pytest.approx((150, 180))
+
+    canvas.set_selection("layer", page.layer_id, False)
+    canvas.set_tool(ToolKind.SHAPE_CREATE)
+    draft = PathNode(
+        x=300, y=100, point_type="bezier",
+        incoming=(240, 160), outgoing=(360, 40),
+        handles_locked=False,
+    )
+    canvas._creation_nodes = [
+        PathNode(x=100, y=100), draft, PathNode(x=500, y=200),
+    ]
+    canvas._creation_selected_node_id = draft.node_id
+    canvas._tool_press(canvas.document_to_widget(QPointF(*draft.incoming)), 1)
+    canvas._tool_move(canvas.document_to_widget(QPointF(143, 167)), 1)
+    canvas._tool_release()
+    assert draft.incoming == pytest.approx((150, 180))
+
+
+def test_delete_point_gizmo_is_undoable_and_respects_minimum(qapp):
+    canvas, chapter, page, layer = _canvas()
+    layer.bound = BoundGeometry.rectangle(100, 100, 300, 200)
+    canvas.set_tool(ToolKind.SHAPE_EDIT)
+    selected = layer.bound.nodes[0]
+    canvas._selected_shape_node_id = selected.node_id
+    position = canvas._shape_gizmo_positions(
+        layer.bound, selected
+    )["delete"]
+    hit = canvas._shape_hit_test(layer.bound, position)
+    assert hit["kind"] == "gizmo"
+    assert hit["name"] == "delete"
+
+    canvas._tool_press(canvas.document_to_widget(position), 1)
+    canvas._tool_release()
+    assert layer.bound.primitive == "custom"
+    assert len(layer.bound.nodes) == 3
+    canvas._selected_shape_node_id = layer.bound.nodes[0].node_id
+    assert "delete" not in canvas._shape_gizmo_positions(
+        layer.bound, layer.bound.nodes[0]
+    )
+
+    canvas.command_stack.undo()
+    restored = canvas.chapter.layers[layer.layer_id]
+    assert restored.bound.primitive == "rectangle"
+    assert len(restored.bound.nodes) == 4
+
+
+def test_roundness_click_toggles_and_preserves_sharp_zero(qapp):
+    canvas, chapter, page, layer = _canvas()
+    node = PathNode(
+        x=300, y=200, point_type="bezier",
+        incoming=(220, 280), outgoing=(390, 120),
+        handles_locked=False,
+    )
+    layer.bound = BoundGeometry.path([
+        PathNode(x=80, y=180), node, PathNode(x=560, y=320),
+    ])
+    layer.layer_kind = "open_shape"
+    canvas.set_tool(ToolKind.SHAPE_EDIT)
+    canvas._selected_shape_node_id = node.node_id
+
+    position = canvas._shape_gizmo_positions(
+        layer.bound, node
+    )["roundness"]
+    canvas._tool_press(canvas.document_to_widget(position), 1)
+    canvas._tool_release()
+    assert node.roundness_enabled
+    assert node.roundness == 0
+
+    position = canvas._shape_gizmo_positions(
+        layer.bound, node
+    )["roundness"]
+    canvas._tool_press(canvas.document_to_widget(position), 1)
+    canvas._tool_release()
+    assert not node.roundness_enabled
+    assert node.roundness == 0
+
+    canvas._tool_press(canvas.document_to_widget(position), 1)
+    canvas._tool_release()
+    assert node.roundness_enabled
+    assert node.roundness == 0
+
+    sharp = CanvasWidget.bound_path(layer.bound)
+    assert sharp.elementCount() == 7
+
+
+def test_closed_seam_vector_converts_to_valid_bezier(qapp):
+    canvas, chapter, page, layer = _canvas()
+    seam = PathNode(x=100, y=100)
+    layer.bound = BoundGeometry.path([
+        seam,
+        PathNode(x=500, y=100),
+        PathNode(x=300, y=500),
+    ], True)
+
+    canvas._toggle_shape_node_type(layer.bound, seam)
+
+    assert seam.point_type == "bezier"
+    assert seam.incoming is not None
+    assert seam.outgoing is not None
+    assert seam.incoming == pytest.approx((
+        seam.x * 2 - seam.outgoing[0],
+        seam.y * 2 - seam.outgoing[1],
+    ))
+    chapter.to_dict()
+
+
+def test_handle_normalization_repairs_topology_without_changing_valid_handles():
+    first = PathNode(
+        x=0, y=0, point_type="bezier",
+        incoming=None, outgoing=(50, 0), handles_locked=False,
+    )
+    middle = PathNode(
+        x=100, y=0, point_type="bezier",
+        incoming=(75, 0), outgoing=(125, 0), handles_locked=False,
+    )
+    last = PathNode(
+        x=200, y=0, point_type="bezier",
+        incoming=(175, 0), outgoing=None, handles_locked=False,
+    )
+    bound = BoundGeometry.path([first, middle, last], False)
+    middle_handles = (middle.incoming, middle.outgoing)
+    first.incoming = (-50, 0)
+    last.outgoing = (250, 0)
+
+    bound.normalize_bezier_handles()
+
+    assert first.incoming is None
+    assert first.outgoing == (50, 0)
+    assert (middle.incoming, middle.outgoing) == middle_handles
+    assert last.incoming == (175, 0)
+    assert last.outgoing is None
+    bound.validate()
+
+
+def test_handle_validation_error_identifies_the_point():
+    malformed = PathNode(
+        node_id="broken-node", x=0, y=0, point_type="bezier",
+        incoming=(-20, 0), outgoing=(20, 0), handles_locked=False,
+    )
+    bound = BoundGeometry.path([
+        malformed, PathNode(x=100, y=0), PathNode(x=50, y=100),
+    ], True)
+    malformed.incoming = None
+
+    with pytest.raises(
+        ValueError,
+        match=r"incoming B.zier handle at contour 0, point 0.*broken-node"
+    ):
+        bound.validate()
+
+
+def test_unlocked_bezier_roundness_is_curve_aware_and_progressive():
+    node = PathNode(
+        x=500, y=300, point_type="bezier",
+        incoming=(350, 550), outgoing=(650, 100),
+        handles_locked=False, roundness=30, roundness_enabled=True,
+    )
+    bound = BoundGeometry.path([
+        PathNode(x=100, y=400), node, PathNode(x=900, y=600),
+    ])
+
+    entry_distances = []
+    for radius in (30, 120):
+        node.roundness = radius
+        path = CanvasWidget.bound_path(bound)
+        assert path.elementCount() == 13
+        elements = [path.elementAt(index) for index in range(path.elementCount())]
+        anchor_indices = [
+            index for index, element in enumerate(elements)
+            if (element.x, element.y) == pytest.approx(node.position)
+        ]
+        assert anchor_indices == [6]
+        anchor_index = anchor_indices[0]
+        incoming_control = QPointF(
+            elements[anchor_index - 1].x, elements[anchor_index - 1].y
+        )
+        outgoing_control = QPointF(
+            elements[anchor_index + 1].x, elements[anchor_index + 1].y
+        )
+        incoming = QPointF(node.x, node.y) - incoming_control
+        outgoing = outgoing_control - QPointF(node.x, node.y)
+        assert (
+            incoming.x() * outgoing.y() - incoming.y() * outgoing.x()
+        ) == pytest.approx(0, abs=1e-6)
+        assert QPointF.dotProduct(incoming, outgoing) > 0
+        assert math.hypot(incoming.x(), incoming.y()) == pytest.approx(
+            math.hypot(outgoing.x(), outgoing.y())
+        )
+        entry = QPointF(elements[3].x, elements[3].y)
+        entry_distances.append(math.dist(node.position, (entry.x(), entry.y())))
+    assert entry_distances[1] > entry_distances[0] * 3
+
+    node.roundness_enabled = False
+    sharp = CanvasWidget.bound_path(bound)
+    assert sharp.elementCount() == 7
+
+
+def test_closed_shapes_hide_nonfunctional_width_gizmo():
+    canvas, chapter, page, layer = _canvas()
+    layer.bound = BoundGeometry.path([
+        PathNode(x=100, y=100),
+        PathNode(x=300, y=100),
+        PathNode(x=200, y=300),
+    ], True)
+    node = layer.bound.nodes[1]
+    assert "thickness" not in canvas._shape_gizmo_positions(
+        layer.bound, node
+    )
+    layer.bound.closed = False
+    layer.layer_kind = "open_shape"
+    assert "thickness" in canvas._shape_gizmo_positions(
+        layer.bound, node
+    )
+
+
+@pytest.mark.parametrize("endpoint_index", [0, -1])
+def test_open_bezier_endpoints_never_create_forbidden_handles(
+    qapp, endpoint_index,
+):
+    canvas, chapter, page, layer = _canvas()
+    layer.layer_kind = "open_shape"
+    layer.bound = BoundGeometry.path([
+        PathNode(x=100, y=100),
+        PathNode(x=300, y=180),
+        PathNode(x=500, y=100),
+    ], False)
+    canvas.set_tool(ToolKind.SHAPE_EDIT)
+    node = layer.bound.nodes[endpoint_index]
+    canvas._selected_shape_node_id = node.node_id
+
+    type_gizmo = canvas._shape_gizmo_positions(
+        layer.bound, node
+    )["type"]
+    canvas._tool_press(canvas.document_to_widget(type_gizmo), 1)
+    assert node.point_type == "bezier"
+    assert node.handles_locked is False
+    if endpoint_index == 0:
+        assert node.incoming is None and node.outgoing is not None
+        handle_name, handle = "outgoing", node.outgoing
+    else:
+        assert node.incoming is not None and node.outgoing is None
+        handle_name, handle = "incoming", node.incoming
+
+    canvas._tool_press(canvas.document_to_widget(QPointF(*handle)), 1)
+    target = QPointF(handle[0] + 35, handle[1] + 20)
+    canvas._tool_move(canvas.document_to_widget(target), 1)
+    canvas._tool_release()
+    assert getattr(node, handle_name) == pytest.approx(
+        target.toTuple(), abs=0.6
+    )
+    if endpoint_index == 0:
+        assert node.incoming is None
+    else:
+        assert node.outgoing is None
+    layer.bound.validate()
+    chapter.to_dict()
+
+    cap = canvas._shape_gizmo_positions(layer.bound, node)["cap"]
+    canvas._tool_press(canvas.document_to_widget(cap), 1)
+    chapter.to_dict()
+
+
+def test_shape_gizmo_labels_tooltips_and_enlarged_hit_targets(qapp):
+    canvas, chapter, page, layer = _canvas()
+    layer.layer_kind = "open_shape"
+    node = PathNode(
+        x=300, y=200, point_type="bezier",
+        incoming=(240, 200), outgoing=(360, 200),
+        handles_locked=False,
+    )
+    layer.bound = BoundGeometry.path([
+        PathNode(x=100, y=100), node, PathNode(x=500, y=300),
+    ], False)
+    canvas.set_tool(ToolKind.SHAPE_EDIT)
+    canvas._selected_shape_node_id = node.node_id
+
+    type_position = canvas._shape_gizmo_positions(
+        layer.bound, node
+    )["type"]
+    canvas._update_shape_hover(type_position)
+    assert canvas.toolTip() == "Convert this point to Vector"
+
+    thickness_position = canvas._shape_gizmo_positions(
+        layer.bound, node
+    )["thickness"]
+    canvas._update_shape_hover(thickness_position)
+    assert canvas.toolTip() == (
+        "Drag to adjust stroke thickness at this point"
+    )
+
+    control_probe = QPointF(
+        node.outgoing[0] + 20 / canvas.scale,
+        node.outgoing[1],
+    )
+    hit = canvas._shape_hit_test(layer.bound, control_probe)
+    assert hit["kind"] == "control"
+    assert hit["name"] == "outgoing"
+    canvas._update_shape_hover(QPointF(*node.outgoing))
+    assert canvas.toolTip() == "Drag the outgoing Bézier handle"
+
+
+def test_round_cap_is_one_tangent_aligned_ribbon_subpath():
+    bound = BoundGeometry.path([
+        PathNode(x=100, y=100, width_multiplier=1),
+        PathNode(x=300, y=100, width_multiplier=1),
+    ], False)
+    mesh = CanvasWidget.open_shape_mesh(
+        bound, 20, start_cap="round", end_cap="round"
+    )
+    bounds = mesh.boundingRect()
+    assert bounds.left() == pytest.approx(90)
+    assert bounds.right() == pytest.approx(310)
+    assert bounds.top() == pytest.approx(90)
+    assert bounds.bottom() == pytest.approx(110)
+    assert sum(
+        mesh.elementAt(index).type == QPainterPath.MoveToElement
+        for index in range(mesh.elementCount())
+    ) == 1
+    assert mesh.contains(QPointF(91, 100))
+    assert mesh.contains(QPointF(309, 100))
+
+
+def test_roundness_enabled_migrates_from_saved_radius():
+    rounded = PathNode.from_dict({
+        "position": [10, 20], "roundness": 12,
+    })
+    sharp = PathNode.from_dict({
+        "position": [10, 20], "roundness": 0,
+    })
+    assert rounded.roundness_enabled
+    assert not sharp.roundness_enabled
+    assert rounded.to_dict()["roundness_enabled"] is True
+
+
 def test_shapes_category_stays_open_after_tool_choice(qapp):
     window = MainWindow()
     try:
         assert not window.shapes_category.isExpanded()
+        assert not window.shapes_category.header.isCheckable()
+        assert window.shapes_category.header.objectName() == "shapeCategoryHeader"
         window.shapes_category.header.click()
         assert window.shapes_category.isExpanded()
         assert not window.shapes_category.contents.isHidden()
@@ -702,6 +1241,6 @@ def test_bound_edit_hotkey_migrates_to_shape_edit(monkeypatch, tmp_path):
     }), encoding="utf-8")
     monkeypatch.setattr(settings_module, "settings_path", lambda: path)
     loaded = load_settings()
-    assert loaded.settings_version == 5
+    assert loaded.settings_version == 11
     assert loaded.hotkeys["shape_edit"] == "Ctrl+B"
     assert "bound_edit" not in loaded.hotkeys

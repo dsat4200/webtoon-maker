@@ -14,14 +14,41 @@ def default_hotkeys() -> dict[str, str]:
     return {
         "raster_pencil": "P",
         "raster_eraser": "E",
+        "fill": "F",
         "object_select": "S",
         "transform": "T",
         "shape_edit": "B",
+        "vector_redraw": "",
+        "vector_connect": "",
+        "vector_simplify": "",
+        "draw_select_rect": "",
+        "draw_select_lasso": "",
+        "draw_select_stroke": "",
+        "insert_page_gap": "",
+        "select_all": "Ctrl+A",
         "save": "Ctrl+S",
         "undo": "Ctrl+Z",
         "redo": "Ctrl+Shift+Z",
         "reset_view": "Ctrl+0",
         "toggle_grid": "Alt+G",
+    }
+
+
+def default_hotkey_hold() -> dict[str, bool]:
+    return {
+        "raster_pencil": False,
+        "raster_eraser": False,
+        "fill": False,
+        "object_select": False,
+        "transform": False,
+        "shape_edit": False,
+        "vector_redraw": False,
+        "vector_connect": False,
+        "vector_simplify": False,
+        "draw_select_rect": False,
+        "draw_select_lasso": False,
+        "draw_select_stroke": False,
+        "insert_page_gap": False,
     }
 
 
@@ -37,7 +64,6 @@ class TextPreset:
     horizontal_alignment: str = "center"
     vertical_alignment: str = "middle"
     margin: float = 24.0
-    transform_snap: bool = True
 
     def clamp(self) -> None:
         self.name = self.name.strip() or "Preset"
@@ -71,18 +97,17 @@ def default_text_presets() -> list[dict]:
 
 @dataclass
 class EditorSettings:
-    settings_version: int = 5
+    settings_version: int = 11
     tablet_mode: bool = False
     brush_size: int = 12
     eraser_size: int = 28
-    brush_color: str = "#111111"
+    brush_color: str = "#000000"
     eraser_square: bool = False
     snap_to_grid: bool = True
     page_scope_select: bool = True
     canvas_renderer: str = "auto"
     predictive_ink: bool = True
     transform_mode: str = "free"
-    transform_snap_to_grid: bool = True
     rectangle_edit_mode: str = "normal"
     text_presets: list[dict] = field(default_factory=default_text_presets)
     active_text_preset: str = "Default"
@@ -99,6 +124,24 @@ class EditorSettings:
     active_pencil_size: str = "medium"
     active_eraser_size: str = "medium"
     hotkeys: dict[str, str] = field(default_factory=default_hotkeys)
+    hotkey_hold: dict[str, bool] = field(default_factory=default_hotkey_hold)
+    vector_eraser_mode: str = "stroke"
+    vector_fit_error: float = 2.0
+    vector_redraw_parameter: str = "thickness"
+    vector_redraw_interaction: str = "manual"
+    vector_redraw_operation: str = "uniform"
+    vector_redraw_amount: float = 1.0
+    vector_redraw_thickness_max: float = 12.0
+    vector_redraw_opacity_max: float = 100.0
+    vector_simplify_amount: int = 25
+    fill_close_gaps: bool = True
+    fill_gap_threshold: float = 8.0
+    fill_narrow_areas: bool = True
+    fill_area_scaling: bool = False
+    fill_area_amount: float = 0.0
+    fill_area_mode: str = "round"
+    fill_mode: str = "normal"
+    ui_splitter_sizes: dict[str, list[int]] = field(default_factory=dict)
     recent_series: list[str] = field(default_factory=list)
 
     def __post_init__(self) -> None:
@@ -108,7 +151,7 @@ class EditorSettings:
         self.clamp()
 
     def clamp(self) -> None:
-        self.settings_version = 5
+        self.settings_version = 11
         self.brush_size = max(1, min(200, int(self.brush_size)))
         self.eraser_size = max(2, min(400, int(self.eraser_size)))
         defaults = {
@@ -134,6 +177,23 @@ class EditorSettings:
         ):
             if getattr(self, field_name) not in {"small", "medium", "large"}:
                 setattr(self, field_name, "medium")
+        splitter_sizes = (
+            self.ui_splitter_sizes
+            if isinstance(self.ui_splitter_sizes, dict) else {}
+        )
+        self.ui_splitter_sizes = {}
+        for key in ("sidebar_workspace", "tools_colors", "ribbon_canvas"):
+            values = splitter_sizes.get(key)
+            if not isinstance(values, (list, tuple)) or len(values) != 2:
+                continue
+            try:
+                normalized = [
+                    max(0, min(100_000, int(value))) for value in values
+                ]
+            except (TypeError, ValueError):
+                continue
+            if sum(normalized) > 0:
+                self.ui_splitter_sizes[key] = normalized
         pencil_presets: list[dict] = []
         pencil_names: set[str] = set()
         for item in self.pencil_presets or []:
@@ -163,7 +223,6 @@ class EditorSettings:
             self.transform_mode = "free"
         if self.rectangle_edit_mode not in {"normal", "free"}:
             self.rectangle_edit_mode = "normal"
-        self.transform_snap_to_grid = bool(self.transform_snap_to_grid)
         presets: list[dict] = []
         names: set[str] = set()
         for item in self.text_presets or []:
@@ -191,6 +250,49 @@ class EditorSettings:
             key: str(supplied.get(key, sequence))
             for key, sequence in default_hotkeys().items()
         }
+        supplied_hold = self.hotkey_hold or {}
+        self.hotkey_hold = {
+            key: bool(supplied_hold.get(key, value))
+            for key, value in default_hotkey_hold().items()
+        }
+        if self.vector_eraser_mode not in {"stroke", "point", "intersection"}:
+            self.vector_eraser_mode = "stroke"
+        self.vector_fit_error = max(0.1, min(50.0, float(
+            self.vector_fit_error
+        )))
+        if self.vector_redraw_parameter not in {"thickness", "opacity"}:
+            self.vector_redraw_parameter = "thickness"
+        if self.vector_redraw_interaction not in {"manual", "point"}:
+            self.vector_redraw_interaction = "manual"
+        if self.vector_redraw_operation not in {
+            "increase", "decrease", "uniform",
+        }:
+            self.vector_redraw_operation = "uniform"
+        redraw_limit = (
+            100 if self.vector_redraw_parameter == "opacity" else 40
+        )
+        self.vector_redraw_amount = max(
+            0, min(redraw_limit, round(float(self.vector_redraw_amount)))
+        )
+        self.vector_redraw_thickness_max = max(
+            1, min(40, round(float(self.vector_redraw_thickness_max)))
+        )
+        self.vector_redraw_opacity_max = max(
+            0, min(100, round(float(self.vector_redraw_opacity_max)))
+        )
+        self.vector_simplify_amount = max(
+            0, min(100, int(self.vector_simplify_amount))
+        )
+        self.fill_gap_threshold = max(
+            0.0, min(1000.0, float(self.fill_gap_threshold))
+        )
+        self.fill_area_amount = max(
+            -1000.0, min(1000.0, float(self.fill_area_amount))
+        )
+        if self.fill_area_mode not in {"round", "rectangle"}:
+            self.fill_area_mode = "round"
+        if self.fill_mode not in {"normal", "enclose"}:
+            self.fill_mode = "normal"
         self.recent_series = list(dict.fromkeys(self.recent_series or []))[:12]
 
     def pencil_size(self) -> int:
@@ -224,7 +326,6 @@ def load_settings() -> EditorSettings:
             if int(raw.get("settings_version", 1)) < 2:
                 raw.setdefault("page_scope_select", True)
                 raw.setdefault("transform_mode", "free")
-                raw.setdefault("transform_snap_to_grid", True)
             if int(raw.get("settings_version", 1)) < 3:
                 raw.setdefault("pencil_size_px", {
                     "small": 4, "medium": int(raw.get("brush_size", 12)), "large": 22,
@@ -242,7 +343,42 @@ def load_settings() -> EditorSettings:
                     hotkeys.pop("bound_edit", None)
             if int(raw.get("settings_version", 1)) < 5:
                 raw.setdefault("rectangle_edit_mode", "normal")
-            raw["settings_version"] = 5
+            if int(raw.get("settings_version", 1)) < 7:
+                raw.setdefault("hotkey_hold", default_hotkey_hold())
+            if int(raw.get("settings_version", 1)) < 8:
+                hotkeys = raw.get("hotkeys")
+                if not isinstance(hotkeys, dict):
+                    hotkeys = {}
+                    raw["hotkeys"] = hotkeys
+                for key, value in default_hotkeys().items():
+                    hotkeys.setdefault(key, value)
+                holds = raw.get("hotkey_hold")
+                if not isinstance(holds, dict):
+                    holds = {}
+                    raw["hotkey_hold"] = holds
+                for key, value in default_hotkey_hold().items():
+                    holds.setdefault(key, value)
+            if int(raw.get("settings_version", 1)) < 9:
+                raw.setdefault("ui_splitter_sizes", {})
+            if int(raw.get("settings_version", 1)) < 10:
+                hotkeys = raw.setdefault("hotkeys", {})
+                holds = raw.setdefault("hotkey_hold", {})
+                for key, value in default_hotkeys().items():
+                    hotkeys.setdefault(key, value)
+                for key, value in default_hotkey_hold().items():
+                    holds.setdefault(key, value)
+            if int(raw.get("settings_version", 1)) < 11:
+                hotkeys = raw.setdefault("hotkeys", {})
+                holds = raw.setdefault("hotkey_hold", {})
+                hotkeys.setdefault("insert_page_gap", "")
+                holds.setdefault("insert_page_gap", False)
+            raw.pop("transform_snap_to_grid", None)
+            stored_presets = raw.get("text_presets")
+            if isinstance(stored_presets, list):
+                for preset in stored_presets:
+                    if isinstance(preset, dict):
+                        preset.pop("transform_snap", None)
+            raw["settings_version"] = 11
             valid = {item.name for item in dataclasses.fields(EditorSettings)}
             result = EditorSettings(**{
                 key: value for key, value in raw.items() if key in valid

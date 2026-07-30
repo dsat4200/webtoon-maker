@@ -16,29 +16,57 @@ from PySide6.QtGui import (
 from PySide6.QtOpenGLWidgets import QOpenGLWidget
 from PySide6.QtWidgets import QApplication, QWidget
 
-from comic_editor.core.commands import CallbackCommand, CommandStack, TilePatchCommand
+from comic_editor.core.commands import (
+    CallbackCommand, CommandStack, ObjectPatchCommand, TilePatchCommand,
+)
 from comic_editor.core.models import (
-    BoundGeometry, ChapterDocument, DocumentObject, LayerNode, PathNode,
-    RasterObject, ShapeStyle, TextObject,
+    BoundGeometry, ChapterDocument, ChildRef, DocumentObject, LayerNode,
+    PathContour, PathNode, RasterObject, ShapeStyle, TextObject,
+    VectorDrawingObject, VectorFillObject, VectorStroke, VectorStrokePoint,
+    canonical_argb, object_from_dict,
 )
 from comic_editor.core.pressure import BrushPreset
 from comic_editor.core.settings import EditorSettings
 from comic_editor.core.tiles import TileStore
+from comic_editor.core.vector_geometry import (
+    Cubic, CubicSpan, FreehandSample, centerline_hit, connect_cubic_paths,
+    corridor_contains, corridor_hits_path, corridor_path_intervals,
+    cubic_derivative, cubic_eval, cubic_subsegment,
+    distance_to_polyline, erase_stroke_by_corridor, find_face_containing,
+    fit_freehand, flatten_stroke, interpolate_stroke_attribute,
+    nearest_on_path,
+    nearest_on_stroke, path_self_intersections, point_in_polygon,
+    path_intersections, simplify_cubic_segments,
+    stroke_cubics, tangent_bridge, trace_cubic_faces,
+)
 
 
 class ToolKind(Enum):
     OBJECT_SELECT = "object_select"
     RASTER_PENCIL = "raster_pencil"
     RASTER_ERASER = "raster_eraser"
+    FILL = "fill"
     TEXT_EDIT = "text_edit"
     TRANSFORM = "transform"
     SHAPE_EDIT = "shape_edit"
     BOUND_EDIT = "shape_edit"
+    VECTOR_EDIT = "vector_edit"
+    VECTOR_REDRAW = "vector_redraw"
+    VECTOR_CONNECT = "vector_connect"
+    VECTOR_SIMPLIFY = "vector_simplify"
+    DRAW_SELECT_RECT = "draw_select_rect"
+    DRAW_SELECT_LASSO = "draw_select_lasso"
+    DRAW_SELECT_STROKE = "draw_select_stroke"
+    INSERT_PAGE_GAP = "insert_page_gap"
     BOX_BOUND = "box_bound"
     CIRCLE_BOUND = "circle_bound"
     SHAPE_CREATE = "shape_create"
     POLYGON_BOUND = "shape_create"
     RASTER_CREATE = "raster_create"
+
+
+RASTER_FRAME_MARGIN = 24.0
+SHAPE_CONTROL_SCALE = 1.5
 
 
 class _CanvasLogic:
@@ -52,6 +80,10 @@ class _CanvasLogic:
     textEditingChanged = Signal(bool)
     selectionCandidatesRequested = Signal(object, object)
     primitiveConversionRequested = Signal(str)
+    vectorSelectionChanged = Signal(object, object)
+    pageCreationFinished = Signal(object, object, str)
+    pageCreationInvalid = Signal(str)
+    pageGapConfirmationChanged = Signal(bool)
 
     def __init__(self, settings: EditorSettings, parent=None):
         super().__init__(parent)
@@ -78,6 +110,8 @@ class _CanvasLogic:
         self._last_draw_point = QPointF()
         self._last_pressure = 1.0
         self._stroke_before: dict[tuple[int, int], QImage | None] = {}
+        self._stroke_frame_before: tuple[float, float, float, float] | None = None
+        self._stroke_erasing = False
         self._model_before: dict | None = None
         self._drag_start_doc = QPointF()
         self._drag_start_value: object = None
@@ -93,8 +127,13 @@ class _CanvasLogic:
         self._transform_handle_index: int | None = None
         self._transform_drag_mode: str | None = None
         self._transform_static_cache = QImage()
+        self._transform_pivot: QPointF | None = None
+        self._transform_pivot_custom = False
+        self._transform_rotate_start = 0.0
         self._render_excluded_object_id = ""
-        self._raster_transform_snapshots: dict[str, tuple[dict, dict]] = {}
+        self._rendering_compound_references = False
+        self._live_underlay_object_id = ""
+        self._live_underlay_amount = 0.0
         self._text_editing = False
         self._text_cursor_position = 0
         self._text_selection_anchor = 0
@@ -113,22 +152,91 @@ class _CanvasLogic:
         self._creation_close_candidate = False
         self._creation_style: ShapeStyle | None = None
         self._raster_creation_parent_id = ""
+        self._raster_creation_index: int | None = None
         self._selected_shape_node_id = ""
+        self._selected_shape_node_ids: set[str] = set()
+        self._shape_drag_nodes: dict[str, dict] = {}
         self._active_shape_control: str | None = None
+        self._shape_control_dragged = False
         self._shape_hover_insert: tuple[int, float, QPointF] | None = None
         self._shape_hover_target: dict | None = None
         self._pending_primitive_insert: (
             tuple[str, int, float, QPointF, QPointF] | None
         ) = None
         self._tablet_tool_active = False
+        self._tablet_hover_widget: QPointF | None = None
+        self._pointer_hover_widget: QPointF | None = None
         self._touch_points: list[QPointF] = []
+        self._touch_anchor_points: list[QPointF] = []
         self._touch_anchor_center = QPointF()
         self._touch_anchor_distance = 1.0
         self._touch_anchor_angle = 0.0
         self._touch_anchor_scale = 1.0
         self._touch_anchor_rotation = 0.0
+        self._touch_anchor_document = QPointF()
+        self._pending_raster_press: tuple[QPointF, QPointF, float] | None = None
+        self._pending_vector_press: tuple[QPointF, QPointF, float] | None = None
+        self._pending_drawing_selection_press: (
+            tuple[QPointF, QPointF, float] | None
+        ) = None
         self._preset = settings.active_brush_preset()
+        self.primary_color = canonical_argb(settings.brush_color)
+        self.secondary_color = "#FFFFFFFF"
         self._predictive: tuple[QPointF, QPointF, float, QColor] | None = None
+        self._compound_path_cache: dict[str, QPainterPath] = {}
+        self._vector_render_cache: dict[
+            tuple[str, int, str, float, float], tuple[QImage, QRectF]
+        ] = {}
+        self._selected_vector_stroke_ids: set[str] = set()
+        self._selected_vector_point_ids: set[str] = set()
+        self._vector_gesture_mode: str | None = None
+        self._vector_samples: list[FreehandSample] = []
+        self._vector_sweep: list[FreehandSample] = []
+        self._vector_simplify_point_ids: set[str] = set()
+        self._vector_before: dict[str, dict | None] | None = None
+        self._vector_drag_origin = QPointF()
+        self._vector_drag_points: dict[
+            str, tuple[tuple[float, float], tuple[float, float] | None,
+                       tuple[float, float] | None]
+        ] = {}
+        self._vector_connect_endpoints: list[tuple[str, str]] = []
+        self._hover_vector_stroke_id = ""
+        self._drawing_selection_path = QPainterPath()
+        self._drawing_selection_gesture: list[QPointF] = []
+        self._drawing_selection_operation = "replace"
+        self._selection_transform_quad: list[tuple[float, float]] | None = None
+        self._selection_transform_start_quad: (
+            list[tuple[float, float]] | None
+        ) = None
+        self._selection_pivot: QPointF | None = None
+        self._selection_pivot_custom = False
+        self._selection_transform_mode: str | None = None
+        self._selection_transform_handle: int | None = None
+        self._selection_transform_start = QPointF()
+        self._selection_rotate_start = 0.0
+        self._selection_rotate_quad: list[tuple[float, float]] | None = None
+        self._selection_vector_points: dict[str, dict] = {}
+        self._selection_before_tiles: dict[tuple[int, int], QImage] | None = None
+        self._selection_before_model: dict | None = None
+        self._page_creation_anchor_id = ""
+        self._page_creation_before: dict | None = None
+        self._page_creation_kind = ""
+        self._page_creation_draft: BoundGeometry | None = None
+        self._page_creation_committing = False
+        self._page_creation_gap_bounds: tuple[float, float] | None = None
+        self._page_creation_base_height = 0
+        self._page_gap_prompt_y: float | None = None
+        self._page_gap_state: dict | None = None
+        self._page_gap_transaction: dict | None = None
+        self._page_gap_hover: dict | None = None
+        self._page_gap_drag_mode: str | None = None
+        self._page_gap_drag_before: dict | None = None
+        self._page_gap_drag_start_y = 0.0
+        self._page_gap_drag_start_top = 0.0
+        self._page_gap_drag_start_bottom = 0.0
+        self._page_gap_drag_translations: dict[str, float] = {}
+        self.documentChanged.connect(self._clear_compound_path_cache)
+        self.hierarchyChanged.connect(self._clear_compound_path_cache)
         self.setMinimumSize(480, 480)
         self.setFocusPolicy(Qt.StrongFocus)
         self.setAttribute(Qt.WA_AcceptTouchEvents, True)
@@ -141,6 +249,7 @@ class _CanvasLogic:
     ) -> None:
         self.chapter = chapter
         self.tiles = tiles
+        self._compound_path_cache.clear()
         self._ensure_raster_frames()
         self.command_stack.clear()
         self.selected_kind = ""
@@ -148,16 +257,40 @@ class _CanvasLogic:
         self.active_page_id = ""
         self.active_layer_id = ""
         self.selected_object_id = ""
+        self._selected_vector_stroke_ids.clear()
+        self._selected_vector_point_ids.clear()
+        self._vector_render_cache.clear()
+        self._cancel_vector_gesture(restore=False)
         self._clear_transform_preview()
+        self._page_creation_anchor_id = ""
+        self._page_creation_before = None
+        self._page_creation_kind = ""
+        self._page_creation_draft = None
+        self._page_creation_committing = False
+        self._page_creation_gap_bounds = None
+        self._page_creation_base_height = 0
+        self._page_gap_transaction = None
+        self._clear_page_gap_editor()
         if reset_view:
             self.reset_view()
         self.update()
         self.hierarchyChanged.emit()
 
+    def set_active_colors(self, primary: str, secondary: str) -> None:
+        """Set the per-series colors used by contextual drawing tools."""
+        self.primary_color = canonical_argb(primary)
+        self.secondary_color = canonical_argb(secondary, "#FFFFFFFF")
+        self.settings.brush_color = self.primary_color
+        self.update()
+
     def replace_chapter(self, state: dict) -> None:
         self._commit_text_edit()
         self._clear_transform_preview()
+        self._page_gap_transaction = None
+        self._clear_page_gap_editor()
+        self.pageGapConfirmationChanged.emit(False)
         self.chapter = ChapterDocument.from_dict(state)
+        self._compound_path_cache.clear()
         valid = (
             self.selected_id in self.chapter.layers
             if self.selected_kind == "layer"
@@ -183,16 +316,210 @@ class _CanvasLogic:
             already_done=True,
         )
 
+    def _active_vector_drawing(self) -> VectorDrawingObject | None:
+        if self.chapter is None or self.selected_kind != "object":
+            return None
+        selected = self.chapter.objects.get(self.selected_id)
+        if isinstance(selected, VectorDrawingObject):
+            return selected
+        if isinstance(selected, VectorFillObject):
+            owner = self.chapter.objects.get(selected.owner_drawing_id)
+            return owner if isinstance(owner, VectorDrawingObject) else None
+        return None
+
+    def _vector_local_point(
+        self, drawing: VectorDrawingObject, world: QPointF,
+    ) -> QPointF:
+        layer_x, layer_y = self.chapter.layer_world_translation(
+            drawing.parent_layer_id
+        )
+        return QPointF(
+            world.x() - layer_x - drawing.x,
+            world.y() - layer_y - drawing.y,
+        )
+
+    def _capture_vector_graph(
+        self, drawing: VectorDrawingObject,
+    ) -> dict[str, dict | None]:
+        identifiers = [drawing.object_id, *drawing.fill_child_ids]
+        return {
+            object_id: (
+                self.chapter.objects[object_id].to_dict()
+                if object_id in self.chapter.objects else None
+            )
+            for object_id in identifiers
+        }
+
+    def _vector_changed(self, hierarchy: bool = False) -> None:
+        self._vector_render_cache.clear()
+        drawing = self._active_vector_drawing()
+        if drawing is not None:
+            live_strokes = {stroke.stroke_id for stroke in drawing.strokes}
+            live_points = {
+                point.point_id
+                for stroke in drawing.strokes
+                for point in stroke.points
+            }
+            self._selected_vector_stroke_ids &= live_strokes
+            if self.tool == ToolKind.DRAW_SELECT_STROKE:
+                self._selected_vector_point_ids = self._point_ids_for_strokes(
+                    drawing, self._selected_vector_stroke_ids
+                )
+            else:
+                self._selected_vector_point_ids &= live_points
+        else:
+            self._selected_vector_stroke_ids.clear()
+            self._selected_vector_point_ids.clear()
+        self.vectorSelectionChanged.emit(
+            set(self._selected_vector_stroke_ids),
+            set(self._selected_vector_point_ids),
+        )
+        self.documentChanged.emit(QRectF())
+        if hierarchy:
+            self.hierarchyChanged.emit()
+        self.update()
+
+    def _push_vector_change(
+        self, before: dict[str, dict | None], label: str,
+        *, hierarchy: bool = False,
+    ) -> bool:
+        drawing_ids = {
+            object_id for object_id, payload in before.items()
+            if payload and payload.get("type") == "vector_drawing"
+        }
+        active = self._active_vector_drawing()
+        if active is not None:
+            drawing_ids.add(active.object_id)
+        identifiers = set(before)
+        for drawing_id in drawing_ids:
+            drawing = self.chapter.objects.get(drawing_id)
+            if isinstance(drawing, VectorDrawingObject):
+                identifiers.update((drawing_id, *drawing.fill_child_ids))
+        before = {
+            object_id: before.get(object_id)
+            for object_id in identifiers
+        }
+        after = {
+            object_id: (
+                self.chapter.objects[object_id].to_dict()
+                if object_id in self.chapter.objects else None
+            )
+            for object_id in identifiers
+        }
+        if before == after:
+            return False
+        self.command_stack.push(
+            CallbackCommand(
+                label,
+                lambda: (
+                    self._restore_vector_payloads(after),
+                    self._vector_changed(hierarchy),
+                ),
+                lambda: (
+                    self._restore_vector_payloads(before),
+                    self._vector_changed(hierarchy),
+                ),
+            ),
+            already_done=True,
+        )
+        self._vector_changed(hierarchy)
+        return True
+
+    def _restore_vector_payloads(
+        self, payloads: dict[str, dict | None],
+    ) -> None:
+        for object_id, payload in payloads.items():
+            if payload is None:
+                self.chapter.objects.pop(object_id, None)
+                continue
+            replacement = object_from_dict(payload)
+            current = self.chapter.objects.get(object_id)
+            if (
+                isinstance(current, VectorDrawingObject)
+                and isinstance(replacement, VectorDrawingObject)
+            ):
+                existing_strokes = {
+                    stroke.stroke_id: stroke for stroke in current.strokes
+                }
+                restored_strokes: list[VectorStroke] = []
+                for replacement_stroke in replacement.strokes:
+                    stroke = existing_strokes.get(
+                        replacement_stroke.stroke_id
+                    )
+                    if stroke is None:
+                        restored_strokes.append(replacement_stroke)
+                        continue
+                    existing_points = {
+                        point.point_id: point for point in stroke.points
+                    }
+                    restored_points: list[VectorStrokePoint] = []
+                    for replacement_point in replacement_stroke.points:
+                        point = existing_points.get(
+                            replacement_point.point_id
+                        )
+                        if point is None:
+                            restored_points.append(replacement_point)
+                        else:
+                            point.__dict__.clear()
+                            point.__dict__.update(
+                                replacement_point.__dict__
+                            )
+                            restored_points.append(point)
+                    values = dict(replacement_stroke.__dict__)
+                    values["points"] = restored_points
+                    stroke.__dict__.clear()
+                    stroke.__dict__.update(values)
+                    restored_strokes.append(stroke)
+                values = dict(replacement.__dict__)
+                values["strokes"] = restored_strokes
+                current.__dict__.clear()
+                current.__dict__.update(values)
+            elif current is not None and type(current) is type(replacement):
+                current.__dict__.clear()
+                current.__dict__.update(replacement.__dict__)
+            else:
+                self.chapter.objects[object_id] = replacement
+
+    def _cancel_vector_gesture(self, *, restore: bool = True) -> None:
+        if restore and self._vector_before and self.chapter is not None:
+            self._restore_vector_payloads(self._vector_before)
+        self._vector_gesture_mode = None
+        self._vector_samples.clear()
+        self._vector_sweep.clear()
+        self._vector_simplify_point_ids.clear()
+        self._vector_before = None
+        self._vector_drag_points.clear()
+        self._vector_connect_endpoints.clear()
+        self._drawing = False
+        self._vector_changed()
+
     def set_selection(
         self, kind: str, entity_id: str, activate_default_tool: bool = True,
     ) -> None:
         if self.chapter is None:
             return
+        if (
+            self._page_gap_state is not None
+            and self._page_gap_transaction is None
+            and not (
+                kind == "layer"
+                and entity_id == self._page_gap_state.get("owner_id")
+            )
+        ):
+            self._clear_page_gap_editor()
         if entity_id != self.selected_object_id:
             self._clear_transform_preview()
+            self._transform_pivot = None
+            self._transform_pivot_custom = False
         if entity_id != self.selected_id:
+            self._pending_drawing_selection_press = None
             self._selected_shape_node_id = ""
+            self._selected_shape_node_ids.clear()
             self._shape_hover_insert = None
+            self._selected_vector_stroke_ids.clear()
+            self._selected_vector_point_ids.clear()
+            self._clear_drawing_selection()
+            self.vectorSelectionChanged.emit(set(), set())
         if kind == "layer" and entity_id not in self.chapter.layers:
             return
         if kind == "object" and entity_id not in self.chapter.objects:
@@ -210,17 +537,78 @@ class _CanvasLogic:
             if activate_default_tool and isinstance(obj, RasterObject):
                 self.tool = ToolKind.RASTER_PENCIL
                 self.chapter.layers[obj.parent_layer_id].last_raster_id = obj.object_id
+            elif activate_default_tool and isinstance(
+                obj, VectorDrawingObject
+            ):
+                self.tool = ToolKind.RASTER_PENCIL
+            elif activate_default_tool and isinstance(obj, VectorFillObject):
+                self.tool = ToolKind.FILL
             elif activate_default_tool and isinstance(obj, TextObject):
                 self.tool = ToolKind.TEXT_EDIT
         else:
             self.selected_object_id = ""
             self.active_layer_id = entity_id
             self.active_page_id = self.chapter.page_for_layer(entity_id).layer_id
+            layer = self.chapter.layers[entity_id]
+            if (
+                activate_default_tool
+                and layer.layer_kind != "fill"
+                and layer.bound is not None
+            ):
+                self.tool = ToolKind.SHAPE_EDIT
         self.toolChanged.emit(self.tool)
         self.selectionChanged.emit(kind, entity_id)
         self.update()
 
+    def clear_selection(self) -> None:
+        """Clear the current entity and notify every selection consumer."""
+        if self.chapter is None:
+            return
+        if (
+            self._page_gap_state is not None
+            and self._page_gap_transaction is None
+        ):
+            self._clear_page_gap_editor()
+        self._commit_text_edit()
+        self._clear_transform_preview()
+        self.selected_kind = ""
+        self.selected_id = ""
+        self.selected_object_id = ""
+        self.active_layer_id = ""
+        self.active_page_id = ""
+        self._selected_shape_node_id = ""
+        self._selected_shape_node_ids.clear()
+        self._selected_vector_stroke_ids.clear()
+        self._selected_vector_point_ids.clear()
+        self._clear_drawing_selection()
+        self.vectorSelectionChanged.emit(set(), set())
+        self.selectionChanged.emit("", "")
+        self.update()
+
     def set_tool(self, tool: ToolKind) -> bool:
+        selected_object = (
+            self.chapter.objects.get(self.selected_object_id)
+            if self.chapter is not None else None
+        )
+        creation_tools = {
+            ToolKind.BOX_BOUND, ToolKind.CIRCLE_BOUND,
+            ToolKind.SHAPE_CREATE,
+        }
+        if (
+            self._page_creation_anchor_id
+            and tool not in creation_tools
+        ):
+            self._cancel_page_creation()
+        if (
+            tool == ToolKind.SHAPE_EDIT
+            and isinstance(selected_object, VectorDrawingObject)
+        ):
+            tool = ToolKind.VECTOR_EDIT
+        if (
+            tool == ToolKind.TRANSFORM
+            and isinstance(selected_object, RasterObject)
+        ):
+            return False
         if self.tool == ToolKind.TRANSFORM and tool != ToolKind.TRANSFORM:
             self._clear_transform_preview()
         if self.tool == ToolKind.SHAPE_CREATE and tool != ToolKind.SHAPE_CREATE:
@@ -232,9 +620,18 @@ class _CanvasLogic:
             self._shape_hover_insert = None
         if tool != ToolKind.TEXT_EDIT:
             self._commit_text_edit()
+        if tool not in {ToolKind.RASTER_PENCIL, ToolKind.RASTER_ERASER}:
+            self._pending_raster_press = None
+            self._pending_vector_press = None
+        if tool not in {
+            ToolKind.DRAW_SELECT_RECT,
+            ToolKind.DRAW_SELECT_LASSO,
+            ToolKind.DRAW_SELECT_STROKE,
+        }:
+            self._pending_drawing_selection_press = None
         if tool == ToolKind.BOUND_EDIT and self.selected_object_id:
             selected = self.chapter.objects[self.selected_object_id]
-            if not isinstance(selected, RasterObject):
+            if not isinstance(selected, (RasterObject, VectorDrawingObject)):
                 self.set_selection(
                     "layer", selected.parent_layer_id,
                     activate_default_tool=False,
@@ -252,8 +649,42 @@ class _CanvasLogic:
         if tool in {ToolKind.RASTER_PENCIL, ToolKind.RASTER_ERASER}:
             if self.selected_kind != "object" or self.chapter is None:
                 return False
-            if not isinstance(self.chapter.objects.get(self.selected_id), RasterObject):
+            if not isinstance(
+                self.chapter.objects.get(self.selected_id),
+                (RasterObject, VectorDrawingObject),
+            ):
                 return False
+        if tool in {
+            ToolKind.VECTOR_EDIT,
+            ToolKind.VECTOR_REDRAW,
+            ToolKind.VECTOR_CONNECT,
+            ToolKind.VECTOR_SIMPLIFY,
+        } and self._active_vector_drawing() is None:
+            return False
+        if tool in {
+            ToolKind.DRAW_SELECT_RECT,
+            ToolKind.DRAW_SELECT_LASSO,
+            ToolKind.DRAW_SELECT_STROKE,
+        }:
+            selected = (
+                self.chapter.objects.get(self.selected_object_id)
+                if self.chapter is not None else None
+            )
+            if not isinstance(selected, (RasterObject, VectorDrawingObject)):
+                return False
+            if (
+                tool == ToolKind.DRAW_SELECT_STROKE
+                and not isinstance(selected, VectorDrawingObject)
+            ):
+                return False
+        if tool == ToolKind.FILL and (
+            self.chapter is None
+            or (
+                self.selected_kind != "layer"
+                and self._active_vector_drawing() is None
+            )
+        ):
+            return False
         if tool == ToolKind.TEXT_EDIT:
             if self.chapter is None or not self.active_page_id:
                 return False
@@ -356,7 +787,9 @@ class _CanvasLogic:
 
     # ---- rendering -----------------------------------------------------
     @staticmethod
-    def bound_path(bound: BoundGeometry, vertex_radius: float = 0.0) -> QPainterPath:
+    def _single_bound_path(
+        bound: BoundGeometry, vertex_radius: float = 0.0,
+    ) -> QPainterPath:
         path = QPainterPath()
         path.setFillRule(Qt.WindingFill)
         if bound.primitive == "ellipse":
@@ -367,12 +800,209 @@ class _CanvasLogic:
         if not nodes:
             return path
 
+        def segment_points(index: int) -> tuple[QPointF, QPointF, QPointF, QPointF]:
+            start = nodes[index]
+            end = nodes[(index + 1) % len(nodes)]
+            p0 = QPointF(start.x, start.y)
+            p3 = QPointF(end.x, end.y)
+            return (
+                p0,
+                QPointF(*(start.outgoing or start.position)),
+                QPointF(*(end.incoming or end.position)),
+                p3,
+            )
+
+        def split_cubic(
+            points: tuple[QPointF, QPointF, QPointF, QPointF], percent: float,
+        ) -> tuple[
+            tuple[QPointF, QPointF, QPointF, QPointF],
+            tuple[QPointF, QPointF, QPointF, QPointF],
+        ]:
+            p0, p1, p2, p3 = points
+            a = p0 * (1 - percent) + p1 * percent
+            b = p1 * (1 - percent) + p2 * percent
+            c = p2 * (1 - percent) + p3 * percent
+            d = a * (1 - percent) + b * percent
+            e = b * (1 - percent) + c * percent
+            point = d * (1 - percent) + e * percent
+            return (p0, a, d, point), (point, e, c, p3)
+
+        def sub_cubic(
+            points: tuple[QPointF, QPointF, QPointF, QPointF],
+            start: float,
+            end: float,
+        ) -> tuple[QPointF, QPointF, QPointF, QPointF]:
+            if end < 1:
+                points = split_cubic(points, end)[0]
+            if start > 0:
+                relative = start / max(end, 1e-9)
+                points = split_cubic(points, relative)[1]
+            return points
+
+        def cubic_point(
+            points: tuple[QPointF, QPointF, QPointF, QPointF], percent: float,
+        ) -> QPointF:
+            inverse = 1 - percent
+            p0, p1, p2, p3 = points
+            return (
+                p0 * (inverse ** 3)
+                + p1 * (3 * inverse * inverse * percent)
+                + p2 * (3 * inverse * percent * percent)
+                + p3 * (percent ** 3)
+            )
+
+        def cubic_tangent(
+            points: tuple[QPointF, QPointF, QPointF, QPointF], percent: float,
+        ) -> QPointF:
+            inverse = 1 - percent
+            p0, p1, p2, p3 = points
+            return (
+                (p1 - p0) * (3 * inverse * inverse)
+                + (p2 - p1) * (6 * inverse * percent)
+                + (p3 - p2) * (3 * percent * percent)
+            )
+
+        def length_table(
+            points: tuple[QPointF, QPointF, QPointF, QPointF],
+        ) -> list[tuple[float, float]]:
+            result = [(0.0, 0.0)]
+            previous = points[0]
+            total = 0.0
+            for step in range(1, 49):
+                percent = step / 48
+                current = cubic_point(points, percent)
+                total += math.dist(
+                    (previous.x(), previous.y()),
+                    (current.x(), current.y()),
+                )
+                result.append((percent, total))
+                previous = current
+            return result
+
+        def parameter_at_length(
+            table: list[tuple[float, float]], target: float,
+        ) -> float:
+            target = max(0.0, min(table[-1][1], target))
+            for index in range(1, len(table)):
+                percent, distance = table[index]
+                if distance < target:
+                    continue
+                previous_percent, previous_distance = table[index - 1]
+                span = max(distance - previous_distance, 1e-9)
+                ratio = (target - previous_distance) / span
+                return previous_percent + (percent - previous_percent) * ratio
+            return 1.0
+
+        curve_rounding: dict[int, dict[str, object]] = {}
+        segment_count = len(nodes) if bound.closed else len(nodes) - 1
+        for index, node in enumerate(nodes):
+            if not (
+                node.roundness_enabled
+                and node.roundness > 0
+                and node.point_type == "bezier"
+                and not node.handles_locked
+                and node.incoming is not None
+                and node.outgoing is not None
+                and (bound.closed or 0 < index < len(nodes) - 1)
+            ):
+                continue
+            incoming_index = index - 1 if index else len(nodes) - 1
+            outgoing_index = index
+            if not (0 <= incoming_index < segment_count and 0 <= outgoing_index < segment_count):
+                continue
+            incoming_curve = segment_points(incoming_index)
+            outgoing_curve = segment_points(outgoing_index)
+            incoming_table = length_table(incoming_curve)
+            outgoing_table = length_table(outgoing_curve)
+            incoming_length = incoming_table[-1][1]
+            outgoing_length = outgoing_table[-1][1]
+            radius = min(
+                node.roundness, incoming_length / 2, outgoing_length / 2
+            )
+            if radius <= 1e-6:
+                continue
+            entry_t = parameter_at_length(
+                incoming_table, incoming_length - radius
+            )
+            exit_t = parameter_at_length(outgoing_table, radius)
+            curve_rounding[index] = {
+                "entry": cubic_point(incoming_curve, entry_t),
+                "exit": cubic_point(outgoing_curve, exit_t),
+                "entry_t": entry_t,
+                "exit_t": exit_t,
+                "incoming_tangent": cubic_tangent(incoming_curve, entry_t),
+                "outgoing_tangent": cubic_tangent(outgoing_curve, exit_t),
+                "anchor_incoming_tangent": cubic_tangent(incoming_curve, 1.0),
+                "anchor_outgoing_tangent": cubic_tangent(outgoing_curve, 0.0),
+            }
+
+        def segment_is_cubic(index: int) -> bool:
+            start = nodes[index]
+            end = nodes[(index + 1) % len(nodes)]
+            return start.outgoing is not None or end.incoming is not None
+
+        vector_curve_rounding: dict[int, dict[str, object]] = {}
+        for index, node in enumerate(nodes):
+            if not (
+                node.point_type == "vector"
+                and node.roundness_enabled
+                and node.roundness > 0
+                and (bound.closed or 0 < index < len(nodes) - 1)
+            ):
+                continue
+            incoming_index = index - 1 if index else len(nodes) - 1
+            outgoing_index = index
+            if not (
+                0 <= incoming_index < segment_count
+                and 0 <= outgoing_index < segment_count
+                and (
+                    segment_is_cubic(incoming_index)
+                    or segment_is_cubic(outgoing_index)
+                )
+            ):
+                continue
+            incoming_curve = segment_points(incoming_index)
+            outgoing_curve = segment_points(outgoing_index)
+            incoming_table = length_table(incoming_curve)
+            outgoing_table = length_table(outgoing_curve)
+            incoming_length = incoming_table[-1][1]
+            outgoing_length = outgoing_table[-1][1]
+            radius = min(
+                node.roundness, incoming_length / 2, outgoing_length / 2
+            )
+            if radius <= 1e-6:
+                continue
+            entry_t = parameter_at_length(
+                incoming_table, incoming_length - radius
+            )
+            exit_t = parameter_at_length(outgoing_table, radius)
+            vector_curve_rounding[index] = {
+                "entry": cubic_point(incoming_curve, entry_t),
+                "exit": cubic_point(outgoing_curve, exit_t),
+                "entry_t": entry_t,
+                "exit_t": exit_t,
+                "incoming_tangent": cubic_tangent(incoming_curve, entry_t),
+                "outgoing_tangent": cubic_tangent(outgoing_curve, exit_t),
+            }
+
+        trim_rounding = {
+            **vector_curve_rounding,
+            **curve_rounding,
+        }
+
         def rounding(index: int) -> tuple[QPointF, QPointF]:
+            if index in curve_rounding:
+                corner = curve_rounding[index]
+                return corner["entry"], corner["exit"]
+            if index in vector_curve_rounding:
+                corner = vector_curve_rounding[index]
+                return corner["entry"], corner["exit"]
             node = nodes[index]
             position = QPointF(node.x, node.y)
             may_round = (
-                node.roundness > 0
-                and (node.point_type == "vector" or not node.handles_locked)
+                node.roundness_enabled
+                and node.roundness > 0
+                and node.point_type == "vector"
                 and (bound.closed or 0 < index < len(nodes) - 1)
             )
             if not may_round:
@@ -396,22 +1026,176 @@ class _CanvasLogic:
         def segment(start_index: int, end_index: int) -> None:
             start_node, end_node = nodes[start_index], nodes[end_index]
             target = rounded[end_index][0]
-            outgoing = start_node.outgoing
-            incoming = end_node.incoming
-            if outgoing is not None or incoming is not None:
+            if start_index in trim_rounding or end_index in trim_rounding:
+                points = segment_points(start_index)
+                start_t = float(
+                    trim_rounding.get(start_index, {}).get("exit_t", 0.0)
+                )
+                end_t = float(
+                    trim_rounding.get(end_index, {}).get("entry_t", 1.0)
+                )
+                if start_t > end_t:
+                    start_t = end_t = (start_t + end_t) / 2
+                p0, p1, p2, p3 = sub_cubic(points, start_t, end_t)
+                actual_start = rounded[start_index][1]
+                p1 += actual_start - p0
+                p2 += target - p3
+                path.cubicTo(p1, p2, target)
+            elif start_node.outgoing is not None or end_node.incoming is not None:
                 control_a = (
-                    QPointF(*outgoing)
-                    if outgoing is not None
+                    QPointF(*start_node.outgoing)
+                    if start_node.outgoing is not None
                     else QPointF(rounded[start_index][1])
                 )
                 control_b = (
-                    QPointF(*incoming)
-                    if incoming is not None else QPointF(target)
+                    QPointF(*end_node.incoming)
+                    if end_node.incoming is not None else QPointF(target)
                 )
                 path.cubicTo(control_a, control_b, target)
             else:
                 path.lineTo(target)
-            if rounded[end_index][0] != rounded[end_index][1]:
+            if end_index in curve_rounding:
+                corner = curve_rounding[end_index]
+                entry = corner["entry"]
+                exit_point = corner["exit"]
+                incoming_tangent = corner["incoming_tangent"]
+                outgoing_tangent = corner["outgoing_tangent"]
+                anchor = QPointF(end_node.x, end_node.y)
+
+                def unit(vector: QPointF) -> QPointF:
+                    length = math.hypot(vector.x(), vector.y())
+                    return (
+                        vector / length
+                        if length > 1e-9 else QPointF()
+                    )
+
+                incoming_unit = unit(incoming_tangent)
+                outgoing_unit = unit(outgoing_tangent)
+                incoming_chord = unit(anchor - entry)
+                outgoing_chord = unit(exit_point - anchor)
+                # The chord bisector is the stable tangent through the point.
+                # It follows the actual trimmed curves without inheriting a
+                # backwards-facing raw handle that would create a loop.
+                shared = incoming_chord + outgoing_chord
+                if math.hypot(shared.x(), shared.y()) <= 1e-6:
+                    shared = exit_point - entry
+                if math.hypot(shared.x(), shared.y()) <= 1e-6:
+                    shared = (
+                        unit(corner["anchor_incoming_tangent"])
+                        + unit(corner["anchor_outgoing_tangent"])
+                    )
+                shared = unit(shared)
+                if math.hypot(shared.x(), shared.y()) <= 1e-6:
+                    shared = unit(anchor - entry)
+
+                incoming_span = math.dist(
+                    (entry.x(), entry.y()), (anchor.x(), anchor.y())
+                )
+                outgoing_span = math.dist(
+                    (anchor.x(), anchor.y()),
+                    (exit_point.x(), exit_point.y()),
+                )
+                shared_handle = min(incoming_span, outgoing_span) / 2
+
+                def safe_outer_handle(
+                    tangent: QPointF, chord: QPointF, span: float,
+                ) -> float:
+                    projection = QPointF.dotProduct(unit(tangent), unit(chord))
+                    return span / 3 * max(0.0, min(1.0, projection))
+
+                incoming_handle = safe_outer_handle(
+                    incoming_tangent, anchor - entry, incoming_span
+                )
+                outgoing_handle = safe_outer_handle(
+                    outgoing_tangent, exit_point - anchor, outgoing_span
+                )
+
+                # Two local Hermite spans meet at the original point. Equal
+                # handles along the shared tangent make that join C1 while
+                # the outer handles retain the incident cubic tangents.
+                path.cubicTo(
+                    entry + incoming_unit * incoming_handle,
+                    anchor - shared * shared_handle,
+                    anchor,
+                )
+                path.cubicTo(
+                    anchor + shared * shared_handle,
+                    exit_point - outgoing_unit * outgoing_handle,
+                    exit_point,
+                )
+            elif end_index in vector_curve_rounding:
+                corner = vector_curve_rounding[end_index]
+                entry = corner["entry"]
+                exit_point = corner["exit"]
+                anchor = QPointF(end_node.x, end_node.y)
+
+                def unit(vector: QPointF) -> QPointF:
+                    length = math.hypot(vector.x(), vector.y())
+                    return vector / length if length > 1e-9 else QPointF()
+
+                incoming_unit = unit(corner["incoming_tangent"])
+                outgoing_unit = unit(corner["outgoing_tangent"])
+                chord = exit_point - entry
+                chord_length = math.hypot(chord.x(), chord.y())
+                if math.hypot(incoming_unit.x(), incoming_unit.y()) <= 1e-9:
+                    incoming_unit = unit(anchor - entry)
+                if math.hypot(outgoing_unit.x(), outgoing_unit.y()) <= 1e-9:
+                    outgoing_unit = unit(exit_point - anchor)
+                incoming_span = math.dist(
+                    (entry.x(), entry.y()), (anchor.x(), anchor.y())
+                )
+                outgoing_span = math.dist(
+                    (anchor.x(), anchor.y()),
+                    (exit_point.x(), exit_point.y()),
+                )
+                maximum_incoming = min(
+                    incoming_span * 2 / 3, chord_length * 2 / 3
+                )
+                maximum_outgoing = min(
+                    outgoing_span * 2 / 3, chord_length * 2 / 3
+                )
+
+                # Intersect the forward incoming tangent with the reverse
+                # outgoing tangent. For ordinary vector corners this is the
+                # acute-side corner; curved incidents use the same construction
+                # while retaining their actual endpoint derivatives.
+                reverse_outgoing = QPointF(
+                    -outgoing_unit.x(), -outgoing_unit.y()
+                )
+                denominator = (
+                    incoming_unit.x() * reverse_outgoing.y()
+                    - incoming_unit.y() * reverse_outgoing.x()
+                )
+                incoming_length = outgoing_length = -1.0
+                if abs(denominator) > 1e-7:
+                    delta = exit_point - entry
+                    incoming_ray = (
+                        delta.x() * reverse_outgoing.y()
+                        - delta.y() * reverse_outgoing.x()
+                    ) / denominator
+                    outgoing_ray = (
+                        delta.x() * incoming_unit.y()
+                        - delta.y() * incoming_unit.x()
+                    ) / denominator
+                    if incoming_ray >= 0 and outgoing_ray >= 0:
+                        incoming_length = incoming_ray * 2 / 3
+                        outgoing_length = outgoing_ray * 2 / 3
+                if incoming_length <= 1e-6 or outgoing_length <= 1e-6:
+                    fallback = chord_length / 3
+                    incoming_length = min(fallback, incoming_span / 2)
+                    outgoing_length = min(fallback, outgoing_span / 2)
+                incoming_length = max(
+                    0.0, min(maximum_incoming, incoming_length)
+                )
+                outgoing_length = max(
+                    0.0, min(maximum_outgoing, outgoing_length)
+                )
+                path.cubicTo(
+                    entry + incoming_unit * incoming_length,
+                    exit_point - outgoing_unit * outgoing_length,
+                    exit_point,
+                )
+            elif rounded[end_index][0] != rounded[end_index][1]:
                 path.quadTo(
                     QPointF(end_node.x, end_node.y), rounded[end_index][1]
                 )
@@ -422,6 +1206,22 @@ class _CanvasLogic:
         if bound.closed:
             segment(len(nodes) - 1, 0)
             path.closeSubpath()
+        return path
+
+    @classmethod
+    def bound_path(
+        cls, bound: BoundGeometry, vertex_radius: float = 0.0,
+    ) -> QPainterPath:
+        path = cls._single_bound_path(bound, vertex_radius)
+        if not bound.additional_contours:
+            return path
+        path.setFillRule(Qt.OddEvenFill)
+        for contour in bound.additional_contours:
+            extra = BoundGeometry(
+                nodes=contour.nodes, closed=contour.closed,
+                primitive="custom",
+            )
+            path.addPath(cls._single_bound_path(extra))
         return path
 
     @classmethod
@@ -468,12 +1268,45 @@ class _CanvasLogic:
             previous = samples[max(0, index - 1)][0]
             following = samples[min(len(samples) - 1, index + 1)][0]
             dx, dy = following.x() - previous.x(), following.y() - previous.y()
-            length = max(1e-6, math.hypot(dx, dy))
+            length = math.hypot(dx, dy)
+            if length <= 1e-6:
+                if index == 0:
+                    dx = bound.nodes[1].x - bound.nodes[0].x
+                    dy = bound.nodes[1].y - bound.nodes[0].y
+                elif index == len(samples) - 1:
+                    dx = bound.nodes[-1].x - bound.nodes[-2].x
+                    dy = bound.nodes[-1].y - bound.nodes[-2].y
+                length = math.hypot(dx, dy)
+            if length <= 1e-6:
+                dx, dy, length = 1.0, 0.0, 1.0
             normal = QPointF(-dy / length, dx / length) * (width / 2)
             left.append(point + normal)
             right.append(point - normal)
-        start_tangent = samples[1][0] - samples[0][0]
-        end_tangent = samples[-1][0] - samples[-2][0]
+        def endpoint_tangent(start: bool) -> QPointF:
+            endpoint = samples[0 if start else -1][0]
+            candidates = (
+                samples[1:] if start else reversed(samples[:-1])
+            )
+            for candidate, _width in candidates:
+                tangent = (
+                    candidate - endpoint if start
+                    else endpoint - candidate
+                )
+                if math.hypot(tangent.x(), tangent.y()) > 1e-6:
+                    return tangent
+            first, second = (
+                (bound.nodes[0], bound.nodes[1])
+                if start else (bound.nodes[-2], bound.nodes[-1])
+            )
+            fallback = QPointF(second.x - first.x, second.y - first.y)
+            return (
+                fallback
+                if math.hypot(fallback.x(), fallback.y()) > 1e-6
+                else QPointF(1, 0)
+            )
+
+        start_tangent = endpoint_tangent(True)
+        end_tangent = endpoint_tangent(False)
         for points, tangent, cap, direction in (
             ((left, right), start_tangent, start_cap, -1),
             ((left, right), end_tangent, end_cap, 1),
@@ -505,15 +1338,57 @@ class _CanvasLogic:
             mesh.lineTo(samples[-1][0] + tangent * (
                 samples[-1][1] / 2 / length
             ))
+        elif end_cap == "round":
+            center = samples[-1][0]
+            radius = samples[-1][1] / 2
+            length = max(
+                1e-6, math.hypot(end_tangent.x(), end_tangent.y())
+            )
+            tangent = end_tangent / length
+            normal = left[-1] - center
+            normal_length = max(
+                1e-6, math.hypot(normal.x(), normal.y())
+            )
+            normal = normal / normal_length
+            kappa = 0.5522847498307936
+            outward = center + tangent * radius
+            mesh.cubicTo(
+                left[-1] + tangent * (kappa * radius),
+                outward + normal * (kappa * radius),
+                outward,
+            )
+            mesh.cubicTo(
+                outward - normal * (kappa * radius),
+                right[-1] + tangent * (kappa * radius),
+                right[-1],
+            )
         for point in reversed(right):
             mesh.lineTo(point)
-        mesh.closeSubpath()
         if start_cap == "round":
-            width = samples[0][1]
-            mesh.addEllipse(samples[0][0], width / 2, width / 2)
-        if end_cap == "round":
-            width = samples[-1][1]
-            mesh.addEllipse(samples[-1][0], width / 2, width / 2)
+            center = samples[0][0]
+            radius = samples[0][1] / 2
+            length = max(
+                1e-6, math.hypot(start_tangent.x(), start_tangent.y())
+            )
+            tangent = start_tangent / length
+            normal = left[0] - center
+            normal_length = max(
+                1e-6, math.hypot(normal.x(), normal.y())
+            )
+            normal = normal / normal_length
+            outward_tangent = tangent * -1
+            outward = center + outward_tangent * radius
+            mesh.cubicTo(
+                right[0] + outward_tangent * (kappa * radius),
+                outward - normal * (kappa * radius),
+                outward,
+            )
+            mesh.cubicTo(
+                outward + normal * (kappa * radius),
+                left[0] + outward_tangent * (kappa * radius),
+                left[0],
+            )
+        mesh.closeSubpath()
         return mesh
 
     @classmethod
@@ -525,6 +1400,73 @@ class _CanvasLogic:
                 layer.shape_style.start_cap, layer.shape_style.end_cap,
             )
         return cls.bound_path(layer.bound, layer.vertex_radius)
+
+    def _clear_compound_path_cache(self, *args) -> None:
+        self._compound_path_cache.clear()
+
+    def _layer_operand_path(self, layer: LayerNode) -> QPainterPath:
+        if layer.bound is None:
+            return QPainterPath()
+        if layer.layer_kind == "open_shape":
+            return self.open_shape_mesh(
+                layer.bound, layer.shape_style.base_thickness, 0,
+                layer.shape_style.start_cap, layer.shape_style.end_cap,
+            )
+        return self.bound_path(layer.bound, layer.vertex_radius)
+
+    def layer_effective_path(self, layer_id: str) -> QPainterPath:
+        layer = self.chapter.layers[layer_id]
+        if not layer.compound_enabled:
+            return self.layer_shape_path(layer)
+        cached = self._compound_path_cache.get(layer_id)
+        if cached is not None:
+            return QPainterPath(cached)
+        root_x, root_y = self.chapter.layer_world_translation(layer_id)
+        additions = QPainterPath(self._layer_operand_path(layer))
+        additions.setFillRule(Qt.OddEvenFill)
+        subtractions = QPainterPath()
+        subtractions.setFillRule(Qt.OddEvenFill)
+
+        def combine(target: QPainterPath, operand: QPainterPath) -> QPainterPath:
+            return QPainterPath(operand) if target.isEmpty() else target.united(operand)
+
+        def collect(parent: LayerNode) -> None:
+            nonlocal additions, subtractions
+            for reference in parent.children:
+                if reference.kind != "layer":
+                    continue
+                child = self.chapter.layers[reference.entity_id]
+                if (
+                    not child.visible or child.layer_kind == "fill"
+                    or child.compound_operation == "ignore"
+                ):
+                    continue
+                operand = (
+                    self.layer_effective_path(child.layer_id)
+                    if child.compound_enabled
+                    else self._layer_operand_path(child)
+                )
+                child_x, child_y = self.chapter.layer_world_translation(
+                    child.layer_id
+                )
+                transform = QTransform()
+                transform.translate(child_x - root_x, child_y - root_y)
+                operand = transform.map(operand)
+                if child.compound_operation == "subtract":
+                    subtractions = combine(subtractions, operand)
+                else:
+                    additions = combine(additions, operand)
+                if not child.compound_enabled:
+                    collect(child)
+
+        collect(layer)
+        result = (
+            additions.subtracted(subtractions)
+            if not subtractions.isEmpty() else additions
+        )
+        result.setFillRule(Qt.OddEvenFill)
+        self._compound_path_cache[layer_id] = QPainterPath(result)
+        return result
 
     def paintEvent(self, event) -> None:  # noqa: N802
         painter = QPainter(self)
@@ -547,10 +1489,15 @@ class _CanvasLogic:
             painter.setClipRect(
                 QRectF(0, 0, self.chapter.width, self.chapter.height)
             )
+            visible = self.visible_document_rect()
+            self._set_live_underlay_context()
             self._render_selected_raster_preview(
-                painter, self.visible_document_rect()
+                painter, visible
             )
+            self._render_selected_drawing_underlay(painter, visible)
+            self._draw_grid(painter, visible)
             self._draw_selection(painter)
+            self._clear_live_underlay_context()
             painter.restore()
             return
         painter.setTransform(self.camera_transform())
@@ -561,11 +1508,16 @@ class _CanvasLogic:
         painter.save()
         painter.setClipRect(QRectF(0, 0, self.chapter.width, self.chapter.height))
         visible = self.visible_document_rect()
+        self._set_live_underlay_context()
         for page_id in reversed(self.chapter.root_page_ids):
             self._render_layer(painter, self.chapter.layers[page_id], 1.0, visible)
+        self._render_selected_drawing_underlay(painter, visible)
+        self._clear_live_underlay_context()
         self._draw_grid(painter, visible)
         self._draw_predictive_ink(painter)
+        self._draw_live_vector_gesture(painter)
         self._draw_selection(painter)
+        self._draw_page_gap_overlay(painter)
         self._draw_creation_preview(painter)
         painter.restore()
         painter.setTransform(QTransform())
@@ -574,6 +1526,93 @@ class _CanvasLogic:
             0, 0, self.chapter.width, self.chapter.height
         )))
         painter.drawPolygon(chapter_poly)
+        self._draw_tablet_hover(painter)
+        self._draw_simplify_hover(painter)
+
+    def _set_live_underlay_context(self) -> None:
+        self._live_underlay_object_id = ""
+        self._live_underlay_amount = 0.0
+        if self.chapter is None or self.selected_kind != "object":
+            return
+        obj = self.chapter.objects.get(self.selected_object_id)
+        if not isinstance(obj, (RasterObject, VectorDrawingObject)):
+            return
+        amount = max(0.0, min(1.0, float(obj.underlay_opacity)))
+        if amount > 0:
+            self._live_underlay_object_id = obj.object_id
+            self._live_underlay_amount = amount
+
+    def _clear_live_underlay_context(self) -> None:
+        self._live_underlay_object_id = ""
+        self._live_underlay_amount = 0.0
+
+    def _render_selected_drawing_underlay(
+        self, painter: QPainter, visible: QRectF,
+    ) -> None:
+        if (
+            self.chapter is None
+            or not self._live_underlay_object_id
+            or self._live_underlay_amount <= 0
+        ):
+            return
+        obj = self.chapter.objects.get(self._live_underlay_object_id)
+        if (
+            not isinstance(obj, (RasterObject, VectorDrawingObject))
+            or not obj.visible
+        ):
+            return
+        ancestors = self.chapter.ancestor_layers(obj.parent_layer_id)
+        if any(not layer.visible or layer.opacity <= 0 for layer in ancestors):
+            return
+        world_x, world_y = self.chapter.layer_world_translation(
+            obj.parent_layer_id
+        )
+        painter.save()
+        painter.setOpacity(
+            self.chapter.effective_object_opacity(obj.object_id)
+            * self._live_underlay_amount
+        )
+        painter.translate(world_x, world_y)
+        if isinstance(obj, VectorDrawingObject):
+            self._render_vector_drawing(painter, obj)
+        else:
+            self._render_raster_content(
+                painter, obj, visible.translated(-world_x, -world_y),
+                use_transform_preview=True,
+            )
+        painter.restore()
+
+    def _draw_page_gap_overlay(self, painter: QPainter) -> None:
+        if self.chapter is None:
+            return
+        scale = max(self.scale, 0.05)
+        painter.save()
+        painter.setBrush(Qt.NoBrush)
+        pen = QPen(
+            QColor("#ff9f22"), 2 / scale, Qt.DotLine,
+            Qt.RoundCap, Qt.RoundJoin,
+        )
+        painter.setPen(pen)
+        if self._page_gap_prompt_y is not None:
+            y = self._page_gap_prompt_y
+            painter.drawLine(QPointF(0, y), QPointF(self.chapter.width, y))
+        if self.tool == ToolKind.INSERT_PAGE_GAP and self._page_gap_hover:
+            y = float(self._page_gap_hover["y"])
+            painter.drawLine(QPointF(0, y), QPointF(self.chapter.width, y))
+        if self._page_gap_editor_visible():
+            top = float(self._page_gap_state["top_y"])
+            bottom = float(self._page_gap_state["bottom_y"])
+            painter.fillRect(
+                QRectF(0, top, self.chapter.width, bottom - top),
+                QColor(255, 159, 34, 38),
+            )
+            painter.drawLine(
+                QPointF(0, top), QPointF(self.chapter.width, top)
+            )
+            painter.drawLine(
+                QPointF(0, bottom), QPointF(self.chapter.width, bottom)
+            )
+        painter.restore()
 
     def render_preview(self, image: QImage, clip: QRect | None = None) -> None:
         if self.chapter is None or image.isNull():
@@ -605,45 +1644,88 @@ class _CanvasLogic:
             painter.save()
             painter.setOpacity(parent_opacity * layer.opacity)
             painter.fillPath(
-                self.bound_path(parent.bound, parent.vertex_radius),
+                self.layer_effective_path(parent.layer_id),
                 QColor(layer.fill_color or "#111111"),
             )
             painter.restore()
             return
         painter.save()
         painter.translate(layer.translate_x, layer.translate_y)
-        if layer.layer_kind == "open_shape":
-            style = layer.shape_style
-            painter.setOpacity(parent_opacity * layer.opacity)
-            if style.outline_thickness > 0:
-                painter.fillPath(
-                    self.open_shape_mesh(
-                        layer.bound, style.base_thickness,
-                        style.outline_thickness * 2,
-                        style.start_cap, style.end_cap,
-                    ),
-                    QColor(style.outline_color),
-                )
-            painter.fillPath(
-                self.open_shape_mesh(
-                    layer.bound, style.base_thickness, 0,
-                    style.start_cap, style.end_cap,
-                ),
-                QColor(style.primary_color or "#111111"),
+        if layer.compound_enabled:
+            self._render_compound_layer_contents(
+                painter, layer, parent_opacity, visible_world
             )
             painter.restore()
             return
+        if layer.layer_kind == "open_shape":
+            style = layer.shape_style
+            opacity = parent_opacity * layer.opacity
+            painter.setOpacity(opacity)
+            core = self.open_shape_mesh(
+                layer.bound, style.base_thickness, 0,
+                style.start_cap, style.end_cap,
+            )
+            painter.fillPath(
+                core, QColor(style.primary_color or "#111111"),
+            )
+            clip_path = self.open_shape_mesh(
+                layer.bound, style.base_thickness,
+                style.outline_thickness * 2,
+                style.start_cap, style.end_cap,
+            )
+            painter.save()
+            painter.setClipPath(clip_path, Qt.IntersectClip)
+            world_x, world_y = self.chapter.layer_world_translation(
+                layer.layer_id
+            )
+            local_visible = visible_world.translated(-world_x, -world_y)
+            for child in reversed(layer.children):
+                if self._child_ignores_parent_mask(child):
+                    continue
+                if child.kind == "layer":
+                    self._render_layer(
+                        painter, self.chapter.layers[child.entity_id],
+                        opacity, visible_world,
+                    )
+                else:
+                    self._render_object(
+                        painter, self.chapter.objects[child.entity_id],
+                        opacity, local_visible,
+                    )
+            painter.restore()
+            if style.outline_thickness > 0:
+                ring = clip_path.subtracted(core)
+                painter.fillPath(ring, QColor(style.outline_color))
+            for child in reversed(layer.children):
+                if not self._child_ignores_parent_mask(child):
+                    continue
+                if child.kind == "layer":
+                    self._render_layer(
+                        painter, self.chapter.layers[child.entity_id],
+                        opacity, visible_world,
+                    )
+                else:
+                    self._render_object(
+                        painter, self.chapter.objects[child.entity_id],
+                        opacity, local_visible,
+                    )
+            painter.restore()
+            return
         layer_path = self.bound_path(layer.bound, layer.vertex_radius)
-        painter.setClipPath(layer_path, Qt.IntersectClip)
         opacity = parent_opacity * layer.opacity
         if layer.fill_color:
             painter.save()
             painter.setOpacity(opacity)
+            painter.setClipPath(layer_path, Qt.IntersectClip)
             painter.fillPath(layer_path, QColor(layer.fill_color))
             painter.restore()
         world_x, world_y = self.chapter.layer_world_translation(layer.layer_id)
         local_visible = visible_world.translated(-world_x, -world_y)
+        painter.save()
+        painter.setClipPath(layer_path, Qt.IntersectClip)
         for child in reversed(layer.children):
+            if self._child_ignores_parent_mask(child):
+                continue
             if child.kind == "layer":
                 self._render_layer(
                     painter, self.chapter.layers[child.entity_id], opacity, visible_world
@@ -666,6 +1748,421 @@ class _CanvasLogic:
             painter.drawPath(layer_path)
             painter.restore()
         painter.restore()
+        for child in reversed(layer.children):
+            if not self._child_ignores_parent_mask(child):
+                continue
+            if child.kind == "layer":
+                self._render_layer(
+                    painter, self.chapter.layers[child.entity_id],
+                    opacity, visible_world,
+                )
+            else:
+                self._render_object(
+                    painter, self.chapter.objects[child.entity_id],
+                    opacity, local_visible,
+                )
+        painter.restore()
+        return
+
+    def _render_compound_layer_contents(
+        self, painter: QPainter, layer: LayerNode, parent_opacity: float,
+        visible_world: QRectF,
+    ) -> None:
+        layer_path = self.layer_effective_path(layer.layer_id)
+        opacity = parent_opacity * layer.opacity
+        world_x, world_y = self.chapter.layer_world_translation(layer.layer_id)
+        local_visible = visible_world.translated(-world_x, -world_y)
+        painter.save()
+        painter.setClipPath(layer_path, Qt.IntersectClip)
+        if layer.fill_color:
+            painter.save()
+            painter.setOpacity(opacity)
+            painter.fillPath(layer_path, QColor(layer.fill_color))
+            painter.restore()
+        for child in reversed(layer.children):
+            if self._child_ignores_parent_mask(child):
+                continue
+            if child.kind == "object":
+                self._render_object(
+                    painter, self.chapter.objects[child.entity_id], opacity,
+                    local_visible,
+                )
+                continue
+            candidate = self.chapter.layers[child.entity_id]
+            if candidate.compound_operation == "ignore":
+                self._render_layer(
+                    painter, candidate, opacity, visible_world
+                )
+            elif candidate.visible:
+                self._render_compound_contributor(
+                    painter, candidate, opacity, visible_world
+                )
+        self._render_compound_reference_objects(
+            painter, layer.layer_id, opacity, visible_world
+        )
+        painter.restore()
+        if layer.border_width > 0:
+            painter.save()
+            painter.setOpacity(opacity)
+            pen = QPen(
+                QColor(layer.border_color), layer.border_width * 2,
+                Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin,
+            )
+            painter.setPen(pen)
+            painter.setBrush(Qt.NoBrush)
+            painter.drawPath(layer_path)
+            painter.restore()
+        for child in reversed(layer.children):
+            if not self._child_ignores_parent_mask(child):
+                continue
+            if child.kind == "object":
+                self._render_object(
+                    painter, self.chapter.objects[child.entity_id], opacity,
+                    local_visible,
+                )
+            else:
+                self._render_layer(
+                    painter, self.chapter.layers[child.entity_id],
+                    opacity, visible_world,
+                )
+
+    def _render_compound_contributor(
+        self, painter: QPainter, layer: LayerNode, parent_opacity: float,
+        visible_world: QRectF,
+    ) -> None:
+        if not layer.visible:
+            return
+        painter.save()
+        painter.translate(layer.translate_x, layer.translate_y)
+        path = (
+            self.layer_effective_path(layer.layer_id)
+            if layer.compound_enabled else self._layer_operand_path(layer)
+        )
+        painter.save()
+        painter.setClipPath(path, Qt.IntersectClip)
+        opacity = parent_opacity * layer.opacity
+        world_x, world_y = self.chapter.layer_world_translation(layer.layer_id)
+        local_visible = visible_world.translated(-world_x, -world_y)
+        for child in reversed(layer.children):
+            if self._child_ignores_parent_mask(child):
+                continue
+            if child.kind == "object":
+                self._render_object(
+                    painter, self.chapter.objects[child.entity_id], opacity,
+                    local_visible,
+                )
+                continue
+            candidate = self.chapter.layers[child.entity_id]
+            if candidate.compound_operation == "ignore":
+                self._render_layer(
+                    painter, candidate, opacity, visible_world
+                )
+            elif candidate.visible:
+                self._render_compound_contributor(
+                    painter, candidate, opacity, visible_world
+                )
+        if layer.compound_enabled:
+            self._render_compound_reference_objects(
+                painter, layer.layer_id, opacity, visible_world
+            )
+        painter.restore()
+        for child in reversed(layer.children):
+            if not self._child_ignores_parent_mask(child):
+                continue
+            if child.kind == "object":
+                self._render_object(
+                    painter, self.chapter.objects[child.entity_id],
+                    opacity, local_visible,
+                )
+            else:
+                self._render_layer(
+                    painter, self.chapter.layers[child.entity_id],
+                    opacity, visible_world,
+                )
+        painter.restore()
+
+    def _child_ignores_parent_mask(self, child: ChildRef) -> bool:
+        entity = (
+            self.chapter.layers.get(child.entity_id)
+            if child.kind == "layer"
+            else self.chapter.objects.get(child.entity_id)
+        )
+        return bool(entity and entity.ignore_parent_mask)
+
+    def _render_compound_reference_objects(
+        self, painter: QPainter, compound_id: str, parent_opacity: float,
+        visible_world: QRectF,
+    ) -> None:
+        compound_x, compound_y = self.chapter.layer_world_translation(
+            compound_id
+        )
+        references: list[DocumentObject] = []
+
+        def collect(layer: LayerNode) -> None:
+            if layer.layer_id != compound_id and not layer.visible:
+                return
+            for child in reversed(layer.children):
+                if child.kind == "object":
+                    obj = self.chapter.objects[child.entity_id]
+                    closest = self.chapter.closest_compound_ancestor(
+                        obj.parent_layer_id, include_self=True
+                    )
+                    if (
+                        obj.geometry_reference == "compound"
+                        and closest is not None
+                        and closest.layer_id == compound_id
+                    ):
+                        references.append(obj)
+                else:
+                    collect(self.chapter.layers[child.entity_id])
+
+        collect(self.chapter.layers[compound_id])
+        self._rendering_compound_references = True
+        try:
+            for obj in references:
+                parent_x, parent_y = self.chapter.layer_world_translation(
+                    obj.parent_layer_id
+                )
+                branch_opacity = parent_opacity
+                cursor = self.chapter.layers[obj.parent_layer_id]
+                while cursor.layer_id != compound_id:
+                    branch_opacity *= cursor.opacity
+                    if cursor.parent_id is None:
+                        break
+                    cursor = self.chapter.layers[cursor.parent_id]
+                painter.save()
+                painter.translate(
+                    parent_x - compound_x, parent_y - compound_y
+                )
+                local_visible = visible_world.translated(
+                    -parent_x, -parent_y
+                )
+                self._render_object(
+                    painter, obj, branch_opacity, local_visible
+                )
+                painter.restore()
+        finally:
+            self._rendering_compound_references = False
+
+    @staticmethod
+    def _vector_centerline_path(stroke: VectorStroke) -> QPainterPath:
+        path = QPainterPath()
+        if not stroke.points:
+            return path
+        path.moveTo(QPointF(*stroke.points[0].position))
+        for cubic in stroke_cubics(stroke.points, stroke.closed):
+            path.cubicTo(
+                QPointF(*cubic[1]),
+                QPointF(*cubic[2]),
+                QPointF(*cubic[3]),
+            )
+        return path
+
+    def _vector_stroke_image(
+        self, drawing: VectorDrawingObject, stroke: VectorStroke,
+    ) -> tuple[QImage, QRectF] | None:
+        """Rasterize one stroke opacity mask, then colorize it exactly once."""
+        if not stroke.points:
+            return None
+        device_ratio = max(1.0, float(self.devicePixelRatioF()))
+        requested_scale = max(0.1, min(8.0, self.scale * device_ratio))
+        key = (
+            drawing.object_id,
+            drawing.drawing_revision,
+            stroke.stroke_id,
+            round(requested_scale, 3),
+            device_ratio,
+        )
+        cached = self._vector_render_cache.get(key)
+        if cached is not None:
+            return cached
+        left, top, width, height = stroke.derived_bounds()
+        padding = 3.0 / requested_scale
+        target = QRectF(
+            left - padding, top - padding,
+            max(1.0, width + padding * 2),
+            max(1.0, height + padding * 2),
+        )
+        render_scale = requested_scale
+        maximum_dimension = max(target.width(), target.height()) * render_scale
+        if maximum_dimension > 8192:
+            render_scale *= 8192 / maximum_dimension
+        pixel_width = max(1, math.ceil(target.width() * render_scale))
+        pixel_height = max(1, math.ceil(target.height() * render_scale))
+        mask = QImage(pixel_width, pixel_height, QImage.Format_Alpha8)
+        mask.fill(0)
+        mask_painter = QPainter(mask)
+        mask_painter.setRenderHint(QPainter.Antialiasing, True)
+        mask_painter.setCompositionMode(QPainter.CompositionMode_Lighten)
+        mask_painter.scale(render_scale, render_scale)
+        mask_painter.translate(-target.left(), -target.top())
+        if len(stroke.points) == 1:
+            point = stroke.points[0]
+            mask_painter.setPen(Qt.NoPen)
+            mask_painter.setBrush(QColor(
+                255, 255, 255,
+                round(max(0.0, min(1.0, point.opacity)) * 255),
+            ))
+            mask_painter.drawEllipse(
+                QPointF(point.x, point.y), point.width / 2, point.width / 2
+            )
+        else:
+            samples = flatten_stroke(
+                stroke.points, closed=stroke.closed, tolerance=0.3
+            )
+            raster_samples: list[
+                tuple[tuple[float, float], float, float]
+            ] = []
+            for first, second in zip(samples, samples[1:]):
+                length = math.dist(first.point, second.point)
+                steps = max(1, math.ceil(length * render_scale / 3))
+                if not raster_samples:
+                    raster_samples.append(
+                        (first.point, first.width, first.opacity)
+                    )
+                for step in range(1, steps + 1):
+                    amount = step / steps
+                    current_point = (
+                        first.point[0]
+                        + (second.point[0] - first.point[0]) * amount,
+                        first.point[1]
+                        + (second.point[1] - first.point[1]) * amount,
+                    )
+                    current_width = (
+                        first.width + (second.width - first.width) * amount
+                    )
+                    current_opacity = (
+                        first.opacity
+                        + (second.opacity - first.opacity) * amount
+                    )
+                    raster_samples.append(
+                        (current_point, current_width, current_opacity)
+                    )
+            for first, second in zip(raster_samples, raster_samples[1:]):
+                opacity = max(
+                    0.0, min(1.0, (first[2] + second[2]) / 2)
+                )
+                pen = QPen(
+                    QColor(255, 255, 255, round(opacity * 255)),
+                    max(1.0, (first[1] + second[1]) / 2),
+                    Qt.SolidLine,
+                    Qt.FlatCap,
+                    Qt.RoundJoin,
+                )
+                mask_painter.setPen(pen)
+                mask_painter.drawLine(
+                    QPointF(*first[0]), QPointF(*second[0])
+                )
+            mask_painter.setPen(Qt.NoPen)
+            for point, width, opacity in raster_samples[1:-1]:
+                mask_painter.setBrush(QColor(
+                    255, 255, 255,
+                    round(max(0.0, min(1.0, opacity)) * 255),
+                ))
+                mask_painter.drawEllipse(
+                    QPointF(*point), width / 2, width / 2
+                )
+
+            def draw_cap(
+                endpoint, neighbor, cap: str, outward: bool,
+            ) -> None:
+                point, width, opacity = endpoint
+                direction = QPointF(
+                    point[0] - neighbor[0][0],
+                    point[1] - neighbor[0][1],
+                )
+                magnitude = math.hypot(direction.x(), direction.y())
+                if magnitude <= 1.0e-8:
+                    return
+                direction /= magnitude
+                if not outward:
+                    direction = -direction
+                normal = QPointF(-direction.y(), direction.x())
+                radius = width / 2
+                mask_painter.setBrush(QColor(
+                    255, 255, 255,
+                    round(max(0.0, min(1.0, opacity)) * 255),
+                ))
+                if cap == "round":
+                    mask_painter.drawEllipse(
+                        QPointF(*point), radius, radius
+                    )
+                elif cap == "point":
+                    center = QPointF(*point)
+                    mask_painter.drawPolygon(QPolygonF([
+                        center + normal * radius,
+                        center + direction * radius,
+                        center - normal * radius,
+                    ]))
+                elif cap == "square":
+                    center = QPointF(*point) + direction * (radius / 2)
+                    mask_painter.drawPolygon(QPolygonF([
+                        center + normal * radius - direction * (radius / 2),
+                        center - normal * radius - direction * (radius / 2),
+                        center - normal * radius + direction * (radius / 2),
+                        center + normal * radius + direction * (radius / 2),
+                    ]))
+
+            if raster_samples and not stroke.closed:
+                draw_cap(
+                    raster_samples[0], raster_samples[1],
+                    stroke.start_cap, True,
+                )
+                draw_cap(
+                    raster_samples[-1], raster_samples[-2],
+                    stroke.end_cap, True,
+                )
+            elif raster_samples and stroke.closed:
+                point, width, opacity = raster_samples[0]
+                mask_painter.setBrush(QColor(
+                    255, 255, 255,
+                    round(max(0.0, min(1.0, opacity)) * 255),
+                ))
+                mask_painter.drawEllipse(
+                    QPointF(*point), width / 2, width / 2
+                )
+        mask_painter.end()
+        image = QImage(
+            pixel_width, pixel_height, QImage.Format_ARGB32_Premultiplied
+        )
+        image.fill(Qt.transparent)
+        image_painter = QPainter(image)
+        image_painter.fillRect(image.rect(), QColor(stroke.color))
+        image_painter.setCompositionMode(QPainter.CompositionMode_DestinationIn)
+        image_painter.drawImage(0, 0, mask)
+        image_painter.end()
+        result = image, target
+        self._vector_render_cache[key] = result
+        return result
+
+    def _render_vector_fill(
+        self, painter: QPainter, fill: VectorFillObject,
+    ) -> None:
+        if not fill.visible:
+            return
+        painter.save()
+        painter.setOpacity(
+            painter.opacity() * (1.0 if fill.opacity_locked else fill.opacity)
+        )
+        painter.fillPath(self.bound_path(fill.geometry), QColor(fill.fill_color))
+        painter.restore()
+
+    def _render_vector_drawing(
+        self, painter: QPainter, drawing: VectorDrawingObject,
+    ) -> None:
+        painter.save()
+        painter.translate(drawing.x, drawing.y)
+        # Fill IDs are frontmost-first, so paint them back-to-front.
+        for fill_id in reversed(drawing.fill_child_ids):
+            fill = self.chapter.objects.get(fill_id)
+            if isinstance(fill, VectorFillObject):
+                self._render_vector_fill(painter, fill)
+        for stroke in drawing.strokes:
+            rendered = self._vector_stroke_image(drawing, stroke)
+            if rendered is not None:
+                image, target = rendered
+                painter.drawImage(target, image)
+        painter.restore()
 
     def _render_object(
         self, painter: QPainter, obj: DocumentObject, parent_opacity: float,
@@ -673,35 +2170,95 @@ class _CanvasLogic:
     ) -> None:
         if obj.object_id == self._render_excluded_object_id:
             return
+        if (
+            not self._rendering_compound_references
+            and obj.geometry_reference == "compound"
+            and self.chapter.closest_compound_ancestor(
+                obj.parent_layer_id, include_self=True
+            ) is not None
+        ):
+            return
         if not obj.visible:
             return
         painter.save()
-        painter.setOpacity(parent_opacity if obj.opacity_locked else parent_opacity * obj.opacity)
-        if isinstance(obj, RasterObject):
-            if (
-                obj.object_id == self.selected_object_id
-                and self.tool == ToolKind.TRANSFORM
-                and self._transform_preview_quad is not None
-            ):
-                source = QRectF(*obj.interaction_rect).translated(obj.x, obj.y)
-                transform = self._quad_transform(source, self._transform_preview_quad)
-                painter.setRenderHint(QPainter.SmoothPixmapTransform, True)
-                painter.setTransform(transform, True)
-                for (tile_x, tile_y), image in self.tiles.iter_tiles(obj.object_id):
-                    painter.drawImage(
-                        obj.x + tile_x * obj.tile_size,
-                        obj.y + tile_y * obj.tile_size,
-                        image,
-                    )
-                painter.restore()
-                return
-            painter.translate(obj.x, obj.y)
-            object_visible = local_visible.translated(-obj.x, -obj.y)
-            for (tile_x, tile_y), image in self.tiles.iter_tiles(obj.object_id, object_visible):
-                painter.drawImage(tile_x * obj.tile_size, tile_y * obj.tile_size, image)
+        opacity = (
+            parent_opacity
+            if obj.opacity_locked else parent_opacity * obj.opacity
+        )
+        if obj.object_id == self._live_underlay_object_id:
+            opacity *= 1.0 - self._live_underlay_amount
+        painter.setOpacity(opacity)
+        if isinstance(obj, VectorDrawingObject):
+            self._render_vector_drawing(painter, obj)
+        elif isinstance(obj, RasterObject):
+            self._render_raster_content(
+                painter, obj, local_visible, use_transform_preview=True
+            )
         elif isinstance(obj, TextObject):
             self._draw_text_object(painter, obj)
         painter.restore()
+
+    def _render_raster_content(
+        self, painter: QPainter, obj: RasterObject, local_visible: QRectF,
+        *, use_transform_preview: bool,
+    ) -> None:
+        preview = (
+            use_transform_preview
+            and obj.object_id == self.selected_object_id
+            and self._transform_preview_quad is not None
+        )
+        if preview and (
+            self._transform_drag_mode == "translate"
+            and self._transform_start_quad is not None
+        ):
+            dx = (
+                self._transform_preview_quad[0][0]
+                - self._transform_start_quad[0][0]
+            )
+            dy = (
+                self._transform_preview_quad[0][1]
+                - self._transform_start_quad[0][1]
+            )
+            painter.translate(obj.x + dx, obj.y + dy)
+            object_visible = local_visible.translated(
+                -obj.x - dx, -obj.y - dy
+            )
+            for (tile_x, tile_y), image in self.tiles.iter_tiles(
+                obj.object_id, object_visible
+            ):
+                painter.drawImage(
+                    tile_x * obj.tile_size, tile_y * obj.tile_size, image
+                )
+            return
+        if preview:
+            source = QRectF(*obj.interaction_rect).translated(obj.x, obj.y)
+            transform = self._quad_transform(
+                source, self._transform_preview_quad
+            )
+            painter.setRenderHint(QPainter.SmoothPixmapTransform, True)
+            painter.setTransform(transform, True)
+            inverse, invertible = transform.inverted()
+            object_visible = (
+                inverse.mapRect(local_visible).translated(-obj.x, -obj.y)
+                if invertible else None
+            )
+            for (tile_x, tile_y), image in self.tiles.iter_tiles(
+                obj.object_id, object_visible
+            ):
+                painter.drawImage(
+                    obj.x + tile_x * obj.tile_size,
+                    obj.y + tile_y * obj.tile_size,
+                    image,
+                )
+            return
+        painter.translate(obj.x, obj.y)
+        object_visible = local_visible.translated(-obj.x, -obj.y)
+        for (tile_x, tile_y), image in self.tiles.iter_tiles(
+            obj.object_id, object_visible
+        ):
+            painter.drawImage(
+                tile_x * obj.tile_size, tile_y * obj.tile_size, image
+            )
 
     def _text_document(self, obj: TextObject, width: float) -> QTextDocument:
         document = QTextDocument()
@@ -727,7 +2284,31 @@ class _CanvasLogic:
 
     def _strict_text_rect(self, obj: TextObject) -> QRectF:
         parent = self.chapter.layers[obj.parent_layer_id]
-        left, top, width, height = parent.bound.bbox()
+        reference = parent
+        if obj.geometry_reference == "compound":
+            reference = (
+                self.chapter.closest_compound_ancestor(
+                    obj.parent_layer_id, include_self=True
+                ) or parent
+            )
+        path = (
+            self._layer_operand_path(reference)
+            if (
+                obj.geometry_reference == "direct"
+                and reference.compound_enabled
+            )
+            else self.layer_effective_path(reference.layer_id)
+        )
+        bounds = path.boundingRect()
+        parent_x, parent_y = self.chapter.layer_world_translation(
+            parent.layer_id
+        )
+        reference_x, reference_y = self.chapter.layer_world_translation(
+            reference.layer_id
+        )
+        left = bounds.left() + reference_x - parent_x
+        top = bounds.top() + reference_y - parent_y
+        width, height = bounds.width(), bounds.height()
         margin = min(max(0.0, obj.margin), max(0.0, min(width, height) / 2 - 1))
         return QRectF(
             left + margin, top + margin,
@@ -757,6 +2338,20 @@ class _CanvasLogic:
         transform = QTransform.quadToQuad(source_quad, destination)
         return transform if isinstance(transform, QTransform) else QTransform()
 
+    @staticmethod
+    def _quad_to_quad_transform(
+        source: list[tuple[float, float]],
+        destination: list[tuple[float, float]],
+    ) -> QTransform:
+        source_polygon = QPolygonF([QPointF(*point) for point in source])
+        destination_polygon = QPolygonF([
+            QPointF(*point) for point in destination
+        ])
+        transform = QTransform.quadToQuad(
+            source_polygon, destination_polygon
+        )
+        return transform if isinstance(transform, QTransform) else QTransform()
+
     def _text_vertical_offset(
         self, obj: TextObject, document: QTextDocument, available_height: float,
     ) -> float:
@@ -780,10 +2375,12 @@ class _CanvasLogic:
             return
         source = QRectF(0, 0, max(1.0, obj.width), max(1.0, obj.height))
         document = self._text_document(obj, source.width())
+        offset = self._text_vertical_offset(obj, document, source.height())
         transform = self._quad_transform(source, self._text_quad(obj))
         painter.save()
         painter.setTransform(transform, True)
         painter.setClipRect(source)
+        painter.translate(0, offset)
         self._draw_text_document(painter, obj, document)
         painter.restore()
 
@@ -873,18 +2470,150 @@ class _CanvasLogic:
             transform.translate(wx, wy)
             if layer.bound is not None:
                 painter.setClipPath(
-                    transform.map(self.bound_path(layer.bound, layer.vertex_radius)),
+                    transform.map(self.layer_effective_path(layer.layer_id)),
                     Qt.IntersectClip,
                 )
         start, end, size, color = self._predictive
         preview = QColor(color)
-        preview.setAlpha(110)
+        preview.setAlpha(round(110 * color.alphaF()))
         pen = QPen(preview, size, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin)
         painter.setPen(pen)
         painter.drawLine(start, end)
         painter.restore()
 
+    def _draw_live_vector_gesture(self, painter: QPainter) -> None:
+        if (
+            self._vector_gesture_mode == "simplify"
+            and self._vector_sweep
+            and self._selected_vector_drawing() is not None
+        ):
+            drawing = self._selected_vector_drawing()
+            layer_x, layer_y = self.chapter.layer_world_translation(
+                drawing.parent_layer_id
+            )
+            radius = 12.0 / max(self.scale, 0.05)
+            painter.save()
+            painter.translate(layer_x + drawing.x, layer_y + drawing.y)
+            overlay = QColor(255, 139, 30, 72)
+            if len(self._vector_sweep) == 1:
+                painter.setPen(Qt.NoPen)
+                painter.setBrush(overlay)
+                painter.drawEllipse(
+                    QPointF(*self._vector_sweep[0].point), radius, radius
+                )
+            else:
+                path = QPainterPath(QPointF(*self._vector_sweep[0].point))
+                for sample in self._vector_sweep[1:]:
+                    path.lineTo(QPointF(*sample.point))
+                painter.setBrush(Qt.NoBrush)
+                painter.setPen(QPen(
+                    overlay, radius * 2, Qt.SolidLine,
+                    Qt.RoundCap, Qt.RoundJoin,
+                ))
+                painter.drawPath(path)
+            painter.restore()
+            return
+        if (
+            self._vector_gesture_mode != "pencil"
+            or not self._vector_samples
+            or self._active_vector_drawing() is None
+        ):
+            return
+        drawing = self._active_vector_drawing()
+        layer_x, layer_y = self.chapter.layer_world_translation(
+            drawing.parent_layer_id
+        )
+        painter.save()
+        painter.translate(layer_x + drawing.x, layer_y + drawing.y)
+        color = QColor(self.primary_color)
+        if len(self._vector_samples) == 1:
+            sample = self._vector_samples[0]
+            width, opacity = self._vector_pressure_values(sample.pressure)
+            color.setAlphaF(color.alphaF() * opacity)
+            painter.setPen(Qt.NoPen)
+            painter.setBrush(color)
+            painter.drawEllipse(
+                QPointF(*sample.point), width / 2, width / 2
+            )
+        else:
+            for first, second in zip(
+                self._vector_samples, self._vector_samples[1:]
+            ):
+                width_a, opacity_a = self._vector_pressure_values(
+                    first.pressure
+                )
+                width_b, opacity_b = self._vector_pressure_values(
+                    second.pressure
+                )
+                segment_color = QColor(color)
+                segment_color.setAlphaF(
+                    color.alphaF() * (opacity_a + opacity_b) / 2
+                )
+                painter.setPen(QPen(
+                    segment_color,
+                    (width_a + width_b) / 2,
+                    Qt.PenStyle.SolidLine,
+                    Qt.PenCapStyle.RoundCap,
+                    Qt.PenJoinStyle.RoundJoin,
+                ))
+                painter.drawLine(
+                    QPointF(*first.point), QPointF(*second.point)
+                )
+        painter.restore()
+
+    def _draw_simplify_hover(self, painter: QPainter) -> None:
+        if self.tool != ToolKind.VECTOR_SIMPLIFY:
+            return
+        center = self._tablet_hover_widget or self._pointer_hover_widget
+        if center is None:
+            return
+        painter.save()
+        painter.setTransform(QTransform())
+        painter.setBrush(Qt.NoBrush)
+        painter.setPen(QPen(QColor("#ff8b1e"), 1.5))
+        painter.drawEllipse(center, 12.0, 12.0)
+        painter.restore()
+
+    def _draw_tablet_hover(self, painter: QPainter) -> None:
+        if (
+            self._tablet_hover_widget is None
+            or self._tablet_tool_active
+            or self._nav_mode is not None
+            or self.tool not in {
+                ToolKind.RASTER_PENCIL, ToolKind.RASTER_ERASER
+            }
+        ):
+            return
+        size = (
+            self.settings.active_eraser_pixels()
+            if self.tool == ToolKind.RASTER_ERASER
+            else self.settings.pencil_size()
+        )
+        radius = max(2.0, size * self.scale / 2)
+        center = self._tablet_hover_widget
+        painter.save()
+        painter.setTransform(QTransform())
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        painter.setPen(QPen(QColor("#E8F5FF"), 1.25))
+        painter.drawEllipse(center, radius, radius)
+        cross = min(6.0, max(3.0, radius * 0.35))
+        painter.drawLine(
+            QPointF(center.x() - cross, center.y()),
+            QPointF(center.x() + cross, center.y()),
+        )
+        painter.drawLine(
+            QPointF(center.x(), center.y() - cross),
+            QPointF(center.x(), center.y() + cross),
+        )
+        painter.restore()
+
     def _draw_selection(self, painter: QPainter) -> None:
+        if self.tool in {
+            ToolKind.DRAW_SELECT_RECT,
+            ToolKind.DRAW_SELECT_LASSO,
+            ToolKind.DRAW_SELECT_STROKE,
+        }:
+            self._draw_drawing_selection(painter)
         if (
             self.tool == ToolKind.TEXT_EDIT
             and not isinstance(
@@ -924,37 +2653,35 @@ class _CanvasLogic:
             )
             painter.setPen(orange)
             if active.bound is not None:
-                painter.drawPath(self.bound_path(active.bound, active.vertex_radius))
+                painter.drawPath(self.layer_effective_path(active.layer_id))
             painter.restore()
         pen = QPen(QColor("#36b7ff"), 2 / max(self.scale, 0.05), Qt.DashLine)
         painter.setPen(pen)
+        selected_object = self.chapter.objects.get(self.selected_id)
         if self.selected_kind == "layer":
             layer = self.chapter.layers.get(self.selected_id)
             if layer:
                 world_x, world_y = self.chapter.layer_world_translation(layer.layer_id)
                 painter.translate(world_x, world_y)
                 if layer.bound is not None:
-                    painter.drawPath(self.bound_path(layer.bound, layer.vertex_radius))
+                    painter.drawPath(self.layer_effective_path(layer.layer_id))
                 if self.tool == ToolKind.BOUND_EDIT and layer.bound is not None:
                     self._draw_shape_edit_handles(painter, layer)
         else:
             quad = self._selected_world_quad()
             if quad:
-                selected_object = self.chapter.objects.get(self.selected_id)
-                hide_raster_frame = (
-                    isinstance(selected_object, RasterObject)
-                    and self.tool in {
-                        ToolKind.RASTER_PENCIL, ToolKind.RASTER_ERASER
-                    }
-                )
                 polygon = QPolygonF([QPointF(*point) for point in quad])
-                if not hide_raster_frame:
-                    painter.drawPolygon(polygon)
-                if self.tool == ToolKind.TRANSFORM:
-                    radius = 7 / max(self.scale, 0.05)
-                    painter.setBrush(QColor("#f5f5f5"))
-                    for point in self._quad_handles(quad):
-                        painter.drawEllipse(QPointF(*point), radius, radius)
+                painter.drawPolygon(polygon)
+                if (
+                    isinstance(selected_object, RasterObject)
+                    or self.tool == ToolKind.TRANSFORM
+                    or (
+                        self.tool == ToolKind.TEXT_EDIT
+                        and isinstance(selected_object, TextObject)
+                        and selected_object.layout_mode == "free"
+                    )
+                ):
+                    self._draw_transform_controls(painter, quad)
                 if (
                     self.tool == ToolKind.BOUND_EDIT
                     and isinstance(selected_object, RasterObject)
@@ -980,6 +2707,114 @@ class _CanvasLogic:
                             point[0] - radius, point[1] - radius,
                             radius * 2, radius * 2,
                         ))
+                if (
+                    isinstance(selected_object, VectorDrawingObject)
+                    and self.tool in {
+                        ToolKind.VECTOR_EDIT, ToolKind.VECTOR_REDRAW,
+                        ToolKind.VECTOR_SIMPLIFY,
+                        ToolKind.DRAW_SELECT_RECT,
+                        ToolKind.DRAW_SELECT_LASSO,
+                        ToolKind.DRAW_SELECT_STROKE,
+                    }
+                ):
+                    self._draw_vector_edit_handles(
+                        painter, selected_object
+                    )
+        painter.restore()
+
+    def _transform_control_points(
+        self, quad: list[tuple[float, float]],
+        pivot: QPointF | None = None,
+    ) -> tuple[list[tuple[float, float]], QPointF, QPointF]:
+        handles = self._quad_handles(quad)
+        center = QPointF(
+            sum(point[0] for point in quad) / 4,
+            sum(point[1] for point in quad) / 4,
+        )
+        top = QPointF(*self._edge_midpoints(quad)[0])
+        direction = top - center
+        length = max(1e-6, math.hypot(direction.x(), direction.y()))
+        rotate = top + direction / length * (
+            30 / max(self.scale, 0.05)
+        )
+        return handles, rotate, pivot or center
+
+    def _draw_transform_controls(
+        self, painter: QPainter, quad: list[tuple[float, float]],
+    ) -> None:
+        handles, rotate, pivot = self._transform_control_points(
+            quad, self._transform_pivot
+        )
+        radius = 7 / max(self.scale, 0.05)
+        painter.setBrush(QColor("#f5f5f5"))
+        for point in handles:
+            painter.drawEllipse(QPointF(*point), radius, radius)
+        top = QPointF(*self._edge_midpoints(quad)[0])
+        painter.drawLine(top, rotate)
+        painter.drawEllipse(rotate, radius, radius)
+        cross = 8 / max(self.scale, 0.05)
+        painter.drawLine(
+            QPointF(pivot.x() - cross, pivot.y()),
+            QPointF(pivot.x() + cross, pivot.y()),
+        )
+        painter.drawLine(
+            QPointF(pivot.x(), pivot.y() - cross),
+            QPointF(pivot.x(), pivot.y() + cross),
+        )
+
+    def _draw_vector_edit_handles(
+        self, painter: QPainter, drawing: VectorDrawingObject,
+    ) -> None:
+        layer_x, layer_y = self.chapter.layer_world_translation(
+            drawing.parent_layer_id
+        )
+        scale = max(self.scale, 0.05)
+        painter.save()
+        painter.translate(layer_x + drawing.x, layer_y + drawing.y)
+        show_all = (
+            (
+                self.tool == ToolKind.VECTOR_REDRAW
+                and self.settings.vector_redraw_interaction == "manual"
+            )
+            or self.tool == ToolKind.VECTOR_SIMPLIFY
+            or self.tool in {
+                ToolKind.DRAW_SELECT_RECT,
+                ToolKind.DRAW_SELECT_LASSO,
+                ToolKind.DRAW_SELECT_STROKE,
+            }
+        )
+        for stroke in drawing.strokes:
+            if (
+                not show_all
+                and stroke.stroke_id not in self._selected_vector_stroke_ids
+            ):
+                continue
+            if (
+                stroke.stroke_id in self._selected_vector_stroke_ids
+                or self.tool in {
+                    ToolKind.VECTOR_REDRAW, ToolKind.VECTOR_SIMPLIFY,
+                }
+            ):
+                painter.setPen(QPen(
+                    QColor("#ff9f2f"), 2.5 / scale, Qt.SolidLine,
+                    Qt.RoundCap, Qt.RoundJoin,
+                ))
+                painter.setBrush(Qt.NoBrush)
+                painter.drawPath(self._vector_centerline_path(stroke))
+            for point in stroke.points:
+                selected = (
+                    point.point_id in self._selected_vector_point_ids
+                    or point.point_id in self._vector_simplify_point_ids
+                )
+                painter.setPen(QPen(
+                    QColor("#ff7417" if selected else "#079bd3"),
+                    (3 if selected else 2) / scale,
+                ))
+                painter.setBrush(QColor("#aeeaff"))
+                radius = (7 if selected else 5.5) / scale
+                painter.drawEllipse(
+                    QPointF(point.x, point.y), radius, radius
+                )
         painter.restore()
 
     def _draw_path_node_handle(
@@ -989,21 +2824,25 @@ class _CanvasLogic:
         scale = max(self.scale, 0.05)
         point_color = QColor("#FF7417" if selected else "#0097D7")
         gizmo_color = QColor("#FFBE00" if selected else "#9BDDF0")
-        point_radius = 6 / scale
-        control_radius = 4.5 / scale
+        point_radius = 6 * SHAPE_CONTROL_SCALE / scale
+        control_radius = 8 * SHAPE_CONTROL_SCALE / scale
         painter.save()
         painter.setBrush(QColor("#ffffff"))
         if hovered and not selected:
-            painter.setPen(QPen(QColor("#9BDDF0"), 2 / scale))
+            painter.setPen(QPen(
+                QColor("#9BDDF0"), 2 * SHAPE_CONTROL_SCALE / scale
+            ))
             painter.setBrush(Qt.NoBrush)
             painter.drawEllipse(
                 QPointF(node.x, node.y),
-                point_radius + 3 / scale,
-                point_radius + 3 / scale,
+                point_radius + 3 * SHAPE_CONTROL_SCALE / scale,
+                point_radius + 3 * SHAPE_CONTROL_SCALE / scale,
             )
             painter.setBrush(QColor("#ffffff"))
         if node.point_type == "bezier":
-            painter.setPen(QPen(gizmo_color, 2 / scale))
+            painter.setPen(QPen(
+                gizmo_color, 2 * SHAPE_CONTROL_SCALE / scale
+            ))
             for control in (node.incoming, node.outgoing):
                 if control is None:
                     continue
@@ -1011,12 +2850,16 @@ class _CanvasLogic:
                 painter.drawEllipse(
                     QPointF(*control), control_radius, control_radius
                 )
-            painter.setPen(QPen(point_color, 3 / scale))
+            painter.setPen(QPen(
+                point_color, 3 * SHAPE_CONTROL_SCALE / scale
+            ))
             painter.drawEllipse(
                 QPointF(node.x, node.y), point_radius, point_radius
             )
         else:
-            painter.setPen(QPen(point_color, 3 / scale))
+            painter.setPen(QPen(
+                point_color, 3 * SHAPE_CONTROL_SCALE / scale
+            ))
             x, y = node.x, node.y
             painter.drawPolygon(QPolygonF([
                 QPointF(x, y - point_radius),
@@ -1029,6 +2872,7 @@ class _CanvasLogic:
     def _shape_gizmo_positions(
         self, bound: BoundGeometry, node: PathNode,
     ) -> dict[str, QPointF]:
+        bound = self._contour_bound_for_node(bound, node)
         scale = max(self.scale, 0.05)
         index = bound.nodes.index(node)
         previous = bound.nodes[index - 1] if index else bound.nodes[0]
@@ -1043,23 +2887,48 @@ class _CanvasLogic:
         normal = QPointF(-tangent.y() / length, tangent.x() / length)
         position = QPointF(node.x, node.y)
         side = normal * ((24 + node.width_multiplier * 10) / scale)
-        opposite = normal * (-max(24 / scale, node.roundness))
-        result = {
-            "thickness": position + side,
-            "type": position + QPointF(44 / scale, -34 / scale),
-        }
+        opposite = normal * (-max(
+            24 * SHAPE_CONTROL_SCALE / scale, node.roundness
+        ))
+        result = {"type": position + QPointF(
+            44 * SHAPE_CONTROL_SCALE / scale,
+            -34 * SHAPE_CONTROL_SCALE / scale,
+        )}
+        if not bound.closed:
+            result["thickness"] = position + side
+        if self._can_delete_shape_node(bound, node):
+            result["delete"] = position + QPointF(
+                -44 * SHAPE_CONTROL_SCALE / scale,
+                -34 * SHAPE_CONTROL_SCALE / scale,
+            )
         may_round = (
             0 < index < len(bound.nodes) - 1 or bound.closed
         ) and (
             node.point_type == "vector"
-            or (node.point_type == "bezier" and not node.handles_locked)
+            or (
+                node.point_type == "bezier"
+                and not node.handles_locked
+                and node.incoming is not None
+                and node.outgoing is not None
+            )
         )
         if may_round:
             result["roundness"] = position + opposite
-        if node.point_type == "bezier" and 0 < index < len(bound.nodes) - 1:
-            result["lock"] = position + QPointF(50 / scale, 4 / scale)
+        if (
+            node.point_type == "bezier"
+            and node.incoming is not None
+            and node.outgoing is not None
+            and (bound.closed or 0 < index < len(bound.nodes) - 1)
+        ):
+            result["lock"] = position + QPointF(
+                58 * SHAPE_CONTROL_SCALE / scale,
+                18 * SHAPE_CONTROL_SCALE / scale,
+            )
         if not bound.closed and index in {0, len(bound.nodes) - 1}:
-            result["cap"] = position + QPointF(44 / scale, 38 / scale)
+            result["cap"] = position + QPointF(
+                44 * SHAPE_CONTROL_SCALE / scale,
+                38 * SHAPE_CONTROL_SCALE / scale,
+            )
         return result
 
     def _rectangle_radius_positions(
@@ -1103,7 +2972,10 @@ class _CanvasLogic:
                 direction *= -1
             maximum = min(previous_length, following_length) / 2
             radius = min(maximum, max(0.0, node.roundness))
-            distance = max(18 * math.sqrt(2) / scale, radius * math.sqrt(2))
+            distance = max(
+                18 * SHAPE_CONTROL_SCALE * math.sqrt(2) / scale,
+                radius * math.sqrt(2),
+            )
             positions.append(
                 QPointF(node.x, node.y) + direction * distance
             )
@@ -1139,7 +3011,9 @@ class _CanvasLogic:
                 )
                 if best is None or distance < best[0]:
                     best = distance, segment, percent, point
-        if best is None or best[0] > 10 / max(self.scale, 0.05):
+        if best is None or best[0] > (
+            10 * SHAPE_CONTROL_SCALE / max(self.scale, 0.05)
+        ):
             return None
         _distance, segment, percent, point = best
         return segment, percent, point
@@ -1169,8 +3043,29 @@ class _CanvasLogic:
         include_insert: bool = True,
     ) -> dict | None:
         """Resolve one shape target using the same priority as rendering."""
+        if bound.additional_contours:
+            candidates = [
+                PathContour(bound.nodes, bound.closed),
+                *bound.additional_contours,
+            ]
+            interior: dict | None = None
+            for contour_index, contour in enumerate(candidates):
+                working = BoundGeometry(
+                    nodes=contour.nodes, closed=contour.closed,
+                    primitive="custom",
+                )
+                hit = self._shape_hit_test(
+                    working, local, include_insert=include_insert
+                )
+                if hit is None:
+                    continue
+                hit["contour_index"] = contour_index
+                if hit["kind"] != "interior":
+                    return hit
+                interior = interior or hit
+            return interior
         scale = max(self.scale, 0.05)
-        tolerance = 14 / scale
+        tolerance = 14 * SHAPE_CONTROL_SCALE / scale
         selected = self._selected_shape_node(bound)
         if bound.primitive == "rectangle":
             for index, position in enumerate(
@@ -1178,19 +3073,43 @@ class _CanvasLogic:
             ):
                 if math.dist(
                     (local.x(), local.y()), (position.x(), position.y())
-                ) <= 11 / scale:
+                ) <= 11 * SHAPE_CONTROL_SCALE / scale:
                     return {
                         "kind": "radius", "index": index,
                         "node_id": bound.nodes[index].node_id,
                         "position": position,
                     }
-        elif selected is not None and bound.primitive == "custom":
+        if selected is not None and self._can_delete_shape_node(bound, selected):
+            position = self._shape_gizmo_positions(bound, selected)["delete"]
+            if math.dist(
+                (local.x(), local.y()), (position.x(), position.y())
+            ) <= 12 * SHAPE_CONTROL_SCALE / scale:
+                return {
+                    "kind": "gizmo", "name": "delete",
+                    "node_id": selected.node_id, "position": position,
+                }
+        if selected is not None and bound.primitive == "custom":
             for name, position in self._shape_gizmo_positions(
                 bound, selected
             ).items():
-                if math.dist(
-                    (local.x(), local.y()), (position.x(), position.y())
-                ) <= 12 / scale:
+                if name == "delete":
+                    continue
+                if name == "type":
+                    hit = QRectF(
+                        position.x() - 30 / scale,
+                        position.y() - 12 / scale,
+                        60 / scale, 24 / scale,
+                    ).contains(local)
+                else:
+                    hit_tolerance = (
+                        (16 if name == "lock" else 12)
+                        * SHAPE_CONTROL_SCALE / scale
+                    )
+                    hit = math.dist(
+                        (local.x(), local.y()),
+                        (position.x(), position.y()),
+                    ) <= hit_tolerance
+                if hit:
                     return {
                         "kind": "gizmo", "name": name,
                         "node_id": selected.node_id, "position": position,
@@ -1291,10 +3210,13 @@ class _CanvasLogic:
                     and hover.get("index") == index
                 )
                 color = QColor("#FF7417" if selected else "#0097D7")
-                radius = 6 / scale if index < 4 else 4.5 / scale
+                radius = (
+                    (6 if index < 4 else 4.5)
+                    * SHAPE_CONTROL_SCALE / scale
+                )
                 painter.setPen(QPen(
                     QColor("#9BDDF0") if hovered and not selected else color,
-                    (4 if hovered else 3) / scale,
+                    (4 if hovered else 3) * SHAPE_CONTROL_SCALE / scale,
                 ))
                 painter.setBrush(QColor("#ffffff"))
                 painter.drawRect(QRectF(
@@ -1318,37 +3240,62 @@ class _CanvasLogic:
                         "#FFBE00" if selected else "#9BDDF0"
                     )
                     painter.setPen(QPen(
-                        color, (3 if hovered or selected else 2) / scale
+                        color,
+                        (3 if hovered or selected else 2)
+                        * SHAPE_CONTROL_SCALE / scale,
                     ))
                     painter.drawLine(
                         QPointF(*bound.nodes[index].position), point
                     )
                     painter.setBrush(QColor("#ffffff"))
-                    painter.drawEllipse(point, 4.5 / scale, 4.5 / scale)
+                    painter.drawEllipse(
+                        point,
+                        4.5 * SHAPE_CONTROL_SCALE / scale,
+                        4.5 * SHAPE_CONTROL_SCALE / scale,
+                    )
+            if selected_index >= 0 and self._can_delete_shape_node(bound):
+                self._draw_delete_point_gizmo(
+                    painter, bound, bound.nodes[selected_index]
+                )
             if self._shape_hover_insert is not None:
                 point = self._shape_hover_insert[2]
-                radius = 3 / max(self.scale, 0.05)
+                radius = (
+                    3 * SHAPE_CONTROL_SCALE
+                    / max(self.scale, 0.05)
+                )
                 painter.setPen(QPen(
-                    QColor("#9BDDF0"), 2 / max(self.scale, 0.05)
+                    QColor("#9BDDF0"),
+                    2 * SHAPE_CONTROL_SCALE / max(self.scale, 0.05),
                 ))
                 painter.setBrush(QColor("#ffffff"))
                 painter.drawEllipse(point, radius, radius)
             return
-        for node in bound.nodes:
-            selected = node.node_id == self._selected_shape_node_id
-            hovered = (
-                hover.get("kind") == "node"
-                and hover.get("node_id") == node.node_id
-            )
-            self._draw_path_node_handle(painter, node, selected, hovered)
-            if selected:
-                self._draw_selected_shape_gizmos(
-                    painter, bound, node, layer.shape_style
+        for contour in bound.iter_contours():
+            for node in contour.nodes:
+                selected = (
+                    node.node_id == self._selected_shape_node_id
+                    or node.node_id in self._selected_shape_node_ids
                 )
+                hovered = (
+                    hover.get("kind") == "node"
+                    and hover.get("node_id") == node.node_id
+                )
+                self._draw_path_node_handle(
+                    painter, node, selected, hovered
+                )
+                if node.node_id == self._selected_shape_node_id:
+                    self._draw_selected_shape_gizmos(
+                        painter, bound, node, layer.shape_style
+                    )
         if self._shape_hover_insert is not None:
             point = self._shape_hover_insert[2]
-            radius = 3 / max(self.scale, 0.05)
-            painter.setPen(QPen(QColor("#9BDDF0"), 2 / max(self.scale, 0.05)))
+            radius = (
+                3 * SHAPE_CONTROL_SCALE / max(self.scale, 0.05)
+            )
+            painter.setPen(QPen(
+                QColor("#9BDDF0"),
+                2 * SHAPE_CONTROL_SCALE / max(self.scale, 0.05),
+            ))
             painter.setBrush(QColor("#ffffff"))
             painter.drawEllipse(point, radius, radius)
 
@@ -1358,61 +3305,154 @@ class _CanvasLogic:
     ) -> None:
         scale = max(self.scale, 0.05)
         positions = self._shape_gizmo_positions(bound, node)
-        painter.setPen(QPen(QColor("#FFBE00"), 2 / scale))
+        painter.save()
+        painter.setPen(QPen(
+            QColor("#FFBE00"), 2 * SHAPE_CONTROL_SCALE / scale
+        ))
         painter.setBrush(QColor("#ffffff"))
         for name, point in positions.items():
             painter.drawLine(QPointF(node.x, node.y), point)
-            radius = 4.5 / scale
-            if name in {"type", "lock", "cap"}:
+            radius = 4.5 * SHAPE_CONTROL_SCALE / scale
+            if name == "delete":
+                painter.drawEllipse(
+                    point,
+                    radius + SHAPE_CONTROL_SCALE / scale,
+                    radius + SHAPE_CONTROL_SCALE / scale,
+                )
+                arm = 2.5 * SHAPE_CONTROL_SCALE / scale
+                painter.drawLine(
+                    point + QPointF(-arm, -arm),
+                    point + QPointF(arm, arm),
+                )
+                painter.drawLine(
+                    point + QPointF(-arm, arm),
+                    point + QPointF(arm, -arm),
+                )
+            elif name == "lock":
+                self._draw_bezier_lock_gizmo(
+                    painter, point, node.handles_locked, scale
+                )
+            elif name == "type":
+                badge = QRectF(
+                    point.x() - 30 / scale,
+                    point.y() - 12 / scale,
+                    60 / scale, 24 / scale,
+                )
+                painter.drawRoundedRect(
+                    badge, 6 / scale, 6 / scale
+                )
+                font = painter.font()
+                font.setPixelSize(max(1, round(11 / scale)))
+                font.setBold(True)
+                painter.setFont(font)
+                painter.drawText(
+                    badge, Qt.AlignCenter,
+                    "Bézier" if node.point_type == "bezier" else "Vector",
+                )
+            elif name == "cap":
                 painter.drawRect(QRectF(
                     point.x() - radius, point.y() - radius,
                     radius * 2, radius * 2,
                 ))
-                if name == "type":
-                    size = 2.5 / scale
-                    painter.drawPolygon(QPolygonF([
-                        point + QPointF(0, -size),
-                        point + QPointF(size, 0),
-                        point + QPointF(0, size),
-                        point + QPointF(-size, 0),
-                    ]))
-                elif name == "lock":
+                cap = (
+                    style.start_cap
+                    if style and node is bound.nodes[0]
+                    else style.end_cap if style else "round"
+                )
+                cap_size = 2.5 * SHAPE_CONTROL_SCALE / scale
+                painter.drawLine(
+                    point + QPointF(0, -cap_size),
+                    point + QPointF(0, cap_size),
+                )
+                if cap == "round":
+                    painter.drawArc(QRectF(
+                        point.x() - 2 * SHAPE_CONTROL_SCALE / scale,
+                        point.y() - cap_size,
+                        4 * SHAPE_CONTROL_SCALE / scale,
+                        5 * SHAPE_CONTROL_SCALE / scale,
+                    ), 90 * 16, 180 * 16)
+                elif cap == "point":
                     painter.drawLine(
-                        point + QPointF(-2 / scale, 0),
-                        point + QPointF(2 / scale, 0),
-                    )
-                    if not node.handles_locked:
-                        painter.drawLine(
-                            point + QPointF(0, -2 / scale),
-                            point + QPointF(0, 2 / scale),
-                        )
-                elif name == "cap":
-                    cap = (
-                        style.start_cap
-                        if style and node is bound.nodes[0]
-                        else style.end_cap if style else "round"
+                        point + QPointF(0, -cap_size),
+                        point + QPointF(cap_size, 0),
                     )
                     painter.drawLine(
-                        point + QPointF(0, -2.5 / scale),
-                        point + QPointF(0, 2.5 / scale),
+                        point + QPointF(cap_size, 0),
+                        point + QPointF(0, cap_size),
                     )
-                    if cap == "round":
-                        painter.drawArc(QRectF(
-                            point.x() - 2 / scale,
-                            point.y() - 2.5 / scale,
-                            4 / scale, 5 / scale,
-                        ), 90 * 16, 180 * 16)
-                    elif cap == "point":
-                        painter.drawLine(
-                            point + QPointF(0, -2.5 / scale),
-                            point + QPointF(2.5 / scale, 0),
-                        )
-                        painter.drawLine(
-                            point + QPointF(2.5 / scale, 0),
-                            point + QPointF(0, 2.5 / scale),
-                        )
             else:
+                if name == "roundness" and node.roundness_enabled:
+                    painter.setBrush(QColor("#FFBE00"))
                 painter.drawEllipse(point, radius, radius)
+                painter.setBrush(QColor("#ffffff"))
+        painter.restore()
+
+    @staticmethod
+    def _draw_bezier_lock_gizmo(
+        painter: QPainter, point: QPointF, locked: bool, scale: float,
+    ) -> None:
+        """Draw an unmistakable screen-stable closed/open padlock."""
+        unit = SHAPE_CONTROL_SCALE / scale
+        painter.save()
+        painter.setPen(QPen(QColor("#FFBE00"), 2 * unit))
+        painter.setBrush(QColor("#ffffff"))
+        body = QRectF(
+            point.x() - 7 * unit, point.y() - unit,
+            14 * unit, 10 * unit,
+        )
+        painter.drawRoundedRect(body, 2 * unit, 2 * unit)
+        shackle = QPainterPath()
+        if locked:
+            shackle.moveTo(point + QPointF(-5 * unit, -unit))
+            shackle.lineTo(point + QPointF(-5 * unit, -5 * unit))
+            shackle.cubicTo(
+                point + QPointF(-5 * unit, -11 * unit),
+                point + QPointF(5 * unit, -11 * unit),
+                point + QPointF(5 * unit, -5 * unit),
+            )
+            shackle.lineTo(point + QPointF(5 * unit, -unit))
+        else:
+            shackle.moveTo(point + QPointF(-5 * unit, -unit))
+            shackle.lineTo(point + QPointF(-5 * unit, -5 * unit))
+            shackle.cubicTo(
+                point + QPointF(-5 * unit, -11 * unit),
+                point + QPointF(5 * unit, -11 * unit),
+                point + QPointF(5 * unit, -5 * unit),
+            )
+            shackle.lineTo(point + QPointF(7 * unit, -7 * unit))
+        painter.setBrush(Qt.NoBrush)
+        painter.drawPath(shackle)
+        painter.setBrush(QColor("#FFBE00"))
+        painter.drawEllipse(
+            point + QPointF(0, 3 * unit), 1.25 * unit, 1.25 * unit
+        )
+        painter.drawLine(
+            point + QPointF(0, 4 * unit),
+            point + QPointF(0, 6 * unit),
+        )
+        painter.restore()
+
+    def _draw_delete_point_gizmo(
+        self, painter: QPainter, bound: BoundGeometry, node: PathNode,
+    ) -> None:
+        scale = max(self.scale, 0.05)
+        point = self._shape_gizmo_positions(bound, node)["delete"]
+        painter.save()
+        painter.setPen(QPen(
+            QColor("#FFBE00"), 2 * SHAPE_CONTROL_SCALE / scale
+        ))
+        painter.setBrush(QColor("#ffffff"))
+        painter.drawLine(QPointF(node.x, node.y), point)
+        radius = 5.5 * SHAPE_CONTROL_SCALE / scale
+        painter.drawEllipse(point, radius, radius)
+        arm = 2.5 * SHAPE_CONTROL_SCALE / scale
+        painter.drawLine(
+            point + QPointF(-arm, -arm), point + QPointF(arm, arm)
+        )
+        painter.drawLine(
+            point + QPointF(-arm, arm), point + QPointF(arm, -arm)
+        )
+        painter.restore()
 
     def _draw_creation_preview(self, painter: QPainter) -> None:
         if not self._creation_points and not self._creation_nodes:
@@ -1496,6 +3536,28 @@ class _CanvasLogic:
                 (x + layer_x, y + layer_y)
                 for x, y in self._rect_quad(local)
             ]
+        if isinstance(obj, VectorDrawingObject):
+            left, top, width, height = obj.derived_bounds()
+            local = QRectF(
+                obj.x + left, obj.y + top, max(1.0, width), max(1.0, height)
+            )
+            return [
+                (x + layer_x, y + layer_y)
+                for x, y in self._rect_quad(local)
+            ]
+        if isinstance(obj, VectorFillObject):
+            owner = self.chapter.objects.get(obj.owner_drawing_id)
+            owner_x = owner.x if isinstance(owner, VectorDrawingObject) else 0.0
+            owner_y = owner.y if isinstance(owner, VectorDrawingObject) else 0.0
+            left, top, width, height = obj.derived_bounds()
+            local = QRectF(
+                owner_x + left, owner_y + top,
+                max(1.0, width), max(1.0, height),
+            )
+            return [
+                (x + layer_x, y + layer_y)
+                for x, y in self._rect_quad(local)
+            ]
         return [
             (layer_x + obj.x, layer_y + obj.y),
             (layer_x + obj.x + 80, layer_y + obj.y),
@@ -1547,64 +3609,256 @@ class _CanvasLogic:
         polygon = self.camera_transform().map(QPolygonF(rect))
         return polygon.boundingRect().toAlignedRect()
 
-    def _point_inside_layer_masks(self, layer_id: str, point: QPointF) -> bool:
-        for layer in self.chapter.ancestor_layers(layer_id):
+    def _point_inside_layer_masks(
+        self, layer_id: str, point: QPointF,
+        obj: DocumentObject | None = None,
+    ) -> bool:
+        layers = self.chapter.ancestor_layers(layer_id)
+        if obj is not None and obj.geometry_reference == "compound":
+            compound = self.chapter.closest_compound_ancestor(
+                layer_id, include_self=True
+            )
+            if compound is not None:
+                index = next(
+                    i for i, layer in enumerate(layers)
+                    if layer.layer_id == compound.layer_id
+                )
+                layers = layers[:index + 1]
+        direct_mask_id = (
+            layer_id
+            if obj is not None and obj.ignore_parent_mask else ""
+        )
+        skipped_masks = {direct_mask_id} if direct_mask_id else set()
+        for parent, child in zip(layers, layers[1:]):
+            if child.ignore_parent_mask:
+                skipped_masks.add(parent.layer_id)
+        for layer in layers:
             wx, wy = self.chapter.layer_world_translation(layer.layer_id)
             if not layer.visible:
                 return False
-            if layer.bound is not None:
-                path = self.bound_path(layer.bound, layer.vertex_radius)
+            if (
+                layer.bound is not None
+                and layer.layer_id not in skipped_masks
+            ):
+                path = self.layer_effective_path(layer.layer_id)
                 if not path.contains(QPointF(point.x() - wx, point.y() - wy)):
                     return False
         return True
 
-    def _objects_front_to_back(self, page_id: str) -> list[str]:
-        result: list[str] = []
+    def _entities_front_to_back(
+        self, page_id: str,
+    ) -> list[tuple[str, str]]:
+        result: list[tuple[str, str]] = []
 
         def walk(layer_id: str) -> None:
             layer = self.chapter.layers[layer_id]
             for child in layer.children:
                 if child.kind == "object":
-                    result.append(child.entity_id)
+                    result.append(("object", child.entity_id))
+                    obj = self.chapter.objects.get(child.entity_id)
+                    if isinstance(obj, VectorDrawingObject):
+                        result.extend(
+                            ("object", fill_id)
+                            for fill_id in obj.fill_child_ids
+                            if fill_id in self.chapter.objects
+                        )
                 else:
+                    candidate = self.chapter.layers[child.entity_id]
+                    if (
+                        not candidate.is_page
+                        and candidate.layer_kind != "fill"
+                        and candidate.bound is not None
+                    ):
+                        result.append(("layer", child.entity_id))
                     walk(child.entity_id)
 
         walk(page_id)
         return result
+
+    def _object_hit_contains(
+        self, obj: DocumentObject, point: QPointF,
+    ) -> bool:
+        if not obj.visible:
+            return False
+        if isinstance(obj, VectorDrawingObject):
+            if not obj.opacity_locked and obj.opacity <= 0:
+                return False
+            local = self._vector_local_point(obj, point)
+            tolerance = 6.0 / max(self.scale, 0.05)
+            for stroke in obj.strokes:
+                if QColor(stroke.color).alpha() <= 0:
+                    continue
+                location = nearest_on_stroke(
+                    stroke.points,
+                    (local.x(), local.y()),
+                    closed=stroke.closed,
+                )
+                if (
+                    location is not None
+                    and location.opacity > 0
+                    and location.distance
+                    <= location.width / 2 + tolerance
+                ):
+                    return True
+            return False
+        if isinstance(obj, VectorFillObject):
+            owner = self.chapter.objects.get(obj.owner_drawing_id)
+            if (
+                not isinstance(owner, VectorDrawingObject)
+                or not owner.visible
+                or (not owner.opacity_locked and owner.opacity <= 0)
+                or (not obj.opacity_locked and obj.opacity <= 0)
+                or QColor(obj.fill_color).alpha() <= 0
+            ):
+                return False
+            local = self._vector_local_point(owner, point)
+            return self.bound_path(obj.geometry).contains(local)
+        quad = self.object_world_quad(obj.object_id)
+        path = QPainterPath()
+        if quad:
+            path.addPolygon(QPolygonF([
+                QPointF(*candidate) for candidate in quad
+            ]))
+        return bool(quad and path.contains(point))
+
+    def _objects_front_to_back(self, page_id: str) -> list[str]:
+        return [
+            entity_id for kind, entity_id
+            in self._entities_front_to_back(page_id)
+            if kind == "object"
+        ]
+
+    def _point_inside_parent_masks(
+        self, layer_id: str, point: QPointF,
+    ) -> bool:
+        layer = self.chapter.layers[layer_id]
+        current = layer
+        while current.parent_id:
+            parent = self.chapter.layers[current.parent_id]
+            if not parent.visible:
+                return False
+            if parent.bound is not None and not current.ignore_parent_mask:
+                wx, wy = self.chapter.layer_world_translation(parent.layer_id)
+                path = self.layer_effective_path(parent.layer_id)
+                if not path.contains(QPointF(point.x() - wx, point.y() - wy)):
+                    return False
+            current = parent
+        return True
+
+    def _shape_border_contains(
+        self, layer_id: str, point: QPointF, raw: bool = False,
+        include_pages: bool = False,
+    ) -> bool:
+        layer = self.chapter.layers[layer_id]
+        if (
+            not layer.visible or layer.bound is None
+            or (layer.is_page and not include_pages)
+            or layer.layer_kind == "fill"
+            or (
+                not raw
+                and not self._point_inside_parent_masks(layer_id, point)
+            )
+        ):
+            return False
+        if raw and any(
+            not ancestor.visible
+            for ancestor in self.chapter.ancestor_layers(layer_id)
+        ):
+            return False
+        if (
+            not raw
+            and self.chapter.contributing_compound_ancestor(layer_id)
+            is not None
+        ):
+            return False
+        wx, wy = self.chapter.layer_world_translation(layer_id)
+        local = QPointF(point.x() - wx, point.y() - wy)
+        path = (
+            self.layer_shape_path(layer)
+            if raw else self.layer_effective_path(layer_id)
+        )
+        stroker = QPainterPathStroker()
+        visible_width = max(
+            24.0 / max(self.scale, 0.05),
+            layer.shape_style.outline_thickness * 2,
+        )
+        stroker.setWidth(visible_width)
+        border = stroker.createStroke(path)
+        return border.contains(local) or (
+            layer.layer_kind == "open_shape" and path.contains(local)
+        )
+
+    def hit_test_shape_edit_layers(
+        self, point: QPointF,
+    ) -> list[dict[str, str]]:
+        if self.chapter is None:
+            return []
+        result: list[dict[str, str]] = []
+        for page_id in self.chapter.root_page_ids:
+            if self._shape_border_contains(
+                page_id, point, raw=True, include_pages=True
+            ):
+                result.append({"kind": "layer", "id": page_id})
+            for kind, entity_id in self._entities_front_to_back(page_id):
+                if (
+                    kind == "layer"
+                    and self._shape_border_contains(
+                        entity_id, point, raw=True
+                    )
+                ):
+                    result.append({"kind": "layer", "id": entity_id})
+        return result
+
+    def hit_test_entities(self, point: QPointF) -> list[dict[str, str]]:
+        if self.chapter is None:
+            return []
+        candidates: list[tuple[str, str]] = []
+        for page_id in self.chapter.root_page_ids:
+            if self._shape_border_contains(
+                page_id, point, include_pages=True
+            ):
+                candidates.append(("layer", page_id))
+            candidates.extend(self._entities_front_to_back(page_id))
+        hits: list[dict[str, str]] = []
+        for kind, entity_id in candidates:
+            if kind == "layer":
+                layer = self.chapter.layers[entity_id]
+                if (
+                    layer.is_page
+                    or self._shape_border_contains(entity_id, point)
+                ):
+                    hits.append({"kind": kind, "id": entity_id})
+                continue
+            obj = self.chapter.objects[entity_id]
+            if (
+                self._object_hit_contains(obj, point)
+                and self._point_inside_layer_masks(
+                    obj.parent_layer_id, point, obj
+                )
+            ):
+                hits.append({"kind": kind, "id": entity_id})
+        return hits
 
     def hit_test_objects(
         self, point: QPointF, text_only: bool = False,
     ) -> list[str]:
         if self.chapter is None:
             return []
-        candidates: list[str] = []
-        if self.settings.page_scope_select:
-            layer_id = self._selected_layer_id()
-            page_id = self.active_page_id or (
-                self.chapter.page_for_layer(layer_id).layer_id if layer_id else ""
-            )
-            if not page_id:
-                return []
-            candidates = self._objects_front_to_back(page_id)
-        else:
-            layer_id = self._selected_layer_id()
-            if not layer_id:
-                return []
-            candidates = [
-                ref.entity_id for ref in self.chapter.layers[layer_id].children
-                if ref.kind == "object"
-            ]
+        candidates = [
+            object_id
+            for page_id in self.chapter.root_page_ids
+            for object_id in self._objects_front_to_back(page_id)
+        ]
         hits: list[str] = []
         for object_id in candidates:
             obj = self.chapter.objects[object_id]
             if text_only and not isinstance(obj, TextObject):
                 continue
-            quad = self.object_world_quad(object_id)
-            path = QPainterPath()
-            if quad:
-                path.addPolygon(QPolygonF([QPointF(*candidate) for candidate in quad]))
-            if obj.visible and quad and path.contains(point) and self._point_inside_layer_masks(
-                obj.parent_layer_id, point
+            if (
+                self._object_hit_contains(obj, point)
+                and self._point_inside_layer_masks(
+                    obj.parent_layer_id, point, obj
+                )
             ):
                 hits.append(object_id)
         return hits
@@ -1631,6 +3885,8 @@ class _CanvasLogic:
             selected = self.chapter.layers[self.selected_id]
             if selected.is_page:
                 return selected.layer_id, 0
+            if selected.compound_enabled:
+                return selected.layer_id, 0
             if selected.parent_id:
                 siblings = self.chapter.layers[selected.parent_id].children
                 index = next((
@@ -1655,6 +3911,484 @@ class _CanvasLogic:
         x, y = grid.snap(point.x(), point.y())
         return QPointF(x, y)
 
+    # ---- page creation and editable gutters ---------------------------
+    def page_world_bounds(self, page_id: str) -> QRectF:
+        if (
+            self.chapter is None or page_id not in self.chapter.layers
+            or self.chapter.layers[page_id].bound is None
+        ):
+            return QRectF()
+        page = self.chapter.layers[page_id]
+        left, top, width, height = page.bound.bbox()
+        return QRectF(
+            page.translate_x + left, page.translate_y + top,
+            width, height,
+        )
+
+    def physically_ordered_pages(self) -> list[str]:
+        if self.chapter is None:
+            return []
+        root_order = {
+            page_id: index
+            for index, page_id in enumerate(self.chapter.root_page_ids)
+        }
+        return sorted(
+            self.chapter.root_page_ids,
+            key=lambda page_id: (
+                self.page_world_bounds(page_id).top(),
+                self.page_world_bounds(page_id).bottom(),
+                root_order[page_id],
+            ),
+        )
+
+    def begin_page_creation(
+        self, anchor_page_id: str, kind: str, *,
+        before: dict | None = None,
+        gap_bounds: tuple[float, float] | None = None,
+    ) -> bool:
+        if (
+            self.chapter is None
+            or anchor_page_id not in self.chapter.root_page_ids
+            or kind not in {"rectangle", "circle", "custom"}
+        ):
+            return False
+        if gap_bounds is None:
+            self._clear_page_gap_editor()
+        self._page_creation_anchor_id = anchor_page_id
+        self._page_creation_before = before or self.chapter.to_dict()
+        self._page_creation_kind = kind
+        self._page_creation_draft = None
+        self._page_creation_committing = False
+        self._page_creation_gap_bounds = gap_bounds
+        self._page_creation_base_height = self.chapter.height
+        anchor = self.page_world_bounds(anchor_page_id)
+        self.chapter.height = max(
+            self.chapter.height,
+            math.ceil(anchor.bottom() + 120 + 1080),
+        )
+        self._creation_points.clear()
+        self._creation_nodes.clear()
+        self._creation_selected_node_id = ""
+        self._creation_active_control = None
+        target = {
+            "rectangle": ToolKind.BOX_BOUND,
+            "circle": ToolKind.CIRCLE_BOUND,
+            "custom": ToolKind.SHAPE_CREATE,
+        }[kind]
+        self.tool = target
+        self.toolChanged.emit(target)
+        self.documentChanged.emit(QRectF())
+        self.update()
+        return True
+
+    def _cancel_page_creation(self) -> None:
+        before = self._page_creation_before
+        anchor_id = self._page_creation_anchor_id
+        self._page_creation_anchor_id = ""
+        self._page_creation_before = None
+        self._page_creation_kind = ""
+        self._page_creation_draft = None
+        self._page_creation_committing = False
+        self._page_creation_gap_bounds = None
+        self._page_creation_base_height = 0
+        self._creation_points.clear()
+        self._creation_nodes.clear()
+        self._creation_selected_node_id = ""
+        self._creation_active_control = None
+        self._creation_style = None
+        self._page_gap_transaction = None
+        self._clear_page_gap_editor()
+        self.pageGapConfirmationChanged.emit(False)
+        if before is not None:
+            self.replace_chapter(before)
+        if (
+            self.chapter is not None
+            and anchor_id in self.chapter.layers
+        ):
+            self.set_selection(
+                "layer", anchor_id, activate_default_tool=False
+            )
+        self.tool = ToolKind.SHAPE_EDIT
+        self.toolChanged.emit(self.tool)
+        self.interactionFinished.emit()
+
+    def _finish_pending_page_bound(self, bound: BoundGeometry) -> bool:
+        anchor_id = self._page_creation_anchor_id
+        if (
+            self.chapter is None or not anchor_id
+            or anchor_id not in self.chapter.layers
+            or self._page_creation_committing
+        ):
+            return False
+        if not bound.closed:
+            return False
+        anchor = self.page_world_bounds(anchor_id)
+        _left, top, _width, height = bound.bbox()
+        if top < anchor.bottom() - 1e-6:
+            self.pageCreationInvalid.emit(
+                "Draw the new page completely below the active page."
+            )
+            self.update()
+            return False
+        if self._page_creation_gap_bounds is not None:
+            gap_top, gap_bottom = self._page_creation_gap_bounds
+            if top < gap_top - 1e-6 or top + height > gap_bottom + 1e-6:
+                self.pageCreationInvalid.emit(
+                    "Keep the complete page inside the confirmed page gap."
+                )
+                self.update()
+                return False
+        before = self._page_creation_before or self.chapter.to_dict()
+        self._page_creation_draft = BoundGeometry.from_dict(bound.to_dict())
+        self._page_creation_committing = True
+        self.pageCreationFinished.emit(
+            BoundGeometry.from_dict(self._page_creation_draft.to_dict()),
+            before, anchor_id
+        )
+        return True
+
+    def resolve_page_creation(
+        self, success: bool, message: str = "",
+    ) -> None:
+        """Acknowledge the synchronous MainWindow insertion request.
+
+        A failed insertion deliberately leaves the draft and anchor intact so
+        the user can adjust/redraw it or cancel without losing the workflow.
+        """
+        self._page_creation_committing = False
+        if not success:
+            if message:
+                self.pageCreationInvalid.emit(message)
+            self.update()
+            return
+        self._page_creation_anchor_id = ""
+        self._page_creation_before = None
+        self._page_creation_kind = ""
+        self._page_creation_draft = None
+        self._page_creation_gap_bounds = None
+        self._page_creation_base_height = 0
+        self._creation_points.clear()
+        self._creation_nodes.clear()
+        self._creation_selected_node_id = ""
+        self._creation_active_control = None
+        self._creation_close_candidate = False
+        self._creation_style = None
+        self._shape_hover_target = None
+        self._shape_hover_insert = None
+        self.update()
+
+    def page_creation_base_height(self) -> int:
+        return int(self._page_creation_base_height or (
+            self.chapter.height if self.chapter is not None else 0
+        ))
+
+    def set_page_gap_prompt_line(self, y: float | None) -> None:
+        self._page_gap_prompt_y = None if y is None else float(y)
+        self.update()
+
+    def begin_page_gap_editor(
+        self, owner_id: str, top_ids: list[str], bottom_ids: list[str],
+        top_y: float, bottom_y: float,
+    ) -> None:
+        self._page_gap_prompt_y = None
+        self._page_gap_state = {
+            "owner_id": owner_id,
+            "top_ids": list(top_ids),
+            "bottom_ids": list(bottom_ids),
+            "top_y": float(top_y),
+            "bottom_y": max(float(top_y), float(bottom_y)),
+        }
+        self._page_gap_hover = None
+        self.update()
+
+    def begin_page_gap_transaction(
+        self, origin: str, anchor_id: str, top_ids: list[str],
+        bottom_ids: list[str], top_y: float,
+    ) -> bool:
+        if (
+            self.chapter is None
+            or origin not in {"add_page", "standalone"}
+            or anchor_id not in self.chapter.root_page_ids
+            or not bottom_ids
+        ):
+            return False
+        before = self.chapter.to_dict()
+        for page_id in bottom_ids:
+            if page_id in self.chapter.layers:
+                self.chapter.layers[page_id].translate_y += 120
+        self._page_gap_transaction = {
+            "origin": origin,
+            "anchor_id": anchor_id,
+            "before": before,
+            "confirmed": False,
+        }
+        self.begin_page_gap_editor(
+            anchor_id, top_ids, bottom_ids, top_y, top_y + 120
+        )
+        self._ensure_page_height_safety()
+        self.pageGapConfirmationChanged.emit(True)
+        self.hierarchyChanged.emit()
+        self.documentChanged.emit(QRectF())
+        self.update()
+        return True
+
+    def page_gap_transaction(self) -> dict | None:
+        if self._page_gap_transaction is None or self._page_gap_state is None:
+            return None
+        return {
+            **self._page_gap_transaction,
+            "top_ids": list(self._page_gap_state["top_ids"]),
+            "bottom_ids": list(self._page_gap_state["bottom_ids"]),
+            "top_y": float(self._page_gap_state["top_y"]),
+            "bottom_y": float(self._page_gap_state["bottom_y"]),
+        }
+
+    def confirm_page_gap_transaction(self) -> dict | None:
+        if self.chapter is None or self._page_gap_transaction is None:
+            return None
+        self._ensure_page_height_safety()
+        transaction = self.page_gap_transaction()
+        if transaction is None:
+            return None
+        origin = transaction["origin"]
+        if origin == "standalone":
+            before = transaction["before"]
+            owner_id = transaction["anchor_id"]
+            after = self.chapter.to_dict()
+            self._page_gap_transaction = None
+            self._clear_page_gap_editor()
+            self.pageGapConfirmationChanged.emit(False)
+            if before != after:
+                self.push_model_change(
+                    before, after, "Insert page gap"
+                )
+            if owner_id in self.chapter.layers:
+                self.set_selection(
+                    "layer", owner_id, activate_default_tool=False
+                )
+            self.tool = ToolKind.SHAPE_EDIT
+            self.toolChanged.emit(self.tool)
+            self.hierarchyChanged.emit()
+            self.documentChanged.emit(QRectF())
+            self.interactionFinished.emit()
+            self.update()
+        else:
+            self._page_gap_transaction["confirmed"] = True
+        return transaction
+
+    def cancel_page_gap_transaction(self) -> str:
+        transaction = self._page_gap_transaction
+        if transaction is None:
+            self._clear_page_gap_editor()
+            self.pageGapConfirmationChanged.emit(False)
+            return ""
+        origin = str(transaction["origin"])
+        before = transaction["before"]
+        anchor_id = str(transaction["anchor_id"])
+        self._page_gap_transaction = None
+        self._clear_page_gap_editor()
+        self.pageGapConfirmationChanged.emit(False)
+        self.replace_chapter(before)
+        if anchor_id in self.chapter.layers:
+            self.set_selection(
+                "layer", anchor_id, activate_default_tool=False
+            )
+        if origin == "standalone":
+            self.tool = ToolKind.INSERT_PAGE_GAP
+            self.toolChanged.emit(self.tool)
+        else:
+            self.tool = ToolKind.SHAPE_EDIT
+            self.toolChanged.emit(self.tool)
+        self.interactionFinished.emit()
+        self.update()
+        return origin
+
+    def finish_page_gap_workflow(self) -> None:
+        self._page_gap_transaction = None
+        self._clear_page_gap_editor()
+        self.pageGapConfirmationChanged.emit(False)
+
+    def _clear_page_gap_editor(self) -> None:
+        self._page_gap_prompt_y = None
+        self._page_gap_state = None
+        self._page_gap_hover = None
+        self._page_gap_drag_mode = None
+        self._page_gap_drag_before = None
+        self._page_gap_drag_translations.clear()
+        self.unsetCursor()
+        self.update()
+
+    def _page_gap_editor_visible(self) -> bool:
+        return bool(
+            self._page_gap_state
+            and (
+                self._page_gap_transaction is not None
+                or (
+                    self.selected_kind == "layer"
+                    and self.selected_id == self._page_gap_state.get("owner_id")
+                )
+            )
+        )
+
+    def _page_gap_hit(self, world: QPointF) -> str | None:
+        if not self._page_gap_editor_visible():
+            return None
+        top = float(self._page_gap_state["top_y"])
+        bottom = float(self._page_gap_state["bottom_y"])
+        tolerance = 12 / max(self.scale, 0.05)
+        if abs(world.y() - top) <= tolerance:
+            return "top"
+        if abs(world.y() - bottom) <= tolerance:
+            return "bottom"
+        if top < world.y() < bottom:
+            return "band"
+        return None
+
+    def _update_page_gap_hover(self, world: QPointF) -> None:
+        if self.tool != ToolKind.INSERT_PAGE_GAP or self.chapter is None:
+            self._page_gap_hover = None
+            return
+        ordered = self.physically_ordered_pages()
+        hover = None
+        for index in range(len(ordered) - 1):
+            upper = self.page_world_bounds(ordered[index])
+            lower = self.page_world_bounds(ordered[index + 1])
+            if upper.bottom() <= world.y() <= lower.top():
+                hover = {
+                    "y": world.y(),
+                    "top_ids": ordered[:index + 1],
+                    "bottom_ids": ordered[index + 1:],
+                    "owner_id": ordered[index + 1],
+                }
+                break
+        self._page_gap_hover = hover
+        self.setCursor(
+            Qt.PointingHandCursor if hover else Qt.ForbiddenCursor
+        )
+        self.update()
+
+    def _begin_page_gap_interaction(self, world: QPointF) -> bool:
+        mode = self._page_gap_hit(world)
+        if mode is None:
+            return False
+        state = self._page_gap_state
+        self._page_gap_drag_mode = mode
+        self._page_gap_drag_before = self.chapter.to_dict()
+        self._page_gap_drag_start_y = world.y()
+        self._page_gap_drag_start_top = float(state["top_y"])
+        self._page_gap_drag_start_bottom = float(state["bottom_y"])
+        ids = set(state["top_ids"]) | set(state["bottom_ids"])
+        self._page_gap_drag_translations = {
+            page_id: self.chapter.layers[page_id].translate_y
+            for page_id in ids if page_id in self.chapter.layers
+        }
+        self.setCursor(
+            Qt.ClosedHandCursor
+            if mode == "band" else Qt.PointingHandCursor
+        )
+        return True
+
+    def _move_page_gap_interaction(self, world: QPointF) -> None:
+        if not self._page_gap_drag_mode or not self._page_gap_state:
+            return
+        delta = world.y() - self._page_gap_drag_start_y
+        mode = self._page_gap_drag_mode
+        if mode == "top":
+            delta = min(
+                delta,
+                self._page_gap_drag_start_bottom
+                - self._page_gap_drag_start_top,
+            )
+            moving = self._page_gap_state["top_ids"]
+            self._page_gap_state["top_y"] = (
+                self._page_gap_drag_start_top + delta
+            )
+        elif mode == "bottom":
+            delta = max(
+                delta,
+                self._page_gap_drag_start_top
+                - self._page_gap_drag_start_bottom,
+            )
+            moving = self._page_gap_state["bottom_ids"]
+            self._page_gap_state["bottom_y"] = (
+                self._page_gap_drag_start_bottom + delta
+            )
+        else:
+            moving = (
+                self._page_gap_state["top_ids"]
+                + self._page_gap_state["bottom_ids"]
+            )
+            self._page_gap_state["top_y"] = (
+                self._page_gap_drag_start_top + delta
+            )
+            self._page_gap_state["bottom_y"] = (
+                self._page_gap_drag_start_bottom + delta
+            )
+        for page_id in moving:
+            if (
+                page_id in self.chapter.layers
+                and page_id in self._page_gap_drag_translations
+            ):
+                self.chapter.layers[page_id].translate_y = (
+                    self._page_gap_drag_translations[page_id] + delta
+                )
+        self.documentChanged.emit(QRectF())
+        self.update()
+
+    def _ensure_page_height_safety(self) -> None:
+        if self.chapter is None or not self.chapter.root_page_ids:
+            return
+        bounds = [
+            self.page_world_bounds(page_id)
+            for page_id in self.chapter.root_page_ids
+        ]
+        minimum_top = min(rect.top() for rect in bounds)
+        if minimum_top < 0:
+            correction = 120 - minimum_top
+            for page_id in self.chapter.root_page_ids:
+                self.chapter.layers[page_id].translate_y += correction
+            if self._page_gap_state:
+                self._page_gap_state["top_y"] += correction
+                self._page_gap_state["bottom_y"] += correction
+            self.chapter.height += math.ceil(correction)
+            bounds = [
+                self.page_world_bounds(page_id)
+                for page_id in self.chapter.root_page_ids
+            ]
+        maximum_bottom = max(rect.bottom() for rect in bounds)
+        if maximum_bottom > self.chapter.height:
+            self.chapter.height = math.ceil(maximum_bottom + 120)
+
+    def _finish_page_gap_interaction(self) -> bool:
+        if not self._page_gap_drag_mode:
+            return False
+        before = self._page_gap_drag_before
+        self._page_gap_drag_mode = None
+        self._page_gap_drag_before = None
+        self._page_gap_drag_translations.clear()
+        self._ensure_page_height_safety()
+        after = self.chapter.to_dict()
+        if (
+            self._page_gap_transaction is None
+            and before is not None and before != after
+        ):
+            self.push_model_change(before, after, "Adjust page gap")
+            self.hierarchyChanged.emit()
+            self.documentChanged.emit(QRectF())
+        self.setCursor(Qt.OpenHandCursor)
+        self.interactionFinished.emit()
+        self.update()
+        return True
+
+    def _insert_hovered_page_gap(self) -> bool:
+        hover = self._page_gap_hover
+        if self.chapter is None or hover is None:
+            return False
+        return self.begin_page_gap_transaction(
+            "standalone", hover["owner_id"],
+            hover["top_ids"], hover["bottom_ids"], hover["y"],
+        )
+
     # ---- input ---------------------------------------------------------
     def _navigation_mode(self) -> str | None:
         modifiers = QGuiApplication.keyboardModifiers()
@@ -1663,6 +4397,20 @@ class _CanvasLogic:
         if modifiers == Qt.AltModifier:
             return "pan"
         if modifiers == Qt.ShiftModifier:
+            if (
+                self.tool in {
+                    ToolKind.SHAPE_EDIT,
+                    ToolKind.VECTOR_EDIT,
+                    ToolKind.DRAW_SELECT_RECT,
+                    ToolKind.DRAW_SELECT_LASSO,
+                    ToolKind.DRAW_SELECT_STROKE,
+                }
+                or (
+                    self.tool == ToolKind.VECTOR_REDRAW
+                    and self.settings.vector_redraw_interaction == "point"
+                )
+            ):
+                return None
             return "rotate"
         return None
 
@@ -1685,6 +4433,81 @@ class _CanvasLogic:
         if self._nav_mode:
             self._update_navigation(event.position())
             return
+        self._pointer_hover_widget = QPointF(event.position())
+        world = self.widget_to_document(event.position())
+        transform_quad = (
+            self._selection_transform_quad
+            if self.tool in {
+                ToolKind.DRAW_SELECT_RECT,
+                ToolKind.DRAW_SELECT_LASSO,
+                ToolKind.DRAW_SELECT_STROKE,
+            }
+            else (
+                self._selected_world_quad()
+                if (
+                    self.tool == ToolKind.TRANSFORM
+                    or (
+                        self.tool == ToolKind.TEXT_EDIT
+                        and isinstance(
+                            self.chapter.objects.get(
+                                self.selected_object_id
+                            ), TextObject
+                        )
+                        and self.chapter.objects[
+                            self.selected_object_id
+                        ].layout_mode == "free"
+                    )
+                )
+                else None
+            )
+        )
+        over_transform_handle = False
+        over_transform_edge = False
+        if transform_quad:
+            tolerance = 12 / max(self.scale, 0.05)
+            pivot = (
+                self._selection_pivot
+                if self.tool in {
+                    ToolKind.DRAW_SELECT_RECT,
+                    ToolKind.DRAW_SELECT_LASSO,
+                    ToolKind.DRAW_SELECT_STROKE,
+                }
+                else self._transform_pivot
+            )
+            handles, rotate, pivot = self._transform_control_points(
+                transform_quad, pivot
+            )
+            over_transform_handle = any(
+                math.dist(world.toTuple(), candidate) <= tolerance
+                for candidate in handles
+            ) or math.dist(
+                world.toTuple(), rotate.toTuple()
+            ) <= tolerance or math.dist(
+                world.toTuple(), pivot.toTuple()
+            ) <= tolerance
+            outline = QPainterPath()
+            outline.addPolygon(QPolygonF([
+                QPointF(*point) for point in transform_quad
+            ]))
+            stroker = QPainterPathStroker()
+            stroker.setWidth(16 / max(self.scale, 0.05))
+            over_transform_edge = stroker.createStroke(
+                outline
+            ).contains(world)
+        if over_transform_handle:
+            self.setCursor(Qt.PointingHandCursor)
+        elif over_transform_edge:
+            self.setCursor(Qt.SizeAllCursor)
+        elif self.tool == ToolKind.DRAW_SELECT_STROKE:
+            self.setCursor(Qt.PointingHandCursor)
+        elif self.tool in {
+            ToolKind.DRAW_SELECT_RECT, ToolKind.DRAW_SELECT_LASSO,
+        }:
+            self.setCursor(Qt.CrossCursor)
+        elif self.tool == ToolKind.TRANSFORM:
+            self.setCursor(Qt.SizeAllCursor)
+        else:
+            self.unsetCursor()
         self._tool_move(event.position(), 1.0)
 
     def mouseReleaseEvent(self, event: QMouseEvent) -> None:  # noqa: N802
@@ -1698,6 +4521,25 @@ class _CanvasLogic:
             self._tool_release()
 
     def mouseDoubleClickEvent(self, event: QMouseEvent) -> None:  # noqa: N802
+        if (
+            self.tool == ToolKind.TRANSFORM
+            and self.chapter is not None
+            and self.selected_kind == "object"
+        ):
+            obj = self.chapter.objects.get(self.selected_id)
+            if isinstance(obj, TextObject) and obj.layout_mode == "free":
+                world = self.widget_to_document(event.position())
+                path = QPainterPath()
+                path.addPolygon(QPolygonF([
+                    QPointF(*point)
+                    for point in self.object_world_quad(obj.object_id)
+                ]))
+                if path.contains(world):
+                    self.set_tool(ToolKind.TEXT_EDIT)
+                    self._begin_text_pointer(world)
+                    self._text_dragging = False
+                    event.accept()
+                    return
         if self.tool == ToolKind.SHAPE_CREATE and len(self._creation_nodes) >= 2:
             if (
                 len(self._creation_nodes) >= 3
@@ -1713,7 +4555,27 @@ class _CanvasLogic:
         super().mouseDoubleClickEvent(event)
 
     def keyPressEvent(self, event) -> None:  # noqa: N802
+        if event.key() in {Qt.Key_Shift, Qt.Key_Control}:
+            self.update()
+        if event.key() == Qt.Key_Escape and self._page_gap_state is not None:
+            if self._page_gap_transaction is not None:
+                self.cancel_page_gap_transaction()
+            else:
+                self._clear_page_gap_editor()
+            event.accept()
+            return
+        if event.key() == Qt.Key_Escape and self._page_creation_anchor_id:
+            self._cancel_page_creation()
+            event.accept()
+            return
         if self._handle_text_key(event):
+            return
+        if (
+            event.key() == Qt.Key_Escape
+            and self._vector_gesture_mode is not None
+        ):
+            self._cancel_vector_gesture(restore=True)
+            self.interactionFinished.emit()
             return
         if self.tool == ToolKind.SHAPE_CREATE:
             if (
@@ -1744,6 +4606,7 @@ class _CanvasLogic:
         if self.tool == ToolKind.RASTER_CREATE and event.key() == Qt.Key_Escape:
             self._creation_points.clear()
             self._raster_creation_parent_id = ""
+            self._raster_creation_index = None
             self.set_tool(ToolKind.OBJECT_SELECT)
             return
         if event.key() == Qt.Key_Escape:
@@ -1753,20 +4616,17 @@ class _CanvasLogic:
             and self._selected_shape_node_id and self.chapter is not None
         ):
             layer = self.chapter.layers[self.selected_id]
-            node = self._selected_shape_node(layer.bound)
-            minimum = 3 if layer.bound.closed else 2
             if (
-                event.key() == Qt.Key_Delete and node is not None
-                and len(layer.bound.nodes) > minimum
+                event.key() == Qt.Key_Delete
+                and self._delete_selected_shape_node(layer)
             ):
-                before = self.chapter.to_dict()
-                layer.bound.primitive = "custom"
-                layer.bound.nodes.remove(node)
-                self._normalize_shape_endpoint_handles(layer.bound)
-                self._selected_shape_node_id = ""
-                self._push_immediate_shape_change(before, "Delete shape point")
                 return
         super().keyPressEvent(event)
+
+    def keyReleaseEvent(self, event) -> None:  # noqa: N802
+        if event.key() in {Qt.Key_Shift, Qt.Key_Control}:
+            self.update()
+        super().keyReleaseEvent(event)
 
     @staticmethod
     def _normalize_shape_endpoint_handles(bound: BoundGeometry) -> None:
@@ -1820,6 +4680,7 @@ class _CanvasLogic:
         if self.chapter is None:
             event.accept()
             return
+        self._tablet_hover_widget = QPointF(event.position())
         nav = self._navigation_mode()
         if event.type() == QEvent.TabletPress:
             if nav:
@@ -1832,15 +4693,24 @@ class _CanvasLogic:
                 self._update_navigation(event.position())
             elif self._tablet_tool_active:
                 self._tool_move(event.position(), event.pressure())
+            elif self.tool == ToolKind.DRAW_SELECT_STROKE:
+                self._continue_drawing_selection(
+                    self.widget_to_document(event.position()),
+                    event.position(),
+                )
         elif event.type() == QEvent.TabletRelease:
             if self._nav_mode:
                 self._end_navigation()
             elif self._tablet_tool_active:
                 self._tablet_tool_active = False
                 self._tool_release()
+        self.update()
         event.accept()
 
     def event(self, event) -> bool:
+        if event.type() == QEvent.Type.Leave:
+            self._tablet_hover_widget = None
+            self.update()
         if self.settings.tablet_mode and event.type() in {
             QEvent.TouchBegin, QEvent.TouchUpdate, QEvent.TouchEnd, QEvent.TouchCancel
         }:
@@ -1889,51 +4759,107 @@ class _CanvasLogic:
     def _touch_event(self, event) -> bool:
         points = [item.position() for item in event.points()]
         if event.type() == QEvent.TouchBegin:
-            self._touch_points = points
-            self._touch_anchor_center = QPointF(self.center_x, self.center_y)
-            self._touch_anchor_scale = self.scale
-            self._touch_anchor_rotation = self.rotation
-            if len(points) >= 2:
-                self._touch_anchor_distance = max(1.0, math.dist(
-                    (points[0].x(), points[0].y()), (points[1].x(), points[1].y())
-                ))
-                self._touch_anchor_angle = math.atan2(
-                    points[1].y() - points[0].y(), points[1].x() - points[0].x()
-                )
+            self._rebase_touch_navigation(points)
             event.accept()
             return True
-        if event.type() == QEvent.TouchUpdate and points and self._touch_points:
-            old_center = sum((p.x() for p in self._touch_points), 0.0) / len(self._touch_points)
-            old_y = sum((p.y() for p in self._touch_points), 0.0) / len(self._touch_points)
-            center = sum((p.x() for p in points), 0.0) / len(points)
-            center_y = sum((p.y() for p in points), 0.0) / len(points)
-            # Tablet mode follows viewport-scroll semantics: moving a finger
-            # right advances the camera right. Desktop Alt-drag remains
-            # canvas-grab navigation and intentionally uses the opposite sign.
-            self._apply_touch_pan_delta(center - old_center, center_y - old_y)
-            if len(points) >= 2:
-                distance = max(1.0, math.dist(
-                    (points[0].x(), points[0].y()), (points[1].x(), points[1].y())
-                ))
-                angle = math.atan2(points[1].y() - points[0].y(), points[1].x() - points[0].x())
-                self.scale = max(0.05, min(8.0, self.scale * distance / self._touch_anchor_distance))
-                self.rotation += math.degrees(angle - self._touch_anchor_angle)
-                self._touch_anchor_distance = distance
-                self._touch_anchor_angle = angle
-            self._touch_points = points
-            self._snap_camera()
-            self.update()
-            self.cameraChanged.emit()
+        if event.type() == QEvent.TouchUpdate and points:
+            if len(points) != len(self._touch_anchor_points):
+                self._rebase_touch_navigation(points)
+            else:
+                self._apply_touch_navigation(points)
             event.accept()
             return True
         self._touch_points.clear()
+        self._touch_anchor_points.clear()
         self.interactionFinished.emit()
         event.accept()
         return True
 
+    @staticmethod
+    def _touch_centroid(points: list[QPointF]) -> QPointF:
+        return QPointF(
+            sum(point.x() for point in points) / len(points),
+            sum(point.y() for point in points) / len(points),
+        )
+
+    def _rebase_touch_navigation(self, points: list[QPointF]) -> None:
+        self._touch_points = [QPointF(point) for point in points]
+        self._touch_anchor_points = [QPointF(point) for point in points]
+        self._touch_anchor_center = QPointF(self.center_x, self.center_y)
+        self._touch_anchor_scale = self.scale
+        self._touch_anchor_rotation = self.rotation
+        if not points:
+            self._touch_anchor_document = QPointF()
+            return
+        center = self._touch_centroid(points)
+        self._touch_anchor_document = self.widget_to_document(center)
+        if len(points) >= 2:
+            vector = points[1] - points[0]
+            self._touch_anchor_distance = max(
+                0.001, math.hypot(vector.x(), vector.y())
+            )
+            self._touch_anchor_angle = math.atan2(vector.y(), vector.x())
+
+    def _apply_touch_navigation(
+        self, points: list[QPointF],
+    ) -> tuple[float, float, float, float]:
+        """Apply a deterministic pan/pinch/twist frame from stable anchors."""
+        if (
+            not self._touch_anchor_points
+            or len(points) != len(self._touch_anchor_points)
+        ):
+            self._rebase_touch_navigation(points)
+            return self.center_x, self.center_y, self.rotation, self.scale
+        current_center = self._touch_centroid(points)
+        new_scale = self._touch_anchor_scale
+        new_rotation = self._touch_anchor_rotation
+        if len(points) >= 2:
+            vector = points[1] - points[0]
+            distance = max(0.001, math.hypot(vector.x(), vector.y()))
+            angle = math.atan2(vector.y(), vector.x())
+            angle_delta = math.atan2(
+                math.sin(angle - self._touch_anchor_angle),
+                math.cos(angle - self._touch_anchor_angle),
+            )
+            new_scale = max(
+                0.05,
+                min(
+                    8.0,
+                    self._touch_anchor_scale
+                    * distance / self._touch_anchor_distance,
+                ),
+            )
+            new_rotation = (
+                self._touch_anchor_rotation + math.degrees(angle_delta)
+            )
+
+        viewport_delta = current_center - QPointF(
+            self.width() / 2, self.height() / 2
+        )
+        angle = math.radians(new_rotation)
+        cos_a, sin_a = math.cos(angle), math.sin(angle)
+        document_delta = QPointF(
+            (
+                viewport_delta.x() * cos_a
+                + viewport_delta.y() * sin_a
+            ) / new_scale,
+            (
+                -viewport_delta.x() * sin_a
+                + viewport_delta.y() * cos_a
+            ) / new_scale,
+        )
+        self.center_x = self._touch_anchor_document.x() - document_delta.x()
+        self.center_y = self._touch_anchor_document.y() - document_delta.y()
+        self.scale = new_scale
+        self.rotation = new_rotation
+        self._touch_points = [QPointF(point) for point in points]
+        self.update()
+        self.cameraChanged.emit()
+        return self.center_x, self.center_y, self.rotation, self.scale
+
     def _apply_touch_pan_delta(self, delta_x: float, delta_y: float) -> None:
         """Apply tablet navigation deltas without changing desktop grab-pan."""
-        self.center_x += delta_x / self.scale
+        self.center_x -= delta_x / self.scale
         self.center_y -= delta_y / self.scale
 
     def _creation_selected_node(self) -> PathNode | None:
@@ -1942,12 +4868,37 @@ class _CanvasLogic:
             if node.node_id == self._creation_selected_node_id
         ), None)
 
+    def _normalize_creation_handles(self) -> None:
+        if len(self._creation_nodes) >= 2:
+            BoundGeometry._normalize_contour_handles(PathContour(
+                self._creation_nodes, False
+            ))
+
     def _creation_hit_test(self, point: QPointF) -> dict | None:
         if not self._creation_nodes:
             return None
+        self._normalize_creation_handles()
+        if (
+            self._page_creation_anchor_id
+            and len(self._creation_nodes) >= 3
+        ):
+            first = self._creation_nodes[0]
+            tolerance = 14 * SHAPE_CONTROL_SCALE / max(
+                self.scale, 0.05
+            )
+            if math.dist(
+                (point.x(), point.y()), first.position
+            ) <= tolerance:
+                return {
+                    "kind": "node", "index": 0,
+                    "node_id": first.node_id,
+                    "position": QPointF(first.x, first.y),
+                }
         if len(self._creation_nodes) == 1:
             node = self._creation_nodes[0]
-            tolerance = 14 / max(self.scale, 0.05)
+            tolerance = (
+                14 * SHAPE_CONTROL_SCALE / max(self.scale, 0.05)
+            )
             for name, control in (
                 ("incoming", node.incoming), ("outgoing", node.outgoing)
             ):
@@ -1976,19 +4927,76 @@ class _CanvasLogic:
         finally:
             self._selected_shape_node_id = previous
 
+    @staticmethod
+    def _shape_hit_tooltip(
+        bound: BoundGeometry | None, hit: dict | None,
+        style: ShapeStyle | None = None,
+    ) -> str:
+        if not hit:
+            return ""
+        kind = hit["kind"]
+        labels = {
+            "radius": "Drag to adjust this corner's roundness",
+            "node": "Click to select; drag to move this point",
+            "rectangle_point": "Drag to move this rectangle point",
+            "rectangle_edge": "Drag to move both points on this edge",
+            "primitive_handle": "Drag to resize this shape",
+            "insert": "Click to insert a Vector point; drag to insert a Bézier point",
+            "interior": "Drag to move this shape",
+        }
+        if kind == "control":
+            direction = hit.get("name", "")
+            return (
+                f"Drag the {direction} Bézier handle"
+                if direction in {"incoming", "outgoing"}
+                else "Drag this Bézier handle"
+            )
+        if kind != "gizmo":
+            return labels.get(kind, "")
+        name = hit.get("name")
+        node = next((
+            candidate
+            for contour in bound.iter_contours()
+            for candidate in contour.nodes
+            if candidate.node_id == hit.get("node_id")
+        ), None) if bound is not None else None
+        if name == "delete":
+            return "Delete this point"
+        if name == "type" and node is not None:
+            target = "Bézier" if node.point_type == "vector" else "Vector"
+            return f"Convert this point to {target}"
+        if name == "lock" and node is not None:
+            return (
+                "Unlock Bézier handles"
+                if node.handles_locked else "Lock Bézier handles"
+            )
+        if name == "thickness":
+            return "Drag to adjust stroke thickness at this point"
+        if name == "roundness":
+            return "Click to toggle smoothness; drag to adjust it"
+        if name == "cap" and node is not None:
+            is_start = bool(bound and node is bound.nodes[0])
+            cap = (
+                style.start_cap if style and is_start
+                else style.end_cap if style else "round"
+            )
+            end = "start" if is_start else "end"
+            return f"Change the {end} cap (currently {cap.title()})"
+        return ""
+
     def _update_creation_hover(self, point: QPointF) -> None:
         hit = self._creation_hit_test(point)
         self._shape_hover_target = hit
         self._shape_hover_insert = (
             hit["insert"] if hit and hit["kind"] == "insert" else None
         )
-        labels = {
-            "gizmo": "Edit selected point",
-            "control": "Drag Bézier control",
-            "node": "Click to select; drag to move point",
-            "insert": "Click to insert a vector point; drag for Bézier",
-        }
-        self.setToolTip(labels.get(hit["kind"], "") if hit else "")
+        geometry = (
+            BoundGeometry.path(self._creation_nodes, False)
+            if len(self._creation_nodes) >= 2 else None
+        )
+        self.setToolTip(self._shape_hit_tooltip(
+            geometry, hit, self._creation_style
+        ))
         self.update()
 
     def _begin_creation_shape_interaction(
@@ -2009,6 +5017,10 @@ class _CanvasLogic:
                 self._toggle_shape_node_type(geometry, node)
             elif name == "lock":
                 self._toggle_shape_node_lock(geometry, node)
+            elif name == "delete":
+                if self._can_delete_shape_node(geometry):
+                    self._creation_nodes.remove(node)
+                    self._creation_selected_node_id = ""
             elif name == "cap":
                 style = self._creation_style or ShapeStyle()
                 values = ["point", "square", "round"]
@@ -2026,6 +5038,7 @@ class _CanvasLogic:
                 self._creation_active_control = name
                 self._creation_press_widget = QPointF(widget_point)
                 self._drag_start_doc = QPointF(point)
+                self._creation_node_dragged = False
             self.update()
             return True
         if kind == "control":
@@ -2078,8 +5091,11 @@ class _CanvasLogic:
         if control == "new_point":
             if moved:
                 node.point_type = "bezier"
-                node.handles_locked = True
-                target = (point.x(), point.y())
+                node.handles_locked = False
+                snapped = self._snap(
+                    point, self._target_parent_for_new_layer()
+                )
+                target = (snapped.x(), snapped.y())
                 if node is self._creation_nodes[0]:
                     node.outgoing = target
                 else:
@@ -2090,9 +5106,12 @@ class _CanvasLogic:
             if control == "draft_insert" and moved:
                 node.point_type = "bezier"
                 node.handles_locked = True
-                node.incoming = (point.x(), point.y())
+                snapped = self._snap(
+                    point, self._target_parent_for_new_layer()
+                )
+                node.incoming = (snapped.x(), snapped.y())
                 node.outgoing = (
-                    node.x * 2 - point.x(), node.y * 2 - point.y()
+                    node.x * 2 - snapped.x(), node.y * 2 - snapped.y()
                 )
             elif control == "draft_node" and moved:
                 snapped = self._snap(
@@ -2111,12 +5130,13 @@ class _CanvasLogic:
             self.update()
             return True
         if control in {"incoming", "outgoing"}:
-            setattr(node, control, (point.x(), point.y()))
-            if node.handles_locked:
-                other = "outgoing" if control == "incoming" else "incoming"
-                setattr(node, other, (
-                    node.x * 2 - point.x(), node.y * 2 - point.y()
-                ))
+            snapped = self._snap(
+                point, self._target_parent_for_new_layer()
+            )
+            geometry = BoundGeometry.path(self._creation_nodes, False)
+            self._move_shape_bezier_handle(
+                geometry, node, control, (snapped.x(), snapped.y())
+            )
         elif control == "thickness":
             geometry = BoundGeometry.path(self._creation_nodes, False)
             position = self._shape_gizmo_positions(geometry, node)["thickness"]
@@ -2130,19 +5150,2480 @@ class _CanvasLogic:
                 0.1, min(10.0, (distance * self.scale - 24) / 10)
             ) * 10) / 10
         elif control == "roundness":
-            node.roundness = max(
-                0.0, math.dist(node.position, (point.x(), point.y()))
-            )
+            if moved:
+                geometry = BoundGeometry.path(self._creation_nodes, False)
+                node.roundness = min(
+                    self._maximum_shape_roundness(geometry, node),
+                    max(
+                        0.0,
+                        math.dist(node.position, (point.x(), point.y())),
+                    ),
+                )
+                node.roundness_enabled = True
+        self._normalize_creation_handles()
         self.update()
         return True
+
+    # ---- drawing selections -------------------------------------------
+    def _clear_drawing_selection(self, *, reset_pivot: bool = True) -> None:
+        self._drawing_selection_path = QPainterPath()
+        self._drawing_selection_gesture.clear()
+        self._selection_transform_quad = None
+        self._selection_transform_start_quad = None
+        self._selection_transform_mode = None
+        self._selection_transform_handle = None
+        self._hover_vector_stroke_id = ""
+        if reset_pivot:
+            self._selection_pivot = None
+            self._selection_pivot_custom = False
+
+    def _drawing_selection_object(
+        self,
+    ) -> RasterObject | VectorDrawingObject | None:
+        if self.chapter is None:
+            return None
+        candidate = self.chapter.objects.get(self.selected_object_id)
+        return (
+            candidate
+            if isinstance(candidate, (RasterObject, VectorDrawingObject))
+            else None
+        )
+
+    def _drawing_local_point(
+        self, obj: RasterObject | VectorDrawingObject, world: QPointF,
+    ) -> QPointF:
+        layer_x, layer_y = self.chapter.layer_world_translation(
+            obj.parent_layer_id
+        )
+        return QPointF(
+            world.x() - layer_x - obj.x,
+            world.y() - layer_y - obj.y,
+        )
+
+    def _point_inside_drawing_bounds(
+        self, obj: RasterObject | VectorDrawingObject, world: QPointF,
+    ) -> bool:
+        if isinstance(obj, RasterObject):
+            quad = self.object_world_quad(obj.object_id)
+            if not quad:
+                return False
+            path = QPainterPath()
+            path.addPolygon(QPolygonF([QPointF(*point) for point in quad]))
+            path.closeSubpath()
+            return path.contains(world)
+        if not obj.strokes:
+            return False
+        local = self._drawing_local_point(obj, world)
+        bounds = QRectF(*obj.derived_bounds())
+        return not bounds.isEmpty() and bounds.contains(local)
+
+    @staticmethod
+    def _selection_operation() -> str:
+        modifiers = QGuiApplication.keyboardModifiers()
+        if modifiers & Qt.ControlModifier:
+            return "remove"
+        if modifiers & Qt.ShiftModifier:
+            return "add"
+        return "replace"
+
+    @staticmethod
+    def _stroke_ids_containing_points(
+        drawing: VectorDrawingObject, point_ids: set[str],
+    ) -> set[str]:
+        return {
+            stroke.stroke_id
+            for stroke in drawing.strokes
+            if any(point.point_id in point_ids for point in stroke.points)
+        }
+
+    @staticmethod
+    def _point_ids_for_strokes(
+        drawing: VectorDrawingObject, stroke_ids: set[str],
+    ) -> set[str]:
+        return {
+            point.point_id
+            for stroke in drawing.strokes
+            if stroke.stroke_id in stroke_ids
+            for point in stroke.points
+        }
+
+    def _reset_drawing_selection_frame(self) -> None:
+        self._selection_pivot = None
+        self._selection_pivot_custom = False
+        self._refresh_drawing_selection_transform()
+
+    def _strokes_intersecting_selection_region(
+        self, drawing: VectorDrawingObject, region: QPainterPath,
+    ) -> set[str]:
+        result: set[str] = set()
+        stroker = QPainterPathStroker()
+        stroker.setWidth(max(0.05, 1.0 / max(self.scale, 0.05)))
+        for stroke in drawing.strokes:
+            centerline = self._vector_centerline_path(stroke)
+            if (
+                region.intersects(stroker.createStroke(centerline))
+                or any(
+                    region.contains(QPointF(point.x, point.y))
+                    for point in stroke.points
+                )
+            ):
+                result.add(stroke.stroke_id)
+        return result
+
+    def _begin_drawing_selection_transform(
+        self, obj: RasterObject | VectorDrawingObject, world: QPointF,
+    ) -> bool:
+        quad = self._selection_transform_quad
+        if not quad:
+            return False
+        tolerance = 14 / max(self.scale, 0.05)
+        handles, rotate, pivot = self._transform_control_points(
+            quad, self._selection_pivot
+        )
+        pivot_distance = math.dist(world.toTuple(), pivot.toTuple())
+        if (
+            4 / max(self.scale, 0.05)
+            <= pivot_distance <= tolerance
+        ):
+            mode, handle = "pivot", None
+        elif math.dist(world.toTuple(), rotate.toTuple()) <= tolerance:
+            mode, handle = "rotate", None
+        else:
+            distances = [
+                math.dist(world.toTuple(), candidate)
+                for candidate in handles
+            ]
+            selection_path = QPainterPath()
+            selection_path.addPolygon(QPolygonF([
+                QPointF(*candidate) for candidate in quad
+            ]))
+            center = QPointF(
+                sum(x for x, _ in quad) / 4,
+                sum(y for _, y in quad) / 4,
+            )
+            center_distance = math.dist(
+                world.toTuple(), center.toTuple()
+            )
+            if (
+                selection_path.contains(world)
+                and distances
+                and center_distance < min(distances)
+            ):
+                mode, handle = "translate", None
+            elif distances and min(distances) <= tolerance:
+                mode, handle = "handle", distances.index(min(distances))
+            else:
+                stroker = QPainterPathStroker()
+                stroker.setWidth(18 / max(self.scale, 0.05))
+                if (
+                    selection_path.contains(world)
+                    or stroker.createStroke(selection_path).contains(world)
+                ):
+                    mode, handle = "translate", None
+                else:
+                    return False
+        self._selection_transform_mode = mode
+        self._selection_transform_handle = handle
+        self._selection_transform_start = QPointF(world)
+        self._selection_transform_start_quad = list(quad)
+        self._selection_rotate_quad = list(quad)
+        self._selection_before_model = self.chapter.to_dict()
+        self._selection_vector_points = {}
+        if isinstance(obj, VectorDrawingObject):
+            self._selection_vector_points = {
+                point.point_id: {
+                    "position": point.position,
+                    "incoming": point.incoming,
+                    "outgoing": point.outgoing,
+                    "width": point.width,
+                }
+                for stroke in obj.strokes
+                for point in stroke.points
+                if point.point_id in self._selected_vector_point_ids
+            }
+        else:
+            self._selection_before_tiles = self.tiles.object_tiles(
+                obj.object_id
+            )
+        self._selection_rotate_start = math.atan2(
+            world.y() - pivot.y(), world.x() - pivot.x()
+        )
+        return True
+
+    def _update_drawing_selection_transform(
+        self, obj: RasterObject | VectorDrawingObject, world: QPointF,
+    ) -> None:
+        start = self._selection_transform_start_quad
+        if not start:
+            return
+        mode = self._selection_transform_mode
+        pivot = self._selection_pivot or QPointF(
+            sum(x for x, _ in start) / 4,
+            sum(y for _, y in start) / 4,
+        )
+        if mode == "pivot":
+            self._selection_pivot = QPointF(world)
+            self._selection_pivot_custom = True
+            self.update()
+            return
+        if mode == "translate":
+            delta = world - self._selection_transform_start
+            target = [
+                (x + delta.x(), y + delta.y()) for x, y in start
+            ]
+        elif mode == "rotate":
+            angle = math.atan2(
+                world.y() - pivot.y(), world.x() - pivot.x()
+            ) - self._selection_rotate_start
+            cosine, sine = math.cos(angle), math.sin(angle)
+            target = [
+                (
+                    pivot.x() + (x - pivot.x()) * cosine
+                    - (y - pivot.y()) * sine,
+                    pivot.y() + (x - pivot.x()) * sine
+                    + (y - pivot.y()) * cosine,
+                )
+                for x, y in start
+            ]
+        else:
+            handle = self._selection_transform_handle
+            if handle is None:
+                return
+            anchors = start + self._edge_midpoints(start)
+            opposite = [2, 3, 0, 1, 6, 7, 4, 5][handle]
+            origin = QPointF(*anchors[opposite])
+            initial = QPointF(*anchors[handle])
+            if self.settings.transform_mode == "uniform":
+                factor = math.dist(
+                    origin.toTuple(), world.toTuple()
+                ) / max(
+                    1e-6, math.dist(origin.toTuple(), initial.toTuple())
+                )
+                target = [
+                    (
+                        origin.x() + (x - origin.x()) * factor,
+                        origin.y() + (y - origin.y()) * factor,
+                    )
+                    for x, y in start
+                ]
+            else:
+                target = list(start)
+                if handle < 4:
+                    target[handle] = (world.x(), world.y())
+                else:
+                    edge = handle - 4
+                    midpoint = QPointF(*self._edge_midpoints(start)[edge])
+                    delta = world - midpoint
+                    for index in (edge, (edge + 1) % 4):
+                        target[index] = (
+                            start[index][0] + delta.x(),
+                            start[index][1] + delta.y(),
+                        )
+        if not self._quad_is_valid(target):
+            return
+        self._selection_transform_quad = target
+        if isinstance(obj, VectorDrawingObject):
+            layer_x, layer_y = self.chapter.layer_world_translation(
+                obj.parent_layer_id
+            )
+            offset = QPointF(layer_x + obj.x, layer_y + obj.y)
+            transform = self._quad_to_quad_transform(start, target)
+            width_scale = math.sqrt(abs(transform.determinant()))
+            for stroke in obj.strokes:
+                for point in stroke.points:
+                    source = self._selection_vector_points.get(
+                        point.point_id
+                    )
+                    if source is None:
+                        continue
+                    mapped = transform.map(
+                        QPointF(*source["position"]) + offset
+                    ) - offset
+                    point.position = mapped.toTuple()
+                    if source["incoming"] is not None:
+                        point.incoming = (
+                            transform.map(
+                                QPointF(*source["incoming"]) + offset
+                            ) - offset
+                        ).toTuple()
+                    if source["outgoing"] is not None:
+                        point.outgoing = (
+                            transform.map(
+                                QPointF(*source["outgoing"]) + offset
+                            ) - offset
+                        ).toTuple()
+                    point.width = max(
+                        1.0, min(
+                            1000.0,
+                            float(source["width"]) * width_scale,
+                        )
+                    )
+            self._vector_changed()
+        self.update()
+
+    def _restore_drawing_transform_model(
+        self, model: dict, quad: list[tuple[float, float]] | None,
+        pivot: QPointF | None, pivot_custom: bool,
+    ) -> None:
+        self.replace_chapter(model)
+        self._selection_transform_quad = (
+            list(quad) if quad is not None else None
+        )
+        self._selection_pivot = (
+            QPointF(pivot) if pivot is not None else None
+        )
+        self._selection_pivot_custom = bool(pivot_custom)
+        self.update()
+
+    def _finish_drawing_selection_transform(
+        self, obj: RasterObject | VectorDrawingObject,
+    ) -> bool:
+        mode = self._selection_transform_mode
+        self._selection_transform_mode = None
+        self._selection_transform_handle = None
+        if mode == "pivot":
+            self._selection_before_model = None
+            self._selection_before_tiles = None
+            self.update()
+            return True
+        before = self._selection_before_model
+        self._selection_before_model = None
+        if isinstance(obj, VectorDrawingObject):
+            self._selection_vector_points.clear()
+            if before is not None:
+                after = self.chapter.to_dict()
+                if before != after:
+                    before_quad = list(
+                        self._selection_transform_start_quad or []
+                    ) or None
+                    after_quad = list(
+                        self._selection_transform_quad or []
+                    ) or None
+                    pivot = (
+                        QPointF(self._selection_pivot)
+                        if self._selection_pivot is not None else None
+                    )
+                    pivot_custom = self._selection_pivot_custom
+                    self.command_stack.push(
+                        CallbackCommand(
+                            "Transform vector selection",
+                            lambda: self._restore_drawing_transform_model(
+                                after, after_quad, pivot, pivot_custom
+                            ),
+                            lambda: self._restore_drawing_transform_model(
+                                before, before_quad, pivot, pivot_custom
+                            ),
+                        ),
+                        already_done=True,
+                    )
+            self._vector_changed()
+        elif self._selection_before_tiles is not None:
+            self._commit_raster_selection_transform(
+                obj, self._selection_before_tiles
+            )
+            self._selection_before_tiles = None
+        self.interactionFinished.emit()
+        self.update()
+        return True
+
+    def _commit_raster_selection_transform(
+        self, obj: RasterObject,
+        before_tiles: dict[tuple[int, int], QImage],
+    ) -> None:
+        start = self._selection_transform_start_quad
+        destination = self._selection_transform_quad
+        if (
+            not start or not destination
+            or self._drawing_selection_path.isEmpty()
+        ):
+            return
+        layer_x, layer_y = self.chapter.layer_world_translation(
+            obj.parent_layer_id
+        )
+        offset = QPointF(layer_x + obj.x, layer_y + obj.y)
+        source_quad = [
+            (x - offset.x(), y - offset.y()) for x, y in start
+        ]
+        destination_local = [
+            (x - offset.x(), y - offset.y())
+            for x, y in destination
+        ]
+        transform = self._quad_to_quad_transform(
+            source_quad, destination_local
+        )
+        if not transform.isInvertible():
+            return
+        source_path = QPainterPath(self._drawing_selection_path)
+        target_path = transform.map(source_path)
+        result = {
+            key: QImage(image) for key, image in before_tiles.items()
+        }
+        source_keys = self.tiles.keys_for_rect(source_path.boundingRect())
+        for key in source_keys:
+            image = result.get(key)
+            if image is None:
+                continue
+            painter = QPainter(image)
+            painter.setCompositionMode(QPainter.CompositionMode_Clear)
+            painter.translate(
+                -key[0] * obj.tile_size, -key[1] * obj.tile_size
+            )
+            painter.fillPath(source_path, Qt.black)
+            painter.end()
+            if self.tiles.is_empty(image):
+                result.pop(key, None)
+        target_keys = self.tiles.keys_for_rect(
+            target_path.boundingRect().adjusted(-2, -2, 2, 2)
+        )
+        for key in target_keys:
+            image = result.get(key)
+            if image is None:
+                image = self.tiles._empty(obj.tile_size)
+            painter = QPainter(image)
+            painter.setRenderHint(QPainter.SmoothPixmapTransform, True)
+            painter.translate(
+                -key[0] * obj.tile_size, -key[1] * obj.tile_size
+            )
+            painter.setClipPath(target_path, Qt.IntersectClip)
+            painter.setTransform(transform, True)
+            for (source_x, source_y), source_image in before_tiles.items():
+                painter.drawImage(
+                    source_x * obj.tile_size,
+                    source_y * obj.tile_size,
+                    source_image,
+                )
+            painter.end()
+            if self.tiles.is_empty(image):
+                result.pop(key, None)
+            else:
+                result[key] = image
+        before_frame = tuple(obj.interaction_rect)
+        before_state = {
+            "frame": before_frame,
+            "path": QPainterPath(source_path),
+            "quad": list(start),
+            "pivot": (
+                QPointF(self._selection_pivot)
+                if self._selection_pivot is not None else None
+            ),
+            "pivot_custom": self._selection_pivot_custom,
+        }
+        self.tiles.replace_object_tiles(obj.object_id, result)
+        content = self.tiles.content_bounds(obj.object_id)
+        if content is not None:
+            frame = content.adjusted(
+                -RASTER_FRAME_MARGIN, -RASTER_FRAME_MARGIN,
+                RASTER_FRAME_MARGIN, RASTER_FRAME_MARGIN,
+            )
+            obj.interaction_rect = (
+                frame.left(), frame.top(), frame.width(), frame.height()
+            )
+        after_frame = tuple(obj.interaction_rect)
+        after_state = {
+            "frame": after_frame,
+            "path": QPainterPath(target_path),
+            "quad": list(destination),
+            "pivot": (
+                QPointF(self._selection_pivot)
+                if self._selection_pivot is not None else None
+            ),
+            "pivot_custom": self._selection_pivot_custom,
+        }
+        all_keys = set(before_tiles) | set(result)
+        before_patch = {
+            key: before_tiles.get(key) for key in all_keys
+        }
+        after_patch = {key: result.get(key) for key in all_keys}
+        self.command_stack.push(
+            TilePatchCommand(
+                "Transform raster selection", self.tiles, obj.object_id,
+                before_patch, after_patch,
+                lambda: (
+                    self.documentChanged.emit(QRectF()), self.update()
+                ),
+                before_state, after_state,
+                lambda state, object_id=obj.object_id:
+                self._restore_raster_selection_transform_state(
+                    object_id, state
+                ),
+            ),
+            already_done=True,
+        )
+        self._drawing_selection_path = target_path
+        self.documentChanged.emit(QRectF())
+
+    def _restore_raster_selection_transform_state(
+        self, object_id: str, state: dict,
+    ) -> None:
+        self._restore_raster_frame(object_id, state["frame"])
+        self._drawing_selection_path = QPainterPath(state["path"])
+        self._selection_transform_quad = list(state["quad"])
+        pivot = state.get("pivot")
+        self._selection_pivot = (
+            QPointF(pivot) if pivot is not None else None
+        )
+        self._selection_pivot_custom = bool(
+            state.get("pivot_custom", False)
+        )
+
+    def select_all_drawing(self) -> bool:
+        """Select every pixel/point in the active drawing."""
+        obj = self._drawing_selection_object()
+        if obj is None:
+            return False
+        if isinstance(obj, VectorDrawingObject):
+            self._set_vector_selection(
+                obj,
+                {stroke.stroke_id for stroke in obj.strokes},
+                {
+                    point.point_id
+                    for stroke in obj.strokes
+                    for point in stroke.points
+                },
+            )
+        else:
+            bounds = self.tiles.content_bounds(obj.object_id)
+            if bounds is None:
+                bounds = QRectF(*obj.interaction_rect)
+            path = QPainterPath()
+            path.addRect(bounds)
+            self._drawing_selection_path = path
+        self._refresh_drawing_selection_transform()
+        self.update()
+        return True
+
+    def _refresh_drawing_selection_transform(self) -> None:
+        obj = self._drawing_selection_object()
+        if obj is None:
+            self._selection_transform_quad = None
+            return
+        bounds = QRectF()
+        if isinstance(obj, RasterObject):
+            bounds = self._drawing_selection_path.boundingRect()
+        else:
+            points = [
+                point
+                for stroke in obj.strokes
+                for point in stroke.points
+                if point.point_id in self._selected_vector_point_ids
+            ]
+            if points:
+                left = min(point.x for point in points)
+                right = max(point.x for point in points)
+                top = min(point.y for point in points)
+                bottom = max(point.y for point in points)
+                bounds = QRectF(left, top, right - left, bottom - top)
+                if bounds.width() < 1:
+                    bounds.adjust(-0.5, 0, 0.5, 0)
+                if bounds.height() < 1:
+                    bounds.adjust(0, -0.5, 0, 0.5)
+        if bounds.isNull() or bounds.isEmpty():
+            self._selection_transform_quad = None
+            return
+        layer_x, layer_y = self.chapter.layer_world_translation(
+            obj.parent_layer_id
+        )
+        offset_x, offset_y = layer_x + obj.x, layer_y + obj.y
+        self._selection_transform_quad = [
+            (bounds.left() + offset_x, bounds.top() + offset_y),
+            (bounds.right() + offset_x, bounds.top() + offset_y),
+            (bounds.right() + offset_x, bounds.bottom() + offset_y),
+            (bounds.left() + offset_x, bounds.bottom() + offset_y),
+        ]
+        if self._selection_pivot is None:
+            center = bounds.center()
+            self._selection_pivot = QPointF(
+                center.x() + offset_x, center.y() + offset_y
+            )
+
+    def _begin_drawing_selection(
+        self, world: QPointF, widget: QPointF, *,
+        test_transform: bool = True,
+    ) -> bool:
+        obj = self._drawing_selection_object()
+        if obj is None:
+            return False
+        self._drawing_selection_operation = self._selection_operation()
+        if (
+            test_transform
+            and self._drawing_selection_operation == "replace"
+            and self._begin_drawing_selection_transform(obj, world)
+        ):
+            return True
+        local = self._drawing_local_point(obj, world)
+        if self.tool == ToolKind.DRAW_SELECT_STROKE:
+            if not isinstance(obj, VectorDrawingObject):
+                return False
+            hits = self._hit_vector_strokes(obj, local)
+            if not hits:
+                self._drawing_selection_gesture = [QPointF(local)]
+                return True
+            stroke_id = hits[0]
+            stroke = self._vector_stroke_by_id(obj, stroke_id)
+            strokes = set(self._selected_vector_stroke_ids)
+            if self._drawing_selection_operation == "replace":
+                strokes = {stroke_id}
+            elif self._drawing_selection_operation == "add":
+                if stroke_id in strokes:
+                    strokes.remove(stroke_id)
+                else:
+                    strokes.add(stroke_id)
+            else:
+                strokes.discard(stroke_id)
+            self._set_vector_selection(
+                obj, strokes, self._point_ids_for_strokes(obj, strokes)
+            )
+            self._reset_drawing_selection_frame()
+            return True
+        self._drawing_selection_gesture = [QPointF(local)]
+        return True
+
+    def _continue_drawing_selection(
+        self, world: QPointF, widget: QPointF,
+    ) -> bool:
+        obj = self._drawing_selection_object()
+        if obj is None:
+            return False
+        if self._selection_transform_mode is not None:
+            self._update_drawing_selection_transform(obj, world)
+            return True
+        local = self._drawing_local_point(obj, world)
+        if self.tool == ToolKind.DRAW_SELECT_STROKE:
+            if isinstance(obj, VectorDrawingObject):
+                if self._drawing_selection_gesture:
+                    if math.dist(
+                        self._drawing_selection_gesture[-1].toTuple(),
+                        local.toTuple(),
+                    ) >= 1.5 / max(self.scale, 0.05):
+                        self._drawing_selection_gesture.append(QPointF(local))
+                        self.update()
+                else:
+                    hits = self._hit_vector_strokes(obj, local)
+                    hovered = hits[0] if hits else ""
+                    if hovered != self._hover_vector_stroke_id:
+                        self._hover_vector_stroke_id = hovered
+                        self.update()
+            return True
+        if not self._drawing_selection_gesture:
+            return False
+        if self.tool == ToolKind.DRAW_SELECT_RECT:
+            if len(self._drawing_selection_gesture) == 1:
+                self._drawing_selection_gesture.append(QPointF(local))
+            else:
+                self._drawing_selection_gesture[-1] = QPointF(local)
+        elif math.dist(
+            self._drawing_selection_gesture[-1].toTuple(), local.toTuple()
+        ) >= 1.5 / max(self.scale, 0.05):
+            self._drawing_selection_gesture.append(QPointF(local))
+        self.update()
+        return True
+
+    def _finish_drawing_selection(self) -> bool:
+        obj = self._drawing_selection_object()
+        if obj is not None and self._selection_transform_mode is not None:
+            return self._finish_drawing_selection_transform(obj)
+        if obj is None or not self._drawing_selection_gesture:
+            return False
+        gesture = self._drawing_selection_gesture
+        self._drawing_selection_gesture = []
+        region = QPainterPath()
+        if self.tool == ToolKind.DRAW_SELECT_RECT:
+            end = gesture[-1]
+            region.addRect(QRectF(gesture[0], end).normalized())
+        else:
+            if len(gesture) < 3:
+                if self._drawing_selection_operation == "replace":
+                    self._clear_drawing_selection()
+                    if isinstance(obj, VectorDrawingObject):
+                        self._set_vector_selection(obj, set(), set())
+                self.update()
+                return True
+            polygon = QPolygonF(gesture)
+            polygon.append(gesture[0])
+            region.addPolygon(polygon)
+            region.closeSubpath()
+        if isinstance(obj, VectorDrawingObject):
+            if self.tool == ToolKind.DRAW_SELECT_STROKE:
+                selected_strokes = self._strokes_intersecting_selection_region(
+                    obj, region
+                )
+                if self._drawing_selection_operation == "replace":
+                    strokes = selected_strokes
+                elif self._drawing_selection_operation == "add":
+                    strokes = (
+                        self._selected_vector_stroke_ids | selected_strokes
+                    )
+                else:
+                    strokes = (
+                        self._selected_vector_stroke_ids - selected_strokes
+                    )
+                self._set_vector_selection(
+                    obj, strokes,
+                    self._point_ids_for_strokes(obj, strokes),
+                )
+                self._reset_drawing_selection_frame()
+                self.update()
+                return True
+            selected_points = {
+                point.point_id
+                for stroke in obj.strokes
+                for point in stroke.points
+                if region.contains(QPointF(point.x, point.y))
+            }
+            selected_strokes = {
+                stroke.stroke_id
+                for stroke in obj.strokes
+                if any(
+                    point.point_id in selected_points
+                    for point in stroke.points
+                )
+            }
+            if self._drawing_selection_operation == "replace":
+                points, strokes = selected_points, selected_strokes
+            elif self._drawing_selection_operation == "add":
+                points = self._selected_vector_point_ids | selected_points
+                strokes = self._stroke_ids_containing_points(obj, points)
+            else:
+                points = self._selected_vector_point_ids - selected_points
+                strokes = self._stroke_ids_containing_points(obj, points)
+            self._set_vector_selection(obj, strokes, points)
+        else:
+            current = self._drawing_selection_path
+            if self._drawing_selection_operation == "replace":
+                current = region
+            elif self._drawing_selection_operation == "add":
+                current = current.united(region)
+            else:
+                current = current.subtracted(region)
+            self._drawing_selection_path = current.simplified()
+        self._reset_drawing_selection_frame()
+        self.update()
+        return True
+
+    def _draw_drawing_selection(self, painter: QPainter) -> None:
+        obj = self._drawing_selection_object()
+        if obj is None:
+            return
+        layer_x, layer_y = self.chapter.layer_world_translation(
+            obj.parent_layer_id
+        )
+        offset = QPointF(layer_x + obj.x, layer_y + obj.y)
+        painter.save()
+        painter.setBrush(Qt.NoBrush)
+        painter.setPen(QPen(
+            QColor("#59c9ff"), 1.5 / max(self.scale, 0.05),
+            Qt.DashLine,
+        ))
+        if isinstance(obj, RasterObject) and not self._drawing_selection_path.isEmpty():
+            painter.translate(offset)
+            painter.drawPath(self._drawing_selection_path)
+            painter.translate(-offset)
+        if self._drawing_selection_gesture:
+            preview = QPainterPath()
+            if self.tool == ToolKind.DRAW_SELECT_RECT:
+                preview.addRect(QRectF(
+                    self._drawing_selection_gesture[0],
+                    self._drawing_selection_gesture[-1],
+                ).normalized())
+            else:
+                preview.addPolygon(QPolygonF(self._drawing_selection_gesture))
+            painter.translate(offset)
+            painter.drawPath(preview)
+            painter.translate(-offset)
+        if self._hover_vector_stroke_id and isinstance(
+            obj, VectorDrawingObject
+        ):
+            stroke = self._vector_stroke_by_id(
+                obj, self._hover_vector_stroke_id
+            )
+            if stroke is not None:
+                painter.setPen(QPen(
+                    QColor("#239cff"), 5 / max(self.scale, 0.05),
+                    Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin,
+                ))
+                painter.translate(offset)
+                painter.drawPath(self._vector_centerline_path(stroke))
+                painter.translate(-offset)
+        quad = self._selection_transform_quad
+        if quad:
+            painter.setPen(QPen(
+                QColor("#249eff"), 1.5 / max(self.scale, 0.05)
+            ))
+            painter.drawPolygon(QPolygonF([QPointF(*point) for point in quad]))
+            radius = 6 / max(self.scale, 0.05)
+            painter.setBrush(QColor("#ffffff"))
+            for point in self._quad_handles(quad):
+                painter.drawRect(QRectF(
+                    point[0] - radius, point[1] - radius,
+                    radius * 2, radius * 2,
+                ))
+            top = self._edge_midpoints(quad)[0]
+            center = QPointF(
+                sum(point[0] for point in quad) / 4,
+                sum(point[1] for point in quad) / 4,
+            )
+            direction = QPointF(top[0], top[1]) - center
+            length = max(1e-6, math.hypot(direction.x(), direction.y()))
+            rotate = QPointF(top[0], top[1]) + direction / length * (
+                28 / max(self.scale, 0.05)
+            )
+            painter.drawLine(QPointF(*top), rotate)
+            painter.drawEllipse(rotate, radius, radius)
+            pivot = self._selection_pivot or center
+            cross = 8 / max(self.scale, 0.05)
+            painter.drawLine(
+                QPointF(pivot.x() - cross, pivot.y()),
+                QPointF(pivot.x() + cross, pivot.y()),
+            )
+            painter.drawLine(
+                QPointF(pivot.x(), pivot.y() - cross),
+                QPointF(pivot.x(), pivot.y() + cross),
+            )
+        hover = self._pointer_hover_widget or self._tablet_hover_widget
+        operation = self._selection_operation()
+        if hover is not None and operation in {"add", "remove"}:
+            marker = self.widget_to_document(hover) + QPointF(
+                14 / max(self.scale, 0.05),
+                -10 / max(self.scale, 0.05),
+            )
+            font = painter.font()
+            font.setPixelSize(max(1, round(15 / max(self.scale, 0.05))))
+            font.setBold(True)
+            painter.setFont(font)
+            painter.setPen(QPen(QColor("#239cff")))
+            painter.drawText(marker, "+" if operation == "add" else "−")
+        painter.restore()
+
+    # ---- vector drawing tools -----------------------------------------
+    def _selected_vector_drawing(self) -> VectorDrawingObject | None:
+        if self.chapter is None or self.selected_kind != "object":
+            return None
+        candidate = self.chapter.objects.get(self.selected_id)
+        return (
+            candidate if isinstance(candidate, VectorDrawingObject) else None
+        )
+
+    @property
+    def selected_vector_stroke_ids(self) -> set[str]:
+        return set(self._selected_vector_stroke_ids)
+
+    @property
+    def selected_vector_point_ids(self) -> set[str]:
+        return set(self._selected_vector_point_ids)
+
+    def _set_vector_selection(
+        self,
+        drawing: VectorDrawingObject,
+        stroke_ids: set[str] | None = None,
+        point_ids: set[str] | None = None,
+    ) -> None:
+        live_strokes = {stroke.stroke_id for stroke in drawing.strokes}
+        live_points = {
+            point.point_id
+            for stroke in drawing.strokes
+            for point in stroke.points
+        }
+        if stroke_ids is not None:
+            self._selected_vector_stroke_ids = stroke_ids & live_strokes
+        else:
+            self._selected_vector_stroke_ids &= live_strokes
+        if point_ids is not None:
+            self._selected_vector_point_ids = point_ids & live_points
+        else:
+            self._selected_vector_point_ids &= live_points
+        self.vectorSelectionChanged.emit(
+            set(self._selected_vector_stroke_ids),
+            set(self._selected_vector_point_ids),
+        )
+        self.update()
+
+    @staticmethod
+    def _vector_point_by_id(
+        drawing: VectorDrawingObject, point_id: str,
+    ) -> VectorStrokePoint | None:
+        return next((
+            point
+            for stroke in drawing.strokes
+            for point in stroke.points
+            if point.point_id == point_id
+        ), None)
+
+    @staticmethod
+    def _vector_stroke_by_id(
+        drawing: VectorDrawingObject, stroke_id: str,
+    ) -> VectorStroke | None:
+        return next((
+            stroke for stroke in drawing.strokes
+            if stroke.stroke_id == stroke_id
+        ), None)
+
+    def _hit_vector_strokes(
+        self, drawing: VectorDrawingObject, local: QPointF,
+        tolerance: float | None = None,
+    ) -> list[str]:
+        tolerance = (
+            8.0 / max(self.scale, 0.05)
+            if tolerance is None else tolerance
+        )
+        return [
+            stroke.stroke_id
+            for stroke in reversed(drawing.strokes)
+            if centerline_hit(
+                stroke.points,
+                (local.x(), local.y()),
+                closed=stroke.closed,
+                extra_tolerance=tolerance,
+            ) is not None
+        ]
+
+    def _hit_vector_point(
+        self, drawing: VectorDrawingObject, local: QPointF,
+    ) -> tuple[str, str] | None:
+        tolerance = 11.0 / max(self.scale, 0.05)
+        candidates: list[tuple[float, str, str]] = []
+        for stroke in reversed(drawing.strokes):
+            if stroke.stroke_id not in self._selected_vector_stroke_ids:
+                continue
+            for point in stroke.points:
+                separation = math.dist(
+                    (local.x(), local.y()), point.position
+                )
+                if separation <= tolerance:
+                    candidates.append(
+                        (separation, stroke.stroke_id, point.point_id)
+                    )
+        if not candidates:
+            return None
+        _, stroke_id, point_id = min(candidates)
+        return stroke_id, point_id
+
+    def _begin_vector_edit_pointer(
+        self, drawing: VectorDrawingObject, local: QPointF,
+    ) -> bool:
+        operation = self._selection_operation()
+        point_hit = self._hit_vector_point(drawing, local)
+        if point_hit is not None:
+            stroke_id, point_id = point_hit
+            strokes = set(self._selected_vector_stroke_ids)
+            strokes.add(stroke_id)
+            points = set(self._selected_vector_point_ids)
+            if operation == "remove":
+                points.discard(point_id)
+                self._set_vector_selection(drawing, strokes, points)
+                return True
+            if operation == "add":
+                points.add(point_id)
+            elif point_id not in points:
+                points = {point_id}
+            self._set_vector_selection(drawing, strokes, points)
+            self._vector_before = {
+                drawing.object_id: drawing.to_dict()
+            }
+            self._vector_drag_origin = QPointF(local)
+            self._vector_drag_points = {}
+            for selected_id in self._selected_vector_point_ids:
+                point = self._vector_point_by_id(drawing, selected_id)
+                if point is not None:
+                    self._vector_drag_points[selected_id] = (
+                        point.position, point.incoming, point.outgoing
+                    )
+            self._vector_gesture_mode = "edit_drag"
+            return True
+        stroke_hits = self._hit_vector_strokes(drawing, local)
+        if stroke_hits:
+            stroke_id = stroke_hits[0]
+            strokes = set(self._selected_vector_stroke_ids)
+            points = set(self._selected_vector_point_ids)
+            if operation == "remove":
+                strokes.discard(stroke_id)
+                stroke = self._vector_stroke_by_id(drawing, stroke_id)
+                if stroke is not None:
+                    points -= {
+                        point.point_id for point in stroke.points
+                    }
+            elif operation == "add":
+                strokes.add(stroke_id)
+            else:
+                strokes = {stroke_id}
+                points = set()
+            if operation == "remove":
+                point_ids = points
+            elif operation == "add":
+                point_ids = {
+                    point_id for point_id in points
+                    if any(
+                        stroke.stroke_id in strokes
+                        and any(
+                            point.point_id == point_id
+                            for point in stroke.points
+                        )
+                        for stroke in drawing.strokes
+                    )
+                }
+            else:
+                point_ids = set()
+            self._set_vector_selection(drawing, strokes, point_ids)
+            return True
+        self._set_vector_selection(drawing, set(), set())
+        return False
+
+    def _begin_vector_point_select(
+        self, drawing: VectorDrawingObject, local: QPointF,
+    ) -> None:
+        operation = self._selection_operation()
+        self._drawing_selection_operation = operation
+        point_hit = self._hit_vector_point(drawing, local)
+        strokes = set(self._selected_vector_stroke_ids)
+        points = set(self._selected_vector_point_ids)
+        if point_hit is not None:
+            stroke_id, point_id = point_hit
+            if operation == "remove":
+                points.discard(point_id)
+                strokes = self._stroke_ids_containing_points(
+                    drawing, points
+                )
+            elif operation == "add":
+                points.add(point_id)
+                strokes.add(stroke_id)
+            else:
+                points = {point_id}
+                strokes = {stroke_id}
+        else:
+            hits = self._hit_vector_strokes(drawing, local)
+            if hits:
+                stroke_id = hits[0]
+                stroke = self._vector_stroke_by_id(drawing, stroke_id)
+                stroke_points = {
+                    point.point_id for point in stroke.points
+                } if stroke else set()
+                if operation == "remove":
+                    points -= stroke_points
+                    strokes.discard(stroke_id)
+                elif operation == "add":
+                    strokes.add(stroke_id)
+                    points |= stroke_points
+                else:
+                    strokes = {stroke_id}
+                    points = stroke_points
+            elif operation == "replace":
+                strokes.clear()
+                points.clear()
+        self._set_vector_selection(drawing, strokes, points)
+        self._vector_gesture_mode = "point_select"
+        self._vector_sweep = [
+            FreehandSample(local.x(), local.y(), 1.0)
+        ]
+
+    def _continue_vector_point_select(
+        self, drawing: VectorDrawingObject, local: QPointF,
+    ) -> None:
+        radius = 11.0 / max(self.scale, 0.05)
+        points = set(self._selected_vector_point_ids)
+        for stroke in drawing.strokes:
+            for point in stroke.points:
+                if math.dist(point.position, (local.x(), local.y())) <= radius:
+                    if self._drawing_selection_operation == "remove":
+                        points.discard(point.point_id)
+                    else:
+                        points.add(point.point_id)
+        self._set_vector_selection(
+            drawing, self._stroke_ids_containing_points(drawing, points),
+            points,
+        )
+
+    def _update_vector_anchor_drag(
+        self, drawing: VectorDrawingObject, local: QPointF,
+    ) -> None:
+        delta = local - self._vector_drag_origin
+        for point_id, (position, incoming, outgoing) in (
+            self._vector_drag_points.items()
+        ):
+            point = self._vector_point_by_id(drawing, point_id)
+            if point is None:
+                continue
+            point.x = position[0] + delta.x()
+            point.y = position[1] + delta.y()
+            if incoming is not None:
+                point.incoming = (
+                    incoming[0] + delta.x(), incoming[1] + delta.y()
+                )
+            if outgoing is not None:
+                point.outgoing = (
+                    outgoing[0] + delta.x(), outgoing[1] + delta.y()
+                )
+        drawing.touch_revision()
+        self._vector_changed()
+
+    def _vector_pressure_values(self, pressure: float) -> tuple[float, float]:
+        pressure = pressure if pressure > 0.001 else 1.0
+        width = float(self.settings.pencil_size())
+        opacity = 1.0
+        if self._preset.pressure_size:
+            width *= self._preset.size_curve.evaluate_fast(pressure)
+        if self._preset.pressure_opacity:
+            opacity = self._preset.opacity_curve.evaluate_fast(pressure)
+        return (
+            max(1.0, min(1000.0, width)),
+            max(0.0, min(1.0, opacity)),
+        )
+
+    def _append_vector_sample(
+        self, local: QPointF, pressure: float,
+    ) -> None:
+        sample = FreehandSample(
+            local.x(), local.y(),
+            pressure if pressure > 0.001 else 1.0,
+        )
+        if (
+            self._vector_samples
+            and math.dist(
+                self._vector_samples[-1].point, sample.point
+            ) < 0.2
+        ):
+            self._vector_samples[-1] = sample
+        else:
+            self._vector_samples.append(sample)
+
+    def _begin_vector_pencil(
+        self, drawing: VectorDrawingObject, local: QPointF, pressure: float,
+    ) -> None:
+        self._vector_before = {drawing.object_id: drawing.to_dict()}
+        self._vector_gesture_mode = "pencil"
+        self._vector_samples = []
+        self._append_vector_sample(local, pressure)
+
+    def _finish_vector_pencil(
+        self, drawing: VectorDrawingObject,
+    ) -> None:
+        fitted = fit_freehand(
+            self._vector_samples,
+            error=self.settings.vector_fit_error,
+            resample_spacing=max(
+                0.5, min(2.0, self.settings.vector_fit_error / 2)
+            ),
+        )
+        if fitted:
+            points: list[VectorStrokePoint] = []
+            for fitted_point in fitted:
+                width, opacity = self._vector_pressure_values(
+                    fitted_point.pressure
+                )
+                points.append(VectorStrokePoint(
+                    x=fitted_point.x,
+                    y=fitted_point.y,
+                    incoming=fitted_point.incoming,
+                    outgoing=fitted_point.outgoing,
+                    width=width,
+                    opacity=opacity,
+                ))
+            stroke = VectorStroke(
+                color=self.primary_color,
+                points=points,
+                start_cap="round",
+                end_cap="round",
+            )
+            drawing.strokes.append(stroke)
+            drawing.touch_revision()
+        before = self._vector_before or {}
+        self._vector_gesture_mode = None
+        self._vector_samples = []
+        self._vector_before = None
+        self._push_vector_change(before, "Vector pencil stroke")
+        self.interactionFinished.emit()
+
+    def _stroke_from_spans(
+        self, source: VectorStroke, spans: list[CubicSpan],
+        *, preserve_id: bool = False,
+    ) -> VectorStroke | None:
+        if not spans:
+            return None
+
+        def attributes(segment: int, amount: float) -> tuple[float, float]:
+            return (
+                interpolate_stroke_attribute(
+                    source.points, segment, amount, "width", 1.0,
+                    closed=source.closed,
+                ),
+                interpolate_stroke_attribute(
+                    source.points, segment, amount, "opacity", 1.0,
+                    closed=source.closed,
+                ),
+            )
+
+        first = spans[0]
+        width, opacity = attributes(first.source_segment, first.t0)
+        points = [VectorStrokePoint(
+            x=first.cubic[0][0],
+            y=first.cubic[0][1],
+            width=width,
+            opacity=opacity,
+        )]
+        for span in spans:
+            current = points[-1]
+            current.outgoing = span.cubic[1]
+            width, opacity = attributes(span.source_segment, span.t1)
+            points.append(VectorStrokePoint(
+                x=span.cubic[3][0],
+                y=span.cubic[3][1],
+                incoming=span.cubic[2],
+                width=width,
+                opacity=opacity,
+            ))
+        starts_original = (
+            first.source_segment == 0 and first.t0 <= 1.0e-6
+        )
+        last = spans[-1]
+        ends_original = (
+            last.source_segment == len(stroke_cubics(
+                source.points, source.closed
+            )) - 1
+            and last.t1 >= 1 - 1.0e-6
+        )
+        result = VectorStroke(
+            color=source.color,
+            points=points,
+            start_cap=source.start_cap if starts_original else "round",
+            end_cap=source.end_cap if ends_original else "round",
+        )
+        if preserve_id:
+            result.stroke_id = source.stroke_id
+        return result
+
+    def _stroke_from_cubics(
+        self, source: VectorStroke, cubics: list[Cubic],
+        *, preserve_id: bool = True, closed: bool = False,
+    ) -> VectorStroke | None:
+        if not cubics:
+            return None
+        original = stroke_cubics(source.points, source.closed)
+
+        def attributes(point: tuple[float, float]) -> tuple[float, float]:
+            projection = nearest_on_path(original, point)
+            if projection is None:
+                return source.points[0].width, source.points[0].opacity
+            return (
+                interpolate_stroke_attribute(
+                    source.points,
+                    projection.segment_index,
+                    projection.t,
+                    "width",
+                    1.0,
+                    closed=source.closed,
+                ),
+                interpolate_stroke_attribute(
+                    source.points,
+                    projection.segment_index,
+                    projection.t,
+                    "opacity",
+                    1.0,
+                    closed=source.closed,
+                ),
+            )
+
+        width, opacity = attributes(cubics[0][0])
+        points = [VectorStrokePoint(
+            x=cubics[0][0][0],
+            y=cubics[0][0][1],
+            width=width,
+            opacity=opacity,
+        )]
+        for cubic in cubics:
+            points[-1].outgoing = cubic[1]
+            width, opacity = attributes(cubic[3])
+            points.append(VectorStrokePoint(
+                x=cubic[3][0], y=cubic[3][1],
+                incoming=cubic[2], width=width, opacity=opacity,
+            ))
+        if closed and math.dist(points[0].position, points[-1].position) < 1e-6:
+            closing = points.pop()
+            points[0].incoming = closing.incoming
+        result = VectorStroke(
+            color=source.color,
+            closed=closed,
+            start_cap=source.start_cap,
+            end_cap=source.end_cap,
+            points=points,
+        )
+        if preserve_id:
+            result.stroke_id = source.stroke_id
+        return result
+
+    def _vector_stroke_touched(
+        self, stroke: VectorStroke, sweep: list[tuple[float, float]],
+        radius: float,
+    ) -> bool:
+        shape = "square" if self.settings.eraser_square else "round"
+        if len(stroke.points) == 1:
+            point = stroke.points[0]
+            return corridor_contains(
+                point.position,
+                sweep,
+                radius + point.width / 2,
+                shape=shape,
+            )
+        cubics = stroke_cubics(stroke.points, stroke.closed)
+        for segment_index, cubic in enumerate(cubics):
+            following = (segment_index + 1) % len(stroke.points)
+            local_width = max(
+                stroke.points[segment_index].width,
+                stroke.points[following].width,
+            )
+            if corridor_hits_path(
+                [cubic],
+                sweep,
+                radius + local_width / 2,
+                shape=shape,
+            ):
+                return True
+        return False
+
+    def _erase_vector_intersection_groups(
+        self,
+        drawing: VectorDrawingObject,
+        stroke: VectorStroke,
+        cubics: list[Cubic],
+        sweep: list[tuple[float, float]],
+        radius: float,
+    ) -> list[list[CubicSpan]]:
+        shape = "square" if self.settings.eraser_square else "round"
+        touched: list[tuple[float, float]] = []
+        for segment_index, cubic in enumerate(cubics):
+            following = (segment_index + 1) % len(stroke.points)
+            local_width = max(
+                stroke.points[segment_index].width,
+                stroke.points[following].width,
+            )
+            for _, start, end in corridor_path_intervals(
+                [cubic],
+                sweep,
+                radius + local_width / 2,
+                shape=shape,
+            ):
+                parameter = (start + end) / 2
+                touched.append((
+                    distance_to_polyline(
+                        cubic_eval(cubic, parameter), sweep
+                    ),
+                    segment_index + parameter,
+                ))
+        if not touched:
+            return [[
+                CubicSpan(cubic, index, 0.0, 1.0)
+                for index, cubic in enumerate(cubics)
+            ]]
+        scalar = min(touched)[1]
+        cuts: list[float] = []
+        for intersection in path_self_intersections(
+            cubics, closed=stroke.closed
+        ):
+            cuts.extend((
+                intersection.first_segment + intersection.first_t,
+                intersection.second_segment + intersection.second_t,
+            ))
+        for other in drawing.strokes:
+            if other is stroke or len(other.points) < 2:
+                continue
+            for intersection in path_intersections(
+                cubics, stroke_cubics(other.points, other.closed)
+            ):
+                cuts.append(
+                    intersection.first_segment + intersection.first_t
+                )
+        cuts = sorted({
+            round(value, 9) for value in cuts
+            if abs(value - scalar) > 1.0e-6
+        })
+        length = float(len(cubics))
+        if not stroke.closed:
+            cuts = [0.0, *cuts, length]
+        if not cuts:
+            return []
+        before = max(
+            (value for value in cuts if value < scalar), default=None
+        )
+        after = min(
+            (value for value in cuts if value > scalar), default=None
+        )
+        if stroke.closed:
+            if before is None:
+                before = max(cuts) - length
+            if after is None:
+                after = min(cuts) + length
+        if before is None or after is None:
+            return []
+        erased: dict[int, list[tuple[float, float]]] = {}
+        cursor = before
+        while cursor < after - 1.0e-8:
+            wrapped = cursor % len(cubics)
+            index = int(math.floor(wrapped)) % len(cubics)
+            start = wrapped - math.floor(wrapped)
+            amount = min(1.0 - start, after - cursor)
+            erased.setdefault(index, []).append(
+                (start, start + amount)
+            )
+            cursor += amount
+
+        def complement(
+            values: list[tuple[float, float]],
+        ) -> list[tuple[float, float]]:
+            if not values:
+                return [(0.0, 1.0)]
+            merged: list[list[float]] = []
+            for start, end in sorted(values):
+                if not merged or start > merged[-1][1] + 1.0e-7:
+                    merged.append([start, end])
+                else:
+                    merged[-1][1] = max(merged[-1][1], end)
+            result = []
+            position = 0.0
+            for start, end in merged:
+                if start > position + 1.0e-7:
+                    result.append((position, start))
+                position = max(position, end)
+            if position < 1.0 - 1.0e-7:
+                result.append((position, 1.0))
+            return result
+
+        groups: list[list[CubicSpan]] = []
+        current: list[CubicSpan] = []
+        for index, cubic in enumerate(cubics):
+            kept = complement(erased.get(index, []))
+            for kept_index, (start, end) in enumerate(kept):
+                if (
+                    current
+                    and not (
+                        current[-1].source_segment == index - 1
+                        and current[-1].t1 >= 1 - 1.0e-7
+                        and start <= 1.0e-7
+                        and kept_index == 0
+                    )
+                ):
+                    groups.append(current)
+                    current = []
+                current.append(CubicSpan(
+                    cubic_subsegment(cubic, start, end),
+                    index,
+                    start,
+                    end,
+                ))
+                if end < 1 - 1.0e-7:
+                    groups.append(current)
+                    current = []
+            if not kept and current:
+                groups.append(current)
+                current = []
+        if current:
+            groups.append(current)
+        return groups
+
+    def _finish_vector_eraser(
+        self, drawing: VectorDrawingObject,
+    ) -> None:
+        before = self._vector_before or {}
+        if before:
+            self._restore_vector_payloads(before)
+            drawing = self._selected_vector_drawing() or drawing
+        self._apply_vector_eraser_sweep(drawing)
+        self._set_vector_selection(drawing)
+        self._vector_gesture_mode = None
+        self._vector_sweep = []
+        self._vector_before = None
+        self._push_vector_change(before, "Vector eraser")
+        self.interactionFinished.emit()
+
+    def _apply_vector_eraser_sweep(
+        self, drawing: VectorDrawingObject,
+    ) -> bool:
+        sweep = [sample.point for sample in self._vector_sweep]
+        if not sweep:
+            return False
+        radius = self.settings.active_eraser_pixels() / 2
+        mode = self.settings.vector_eraser_mode
+        rebuilt: list[VectorStroke] = []
+        changed = False
+        for stroke in drawing.strokes:
+            if not self._vector_stroke_touched(stroke, sweep, radius):
+                rebuilt.append(stroke)
+                continue
+            changed = True
+            if mode == "stroke" or len(stroke.points) == 1:
+                continue
+            cubics = stroke_cubics(stroke.points, stroke.closed)
+            groups = (
+                self._erase_vector_intersection_groups(
+                    drawing, stroke, cubics, sweep, radius
+                )
+                if mode == "intersection"
+                else erase_stroke_by_corridor(
+                    stroke.points,
+                    sweep,
+                    radius,
+                    shape=(
+                        "square" if self.settings.eraser_square else "round"
+                    ),
+                    closed=stroke.closed,
+                )
+            )
+            for group_index, group in enumerate(groups):
+                replacement = self._stroke_from_spans(
+                    stroke, group, preserve_id=group_index == 0
+                )
+                if replacement is not None:
+                    rebuilt.append(replacement)
+        if changed:
+            drawing.strokes = rebuilt
+            drawing.touch_revision()
+            self._vector_changed()
+        return changed
+
+    def _manual_redraw_at(
+        self, drawing: VectorDrawingObject,
+        local: QPointF, pressure: float,
+    ) -> None:
+        radius = 12.0 / max(self.scale, 0.05)
+        curve = (
+            self._preset.size_curve
+            if self.settings.vector_redraw_parameter == "thickness"
+            else self._preset.opacity_curve
+        )
+        mapped = curve.evaluate_fast(
+            pressure if pressure > 0.001 else 1.0
+        )
+        changed = False
+        for stroke in drawing.strokes:
+            for point in stroke.points:
+                if math.dist(point.position, (local.x(), local.y())) > radius:
+                    continue
+                if self.settings.vector_redraw_parameter == "thickness":
+                    point.width = max(
+                        1.0,
+                        min(
+                            1000.0,
+                            1.0
+                            + (
+                                self.settings.vector_redraw_thickness_max - 1
+                            ) * mapped,
+                        ),
+                    )
+                else:
+                    point.opacity = max(
+                        0.0,
+                        min(
+                            1.0,
+                            self.settings.vector_redraw_opacity_max
+                            / 100 * mapped,
+                        ),
+                    )
+                changed = True
+        if changed:
+            drawing.touch_revision()
+            self._vector_changed()
+
+    def _vector_target_points(
+        self, drawing: VectorDrawingObject,
+    ) -> list[VectorStrokePoint]:
+        if self._selected_vector_point_ids:
+            return [
+                point
+                for stroke in drawing.strokes
+                for point in stroke.points
+                if point.point_id in self._selected_vector_point_ids
+            ]
+        if self._selected_vector_stroke_ids:
+            return [
+                point
+                for stroke in drawing.strokes
+                if stroke.stroke_id in self._selected_vector_stroke_ids
+                for point in stroke.points
+            ]
+        return [
+            point for stroke in drawing.strokes for point in stroke.points
+        ]
+
+    def apply_vector_redraw(
+        self,
+        parameter: str | None = None,
+        operation: str | None = None,
+        value: float | None = None,
+    ) -> bool:
+        drawing = self._selected_vector_drawing()
+        if drawing is None:
+            return False
+        targets = self._vector_target_points(drawing)
+        if not targets:
+            return False
+        before = {drawing.object_id: drawing.to_dict()}
+        parameter = parameter or self.settings.vector_redraw_parameter
+        operation = operation or self.settings.vector_redraw_operation
+        amount = (
+            self.settings.vector_redraw_amount
+            if value is None else float(value)
+        )
+        if parameter not in {"thickness", "opacity"}:
+            return False
+        if operation not in {"increase", "decrease", "uniform"}:
+            return False
+        for point in targets:
+            current = point.width if parameter == "thickness" else point.opacity
+            value = amount if parameter == "thickness" else amount / 100
+            if operation == "increase":
+                current += value
+            elif operation == "decrease":
+                current -= value
+            else:
+                current = value
+            if parameter == "thickness":
+                point.width = max(1.0, min(1000.0, current))
+            else:
+                point.opacity = max(0.0, min(1.0, current))
+        drawing.touch_revision()
+        return self._push_vector_change(before, "Redraw vector parameter")
+
+    def _simplify_vector_stroke(
+        self, stroke: VectorStroke,
+    ) -> VectorStroke:
+        cubics = stroke_cubics(stroke.points, stroke.closed)
+        if not cubics:
+            return stroke
+        rebuilt, _mapping = self._simplify_vector_stroke_segments(
+            stroke, set(range(len(cubics))), set()
+        )
+        return rebuilt
+
+    @staticmethod
+    def _segments_incident_to_points(
+        stroke: VectorStroke, point_ids: set[str],
+    ) -> set[int]:
+        count = len(stroke.points)
+        if count < 2:
+            return set()
+        result: set[int] = set()
+        for index, point in enumerate(stroke.points):
+            if point.point_id not in point_ids:
+                continue
+            if stroke.closed:
+                result.update({(index - 1) % count, index % count})
+            else:
+                if index > 0:
+                    result.add(index - 1)
+                if index < count - 1:
+                    result.add(index)
+        return result
+
+    def _simplify_vector_stroke_segments(
+        self, stroke: VectorStroke, segment_indexes: set[int],
+        remap_point_ids: set[str],
+    ) -> tuple[VectorStroke, dict[str, str]]:
+        cubics = stroke_cubics(stroke.points, stroke.closed)
+        if not cubics or not segment_indexes:
+            return stroke, {
+                point_id: point_id for point_id in remap_point_ids
+            }
+        rebuilt_cubics = simplify_cubic_segments(
+            cubics, segment_indexes,
+            self.settings.vector_simplify_amount,
+            closed=stroke.closed,
+        )
+        rebuilt = self._stroke_from_cubics(
+            stroke, rebuilt_cubics,
+            preserve_id=True, closed=stroke.closed,
+        ) or stroke
+        # Keep stable IDs for every anchor that survives at the same position,
+        # including every boundary of an untouched cubic run.
+        used: set[int] = set()
+        preserved: dict[str, str] = {}
+        for original in stroke.points:
+            candidates = [
+                (math.dist(original.position, candidate.position), index)
+                for index, candidate in enumerate(rebuilt.points)
+                if index not in used
+            ]
+            if not candidates:
+                continue
+            distance, index = min(candidates)
+            if distance <= 1.0e-6:
+                rebuilt.points[index].point_id = original.point_id
+                used.add(index)
+                preserved[original.point_id] = original.point_id
+        mapping: dict[str, str] = {}
+        for point_id in remap_point_ids:
+            if point_id in preserved:
+                mapping[point_id] = point_id
+                continue
+            original = next((
+                point for point in stroke.points
+                if point.point_id == point_id
+            ), None)
+            if original is None or not rebuilt.points:
+                continue
+            nearest = min(
+                rebuilt.points,
+                key=lambda point: math.dist(
+                    original.position, point.position
+                ),
+            )
+            mapping[point_id] = nearest.point_id
+        return rebuilt, mapping
+
+    def apply_vector_simplify(self, amount: int | None = None) -> bool:
+        drawing = self._selected_vector_drawing()
+        if drawing is None or not drawing.strokes:
+            return False
+        previous_amount = self.settings.vector_simplify_amount
+        if amount is not None:
+            self.settings.vector_simplify_amount = max(
+                0, min(100, int(amount))
+            )
+        selected_points = set(self._selected_vector_point_ids)
+        selected_strokes = set(self._selected_vector_stroke_ids)
+        before = {drawing.object_id: drawing.to_dict()}
+        rebuilt_strokes: list[VectorStroke] = []
+        remapped_points: set[str] = set()
+        affected_strokes: set[str] = set()
+        for stroke in drawing.strokes:
+            if selected_points:
+                local_points = {
+                    point.point_id for point in stroke.points
+                    if point.point_id in selected_points
+                }
+                segments = self._segments_incident_to_points(
+                    stroke, local_points
+                )
+            elif not selected_strokes or stroke.stroke_id in selected_strokes:
+                local_points = set()
+                segments = set(range(len(stroke_cubics(
+                    stroke.points, stroke.closed
+                ))))
+            else:
+                local_points, segments = set(), set()
+            if not segments:
+                rebuilt_strokes.append(stroke)
+                continue
+            rebuilt, mapping = self._simplify_vector_stroke_segments(
+                stroke, segments, local_points
+            )
+            rebuilt_strokes.append(rebuilt)
+            affected_strokes.add(stroke.stroke_id)
+            remapped_points.update(mapping.values())
+        drawing.strokes = rebuilt_strokes
+        if not affected_strokes:
+            if amount is not None:
+                self.settings.vector_simplify_amount = previous_amount
+            return False
+        drawing.touch_revision()
+        if selected_points:
+            self._set_vector_selection(
+                drawing, affected_strokes, remapped_points
+            )
+        else:
+            self._set_vector_selection(
+                drawing,
+                selected_strokes if selected_strokes else affected_strokes,
+                set(),
+            )
+        changed = self._push_vector_change(before, "Simplify vector line")
+        if amount is not None:
+            self.settings.vector_simplify_amount = previous_amount
+        return changed
+
+    def _collect_vector_endpoint(
+        self, drawing: VectorDrawingObject, local: QPointF,
+    ) -> None:
+        candidates: list[tuple[float, str, str]] = []
+        for stroke in reversed(drawing.strokes):
+            if not stroke.points:
+                continue
+            endpoints = [("start", stroke.points[0])]
+            if len(stroke.points) > 1 and not stroke.closed:
+                endpoints.append(("end", stroke.points[-1]))
+            for end, point in endpoints:
+                separation = math.dist(
+                    point.position, (local.x(), local.y())
+                )
+                tolerance = max(
+                    12.0 / max(self.scale, 0.05), point.width / 2
+                )
+                if separation <= tolerance:
+                    candidates.append(
+                        (separation, stroke.stroke_id, end)
+                    )
+        if candidates:
+            _, stroke_id, endpoint = min(candidates)
+            candidate = stroke_id, endpoint
+            if candidate not in self._vector_connect_endpoints:
+                self._vector_connect_endpoints.append(candidate)
+
+    @staticmethod
+    def _reverse_vector_points(
+        points: list[VectorStrokePoint],
+    ) -> list[VectorStrokePoint]:
+        result: list[VectorStrokePoint] = []
+        for point in reversed(points):
+            result.append(VectorStrokePoint(
+                point_id=point.point_id,
+                x=point.x,
+                y=point.y,
+                incoming=point.outgoing,
+                outgoing=point.incoming,
+                width=point.width,
+                opacity=point.opacity,
+            ))
+        return result
+
+    def _finish_vector_connect(
+        self, drawing: VectorDrawingObject,
+    ) -> None:
+        before = self._vector_before or {}
+        endpoints = self._vector_connect_endpoints[:2]
+        changed = False
+        if len(endpoints) == 2:
+            first_id, first_end = endpoints[0]
+            second_id, second_end = endpoints[1]
+            first = self._vector_stroke_by_id(drawing, first_id)
+            second = self._vector_stroke_by_id(drawing, second_id)
+            if first is not None and second is not None:
+                if first is second and first_end != second_end:
+                    oriented = (
+                        self._reverse_vector_points(first.points)
+                        if first_end == "start" else [
+                            VectorStrokePoint.from_dict(point.to_dict())
+                            for point in first.points
+                        ]
+                    )
+                    cubics = stroke_cubics(oriented, False)
+                    departure = (
+                        cubic_derivative(cubics[-1], 1)
+                        if cubics else (1.0, 0.0)
+                    )
+                    arrival = (
+                        cubic_derivative(cubics[0], 0)
+                        if cubics else (1.0, 0.0)
+                    )
+                    bridge = tangent_bridge(
+                        oriented[-1].position,
+                        oriented[0].position,
+                        departure,
+                        arrival,
+                    )
+                    oriented[-1].outgoing = bridge[1]
+                    oriented[0].incoming = bridge[2]
+                    first.points = oriented
+                    first.closed = True
+                    changed = True
+                elif first is not second:
+                    first_points = (
+                        self._reverse_vector_points(first.points)
+                        if first_end == "start" else [
+                            VectorStrokePoint.from_dict(point.to_dict())
+                            for point in first.points
+                        ]
+                    )
+                    second_points = (
+                        self._reverse_vector_points(second.points)
+                        if second_end == "end" else [
+                            VectorStrokePoint.from_dict(point.to_dict())
+                            for point in second.points
+                        ]
+                    )
+                    first_cubics = stroke_cubics(first_points, False)
+                    second_cubics = stroke_cubics(second_points, False)
+                    departure = (
+                        cubic_derivative(first_cubics[-1], 1)
+                        if first_cubics else (
+                            second_points[0].x - first_points[-1].x,
+                            second_points[0].y - first_points[-1].y,
+                        )
+                    )
+                    arrival = (
+                        cubic_derivative(second_cubics[0], 0)
+                        if second_cubics else departure
+                    )
+                    bridge = tangent_bridge(
+                        first_points[-1].position,
+                        second_points[0].position,
+                        departure,
+                        arrival,
+                    )
+                    first_points[-1].outgoing = bridge[1]
+                    second_points[0].incoming = bridge[2]
+                    first.points = [*first_points, *second_points]
+                    first.closed = False
+                    drawing.strokes = [
+                        stroke for stroke in drawing.strokes
+                        if stroke is not second
+                    ]
+                    changed = True
+        if changed:
+            drawing.touch_revision()
+        self._vector_gesture_mode = None
+        self._vector_sweep = []
+        self._vector_connect_endpoints = []
+        self._vector_before = None
+        self._set_vector_selection(drawing)
+        self._push_vector_change(before, "Connect vector lines")
+        self.interactionFinished.emit()
+
+    def _finish_vector_simplify_gesture(
+        self, drawing: VectorDrawingObject,
+    ) -> None:
+        before = self._vector_before or {}
+        changed = False
+        rebuilt: list[VectorStroke] = []
+        affected_strokes: set[str] = set()
+        remapped_points: set[str] = set()
+        selected_points = set(self._vector_simplify_point_ids)
+        for stroke in drawing.strokes:
+            local_points = {
+                point.point_id for point in stroke.points
+                if point.point_id in selected_points
+            }
+            segments = self._segments_incident_to_points(
+                stroke, local_points
+            )
+            if not segments:
+                rebuilt.append(stroke)
+                continue
+            simplified, mapping = self._simplify_vector_stroke_segments(
+                stroke, segments, local_points
+            )
+            rebuilt.append(simplified)
+            affected_strokes.add(stroke.stroke_id)
+            remapped_points.update(mapping.values())
+            changed = True
+        if changed:
+            drawing.strokes = rebuilt
+            drawing.touch_revision()
+        self._vector_gesture_mode = None
+        self._vector_sweep = []
+        self._vector_simplify_point_ids.clear()
+        self._vector_before = None
+        self._set_vector_selection(
+            drawing, affected_strokes, remapped_points
+        )
+        self._push_vector_change(before, "Simplify vector line")
+        self.tool = ToolKind.VECTOR_EDIT
+        self.toolChanged.emit(self.tool)
+        self.interactionFinished.emit()
+
+    def _update_simplify_point_sweep(
+        self, drawing: VectorDrawingObject,
+    ) -> None:
+        if not self._vector_sweep:
+            return
+        sweep = [sample.point for sample in self._vector_sweep]
+        radius = 12.0 / max(self.scale, 0.05)
+        self._vector_simplify_point_ids = {
+            point.point_id
+            for stroke in drawing.strokes
+            for point in stroke.points
+            if corridor_contains(point.position, sweep, radius)
+        }
+
+    def _vector_fill_settings(self) -> dict:
+        return {
+            "close_gaps": self.settings.fill_close_gaps,
+            "gap_threshold": self.settings.fill_gap_threshold,
+            "fill_narrow_areas": self.settings.fill_narrow_areas,
+            "area_scaling": self.settings.fill_area_scaling,
+            "area_amount": self.settings.fill_area_amount,
+            "area_mode": self.settings.fill_area_mode,
+            "mode": self.settings.fill_mode,
+        }
+
+    def _face_path(
+        self, face, drawing: VectorDrawingObject | None = None,
+    ) -> QPainterPath:
+        path = QPainterPath()
+        if not face.vertices:
+            return path
+        path.moveTo(QPointF(*face.vertices[0]))
+        source_paths = (
+            [
+                stroke_cubics(stroke.points, stroke.closed)
+                for stroke in drawing.strokes
+                if stroke_cubics(stroke.points, stroke.closed)
+            ]
+            if drawing is not None else []
+        )
+        for edge in face.edges:
+            provenance = edge.provenance
+            if (
+                provenance.path_index >= 0
+                and provenance.path_index < len(source_paths)
+                and provenance.segment_index >= 0
+                and provenance.segment_index
+                < len(source_paths[provenance.path_index])
+                and not provenance.virtual
+            ):
+                cubic = source_paths[
+                    provenance.path_index
+                ][provenance.segment_index]
+                subspan = cubic_subsegment(
+                    cubic, provenance.t0, provenance.t1
+                )
+                path.cubicTo(
+                    QPointF(*subspan[1]),
+                    QPointF(*subspan[2]),
+                    QPointF(*subspan[3]),
+                )
+            else:
+                path.lineTo(QPointF(*edge.end))
+        path.closeSubpath()
+        return path
+
+    def _scale_vector_fill_path(self, path: QPainterPath) -> QPainterPath:
+        if (
+            not self.settings.fill_area_scaling
+            or abs(self.settings.fill_area_amount) <= 1.0e-6
+        ):
+            return path
+        amount = self.settings.fill_area_amount
+        stroker = QPainterPathStroker()
+        stroker.setWidth(abs(amount) * 2)
+        stroker.setJoinStyle(
+            Qt.RoundJoin
+            if self.settings.fill_area_mode == "round"
+            else Qt.MiterJoin
+        )
+        stroker.setCapStyle(
+            Qt.RoundCap
+            if self.settings.fill_area_mode == "round"
+            else Qt.SquareCap
+        )
+        border = stroker.createStroke(path)
+        return (
+            path.united(border)
+            if amount > 0 else path.subtracted(border)
+        )
+
+    def _remove_narrow_vector_fill_areas(
+        self, path: QPainterPath,
+    ) -> QPainterPath:
+        """Remove thin corridors without rejecting an otherwise large face."""
+        if self.settings.fill_narrow_areas or path.isEmpty():
+            return path
+        width = max(
+            2.0,
+            self.settings.fill_gap_threshold
+            if self.settings.fill_close_gaps else 2.0,
+        )
+        stroker = QPainterPathStroker()
+        stroker.setWidth(width)
+        stroker.setJoinStyle(Qt.RoundJoin)
+        stroker.setCapStyle(Qt.RoundCap)
+        core = path.subtracted(stroker.createStroke(path))
+        if core.isEmpty():
+            return QPainterPath()
+        restored = core.united(stroker.createStroke(core))
+        return restored.intersected(path)
+
+    def _prepare_vector_fill_path(
+        self, path: QPainterPath,
+    ) -> QPainterPath:
+        return self._scale_vector_fill_path(
+            self._remove_narrow_vector_fill_areas(path)
+        )
+
+    def _geometry_for_face(
+        self, face, drawing: VectorDrawingObject,
+    ) -> BoundGeometry | None:
+        path = self._prepare_vector_fill_path(
+            self._face_path(face, drawing)
+        )
+        if path.isEmpty():
+            return None
+        return self._geometry_from_painter_path(path)
+
+    def _vector_fill_faces(self, drawing: VectorDrawingObject):
+        paths: list[list[Cubic]] = []
+        closed: list[bool] = []
+        for stroke in drawing.strokes:
+            cubics = stroke_cubics(stroke.points, stroke.closed)
+            if not cubics:
+                continue
+            paths.append(cubics)
+            closed.append(stroke.closed)
+        if not paths:
+            return []
+        faces = trace_cubic_faces(
+            paths,
+            closed=closed,
+            gap_threshold=(
+                self.settings.fill_gap_threshold
+                if self.settings.fill_close_gaps else 0.0
+            ),
+            flatten_tolerance=0.2,
+        )
+        return faces
+
+    def _point_hits_vector_stroke(
+        self, drawing: VectorDrawingObject, local: tuple[float, float],
+    ) -> bool:
+        return any(
+            centerline_hit(
+                stroke.points,
+                local,
+                closed=stroke.closed,
+                extra_tolerance=1.0 / max(self.scale, 0.05),
+            ) is not None
+            for stroke in drawing.strokes
+        )
+
+    def _existing_fill_at(
+        self, drawing: VectorDrawingObject, local: tuple[float, float],
+    ) -> VectorFillObject | None:
+        return next((
+            fill
+            for fill in self.chapter.vector_fill_children(drawing.object_id)
+            if self.bound_path(fill.geometry).contains(QPointF(*local))
+        ), None)
+
+    def _finish_vector_fill(
+        self, drawing: VectorDrawingObject,
+    ) -> None:
+        before = self._vector_before or self._capture_vector_graph(drawing)
+        samples = [sample.point for sample in self._vector_sweep]
+        faces = self._vector_fill_faces(drawing)
+        created = False
+        changed = False
+        settings = self._vector_fill_settings()
+        if self.settings.fill_mode == "enclose":
+            if len(samples) >= 3:
+                lasso = QPainterPath()
+                lasso.addPolygon(QPolygonF([
+                    QPointF(*point) for point in samples
+                ]))
+                lasso.closeSubpath()
+                chosen = []
+                for face in faces:
+                    centroid = (
+                        sum(point[0] for point in face.vertices)
+                        / len(face.vertices),
+                        sum(point[1] for point in face.vertices)
+                        / len(face.vertices),
+                    )
+                    if lasso.contains(QPointF(*centroid)):
+                        chosen.append(face)
+                compiled = QPainterPath()
+                for face in chosen:
+                    compiled = compiled.united(
+                        self._face_path(face, drawing)
+                    )
+                compiled = self._prepare_vector_fill_path(compiled)
+                geometry = self._geometry_from_painter_path(compiled)
+                if geometry is not None:
+                    probe = next(iter(chosen), None)
+                    centroid = (
+                        (
+                            sum(point[0] for point in probe.vertices)
+                            / len(probe.vertices),
+                            sum(point[1] for point in probe.vertices)
+                            / len(probe.vertices),
+                        )
+                        if probe is not None else samples[0]
+                    )
+                    fill = self._existing_fill_at(drawing, centroid)
+                    if fill is None:
+                        fill = VectorFillObject(
+                            geometry=geometry,
+                            fill_color=self.primary_color,
+                            source_lasso=list(samples),
+                            fill_settings=settings,
+                        )
+                        self.chapter.add_vector_fill(
+                            drawing.object_id, fill, index=0
+                        )
+                        created = True
+                    else:
+                        fill.geometry = geometry
+                        fill.fill_color = self.primary_color
+                        fill.source_lasso = list(samples)
+                        fill.source_seed = None
+                        fill.fill_settings = settings
+                        drawing.touch_revision()
+                    changed = True
+        else:
+            used: set[tuple[tuple[float, float], ...]] = set()
+            for seed in samples:
+                if self._point_hits_vector_stroke(drawing, seed):
+                    continue
+                face = find_face_containing(faces, seed)
+                if face is None:
+                    continue
+                signature = tuple(sorted(
+                    (round(point[0], 3), round(point[1], 3))
+                    for point in face.vertices
+                ))
+                if signature in used:
+                    continue
+                used.add(signature)
+                geometry = self._geometry_for_face(face, drawing)
+                if geometry is None:
+                    continue
+                fill = self._existing_fill_at(drawing, seed)
+                if fill is None:
+                    fill = VectorFillObject(
+                        geometry=geometry,
+                        fill_color=self.primary_color,
+                        source_seed=seed,
+                        fill_settings=settings,
+                    )
+                    self.chapter.add_vector_fill(
+                        drawing.object_id, fill, index=0
+                    )
+                    created = True
+                else:
+                    fill.geometry = geometry
+                    fill.fill_color = self.primary_color
+                    fill.source_seed = seed
+                    fill.source_lasso = []
+                    fill.fill_settings = settings
+                    drawing.touch_revision()
+                changed = True
+        self._vector_gesture_mode = None
+        self._vector_sweep = []
+        self._vector_before = None
+        if changed:
+            self._push_vector_change(
+                before, "Vector fill", hierarchy=created
+            )
+        self.set_selection(
+            "object", drawing.object_id, activate_default_tool=False
+        )
+        self.tool = ToolKind.FILL
+        self.toolChanged.emit(self.tool)
+        self.interactionFinished.emit()
+        self.update()
+
+    def _apply_shape_fill(self, world: QPointF) -> bool:
+        if (
+            self.chapter is None
+            or self.selected_kind != "layer"
+            or self.selected_id not in self.chapter.layers
+        ):
+            return False
+        layer = self.chapter.layers[self.selected_id]
+        if (
+            layer.bound is None or layer.is_page
+            or layer.layer_kind == "fill"
+        ):
+            return False
+        before = self.chapter.to_dict()
+        if self._shape_border_contains(layer.layer_id, world, raw=True):
+            layer.shape_style.outline_color = self.primary_color
+            if layer.shape_style.outline_thickness <= 0:
+                layer.shape_style.outline_thickness = 4.0
+        elif layer.bound.closed:
+            world_x, world_y = self.chapter.layer_world_translation(
+                layer.layer_id
+            )
+            local = QPointF(world.x() - world_x, world.y() - world_y)
+            if not self.layer_effective_path(layer.layer_id).contains(local):
+                return False
+            layer.shape_style.primary_color = self.primary_color
+        else:
+            return False
+        after = self.chapter.to_dict()
+        self.push_model_change(before, after, "Fill shape")
+        self.documentChanged.emit(QRectF())
+        self.interactionFinished.emit()
+        self.update()
+        return True
+
+    def _begin_vector_gesture(
+        self, drawing: VectorDrawingObject,
+        world: QPointF, pressure: float,
+    ) -> None:
+        local = self._vector_local_point(drawing, world)
+        if self.tool == ToolKind.RASTER_PENCIL:
+            self._begin_vector_pencil(drawing, local, pressure)
+            return
+        if self.tool == ToolKind.RASTER_ERASER:
+            self._vector_before = {drawing.object_id: drawing.to_dict()}
+            self._vector_gesture_mode = "eraser"
+        elif self.tool == ToolKind.VECTOR_REDRAW:
+            if self.settings.vector_redraw_interaction == "point":
+                self._begin_vector_point_select(drawing, local)
+                return
+            self._vector_before = {drawing.object_id: drawing.to_dict()}
+            self._vector_gesture_mode = "redraw"
+        elif self.tool == ToolKind.VECTOR_CONNECT:
+            self._vector_before = {drawing.object_id: drawing.to_dict()}
+            self._vector_gesture_mode = "connect"
+            self._vector_connect_endpoints = []
+        elif self.tool == ToolKind.VECTOR_SIMPLIFY:
+            self._vector_before = {drawing.object_id: drawing.to_dict()}
+            self._vector_gesture_mode = "simplify"
+        elif self.tool == ToolKind.FILL:
+            self._vector_before = self._capture_vector_graph(drawing)
+            self._vector_gesture_mode = "fill"
+        self._vector_sweep = [
+            FreehandSample(local.x(), local.y(), pressure)
+        ]
+        if self._vector_gesture_mode == "simplify":
+            self._update_simplify_point_sweep(drawing)
+        if self._vector_gesture_mode == "redraw":
+            self._manual_redraw_at(drawing, local, pressure)
+        elif self._vector_gesture_mode == "connect":
+            self._collect_vector_endpoint(drawing, local)
+
+    def _continue_vector_gesture(
+        self, world: QPointF, pressure: float,
+    ) -> None:
+        drawing = (
+            self._active_vector_drawing()
+            if self._vector_gesture_mode == "fill"
+            else self._selected_vector_drawing()
+        )
+        if drawing is None:
+            return
+        local = self._vector_local_point(drawing, world)
+        if self._vector_gesture_mode == "edit_drag":
+            self._update_vector_anchor_drag(drawing, local)
+            return
+        if self._vector_gesture_mode == "point_select":
+            self._continue_vector_point_select(drawing, local)
+            return
+        if self._vector_gesture_mode == "pencil":
+            self._append_vector_sample(local, pressure)
+            self.update()
+            return
+        sample = FreehandSample(local.x(), local.y(), pressure)
+        if not self._vector_sweep:
+            self._vector_sweep.append(sample)
+        elif self._vector_gesture_mode == "fill":
+            previous = self._vector_sweep[-1]
+            separation = math.dist(previous.point, sample.point)
+            spacing = max(1.0, 4.0 / max(self.scale, 0.05))
+            steps = min(4096, max(1, math.ceil(separation / spacing)))
+            for step in range(1, steps + 1):
+                amount = step / steps
+                self._vector_sweep.append(FreehandSample(
+                    previous.x + (sample.x - previous.x) * amount,
+                    previous.y + (sample.y - previous.y) * amount,
+                    previous.pressure
+                    + (sample.pressure - previous.pressure) * amount,
+                ))
+        elif math.dist(self._vector_sweep[-1].point, sample.point) >= 0.2:
+            self._vector_sweep.append(sample)
+        if self._vector_gesture_mode == "simplify":
+            self._update_simplify_point_sweep(drawing)
+        if self._vector_gesture_mode == "redraw":
+            self._manual_redraw_at(drawing, local, pressure)
+        elif self._vector_gesture_mode == "connect":
+            self._collect_vector_endpoint(drawing, local)
+        elif (
+            self._vector_gesture_mode == "eraser"
+            and len(self._vector_sweep) % 2 == 0
+            and self._vector_before
+        ):
+            self._restore_vector_payloads(self._vector_before)
+            drawing = self._selected_vector_drawing() or drawing
+            self._apply_vector_eraser_sweep(drawing)
+        self.update()
+
+    def _end_vector_gesture(self) -> None:
+        drawing = (
+            self._active_vector_drawing()
+            if self._vector_gesture_mode == "fill"
+            else self._selected_vector_drawing()
+        )
+        if drawing is None:
+            self._cancel_vector_gesture()
+            return
+        mode = self._vector_gesture_mode
+        if mode == "edit_drag":
+            before = self._vector_before or {}
+            self._vector_gesture_mode = None
+            self._vector_before = None
+            self._vector_drag_points.clear()
+            self._push_vector_change(before, "Move vector points")
+            self.interactionFinished.emit()
+        elif mode == "point_select":
+            self._vector_gesture_mode = None
+            self._vector_sweep = []
+            self.interactionFinished.emit()
+        elif mode == "pencil":
+            self._finish_vector_pencil(drawing)
+        elif mode == "eraser":
+            self._finish_vector_eraser(drawing)
+        elif mode == "redraw":
+            before = self._vector_before or {}
+            self._vector_gesture_mode = None
+            self._vector_before = None
+            self._vector_sweep = []
+            self._push_vector_change(before, "Redraw vector parameter")
+            self.interactionFinished.emit()
+        elif mode == "connect":
+            self._finish_vector_connect(drawing)
+        elif mode == "simplify":
+            self._finish_vector_simplify_gesture(drawing)
+        elif mode == "fill":
+            self._finish_vector_fill(drawing)
 
     # ---- tool actions --------------------------------------------------
     def _tool_press(self, widget_point: QPointF, pressure: float) -> None:
         point = self.widget_to_document(widget_point)
         self._press_widget_point = QPointF(widget_point)
         self._press_document_point = QPointF(point)
+        if self._begin_page_gap_interaction(point):
+            return
+        if self.tool == ToolKind.INSERT_PAGE_GAP:
+            self._update_page_gap_hover(point)
+            self._insert_hovered_page_gap()
+            return
+        if self.tool in {
+            ToolKind.DRAW_SELECT_RECT,
+            ToolKind.DRAW_SELECT_LASSO,
+            ToolKind.DRAW_SELECT_STROKE,
+        }:
+            drawing = self._drawing_selection_object()
+            if (
+                drawing is not None
+                and self._selection_operation() == "replace"
+                and self._begin_drawing_selection_transform(drawing, point)
+            ):
+                return
+            if self._begin_selected_raster_transform(point):
+                return
+            if (
+                drawing is not None
+                and not self._point_inside_drawing_bounds(drawing, point)
+            ):
+                self._pending_drawing_selection_press = (
+                    QPointF(widget_point), QPointF(point), pressure
+                )
+                return
+            self._begin_drawing_selection(
+                point, widget_point, test_transform=False
+            )
+            return
+        if self._begin_selected_raster_transform(point):
+            return
         if self.tool in {ToolKind.RASTER_PENCIL, ToolKind.RASTER_ERASER}:
             obj = self.chapter.objects.get(self.selected_object_id)
+            if isinstance(obj, VectorDrawingObject):
+                path = QPainterPath()
+                bounds = QRectF(*obj.derived_bounds())
+                if obj.strokes and not bounds.isEmpty():
+                    radius = (
+                        self.settings.active_eraser_pixels() / 2
+                        + 4 / max(self.scale, 0.05)
+                        if self.tool == ToolKind.RASTER_ERASER else 0.0
+                    )
+                    bounds.adjust(-radius, -radius, radius, radius)
+                    layer_x, layer_y = self.chapter.layer_world_translation(
+                        obj.parent_layer_id
+                    )
+                    bounds.translate(layer_x + obj.x, layer_y + obj.y)
+                    path.addRect(bounds)
+                if not obj.strokes or path.contains(point):
+                    self._begin_vector_gesture(obj, point, pressure)
+                else:
+                    self._pending_vector_press = (
+                        QPointF(widget_point), QPointF(point), pressure
+                    )
+                return
             quad = (
                 self.object_world_quad(obj.object_id)
                 if isinstance(obj, RasterObject) else None
@@ -2153,7 +7634,32 @@ class _CanvasLogic:
             if quad and path.contains(point):
                 self._begin_stroke(point, pressure)
             else:
-                self._request_object_selection(point, widget_point)
+                self._pending_raster_press = (
+                    QPointF(widget_point), QPointF(point), pressure
+                )
+            return
+        if self.tool == ToolKind.VECTOR_EDIT:
+            drawing = self._selected_vector_drawing()
+            if drawing is not None:
+                self._begin_vector_edit_pointer(
+                    drawing, self._vector_local_point(drawing, point)
+                )
+            return
+        if self.tool in {
+            ToolKind.VECTOR_REDRAW,
+            ToolKind.VECTOR_CONNECT,
+            ToolKind.VECTOR_SIMPLIFY,
+        }:
+            drawing = self._selected_vector_drawing()
+            if drawing is not None:
+                self._begin_vector_gesture(drawing, point, pressure)
+            return
+        if self.tool == ToolKind.FILL:
+            drawing = self._active_vector_drawing()
+            if drawing is not None:
+                self._begin_vector_gesture(drawing, point, pressure)
+            elif self.selected_kind == "layer":
+                self._apply_shape_fill(point)
             return
         if self.tool == ToolKind.TEXT_EDIT and not isinstance(
             self.chapter.objects.get(self.selected_object_id), TextObject
@@ -2162,11 +7668,34 @@ class _CanvasLogic:
             if hits:
                 self.set_selection("object", hits[0])
             return
-        if (
-            self.tool == ToolKind.SHAPE_EDIT
-            and self.selected_kind == "layer"
-            and self._begin_shape_edit(point)
-        ):
+        if self.tool == ToolKind.SHAPE_EDIT:
+            if (
+                self.selected_kind == "layer"
+                and self._begin_shape_edit(point, allow_interior=False)
+            ):
+                return
+            hits = [
+                hit for hit in self.hit_test_shape_edit_layers(point)
+                if hit["id"] != self.selected_id
+            ]
+            if (
+                len(hits) > 1
+                and QGuiApplication.keyboardModifiers() & Qt.ControlModifier
+            ):
+                self.selectionCandidatesRequested.emit(
+                    hits, self.mapToGlobal(widget_point.toPoint())
+                )
+                return
+            if hits:
+                self.set_selection("layer", hits[0]["id"])
+                return
+            if (
+                self.selected_kind == "layer"
+                and self._begin_shape_edit(point)
+            ):
+                return
+        if self.tool == ToolKind.OBJECT_SELECT:
+            self._request_object_selection(point, widget_point)
             return
         self._outside_click_candidate = (
             False if self.tool in {
@@ -2177,9 +7706,6 @@ class _CanvasLogic:
         )
         if self._outside_click_candidate:
             return
-        if self.tool == ToolKind.OBJECT_SELECT:
-            self._request_object_selection(point, widget_point)
-            return
         if self.tool == ToolKind.RASTER_CREATE:
             target = self._raster_creation_parent_id or self._target_parent_for_new_layer()
             snapped = self._snap(point, target)
@@ -2187,6 +7713,41 @@ class _CanvasLogic:
                 (snapped.x(), snapped.y()), (snapped.x(), snapped.y())
             ]
             return
+        if (
+            self.tool == ToolKind.TEXT_EDIT
+            and self.selected_object_id
+            and isinstance(
+                self.chapter.objects.get(self.selected_object_id), TextObject
+            )
+            and self.chapter.objects[
+                self.selected_object_id
+            ].layout_mode == "free"
+        ):
+            obj = self.chapter.objects[self.selected_object_id]
+            world_quad = self.object_world_quad(obj.object_id)
+            mode, handle = self._transform_control_hit(world_quad, point)
+            if mode in {"handle", "rotate", "pivot"}:
+                layer_x, layer_y = self.chapter.layer_world_translation(
+                    obj.parent_layer_id
+                )
+                self._transform_handle_index = handle
+                self._transform_drag_mode = mode
+                self._model_before = self.chapter.to_dict()
+                self._drag_start_doc = point
+                self._transform_start_quad = [
+                    (x - layer_x, y - layer_y) for x, y in world_quad
+                ]
+                self._transform_preview_quad = list(
+                    self._transform_start_quad
+                )
+                pivot = self._transform_pivot or QPointF(
+                    sum(x for x, _ in world_quad) / 4,
+                    sum(y for _, y in world_quad) / 4,
+                )
+                self._transform_rotate_start = math.atan2(
+                    point.y() - pivot.y(), point.x() - pivot.x()
+                )
+                return
         if self.tool == ToolKind.TEXT_EDIT and self.selected_object_id:
             if self._begin_text_pointer(point):
                 return
@@ -2199,26 +7760,22 @@ class _CanvasLogic:
                 return
             layer_x, layer_y = self.chapter.layer_world_translation(obj.parent_layer_id)
             local_quad = [(x - layer_x, y - layer_y) for x, y in world_quad]
-            tolerance = 14 / max(self.scale, 0.05)
-            handles = self._quad_handles(world_quad)
-            distances = [
-                math.dist((point.x(), point.y()), candidate)
-                for candidate in handles
-            ]
-            if distances and min(distances) <= tolerance:
-                self._transform_handle_index = distances.index(min(distances))
-                self._transform_drag_mode = "handle"
-            else:
-                path = QPainterPath()
-                path.addPolygon(QPolygonF([QPointF(*candidate) for candidate in world_quad]))
-                if not path.contains(point):
-                    return
-                self._transform_handle_index = None
-                self._transform_drag_mode = "translate"
+            mode, handle = self._transform_control_hit(world_quad, point)
+            if not mode:
+                return
+            self._transform_handle_index = handle
+            self._transform_drag_mode = mode
             self._model_before = self.chapter.to_dict()
             self._drag_start_doc = point
             self._transform_start_quad = local_quad
             self._transform_preview_quad = list(local_quad)
+            pivot = self._transform_pivot or QPointF(
+                sum(x for x, _ in world_quad) / 4,
+                sum(y for _, y in world_quad) / 4,
+            )
+            self._transform_rotate_start = math.atan2(
+                point.y() - pivot.y(), point.x() - pivot.x()
+            )
             if isinstance(obj, RasterObject):
                 self._build_raster_transform_cache()
             return
@@ -2270,9 +7827,10 @@ class _CanvasLogic:
             self._creation_selected_node_id = node.node_id
             if self._creation_style is None:
                 self._creation_style = ShapeStyle(
-                    primary_color=self.settings.brush_color,
+                    primary_color=self.secondary_color,
                     base_thickness=float(self.settings.pencil_size()),
-                    outline_color="#111111",
+                    outline_color=self.primary_color,
+                    outline_thickness=4.0,
                 )
             self._creation_active_control = "new_point"
             self._creation_press_widget = QPointF(widget_point)
@@ -2282,6 +7840,99 @@ class _CanvasLogic:
 
     def _tool_move(self, widget_point: QPointF, pressure: float) -> None:
         point = self.widget_to_document(widget_point)
+        if self._page_gap_drag_mode is not None:
+            self._move_page_gap_interaction(point)
+            return
+        if self.tool == ToolKind.INSERT_PAGE_GAP:
+            self._update_page_gap_hover(point)
+            return
+        if (
+            self._model_before is not None
+            and self._transform_start_quad is not None
+            and isinstance(
+                self.chapter.objects.get(self.selected_object_id),
+                RasterObject,
+            )
+        ):
+            self._update_transform_preview(point)
+            self.update()
+            return
+        gap_hit = self._page_gap_hit(point)
+        if gap_hit == "band":
+            self.setCursor(Qt.OpenHandCursor)
+        elif gap_hit in {"top", "bottom"}:
+            self.setCursor(Qt.PointingHandCursor)
+        elif self._model_before is None:
+            selected_raster = self.chapter.objects.get(
+                self.selected_object_id
+            )
+            if isinstance(selected_raster, RasterObject):
+                world_quad = self.object_world_quad(
+                    selected_raster.object_id
+                )
+                raster_hit, _handle = (
+                    self._raster_transform_control_hit(world_quad, point)
+                    if world_quad else ("", None)
+                )
+                if raster_hit == "translate":
+                    self.setCursor(Qt.SizeAllCursor)
+                elif raster_hit is not None:
+                    self.setCursor(Qt.PointingHandCursor)
+                else:
+                    self.unsetCursor()
+        if self.tool in {
+            ToolKind.DRAW_SELECT_RECT,
+            ToolKind.DRAW_SELECT_LASSO,
+            ToolKind.DRAW_SELECT_STROKE,
+        }:
+            if self._pending_drawing_selection_press is not None:
+                press_widget, press_document, _press_pressure = (
+                    self._pending_drawing_selection_press
+                )
+                if math.dist(
+                    (widget_point.x(), widget_point.y()),
+                    (press_widget.x(), press_widget.y()),
+                ) > 4:
+                    self._pending_drawing_selection_press = None
+                    self._begin_drawing_selection(
+                        press_document, press_widget, test_transform=False
+                    )
+                    self._continue_drawing_selection(point, widget_point)
+                return
+            self._continue_drawing_selection(point, widget_point)
+            return
+        if self._vector_gesture_mode is not None:
+            self._continue_vector_gesture(point, pressure)
+            return
+        if self._pending_vector_press is not None:
+            press_widget, press_document, press_pressure = (
+                self._pending_vector_press
+            )
+            if math.dist(
+                (widget_point.x(), widget_point.y()),
+                (press_widget.x(), press_widget.y()),
+            ) > 4:
+                self._pending_vector_press = None
+                drawing = self._selected_vector_drawing()
+                if drawing is not None:
+                    self._begin_vector_gesture(
+                        drawing, press_document, press_pressure
+                    )
+                    self._continue_vector_gesture(point, pressure)
+            return
+        if self._pending_raster_press is not None:
+            press_widget, press_document, press_pressure = (
+                self._pending_raster_press
+            )
+            if math.dist(
+                (widget_point.x(), widget_point.y()),
+                (press_widget.x(), press_widget.y()),
+            ) > 4:
+                self._pending_raster_press = None
+                self._begin_stroke(press_document, press_pressure)
+                if self._drawing:
+                    self._continue_stroke(point, pressure)
+            return
         if self._outside_click_candidate:
             if math.dist(
                 (widget_point.x(), widget_point.y()),
@@ -2302,7 +7953,7 @@ class _CanvasLogic:
                 self._update_creation_hover(point)
             return
         if (
-            self.tool == ToolKind.TRANSFORM
+            self.tool in {ToolKind.TRANSFORM, ToolKind.TEXT_EDIT}
             and self._model_before is not None
             and self._transform_start_quad is not None
         ):
@@ -2368,6 +8019,52 @@ class _CanvasLogic:
             self._update_shape_hover(point)
 
     def _tool_release(self) -> None:
+        if self._finish_page_gap_interaction():
+            return
+        if self.tool == ToolKind.INSERT_PAGE_GAP:
+            return
+        if (
+            self._model_before is not None
+            and self._transform_preview_quad is not None
+            and isinstance(
+                self.chapter.objects.get(self.selected_object_id),
+                RasterObject,
+            )
+        ):
+            self._commit_object_transform()
+            self.interactionFinished.emit()
+            return
+        if self.tool in {
+            ToolKind.DRAW_SELECT_RECT,
+            ToolKind.DRAW_SELECT_LASSO,
+            ToolKind.DRAW_SELECT_STROKE,
+        }:
+            if self._pending_drawing_selection_press is not None:
+                widget_point, point, _pressure = (
+                    self._pending_drawing_selection_press
+                )
+                self._pending_drawing_selection_press = None
+                self._request_object_selection(point, widget_point)
+                self.interactionFinished.emit()
+                return
+            self._finish_drawing_selection()
+            self.interactionFinished.emit()
+            return
+        if self._vector_gesture_mode is not None:
+            self._end_vector_gesture()
+            return
+        if self._pending_vector_press is not None:
+            widget_point, point, _pressure = self._pending_vector_press
+            self._pending_vector_press = None
+            self._request_object_selection(point, widget_point)
+            self.interactionFinished.emit()
+            return
+        if self._pending_raster_press is not None:
+            widget_point, point, _pressure = self._pending_raster_press
+            self._pending_raster_press = None
+            self._request_object_selection(point, widget_point)
+            self.interactionFinished.emit()
+            return
         if self._outside_click_candidate:
             self._outside_click_candidate = False
             page_id = self.active_page_id
@@ -2379,11 +8076,45 @@ class _CanvasLogic:
         if self._drawing:
             self._end_stroke()
             return
+        if (
+            self._page_creation_anchor_id
+            and self._page_creation_kind in {"rectangle", "circle"}
+            and len(self._creation_points) >= 2
+        ):
+            first, second = (
+                self._creation_points[0], self._creation_points[-1]
+            )
+            if math.dist(first, second) < 2:
+                self.update()
+                return
+            if self._page_creation_kind == "rectangle":
+                left, right = sorted((first[0], second[0]))
+                top, bottom = sorted((first[1], second[1]))
+                bound = BoundGeometry.rectangle(
+                    left, top, right - left, bottom - top
+                )
+            else:
+                bound = BoundGeometry.circle(
+                    first[0], first[1], math.dist(first, second)
+                )
+            self._finish_pending_page_bound(bound)
+            self.interactionFinished.emit()
+            return
         if self.tool == ToolKind.SHAPE_CREATE:
             close = (
                 self._creation_close_candidate
                 and not self._creation_node_dragged
             )
+            if (
+                self._creation_active_control == "roundness"
+                and not self._creation_node_dragged
+            ):
+                node = self._creation_selected_node()
+                if node is not None:
+                    geometry = BoundGeometry.path(
+                        self._creation_nodes, False
+                    )
+                    self._toggle_shape_node_roundness(geometry, node)
             self._creation_active_control = None
             self._creation_close_candidate = False
             self._creation_node_dragged = False
@@ -2398,7 +8129,7 @@ class _CanvasLogic:
             self.update()
             return
         if (
-            self.tool == ToolKind.TRANSFORM
+            self.tool in {ToolKind.TRANSFORM, ToolKind.TEXT_EDIT}
             and self._model_before is not None
             and self._transform_preview_quad is not None
             and self.selected_object_id
@@ -2408,10 +8139,30 @@ class _CanvasLogic:
             return
         if self._model_before is not None:
             before, self._model_before = self._model_before, None
+            if (
+                self._active_shape_control == "roundness"
+                and not self._shape_control_dragged
+                and self.selected_kind == "layer"
+            ):
+                layer = self.chapter.layers[self.selected_id]
+                selected = self._selected_shape_node(layer.bound)
+                if selected is not None:
+                    self._toggle_shape_node_roundness(
+                        layer.bound, selected
+                    )
             self._active_handle = None
             self._active_shape_control = None
+            self._shape_control_dragged = False
             self._bound_drag_mode = None
             self._bound_start_points = []
+            if (
+                self.selected_kind == "layer"
+                and self.selected_id in self.chapter.layers
+                and self.chapter.layers[self.selected_id].bound is not None
+            ):
+                self.chapter.layers[
+                    self.selected_id
+                ].bound.normalize_bezier_handles()
             after = self.chapter.to_dict()
             if before != after:
                 self.push_model_change(before, after, "Edit geometry")
@@ -2435,7 +8186,14 @@ class _CanvasLogic:
                 bound = BoundGeometry.rectangle(left, top, right - left, bottom - top)
             else:
                 bound = BoundGeometry.circle(first[0], first[1], math.dist(first, second))
-            self._create_layer_from_world_bound(bound)
+            self._create_layer_from_world_bound(
+                bound,
+                style=ShapeStyle(
+                    primary_color=self.secondary_color,
+                    outline_color=self.primary_color,
+                    outline_thickness=4.0,
+                ),
+            )
 
     @staticmethod
     def _resize_axis_rect(
@@ -2457,22 +8215,55 @@ class _CanvasLogic:
             QPointF(max(left, right), max(top, bottom)),
         )
 
-    def begin_raster_creation(self, parent_id: str) -> bool:
+    def begin_raster_creation(
+        self, parent_id: str, insertion_index: int | None = None,
+    ) -> bool:
         if (
             self.chapter is None or parent_id not in self.chapter.layers
-            or self.chapter.layers[parent_id].is_page
-            or self.chapter.layers[parent_id].layer_kind == "fill"
+            or self.chapter.layers[parent_id].layer_kind
+            in {"fill", "open_shape"}
         ):
             return False
         self._raster_creation_parent_id = parent_id
+        self._raster_creation_index = insertion_index
         self._creation_points.clear()
         return self.set_tool(ToolKind.RASTER_CREATE)
+
+    def create_vector_drawing(
+        self, parent_id: str, insertion_index: int | None = None,
+    ) -> VectorDrawingObject | None:
+        if (
+            self.chapter is None
+            or parent_id not in self.chapter.layers
+            or self.chapter.layers[parent_id].layer_kind == "fill"
+        ):
+            return None
+        before = self.chapter.to_dict()
+        count = sum(
+            isinstance(item, VectorDrawingObject)
+            for item in self.chapter.objects.values()
+        ) + 1
+        drawing = VectorDrawingObject(name=f"Vector Drawing {count}")
+        self.chapter.add_object(
+            parent_id, drawing, index=insertion_index
+        )
+        after = self.chapter.to_dict()
+        self.push_model_change(
+            before, after, "Add vector drawing"
+        )
+        self.set_selection("object", drawing.object_id)
+        self.hierarchyChanged.emit()
+        self.documentChanged.emit(QRectF())
+        self.interactionFinished.emit()
+        return drawing
 
     def _create_raster_from_world_rect(
         self, first: tuple[float, float], second: tuple[float, float],
     ) -> None:
         parent_id = self._raster_creation_parent_id
+        insertion_index = self._raster_creation_index
         self._raster_creation_parent_id = ""
+        self._raster_creation_index = None
         if parent_id not in self.chapter.layers:
             return
         world = QRectF(QPointF(*first), QPointF(*second)).normalized()
@@ -2490,7 +8281,7 @@ class _CanvasLogic:
             x=world.left() - layer_x, y=world.top() - layer_y,
             interaction_rect=(0.0, 0.0, world.width(), world.height()),
         )
-        self.chapter.add_object(parent_id, obj)
+        self.chapter.add_object(parent_id, obj, index=insertion_index)
         after = self.chapter.to_dict()
         self.push_model_change(before, after, "Add raster object")
         self.set_selection("object", obj.object_id, activate_default_tool=False)
@@ -2511,7 +8302,7 @@ class _CanvasLogic:
         local = QPointF(point.x() - world_x, point.y() - world_y)
         if layer.bound is None:
             return False
-        path = self.layer_shape_path(layer)
+        path = self.layer_effective_path(layer.layer_id)
         if path.contains(local):
             return False
         if layer.layer_kind == "open_shape":
@@ -2523,7 +8314,7 @@ class _CanvasLogic:
     def _request_object_selection(
         self, point: QPointF, widget_point: QPointF,
     ) -> None:
-        hits = self.hit_test_objects(point)
+        hits = self.hit_test_entities(point)
         if (
             len(hits) > 1
             and QGuiApplication.keyboardModifiers() & Qt.ControlModifier
@@ -2533,7 +8324,10 @@ class _CanvasLogic:
             )
             return
         if hits:
-            self.set_selection("object", hits[0], activate_default_tool=True)
+            hit = hits[0]
+            self.set_selection(
+                hit["kind"], hit["id"], activate_default_tool=True
+            )
             return
         page_id = self.active_page_id
         if page_id and page_id in self.chapter.layers:
@@ -2542,17 +8336,97 @@ class _CanvasLogic:
 
     def _selected_shape_node(self, bound: BoundGeometry) -> PathNode | None:
         return next((
-            node for node in bound.nodes
+            node
+            for contour in bound.iter_contours()
+            for node in contour.nodes
             if node.node_id == self._selected_shape_node_id
         ), None)
 
-    def _begin_shape_edit(self, world_point: QPointF) -> bool:
+    @staticmethod
+    def _contour_bound_for_node(
+        bound: BoundGeometry, node: PathNode,
+    ) -> BoundGeometry:
+        contour = bound.contour_for_node(node.node_id)
+        if contour is None or contour.nodes is bound.nodes:
+            return bound
+        return BoundGeometry(
+            nodes=contour.nodes, closed=contour.closed, primitive="custom"
+        )
+
+    @classmethod
+    def _can_delete_shape_node(
+        cls, bound: BoundGeometry, node: PathNode | None = None,
+    ) -> bool:
+        if node is not None:
+            bound = cls._contour_bound_for_node(bound, node)
+        minimum = 3 if bound.closed else 2
+        return len(bound.nodes) > minimum
+
+    def _delete_selected_shape_node(self, layer: LayerNode) -> bool:
+        bound = layer.bound
+        node = self._selected_shape_node(bound)
+        if node is None or not self._can_delete_shape_node(bound, node):
+            return False
+        bound.normalize_bezier_handles()
+        before = self.chapter.to_dict()
+        bound.primitive = "custom"
+        contour = bound.contour_for_node(node.node_id)
+        contour.nodes.remove(node)
+        bound.normalize_bezier_handles()
+        self._selected_shape_node_id = ""
+        self._push_immediate_shape_change(before, "Delete shape point")
+        return True
+
+    def _maximum_shape_roundness(
+        self, bound: BoundGeometry, node: PathNode,
+    ) -> float:
+        bound = self._contour_bound_for_node(bound, node)
+        index = bound.nodes.index(node)
+        if not bound.closed and index in {0, len(bound.nodes) - 1}:
+            return 0.0
+
+        def segment_length(segment: int) -> float:
+            previous = self._shape_segment_point(bound, segment, 0.0)
+            total = 0.0
+            for step in range(1, 49):
+                current = self._shape_segment_point(
+                    bound, segment, step / 48
+                )
+                total += math.dist(
+                    (previous.x(), previous.y()),
+                    (current.x(), current.y()),
+                )
+                previous = current
+            return total
+
+        incoming = index - 1 if index else len(bound.nodes) - 1
+        outgoing = index
+        return min(
+            segment_length(incoming), segment_length(outgoing)
+        ) / 2
+
+    def _toggle_shape_node_roundness(
+        self, bound: BoundGeometry, node: PathNode,
+    ) -> None:
+        if node.roundness_enabled:
+            node.roundness_enabled = False
+            return
+        maximum = self._maximum_shape_roundness(bound, node)
+        if maximum <= 0:
+            return
+        node.roundness = min(node.roundness, maximum)
+        node.roundness_enabled = True
+
+    def _begin_shape_edit(
+        self, world_point: QPointF, allow_interior: bool = True,
+    ) -> bool:
         layer = self.chapter.layers[self.selected_id]
         if layer.layer_kind == "fill" or layer.bound is None:
             return False
         wx, wy = self.chapter.layer_world_translation(layer.layer_id)
         local = QPointF(world_point.x() - wx, world_point.y() - wy)
         bound = layer.bound
+        bound.normalize_bezier_handles()
         hit = self._shape_hit_test(bound, local)
         self._shape_hover_target = hit
         self._shape_hover_insert = (
@@ -2561,6 +8435,8 @@ class _CanvasLogic:
         if hit is None:
             return False
         kind = hit["kind"]
+        if kind == "interior" and not allow_interior:
+            return False
         if kind == "gizmo":
             selected = self._selected_shape_node(bound)
             if selected is None:
@@ -2574,6 +8450,8 @@ class _CanvasLogic:
                 before = self.chapter.to_dict()
                 self._toggle_shape_node_lock(bound, selected)
                 self._push_immediate_shape_change(before, "Toggle Bézier lock")
+            elif name == "delete":
+                self._delete_selected_shape_node(layer)
             elif name == "cap":
                 before = self.chapter.to_dict()
                 self._cycle_shape_cap(layer, selected)
@@ -2582,6 +8460,7 @@ class _CanvasLogic:
                 self._model_before = self.chapter.to_dict()
                 self._active_shape_control = name
                 self._drag_start_doc = QPointF(world_point)
+                self._shape_control_dragged = False
             return True
         if kind == "radius":
             index = hit["index"]
@@ -2619,11 +8498,35 @@ class _CanvasLogic:
             self._drag_start_doc = QPointF(world_point)
             return True
         if kind == "node":
-            self._selected_shape_node_id = hit["node_id"]
+            node_id = hit["node_id"]
+            shift = bool(
+                QGuiApplication.keyboardModifiers() & Qt.ShiftModifier
+            )
+            if shift:
+                if node_id in self._selected_shape_node_ids:
+                    self._selected_shape_node_ids.remove(node_id)
+                    if self._selected_shape_node_id == node_id:
+                        self._selected_shape_node_id = next(
+                            iter(self._selected_shape_node_ids), ""
+                        )
+                    self.update()
+                    return True
+                self._selected_shape_node_ids.add(node_id)
+            else:
+                if node_id not in self._selected_shape_node_ids:
+                    self._selected_shape_node_ids = {node_id}
+            self._selected_shape_node_id = node_id
             selected = self._selected_shape_node(bound)
             self._model_before = self.chapter.to_dict()
             self._active_shape_control = "node"
             self._drag_start_value = selected.to_dict()
+            self._drag_start_doc = QPointF(world_point)
+            self._shape_drag_nodes = {
+                node.node_id: node.to_dict()
+                for contour in bound.iter_contours()
+                for node in contour.nodes
+                if node.node_id in self._selected_shape_node_ids
+            }
             self.update()
             return True
         if kind == "insert":
@@ -2636,7 +8539,8 @@ class _CanvasLogic:
                 self.primitiveConversionRequested.emit(bound.primitive)
                 return True
             self._insert_shape_node(
-                index, percent, insert_point, world_point
+                index, percent, insert_point, world_point,
+                contour_index=int(hit.get("contour_index", 0)),
             )
             return True
         if kind == "interior":
@@ -2678,11 +8582,13 @@ class _CanvasLogic:
         )
         r0, r1 = interpolate(q0, q1), interpolate(q1, q2)
         point = interpolate(r0, r1)
-        start.outgoing = q0
-        end.incoming = q2
-        if start.incoming is not None:
+        if start.point_type == "bezier":
+            start.outgoing = q0
+        if end.point_type == "bezier":
+            end.incoming = q2
+        if start.point_type == "bezier" and start.incoming is not None:
             start.handles_locked = False
-        if end.outgoing is not None:
+        if end.point_type == "bezier" and end.outgoing is not None:
             end.handles_locked = False
         return PathNode(
             x=point[0], y=point[1], point_type="bezier",
@@ -2691,14 +8597,24 @@ class _CanvasLogic:
 
     def _insert_shape_node(
         self, index: int, percent: float, insert_point: QPointF,
-        world_point: QPointF,
+        world_point: QPointF, contour_index: int = 0,
     ) -> None:
         layer = self.chapter.layers[self.selected_id]
         bound = layer.bound
         before = self.chapter.to_dict()
         bound.primitive = "custom"
-        node = self._split_shape_segment(bound, index, percent)
-        bound.nodes.insert(index + 1, node)
+        contour = (
+            PathContour(bound.nodes, bound.closed)
+            if contour_index == 0
+            else bound.additional_contours[contour_index - 1]
+        )
+        working = BoundGeometry(
+            nodes=contour.nodes, closed=contour.closed,
+            primitive="custom",
+        )
+        node = self._split_shape_segment(working, index, percent)
+        contour.nodes.insert(index + 1, node)
+        bound.normalize_bezier_handles()
         self._selected_shape_node_id = node.node_id
         self._model_before = before
         self._active_shape_control = "insert"
@@ -2729,6 +8645,14 @@ class _CanvasLogic:
         local = QPointF(world_point.x() - wx, world_point.y() - wy)
         selected = self._selected_shape_node(bound)
         control = self._active_shape_control or ""
+        if (
+            control == "roundness"
+            and math.dist(
+                (world_point.x(), world_point.y()),
+                (self._drag_start_doc.x(), self._drag_start_doc.y()),
+            ) > 3 / max(self.scale, 0.05)
+        ):
+            self._shape_control_dragged = True
         if control.startswith("primitive:"):
             index = int(control.split(":", 1)[1])
             snapped = self._snap(world_point, layer.layer_id)
@@ -2794,19 +8718,36 @@ class _CanvasLogic:
                 maximum,
                 projected / math.sqrt(2),
             )
+            bound.nodes[index].roundness_enabled = (
+                bound.nodes[index].roundness > 0
+            )
         elif control == "node" and selected is not None:
             snapped = self._snap(world_point, layer.layer_id)
             target = QPointF(snapped.x() - wx, snapped.y() - wy)
-            dx, dy = target.x() - selected.x, target.y() - selected.y
-            selected.position = (target.x(), target.y())
-            if selected.incoming:
-                selected.incoming = (
-                    selected.incoming[0] + dx, selected.incoming[1] + dy
-                )
-            if selected.outgoing:
-                selected.outgoing = (
-                    selected.outgoing[0] + dx, selected.outgoing[1] + dy
-                )
+            primary_start = self._shape_drag_nodes.get(
+                selected.node_id, self._drag_start_value
+            )
+            dx = target.x() - float(primary_start["x"])
+            dy = target.y() - float(primary_start["y"])
+            for contour in bound.iter_contours():
+                for node in contour.nodes:
+                    source = self._shape_drag_nodes.get(node.node_id)
+                    if source is None:
+                        continue
+                    node.position = (
+                        float(source["x"]) + dx,
+                        float(source["y"]) + dy,
+                    )
+                    incoming = source.get("incoming")
+                    outgoing = source.get("outgoing")
+                    node.incoming = (
+                        (float(incoming[0]) + dx, float(incoming[1]) + dy)
+                        if incoming is not None else None
+                    )
+                    node.outgoing = (
+                        (float(outgoing[0]) + dx, float(outgoing[1]) + dy)
+                        if outgoing is not None else None
+                    )
         elif control == "insert" and selected is not None:
             if math.dist(
                 (world_point.x(), world_point.y()),
@@ -2819,13 +8760,11 @@ class _CanvasLogic:
                     selected.x * 2 - local.x(), selected.y * 2 - local.y()
                 )
         elif control in {"incoming", "outgoing"} and selected is not None:
-            target = (local.x(), local.y())
-            setattr(selected, control, target)
-            if selected.handles_locked:
-                other = "outgoing" if control == "incoming" else "incoming"
-                setattr(selected, other, (
-                    selected.x * 2 - target[0], selected.y * 2 - target[1]
-                ))
+            snapped = self._snap(world_point, layer.layer_id)
+            target = (snapped.x() - wx, snapped.y() - wy)
+            self._move_shape_bezier_handle(
+                bound, selected, control, target
+            )
         elif control == "thickness" and selected is not None:
             positions = self._shape_gizmo_positions(bound, selected)
             origin = QPointF(selected.x, selected.y)
@@ -2837,9 +8776,17 @@ class _CanvasLogic:
                 0.1, min(10.0, (distance * self.scale - 24) / 10)
             ) * 10) / 10
         elif control == "roundness" and selected is not None:
-            selected.roundness = max(
-                0.0, math.dist(selected.position, (local.x(), local.y()))
-            )
+            if self._shape_control_dragged:
+                selected.roundness = min(
+                    self._maximum_shape_roundness(bound, selected),
+                    max(
+                        0.0,
+                        math.dist(
+                            selected.position, (local.x(), local.y())
+                        ),
+                    ),
+                )
+                selected.roundness_enabled = True
         elif control == "translate":
             original = BoundGeometry.from_dict(self._drag_start_value)
             dx = world_point.x() - self._drag_start_doc.x()
@@ -2855,17 +8802,23 @@ class _CanvasLogic:
             bound.nodes = [
                 PathNode.from_dict(node.to_dict()) for node in original.nodes
             ]
-            for node in bound.nodes:
-                node.x += dx
-                node.y += dy
-                if node.incoming:
-                    node.incoming = (
-                        node.incoming[0] + dx, node.incoming[1] + dy
-                    )
-                if node.outgoing:
-                    node.outgoing = (
-                        node.outgoing[0] + dx, node.outgoing[1] + dy
-                    )
+            bound.additional_contours = [
+                PathContour.from_dict(contour.to_dict())
+                for contour in original.additional_contours
+            ]
+            for contour in bound.iter_contours():
+                for node in contour.nodes:
+                    node.x += dx
+                    node.y += dy
+                    if node.incoming:
+                        node.incoming = (
+                            node.incoming[0] + dx, node.incoming[1] + dy
+                        )
+                    if node.outgoing:
+                        node.outgoing = (
+                            node.outgoing[0] + dx, node.outgoing[1] + dy
+                        )
+        bound.normalize_bezier_handles()
         self.documentChanged.emit(QRectF())
         self.update()
 
@@ -2883,36 +8836,32 @@ class _CanvasLogic:
         self._shape_hover_insert = (
             hit["insert"] if hit and hit["kind"] == "insert" else None
         )
-        labels = {
-            "gizmo": "Edit selected point",
-            "radius": "Drag to adjust this corner's roundness",
-            "control": "Drag Bézier control",
-            "node": "Click to select; drag to move point",
-            "rectangle_point": "Drag to move this rectangle point",
-            "rectangle_edge": "Drag to move both edge points",
-            "primitive_handle": "Drag to resize primitive",
-            "insert": "Click to insert a vector point; drag for Bézier",
-            "interior": "Drag to move shape",
-        }
-        self.setToolTip(labels.get(hit["kind"], "") if hit else "")
+        self.setToolTip(self._shape_hit_tooltip(
+            layer.bound, hit, layer.shape_style
+        ))
         self.update()
 
     def _toggle_shape_node_type(
         self, bound: BoundGeometry, node: PathNode,
     ) -> None:
         bound.primitive = "custom"
-        index = bound.nodes.index(node)
+        working = self._contour_bound_for_node(bound, node)
+        index = working.nodes.index(node)
         if node.point_type == "bezier":
             node.point_type = "vector"
             node.incoming = node.outgoing = None
+            working.normalize_bezier_handles()
             return
-        previous = bound.nodes[index - 1] if index else None
+        previous = (
+            working.nodes[index - 1]
+            if index or working.closed else None
+        )
         following = (
-            bound.nodes[(index + 1) % len(bound.nodes)]
-            if bound.closed or index + 1 < len(bound.nodes) else None
+            working.nodes[(index + 1) % len(working.nodes)]
+            if working.closed or index + 1 < len(working.nodes) else None
         )
         node.point_type = "bezier"
-        node.handles_locked = True
+        node.handles_locked = previous is not None and following is not None
         if previous is not None:
             distance = math.dist(node.position, previous.position) / 3
             dx, dy = previous.x - node.x, previous.y - node.y
@@ -2935,11 +8884,37 @@ class _CanvasLogic:
                     node.x + dx / length * distance,
                     node.y + dy / length * distance,
                 )
+        working.normalize_bezier_handles()
+
+    @staticmethod
+    def _move_shape_bezier_handle(
+        bound: BoundGeometry, node: PathNode, control: str,
+        target: tuple[float, float],
+    ) -> None:
+        needs_incoming, needs_outgoing = bound.handle_requirements(node)
+        permitted = {
+            "incoming": needs_incoming,
+            "outgoing": needs_outgoing,
+        }
+        if not permitted.get(control, False):
+            return
+        setattr(node, control, target)
+        other = "outgoing" if control == "incoming" else "incoming"
+        if node.handles_locked and permitted[other]:
+            setattr(node, other, (
+                node.x * 2 - target[0], node.y * 2 - target[1]
+            ))
+        bound.normalize_bezier_handles()
 
     @staticmethod
     def _toggle_shape_node_lock(
         bound: BoundGeometry, node: PathNode,
     ) -> None:
+        needs_incoming, needs_outgoing = bound.handle_requirements(node)
+        if not (needs_incoming and needs_outgoing):
+            node.handles_locked = False
+            bound.normalize_bezier_handles()
+            return
         node.handles_locked = not node.handles_locked
         if node.handles_locked:
             use_outgoing = node.outgoing is not None
@@ -2952,6 +8927,7 @@ class _CanvasLogic:
                     node.incoming = opposite
                 else:
                     node.outgoing = opposite
+        bound.normalize_bezier_handles()
 
     @staticmethod
     def _cycle_shape_cap(layer: LayerNode, node: PathNode) -> None:
@@ -2976,23 +8952,27 @@ class _CanvasLogic:
             self.update()
 
     def _finish_shape(self, closed: bool) -> None:
+        if self._page_creation_anchor_id:
+            if len(self._creation_nodes) < 3:
+                self.pageCreationInvalid.emit(
+                    "A page shape requires at least three points."
+                )
+                return
+            nodes = [
+                PathNode.from_dict(node.to_dict())
+                for node in self._creation_nodes
+            ]
+            bound = BoundGeometry.path(nodes, True)
+            bound.normalize_bezier_handles()
+            if not self._finish_pending_page_bound(bound):
+                return
+            return
         minimum = 3 if closed else 2
         if len(self._creation_nodes) < minimum:
             return
         nodes = [PathNode.from_dict(node.to_dict()) for node in self._creation_nodes]
-        if closed:
-            first, last = nodes[0], nodes[-1]
-            if first.point_type == "bezier" and first.incoming is None:
-                reference = first.outgoing or nodes[1].position
-                first.incoming = (
-                    first.x * 2 - reference[0], first.y * 2 - reference[1]
-                )
-            if last.point_type == "bezier" and last.outgoing is None:
-                reference = last.incoming or nodes[-2].position
-                last.outgoing = (
-                    last.x * 2 - reference[0], last.y * 2 - reference[1]
-                )
         bound = BoundGeometry.path(nodes, closed)
+        bound.normalize_bezier_handles()
         self._creation_nodes = []
         self._creation_points = []
         self._creation_selected_node_id = ""
@@ -3000,38 +8980,45 @@ class _CanvasLogic:
         self._shape_hover_target = None
         self._shape_hover_insert = None
         style = self._creation_style or ShapeStyle(
-            primary_color=self.settings.brush_color,
+            primary_color=self.secondary_color,
             base_thickness=float(self.settings.pencil_size()),
-            outline_color="#111111",
+            outline_color=self.primary_color,
+            outline_thickness=4.0,
         )
+        if closed:
+            style = ShapeStyle.from_dict(style.to_dict())
+            style.primary_color = self.secondary_color
         self._creation_style = None
-        self._create_layer_from_world_bound(
+        created = self._create_layer_from_world_bound(
             bound, style=style,
         )
+        if created is not None:
+            self.set_tool(ToolKind.SHAPE_EDIT)
 
     def _create_layer_from_world_bound(
         self, bound: BoundGeometry, style: ShapeStyle | None = None,
-    ) -> None:
+    ) -> LayerNode | None:
         placement = self._target_placement_for_new_bound()
         if placement is None:
-            return
+            return None
         parent_id, insertion_index = placement
         before = self.chapter.to_dict()
         parent_x, parent_y = self.chapter.layer_world_translation(parent_id)
         local = BoundGeometry.from_dict(bound.to_dict())
-        for node in local.nodes:
-            node.x -= parent_x
-            node.y -= parent_y
-            if node.incoming:
-                node.incoming = (
-                    node.incoming[0] - parent_x,
-                    node.incoming[1] - parent_y,
-                )
-            if node.outgoing:
-                node.outgoing = (
-                    node.outgoing[0] - parent_x,
-                    node.outgoing[1] - parent_y,
-                )
+        for contour in local.iter_contours():
+            for node in contour.nodes:
+                node.x -= parent_x
+                node.y -= parent_y
+                if node.incoming:
+                    node.incoming = (
+                        node.incoming[0] - parent_x,
+                        node.incoming[1] - parent_y,
+                    )
+                if node.outgoing:
+                    node.outgoing = (
+                        node.outgoing[0] - parent_x,
+                        node.outgoing[1] - parent_y,
+                    )
         numbered = []
         for candidate in self.chapter.layers.values():
             if candidate.name.startswith("Layer "):
@@ -3051,6 +9038,188 @@ class _CanvasLogic:
         self.hierarchyChanged.emit()
         self.documentChanged.emit(QRectF())
         self.update()
+        return layer
+
+    @staticmethod
+    def _geometry_from_painter_path(
+        path: QPainterPath,
+    ) -> BoundGeometry | None:
+        contours: list[PathContour] = []
+        nodes: list[PathNode] = []
+
+        def finish() -> None:
+            nonlocal nodes
+            if len(nodes) > 1 and math.dist(
+                nodes[0].position, nodes[-1].position
+            ) <= 1e-5:
+                closing = nodes.pop()
+                if closing.incoming is not None:
+                    nodes[0].point_type = "bezier"
+                    nodes[0].incoming = closing.incoming
+            if len(nodes) >= 3:
+                for node in nodes:
+                    if node.point_type == "bezier":
+                        node.incoming = node.incoming or node.position
+                        node.outgoing = node.outgoing or node.position
+                        node.handles_locked = False
+                contours.append(PathContour(nodes=nodes, closed=True))
+            nodes = []
+
+        index = 0
+        while index < path.elementCount():
+            element = path.elementAt(index)
+            if element.isMoveTo():
+                finish()
+                nodes = [PathNode(x=element.x, y=element.y)]
+                index += 1
+                continue
+            if not nodes:
+                index += 1
+                continue
+            if element.isLineTo():
+                nodes.append(PathNode(x=element.x, y=element.y))
+                index += 1
+                continue
+            if element.isCurveTo() and index + 2 < path.elementCount():
+                control_two = path.elementAt(index + 1)
+                endpoint = path.elementAt(index + 2)
+                nodes[-1].point_type = "bezier"
+                nodes[-1].outgoing = (element.x, element.y)
+                nodes.append(PathNode(
+                    x=endpoint.x, y=endpoint.y, point_type="bezier",
+                    incoming=(control_two.x, control_two.y),
+                    handles_locked=False,
+                ))
+                index += 3
+                continue
+            index += 1
+        finish()
+        if not contours:
+            return None
+        primary, *additional = contours
+        geometry = BoundGeometry(
+            nodes=primary.nodes, closed=True, primitive="custom",
+            additional_contours=additional,
+        )
+        geometry.normalize_bezier_handles()
+        return geometry
+
+    def flatten_compound_layer(self, layer_id: str) -> bool:
+        if (
+            self.chapter is None or layer_id not in self.chapter.layers
+            or not self.chapter.layers[layer_id].compound_enabled
+        ):
+            return False
+        layer = self.chapter.layers[layer_id]
+        calculated = self.layer_effective_path(layer_id)
+        geometry = self._geometry_from_painter_path(calculated)
+        if geometry is None:
+            return False
+        before = self.chapter.to_dict()
+        root_x, root_y = self.chapter.layer_world_translation(layer_id)
+        removed_layers: set[str] = set()
+
+        def removed_opacity(parent_id: str) -> float:
+            factor = 1.0
+            cursor = parent_id
+            while cursor and cursor != layer_id:
+                current = self.chapter.layers[cursor]
+                factor *= current.opacity
+                cursor = current.parent_id
+            return factor
+
+        def reparent_object(obj: DocumentObject) -> ChildRef:
+            old_x, old_y = self.chapter.layer_world_translation(
+                obj.parent_layer_id
+            )
+            dx, dy = old_x - root_x, old_y - root_y
+            if isinstance(obj, TextObject):
+                if (
+                    obj.layout_mode == "strict"
+                    and obj.geometry_reference == "direct"
+                ):
+                    rect = self._strict_text_rect(obj).translated(dx, dy)
+                    obj.transform_quad = self._rect_quad(rect)
+                    obj.layout_mode = "free"
+                elif obj.layout_mode == "free" and obj.transform_quad:
+                    obj.transform_quad = [
+                        (x + dx, y + dy) for x, y in obj.transform_quad
+                    ]
+            obj.x += dx
+            obj.y += dy
+            opacity_factor = removed_opacity(obj.parent_layer_id)
+            if opacity_factor != 1.0:
+                if obj.opacity_locked:
+                    obj.opacity_locked = False
+                    obj.opacity = opacity_factor
+                else:
+                    obj.opacity *= opacity_factor
+            obj.parent_layer_id = layer_id
+            obj.geometry_reference = "direct"
+            if isinstance(obj, RasterObject):
+                layer.last_raster_id = obj.object_id
+            return ChildRef("object", obj.object_id)
+
+        def preserve_ignored(candidate: LayerNode) -> ChildRef:
+            opacity_factor = removed_opacity(candidate.parent_id)
+            world_x, world_y = self.chapter.layer_world_translation(
+                candidate.layer_id
+            )
+            candidate.parent_id = layer_id
+            candidate.translate_x = world_x - root_x
+            candidate.translate_y = world_y - root_y
+            candidate.opacity *= opacity_factor
+            return ChildRef("layer", candidate.layer_id)
+
+        def flatten_branch(candidate: LayerNode) -> list[ChildRef]:
+            result: list[ChildRef] = []
+            for reference in list(candidate.children):
+                if reference.kind == "object":
+                    result.append(reparent_object(
+                        self.chapter.objects[reference.entity_id]
+                    ))
+                    continue
+                child = self.chapter.layers[reference.entity_id]
+                if child.compound_operation == "ignore" or not child.visible:
+                    result.append(preserve_ignored(child))
+                elif child.layer_kind == "fill":
+                    removed_layers.add(child.layer_id)
+                else:
+                    result.extend(flatten_branch(child))
+                    removed_layers.add(child.layer_id)
+            candidate.children = []
+            return result
+
+        rebuilt: list[ChildRef] = []
+        for reference in list(layer.children):
+            if reference.kind == "object":
+                rebuilt.append(reference)
+                obj = self.chapter.objects[reference.entity_id]
+                obj.geometry_reference = "direct"
+                continue
+            child = self.chapter.layers[reference.entity_id]
+            if child.compound_operation == "ignore" or not child.visible:
+                rebuilt.append(reference)
+            elif child.layer_kind == "fill":
+                removed_layers.add(child.layer_id)
+            else:
+                rebuilt.extend(flatten_branch(child))
+                removed_layers.add(child.layer_id)
+        for removed_id in removed_layers:
+            self.chapter.layers.pop(removed_id, None)
+        layer.children = rebuilt
+        layer.bound = geometry
+        layer.layer_kind = "bounded"
+        layer.compound_enabled = False
+        layer.compound_operation = "add"
+        self._compound_path_cache.clear()
+        after = self.chapter.to_dict()
+        self.push_model_change(before, after, "Flatten compound shape")
+        self.documentChanged.emit(QRectF())
+        self.hierarchyChanged.emit()
+        self.set_selection("layer", layer_id)
+        self.update()
+        return True
 
     def _begin_stroke(self, point: QPointF, pressure: float) -> None:
         if self.chapter is None or self.selected_kind != "object":
@@ -3058,19 +9227,20 @@ class _CanvasLogic:
         obj = self.chapter.objects.get(self.selected_id)
         if not isinstance(obj, RasterObject):
             return
-        self._raster_transform_snapshots.pop(obj.object_id, None)
         layer_x, layer_y = self.chapter.layer_world_translation(obj.parent_layer_id)
         local = QPointF(round(point.x() - layer_x - obj.x), round(point.y() - layer_y - obj.y))
         self._drawing = True
         self._last_draw_point = local
         self._last_pressure = pressure if pressure > 0.001 else 1.0
         self._stroke_before = {}
+        self._stroke_frame_before = tuple(obj.interaction_rect)
+        self._stroke_erasing = self.tool == ToolKind.RASTER_ERASER
         self._predictive = None
         size, opacity = self._brush_values(self._last_pressure)
         if self.tool == ToolKind.RASTER_PENCIL:
             size *= self._preset.stroke_start_ratio
         dirty = self.tiles.paint_dab(
-            obj.object_id, local, size, QColor(self.settings.brush_color), opacity,
+            obj.object_id, local, size, QColor(self.primary_color), opacity,
             erase=self.tool == ToolKind.RASTER_ERASER,
             square=self.settings.eraser_square and self.tool == ToolKind.RASTER_ERASER,
             antialias=(
@@ -3091,7 +9261,7 @@ class _CanvasLogic:
         size = (size_start + size_end) / 2
         dirty = self.tiles.paint_line(
             obj.object_id, self._last_draw_point, local, size,
-            QColor(self.settings.brush_color), opacity_start, opacity_end,
+            QColor(self.primary_color), opacity_start, opacity_end,
             erase=self.tool == ToolKind.RASTER_ERASER,
             square=self.settings.eraser_square and self.tool == ToolKind.RASTER_ERASER,
             antialias=(
@@ -3120,35 +9290,63 @@ class _CanvasLogic:
             )
             self._predictive = (
                 world_current, world_predicted, size,
-                QColor(self.settings.brush_color),
+                QColor(self.primary_color),
             )
         self._emit_raster_dirty(obj, dirty)
 
     def _end_stroke(self) -> None:
         obj = self.chapter.objects[self.selected_id]
         if (
-            self.tool == ToolKind.RASTER_PENCIL
+            not self._stroke_erasing
             and self._preset.stroke_end_ratio < 0.999
         ):
             size, opacity = self._brush_values(self._last_pressure)
             dirty = self.tiles.paint_dab(
                 obj.object_id, self._last_draw_point,
                 size * self._preset.stroke_end_ratio,
-                QColor(self.settings.brush_color), opacity,
+                QColor(self.primary_color), opacity,
                 antialias=self._preset.antialiasing,
                 before=self._stroke_before,
             )
             self._emit_raster_dirty(obj, dirty)
         keys = set(self._stroke_before)
         self.tiles.prune_empty(obj.object_id, keys)
+        frame_before = (
+            self._stroke_frame_before
+            if self._stroke_frame_before is not None
+            else tuple(obj.interaction_rect)
+        )
+        content = self.tiles.content_bounds(obj.object_id)
+        if content is None:
+            obj.interaction_rect = frame_before
+        else:
+            padded = content.adjusted(
+                -RASTER_FRAME_MARGIN, -RASTER_FRAME_MARGIN,
+                RASTER_FRAME_MARGIN, RASTER_FRAME_MARGIN,
+            )
+            frame = (
+                padded
+                if self._stroke_erasing
+                else QRectF(*frame_before).united(padded)
+            )
+            obj.interaction_rect = (
+                frame.left(), frame.top(),
+                max(1.0, frame.width()), max(1.0, frame.height()),
+            )
+        frame_after = tuple(obj.interaction_rect)
         after = self.tiles.snapshot(obj.object_id, keys)
         command = TilePatchCommand(
             "Raster stroke", self.tiles, obj.object_id,
             self._stroke_before, after,
             lambda: (self.update(), self.documentChanged.emit(QRectF())),
+            frame_before, frame_after,
+            lambda frame, object_id=obj.object_id:
+            self._restore_raster_frame(object_id, frame),
         )
         self.command_stack.push(command, already_done=True)
         self._stroke_before = {}
+        self._stroke_frame_before = None
+        self._stroke_erasing = False
         self._drawing = False
         self._predictive = None
         self.interactionFinished.emit()
@@ -3167,6 +9365,7 @@ class _CanvasLogic:
             size *= self._preset.size_curve.evaluate_fast(pressure)
         if self._preset.pressure_opacity:
             opacity = self._preset.opacity_curve.evaluate_fast(pressure)
+        opacity *= QColor(self.primary_color).alphaF()
         return max(0.5, size), opacity
 
     def refresh_brush_settings(self) -> None:
@@ -3174,7 +9373,12 @@ class _CanvasLogic:
         self.update()
 
     def _emit_raster_dirty(self, obj: RasterObject, local: QRectF) -> None:
-        frame = QRectF(*obj.interaction_rect).united(local)
+        frame = QRectF(*obj.interaction_rect)
+        if not self._stroke_erasing:
+            frame = frame.united(local.adjusted(
+                -RASTER_FRAME_MARGIN, -RASTER_FRAME_MARGIN,
+                RASTER_FRAME_MARGIN, RASTER_FRAME_MARGIN,
+            ))
         obj.interaction_rect = (
             frame.left(), frame.top(), max(1.0, frame.width()),
             max(1.0, frame.height()),
@@ -3187,6 +9391,18 @@ class _CanvasLogic:
             self.hierarchyChanged.emit()
         self.documentChanged.emit(world)
         self.update()
+
+    def _restore_raster_frame(
+        self, object_id: str, frame: object,
+    ) -> None:
+        if (
+            self.chapter is None or frame is None
+            or object_id not in self.chapter.objects
+        ):
+            return
+        obj = self.chapter.objects[object_id]
+        if isinstance(obj, RasterObject):
+            obj.interaction_rect = tuple(frame)
 
     @staticmethod
     def _edge_midpoints(
@@ -3205,6 +9421,108 @@ class _CanvasLogic:
         cls, quad: list[tuple[float, float]],
     ) -> list[tuple[float, float]]:
         return list(quad) + cls._edge_midpoints(quad)
+
+    def _transform_control_hit(
+        self, quad: list[tuple[float, float]], point: QPointF,
+    ) -> tuple[str, int | None]:
+        tolerance = 14 / max(self.scale, 0.05)
+        handles, rotate, pivot = self._transform_control_points(
+            quad, self._transform_pivot
+        )
+        pivot_distance = math.dist(point.toTuple(), pivot.toTuple())
+        if (
+            4 / max(self.scale, 0.05)
+            <= pivot_distance <= tolerance
+        ):
+            return "pivot", None
+        if math.dist(point.toTuple(), rotate.toTuple()) <= tolerance:
+            return "rotate", None
+        distances = [
+            math.dist(point.toTuple(), candidate) for candidate in handles
+        ]
+        if distances and min(distances) <= tolerance:
+            return "handle", distances.index(min(distances))
+        path = QPainterPath()
+        path.addPolygon(QPolygonF([QPointF(*candidate) for candidate in quad]))
+        return ("translate", None) if path.contains(point) else ("", None)
+
+    @staticmethod
+    def _point_segment_distance(
+        point: QPointF, start: tuple[float, float],
+        end: tuple[float, float],
+    ) -> float:
+        dx, dy = end[0] - start[0], end[1] - start[1]
+        length_squared = dx * dx + dy * dy
+        if length_squared <= 1e-9:
+            return math.dist(point.toTuple(), start)
+        percent = max(0.0, min(
+            1.0,
+            ((point.x() - start[0]) * dx
+             + (point.y() - start[1]) * dy) / length_squared,
+        ))
+        nearest = start[0] + percent * dx, start[1] + percent * dy
+        return math.dist(point.toTuple(), nearest)
+
+    def _raster_transform_control_hit(
+        self, quad: list[tuple[float, float]], point: QPointF,
+    ) -> tuple[str, int | None]:
+        tolerance = 14 / max(self.scale, 0.05)
+        handles, rotate, pivot = self._transform_control_points(
+            quad, self._transform_pivot
+        )
+        pivot_distance = math.dist(point.toTuple(), pivot.toTuple())
+        if 4 / max(self.scale, 0.05) <= pivot_distance <= tolerance:
+            return "pivot", None
+        if math.dist(point.toTuple(), rotate.toTuple()) <= tolerance:
+            return "rotate", None
+        distances = [
+            math.dist(point.toTuple(), candidate) for candidate in handles
+        ]
+        if distances and min(distances) <= tolerance:
+            return "handle", distances.index(min(distances))
+        if any(
+            self._point_segment_distance(
+                point, quad[index], quad[(index + 1) % 4]
+            ) <= tolerance
+            for index in range(4)
+        ):
+            return "translate", None
+        return "", None
+
+    def _begin_selected_raster_transform(self, point: QPointF) -> bool:
+        if self.chapter is None or not self.selected_object_id:
+            return False
+        obj = self.chapter.objects.get(self.selected_object_id)
+        if not isinstance(obj, RasterObject):
+            return False
+        world_quad = self.object_world_quad(obj.object_id)
+        if not world_quad:
+            return False
+        mode, handle = self._raster_transform_control_hit(
+            world_quad, point
+        )
+        if not mode:
+            return False
+        layer_x, layer_y = self.chapter.layer_world_translation(
+            obj.parent_layer_id
+        )
+        self._transform_handle_index = handle
+        self._transform_drag_mode = mode
+        self._model_before = self.chapter.to_dict()
+        self._drag_start_doc = QPointF(point)
+        self._transform_start_quad = [
+            (x - layer_x, y - layer_y) for x, y in world_quad
+        ]
+        self._transform_preview_quad = list(self._transform_start_quad)
+        pivot = self._transform_pivot or QPointF(
+            sum(x for x, _ in world_quad) / 4,
+            sum(y for _, y in world_quad) / 4,
+        )
+        self._transform_rotate_start = math.atan2(
+            point.y() - pivot.y(), point.x() - pivot.x()
+        )
+        self._build_raster_transform_cache()
+        return True
 
     @staticmethod
     def _quad_is_valid(quad: list[tuple[float, float]]) -> bool:
@@ -3231,7 +9549,7 @@ class _CanvasLogic:
     def _snap_transform_point(
         self, point: tuple[float, float], layer_id: str,
     ) -> tuple[float, float]:
-        if not self.settings.transform_snap_to_grid:
+        if not self.settings.snap_to_grid:
             return point
         layer_x, layer_y = self.chapter.layer_world_translation(layer_id)
         grid = self.chapter.effective_grid(layer_id)
@@ -3247,9 +9565,38 @@ class _CanvasLogic:
         start = list(self._transform_start_quad)
         dx = point.x() - self._drag_start_doc.x()
         dy = point.y() - self._drag_start_doc.y()
-        if self._transform_drag_mode == "translate":
+        if self._transform_drag_mode == "pivot":
+            self._transform_pivot = QPointF(point)
+            self._transform_pivot_custom = True
+            return
+        if self._transform_drag_mode == "rotate":
+            world_pivot = self._transform_pivot or QPointF(
+                sum(x for x, _ in start) / 4 + layer_x,
+                sum(y for _, y in start) / 4 + layer_y,
+            )
+            current_angle = math.atan2(
+                point.y() - world_pivot.y(),
+                point.x() - world_pivot.x(),
+            )
+            angle = current_angle - self._transform_rotate_start
+            cosine, sine = math.cos(angle), math.sin(angle)
+            pivot = QPointF(
+                world_pivot.x() - layer_x, world_pivot.y() - layer_y
+            )
+            candidate = [
+                (
+                    pivot.x()
+                    + (x - pivot.x()) * cosine
+                    - (y - pivot.y()) * sine,
+                    pivot.y()
+                    + (x - pivot.x()) * sine
+                    + (y - pivot.y()) * cosine,
+                )
+                for x, y in start
+            ]
+        elif self._transform_drag_mode == "translate":
             candidate = [(x + dx, y + dy) for x, y in start]
-            if self.settings.transform_snap_to_grid:
+            if self.settings.snap_to_grid:
                 center = (
                     sum(x for x, _ in candidate) / 4,
                     sum(y for _, y in candidate) / 4,
@@ -3300,12 +9647,17 @@ class _CanvasLogic:
         obj = self.chapter.objects[object_id]
         before_model = self._model_before
         destination = list(self._transform_preview_quad)
+        source = list(self._transform_start_quad)
+        drag_mode = self._transform_drag_mode
         self._model_before = None
         self._transform_start_quad = None
         self._transform_preview_quad = None
         self._transform_handle_index = None
         self._transform_drag_mode = None
         self._transform_static_cache = QImage()
+        if drag_mode == "pivot":
+            self.update()
+            return
         if isinstance(obj, TextObject):
             obj.transform_quad = destination
             obj.x = obj.y = 0
@@ -3318,8 +9670,19 @@ class _CanvasLogic:
             return
         if not isinstance(obj, RasterObject):
             return
+        if drag_mode == "translate":
+            obj.x += destination[0][0] - source[0][0]
+            obj.y += destination[0][1] - source[0][1]
+            after_model = self.chapter.to_dict()
+            if before_model != after_model:
+                self.push_model_change(
+                    before_model, after_model, "Translate raster"
+                )
+                self.hierarchyChanged.emit()
+            self.documentChanged.emit(QRectF())
+            self.update()
+            return
         before_tiles = self.tiles.object_tiles(object_id)
-        pre_transform_state = obj.to_dict()
         try:
             after_tiles = self.tiles.projective_transform(
                 object_id, obj.x, obj.y, destination,
@@ -3328,9 +9691,6 @@ class _CanvasLogic:
         except ValueError:
             self.update()
             return
-        self._raster_transform_snapshots[object_id] = (
-            pre_transform_state, before_tiles
-        )
         obj.x = obj.y = 0
         destination_bounds = QPolygonF([
             QPointF(*point) for point in destination
@@ -3350,13 +9710,9 @@ class _CanvasLogic:
             self.update()
 
         def redo_transform() -> None:
-            self._raster_transform_snapshots[object_id] = (
-                pre_transform_state, before_tiles
-            )
             apply(after_model, after_tiles)
 
         def undo_transform() -> None:
-            self._raster_transform_snapshots.pop(object_id, None)
             apply(before_model, before_tiles)
 
         self.command_stack.push(
@@ -3408,7 +9764,6 @@ class _CanvasLogic:
                 painter, self.chapter.layers[page_id], 1.0, visible
             )
         self._render_excluded_object_id = ""
-        self._draw_grid(painter, visible)
         painter.restore()
         painter.end()
         self._transform_static_cache = image
@@ -3427,7 +9782,7 @@ class _CanvasLogic:
                 return
             painter.translate(layer.translate_x, layer.translate_y)
             painter.setClipPath(
-                self.bound_path(layer.bound, layer.vertex_radius),
+                self.layer_effective_path(layer.layer_id),
                 Qt.IntersectClip,
             )
             opacity *= layer.opacity
@@ -3438,47 +9793,6 @@ class _CanvasLogic:
             painter, obj, opacity, visible.translated(-world_x, -world_y)
         )
         painter.restore()
-
-    def can_undo_raster_transform(self) -> bool:
-        return bool(
-            self.selected_object_id
-            and self.selected_object_id in self._raster_transform_snapshots
-        )
-
-    def undo_raster_transform(self) -> bool:
-        object_id = self.selected_object_id
-        snapshot = self._raster_transform_snapshots.pop(object_id, None)
-        if snapshot is None or not isinstance(
-            self.chapter.objects.get(object_id), RasterObject
-        ):
-            return False
-        restore_state, restore_tiles = snapshot
-        current_state = self.chapter.objects[object_id].to_dict()
-        current_tiles = self.tiles.object_tiles(object_id)
-
-        def apply(state: dict, values: dict) -> None:
-            obj = self.chapter.objects.get(object_id)
-            if not isinstance(obj, RasterObject):
-                return
-            position = state.get("position", [0, 0])
-            obj.x, obj.y = float(position[0]), float(position[1])
-            rect = state.get("interaction_rect", [0, 0, 120, 120])
-            obj.interaction_rect = tuple(float(value) for value in rect)
-            self.tiles.replace_object_tiles(object_id, values)
-            self.documentChanged.emit(QRectF())
-            self.update()
-
-        apply(restore_state, restore_tiles)
-        self.command_stack.push(
-            CallbackCommand(
-                "Undo raster transform",
-                lambda: apply(restore_state, restore_tiles),
-                lambda: apply(current_state, current_tiles),
-            ),
-            already_done=True,
-        )
-        self.interactionFinished.emit()
-        return True
 
     def _editing_text_object(self) -> TextObject | None:
         if (
@@ -3504,10 +9818,14 @@ class _CanvasLogic:
                 QTransform(),
             )
         source = QRectF(0, 0, max(1.0, obj.width), max(1.0, obj.height))
+        document = self._text_document(obj, source.width())
+        offset = self._text_vertical_offset(obj, document, source.height())
+        transform = self._quad_transform(source, self._text_quad(obj))
+        transform.translate(0, offset)
         return (
-            self._text_document(obj, source.width()),
+            document,
             QPointF(layer_x, layer_y),
-            self._quad_transform(source, self._text_quad(obj)),
+            transform,
         )
 
     def _text_local_point(
