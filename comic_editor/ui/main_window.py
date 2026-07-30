@@ -21,7 +21,8 @@ from PySide6.QtWidgets import (
 )
 
 from comic_editor.core.models import (
-    BoundGeometry, ChapterDocument, ColorPalette, PaletteSwatch,
+    BoundGeometry, ChapterDocument, ColorFillGradientObject,
+    ColorGradientRampPreset, ColorPalette, GradientObject, PaletteSwatch,
     RasterObject, TextObject, VectorDrawingObject, VectorFillObject,
 )
 from comic_editor.core.persistence import SeriesRepository
@@ -36,6 +37,7 @@ from comic_editor.ui.hotkeys_dialog import HotkeysDialog
 from comic_editor.ui.hotkeys import (
     MODIFIER_LABELS, chord_keys, chord_text,
 )
+from comic_editor.ui.gradient_tools import GradientToolsControls
 from comic_editor.ui.pencil_settings_dialog import PencilSettingsDialog
 from comic_editor.ui.preview import ChapterPreview
 from comic_editor.ui.ribbon import RibbonWidget
@@ -374,6 +376,30 @@ class MainWindow(QMainWindow):
         raster_transform_group.add_widget(
             self.raster_object_controls.transform_widget
         )
+        self.gradient_tools_page = self.ribbon.add_page(
+            "gradient_tools", "Gradient Tools", visible=False
+        )
+        self.gradient_tools_controls = GradientToolsControls(
+            self.canvas, self.ribbon
+        )
+        gradient_create_group = self.gradient_tools_page.add_group(
+            "Create Gradient", minimum_width=430
+        )
+        gradient_create_group.add_widget(
+            self.gradient_tools_controls.create_widget
+        )
+        gradient_parameters_group = self.gradient_tools_page.add_group(
+            "Gradient Parameters", minimum_width=390
+        )
+        gradient_parameters_group.add_widget(
+            self.gradient_tools_controls.parameters_widget
+        )
+        gradient_presets_group = self.gradient_tools_page.add_group(
+            "Gradient Ramp Presets", minimum_width=270
+        )
+        gradient_presets_group.add_widget(
+            self.gradient_tools_controls.presets_widget
+        )
         self.preview = ChapterPreview(self.canvas)
         canvas_layout.addWidget(self.preview)
         canvas_layout.addWidget(self.canvas, 1)
@@ -486,6 +512,7 @@ class MainWindow(QMainWindow):
         self.layout_settings_timer.setSingleShot(True)
         self._vector_ribbon_context = False
         self._raster_ribbon_context = False
+        self._gradient_ribbon_context = False
         self._expanded_selected_vector_id = ""
 
     def _restore_workspace_layout(self) -> None:
@@ -673,6 +700,27 @@ class MainWindow(QMainWindow):
         )
         self.raster_object_controls.objectChanged.connect(
             self._hierarchy_changed
+        )
+        self.gradient_tools_controls.createRequested.connect(
+            self._create_gradient
+        )
+        self.gradient_tools_controls.objectChanged.connect(
+            self._hierarchy_changed
+        )
+        self.gradient_tools_controls.presetLoadRequested.connect(
+            self._load_gradient_preset
+        )
+        self.gradient_tools_controls.presetAddRequested.connect(
+            self._add_gradient_preset
+        )
+        self.gradient_tools_controls.presetSaveRequested.connect(
+            self._save_gradient_preset
+        )
+        self.gradient_tools_controls.presetRenameRequested.connect(
+            self._rename_gradient_preset
+        )
+        self.gradient_tools_controls.presetRemoveRequested.connect(
+            self._remove_gradient_preset
         )
         self.vector_tools_controls.redrawToolRequested.connect(
             lambda: self._activate_named_tool("VECTOR_REDRAW")
@@ -1603,6 +1651,30 @@ class MainWindow(QMainWindow):
         self.canvas.push_model_change(before, after, "Add fill layer")
         self._after_structure(layer.layer_id, "layer")
 
+    def _create_gradient(self, field_type: str) -> None:
+        parent_id = self._gradient_context_parent_id()
+        if not parent_id:
+            self.statusBar().showMessage(
+                "Select a page, shape, or one of its child objects first",
+                5000,
+            )
+            return
+        if not self.canvas.begin_gradient_creation(parent_id, field_type):
+            self.statusBar().showMessage(
+                "Unable to create a gradient in this shape", 5000
+            )
+            return
+        if field_type == "line":
+            self.statusBar().showMessage(
+                "Draw an open gradient path; Enter or double-click confirms.",
+                7000,
+            )
+        elif field_type == "radial":
+            self.statusBar().showMessage(
+                "Drag from the gradient origin to set its radius.", 7000
+            )
+        self._sync_contextual_ribbon()
+
     def _add_text(self) -> None:
         parent = self._selected_parent_layer(allow_page=True)
         if parent is None:
@@ -1876,6 +1948,24 @@ class MainWindow(QMainWindow):
             else None
         )
 
+    def _gradient_context_parent_id(self) -> str:
+        if self.chapter is None or not self.canvas.selected_id:
+            return ""
+        if self.canvas.selected_kind == "layer":
+            layer = self.chapter.layers.get(self.canvas.selected_id)
+            if layer is None:
+                return ""
+            if layer.layer_kind == "fill":
+                return layer.parent_id or ""
+            return layer.layer_id if layer.bound is not None else ""
+        obj = self.chapter.objects.get(self.canvas.selected_id)
+        if obj is None:
+            return ""
+        return (
+            obj.parent_layer_id
+            if obj.parent_layer_id in self.chapter.layers else ""
+        )
+
     def _sync_contextual_ribbon(self) -> None:
         if not hasattr(self, "ribbon"):
             return
@@ -1893,20 +1983,27 @@ class MainWindow(QMainWindow):
             selected_object, (VectorDrawingObject, VectorFillObject)
         )
         raster_active = isinstance(selected_object, RasterObject)
+        gradient_selected = isinstance(selected_object, GradientObject)
+        gradient_parent_id = self._gradient_context_parent_id()
+        gradient_active = bool(gradient_parent_id)
         entering = active and not self._vector_ribbon_context
         entering_raster = (
             raster_active and not self._raster_ribbon_context
         )
         self._vector_ribbon_context = active
         self._raster_ribbon_context = raster_active
+        self._gradient_ribbon_context = gradient_active
         self.ribbon.set_page_visible("vector_tools", active)
         self.ribbon.set_page_visible(
             "raster_object_settings", raster_active
         )
+        self.ribbon.set_page_visible("gradient_tools", gradient_active)
         if entering:
             self.ribbon.select_page("vector_tools")
         elif entering_raster:
             self.ribbon.select_page("raster_object_settings")
+        elif gradient_selected:
+            self.ribbon.select_page("gradient_tools")
         self.tool_settings_controls.set_context(
             self.canvas.tool, vector_active=vector_tool_context
         )
@@ -1928,6 +2025,9 @@ class MainWindow(QMainWindow):
             )
         if raster_active:
             self.raster_object_controls.refresh()
+        if gradient_active:
+            self.gradient_tools_controls.refresh()
+            self._sync_gradient_presets()
 
     def _apply_vector_redraw(self) -> None:
         method = getattr(self.canvas, "apply_vector_redraw", None)
@@ -2154,6 +2254,132 @@ class MainWindow(QMainWindow):
         del blocker
 
     # ---- per-series colors and palettes -------------------------------
+    def _sync_gradient_presets(self) -> None:
+        presets = (
+            self.series.gradient_ramp_presets
+            if self.series is not None else []
+        )
+        self.gradient_tools_controls.set_presets(presets)
+        obj = self.gradient_tools_controls.selected_gradient()
+        if obj is not None:
+            index = self.gradient_tools_controls.preset_combo.findData(
+                obj.loaded_preset_id
+            )
+            self.gradient_tools_controls.preset_combo.setCurrentIndex(
+                max(0, index)
+            )
+            self.gradient_tools_controls._sync_preset_name()
+
+    def _gradient_preset_by_id(
+        self, preset_id: str,
+    ) -> ColorGradientRampPreset | None:
+        if self.series is None:
+            return None
+        return next((
+            preset for preset in self.series.gradient_ramp_presets
+            if preset.preset_id == preset_id
+        ), None)
+
+    def _load_gradient_preset(self, preset_id: str) -> None:
+        preset = self._gradient_preset_by_id(preset_id)
+        obj = self.gradient_tools_controls.selected_gradient()
+        if preset is None or obj is None or self.chapter is None:
+            return
+        before = self.chapter.to_dict()
+        obj.ramp = preset.ramp.copy()
+        obj.loaded_preset_id = preset.preset_id
+        obj.touch_revision()
+        after = self.chapter.to_dict()
+        self.canvas.push_model_change(
+            before, after, "Load gradient preset"
+        )
+        self.canvas.documentChanged.emit(None)
+        self.gradient_tools_controls.refresh()
+
+    def _add_gradient_preset(self) -> None:
+        if self.series is None:
+            return
+        obj = self.gradient_tools_controls.selected_gradient()
+        if obj is None:
+            return
+        used = {
+            preset.name.casefold()
+            for preset in self.series.gradient_ramp_presets
+        }
+        number = 1
+        while f"Gradient {number}".casefold() in used:
+            number += 1
+        preset = ColorGradientRampPreset(
+            name=f"Gradient {number}", ramp=obj.ramp.copy()
+        )
+        self.series.gradient_ramp_presets.append(preset)
+        if self.chapter is not None:
+            before = self.chapter.to_dict()
+            obj.loaded_preset_id = preset.preset_id
+            after = self.chapter.to_dict()
+            self.canvas.push_model_change(
+                before, after, "Associate gradient preset"
+            )
+        self._schedule_series_preferences_save(immediate=True)
+        self._sync_gradient_presets()
+
+    def _save_gradient_preset(self, preset_id: str) -> None:
+        preset = self._gradient_preset_by_id(preset_id)
+        obj = self.gradient_tools_controls.selected_gradient()
+        if preset is None or obj is None:
+            return
+        preset.ramp = obj.ramp.copy()
+        preset.validate()
+        obj.loaded_preset_id = preset_id
+        self._schedule_series_preferences_save(immediate=True)
+        self._sync_gradient_presets()
+
+    def _rename_gradient_preset(
+        self, preset_id: str, name: str,
+    ) -> None:
+        preset = self._gradient_preset_by_id(preset_id)
+        if preset is None:
+            return
+        candidate = name.strip() or "Gradient"
+        if self.series is not None and any(
+            other.preset_id != preset_id
+            and other.name.casefold() == candidate.casefold()
+            for other in self.series.gradient_ramp_presets
+        ):
+            self.statusBar().showMessage(
+                "A gradient preset already has that name", 4000
+            )
+            self._sync_gradient_presets()
+            return
+        preset.name = candidate
+        preset.validate()
+        self._schedule_series_preferences_save(immediate=True)
+        self._sync_gradient_presets()
+
+    def _remove_gradient_preset(self, preset_id: str) -> None:
+        if (
+            self.series is None
+            or len(self.series.gradient_ramp_presets) <= 1
+        ):
+            return
+        self.series.gradient_ramp_presets = [
+            preset for preset in self.series.gradient_ramp_presets
+            if preset.preset_id != preset_id
+        ]
+        if self.chapter is not None:
+            changed = False
+            for obj in self.chapter.objects.values():
+                if (
+                    isinstance(obj, ColorFillGradientObject)
+                    and obj.loaded_preset_id == preset_id
+                ):
+                    obj.loaded_preset_id = ""
+                    changed = True
+            if changed:
+                self._mark_dirty(None)
+        self._schedule_series_preferences_save(immediate=True)
+        self._sync_gradient_presets()
+
     def _sync_series_color_ui(self) -> None:
         if self.series is None:
             primary, secondary = "#FF000000", "#FFFFFFFF"
@@ -2174,6 +2400,7 @@ class MainWindow(QMainWindow):
             self.color_panel.active_color()
         )
         self._apply_series_colors_to_canvas(primary, secondary)
+        self._sync_gradient_presets()
 
     def _apply_series_colors_to_canvas(
         self, primary: str, secondary: str

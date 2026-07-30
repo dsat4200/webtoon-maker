@@ -196,7 +196,7 @@
             "state": {
               "type": "search",
               "state": {
-                "query": "",
+                "query": "assets",
                 "matchingCase": false,
                 "explainSearch": false,
                 "collapseAll": false,
@@ -328,10 +328,11 @@
   },
   "active": "6648fe92b3c63e2b",
   "lastOpenFiles": [
-    "characters.md",
-    "Untitled 3.md",
-    "story settings.md",
     "planning/lighter novel/what is the lighter novel.md",
+    "Untitled 3.md",
+    "Pasted image 20260730190248.png",
+    "characters.md",
+    "story settings.md",
     "art notes.md",
     "Basic 3D - blender pipeline.md",
     "Ideal Process notes.md",

@@ -54,7 +54,7 @@ def test_compound_fields_and_multiple_contours_round_trip():
     loaded = ChapterDocument.from_dict(chapter.to_dict())
 
     restored = loaded.layers[layer.layer_id]
-    assert loaded.schema_version == 9
+    assert loaded.schema_version == 10
     assert restored.compound_enabled
     assert restored.compound_operation == "subtract"
     assert len(restored.bound.additional_contours) == 1

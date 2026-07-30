@@ -34,12 +34,66 @@
 - gradients may be used later as maps for other things, so make the structure for gradient data and creation generalizable. instead of all gradients having color fill data, make the gradient we just created a subtype of gradient that specifically does fill colors. the gradients parent structure should have all the shape creation/gizmos/ribbon thing, and type of gradient should be an attribute of that structure.
 - make sure to use best practices for programming patterns when designing how gradients work.
 
+## Gradient tweaks:
+- one preset that can't be changed or deleted but can be loaded - primary to secondary
+- add a "swap primary/secondary" button to the main color picker, in the same row. make it a square button with a refresh icon
+- shape gradient has an option that when enabled, instead of using a center inside, points the gradient outwards, with a gizmo for the distance outwards until it reaches its maximum ignoring the masking of its parent (but not its parent's parent). 
+
+## new gradient type: speed lines
+speed lines, includes opacity too
+	- supports different shapes
+		- however, in line/curve mode, a draggable gizmo lets you set which direction the lines point (on which side of the line, sliding from one to the other)
+			- another gizmo is a toggle with text label - lets you switch between whether the lines start at the ends and follow the curve as they go left/right, or whether they point up/down (as if pointing "normal" to the curve). basically, perpindicular or parallel, above or below, left or right.
+		- in circle/ellipse/shape, the speed lines start at the outside and move inside towards the moveable center point, like the regular version
+	- works the same as a color fill gradient, but with speed lines instead.
+	- has a gradient ramp control the color/opacity (since colors have alpha channel)
+	- a different ramp can control the thickness transition curve (just use the greyscale of whatever gradient ramp)
+	- this means 2 of the full gradient parameters columns - one called "thickness parameters" and the other called "color parameters"
+- another column called "impact line parameters" lets you set the following with sliders, enter-able parameters
+	- density - how dense are the lines (this also means thickness is scaled relative so you dont have overlap)
+	- gap - how much space between each line (none if zero)
+	- close range - margin of how many px away from their expected end point they should actually end/transition to
+	- randomness distance- what is the max distance a point's actual end point be from the expected end point for transition towards (thickness only)
+	- randomness scale - how different should each line's end point be from it's immediate neighbors (think of it like affecting the scale of the noise used for the randomness operation, thickness only)
+	- custom center shape/line (button)
+		- this option creates a child object shape of the speed line gradient. this child can be deleted but not moved.
+			- asks for which shape type (square, rect, free (closed only))
+		- clicking this when one exists just selects it
+		- exists or not, clicking this button selects it and switches to shape edit if not already in that mode
+			- this lets the user modify the shape
+		- what this center shape does is, instead of the lines ending at a point, they project towards the closest point on this internal shape's outside boundary, and end once they reach it, smoothly transitioning as they usually do, following the parameters from the ribbon.
+		- if deleted, reverts to point-based center
+		- only if the gradient object is a line, the shape type should be an open shape.
+			- if the custom center is of a different open-ness type than its parent (open / closed), then it simply shouldn't have an effect.
+			- don't delete the custom center if the gradient shape changes though.
+	- shape version of this speed lines effect also supports the "outwards" toggle, which ignores the custom inner shape if one exists
+
+## New feature: Asset Library
+- "assets" are like prefabs in unity. they are presets made of a layer, its parameters, and its children and their parameters and so on, in a separate "library".
+- like prefabs, assets under the hood are just projects of their own, but only containing the relevant layers/objects that compose the prefab (instead of a full comic chapter or pages)
+- assets exist in this library with a thumbnail (a preview of what the asset looks like) and a name. they can be renamed, and double clicking them opens them up as if they were a project, letting the user modify the preset asset and save it (which also updates its thumbnail)
+- to aid in this, add project tabs (sort of like what you'd see in photoshop or clip studio paint). these "projects" can be actual projects, or assets. these project tabs should show the name of the project that's open, an x button to close it, an asterisk after the name if it hasn't been saved recently. clicking a tab should well, open that project. however, projects that already have open tabs shouldn't be fully opening - they should already be cached / in memory, etc such that they don't slow down the current project but also switching between them is fast, like in any image manipulation program.
+- additionally, add a ribbon menu titled "Asset Library" that's always visible as an option
+	- this assets ribbon shows assets as thumbnails with a name below, in a row, that is scrolled horizontally.
+	- right clicking a layer/object in the outliner should bring up a new right click menu. one of the options should be rename, to rename the layer/object)
+	- another option should be "copy as asset". this brings up a popup asking you to name the asset. clicking OK then creates a folder for that asset which contains, essentially a project of its own, but with only that object and its children as they were when copied. this should also refresh the assets ribbon viewer and show its square thumbnail, which should have been rendered as a finished image, whose view is cropped to a fitted box around the bounds of the selected object
 
 
-- same thing but for speed lines
 
 
-more tweaks (check)
+## Dont forget
+- object/layer outer outline
+	- in drawing object:
+		- appears in object settings
+		- draws an integer px thickness outline around all pixels that have a drawn-on value
+		- lets you set the color of the outline too. since it has an alpha channel that can control the opacity for us
+test the fill tool dumbass (vector and raster drawing)
+(can you free transform 8 handle a shape?)
+- asset library
+
+
+
+## more tweaks (done)
 - [x] stylus should be able to click popup tool menu options (currently not working)
 - [x] sweep simplify should also show a circle outline around the radius so you know which points you select. drawing with sweep simplify should show as if you're drawing with a circular brush, as a transparent orange overlay. the points under this selection are what is simplified when you release the pen from the canvas. (which then also turns off sweep simplify.) it shouldn't simplify the whole stroke, just those points underneath.
 - [x] if you have points selected from a point selection mode, "apply" in simplify should only apply to those selected points (and their nearest neighbor if on a line segment)
@@ -56,7 +110,7 @@ more tweaks (check)
 - [x] the plus, minus should show on the cursor even when hovering, not just when actively selecting something.
 - [x] ignore direct parent is currently unintentionally broken. selecting this for a shape should make it and its children appear as if they are on top of their parent shape - that's what i meant by ignoring the mask
 
-## more tweaks (not done)
+## more tweaks  (done)
 - [x] if i try selecting an object or layer in the outliner with my pen, it "sticks" and starts trying to drag. this is a bug
 - [x] disabling a shape from being visible by unchecking the outliner doesn't let me re-enable it
 - [x] ignore direct parent mask should allow a drawing to show itself as if it were "on top of" the shape / unaffected by its bounds (even while remaining a child). think of it like "always on top"
@@ -93,19 +147,12 @@ more tweaks (check)
 	- remember the underlay setting per-object.
 
 
-## New feature: Gradients
-
-film grain? vignette is just a gradient preset
-
-speed lines shape,like a gradient?
-- has a ramp for thickness, a handle for density, set max/min thickness/opacity
-- linear, radial, or shape-based like gradients do
-- moveable center point.
-crosshatching/speedline pencil?
 
 
 ## Bugs:
 - [ ] now the raster pencil doesn't work. instead it just draws a dot. if the issue is that the interaction would translate, instead make the translation handle for the raster 8 handle system happen only when hovering/clickdragging around the outside of the width/height with a 20px outside margin.
+
+
 ## Performance issues
 - pinch zoom is laggy
 - make sure vector drawing is SNAPPY
@@ -127,3 +174,24 @@ crosshatching/speedline pencil?
 - in text edit, if mode is free transform, show 8 handles to change the text bounds manually.
 	- if a text object is a child of the main shape in a compound shape, and strict is on, there should be an option to strict fit to the main shape, or to strict fit to the full compound shape. the default should be to the main shape (currently its only doing it to the full compound shape)
 - in text edit, trying to transform both with line handles and point handles sometimes only lets me do one or the other, this is a bug.
+
+
+## Fill types - textures
+what supports fill types?
+- shape fills
+- gradient colors
+
+
+what are the fill types / textures
+- repeating pattern
+- brick texture
+- different noise types
+- screentones
+	- tone size, dynamic, texture-able?
+	- parameters - if it has a value from 0 to 1, it can be set to a "texture"
+- support having a mask
+- dynamic mask - glow around, inside an object?
+	- gradient ramp support
+- glow object with a child that represents the fill (but what about scale / parameter support?)
+
+![[Pasted image 20260730190248.png]]

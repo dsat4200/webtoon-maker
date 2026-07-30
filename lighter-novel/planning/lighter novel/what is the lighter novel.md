@@ -191,20 +191,9 @@ raster object tweaks:
 	- put layout setting and the align popup menu button in the same row
 	- aligning should still be possible in free transform mode, just that instead the aligning should be relative to the bounds of the text object's transform rect itself.
 		- instead of showing a row for name, the name of a text object should just be the first 16 characters.
-## New feature: Asset saving
-- "assets" are like prefabs in unity. they are presets made of a layer, its parameters, and its children and their parameters and so on, in a separate "library".
-- like prefabs, assets under the hood are just projects of their own, but only containing the relevant layers/objects that compose the prefab (instead of a full comic chapter or pages)
-- assets exist in this library with a thumbnail (a preview of what the asset looks like) and a name. they can be renamed, and double clicking them opens them up as if they were a project, letting the user modify the preset asset and save it (which also updates its thumbnail)
-- to aid in this, add project tabs (sort of like what you'd see in photoshop or clip studio paint). these "projects" can be actual projects, or assets. these project tabs should show the name of the project that's open, an x button to close it, an asterisk after the name if it hasn't been saved recently. clicking a tab should well, open that project. however, projects that already have open tabs shouldn't be fully opening - they should already be cached / in memory, etc such that they don't slow down the current project but also switching between them is fast, like in any image manipulation program.
-- additionally, add a top bar above the canvas, that, for now, only contains "asset view" (but will contain other menus, in the same fashion as the ribbon menu system from Microsoft office).
-	- this assets ribbon shows assets as thumbnails with a name below, in a row, that is scrolled horizontally.
-	- right clicking a layer/object in the outliner should bring up a new right click menu. one of the options should be rename, to rename the layer/object)
-	- another option should be "copy as asset". this brings up a popup asking you to name the asset. clicking OK then creates a folder for that asset which contains, essentially a project of its own, but with only that object and its children as they were when copied. this should also refresh the assets ribbon viewer and show its square thumbnail, which should have been rendered as a finished image, whose view is cropped to a fitted box around the bounds of the selected object
 
 
-
-
-## new feature: compound shapes
+## new feature: compound shapes (done)
 - compound shapes - a toggle for a shape that allows it to be able to be made of a composite of the shapes that are its children
 	- can be any shape, including non-filled line/curve shapes.
 	- the full compound shape (parent of the compound-contributing children) still has visible toggle and fill, and other properties.
@@ -219,7 +208,7 @@ raster object tweaks:
 - in the a compound shape settings, there should be a "flatten" button. This button takes all that information from the child compound shape contributors and "flattens" them all such that their children become direct children of the compound shape, and the full compound shape gets "compiled" into one shape, made of beziers and vector points and whatnot. This single flattened shape is no longer compound, but looks exactly the same. the shape would have to be calculated from the compound, with new points made where intersections were and whatnot.
 	- if a child text object was previously strict positioned to one of the compound children, it's instead converted to free position, so its position is preserved.
 
-## More shape tweaks:
+## More shape tweaks (done):
 1. stroke thickness and outline thickness should have sliders. their px values should be integers.
 2. when selecting an end point of an open shape, the other two gizmos besides handles and delete freeze up or error out when selected.
 3. the toggle gizmo should be labeled with text that shows what the handle type is currently for the selected handle.
@@ -263,7 +252,7 @@ ValueError: Error calling Python override of QOpenGLWidget::mouseDoubleClickEven
 ```
 
 
-## Vector object tweaks
+## Vector object tweaks (done)
 1. when i draw a vector shape, i can't see the strokes on screen. I think this is a visual bug, because shape edit still lets me select the strokes and points.
 2. the boundaries between tool and scroll bar, and between ribbon and canvas should be draggable to customize width/height of these UI elements.
 3. instead of being in the ribbon, color settings should be another tab of the color window in the bottom left.
@@ -282,7 +271,7 @@ more tweaks (not done)
 - in text edit, if mode is free transform, show 8 handles to change the text bounds manually.
 	- if a text object is a child of the main shape in a compound shape, and strict is on, there should be an option to strict fit to the main shape, or to strict fit to the full compound shape. the default should be to the main shape (currently its only doing it to the full compound shape)
 - in text edit, trying to transform both with line handles and point handles sometimes only lets me do one or the other.
-## New feature - Vector Layers
+## New feature - Vector Layers (done, ultra)
 - add vector layers from clip studio paint.
 - https://help.clip-studio.com/en-us/manual_en/180_layers/Vector_layers.htm
 - however, we only want certain core features for now.

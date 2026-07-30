@@ -10,6 +10,7 @@ from PySide6.QtWidgets import (
 )
 
 from comic_editor.core.models import (
+    GradientObject,
     RasterObject, TextObject, VectorDrawingObject, VectorFillObject,
 )
 from comic_editor.core.settings import TextPreset
@@ -344,7 +345,7 @@ class ContextInspector(QFrame):
             return
         self._updating = True
         entity = chapter.objects[self.canvas.selected_id]
-        if isinstance(entity, RasterObject):
+        if isinstance(entity, (RasterObject, GradientObject)):
             self._updating = False
             self.hide()
             return

@@ -64,6 +64,10 @@ OBJECT_TYPES.register(ObjectTypeSpec(
 OBJECT_TYPES.register(ObjectTypeSpec(
     "vector_fill", object_from_dict, False, ("fill", "object_select"),
 ))
+OBJECT_TYPES.register(ObjectTypeSpec(
+    "gradient", object_from_dict, False,
+    ("shape_edit", "gradient_tools"),
+))
 
 BOUND_TYPES = BoundTypeRegistry()
 BOUND_TYPES.register(BoundTypeSpec("path", BoundGeometry.from_dict, 2))

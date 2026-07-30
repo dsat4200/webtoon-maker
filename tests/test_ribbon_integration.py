@@ -43,6 +43,7 @@ def test_main_window_ribbon_is_contextual_and_tools_are_renamed(qapp):
         assert window.tool_buttons[ToolKind.RASTER_ERASER].text() == "Eraser"
         assert window.ribbon.page_keys() == [
             "tool_settings", "vector_tools", "raster_object_settings",
+            "gradient_tools",
         ]
         assert window.color_tabs.count() == 2
         assert [

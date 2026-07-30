@@ -7,7 +7,7 @@ from dataclasses import dataclass, field
 from typing import Any, Iterable, Iterator, Literal
 
 
-SCHEMA_VERSION = 9
+SCHEMA_VERSION = 10
 CHAPTER_WIDTH = 1080
 DEFAULT_CHAPTER_HEIGHT = 3240
 GROWTH_MARGIN = 1080
@@ -824,6 +824,313 @@ class TextObject(DocumentObject):
 
 
 @dataclass
+class ColorGradientStop:
+    """One stable, independently editable stop in a color ramp."""
+
+    stop_id: str = field(default_factory=new_id)
+    position: float = 0.0
+    color: str = "#FF000000"
+
+    def validate(self) -> None:
+        try:
+            position = float(self.position)
+        except (TypeError, ValueError):
+            position = 0.0
+        self.position = (
+            max(0.0, min(1.0, position))
+            if math.isfinite(position) else 0.0
+        )
+        self.color = canonical_argb(self.color)
+
+    def to_dict(self) -> dict[str, Any]:
+        self.validate()
+        return {
+            "id": self.stop_id,
+            "position": self.position,
+            "color": self.color,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "ColorGradientStop":
+        result = cls(
+            stop_id=str(data.get("id") or new_id()),
+            position=float(data.get("position", 0.0)),
+            color=str(data.get("color", "#FF000000")),
+        )
+        result.validate()
+        return result
+
+
+@dataclass
+class ColorGradientRamp:
+    """Reusable color-map data independent of the field that samples it."""
+
+    stops: list[ColorGradientStop] = field(default_factory=lambda: [
+        ColorGradientStop(position=0.0, color="#FF000000"),
+        ColorGradientStop(position=1.0, color="#FFFFFFFF"),
+    ])
+    interpolation: Literal["linear"] = "linear"
+
+    def validate(self) -> None:
+        if self.interpolation != "linear":
+            self.interpolation = "linear"
+        while len(self.stops) < 2:
+            self.stops.append(ColorGradientStop(
+                position=1.0 if self.stops else 0.0,
+                color=(
+                    self.stops[-1].color
+                    if self.stops else "#FF000000"
+                ),
+            ))
+        ids: set[str] = set()
+        for stop in self.stops:
+            stop.validate()
+            if stop.stop_id in ids:
+                stop.stop_id = new_id()
+            ids.add(stop.stop_id)
+        # Python's stable sort preserves insertion order for hard transitions.
+        self.stops.sort(key=lambda stop: stop.position)
+
+    def to_dict(self) -> dict[str, Any]:
+        self.validate()
+        return {
+            "value_type": "color",
+            "interpolation": self.interpolation,
+            "stops": [stop.to_dict() for stop in self.stops],
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any] | None) -> "ColorGradientRamp":
+        data = data or {}
+        result = cls(
+            stops=[
+                ColorGradientStop.from_dict(item)
+                for item in data.get("stops", [])
+            ],
+            interpolation=str(data.get("interpolation", "linear")),
+        )
+        result.validate()
+        return result
+
+    def copy(self) -> "ColorGradientRamp":
+        return type(self).from_dict(self.to_dict())
+
+
+@dataclass
+class LineGradientField:
+    geometry: BoundGeometry = field(default_factory=lambda: BoundGeometry.path([
+        PathNode(x=270.0, y=540.0),
+        PathNode(x=810.0, y=540.0),
+    ]))
+
+    def validate(self) -> None:
+        self.geometry.closed = False
+        self.geometry.primitive = "custom"
+        self.geometry.validate()
+        if len(self.geometry.nodes) < 2:
+            raise ValueError("Line gradients require at least two points")
+
+    def to_dict(self) -> dict[str, Any]:
+        self.validate()
+        return {"geometry": self.geometry.to_dict()}
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any] | None) -> "LineGradientField":
+        data = data or {}
+        result = cls(
+            geometry=BoundGeometry.from_dict(
+                data.get("geometry") or {
+                    "closed": False,
+                    "primitive": "custom",
+                    "nodes": [
+                        {"position": [270, 540]},
+                        {"position": [810, 540]},
+                    ],
+                }
+            )
+        )
+        result.validate()
+        return result
+
+
+@dataclass
+class RadialGradientField:
+    origin_x: float = 540.0
+    origin_y: float = 540.0
+    radius_x: float = 270.0
+    radius_y: float = 270.0
+    rotation: float = 0.0
+    ellipse_enabled: bool = False
+    center_auto: bool = True
+    manual_center: tuple[float, float] | None = None
+
+    def validate(self) -> None:
+        values = (
+            self.origin_x, self.origin_y, self.radius_x,
+            self.radius_y, self.rotation,
+        )
+        if not all(math.isfinite(float(value)) for value in values):
+            raise ValueError("Radial gradient contains non-finite geometry")
+        self.origin_x = float(self.origin_x)
+        self.origin_y = float(self.origin_y)
+        self.radius_x = max(0.001, abs(float(self.radius_x)))
+        self.radius_y = max(0.001, abs(float(self.radius_y)))
+        self.rotation = float(self.rotation) % 360.0
+        self.ellipse_enabled = bool(self.ellipse_enabled)
+        self.center_auto = bool(self.center_auto)
+        self.manual_center = (
+            _point(self.manual_center)
+            if self.manual_center is not None else None
+        )
+        if self.manual_center is None:
+            self.center_auto = True
+
+    def center(self) -> tuple[float, float]:
+        if self.center_auto or self.manual_center is None:
+            return self.origin_x, self.origin_y
+        return self.manual_center
+
+    def to_dict(self) -> dict[str, Any]:
+        self.validate()
+        return {
+            "origin": [self.origin_x, self.origin_y],
+            "radii": [self.radius_x, self.radius_y],
+            "rotation": self.rotation,
+            "ellipse_enabled": self.ellipse_enabled,
+            "center_auto": self.center_auto,
+            "manual_center": (
+                list(self.manual_center)
+                if self.manual_center is not None else None
+            ),
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any] | None) -> "RadialGradientField":
+        data = data or {}
+        origin = data.get("origin", [540.0, 540.0])
+        radii = data.get("radii", [270.0, 270.0])
+        result = cls(
+            origin_x=float(origin[0]), origin_y=float(origin[1]),
+            radius_x=float(radii[0]), radius_y=float(radii[1]),
+            rotation=float(data.get("rotation", 0.0)),
+            ellipse_enabled=bool(data.get("ellipse_enabled", False)),
+            center_auto=bool(data.get("center_auto", True)),
+            manual_center=(
+                _point(data["manual_center"])
+                if data.get("manual_center") is not None else None
+            ),
+        )
+        result.validate()
+        return result
+
+
+@dataclass
+class ShapeGradientField:
+    center_auto: bool = True
+    manual_center: tuple[float, float] | None = None
+
+    def validate(self) -> None:
+        self.center_auto = bool(self.center_auto)
+        self.manual_center = (
+            _point(self.manual_center)
+            if self.manual_center is not None else None
+        )
+        if self.manual_center is None:
+            self.center_auto = True
+
+    def to_dict(self) -> dict[str, Any]:
+        self.validate()
+        return {
+            "center_auto": self.center_auto,
+            "manual_center": (
+                list(self.manual_center)
+                if self.manual_center is not None else None
+            ),
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any] | None) -> "ShapeGradientField":
+        data = data or {}
+        result = cls(
+            center_auto=bool(data.get("center_auto", True)),
+            manual_center=(
+                _point(data["manual_center"])
+                if data.get("manual_center") is not None else None
+            ),
+        )
+        result.validate()
+        return result
+
+
+@dataclass
+class GradientObject(DocumentObject):
+    """Base object: owns field geometry, while subtypes own mapped values."""
+
+    object_type: str = "gradient"
+    name: str = "Gradient"
+    gradient_type: str = "gradient"
+    field_type: Literal["line", "radial", "parent_shape"] = "line"
+    line_field: LineGradientField = field(default_factory=LineGradientField)
+    radial_field: RadialGradientField = field(
+        default_factory=RadialGradientField
+    )
+    shape_field: ShapeGradientField = field(
+        default_factory=ShapeGradientField
+    )
+    gradient_revision: int = 0
+
+    def validate_gradient(self) -> None:
+        if self.field_type not in {"line", "radial", "parent_shape"}:
+            self.field_type = "line"
+        self.line_field.validate()
+        self.radial_field.validate()
+        self.shape_field.validate()
+        self.gradient_revision = max(0, int(self.gradient_revision))
+
+    def touch_revision(self) -> int:
+        self.gradient_revision += 1
+        return self.gradient_revision
+
+    def gradient_dict(self) -> dict[str, Any]:
+        self.validate_gradient()
+        result = self.common_dict()
+        result.update({
+            "gradient_type": self.gradient_type,
+            "field_type": self.field_type,
+            "line_field": self.line_field.to_dict(),
+            "radial_field": self.radial_field.to_dict(),
+            "shape_field": self.shape_field.to_dict(),
+            "gradient_revision": self.gradient_revision,
+        })
+        return result
+
+    def to_dict(self) -> dict[str, Any]:
+        return self.gradient_dict()
+
+
+@dataclass
+class ColorFillGradientObject(GradientObject):
+    gradient_type: str = "color_fill"
+    name: str = "Color Gradient"
+    ramp: ColorGradientRamp = field(default_factory=ColorGradientRamp)
+    loaded_preset_id: str = ""
+
+    def validate_gradient(self) -> None:
+        super().validate_gradient()
+        self.gradient_type = "color_fill"
+        self.ramp.validate()
+        self.loaded_preset_id = str(self.loaded_preset_id or "")
+
+    def to_dict(self) -> dict[str, Any]:
+        result = self.gradient_dict()
+        result.update({
+            "ramp": self.ramp.to_dict(),
+            "loaded_preset_id": self.loaded_preset_id,
+        })
+        return result
+
+
+@dataclass
 class VectorStrokePoint:
     """An editable anchor plus the hidden cubic controls for one vector stroke."""
 
@@ -1071,7 +1378,8 @@ class VectorFillObject(DocumentObject):
 
 
 ObjectEntity = (
-    RasterObject | TextObject | VectorDrawingObject | VectorFillObject
+    RasterObject | TextObject | GradientObject
+    | VectorDrawingObject | VectorFillObject
     | DocumentObject
 )
 
@@ -1089,6 +1397,33 @@ def object_from_dict(data: dict[str, Any]) -> ObjectEntity:
         underlay_opacity=float(data.get("underlay_opacity", 0.0)),
     )
     object_type = str(data.get("type", "object"))
+    if object_type == "gradient":
+        gradient_type = str(data.get("gradient_type", "color_fill"))
+        gradient_common = dict(
+            **common,
+            field_type=str(data.get("field_type", "line")),
+            line_field=LineGradientField.from_dict(data.get("line_field")),
+            radial_field=RadialGradientField.from_dict(
+                data.get("radial_field")
+            ),
+            shape_field=ShapeGradientField.from_dict(
+                data.get("shape_field")
+            ),
+            gradient_revision=int(data.get("gradient_revision", 0)),
+        )
+        if gradient_type == "color_fill":
+            result = ColorFillGradientObject(
+                **gradient_common,
+                ramp=ColorGradientRamp.from_dict(data.get("ramp")),
+                loaded_preset_id=str(data.get("loaded_preset_id", "")),
+            )
+            result.validate_gradient()
+            return result
+        result = GradientObject(
+            **gradient_common, gradient_type=gradient_type
+        )
+        result.validate_gradient()
+        return result
     if object_type == "vector_drawing":
         return VectorDrawingObject(
             **common,
@@ -1259,6 +1594,8 @@ class ChapterDocument:
                 max(0.0, min(1.0, underlay))
                 if math.isfinite(underlay) else 0.0
             )
+            if isinstance(obj, GradientObject):
+                obj.validate_gradient()
             if not isinstance(obj, VectorDrawingObject):
                 continue
             obj.validate_vector()
@@ -1539,6 +1876,14 @@ class ChapterDocument:
         else:
             entity = self.objects[entity_id]
             old_parent = self.layers[entity.parent_layer_id]
+        old_world = (
+            self.layer_world_translation(old_parent.layer_id)
+            if kind == "object" else (0.0, 0.0)
+        )
+        new_world = (
+            self.layer_world_translation(new_parent_id)
+            if kind == "object" else (0.0, 0.0)
+        )
         old_ref = next(item for item in old_parent.children if item.kind == kind and item.entity_id == entity_id)
         old_index = old_parent.children.index(old_ref)
         old_parent.children.remove(old_ref)
@@ -1549,6 +1894,38 @@ class ChapterDocument:
             entity.parent_id = new_parent_id
         else:
             entity.parent_layer_id = new_parent_id
+            if isinstance(entity, GradientObject):
+                dx = old_world[0] - new_world[0]
+                dy = old_world[1] - new_world[1]
+                for contour in entity.line_field.geometry.iter_contours():
+                    for node in contour.nodes:
+                        node.x += dx
+                        node.y += dy
+                        if node.incoming is not None:
+                            node.incoming = (
+                                node.incoming[0] + dx,
+                                node.incoming[1] + dy,
+                            )
+                        if node.outgoing is not None:
+                            node.outgoing = (
+                                node.outgoing[0] + dx,
+                                node.outgoing[1] + dy,
+                            )
+                radial = entity.radial_field
+                radial.origin_x += dx
+                radial.origin_y += dy
+                if radial.manual_center is not None:
+                    radial.manual_center = (
+                        radial.manual_center[0] + dx,
+                        radial.manual_center[1] + dy,
+                    )
+                shape = entity.shape_field
+                if shape.manual_center is not None:
+                    shape.manual_center = (
+                        shape.manual_center[0] + dx,
+                        shape.manual_center[1] + dy,
+                    )
+                entity.touch_revision()
             if isinstance(entity, VectorDrawingObject):
                 for fill in self.vector_fill_children(entity.object_id):
                     fill.parent_layer_id = new_parent_id
@@ -1850,6 +2227,49 @@ class ColorPalette:
         return result
 
 
+@dataclass
+class ColorGradientRampPreset:
+    preset_id: str = field(default_factory=new_id)
+    name: str = "Default"
+    ramp: ColorGradientRamp = field(default_factory=ColorGradientRamp)
+
+    def validate(self) -> None:
+        self.name = str(self.name).strip() or "Gradient"
+        self.ramp.validate()
+
+    def to_dict(self) -> dict[str, Any]:
+        self.validate()
+        return {
+            "id": self.preset_id,
+            "name": self.name,
+            "ramp": self.ramp.to_dict(),
+        }
+
+    @classmethod
+    def from_dict(
+        cls, data: dict[str, Any],
+    ) -> "ColorGradientRampPreset":
+        result = cls(
+            preset_id=str(data.get("id") or new_id()),
+            name=str(data.get("name", "Gradient")),
+            ramp=ColorGradientRamp.from_dict(data.get("ramp")),
+        )
+        result.validate()
+        return result
+
+
+def default_gradient_ramp_preset(
+    primary: str = "#FF000000", secondary: str = "#FFFFFFFF",
+) -> ColorGradientRampPreset:
+    return ColorGradientRampPreset(
+        name="Default",
+        ramp=ColorGradientRamp(stops=[
+            ColorGradientStop(position=0.0, color=canonical_argb(primary)),
+            ColorGradientStop(position=1.0, color=canonical_argb(secondary)),
+        ]),
+    )
+
+
 def default_color_palette() -> ColorPalette:
     return ColorPalette(
         name="Default",
@@ -1871,6 +2291,9 @@ class SeriesDocument:
         default_factory=lambda: [default_color_palette()]
     )
     active_palette_id: str = ""
+    gradient_ramp_presets: list[ColorGradientRampPreset] = field(
+        default_factory=lambda: [default_gradient_ramp_preset()]
+    )
     schema_version: int = SCHEMA_VERSION
 
     def validate(self) -> None:
@@ -1888,6 +2311,18 @@ class SeriesDocument:
             palette.validate()
         if self.active_palette_id not in palette_ids:
             self.active_palette_id = self.palettes[0].palette_id
+        if not self.gradient_ramp_presets:
+            self.gradient_ramp_presets = [
+                default_gradient_ramp_preset(
+                    self.primary_color, self.secondary_color
+                )
+            ]
+        preset_ids: set[str] = set()
+        for preset in self.gradient_ramp_presets:
+            if preset.preset_id in preset_ids:
+                preset.preset_id = new_id()
+            preset_ids.add(preset.preset_id)
+            preset.validate()
 
     def to_dict(self) -> dict[str, Any]:
         self.validate()
@@ -1898,6 +2333,9 @@ class SeriesDocument:
             "secondary_color": self.secondary_color,
             "active_palette_id": self.active_palette_id,
             "palettes": [palette.to_dict() for palette in self.palettes],
+            "gradient_ramp_presets": [
+                preset.to_dict() for preset in self.gradient_ramp_presets
+            ],
         }
 
     @classmethod
@@ -1909,20 +2347,30 @@ class SeriesDocument:
             ColorPalette.from_dict(item)
             for item in data.get("palettes", [])
         ]
+        primary = canonical_argb(
+            data.get("primary_color", data.get("brush_color", "#FF000000"))
+        )
+        secondary = canonical_argb(
+            data.get("secondary_color", "#FFFFFFFF"), "#FFFFFFFF"
+        )
+        gradient_presets = [
+            ColorGradientRampPreset.from_dict(item)
+            for item in data.get("gradient_ramp_presets", [])
+        ]
         result = cls(
             series_id=str(data["id"]), name=str(data.get("name", "Untitled Series")),
             chapters=[
                 ChapterReference(str(item["id"]), str(item.get("name", "Chapter")))
                 for item in data.get("chapters", [])
             ],
-            primary_color=canonical_argb(
-                data.get("primary_color", data.get("brush_color", "#FF000000"))
-            ),
-            secondary_color=canonical_argb(
-                data.get("secondary_color", "#FFFFFFFF"), "#FFFFFFFF"
-            ),
+            primary_color=primary,
+            secondary_color=secondary,
             palettes=palettes or [default_color_palette()],
             active_palette_id=str(data.get("active_palette_id", "")),
+            gradient_ramp_presets=(
+                gradient_presets
+                or [default_gradient_ramp_preset(primary, secondary)]
+            ),
             schema_version=SCHEMA_VERSION,
         )
         result.validate()

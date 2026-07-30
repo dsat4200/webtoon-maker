@@ -745,6 +745,25 @@ class ColorPickerPopup(QDialog):
         layout = QVBoxLayout(self)
         self.picker = HsvAlphaPicker(color, self)
         layout.addWidget(self.picker)
+        self.quick_colors = QWidget(self)
+        quick_layout = QHBoxLayout(self.quick_colors)
+        quick_layout.setContentsMargins(0, 0, 0, 0)
+        quick_layout.addWidget(QLabel("Use", self.quick_colors))
+        self.primary_quick = QPushButton("Primary", self.quick_colors)
+        self.secondary_quick = QPushButton("Secondary", self.quick_colors)
+        quick_layout.addWidget(self.primary_quick)
+        quick_layout.addWidget(self.secondary_quick)
+        quick_layout.addStretch(1)
+        self.primary_quick.clicked.connect(
+            lambda: self.picker.setColor(self._primary_quick_color)
+        )
+        self.secondary_quick.clicked.connect(
+            lambda: self.picker.setColor(self._secondary_quick_color)
+        )
+        self._primary_quick_color = "#FF000000"
+        self._secondary_quick_color = "#FFFFFFFF"
+        layout.addWidget(self.quick_colors)
+        self.quick_colors.hide()
         self.buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Apply
             | QDialogButtonBox.StandardButton.Cancel,
@@ -764,6 +783,19 @@ class ColorPickerPopup(QDialog):
 
     def setColor(self, color: str | QColor) -> None:  # noqa: N802
         self.picker.setColor(color)
+
+    def setQuickColors(
+        self, primary: str | QColor, secondary: str | QColor,
+    ) -> None:  # noqa: N802
+        self._primary_quick_color = canonical_argb(primary)
+        self._secondary_quick_color = canonical_argb(secondary)
+        self.quick_colors.show()
+        self.primary_quick.setStyleSheet(
+            f"background-color: {QColor(self._primary_quick_color).name()};"
+        )
+        self.secondary_quick.setStyleSheet(
+            f"background-color: {QColor(self._secondary_quick_color).name()};"
+        )
 
     def accept(self) -> None:
         self.colorApplied.emit(self.color_argb())
