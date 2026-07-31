@@ -13,142 +13,160 @@ The program manages series (collections of chapters), each chapter being a
 vertically-extending canvas of 1080px width. Within each chapter, the artist
 creates a hierarchy of:
 
-  - Page layers: rectangular regions arranged vertically down the canvas.
+  - Page layers: drawn (rectangle/circle/custom-shape) regions arranged vertically.
+    Pages are inserted by drawing them below the active page (drag-to-create),
+    or via an Insert Page Gap tool that adds an orange 120px editable gutter.
+    Dotted edges move individual page groups; the shaded band moves both groups.
   - Bounded layers: nested rectangles, circles, or custom shapes that clip their
-    children. Compound shapes can combine additive/subtractive/ignored child
-    branches into a single Boolean mask. Additional contours are supported.
+    children. Compound shapes combine additive/subtractive/ignored descendant
+    branches into one Boolean mask. Additional contours are supported. Layers can
+    ignore their direct parent mask while retaining higher ancestor masks.
   - Fill layers: non-destructive colored fills inheriting their parent's shape.
   - Open shape layers: freeform variable-width stroked lines with caps.
-  - Raster objects: sparse 256x256-tiled bitmap drawing areas supporting
-    pressure-sensitive pencil and eraser tools.
-  - Text objects: in strict (fit-to-parent/compound with alignment/margins) or
-    free (projective quad transform) layout modes. Name derived from content.
-  - Vector Drawing objects: pressure-sensitive cubic Bézier vector strokes with
-    variable width and opacity, plus owned Vector Fill children.
-  - Vector Fill objects: bounded face fills owned by a Vector Drawing, with
-    close-gaps, narrow-area handling, enclose mode, and area scaling.
+  - Raster objects: sparse 256x256-tiled bitmap areas with pressure-sensitive
+    pencil/eraser, explicit non-clipping interaction frames, underlay opacity,
+    and ignore-parent-mask support.
+  - Text objects: strict (fit-to-parent/compound, alignment/margins) or free
+    (projective quad, handles visible while editing) layout; content-derived name.
+  - Vector Drawing objects: pressure-sensitive cubic strokes with variable
+    width/opacity, per-stroke render-revision caching, owned Vector Fill
+    children, underlay, ignore-parent-mask.
+  - Vector Fill objects: bounded face fills owned by a Vector Drawing
+    (close-gaps, narrow areas, enclose mode, area scaling).
+  - Gradient objects: ColorFillGradientObject children of shapes with
+    Line/Curve, Circle/Ellipse, and Parent Shape field types, Blender-style
+    ramp editing, translucent ARGB stops, per-series presets, and a built-in
+    Primary-to-Secondary preset. Scalar distance fields cached independently
+    from ramp colors for interactive editing.
+  - Drawing selections: rectangle/lasso/stroke selection for raster pixels or
+    vector points (Shift adds, Ctrl removes); 8-handle free/uniform transform,
+    edge translation, rotation, movable pivot. Shared by object transforms.
 
-All edits are backed by a full undo/redo command stack with focused object-patch
-commands for vector edits. The application saves projects as portable folders
-with atomic, versioned chapter saves and automatic recovery from interrupted
-writes.
+All edits are backed by a full undo/redo command stack (CallbackCommand,
+TilePatchCommand, ObjectPatchCommand). Projects are saved as portable folders
+with atomic, versioned chapter saves and interrupted-write recovery. Schema
+version is currently 12; settings version 11.
 
 Core design principles:
-  - Non-destructive: masks, fills, compound shapes, and layer opacity compose
-    without modifying child data.
-  - Sparse tiles: raster strokes are stored as 256x256 RGBA tiles, allocated
-    only where the artist draws.
-  - Versioned migration: documents carry a schema version; legacy formats are
-    migrated on load up to V7.
-  - Extensible registries: object and bound types can be registered at runtime.
-  - Portable persistence: series folders are self-contained and relocatable.
-  - Canonical colors: all colors normalized to #AARRGGBB for consistency.
-  - Ribbon UI: contextual tool controls in a tabbed, scrollable ribbon.
+  - Non-destructive: masks, fills, compound shapes, opacity compose without
+    modifying child data.
+  - Sparse tiles: raster strokes stored as 256x256 RGBA tiles, allocated only
+    where drawn.
+  - Versioned migration: documents migrate up to V12 on load.
+  - Extensible registries: object and bound types registerable at runtime.
+  - Canonical colors: everything normalized to #AARRGGBB.
+  - Performance-aware caching: vector stroke images cached per-stroke with
+    render revisions; gradient geometry vs. ramp cached independently; touch
+    navigation uses grab-once snapshots with frame coalescing.
 
 
 2. TOOLS (INTERACTIVE MODES)
 ----------------------------
 
-The application provides 16+ interactive tools, accessed via left toolbar buttons
-and keyboard shortcuts:
+  Object Select (S)       - Click to select entities; Ctrl+click shows candidate
+                            menu for overlapping hits. Shapes selectable within
+                            12 screen px of border; filled interiors stay
+                            click-through. Vector strokes preferred over fill
+                            interiors.
 
-  Object Select (S)    - Click to select entities (layers, objects, shapes,
-                          vector strokes). Ctrl+click shows a candidate menu for
-                          overlapping entities. Shapes selected by clicking near
-                          their border (12px tolerance).
+  Raster Pencil (P)       - Pressure-sensitive drawing (size/opacity curves,
+                            density, antialiasing, taper, predictive ink).
+                            Contextual: draws vector strokes on a Vector Drawing.
+                            Stylus hover shows pressure-tool circle and center
+                            crosshair at the active S/M/L size.
 
-  Raster Pencil (P)    - Draw on a RasterObject with pressure-sensitive size
-                          and opacity curves. Supports density, antialiasing,
-                          stroke taper, and predictive ink. Contextual: draws
-                          vector strokes on a VectorDrawingObject.
+  Raster Eraser (E)       - Erase with circular/square brush; prunes empty
+                            tiles. Contextual: three vector eraser modes
+                            (Stroke / Point / Intersection). Real-time gesture
+                            preview during the sweep.
 
-  Raster Eraser (E)    - Erase from a RasterObject (circular or square brush).
-                          Auto-prunes empty tiles. Contextual: three vector
-                          eraser modes (Stroke / Point / Intersection).
+  Fill (F)                - On shapes: border click changes outline, interior
+                            click sets fill. On Vector Drawing: click/drag
+                            through faces creates Vector Fill children behind
+                            strokes. Enclose and Fill combines enclosed faces.
+                            Close Gaps / narrow areas / area scaling settings.
 
-  Fill (F)             - On shapes: click border for outline, interior for fill.
-                          On Vector Drawing: click/drag through faces to create
-                          Vector Fill children behind its strokes. Enclose mode
-                          creates one fill from a drawn enclosure.
+  Text Edit               - Click to position cursor, drag to select, IME
+                            input, clipboard paste, local undo within session.
+                            Edge midpoint drag for strict margins. Free text
+                            handles visible while editing.
 
-  Text Edit             - Edit a TextObject. Click to position cursor, drag to
-                          select. IME input, clipboard paste, local undo within
-                          session. Drag edge midpoints in strict mode to change
-                          margins.
+  Transform (T)           - 8-handle free projective or uniform scaling; grid
+                            snap; rotation and movable pivot; static background
+                            cache for raster previews. Outside-frame translation
+                            is deferred until a drag is confirmed so pencil
+                            strokes on raster edges are not mistaken for moves.
 
-  Transform (T)         - Free projective (8-handle) or uniform (scale around
-                          opposite handle) transform. Grid snapping. Static
-                          background cache for raster previews.
+  Shape Edit (B)          - Edit a bounded layer's geometry: nodes, Bézier
+                            controls, gizmos (type, lock, roundness, thickness,
+                            delete, cap), insertion, translation. Rectangle
+                            per-corner radius with normal/free modes. Contour
+                            editing. Compound construction-path editing.
 
-  Shape Edit (B)        - Edit a bounded layer's geometry. Select/drag nodes,
-                          Bézier controls, gizmos (type toggle, handle lock,
-                          roundness, thickness, delete, cap). Insert points.
-                          Translate shapes. Rectangle layers: per-corner radius,
-                          normal/free edit modes, edge dragging. Additional
-                          contours: select and edit contour nodes. Compound
-                          shapes: edit construction paths without child handles.
+  Vector Edit             - Auto-activated for a selected Vector Drawing. Blue
+                            anchor circles for the selected stroke; Ctrl+click
+                            extends stroke selection. Point drag with live
+                            preview rendering.
 
-  Vector Edit           - Auto-activated when a Vector Drawing is selected.
-                          Blue anchor circles for the selected stroke. Ctrl+click
-                          extends stroke selection. Point drag, redraw, connect,
-                          simplify via Vector Tools ribbon.
+  Add Rectangle / Circle  - Drag to create bounded layers (primary outline,
+                            secondary fill/core).
 
-  Add Rectangle         - Drag to create a rectangular bounded layer. Uses
-                          primary color for outline, secondary for fill.
+  Add Shape               - Click for vector points, drag for Bézier, click
+                            first point to close, Enter/double-click for open line.
 
-  Add Circle            - Drag (center + radius point) to create an ellipse
-                          bounded layer.
+  Add Raster / Text / Fill / Vector Drawing - create respective objects.
 
-  Add Shape             - Click to place vector points. Drag to create Bézier
-                          curves. Click first point to close a polygon. Press
-                          Enter or double-click to commit an open line.
+  Vector Redraw           - Pressure redraw for thickness/opacity with Manual
+                            or Point Select interaction; Increase/Decrease/
+                            Uniform operations; sliders + numeric entry; Apply
+                            targets selected points, then strokes, then all.
 
-  Add Raster            - Drag to define raster frame size and position.
+  Vector Connect          - Sweep across two endpoints to connect with a
+                            tangent bridge (keeps the first stroke's style).
 
-  Add Text              - Adds a TextObject to the active layer using the
-                          active text preset's formatting.
+  Sweep Simplify          - Translucent orange circular preview; changes only
+                            the swept points and their adjoining curve spans;
+                            selected points remain visible and selected.
+                            Spatial anchor grid keeps gesture queries local.
 
-  Add Fill              - Adds a fill layer with the active brush color.
+  Insert Page Gap         - Adds editable 120px orange gutter between
+                            physically adjacent pages.
 
-  Add Vector Drawing    - Creates an editable VectorDrawingObject.
+  Drawing Selection       - Rectangle / Lasso / Stroke selection for raster
+                            pixels or vector points; Shift adds, Ctrl removes,
+                            unmodified replaces; Select All (Ctrl+A by default);
+                            transform with handles, rotation, pivot.
 
-  Vector Redraw         - Redraws vector stroke thickness or opacity with
-                          manual or point-select interaction. Apply to selected
-                          points, selected strokes, or all strokes.
-
-  Vector Connect        - Sweep across two endpoints to connect them with a
-                          tangent bridge.
-
-  Vector Simplify       - Simplifies selected or all vector curves by amount
-                          (0-100%), preserving local shape.
+  Gradient Tools          - Contextual ribbon: create Line/Curve, Circle/Ellipse,
+                            or Parent Shape gradients; ramp stop editor with
+                            drag + double-click color edit; distance/direction/
+                            uniform/reverse parameters; preset management.
 
 
 3. COMPLETE SCRIPT-BY-SCRIPT, METHOD-BY-METHOD REFERENCE
 ---------------------------------------------------------
 
 ================================================================================
-FILE: main.py  (33 lines)
+FILE: main.py  (40 lines)
 ================================================================================
-Entry point for the application.
+Entry point.
 
-  main()
-    - Disables tablet event compression (AA_CompressTabletEvents = False).
-    - Configures OpenGL surface format: version 3.3 Core Profile, no
-      multisampling, no vsync (swap interval 0).
-    - Sets the default surface format globally.
-    - Creates QApplication with app name "Vertical Comic Editor".
-    - Instantiates and shows a MainWindow.
-    - Runs the Qt event loop.
+  main() -> int
+    - Disables AA_CompressTabletEvents.
+    - Enables AA_SynthesizeMouseForUnhandledTabletEvents (Qt 6.x+) so stylus
+      taps work in popup menus.
+    - Configures OpenGL 3.3 Core Profile surface format (no MSAA, no vsync).
+    - Creates QApplication, instantiates MainWindow, runs the event loop.
 
 ================================================================================
 FILE: run.bat  (4 lines)
 ================================================================================
-Windows batch launcher: changes to script directory and runs `python main.py`.
+Windows launcher: `cd /d "%~dp0"` then `python main.py`.
 
 ================================================================================
-FILE: requirements.txt  (4 lines)
+FILE: requirements.txt  (5 lines)
 ================================================================================
-PySide6 >= 6.7, Pillow >= 10.0, pytest >= 8.0.
+PySide6>=6.7, Pillow>=10.0, numpy>=2.0, pytest>=8.0.
 
 ================================================================================
 FILE: pytest.ini  (4 lines)
@@ -161,598 +179,291 @@ CORE MODULES
 ================================================================================
 
 ================================================================================
-FILE: comic_editor/core/models.py  (1892 lines)
+FILE: comic_editor/core/models.py  (2486 lines)
 ================================================================================
-The UI-independent document model for series, chapters, layers, and objects.
-All data structures are dataclasses with validation and serialization.
-
-Constants:
-  SCHEMA_VERSION = 7            Current document schema version.
-  CHAPTER_WIDTH = 1080          Fixed chapter width in pixels.
-  DEFAULT_CHAPTER_HEIGHT = 3240 Default chapter height.
-  GROWTH_MARGIN = 1080          Margin added when auto-growing chapter height.
+UI-independent document model. SCHEMA_VERSION = 12.
 
 Free functions:
-  new_id() -> str
-    Returns a UUID4 hex string for entity IDs.
+  new_id() -> str                     UUID4 hex.
   _point(value) -> tuple[float, float]
-    Converts an iterable of two floats to a float tuple.
   canonical_argb(value, fallback) -> str
-    Normalizes any color representation to uppercase #AARRGGBB. Supports #rgb,
-    #rgba, #rrggbb, #aarrggbb, QColor, and int. Falls back recursively.
+    Normalizes any color to uppercase #AARRGGBB.
   object_from_dict(data) -> ObjectEntity
-    Factory dispatching by "type" field: "vector_drawing" -> VectorDrawingObject,
-    "vector_fill" -> VectorFillObject, "raster" -> RasterObject, "text" ->
-    TextObject, default -> DocumentObject. Handles legacy_alignment migration.
-  default_color_palette() -> ColorPalette
-    Returns a default palette with black and white swatches.
+    Dispatches by type: vector_drawing, vector_fill, gradient, raster, text,
+    else base DocumentObject.
+  default_color_palette() -> ColorPalette (black + white swatches).
 
 Class: GridSettings
-  Fields: enabled (bool), size (8-1080px), divisions (1-16), origin_x/y,
-  color (#5d7d9c), opacity (0-1).
-  validate() - clamps all ranges.
-  snap(x, y) - snaps to nearest grid intersection.
-  to_dict() / from_dict(data) - serialization.
+  enabled, size (8-1080), divisions (1-16), origin_x/y, color, opacity (0-1).
+  validate() / snap(x, y) / to_dict() / from_dict(data).
 
 Class: PathNode
-  A single point/node in a shape path. Fields: node_id, x, y, point_type
-  ("vector"/"bezier"), incoming/outgoing Bézier controls, handles_locked,
-  roundness, roundness_enabled, width_multiplier.
-  position property (get/set with control translation).
-  validate() - handles non-finite roundness clamping, width_multiplier to
-    [0.1, 10.0], clears controls for vector points.
-  to_dict() / from_dict(data).
+  node_id, x, y, point_type ("vector"/"bezier"), incoming/outgoing controls,
+  handles_locked, roundness, roundness_enabled, width_multiplier (0.1-10.0).
+  position property; validate() (finite clamping); to_dict() / from_dict(data).
 
 Class: PathContour
-  An additional editable subpath in a custom BoundGeometry.
-  Fields: nodes (list of PathNode), closed (bool).
-  validate() - minimum 3 points if closed, 2 if open.
+  Additional editable subpath (nodes, closed). validate() (min points),
   to_dict() / from_dict(data).
 
 Class: ShapeStyle
-  Fill/outline style: primary_color, base_thickness (integer-rounded >=1),
-  outline_color, outline_thickness, start_cap/end_cap ("point"/"square"/"round").
-  validate() - rounds thickness to integers per test expectations.
-  to_dict() / from_dict(data).
+  primary_color, base_thickness (int-rounded >=1), outline_color,
+  outline_thickness (int-rounded >=0), start_cap/end_cap
+  ("point"/"square"/"round"). validate() / to_dict() / from_dict(data).
 
-Class: BoundGeometry
-  Unified closed/open vector path. Fields: nodes, closed, primitive
-  ("rectangle"/"ellipse"/"custom"), additional_contours (list of PathContour).
+Class: BoundGeometry (init=False)
+  Unified closed/open vector path: nodes, closed, primitive
+  ("rectangle"/"ellipse"/"custom"), additional_contours.
 
-  Constructor: __init__(kind, points, nodes, closed, primitive, additional_contours)
-    - nodes provided directly -> uses them.
-    - "circle" kind with >=2 points -> 4 Bézier ellipse nodes.
-    - "rect" kind with 2 points -> expanded to 4 corner points.
-    - Defaults closed from kind, primitive from kind mapping.
+  Constructor: kind+points or explicit args; "circle" -> 4 Bézier ellipse
+    nodes; "rect" 2 points -> 4 corners.
+  _ellipse_nodes() (static) - cubic Bézier circle approximation.
+  rectangle / circle / polygon / path factory methods.
+  kind property; points property (get/set with control translation);
+  iter_contours() / contour_for_node() / handle_requirements().
+  _normalize_contour_handles() (static) - restores handle topology per contour.
+  normalize_bezier_handles() - across all contours.
+  validate() - primitives, point counts, duplicate IDs, per-contour Bézier
+    handle topology, locked-handle symmetry (<1e-4), primitives require 4
+    points and no additional contours.
+  bbox() / radius / contains() (even-odd winding across contours).
+  to_dict() / from_dict(data) (with legacy "rect"/"circle" support).
 
-  Static/class methods:
-    _ellipse_nodes(x, y, w, h) -> list[PathNode]
-      Creates 4 Bézier nodes for perfect circle/ellipse using constant
-      0.2761423749 for cubic Bézier approximation.
-    rectangle(x,y,w,h) / circle(cx,cy,radius) / polygon(points) / path(nodes,closed)
-      Factory methods.
-    from_dict(data) -> BoundGeometry
-      Handles "path" type with nodes+contours, or legacy "rect"/"circle"
-      with points.
-
-  Properties & methods:
-    kind -> "rect"/"circle"/"polygon"/"path".
-    points (get/set) - translate existing nodes, or replace with new.
-    iter_contours() -> Iterator[PathContour]
-      Yields the main contour first, then additional_contours.
-    contour_for_node(node_id) -> PathContour | None
-      Finds which contour owns a node.
-    handle_requirements(node) -> (needs_incoming, needs_outgoing)
-      Based on position within its contour.
-    _normalize_contour_handles(contour) (static)
-      Restores handle topology: clears unused open-path handles, fills missing
-      handles from existing ones or neighbor positions.
-    normalize_bezier_handles()
-      Normalizes handles across all contours after edits.
-    validate()
-      Comprehensive: valid primitive, minimum point counts, duplicate IDs,
-      correct Bézier handle topology per contour, locked handle symmetry
-      (< 1e-4 tolerance), rectangle/ellipse must have 4 points and no
-      additional contours.
-    bbox() -> (left, top, width, height)
-      Across all contours' points and controls.
-    radius -> min(width, height) / 2.
-    contains(x, y) -> bool
-      Even-odd polygon winding across all closed contours.
-    to_dict() - serializes with "type": "path", nodes, closed, primitive,
-      additional_contours.
-
-Class: ChildRef
-  kind ("layer"/"object") + entity_id.
-  to_dict() / from_dict(data).
+Class: ChildRef - kind + entity_id. to_dict() / from_dict(data).
 
 Class: LayerNode
-  Fields: layer_id, name, is_page, layer_kind ("bounded"/"open_shape"/"fill"),
-  parent_id, children (list of ChildRef), visible, opacity, translate_x/y,
-  bound (BoundGeometry|None), shape_style, grid_override, last_raster_id,
-  compound_enabled, compound_operation ("add"/"subtract"/"ignore").
-
-  to_dict() / from_dict(data) - serialization with legacy migration for
-    fill_color, border_color, border_width, vertex_radius.
-  fill_color / border_width / border_color properties (shorthand get/set).
-  vertex_radius property (get: max roundness of vector nodes; set: apply to
-    all vector nodes).
+  layer_id, name, is_page, layer_kind ("bounded"/"open_shape"/"fill"),
+  parent_id, children, visible, opacity, translate_x/y, bound, shape_style,
+  grid_override, last_raster_id, compound_enabled,
+  compound_operation ("add"/"subtract"/"ignore"), ignore_parent_mask.
+  to_dict() / from_dict(data) with legacy migration (fill_color, border_color,
+    border_width, vertex_radius).
+  fill_color / border_width / border_color / vertex_radius properties.
 
 Class: DocumentObject (base)
-  Fields: object_id, object_type, name, parent_layer_id, x, y, visible,
-  opacity, opacity_locked, geometry_reference ("direct"/"compound").
-  common_dict() / to_dict() - serialization.
+  object_id, object_type, name, parent_layer_id, x, y, visible, opacity,
+  opacity_locked, geometry_reference ("direct"/"compound"),
+  ignore_parent_mask, underlay_opacity (0-1).
+  common_dict() / to_dict().
 
 Class: RasterObject(DocumentObject)
-  Fields: tile_size=256, interaction_rect (left, top, width, height).
-  to_dict().
+  tile_size=256, interaction_rect (l, t, w, h). to_dict().
 
 Class: TextObject(DocumentObject)
-  Fields: text, width, height, font_family, font_size, bold, italic, kerning,
-  layout_mode ("free"/"strict"), horizontal_alignment, vertical_alignment,
-  margin, transform_quad (4-point list or None), legacy_alignment (internal).
-  display_name property - first 16 chars of text content, used for tree/UI.
-  to_dict().
+  text, size, font family/size/bold/italic/kerning, layout_mode
+  ("free"/"strict"), alignment, margin, transform_quad, legacy_alignment.
+  display_name property (first 16 chars of content). to_dict().
+
+---- Gradient model types ----
+
+Class: ColorGradientStop
+  stop_id, position (0-1), color (canonical ARGB).
+  validate() / to_dict() / from_dict(data).
+
+Class: ColorGradientRamp
+  stops (>=2, sorted by position), interpolation ("linear").
+  validate() - pads to 2 stops, dedupes IDs, stable-sort by position (preserves
+    hard transitions).
+  copy() - deep copy via serialize/deserialize.
+  to_dict() / from_dict(data).
+
+Class: ColorGradientRampPreset
+  preset_id, name, ramp. validate() / to_dict() / from_dict(data).
+
+Class: LineGradientField
+  geometry (open BoundGeometry, >=2 points), direction_mode
+  ("parallel"/"perpendicular"), reverse_direction, perpendicular_distance
+  (>=0.001). validate() / to_dict() / from_dict(data).
+
+Class: RadialGradientField
+  origin_x/y, radius_x/y (>0.001), rotation (mod 360), ellipse_enabled,
+  center_auto, manual_center, reverse_direction, uniform, distance (>=0.001).
+  center() -> auto or manual center.
+  validate() (rejects non-finite geometry) / to_dict() / from_dict(data)
+    (legacy outward_distance key).
+
+Class: ShapeGradientField
+  center_auto, manual_center, reverse_direction, uniform, distance.
+  validate() / to_dict() / from_dict(data).
+
+Class: GradientObject(DocumentObject)
+  field_type ("line"/"radial"/"parent_shape"), ramp, line_field,
+  radial_field, shape_field, loaded_preset_id, revision.
+  display_name; validate_gradient(); touch_revision(); gradient_dict();
+  to_dict() (conditionally includes per-type field dicts).
+
+Class: ColorFillGradientObject(GradientObject)
+  Full gradient with validate_gradient().
+
+---- Vector model types ----
 
 Class: VectorStrokePoint
-  An editable anchor with hidden cubic controls. Fields: point_id, x, y,
-  incoming/outgoing controls, width (1-1000), opacity (0-1).
-  position property (get/set), validate() (finite checks, field clamping).
-  to_dict() / from_dict(data).
+  point_id, x, y, incoming/outgoing controls, width (1-1000), opacity (0-1).
+  position property; validate() (finite checks) / to_dict() / from_dict(data).
 
 Class: VectorStroke
-  Fields: stroke_id, color (canonical ARGB), closed, start_cap/end_cap
-  ("point"/"square"/"round"), points (list of VectorStrokePoint).
-  validate() - color canonicalization, cap validation, non-empty points,
-    duplicate point ID check. Single-point strokes auto-set closed=False.
-  derived_bounds() -> (left, top, width, height)
-    Conservative bounds including controls and variable width.
-  to_dict() / from_dict(data).
+  stroke_id, color (canonical ARGB), closed, start_cap/end_cap, points,
+  render_revision (int, defaults 0 for legacy drawings).
+  validate() - canonical color, caps, non-empty points, unique point IDs,
+    single-point strokes forced open, render_revision >= 0.
+  touch_render_revision() -> increments render_revision (used to invalidate
+    only this stroke's cached image).
+  derived_bounds() - conservative bounds incl. controls and variable width.
+  to_dict() / from_dict(data) - render_revision serialized.
 
 Class: VectorDrawingObject(DocumentObject)
-  Fields: strokes (list of VectorStroke), fill_child_ids (list of fill IDs),
-  drawing_revision (monotonically increasing).
-  validate_vector() - color/cap validation per stroke, duplicate stroke ID
-    check, duplicate fill_child_ids check.
-  derived_bounds() -> union of stroke bounds.
-  touch_revision() - increments revision, returns new value.
-  to_dict().
+  strokes, fill_child_ids, drawing_revision.
+  validate_vector() (duplicate stroke IDs, duplicate fill refs);
+  derived_bounds(); touch_revision().
 
 Class: VectorFillObject(DocumentObject)
-  Fields: owner_drawing_id, geometry (BoundGeometry, closed contours only),
-  fill_color (canonical ARGB), source_seed (tap point), source_lasso (drag
-  polygon), fill_settings (dict).
-  validate_vector_fill() - owner required, closed geometry, color canonicalization.
-  derived_bounds() -> geometry.bbox().
-  to_dict().
+  owner_drawing_id, geometry (closed contours), fill_color, source_seed,
+  source_lasso, fill_settings.
+  validate_vector_fill() / derived_bounds() / to_dict().
 
 Class: ChapterDocument
-  The main document. Fields: chapter_id, name, width=1080, height=3240,
-  background, grid, root_page_ids, layers (dict), objects (dict),
-  schema_version.
+  chapter_id, name, width=1080, height=3240, background, grid,
+  root_page_ids, layers, objects, schema_version.
 
-  validate()
-    Comprehensive invariant check (~200 lines):
-    - Schema version <= SCHEMA_VERSION, width == CHAPTER_WIDTH.
-    - No duplicate root page IDs.
-    - All roots must be parentless page layers.
-    - All layers: valid kind, valid compound_operation, fill layer constraints
-      (requires parent, boundless leaf, requires color, no compound), bounded
-      layer constraints, open shape constraints (open paths, no children
-      allowed at validation time), compound_enabled not allowed for pages.
-    - No entity appears in multiple parent children lists.
-    - VectorFill objects excluded from child refs (owned by drawings).
-    - Vector drawing/fill cross-validation: each fill owned by exactly one
-      drawing, fill parent_layer matches owner's, fill in owner's fill_child_ids.
-    - All objects have valid container layer (not fill).
-    - Raster/Text invariants, geometry_reference validation.
-    - Layer hierarchy is acyclic (DFS from each root page).
-    - Expected entities match referenced entities (excluding fills in child refs).
+  validate() - full invariant set: schema/width checks, root pages, per-layer
+    kind/compound/fill constraints, unique child refs, vector fill ownership
+    (owned by exactly one drawing, matching parent layer, in fill_child_ids),
+    gradient field-type per-parent exclusivity, object container checks,
+    acyclic hierarchy (DFS), expected == referenced entities.
+  _assert_acyclic() - DFS cycle detection.
+  add_page / add_layer / add_fill_layer / add_object (routes vector fills)
+  add_vector_fill(owner_id, fill, index)
+  add_gradient(parent_id, field_type)
+  gradient_children(parent_id, field_type, excluding) -> matching gradients.
+  vector_fill_children(drawing_id) / reorder_vector_fill(owner, fill, index)
+  parent_ref_list / move_entity (page reorder, layer/object moves, vector fill
+    reorder, moves owned fills with drawings) / delete_entity (recursive,
+    cascades to owned fills).
+  layer_world_translation / page_for_layer / ancestor_layers
+  closest_compound_ancestor / contributing_compound_ancestor
+  effective_grid / effective_object_opacity / set_layer_opacity
+  ensure_height_for / minimum_safe_height / trim_height
+  iter_render_order() - front-to-back; fills behind drawing; gradients part of
+    parent layer.
+  to_dict() / from_dict(data) - V1-V12 migration (legacy text alignment,
+    legacy series colors, clamping).
 
-  _assert_acyclic()
-    DFS from each root page, detecting cycle in parent chain.
-  
-  Page/layer/object creation:
-    add_page(name, bound, x, y) -> LayerNode
-      Creates page layer, adds to root_page_ids, ensures chapter height.
-    add_layer(parent_id, name, bound, index, layer_kind, style) -> LayerNode
-      Creates child layer (fill parents disallowed).
-    add_fill_layer(parent_id, name, color) -> LayerNode
-      Inserts fill at index 0.
-    add_object(parent_id, obj, index) -> ObjectEntity
-      Adds object. Routes VectorFill to add_vector_fill. Updates
-      last_raster_id for rasters.
-    add_vector_fill(owner_id, fill, index) -> VectorFillObject
-      Attaches fill to owner drawing without layer child ref. Validates,
-      pushes to owner.fill_child_ids, touches revision.
-  
-  Vector fill helpers:
-    vector_fill_children(drawing_id) -> list[VectorFillObject]
-    reorder_vector_fill(owner_id, fill_id, index) -> None
-      Reorder fills within owner's fill_child_ids.
+Class: ChapterReference - chapter_id + name.
 
-  parent_ref_list(kind, entity_id) -> list[ChildRef] | None
-    Returns None for root pages and fills.
-  
-  move_entity(kind, entity_id, new_parent_id, index)
-    - VectorFill: delegates to reorder_vector_fill.
-    - Layer (page): reorders within root_page_ids.
-    - Layer (non-page): moves between parents, prevents subtree cycles.
-    - Object: moves between layers. VectorDrawing moves its fills too.
-  
-  delete_entity(kind, entity_id) -> set[str]
-    - VectorFill: removes from owner's fill_child_ids, touches revision.
-    - VectorDrawing: recursively deletes owned fills first.
-    - Other objects: removes from parent children list.
-    - Layers: recursively deletes descendants.
-
-  Query methods:
-    layer_world_translation(layer_id) -> (x, y)
-      Accumulates translate_x/y up parent chain.
-    page_for_layer(layer_id) -> LayerNode
-      Walks to root page.
-    ancestor_layers(layer_id) -> list[LayerNode]
-      Returns reversed path from root to layer.
-    closest_compound_ancestor(layer_id, include_self) -> LayerNode | None
-      Finds nearest compound-enabled ancestor.
-    contributing_compound_ancestor(layer_id) -> LayerNode | None
-      Finds compound ancestor the layer contributes to (not "ignore").
-    effective_grid(layer_id) -> GridSettings
-      Inherits from nearest ancestor with grid_override.
-    effective_object_opacity(object_id) -> float
-      Multiplies object/own-layer/parent-chain opacities.
-    set_layer_opacity(layer_id, value)
-      Sets opacity and propagates to opacity_locked children (including
-      vector fills).
-  
-  Height management:
-    ensure_height_for(layer_id) -> bool
-      Grows chapter height if layer extends beyond bottom.
-    minimum_safe_height() -> int
-      Minimum height to contain all page bottom edges.
-    trim_height(height)
-      Sets chapter height to >= minimum_safe_height.
-
-  iter_render_order() -> Iterator[(kind, entity)]
-    Yields in front-to-back order. Vector fills rendered behind their
-    owner drawing.
-  
-  to_dict() / from_dict(data)
-    Serialization with V1-V7 legacy migration:
-      - TextObject legacy_alignment to free transform_quad.
-      - Text field clamping and validation.
-      - Schema version bump to current.
-
-Class: ChapterReference
-  chapter_id + name. to_dict() / from_dict(data).
-
-Class: PaletteSwatch
-  swatch_id + color (canonical ARGB).
-  to_dict() / from_dict(data|str) - accepts dict or legacy color string.
-
-Class: ColorPalette
-  palette_id, name, swatches (list of PaletteSwatch).
-  validate() - deduplicate IDs, canonicalize colors.
-  to_dict() / from_dict(data) - accepts legacy "colors" key.
-
+Class: PaletteSwatch - swatch_id + color.
+Class: ColorPalette - palette_id, name, swatches (stable IDs).
 Class: SeriesDocument
-  Fields: series_id, name, chapters, primary_color, secondary_color,
-  palettes (list of ColorPalette), active_palette_id, schema_version.
-  validate() - canonicalize primary/secondary, ensure at least one palette,
-    deduplicate palette IDs, set active_palette_id if missing.
-  to_dict() / from_dict(data) - legacy brush_color migration for primary_color.
+  series_id, name, chapters, primary_color, secondary_color, palettes,
+  active_palette_id, gradient_ramp_presets, schema_version.
+  validate() (canonical colors, >=1 palette, dedupe, active palette id),
+  to_dict() / from_dict(data) (legacy brush_color migration).
 
 
 ================================================================================
 FILE: comic_editor/core/commands.py  (145 lines)
 ================================================================================
-Undo/redo command infrastructure.
-
-  Command (Protocol)
-    Interface: label, redo(), undo().
-
-  Class: CallbackCommand
-    Simple command backed by redo_callback and undo_callback callables.
-
-  Class: TilePatchCommand
-    Undoable sparse raster tile change. Stores before/after tile snapshots
-    (dict of tile_key -> QImage|None), optional before_state/after_state
-    for frame rect, and state_callback.
-    _apply(values, state) - iterates tiles via tile_store.set_tile, calls
-      state_callback, then changed_callback.
-    redo() / undo() apply after/before state.
-
-  Class: ObjectPatchCommand
-    Focused object record undo without full chapter snapshot. Stores
-    deep-copied before/after dicts of {object_id: payload_dict or None}.
-    _apply(values) - for each object: if payload is None, deletes from 
-      chapter.objects; otherwise replaces in-place (if same type) or
-      replaces object reference. Calls changed_callback.
-    redo() / undo().
-
-  Class: CommandStack
-    Standard undo/redo with configurable limit (default 200).
-    Properties: can_undo, can_redo (bool).
-    push(command, already_done=False) - redoes if needed, appends to undo,
-      trims to limit, clears redo, notifies.
-    undo() / redo() / clear() - standard operations.
-    _notify() - calls changed_callback if set.
-    changed_callback - set by MainWindow for dirty/subtitle updates.
+  Command (Protocol) - label, redo(), undo().
+  CallbackCommand - redo/undo callbacks.
+  TilePatchCommand - sparse tile undo (before/after tile dicts, optional frame
+    state + state_callback).
+  ObjectPatchCommand - focused object-record undo (deep-copied before/after
+    {object_id: dict|None}; in-place restore preserves object identity).
+  CommandStack - 200-command limit; push/undo/redo/clear; changed_callback.
 
 
 ================================================================================
 FILE: comic_editor/core/persistence.py  (168 lines)
 ================================================================================
-Portable series folders with atomic, recoverable chapter saves.
-
-  atomic_json(path, payload)
-    Writes JSON to temp file with fsync, then atomic replace.
-
-  Class: SeriesRepository
-    __init__(root) - resolves path, sets series_path.
-    exists -> bool (series.json exists).
-    create(name) -> SeriesDocument
-      Creates empty series directory with chapters/ folder.
-    load_series(legacy_primary_color=None) -> SeriesDocument
-      Loads series.json. Seeds primary_color from legacy settings if missing.
-    save_series(series) - atomic JSON write.
-    chapter_root(chapter_id) -> Path
-    create_chapter(series, name) -> (ChapterDocument, TileStore)
-      Default page + drawing layer + raster object. Saves immediately.
-    save_chapter(chapter, tiles, autosave=False)
-      - Normal: backup to last_good/, write .save_pending, save tiles
-        (filtered to raster object IDs only), write manifest, remove pending,
-        clear autosave.
-      - Autosave: write to autosave/ subdirectory with recovery.json timestamp.
-    load_chapter(chapter_id, recover=False) -> (ChapterDocument, TileStore)
-      Recovers interrupted saves, loads chapter + raster tiles from PNG files.
-    has_recovery(chapter_id) -> bool
-      True if autosave is newer than main save.
-    _recover_interrupted_save(root) (static)
-      If .save_pending exists, restores from last_good/ backup.
+  atomic_json(path, payload) - temp file + fsync + atomic replace.
+  SeriesRepository:
+    exists property; create(name); load_series(legacy_primary_color);
+    save_series; chapter_root(chapter_id);
+    create_chapter(series, name) - default page + drawing layer + raster;
+    save_chapter(chapter, tiles, autosave) - last_good backup, .save_pending
+      marker, tiles before manifest, autosave/ subdirectory for recovery;
+    load_chapter(chapter_id, recover);
+    has_recovery(chapter_id); _recover_interrupted_save(root) (static).
 
 
 ================================================================================
 FILE: comic_editor/core/pressure.py  (153 lines)
 ================================================================================
-Pressure-to-brush response curves and brush presets.
-
-  Class: PressureCurve
-    Quadratic Bézier curve mapping [0,1] pressure to brush response.
-    Fields: minimum, maximum, control_x, control_y, _lookup (lazy cache).
-    Properties: min_ratio, max_ratio (invalidate _lookup on set).
-    clamp() - clamps all to [0,1].
-    evaluate(value) -> float
-      Binary search (24 iterations) solves cubic Bézier x(t)=value for t,
-      computes y(t). Returns clamped result.
-    evaluate_fast(value) -> float
-      256-entry lookup table with linear interpolation for real-time use.
-    to_dict() / from_dict(data) - legacy key support.
-
-  Class: BrushPreset
-    Named pencil/eraser preset. Fields: name, size_curve, opacity_curve
-    (PressureCurve), pressure_size, pressure_opacity, stroke_start_ratio
-    (0.1-1.0), stroke_end_ratio (0.1-1.0), density (0.1-3.0), antialiasing.
-    Properties: use_pressure_size, use_pressure_opacity.
-    clamp() - validates name, clamps curves and ranges.
-    to_dict() / from_dict(data) - legacy key support.
-
-  default_pencil_presets() -> list[dict]
-    Single "Linear" BrushPreset as dict.
+  PressureCurve - min/max/control_x/control_y; evaluate() via 24-iteration
+    binary search; evaluate_fast() via 256-entry LUT + lerp.
+  BrushPreset - name, size/opacity curves, pressure toggles, taper ratios,
+    density (0.1-3.0), antialiasing.
+  default_pencil_presets() - one "Linear" preset.
 
 
 ================================================================================
-FILE: comic_editor/core/registry.py  (69 lines)
+FILE: comic_editor/core/registry.py  (73 lines)
 ================================================================================
-Extensible type registries.
-
-  ObjectTypeSpec (frozen) - type_name, loader, raster_tools, contextual_tools,
-    asset_ready.
-  BoundTypeSpec (frozen) - type_name, loader, minimum_points.
-
-  ObjectTypeRegistry - register(spec), spec(type_name), load(data) dispatches
-    to registered loader or object_from_dict.
-  BoundTypeRegistry - register(spec), spec(type_name).
-
-  Module-level:
-    OBJECT_TYPES: raster (pencil/eraser), text (text/transform),
-      vector_drawing (pencil/eraser/fill/vector_edit),
-      vector_fill (fill/object_select).
-    BOUND_TYPES: path (BoundGeometry.from_dict, min 2 points).
+  ObjectTypeRegistry / BoundTypeRegistry - register/spec/load.
+  OBJECT_TYPES: raster (pencil/eraser), text (text/transform),
+    vector_drawing (pencil/eraser/fill/vector_edit), vector_fill
+    (fill/object_select), gradient (shape_edit/gradient_tools).
+  BOUND_TYPES: path (min 2 points).
 
 
 ================================================================================
-FILE: comic_editor/core/settings.py  (355 lines)
+FILE: comic_editor/core/settings.py  (399 lines)
 ================================================================================
-Application preferences, persisted as JSON.
-
-  default_hotkeys() -> dict[str, str]
-    Returns default keybindings: P/E/F/S/T/B for tools, vector_redraw/
-    vector_connect/vector_simplify (empty by default), Save/Undo/Redo/
-    Reset View/Toggle Grid.
-
-  default_hotkey_hold() -> dict[str, bool]
-    All tool hold toggles default to False.
-
-  Class: TextPreset
-    Named formatting preset. Fields: name, font_family, font_size (6-288),
-    bold, italic, kerning, layout_mode, horizontal/vertical_alignment,
-    margin (0-500).
-    clamp() - validate all values.
-    to_dict() / from_dict(data).
-
-  default_text_presets() -> list[dict]
-    Single "Default" TextPreset.
-
-  Class: EditorSettings
-    Main settings dataclass (settings_version=8). Fields include:
-    - tablet_mode, brush_size/eraser_size, brush_color (#000000), eraser_square
-    - snap_to_grid, page_scope_select, canvas_renderer, predictive_ink
-    - transform_mode ("free"/"uniform"), rectangle_edit_mode ("normal"/"free")
-    - text_presets, active_text_preset, pencil_presets, active_pencil_preset
-    - pencil/eraser size presets with S/M/L keys
-    - hotkeys, hotkey_hold
-    - vector_eraser_mode ("stroke"/"point"/"intersection")
-    - vector_fit_error (0.1-50.0), vector_redraw_parameter/interaction/
-      operation/amount, vector_redraw_thickness_max/opacity_max
-    - vector_simplify_amount (0-100), fill_close_gaps, fill_gap_threshold
-    - fill_narrow_areas, fill_area_scaling, fill_area_amount, fill_area_mode
-    - fill_mode ("normal"/"enclose"), recent_series
-
-    __post_init__() calls clamp().
-
-    clamp()
-      Enforces all settings invariants (~75 lines):
-        - Bumps to version 8. Clamps brush/eraser ranges.
-        - S/M/L size normalization with per-kind defaults.
-        - Pencil/text preset dedup and ordering (Linear/Default first).
-        - Hotkeys merged with defaults, hold state merged with defaults.
-        - Vector eraser/redraw/fill setting validation and clamping.
-        - Recent series capped at 12, deduplicated.
-    
-    pencil_size() -> int
-      From active_pencil_size key.
-    active_brush_preset() -> BrushPreset
-      Lookup by active_pencil_preset name.
-    active_eraser_pixels() -> int
-      From active_eraser_size key.
-
-  settings_path() -> Path
-    Platform-appropriate config path (QStandardPaths.AppConfigLocation /
-    "settings.json").
-
-  load_settings() -> EditorSettings
-    Progressive schema V1-V8 migration:
-      V1->V2: page_scope_select, transform_mode defaults.
-      V2->V3: pencil/eraser size presets, pencil presets.
-      V3->V4: "bound_edit" hotkey -> "shape_edit".
-      V4->V5: rectangle_edit_mode.
-      V6->V7: hotkey_hold defaults.
-      V7->V8: backfills missing hotkeys/holds from defaults.
-    Removes deprecated transform_snap keys. Falls back to default on error.
-
-  save_settings(settings)
-    Atomic write via temp file replace.
+  default_hotkeys() - P/E/F/S/T/B, vector_redraw/connect/simplify,
+    draw_select_rect/lasso/stroke, insert_page_gap, select_all=Ctrl+A,
+    save/undo/redo/reset_view/toggle_grid.
+  default_hotkey_hold() - all False.
+  TextPreset - font preset with clamp().
+  EditorSettings (settings_version=11):
+    tablet_mode, brush/eraser sizes, brush_color, eraser_square,
+    snap_to_grid, page_scope_select, canvas_renderer, predictive_ink,
+    transform_mode, rectangle_edit_mode, text/pencil presets, S/M/L sizes,
+    hotkeys, hotkey_hold, vector_eraser_mode, vector_fit_error,
+    vector_redraw_* (parameter/interaction/operation/amount/max), 
+    vector_simplify_amount, fill_* settings, ui_splitter_sizes
+    (sidebar_workspace / tools_colors / ribbon_canvas), recent_series.
+    clamp() - all invariants incl. splitter size normalization and redraw
+      limits (40 thickness / 100 opacity).
+    pencil_size() / active_brush_preset() / active_eraser_pixels().
+  load_settings() - progressive V1-V11 migration (incl. hotkey backfills and
+    insert_page_gap default). save_settings() - atomic JSON.
 
 
 ================================================================================
 FILE: comic_editor/core/tiles.py  (321 lines)
 ================================================================================
-Sparse 256px RGBA raster tile storage and stroke painting.
-
-  TILE_SIZE = 256
-
-  Class: TileStore
-    __init__(tile_size=256) - initializes _tiles dict and dirty set.
-    _empty(size) -> QImage (static) - transparent ARGB32_Premultiplied tile.
-    tile(object_id, key, create=False) -> QImage|None
-    set_tile(object_id, key, image) - sets or clears tile, marks dirty.
-    snapshot(object_id, keys) -> dict - copies tiles for undo.
-    keys_for_rect(rect) -> set[tuple[int,int]] - tile indices covering rect.
-    paint_dab(object_id, point, size, color, opacity, erase, square,
-              antialias, before) -> QRectF
-      Paints circular/square stamp on affected tiles with SourceOver/Clear
-      composition. Records before-snapshots. Returns dirty rect.
-    paint_line(object_id, start, end, size, color, opacity_start, opacity_end,
-               erase, square, antialias, density, before) -> QRectF
-      Line of evenly-spaced dabs (spacing = max(0.75, size/4) / density).
-      Opacity interpolation. Returns union dirty rect.
-    iter_tiles(object_id, local_rect=None) -> Iterator[(key, QImage)]
-    remove_object(object_id) - deletes all tiles, cleans dirty.
-    object_tiles(object_id) / replace_object_tiles(object_id, values)
-    content_bounds(object_id) -> QRectF|None
-      Non-transparent pixel bbox using PIL alpha channel.
-    projective_transform(object_id, object_x, object_y, destination_quad,
-                         source_rect_local) -> dict
-      Renders object's sparse tiles through QTransform.quadToQuad into
-      parent-local tiles. Uses inverse transform for source tile queries.
-    prune_empty(object_id, keys) - removes fully transparent tiles.
-    is_empty(image) -> bool (static) - scans every pixel for alpha.
-    _alpha_bbox(image) -> tuple|None (static) - PIL-based with fallback.
-    load_directory(root, object_ids) - loads from x_y.png files.
-    save_directory(root, object_ids, complete=False)
-      Saves dirty or all tiles as PNG. Removes orphaned directories.
+  TileStore - sparse tile map {object_id: {(x, y): QImage}}:
+    tile / set_tile / snapshot / keys_for_rect;
+    paint_dab (circle/square, SourceOver/Clear, antialias);
+    paint_line (density + opacity interpolation);
+    iter_tiles / remove_object / object_tiles / replace_object_tiles;
+    content_bounds (PIL alpha bbox); projective_transform (quad-to-quad);
+    prune_empty / is_empty / _alpha_bbox;
+    load_directory / save_directory (PNG, atomic, orphan cleanup).
 
 
 ================================================================================
-FILE: comic_editor/core/vector_geometry.py  (2070 lines)
+FILE: comic_editor/core/vector_geometry.py  (2127 lines)
 ================================================================================
-Dependency-free geometry helpers for editable vector drawings.
-
-Type aliases: Point, Cubic, CubicSegment, FlattenedPoint, CubicProjection,
-PathProjection, StrokeLocation, StrokeSample, PathIntersection, CubicSpan,
-FreehandSample, FittedPoint, FittedCubic, ConnectionResult, EdgeProvenance,
-FaceEdge, PlanarFace.
-
-Core math:
-  point_xy(x, y) -> tuple[float, float]
-  cubic_eval(p0, p1, p2, p3, t) -> Point
-  cubic_derivative(p0, p1, p2, p3, t) -> Point
-  split_cubic(cubic) -> (Cubic, Cubic)  (de Casteljau at t=0.5)
-  cubic_subsegment(cubic, t0, t1) -> Cubic
-  reverse_cubic(cubic) -> Cubic
-
-Flattening:
-  flatten_cubic(cubic, tolerance, respect_monotonicity) -> list[FlattenedPoint]
-    Adaptive, tracks source parameters.
-  flatten_path(cubics) -> list[FlattenedPoint]
-  flatten_stroke(cubics, width_interpolator, opacity_interpolator) -> list[StrokeSample]
-    Interpolates variable width/opacity along the path for corridor hits.
-
-Arc length:
-  cubic_arc_length(cubic) / path_arc_lengths(cubics) / t_at_arc_length(...)
-
-Projection:
-  nearest_on_cubic(cubic, point) -> CubicProjection  (Newton refinement)
-  nearest_on_path(cubics, point) -> PathProjection
-  nearest_on_stroke(cubics, widths, point) -> StrokeLocation
-  centerline_hit(cubics, widths, point) -> StrokeLocation|None
-
-Freehand fitting:
-  deduplicate_samples(samples) / resample_freehand(samples, step)
-  fit_cubic_path(samples, error) -> list[Cubic]  (recursive)
-  fit_freehand(samples, error) -> list[Cubic]
-
-Corridor (eraser):
-  corridor_contains(cubic, corridor_width, point) -> bool
-  corridor_hits_path(cubic, corridor_width, cubics) -> bool
-  corridor_path_intervals(cubic, corridor_width, cubics) -> list[tuple[float,float]]
-  erase_cubics_by_corridor(cubics, corridor_cubics, width)
-  erase_stroke_by_corridor(cubics, width_interp, opacity_interp,
-                           corridor_cubics, corridor_width)
-    Variable-width corridor subtraction. Splits cubics, preserves spans
-    outside corridor.
-  erase_intersection_portion(cubics, width_interp, opacity_interp,
-                             corridor, intersections)
-
-Simplification:
-  simplify_tolerance(cubic, amount) -> float  (amount 0-1 -> px tolerance)
-  rdp_indices(points, epsilon) -> list[int]  (Ramer-Douglas-Peucker)
-  simplify_polyline(polygon, epsilon) -> list[tuple[int, float, float]]
-  simplify_polyline_local(polyline, epsilon)
-  simplify_cubics_local(cubics, epsilon) -> list[Cubic]
-
-Connection:
-  tangent_bridge(p0, t0, p1, t1, offset) -> tuple[Point, Point, Point, Point]
-  connect_cubic_paths(cubics0, cubics1, with_tangent=False) -> list[ConnectionResult]
-    Attempts to build cubic bridges from each endpoint pair.
-
-Faces:
-  point_in_polygon(point, polygon) -> bool
-  polygon_area(polygon) -> float  (signed)
-  trace_planar_faces(edges, gap_threshold, narrow_areas) -> list[PlanarFace]
-    Closes gaps < threshold, optionally fills narrow areas.
-  trace_cubic_faces(cubic_edges, gap_threshold, narrow_areas)
-  find_face_containing(faces, point, threshold) -> int|None
-
-Intersection:
-  _line_intersection / _refine_cubic_intersection
-  path_intersections(cubics0, cubics1) -> list[PathIntersection]
-  path_self_intersections(cubics) -> list[PathIntersection]
-
-Stroke adapter:
-  stroke_cubics(stroke) -> list[Cubic]
-  interpolate_stroke_attribute(points, attribute, t) -> float
+Dependency-free vector geometry:
+  Core: cubic_eval / cubic_derivative / split_cubic (de Casteljau) /
+    cubic_subsegment / reverse_cubic.
+  Flattening: flatten_cubic (adaptive, monotonicity-preserving) /
+    flatten_path / flatten_stroke (width+opacity interpolation).
+  Arc length: cubic_arc_length / path_arc_lengths / t_at_arc_length.
+  Projection: nearest_on_cubic (Newton) / nearest_on_path / nearest_on_stroke /
+    centerline_hit.
+  Freehand: deduplicate_samples / resample_freehand / fit_cubic_path
+    (recursive) / fit_freehand.
+  Corridor: corridor_contains / corridor_hits_path / corridor_path_intervals /
+    erase_cubics_by_corridor / erase_stroke_by_corridor (variable width,
+    split + preserve outer spans) / erase_intersection_portion.
+  Simplification: simplify_tolerance / rdp_indices / simplify_polyline /
+    simplify_polyline_local / simplify_cubics_local.
+  Connection: tangent_bridge / connect_cubic_paths.
+  Faces: point_in_polygon / polygon_area / trace_planar_faces (gap closing,
+    narrow areas) / trace_cubic_faces / find_face_containing.
+  Intersection: path_intersections / path_self_intersections.
+  Adapter: stroke_cubics / interpolate_stroke_attribute.
 
 
 ================================================================================
@@ -760,1046 +471,572 @@ UI MODULES
 ================================================================================
 
 ================================================================================
-FILE: comic_editor/ui/canvas.py  (7635 lines)
+FILE: comic_editor/ui/canvas.py  (12530 lines)
 ================================================================================
-The central interactive canvas widget - the heart of the application. This is a
-mixin class mixed into QWidget or QOpenGLWidget.
+The central interactive canvas - the heart of the application. Mixin
+(_CanvasLogic) combined with QWidget or QOpenGLWidget.
 
-  Enum: ToolKind
-    OBJECT_SELECT, RASTER_PENCIL, RASTER_ERASER, FILL, TEXT_EDIT, TRANSFORM,
-    SHAPE_EDIT, BOUND_EDIT (alias), VECTOR_EDIT, VECTOR_REDRAW, VECTOR_CONNECT,
-    VECTOR_SIMPLIFY, BOX_BOUND, CIRCLE_BOUND, SHAPE_CREATE, POLYGON_BOUND
-    (alias), BOUND_EDIT, RASTER_CREATE.
+  Enum: ToolKind (19 tools): OBJECT_SELECT, RASTER_PENCIL, RASTER_ERASER,
+    FILL, TEXT_EDIT, TRANSFORM, SHAPE_EDIT, BOUND_EDIT (alias), VECTOR_EDIT,
+    VECTOR_REDRAW, VECTOR_CONNECT, VECTOR_SIMPLIFY, BOX_BOUND, CIRCLE_BOUND,
+    SHAPE_CREATE, POLYGON_BOUND (alias), RASTER_CREATE, INSERT_PAGE_GAP,
+    DRAW_SELECT_RECT, DRAW_SELECT_LASSO, DRAW_SELECT_STROKE.
 
-  Class: _CanvasLogic (mixin, ~7500 lines)
+  Class: _CanvasLogic (mixin, ~11500 lines)
 
-    Signals:
-      documentChanged(QObject) - document content changed.
-      selectionChanged(str, str) - (kind, entity_id).
-      hierarchyChanged() - structure changed.
-      chapterReplaced(ChapterDocument) - chapter fully reloaded.
-      cameraChanged() - viewport changed.
-      interactionFinished() - tool interaction completed.
-      toolChanged(ToolKind) - active tool switched.
-      textEditingChanged(bool) - text editing session started/ended.
-      selectionCandidatesRequested(list, QPoint) - Ctrl+click multi-hit.
-      primitiveConversionRequested(str) - confirm convert rectangle/circle.
-      vectorSelectionChanged() - vector point/stroke selection changed.
+    Signals (14): documentChanged, selectionChanged, hierarchyChanged,
+      chapterReplaced, cameraChanged, interactionFinished, toolChanged,
+      textEditingChanged, selectionCandidatesRequested,
+      primitiveConversionRequested, vectorSelectionChanged,
+      drawingSelectionChanged, pageGapApplied, drawingSelected.
 
-    __init__(settings, parent)
-      Initializes all state: chapter, tiles, command_stack, tool, selection
-      state, camera (center_x/y, scale, rotation), navigation state, drawing
-      state, drag state, transform/quad state, text editing state, shape
-      creation/edit state, vector edit/pencil/eraser/redraw/connect/simplify
-      state, fill state, touch state, brush preset, predictive ink, compound
-      flatten state, etc.
+    __init__() - full interaction state: chapter, tiles, command_stack, tool,
+      selection, camera (center_x/y, scale, rotation), navigation state,
+      drawing/erase state, transform state, text editing state, shape
+      creation/edit state, vector edit state (selection, preview,
+      simplify anchor grid, overlay), fill state, drawing-selection state,
+      page creation/gap state, touch state (incl. _touch_pending_points +
+      _touch_frame_timer for frame coalescing), brush preset, predictive
+      ink, gradient state (_gradient_preview_active flag), navigation
+      snapshot (_navigation_snapshot QImage + transform), and
+      _pending_raster_transform_press for deferred outside-frame drags.
 
-    ---- Document & Commands ----
-    set_document(chapter, tiles, reset_view=True)
-      Adopts new chapter. Clears selection and command stack, ensures raster
-      frames, resets view.
-    clear_selection()
-    replace_chapter(state_dict)
-      Replaces chapter from dict (undo/redo). Validates selection still exists.
-    push_model_change(before, after, label)
-      Creates CallbackCommand wrapping replace_chapter before/after.
-    push_object_patch(before, after, label)
-      Creates ObjectPatchCommand with before/after object dicts.
-    set_selection(kind, entity_id, activate_default_tool=True)
-      Sets selection. Auto-activates default tool per type.
-    set_tool(tool) -> bool
-      Sets active tool. Clears transform/creation/vector state when switching.
-      Validates tool requirements. Contextual routing for vector tools.
-    _sync_selection_levels()
-      Updates active_layer_id, active_page_id from selection.
-    _ensure_raster_frames()
-      Expands raster frame to contain any drawn content.
+    ---- Document & commands ----
+    set_document / clear_selection / replace_chapter / push_model_change /
+    push_object_patch / set_selection / set_tool (emits toolChanged only when
+    the tool actually changes) / _sync_selection_levels /
+    _ensure_raster_frames.
 
-    ---- Camera / Transforms ----
-    camera_transform() -> QTransform
-      Translate to center, rotate, scale, translate to -center.
-    widget_to_document(point) / document_to_widget(point)
-    visible_document_rect() -> QRectF
-    reset_view() - centers, fits width, rotation to 0.
-    scroll_to_fraction(fraction) / viewport_fraction() -> (top, height)
-    _snap_camera() - sub-pixel rounding for crisp rendering.
+    ---- Camera ----
+    camera_transform() / widget_to_document / document_to_widget /
+    visible_document_rect / reset_view / scroll_to_fraction /
+    viewport_fraction / _snap_camera.
 
-    ---- Path Building ----
-    bound_path(bound, vertex_radius=0.0) -> QPainterPath (static)
-      Builds QPainterPath from BoundGeometry (~400 lines):
-        - Ellipses: direct addEllipse from bbox.
-        - Custom/rectangle: walks nodes building cubic Bézier segments.
-        - handles curve rounding for vector points (arcs via quadTo) and 
-          unlocked Bézier nodes (C1 continuous Hermite joins via chord 
-          bisector tangent sharing).
-        - Uses de Casteljau subdivision (split_cubic, sub_cubic) for partial
-          curve segments during rounding.
-        - cubic_point, cubic_tangent, length_table, parameter_at_length for
-          precise measurement along curves.
+    ---- Vector change notification ----
+    _vector_changed(hierarchy=False, changed_stroke_ids=None)
+      Informs vector consumers and invalidates only the affected stroke
+      images. A missing stroke set means a structural restore (undo/redo,
+      deletion, hierarchy change) and clears the whole drawing cache; live
+      edit paths pass the changed stroke IDs for cheap partial invalidation.
 
+    ---- Path building ----
+    bound_path(bound, vertex_radius) -> QPainterPath (static, ~450 lines):
+      ellipse fast path; cubic Bézier segments with de Casteljau subdivision;
+      curve rounding for vector points (quadTo arcs) and C1-continuous Hermite
+      joins for unlocked Bézier nodes (chord-bisector tangent sharing).
     open_shape_mesh(bound, base_width, extra_width, start_cap, end_cap)
-      -> QPainterPath (classmethod)
-      Variable-width ribbon (~200 lines): samples path at 16-1024 steps,
-      computes normals at each sample, builds left/right boundary polylines.
-      Handles point/square/round caps. Width varies per node via
-      width_multiplier.
+      -> variable-width ribbon (point/square/round caps).
+    layer_shape_path / layer_effective_path (compound Boolean).
 
-    layer_shape_path(layer) -> QPainterPath (classmethod)
-    layer_effective_path(layer) -> QPainterPath (classmethod)
-      For compound shapes: computes Boolean union of own path with
-      additive children, subtracts subtractive children, ignores ignored
-      branches. Returns a QPainterPath with WindingFill.
+    ---- Rendering ----
+    paintEvent - main loop: transform static cache fast path; background;
+      camera transform; pages front-to-back; grid; predictive ink; selection;
+      creation preview; chapter outline. Navigation snapshot fast path when
+      _navigation_snapshot_active.
+    _paint_navigation_snapshot(painter) - draws the captured artwork image
+      under the current camera via (current * inverse) transform, then only
+      overlays grid/selection/page-gap/tablet-hover/simplify-hover. Used
+      during touch navigation so intermediate frames skip full rendering.
+    _capture_navigation_snapshot() - grabs the widget once at gesture/rebase
+      boundaries and stores it with its camera transform.
+    _clear_navigation_snapshot() - resets snapshot state.
+    render_preview / _render_layer (recursive, compound pipeline:
+      _render_compound_layer_contents / _render_compound_contributor /
+      _render_compound_reference_objects) / _render_object.
+    Text rendering: _text_document / _strict_text_rect / _rect_quad /
+      _text_quad / _quad_transform / _text_vertical_offset /
+      _draw_text_object / _draw_text_document / _text_caret_rect.
+    Vector rendering: _vector_centerline_path /
+      _vector_stroke_image (cached; key includes stroke render_revision and
+      an optional cache_token for selection previews; bounded insertion-ordered
+      cache capped at 384 entries, re-insertion on hit keeps entries recent) /
+      _render_vector_drawing (applies _selection_vector_preview positions via a
+      transient "selection-preview" cache token) / _render_vector_fill.
+    Gradient rendering: numpy scalar field computation; _gradient_grid_for_preview
+      returns a reduced grid (256) while _gradient_preview_active, else full
+      (768). Outward (reversed) fields build one canonical padded boundary
+      field cached under ("shape-boundary", path_signature, w, h) and sample it
+      per viewport so Distance drags only redo normalization + ramp lookup.
+      _gradient_geometry_cache / _gradient_render_cache invalidated
+      independently (geometry vs ramp color changes).
 
-    ---- Rendering (paintEvent main loop) ----
-    paintEvent(event)
-      Main render (200+ lines):
-      - If transform static cache is active: draws cached background plus
-        selected raster preview.
-      - Fills background, sets camera transform.
-      - Renders pages front-to-back via _render_layer.
-      - Draws grid, predictive ink, selection highlights, creation preview.
-      - Draws chapter boundary outline.
+    ---- Drawing overlays ----
+    _draw_grid / _draw_predictive_ink / _draw_selection /
+    _draw_path_node_handle / _shape_gizmo_positions /
+    _rectangle_radius_positions / _draw_shape_edit_handles /
+    _draw_selected_shape_gizmos / _draw_bezier_lock_gizmo /
+    _draw_creation_preview / _draw_page_gap_overlay /
+    _draw_tablet_hover / _draw_simplify_hover / _draw_drawing_selection.
 
-    render_preview(image, clip)
-      Renders full chapter at preview widget's resolution.
+    ---- Hit testing ----
+    _shape_hit_test (priority: radius -> delete gizmo -> gizmos -> controls ->
+      nodes -> primitive handles -> edges -> insertion -> interior) /
+    _nearest_shape_insert / _shape_segment_point /
+    hit_test_entities / hit_test_objects / _object_hit_contains /
+    _shape_border_contains / _hit_vector_strokes / _hit_vector_points.
 
-    _render_layer(painter, layer, parent_opacity, visible_world)
-      Recursive layer rendering:
-        - Fill layers: fills parent's bound with fill color.
-        - Open shape layers: renders variable-width mesh with optional outline.
-        - Bounded layers: if compound_enabled, uses compound rendering;
-          otherwise clips to bound, draws fill, renders children (reversed
-          order), then draws border.
-      Applies translate_x/y and opacity inheritance.
+    ---- Geometry queries ----
+    object_world_rect / object_world_quad / _selected_world_quad /
+    selected_widget_rect / _point_inside_layer_masks /
+    _entities_front_to_back / _objects_front_to_back / _selected_layer_id /
+    _target_parent_for_new_layer / _target_placement_for_new_bound / _snap.
 
-    _render_compound_layer_contents / _render_compound_contributor
-      / _render_compound_reference_objects
-        Handles compound shape rendering: renders each contributing descendent,
-        applies Boolean ops (add/subtract/ignore), renders referenced objects
-        through the compound mask.
-
-    _render_object(painter, obj, parent_opacity, local_visible)
-      Object rendering:
-        - RasterObject: draws sparse tiles. During transform drag, applies
-          translation or projective QTransform. Excludes transformed object
-          from static cache.
-        - TextObject: delegates to _draw_text_object.
-        - VectorDrawingObject: delegates to _render_vector_drawing.
-        - VectorFillObject: delegates to _render_vector_fill.
-
-    ---- Text Rendering ----
-    _text_document(obj, width) -> QTextDocument
-    _strict_text_rect(obj) -> QRectF
-      Computes from parent bound or compound mask with margin constraints.
-    _rect_quad(rect) -> list (static) - 4 corner points.
-    _text_quad(obj) - stored or computed transform quad.
-    _quad_transform(source, quad) -> QTransform (static)
-    _text_vertical_offset / _draw_text_object / _draw_text_document
-    _text_caret_rect(document, position) -> QRectF (static)
-
-    ---- Vector Rendering ----
-    _vector_centerline_path(stroke) -> QPainterPath
-      Builds path from cubic segments.
-    _vector_stroke_image(stroke, dpi_scale, local_rect) -> QImage
-      Renders stroke to a cached image with variable width and opacity.
-    _render_vector_drawing(painter, obj, parent_opacity, local_visible)
-      Renders each stroke with cached images, C1 tangent-smooth joins.
-    _render_vector_fill(painter, obj, opacity)
-      Renders fill geometry with fill_color.
-
-    ---- Grid, Selection, Handles Drawing ----
-    _draw_grid(painter, visible)
-      Renders effective grid with cosmetic 1px lines.
-    _draw_predictive_ink(painter)
-      50%-length forward prediction line.
-    _draw_selection(painter)
-      Blue dashed outlines, orange dotted active layer, transform/selection
-      handles, text margin handles, bound edit frames, vector selection.
-    _draw_path_node_handle / _shape_gizmo_positions
-    _rectangle_radius_positions
-    _draw_shape_edit_handles / _draw_selected_shape_gizmos
-    _draw_bezier_lock_gizmo / _draw_creation_preview
-
-    ---- Hit Testing ----
-    _shape_hit_test(bound, local, include_insert=True) -> dict|None
-      Priority: radius handles -> delete gizmo -> other gizmos -> Bézier
-      controls -> nodes -> primitive handles -> edge handles -> insertion
-      points -> interior (translation).
-    _nearest_shape_insert / _shape_segment_point (static)
-    hit_test_entities(point) -> list[dict]
-      Front-to-back hits respecting page scope and mask visibility.
-    hit_test_objects(point, text_only=False) -> list[str]
-    _object_hit_contains(obj, point, tolerance) -> bool
-      Variable-width vector stroke hit test.
-    _shape_border_contains(layer_id, point) -> bool
-      Within 12 screen pixels of border.
-
-    ---- Vector Stroke Hit Testing ----
-    _hit_vector_strokes(obj, point) / _hit_vector_points(obj, point)
-    _selected_vector_drawing() / _set_vector_selection(...)
-
-    ---- Geometry / Selection Queries ----
-    object_world_rect/object_world_quad / _selected_world_quad
-    selected_widget_rect() -> QRect
-    _point_inside_layer_masks / _entities_front_to_back
-    _objects_front_to_back / _selected_layer_id
-    _target_parent_for_new_layer / _target_placement_for_new_bound
-    _snap(point, layer_id) -> QPointF
-
-    ---- Input Handling ----
-    _navigation_mode() -> "pan"/"zoom"/"rotate"/None
-    mousePressEvent/Move/Release/DoubleClickEvent
-      Filter touch-mouse, dispatch to nav or _tool_press/_move/_release.
-    keyPressEvent
-      Text editing keys, shape creation (Enter/Esc/Backspace), raster creation
-      (Esc), global Esc to select, Delete for shape/vector points, vector
-      redraw/connect/simplify shortcuts.
-    inputMethodEvent/Query - IME support.
-    wheelEvent - Ctrl+wheel zoom, plain scroll.
-    tabletEvent - pressure-aware dispatch.
-    event(QEvent) - touch interception in tablet mode.
-    _is_touch_mouse(event) -> bool (static)
+    ---- Input ----
+    mousePressEvent/Move/Release/DoubleClickEvent / keyPressEvent /
+    inputMethodEvent/Query (IME) / wheelEvent / tabletEvent / event (touch) /
+    _is_touch_mouse (static).
 
     ---- Navigation ----
-    _begin/update/end_navigation (pan/zoom/rotate with modifiers)
-    _touch_event, _rebase_touch_navigation, _apply_touch_navigation
-      (pinch/zoom/twist with stable centroid)
+    _begin/update/end_navigation (Alt pan, Shift rotate, Alt+Shift zoom).
+    Touch: _touch_event / _rebase_touch_navigation / _apply_touch_navigation
+      (pinch/zoom/twist with stable centroid) / _flush_touch_navigation -
+      touch hardware can deliver >100 updates/sec; only the newest frame is
+      kept and applied once per event-loop iteration via a single-shot QTimer,
+      removing accumulated camera work without changing the deterministic
+      transform. Snapshots captured at gesture/rebase boundaries.
 
-    ---- Shape Creation (~500 lines) ----
-    _creation_selected_node / _creation_hit_test
-    _update_creation_hover / _begin_creation_shape_interaction
-    _update_creation_shape_interaction
-      Full workflow: point placement, Bézier drag, gizmo interaction (type
-      toggle, lock, delete, cap cycle, thickness, roundness), insertion,
-      point movement, close detection.
-    _normalize_shape_endpoint_handles (static)
-    _finish_shape(closed) -> creates layer from world bound
+    ---- Shape creation / edit ----
+    Full point/Bézier/gizmo workflows; _split_shape_segment (de Casteljau);
+    _finish_shape; _create_layer_from_world_bound;
+    flatten_compound_layer (Boolean result to multi-contour shape);
+    _geometry_from_painter_path.
 
-    ---- Shape Edit (~700 lines) ----
-    _begin_shape_edit(world_point) -> bool
-      Dispatches all hit types: gizmo clicks, radius handle, control handle,
-      primitive/rectangle handles, edge midpoints, node drag, insertion,
-      interior translation drag. Triggers primitive conversion confirmation.
-    _update_shape_edit(world_point)
-      Handles all drag modes: primitive resize, rectangle point/edge drag,
-      primitive corner radius, node drag, insert point, Bézier control,
-      thickness gizmo, roundness gizmo, shape translation, contour editing.
-    _update_shape_hover(world_point) - hover targets and tooltips.
-    _toggle_shape_node_type / _move_shape_bezier_handle
-    _toggle_shape_node_lock (static) / _cycle_shape_cap (static)
-    _split_shape_segment(bound, index, percent) -> PathNode (static)
-      de Casteljau subdivision at percentage.
-    _insert_shape_node / resolve_primitive_conversion
-    _finish_shape / _create_layer_from_world_bound
-    _geometry_from_painter_path(path) -> BoundGeometry
-      Traces QPainterPath to build BoundGeometry for compound flattening.
-    flatten_compound_layer(layer_id) -> bool
-      Compiles compound Boolean result into one multi-contour shape.
-      Preserves holes, disconnected regions, ignored branches, object positions.
-      Single undoable operation.
+    ---- Vector drawing tools ----
+    _selected_vector_drawing / _set_vector_selection /
+    _begin_vector_edit_pointer (Ctrl multi-select) / _update_vector_anchor_drag
+    (live preview via _selection_vector_preview + preview revision token) /
+    _begin_vector_pencil / _finish_vector_pencil (freehand fit, real-time
+    preview) / _stroke_from_spans / _stroke_from_cubics /
+    _erase_vector_intersection_groups / _finish_vector_eraser (stroke/point/
+    intersection) / _manual_redraw_at / apply_vector_redraw /
+    _simplify_vector_stroke / apply_vector_simplify /
+    apply_vector_sweep_simplify.
+    _build_simplify_anchor_index(drawing) - builds a document-space spatial
+      grid (cell = 12px / scale) once per simplify gesture; per-sample queries
+      only touch cells covered by the newest sweep segment, avoiding
+      O(strokes * points * samples) rescans. The overlay brush path is
+      decimated for display (>= 0.5px or radius*0.35 between samples) while
+      the model target set stays exact.
+    _collect_vector_endpoint / _finish_vector_connect.
+    _vector_fill_faces / _finish_vector_fill (normal/enclose, close-gaps,
+      narrow areas, area scaling) / _face_path / _prepare_vector_fill_path /
+    _apply_shape_fill.
 
-    ---- Vector Drawing Tools (~1500 lines) ----
-    _selected_vector_drawing() -> VectorDrawingObject|None
-    _set_vector_selection(strokes, points) - updates vector selection state.
-    _hit_vector_strokes(obj, point) / _hit_vector_points(obj, point)
-    _begin_vector_edit_pointer(world_point) -> bool
-      Point selection with Ctrl-click multi-select extension.
-    _begin_vector_point_select / _continue_vector_point_select
-    _update_vector_anchor_drag
-    _begin_vector_pencil / _finish_vector_pencil
-      Collects freehand samples from pressure input, fits to cubic anchors
-      via fit_freehand, creates new stroke or appends to existing.
-    _stroke_from_spans(spans, color) / _stroke_from_cubics
-      Converts fitted cubics to VectorStroke with attribute interpolation.
-    _erase_vector_intersection_groups / _finish_vector_eraser
-      Stroke mode: removes whole touched strokes. Point mode: corridor
-      subtraction. Intersection mode: erase portion between centerline
-      intersections.
-    _manual_redraw_at(world_point) / apply_vector_redraw
-      Redraw thickness/opacity: manual or point-select interaction, uniform/
-      increase/decrease operations, Apply targets selected entities then all.
-    _simplify_vector_stroke(stroke, amount) / apply_vector_simplify
-      Simplifies cubics by given percentage (0-100), preserving local shape.
-    _collect_vector_endpoint(world_point) / _finish_vector_connect
-      Sweep gesture collects two endpoints, builds tangent bridge.
+    ---- Drawing selection & transform ----
+    _add_selected_vector_points / _selected_drawing_coordinates /
+    _begin_draw_select (rect/lasso/stroke) / _finish_draw_select (replace /
+      shift-add / ctrl-remove) / _drawing_selection_quad /
+    _drawing_selection_handles / _start_drawing_selection_transform /
+    _commit_drawing_selection_transform (8-handle quad, edge translation,
+      rotation, movable pivot) / select_all_drawing_entities /
+    select_all_vector_points.
 
-    ---- Vector Fill ----
-    _vector_fill_faces(drawing, seed_point, lasso=None) / _finish_vector_fill
-      Normal mode: finds face containing seed point. Enclose mode: combines
-      faces within drawn lasso. Creates VectorFillObject as child of drawing.
-    _face_path(face, geometry) / _prepare_vector_fill_path
-    _apply_shape_fill(layer, world_point) -> str
-      Contextual fill on a shape: near border -> outline, interior -> fill.
+    ---- Page insertion & gaps ----
+    _begin_page_creation / _finish_page_creation (drawn pages below active
+      page, inserted after it; lower pages move together; 120px gutter) /
+    _begin_page_gap_interaction / _update_page_gap_interaction /
+    _commit_page_gap_interaction / _apply_page_gap_insertion /
+    _insert_page_gap / _page_group_pages.
 
-    ---- Raster Strokes ----
-    _begin_stroke(point, pressure)
-      Initializes stroke: before-snapshot, paints initial dab with taper.
-    _continue_stroke(point, pressure)
-      Paints interpolated dabs with density/antialiasing/predictive ink.
-      Expands raster frame.
-    _end_stroke()
-      Applies end taper, prunes empty tiles, creates TilePatchCommand.
-    _brush_values(pressure) -> (size, opacity)
-      Computes from preset curves and pressure.
-    refresh_brush_settings() - reloads ActiveBrushPreset.
-    _emit_raster_dirty / _restore_raster_frame
+    ---- Gradient editing ----
+    _begin_gradient_center_drag / _update_gradient_center_drag /
+    _finish_gradient_center_drag - sets _gradient_preview_active during drag,
+    clears gradient render cache on release for final-resolution rebuild.
 
-    ---- Transform ----
-    _edge_midpoints / _quad_handles / _quad_is_valid (static)
-    _snap_transform_point / _update_transform_preview
-      Free projective, uniform scale-around-opposite, edge midpoint drag.
-    _commit_object_transform()
-      Raster: projective_transform to bake into sparse tiles, or sparse
-      translation. Text: updates transform_quad. Creates undo command.
-    _build_raster_transform_cache
-      Snapshot background once for transform preview performance.
-    _clear_transform_preview / _render_selected_raster_preview
-    _quad_centroid
+    ---- Raster strokes ----
+    _begin_stroke / _continue_stroke (dabs, density, antialias, predictive
+    ink, frame expansion, chapter growth) / _end_stroke (TilePatchCommand,
+    prune, frame fit) / _brush_values / refresh_brush_settings /
+    _emit_raster_dirty / _restore_raster_frame.
 
-    ---- Text Editing ----
-    _editing_text_object() -> TextObject|None
-    _begin_text_pointer / _update_text_pointer
-      Cursor positioning, selection, strict margin dragging.
-    _begin_text_session / _handle_text_key
-      Full keyboard/clipboard/IME with local undo within session.
-    _replace_text_selection(text) - tracks local history.
-    _commit_text_edit - single undo command for entire session.
-    _text_edit_layout - QTextDocument, origin, transform for IME.
+    ---- Raster transform ----
+    _raster_transform_control_hit - 8 handles + rotate/pivot affordances;
+      outside-frame translation is a dedicated affordance with an
+      outside_margin (20px/scale) and requires the point to be outside the
+      frame polygon (so a pencil stroke on the raster edge is not mistaken
+      for a move).
+    _begin_or_defer_selected_raster_transform(widget_point, point) - reserves
+      an outside-frame translation until a drag is confirmed (>4px), else
+      treats it as a click (selection). Handles/rotate/pivot begin immediately.
+    _begin_selected_raster_transform / _update_transform_preview /
+    _commit_object_transform (projective bake or sparse translation) /
+    _build_raster_transform_cache / _render_selected_raster_preview /
+    _clear_transform_preview / _quad_handles / _quad_is_valid /
+    _snap_transform_point / _quad_centroid / _edge_midpoints.
 
-    ---- Bound Edit Handles (Raster resize) ----
-    _bound_handles(bound) -> list[tuple[float,float]] (static)
-      8 resize handles.
-    _move_bound_handle(bound, handle_index, target, original) -> int
-      Resize with crossed-axis handling.
+    ---- Text editing ----
+    _editing_text_object / _begin_text_pointer / _update_text_pointer /
+    _begin_text_session / _handle_text_key (keyboard/clipboard/IME, local
+    undo) / _replace_text_selection / _commit_text_edit / _text_edit_layout.
+
+    ---- Bound edit handles ----
+    _bound_handles / _move_bound_handle / _resize_axis_rect.
+
+    ---- Display helpers ----
+    primary_color / secondary_color properties (from series),
+    _page_expansion_safety_margin.
 
   Class: RasterCanvasWidget(QWidget, _CanvasLogic)
   Class: GpuCanvasWidget(QOpenGLWidget, _CanvasLogic)
-  gpu_available() -> bool
-  create_canvas(settings) -> QWidget (factory)
-  CanvasWidget = RasterCanvasWidget
+  gpu_available() / create_canvas(settings) / CanvasWidget alias.
 
 
 ================================================================================
-FILE: comic_editor/ui/main_window.py  (2008 lines)
+FILE: comic_editor/ui/main_window.py  (2952 lines)
 ================================================================================
 Standalone series/chapter application shell (QMainWindow).
 
-  Class: CollapsibleToolCategory(QWidget)
-    Expandable/collapsible toolbar group for "Shapes" category.
-    addTool(text) -> QToolButton, isExpanded(), setExpanded(expanded).
-    expandedChanged signal.
+  Class: CollapsibleToolCategory(QWidget) - expandable toolbar group.
 
   Class: MainWindow(QMainWindow)
 
-    __init__()
-      Loads settings, builds UI, connects signals, installs shortcut system.
+    __init__() - loads settings, builds UI, connects signals, installs the
+      hotkey system, restores splitter layout.
 
-    ---- UI Construction (_build_ui) ----
-      - Loads style.qss stylesheet.
+    _build_ui():
+      - style.qss stylesheet.
       - File toolbar: New/Open Series, Save, Undo/Redo, chapter combo,
         New Chapter, Trim Height, Fullscreen, Hotkeys..., Recent combo.
-      - Left tool toolbar: Select/Pencil/Eraser/Fill/Text/Transform/Shape Edit
-        buttons + collapsible Shapes (Add Rectangle/Circle/Shape) +
-        Add Fill/Text/Raster/Vector Drawing buttons + Reset View +
-        tablet/page-scope/snap toggles + PrimarySecondaryColorPanel.
-      - Ribbon: Color page (palette editor), Tool Settings page (pencil/
-        eraser/fill controls), Vector Tools page (redraw/connect/simplify).
-        Contextual visibility managed by _set_ribbon_context.
-      - Central: canvas + chapter preview sidebar.
-      - Right dock: layer settings panel + hierarchy tree with drag-drop.
-        Add Page/Layer buttons, Delete button.
+      - Left tool toolbar: Select/Pencil/Eraser/Fill/Text/Transform/Shape
+        Edit + collapsible Shapes + Add Fill/Text/Raster/Vector Drawing +
+        Reset View + tablet/page-scope/snap toggles + PrimarySecondaryColorPanel
+        (swappable wells with hex row: accept/copy/paste #RRGGBB/#AARRGGBB).
+      - Left sidebar splitter (tools | colors tabs).
+      - Resizable right sidebar splitter (layers tree | canvas).
+      - Ribbon: Tool Settings, Gradient Tools, Vector Tools pages.
+      - Central: canvas + fixed-width chapter preview.
+      - Right dock: layer settings + hierarchy tree (drag-drop).
       - Floating ContextInspector.
-      - Autosave timer (single-shot, 2-second debounce).
+      - Autosave timer (2s debounce, 30s interval).
 
-    ---- Hotkey System (_install_shortcuts) ----
-      Global event filter on QApplication for key press/release.
-      _hotkey_bindings dict from settings.
-      Chord sequences with 200ms prefix timeout.
-      Hotkey hold: press to activate, release to restore previous tool
-        (if held >= 200ms, otherwise sticky).
-      Text-editing suppression for letter/Shift keys.
-      Application deactivation cleanup.
-      Alt+Return fullscreen shortcut.
+    Hotkey system (_install_shortcuts): global event filter, chord sequences
+      (200ms prefix timeout), hold behavior (tap selects, hold >=200ms
+      temporary switch, release restores), text-editing suppression,
+      Alt+Return fullscreen, Ctrl+A select-all, app-deactivation cleanup.
 
-    _hotkey_action_for_chord / _hotkey_is_prefix / _hotkey_is_suppressed
-    _trigger_hotkey(action_id, chord, started, tap=False)
-      Tool switch or command callback. Activates hold mode if applicable.
-    _restore_active_hotkey_tool() - releases hold.
-    _hotkey_prefix_timeout() - fires pending chord after 200ms.
-    _hotkey_tool_changed(tool) - cancels hold on manual switch.
-    _hotkey_press(key) / _hotkey_release(key) -> bool
-      Core state machine. Tracks pressed keys, matches chords.
-    eventFilter(watched, event) -> bool
-      Global event filter.
+    Workspace layout: three QSplitters persisted to ui_splitter_sizes via
+      _save_splitter_state / _restore_splitter_state.
 
-    ---- Series & Chapter Management ----
-    _folder_name(name) -> str (static) - filesystem-safe name.
-    _create_series() - dialog-driven: choose folder, name, create.
-    _open_series_dialog() - system folder picker.
-    open_series(root) -> bool
-      Loads series with legacy primary color migration, adopts, loads first
-      chapter. Prompts to save.
-    _open_recent(index) - opens from recent combo.
-    _adopt_series(repository, series)
-      Populates chapter combo, sets window title, seeds colors to color panel.
-    _new_chapter() - prompts name, saves current, creates new.
-    _chapter_selected(index) / _load_chapter(chapter_id)
-      With recovery prompt for newer autosaves.
-    _set_chapter(chapter, tiles)
-      Sets canvas document, rebuilds hierarchy, syncs selection/title/colors.
+    Ribbon page persistence (new):
+      _ribbon_page_changed(key) - remembers explicit user tab choices in
+        _manual_ribbon_page (ignored during programmatic selection).
+      _select_ribbon_page(key) - programmatic selection guarded by
+        _programmatic_ribbon_selection counter.
+      _sync_contextual_ribbon() - shows/hides vector_tools,
+        raster_object_settings, gradient_tools; on entering a vector/raster/
+        gradient context routes to the relevant page; otherwise restores the
+        user's manual page. Tracks _selected_gradient_ribbon_id so re-selecting
+        the same gradient does not steal the tab.
+      _set_chapter() - first selection establishes the landing page
+        (vector_tools for a Vector Drawing, raster_object_settings for a
+        Raster, else none).
+      _canvas_selection_changed() / _canvas_tool_changed() - when the
+        pencil/eraser is active and another drawing is selected, route the
+        ribbon to Tool Settings so entering a raster/vector context cannot
+        replace the user's pencil controls.
 
-    ---- Editing Actions ----
-    _selected_parent_layer(allow_page=True) -> LayerNode|None
-    _add_page / _add_layer / _add_raster / _add_text / _add_fill
-    _add_vector_drawing()
-      Each: snapshot before, perform operation, snapshot after, push model
-      change, refresh hierarchy.
-    _next_layer_name() -> str
-    _delete_selected() - confirm, delete, push model change.
-    _after_structure(entity_id, kind) - refresh all UI after edit.
-    _trim_height() - dialog to reduce chapter height.
-    _activate_tool(tool)
-      Auto-selects raster for pencil/eraser. Activates via canvas.set_tool.
-    _confirm_primitive_conversion(primitive) - dialog.
-    _sync_tool_buttons() - update checked state and visibility.
+    Series/chapter: _create_series / _open_series_dialog / open_series
+      (legacy primary color migration) / _open_recent / _adopt_series /
+      _new_chapter / _set_chapter / _load_chapter (recovery prompt).
 
-    ---- Selection & Model Sync ----
-    _tree_selection_changed -> canvas sync.
-    _show_selection_candidates(candidates, global_point) - Ctrl+click menu.
-    _canvas_selection_changed -> tree, inspector, layer settings, ribbon sync.
-    _canvas_tool_changed -> inspector hide, ribbon context update.
-    _tree_mutated(before, after, label) -> push model change.
-    _chapter_replaced / _hierarchy_changed -> full UI refresh.
-    _expanded_layer_ids / _capture_hierarchy_view_state
-    _restore_hierarchy_view_state / _refresh_hierarchy
-      Preserve expanded state and selection across model resets.
+    Editing actions: _add_page / _add_layer / _add_raster / _add_text /
+      _add_fill / _add_vector_drawing / _delete_selected / _trim_height /
+      _activate_tool / _confirm_primitive_conversion.
 
-    ---- Ribbon & Color Management ----
-    _set_ribbon_context(tool)
-      Shows/hides contextual ribbon pages: Color always visible, Tool Settings
-      for pencil/eraser/fill, Vector Tools when vector type selected.
-    _primary_color_changed / _secondary_color_changed
-      Save to series, update ribbon color well.
-    _palette_mutated() - autosave series on palette change.
-    _swatch_applied(color) - apply to active color slot.
-    _sync_series_colors() - read series colors into color panel.
+    Selection/model sync: bidirectional canvas<->tree, Ctrl+click candidate
+      menu, hierarchy refresh preserving expansion/selection.
 
-    ---- Saving, Autosave, Settings ----
-    _mark_dirty(dirty_rect) - starts 2-second debounced autosave timer.
-    _command_stack_changed() - marks dirty on undo/redo.
-    save() -> bool
-      Saves chapter tiles + manifest atomically, updates series.json.
-      Clears dirty flag.
-    _autosave() - 30-second interval to autosave/ subdirectory.
-    _settings_changed() / _pencil_preset_selected / _brush_size_selected
-    _eraser_shape_selected / _feature_settings_changed
-    _edit_pencil_settings / _commit_pencil_presets
-    _edit_brush_sizes() - dialog for S/M/L config.
-    _set_text_shortcut_suppression(editing)
-    _edit_hotkeys() - opens HotkeysDialog, saves changes.
-    _toggle_grid() / _toggle_fullscreen()
-    _closeEvent / _confirm_discard_or_save
+    Color/palette: _primary_color_changed / _secondary_color_changed /
+      _palette_mutated / _swatch_applied / _sync_series_colors.
+
+    Gradient presets: _gradient_preset_load/add/save/rename/remove (per-series
+      gradient_ramp_presets).
+
+    Saving: save() (atomic chapter + series), _autosave, _mark_dirty,
+      _confirm_discard_or_save. Settings: pencil presets, brush sizes, hotkeys
+      dialog, fullscreen toggle.
 
 
 ================================================================================
-FILE: comic_editor/ui/inspector.py  (581 lines)
+FILE: comic_editor/ui/inspector.py  (683 lines)
 ================================================================================
-Floating contextual inspector anchored above selected entity.
+Floating contextual inspector.
 
   Class: ContextInspector(QFrame)
     Signals: changed, pencilPresetSelected, pencilSettingsRequested,
-    brushSizeSelected, brushSizesRequested, eraserShapeChanged.
+      brushSizeSelected, brushSizesRequested, eraserShapeChanged.
 
-    __init__(canvas, settings, save_settings_callback, parent)
-      Builds inspector panel:
-        - Header: title label + text preset selector (combo + S/R/X/+ buttons).
-        - Name row (hidden for text objects, shows display_name as title).
-        - Visibility checkbox, opacity lock + slider.
-        - Text formatting panel: font family, size, bold/italic, kerning,
-          layout mode, align popup with 3x3 alignment grid, margin row
-          (visible only in strict mode).
-        - Shape reference selector (direct parent / closest compound).
-        - Transform mode selector (free/uniform).
-        - Raster tool panel (hidden, retained for legacy compatibility).
-      Fixed width 390px. Connects signals to _apply, text preset management,
-      brush controls (still connected for older signal routing).
-
-    _small_button / _text_entity()
-    refresh_brush_controls() - legacy compatibility.
-    _brush_size_changed / _eraser_shape_changed
-
-    refresh()
-      Shows/hides panels based on selection type. Updates control values:
-        - Title shows display_name for TextObject, "Vector Drawing" for
-          VectorDrawingObject, "Vector Fill" for VectorFillObject, else type.
-        - Text panel visible only for TextObject.
-        - Name row hidden for TextObject (name is content-derived).
-        - Transform panel for RasterObject or free-layout TextObject.
-        - Geometry reference row for Raster/Text objects with compound ancestor.
-        - Raster tool panel always hidden (settings now live in ribbon).
-
-    reposition() - anchors above or below selection screen rect.
-
-    _set_alignment(horizontal, vertical) - from align popup, applies.
-    _apply(*args)
-      Reads controls back to entity. For text: name not writable. Handles
-      geometry_reference. Creates undo command on change.
-
-    _transform_settings_changed() - saves transform_mode.
-    _current_preset() -> TextPreset|None
-    _refresh_presets() - populates combo, protects "Default".
-    _apply_preset / _save_preset / _add_preset / _rename_preset
-    _remove_preset - standard preset management with undo.
+    Title per entity (display_name for text, "Vector Drawing"/"Vector Fill");
+    hidden entirely for RasterObject and GradientObject (ribbon owns them).
+    Controls: name (non-text), visibility, opacity lock + slider,
+      ignore_parent_mask (Raster/Vector Drawing), underlay slider with drag
+      coalescing (single undo per drag), text formatting (font/size/bold/
+      italic/kerning/layout/align popup/margin), geometry reference
+      (direct/compound), transform mode.
+    _begin_underlay_drag / _underlay_changed / _finish_underlay_drag.
+    Text preset management: _apply_preset / _save_preset / _add_preset /
+      _rename_preset / _remove_preset.
+    reposition() - anchors above/below the selection's screen rect.
 
 
 ================================================================================
-FILE: comic_editor/ui/layer_settings.py  (467 lines)
+FILE: comic_editor/ui/layer_settings.py  (485 lines)
 ================================================================================
-Permanent settings panel for active layer (right dock).
+Permanent layer settings panel (right dock).
 
   Class: LayerSettingsPanel(QGroupBox)
-    Signal: changed.
+    Controls: type label, name, visibility, opacity slider,
+      ignore_parent_mask (non-page, non-fill), compound shape
+      (enabled/operation add/subtract/ignore/flatten), rectangle edit mode,
+      fill toggle + color, stroke thickness (slider+spinbox; open shapes),
+      outline width (slider+spinbox; page max 40, others 500) + color,
+      point width/roundness (read-only when node selected), grid override.
+    Thickness drag coalescing via sliderPressed/Released.
+    _flatten_compound() - confirmation dialog + canvas.flatten_compound_layer.
+    refresh() - conditional visibility per layer kind.
 
-    __init__(canvas, settings, save_settings_callback, parent)
-      Builds form:
-        - Type label (dynamic), name field, visibility + opacity slider.
-        - Compound shape: enabled checkbox, operation combo (add/subtract/
-          ignore), flatten button.
-        - Rectangle edit mode combo (normal/free).
-        - Fill toggle + color picker (reinterpreted as "Stroke" for open shapes).
-        - Stroke thickness (slider + spinbox, open shapes only).
-        - Outline width (slider + spinbox) + color picker.
-        - Point width/roundness (read-only, shown when point selected).
-        - Grid override controls.
-      Thickness sliders use drag coalescing (single undo per drag).
-
-    _set_color_button / _choose_color / _set_pair_visible
-    _set_thickness_visible / _layer_title
-
-    refresh()
-      Updates controls based on active layer. Shows/hides conditionally:
-        - Compound controls for non-page, non-fill layers. Operation visible
-          when parent is compound. Flatten button when compound_enabled.
-        - Rectangle mode for rectangle primitives.
-        - Fill, stroke thickness, outline, per-point controls, grid override.
-
-    _rectangle_mode_changed() - saves to settings.
-    _thickness_spin_changed / _thickness_slider_changed
-      Keeps slider/spinbox in sync.
-    _begin_thickness_drag / _finish_thickness_drag
-      Captures before state on drag start, commits single undo on release.
-
-    _apply(*args, push_undo=True)
-      Reads controls back to layer properties: name, visible, opacity, fill
-      color, thickness, outline, compound settings, grid override.
-      Creates undo command if changed (skip during drag).
-
-    _flatten_compound()
-      Confirms, calls canvas.flatten_compound_layer, shows error if empty.
 
 ================================================================================
-FILE: comic_editor/ui/tree_model.py  (291 lines)
+FILE: comic_editor/ui/tree_model.py  (322 lines)
 ================================================================================
-Drag-reorderable hierarchy model with document invariant enforcement.
+  HierarchyModel(QAbstractItemModel):
+    _build() - recursive tree from root pages; Vector Fill children nested
+      under their Vector Drawing owner.
+    data() - display names (content-derived for text), type labels
+      ("Gradient", "Vector Drawing"/"Vector Fill", page/layer kinds), opacity
+      %, checkboxes, tooltips. Stale-index guards in data/setData/flags.
+    setData() - visibility toggle (validated Qt.CheckState) / rename
+      (non-text).
+    flags() - drop-enabled for non-fill layers and Vector Drawings.
+    Drag-drop: custom MIME; fills only onto their owner; pages only at root;
+      restore-from-before on ValueError.
 
-  Class: TreeItem (dataclass)
-    kind, entity_id, parent, children list.
-
-  Class: HierarchyModel(QAbstractItemModel)
-    mutationCommitted(before_dict, after_dict, label) signal.
-
-    __init__ / set_chapter / rebuild
-
-    _build()
-      Recursively builds tree from root_page_ids. For VectorDrawingObject
-      parents, nests VectorFill children as sub-items.
-
-    item_for_index / index_for_entity / index / parent
-    rowCount / columnCount -> 3 (Name, Type, Opacity)
-    headerData
-
-    data(index, role)
-      Col 0: display_name for TextObject, else name. Editable for non-text.
-      Col 1: human-readable type (Page, Rectangle/Circle/Shape Layer, Fill
-        Layer, Open Shape, Vector Drawing, Vector Fill, Raster, Text).
-      Col 2: opacity percentage.
-      Checkbox (visible), tooltips per entity type, background/foreground colors.
-
-    setData(index, value, role) -> bool
-      Rename (non-text only) and visibility toggle. Emits mutationCommitted.
-
-    flags(index)
-      Non-fill layers and VectorDrawing objects are drop-enabled. Text objects
-      not editable in tree (name is content-derived). All items drag-enabled.
-
-    supportedDropActions / mimeTypes / mimeData (JSON {kind, id})
-    canDropMimeData
-      Validates: fills can only drop on their owner VectorDrawing. Vector fills
-      cannot drop on layers. Pages only at root. Non-fill layers exclude fill
-      drops. No drops on fill layers.
-    dropMimeData
-      Calls chapter.move_entity(), validates, rebuilds, emits mutationCommitted.
-      On error, restores chapter from before-state.
 
 ================================================================================
 FILE: comic_editor/ui/preview.py  (118 lines)
 ================================================================================
-Low-resolution live chapter navigator sidebar.
+  ChapterPreview(QWidget) - 92px navigator; cached preview image with band
+    invalidation; draggable blue viewport handle; click/drag scrolls.
 
-  Class: ChapterPreview(QWidget)
-    scrollRequested(float) signal - vertical fraction 0-1.
-
-    __init__(canvas, parent)
-      Fixed 92px wide. Connects to documentChanged (band invalidation),
-      hierarchyChanged (full invalidation), cameraChanged (redraw).
-
-    invalidate_all() - marks full cache dirty.
-    invalidate(world_rect) - band invalidation from world rect.
-    content_rect() -> QRect - scaled, centered preview area.
-    paintEvent(event)
-      Renders cached preview or rebuilds it. Draws draggable blue viewport
-      handle.
-    mousePressEvent/MoveEvent / _scroll(y)
-      Click/drag on preview scrolls canvas.
 
 ================================================================================
-FILE: comic_editor/ui/color_picker.py  (1061 lines)
+FILE: comic_editor/ui/color_picker.py  (1175 lines)
 ================================================================================
-Reusable ARGB color controls for ribbon and toolbar.
+  qcolor_from_argb / canonical_argb - ARGB normalization helpers.
+  _paint_checkerboard - alpha background.
+  HsvAlphaPicker - hue ring + SV square + alpha strip; drag modes;
+    colorChanged / interactionStarted / interactionFinished.
+  ColorWellButton - checker-backed color well.
+  PrimarySecondaryColorPanel - dual-slot picker with swap button, popout HSV
+    picker, hex row accepting/copying/pasting #RRGGBB/#AARRGGBB.
+  ColorSwatchButton - single-click apply, double-click edit, context menu.
+  ColorPickerPopup - HSV picker + Apply/Cancel.
+  PaletteEditorWidget - palette combo, inline name editor, swatch grid;
+    paletteMutated; stable IDs; CRUD via popup; normalizes legacy formats.
 
-  qcolor_from_argb(value, default) -> QColor
-    From string/QColor/int. Hex strings without # are auto-prefixed.
-  canonical_argb(value, default) -> str
-    Normalizes to uppercase #AARRGGBB via QColor.name(HexArgb).
 
-  _paint_checkerboard(painter, rect, cell_size=6.0)
-    Gray/white alpha background.
+================================================================================
+FILE: comic_editor/ui/gradient_tools.py  (726 lines)
+================================================================================
+Contextual gradient creation, ramp editing, and preset controls.
 
-  Class: HsvAlphaPicker(QWidget)
-    Hue ring + inner SV square + vertical alpha strip.
-    colorChanged / interactionStarted / interactionFinished signals.
+  Class: GradientRampEditor(QWidget)
+    Blender-style stop editor. Checkerboard + linear gradient ramp bar,
+    triangle handles with colored squares, drag to move position,
+    double-click to edit color, selected stop outlined orange.
+    Signals: editingStarted / rampChanged / editingFinished /
+      selectionChanged / colorEditRequested.
 
-    __init__(color, parent)
-      Stores HSV alpha components. Tracks _drag_mode.
+  Class: GradientToolsControls(QWidget)
+    Signals: createRequested / objectChanged / presetLoadRequested /
+      presetAddRequested / presetSaveRequested / presetRenameRequested /
+      presetRemoveRequested.
 
-    color() -> QColor / color_argb() -> str
-    setColor(color, emit=False) / set_color
+    Create widget: Line/Curve, Circle/Ellipse, Parent Shape buttons, field
+      type combo, Select Gradient button.
+    Type parameters: Follow (parallel/perpendicular), Reverse direction,
+      Uniform checkbox, Distance slider + spinbox. The distance slider's
+      sliderPressed/sliderReleased now route through _begin_ramp_edit /
+      _finish_ramp_edit so slider drags coalesce into a single undo and use
+      the reduced preview gradient grid.
+    Ramp editor: GradientRampEditor + add/remove stop buttons.
+    Presets: combo + name edit + New/Save/Remove.
 
-    paintEvent(event)
-      Draws: hue ring (conical gradient, 13 stops), SV square (hue + white
-      horizontal + black vertical gradients), alpha strip (checkerboard +
-      vertical opacity gradient). Marker circles on hue ring and SV square.
-      Horizontal line marker on alpha strip.
+    selected_gradient() / context_parent_id() / matching_gradients().
+    _field_changed() - switch field type with conflict detection (one per
+      type per parent).
+    _select_matching_gradient() - selects the child matching the combo.
+    _type_parameter_changed() - commits direction/distance changes; defers the
+      undo commit while an edit is active (single command on release).
+    _begin_ramp_edit() - captures before-state and sets
+      canvas._gradient_preview_active (reduced-resolution gradient grid).
+    _preview_ramp() - live ramp update without undo.
+    _finish_ramp_edit() - clears preview flag + gradient render cache, commits
+      one undo command.
+    _interpolated_stop() (static) - creates a stop at the largest gap with
+      averaged color.
+    _add_stop / _remove_stop (min 2 stops).
+    _edit_stop_color / _apply_stop_color - ColorPickerPopup with quick colors
+      from canvas primary/secondary.
+    _preset_activated / _sync_preset_name / _save_preset / _rename_preset /
+      _remove_preset; set_presets() includes "Custom" and built-in
+      "Primary to Secondary" entries.
+    refresh() - syncs controls with per-field-type visibility rules.
 
-    mousePressEvent/Move/ReleaseEvent
-      _mode_at(point) -> "hue"/"sv"/"alpha"/None
-      _update_from_point(mode, point): updates _hue/_saturation/_value/_alpha,
-        syncs color, emits.
 
-    _layout_geometry() -> (outer, inner, sv, alpha) QRectFs
-      Calculates responsive layout: ring outer/inner radii, SV square fitting
-      inside ring, alpha strip at right.
+================================================================================
+FILE: comic_editor/ui/tool_ribbon_pages.py  (911 lines)
+================================================================================
+  ToolSettingsControls(QWidget):
+    Pencil page (preset/size/Pressure button/Configure sizes), Eraser page
+      (size/shape/vector mode/Configure sizes), Fill page (close gaps +
+      threshold, narrow areas, area scaling + amount + mode, fill mode),
+      Selection page (transform mode Free/Uniform for draw-select tools).
+    set_context(tool, vector_active); refresh(); change handlers emit signals
+    and persist settings.
 
-  Class: ColorWellButton(QAbstractButton)
-    Checker-backed color well, emits colorChanged.
+  VectorToolsControls(QObject):
+    Transform widget (mode combo), Redraw widget (parameter/interaction/
+      operation; amount + pressure-maximum sliders synced with spinboxes,
+      ranges adapt per parameter; manual mode shows maximum only),
+      Connect widget (status + button), Simplify widget (amount slider +
+      Sweep Simplify/Apply).
+    set_selection_summary() - Apply tooltips; auto-switches Redraw to Point
+      Select when points/strokes are selected.
+    _sync_redraw_controls() / slider<->spinbox sync (5x scaling for opacity).
 
-  Class: PrimarySecondaryColorPanel(QWidget)
-    primaryColorChanged / secondaryColorChanged signals.
+  RasterObjectControls(QObject):
+    Contextual raster properties: name, visible, opacity lock + slider,
+      ignore_parent_mask, underlay slider, geometry reference,
+      transform mode. Slider drag coalescing per property
+      (_begin_slider/_slider_changed/_finish_slider), discrete controls via
+      _apply_discrete.
 
-    __init__(primary, secondary, parent)
-      Two ColorWellButtons (primary/secondary). Click to set active slot.
-      Connected to HSV picker: picker changes route to active slot.
-
-    applyColor(color) - updates active slot, emits signal.
-    slotColor(slot) -> str / set_slot_color(slot, color, emit)
-    swap_colors() / active_color() -> str
-
-  Class: ColorSwatchButton(QAbstractButton)
-    Single/double-click palette swatch. Single=apply to active slot,
-    double-click=edit. Right-click context menu for edit/remove.
-
-  Class: ColorPickerPopup(QDialog)
-    HsvAlphaPicker + Apply/Cancel buttons. Stores ongoing color.
-
-  Class: PaletteEditorWidget(QWidget)
-    paletteMutated signal.
-
-    __init__(palettes, active_palette_id, apply_color, parent)
-      Palette selector combo, inline name editor, swatch grid (flexible wrap),
-      add swatch button, context menu for edit/remove.
-
-    _rebuild() - populates swatches from current palette.
-    _add_swatch / _edit_swatch / _remove_swatch
-      CRUD operations with ColorPickerPopup. Normalizes legacy dict/dataclass
-      formats.
 
 ================================================================================
 FILE: comic_editor/ui/ribbon.py  (282 lines)
 ================================================================================
-Reusable horizontally scrolling ribbon controls.
-
-  Class: RibbonGroup(QFrame)
-    Titled column of controls with title label at bottom.
-    add_widget / add_layout / add_stretch / set_title / title.
-
-  Class: RibbonPage(QScrollArea)
-    Scrollable container with horizontal layout of RibbonGroups.
-    add_group(title, minimum_width) -> RibbonGroup
-    insert_group(index, title, minimum_width)
-    groups() -> list[RibbonGroup]
-
-  Class: RibbonWidget(QWidget)
-    Tabbed ribbon with stable page keys and contextual visibility.
-    pageChanged(str) / pageVisibilityChanged(str, bool) signals.
-
-    add_page(key, title, visible=True) -> RibbonPage
-    remove_page(key) -> RibbonPage|None
-    page(key) -> RibbonPage|None
-    page_keys(visible_only=False) -> list[str]
-    set_page_visible(key, visible) / is_page_visible(key) -> bool
-    current_key() -> str|None / select_page(key) -> bool
-    set_visible_pages(keys) - batch visibility control.
-
-    _rebuild_tabs(preferred_key)
-      Rebuilds QTabBar from visible pages, preserving selection.
-    _tab_changed / _show_page(key, emit)
-
-================================================================================
-FILE: comic_editor/ui/tool_ribbon_pages.py  (503 lines)
-================================================================================
-Contextual tool controls hosted in the ribbon.
-
-  Class: ToolSettingsControls(QWidget)
-    Pencil, eraser, and fill control pages (3 pages in a QStackedWidget).
-
-    _build_pencil_page()
-      Preset combo, S/M/L size combo, Pressure/Presets button, Configure sizes
-      button. Signals: pencilPresetSelected, pencilSettingsRequested,
-      brushSizeSelected, brushSizesRequested.
-
-    _build_eraser_page()
-      S/M/L size combo, Circle/Square shape combo, vector eraser mode combo
-      (Stroke/Point/Intersection), Configure sizes button. Signals:
-      brushSizeSelected, eraserShapeChanged, vectorEraserModeChanged.
-
-    _build_fill_page()
-      Close gaps checkbox + threshold spinner, Fill narrow areas checkbox,
-      Area scaling checkbox + amount spinner + Round/Rectangle mode combo,
-      Mode combo (Normal/Enclose and Fill). Signal: fillSettingsChanged.
-
-    set_context(tool, vector_active)
-      Shows pencil/eraser/fill page based on tool. Shows/hides vector eraser
-      mode controls. Labels update for Vector Pencil/Eraser/Fill context.
-
-    refresh() - loads all controls from settings.
-
-    Settings change handlers: writes back to settings, emits signals for
-    main window to handle persistence.
-
-  Class: VectorToolsControls(QObject)
-    Redraw, Connect, Simplify widgets for Vector Tools ribbon page.
-
-    _build_redraw_widget()
-      Parameter combo (thickness/opacity), Interaction combo (manual redraw/
-      point select), Operation combo (increase/decrease/uniform),
-      Amount spinner, Pressure maximum spinner, Use Redraw/Apply buttons.
-
-    _build_connect_widget()
-      Status label, Use Connect button.
-
-    _build_simplify_widget()
-      Amount slider (0-100) sync'd with spinbox, Use Simplify/Apply buttons.
-
-    refresh() - loads settings. Syncs redraw control ranges based on
-      selected parameter (thickness=px 0-1000, opacity=0-100%).
-    set_selection_summary(selected_points, selected_strokes, total_strokes)
-      Updates Apply button tooltips.
-
-    _sync_redraw_controls() - enables/disables based on interaction mode,
-      adjusts suffix and range per parameter.
-
-    _redraw_changed / _simplify_changed - persist settings to EditorSettings.
+  RibbonGroup / RibbonPage / RibbonWidget - tabbed, horizontally scrolling
+    ribbon with stable page keys and contextual visibility;
+    set_visible_pages / select_page / page_keys / _rebuild_tabs.
 
 
 ================================================================================
 FILE: comic_editor/ui/hotkeys.py  (159 lines)
 ================================================================================
-Single-chord capture and normalization, including modifier-only chords.
+  chord_text / chord_keys / normalize_chord - single-chord serialization
+    incl. modifier-only bindings.
+  ChordCaptureEdit - read-only capture editor; commitCapture on all-keys-up;
+    Escape restores original; Backspace/Delete clears.
 
-  MODIFIER_LABELS / MODIFIER_ORDER / MODIFIER_FLAGS
-    Maps Qt key codes to display labels and modifier flags.
-
-  chord_text(keys) -> str
-    Deterministic portable chord string from key ints. Orders modifiers,
-    takes last regular key, joins with "+".
-
-  chord_keys(value) -> frozenset[int]
-    Parses stored chord. Supports modifier-only bindings (e.g. "Ctrl").
-    Uses QKeySequence for non-modifier bindings.
-
-  normalize_chord(value) -> str
-    Round-trip through chord_keys -> chord_text.
-
-  Class: ChordCaptureEdit(QLineEdit)
-    Replacement-style editor for one simultaneous chord.
-    chordChanged(str) signal.
-
-    __init__(value, parent)
-      Read-only, placeholder text. Tracks _value, _original, _pressed,
-      _candidate, _capturing.
-
-    chord() / setChord(value) / commitCapture()
-      Commits the displayed candidate, emits chordChanged.
-
-    mousePressEvent - resets to capture mode.
-    keyPressEvent
-      Escape: restores original. Backspace/Delete: clears. New capture:
-      replaces non-modifier keys, tracks _pressed set.
-    keyReleaseEvent
-      On all keys released, auto-commits capture.
 
 ================================================================================
-FILE: comic_editor/ui/hotkeys_dialog.py  (97 lines)
+FILE: comic_editor/ui/hotkeys_dialog.py  (102 lines)
 ================================================================================
-Compact editable hotkey map dialog.
+  LABELS incl. all drawing-select and page-gap actions.
+  HotkeysDialog - ChordCaptureEdit per action + Hold checkboxes; accept()
+    commits captures and validates uniqueness with a warning dialog.
 
-  LABELS dict - action ID to display name (Pencil, Eraser, Fill, Object
-    Select, Transform, Shape Edit, Redraw/Connect/Simplify Vector, Save,
-    Undo, Redo, Reset View, Toggle Grid).
-
-  Class: HotkeysDialog(QDialog)
-    TOOL_ACTIONS = set of keys with hold capability.
-
-    __init__(bindings, hold_bindings, parent)
-      Form with ChordCaptureEdit per action + Hold checkboxes for tool actions.
-
-    bindings() -> dict[str, str]
-      Returns normalized chords. Validates uniqueness (raises ValueError).
-
-    hold_bindings() -> dict[str, bool]
-
-    accept()
-      Commits captures, validates uniqueness. Shows warning on duplicate.
-
-    _reset()
-      Restores all editors to defaults.
 
 ================================================================================
 FILE: comic_editor/ui/pencil_settings_dialog.py  (254 lines)
 ================================================================================
-Pencil pressure curve and preset manager.
+  PencilSettingsDialog - preset manager with size/opacity curve editors,
+    density/taper sliders, dirty-state resolution, committedPresets signal.
 
-  Class: PencilSettingsDialog(QDialog)
-    committedPresets(presets_list, active_name) signal.
-
-    __init__(presets, active_name, parent)
-      Deep copies presets. Builds UI: preset combo + Save/Delete, toggles
-      (pressure-size, pressure-opacity, antialias), two PressureCurveEditor
-      widgets (size/opacity curves), Density/Start Taper/End Taper sliders.
-
-    _slider(layout, label, low, high) -> (QSlider, QLabel) (static)
-    _populate() - fills combo from _presets.
-    _active() -> BrushPreset
-    _load(preset) - populates all controls.
-    _draft(name=None) -> BrushPreset - from UI state.
-    _mark_dirty() / _sync_enabled() / _resolve_dirty() -> bool
-      Prompts Save/Discard/Cancel on unsaved changes.
-    _select_preset(index) - switches, resolving dirty first.
-    _save() -> bool - prompts name, overwrites/adds, emits committedPresets.
-    _delete() - removes non-Linear preset.
-    _close_requested / closeEvent - resolves dirty.
 
 ================================================================================
 FILE: comic_editor/ui/pressure_curve_editor.py  (144 lines)
 ================================================================================
-Interactive pressure response curve editor widget.
-
-  Class: PressureCurveEditor(QFrame)
-    curveChanged signal.
-
-    __init__(title, curve, parent)
-    curve() / set_curve(curve)
-    paintEvent(event)
-      Draws dark background, 4x4 grid, border. Cubic Bézier curve from
-      (0,min) through control to (1,max). Three draggable handles: min
-      (left edge, orange), max (right edge, orange), control (interior, blue).
-      Title label centered at top.
-
-    _handle_at(point) -> str|None
-      Returns "min"/"max"/"control" by proximity to handle positions.
-
-    mousePressEvent / mouseMoveEvent / mouseReleaseEvent
-      Drags handle. On move: updates curve values, clamps, redraws, emits
-      curveChanged. Cursor changes to open/closed hand.
+  PressureCurveEditor - paints grid + cubic Bézier curve + three draggable
+    handles (min/max/control); emits curveChanged while dragging.
 
 
 ================================================================================
-FILE: comic_editor/ui/style.qss  (94 lines)
+FILE: comic_editor/ui/style.qss  (126 lines)
 ================================================================================
-Qt stylesheet providing the dark editor theme:
-  - Dark backgrounds (#1c1c20, #18181c, #25252a, #202026).
-  - Blue accent highlights (#80c8ff, #3a4a5a).
-  - Rounded buttons (6px radius), styled tree/combos/spinboxes.
-  - Ribbon styling: dark background, tab appearance, group frames.
-  - Shape category header (transparent, hover highlight).
-  - Context inspector: transparent dark background + blue border.
+Dark theme: backgrounds #1c1c20/#18181c/#25252a/#202026, accent #80c8ff,
+selection #3978ad. Styled: toolbars, splitters (hover/pressed accent),
+color tabs, tool/push buttons (6px radius), tree views, inputs, docks,
+status bar, sliders, scroll areas, ribbon pages/groups/tabs/labels,
+tool panel + separator frames.
 
 
 ================================================================================
-TEST FILES (20 files, ~4300 lines total)
+TEST FILES (22 files, ~6400 lines total)
 ================================================================================
 
-  conftest.py (25 lines)
-    Sets QT_QPA_PLATFORM=offscreen. Session-scoped qapp fixture. Auto-flush
-    deferred deletes.
+  conftest.py (25) - offscreen platform, qapp fixture, deferred delete flush.
 
-  test_models.py (190 lines)
-    Shape style thickness integer clamping, page/object parent invariants,
-    mixed children round-trip, grid/opacity inheritance, bound edit vs
-    translation separation, free page overlap/reorder, trim height validation,
-    independent vector roundness, invalid roundness clamping, legacy text
-    migration to free quad.
+  test_models.py (234) - shape style thickness, parent invariants, mixed
+    children round-trip, grid/opacity inheritance, vector roundness,
+    legacy text migration.
 
-  test_persistence.py (113 lines)
-    Series/chapter/sparse tiles round-trip, autosave recovery, future schema
-    rejection, manual save clears recovery, interrupted save restoration,
-    legacy series primary color seeding.
+  test_persistence.py (113) - save/load/autosave/recovery, interrupted save
+    restoration, legacy series color seeding.
 
-  test_settings.py (134 lines)
-    Missing settings has complete hotkeys, partial settings merge defaults,
-    null/partial hotkey merging, main window starts clean, v8 migration
-    removes transform_snap and disables hold, vector/fill settings
-    normalization, rectangle edit mode clamping, default text preset
-    protection.
+  test_settings.py (159) - partial merge, hotkey normalization, V11
+    migration, vector/fill/rectangle clamping.
 
-  test_tiles_and_commands.py (44 lines)
-    Blank doc allocates no raster area, single tile edit doesn't create
-    unrelated tiles, tile patch undo/redo, erasing to empty prunes tile.
+  test_tiles_and_commands.py (44) - sparse allocation, tile patch undo/redo,
+    eraser pruning.
 
-  test_rendering.py (63 lines)
-    Rectangle mask non-destructive, circle/nested masks intersect, preview
-    image is display resolution not chapter resolution.
+  test_rendering.py (242) - mask non-destructive, compound rendering,
+    preview resolution independence.
 
-  test_hotkeys.py (212 lines)
-    Single chord normalization (standalone modifiers), chord capture undo
-    replace/clear/cancel, hold only for tools and rejects duplicates,
-    modal hotkey accept saves/reloads/reopens, hold hotkey tap sticks and
-    long hold restores, real key events apply hold, prefix chord waits and
-    longer chord wins, hold restoration cancels on manual tool change and
-    focus loss.
+  test_hotkeys.py (212) - chord normalization, capture undo/clear, hold
+    tap/long-press/restore, prefix waiting, cancellation.
 
-  test_ui.py (357 lines)
-    Contextual raster tools, layer/page scope selection, object select hits
-    shape border, sibling shape before page, mixed shape/object front-to-back
-    order, shape border precedes descendants, shape selection from outliner
-    uses shape edit, hierarchy model exposes tree, drag-drop objects directly
-    on page, outliner reset preserves expansion/selection, text labels are
-    content-derived and not editable, compact text inspector layout, visibility
-    and quad restore, new text/raster insert above selected object, tablet
-    mode doesn't hide toolbars.
+  test_ui.py (375) - contextual tools, scope selection, border hit, shape
+    ordering, outliner preservation, text labels, insertion ordering,
+    tablet mode.
 
-  test_shape_paths.py (1246 lines - largest test file)
-    Path node/shape style round-trip, open shape leaf invariants, v3 migration
-    of rectangle/circle/polygon with radius/fill/border, malformed Bézier
-    handle rejection, variable-width open shape outline and caps render, open
-    Bézier with unlocked rounding renders, shape creation open/close/Bézier
-    drag, primitive creation uses active primary/secondary, shape edit
-    width/cap/insert/primitive conversion, rectangle mouse resize updates
-    vertices, rectangle free corner/edge drags undoable, every rectangle
-    handle preserves primitive and IDs, rectangle radius gizmos (hit/drag/
-    preserve primitive, zoom-independent screen offset), point hover prevents
-    insertion, primitive insert waits for confirmation and undo, tablet
-    buttonless move, mouse drag existing point doesn't add, new bound
-    sibling/page placement, point type/lock/roundness gizmos, Bézier control
-    grid snap, delete point gizmo undoable, roundness click toggle, unlocked
-    Bézier roundness is curve-aware and progressive (C1 tangent sharing),
-    closed shapes hide width gizmo, roundness migration from saved radius,
-    shapes category stays open after tool choice, bound_edit hotkey migrates
-    to shape_edit.
+  test_shape_paths.py (1246) - the largest: path round-trip, v3 migration,
+    Bézier handle topology, shape creation/edit, rectangle handles/radius,
+    gizmos, grid snap, C1 rounding, hotkey migration.
 
-  test_interaction_rework.py (456 lines)
-    Bound center drag, tablet horizontal pan, tablet touch pan/zoom/rotation,
-    free text transform persistence and content preservation, free text
-    alignment uses projective transform rect, transform double-click reenters
-    text edit, transform handle uses grid snap, uniform transform preserves
-    proportions, sparse raster translation preserves tiles and uses standard
-    undo, raster pencil expands frame with 24px margin, eraser recalculates
-    exact padded bounds and undoes frame, erasing all pixels keeps pre-stroke
-    frame, raster handle transform still bakes and undoes, live text session
-    commits as one document command, text keyboard/clipboard/IME, canvas
-    painting with live inspector state, bound edit promotion, outliner colors
-    and dynamic tools.
+  test_interaction_rework.py (476) - bound drag, tablet pan, touch nav,
+    free text transform, sparse raster translation, frame expansion,
+    text session, IME.
 
-  test_layer_settings.py (227 lines)
-    Layer settings follow selection, kind-specific rows and position above
-    tree, rectangle mode is global setting, preserves all bounded layer fields,
-    thickness sliders use integers sync and coalesce undo, raster tool
-    controls live in tool settings ribbon.
+  test_layer_settings.py (332) - kind-specific rows, rectangle mode, thickness
+    slider coalescing, ribbon context: pencil tool settings remain selected
+    across context refreshes (raster and vector), pressure-presets button
+    opens for both pencil kinds, ribbon returns to tool_settings.
 
-  test_v3_refinements.py (204 lines)
-    Fill layer is boundless leaf and round-trips, layer fill/border/radius
-    affect rendering, frontmost outliner row for hit testing, raster box
-    creation and frame outside selection, raster outside drag draws and
-    expands frame, raster bound edit can't shrink inside alpha, preview
-    centers long chapter, pressure preset round-trip with independent
-    channels, text edit shortcut suppression targets letters and shift.
+  test_v3_refinements.py (204) - fill layer, rendering, raster creation,
+    preview centering, pressure presets.
 
-  test_ribbon_integration.py (159 lines)
-    Main window ribbon is contextual and tools are renamed, add vector from
-    fill is anchored above owner, vector branch stays open in subtree and
-    collapses on leave, series colors and palette mutations autosave, vector
-    redraw controls restore full persisted ranges.
+  test_compound_shapes.py (297) - compound fields/contours, boolean ops,
+    geometry reference, flatten.
 
-  test_color_ribbon.py (185 lines)
-    Canonical ARGB accepts rgb/argb/qcolor, ribbon context pages keep stable
-    order, HSV picker alpha strip and SV square emit canonical color,
-    primary/secondary panel routes picker and palette colors, swatch single
-    click applies and double click only edits, palette editor uses stable IDs
-    and emits mutations, palette editor disables removing last palette.
+  test_page_insertion.py (586) - drawn page creation, page gap insertion,
+    gutter handles (dotted edge = one group, shaded band = both), undo/redo,
+    height auto-resize.
 
-  test_compound_shapes.py (297 lines)
-    Compound fields and multiple contours round-trip, compound add/subtract/
-    ignore visibility and nested geometry, open shape contributes core stroke
-    without child outline, compound renders parent style without internal
-    outline, geometry reference changes strict text bounds, context inspector
-    persists geometry reference, raster compound reference bypasses direct
-    parent mask, compound selection and creation placement, additional contour
-    nodes are shape editable, flatten preserves holes/ignored branches/object
-    positions.
+  test_vector_geometry.py (267) - splitting, flattening, arc length,
+    projection, fitting, corridor subtraction, simplification, connection,
+    faces, gaps.
 
-  test_vector_geometry.py (267 lines)
-    Split/subsegment preserve original cubic, flatten retains monotonic source
-    parameters and tolerance, flatten detects collinear reversal, arc length
-    and nearest projection stability, freehand resampling and fitting preserve
-    pressure, model-friendly stroke adapter and variable width hit, cubic path
-    and self intersections keep both parameters, corridor subtraction splits
-    and preserves exact outer spans, corridor subtraction tracks continuously
-    variable width, square and round corridor metrics, simplification mapping
-    and local preservation, tangent bridge and path connection orient
-    endpoints, planar face trace splits intersections and finds seed face,
-    planar gap closing marks virtual edge.
+  test_vector_models.py (204) - drawing/fill round-trip, owned hierarchy,
+    move/reorder/delete, render order, palette migration, object patch.
 
-  test_vector_models.py (204 lines)
-    Vector drawing and fill round-trip with owned hierarchy, vector fill
-    move/reorder/cascade delete, vector fill cannot be layer child or change
-    owner, render order places owned fills behind drawing strokes, series
-    colors and palettes migrate and persist atomically, object patch command
-    preserves live vector object identity.
+  test_vector_canvas.py (693) - pencil/eraser/fill, caps, edit mapping,
+    selection priority, intersection eraser, connect, redraw, narrow areas,
+    drag resample.
 
-  test_vector_canvas.py (385 lines)
-    Vector pencil creates pressure stroke and undoes, vector pencil tap
-    creates round dot, vector point cap renders outward tip, shape edit maps
-    to vector edit and selects stroke, object select prefers vector stroke
-    then fill interior, vector stroke eraser removes touched stroke, vector
-    fill creates owned child and keeps drawing selected, intersection eraser
-    uses other strokes as cuts, connect sweeps two endpoints and keeps first
-    style, redraw apply targets points before strokes, shape fill changes
-    border or interior contextually, square vector eraser uses square hit
-    shape, refill updates hidden child and fill selection resolves owner,
-    object select ignores fully transparent vector content, disabling fill
-    narrow areas removes neck not whole face, drag fill resamples between
-    pointer events.
+  test_stylus_vector_refinements.py (176) - stylus hover circle/crosshair,
+    stylus taps in popups, real-time gesture previews.
 
-  test_vector_tree.py (56 lines)
-    Vector fills are nested under their drawing in tree, vector fill drop is
-    limited to its owner.
+  test_vector_tree.py (56) - nested fill display, fill drop restricted.
+
+  test_gradients.py (540) - gradient creation/per-type exclusivity, ramp
+    editing, stops, presets CRUD, built-in primary-secondary, uniform/
+    reversed distance, center auto/manual, field switching, rendering.
+
+  test_ribbon_integration.py (297) - ribbon context/tools, vector branch
+    open/close, series colors/palette autosave, redraw control persistence.
+
+  test_color_ribbon.py (228) - canonical ARGB, page ordering, HSV picker,
+    primary/secondary routing, swatch clicks, palette stable IDs,
+    last-palette protection.
