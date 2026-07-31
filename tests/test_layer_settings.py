@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+from PySide6.QtCore import QObject, Signal
 from PySide6.QtWidgets import QSlider, QSpinBox
 
 from comic_editor.core.models import (
     BoundGeometry, ChapterDocument, PathNode, RasterObject, ShapeStyle,
+    VectorDrawingObject,
 )
 from comic_editor.core.tiles import TileStore
 from comic_editor.ui.canvas import ToolKind
@@ -235,7 +237,96 @@ def test_raster_tool_controls_live_in_tool_settings_ribbon(qapp, monkeypatch):
         qapp.processEvents()
         assert window.inspector.isHidden()
         assert window.canvas.tool == ToolKind.RASTER_ERASER
-        assert window.ribbon.current_key() == "raster_object_settings"
+        assert window.ribbon.current_key() == "tool_settings"
     finally:
         window.hide()
+        window.deleteLater()
+
+
+def test_pencil_tool_settings_remains_selected_across_context_refreshes(
+    qapp, monkeypatch,
+):
+    monkeypatch.setattr(main_window_module, "save_settings", lambda _value: None)
+    window = MainWindow()
+    chapter, _page, layer, raster = _window_document(window)
+    vector = chapter.add_object(
+        layer.layer_id, VectorDrawingObject(name="Vector Ink")
+    )
+    window._refresh_hierarchy()
+    window.show()
+    try:
+        # Re-selecting a raster while Pencil is already active must still
+        # expose Tool Settings; Canvas does not emit toolChanged in that case.
+        window.canvas.set_selection("object", raster.object_id)
+        qapp.processEvents()
+        assert window.canvas.tool == ToolKind.RASTER_PENCIL
+        assert window.ribbon.current_key() == "tool_settings"
+        controls = window.tool_settings_controls
+        assert controls.stack.currentWidget() is controls.pencil_page
+        assert controls.pencil_presets_button.isVisible()
+        assert controls.pencil_presets_button.isEnabled()
+
+        # A user-selected contextual tab survives ordinary ribbon refreshes.
+        window.ribbon.tab_bar.setCurrentIndex(
+            window.ribbon._tab_keys.index("raster_object_settings")
+        )
+        assert window.ribbon.current_key() == "raster_object_settings"
+        window._sync_contextual_ribbon()
+        assert window.ribbon.current_key() == "raster_object_settings"
+
+        # Vector Pencil uses the same Tool Settings page and must not be
+        # replaced by Vector Tools after its default tool is selected.
+        window.canvas.set_selection("object", vector.object_id)
+        qapp.processEvents()
+        assert window.canvas.tool == ToolKind.RASTER_PENCIL
+        assert window.ribbon.is_page_visible("vector_tools")
+        assert window.ribbon.current_key() == "tool_settings"
+        assert controls.stack.currentWidget() is controls.pencil_page
+
+        window.ribbon.tab_bar.setCurrentIndex(
+            window.ribbon._tab_keys.index("vector_tools")
+        )
+        window._sync_contextual_ribbon()
+        assert window.ribbon.current_key() == "vector_tools"
+    finally:
+        window.hide()
+        window.deleteLater()
+
+
+def test_pressure_presets_button_opens_for_raster_and_vector_pencil(
+    qapp, monkeypatch,
+):
+    opened = []
+
+    class FakePencilSettingsDialog(QObject):
+        committedPresets = Signal(object, str)
+
+        def __init__(self, presets, active_name, parent):
+            super().__init__(parent)
+            opened.append((presets, active_name, parent))
+
+        def exec(self):
+            return 0
+
+    monkeypatch.setattr(
+        main_window_module, "PencilSettingsDialog", FakePencilSettingsDialog,
+    )
+    window = MainWindow()
+    chapter, _page, layer, raster = _window_document(window)
+    vector = chapter.add_object(
+        layer.layer_id, VectorDrawingObject(name="Vector Ink")
+    )
+    window._refresh_hierarchy()
+    try:
+        controls = window.tool_settings_controls
+        for object_id in (raster.object_id, vector.object_id):
+            window.canvas.set_selection("object", object_id)
+            qapp.processEvents()
+            assert window.ribbon.current_key() == "tool_settings"
+            controls.pencil_presets_button.click()
+
+        assert len(opened) == 2
+        assert all(active_name == window.settings.active_pencil_preset
+                   for _presets, active_name, _parent in opened)
+    finally:
         window.deleteLater()

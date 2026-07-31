@@ -7,7 +7,9 @@ from enum import Enum
 
 import numpy as np
 
-from PySide6.QtCore import QEvent, QPoint, QPointF, QRect, QRectF, Qt, Signal
+from PySide6.QtCore import (
+    QEvent, QPoint, QPointF, QRect, QRectF, Qt, QTimer, Signal,
+)
 from PySide6.QtGui import (
     QAbstractTextDocumentLayout, QBrush, QColor, QFont, QFontMetricsF,
     QGuiApplication,
@@ -119,6 +121,9 @@ class _CanvasLogic:
         self._stroke_before: dict[tuple[int, int], QImage | None] = {}
         self._stroke_frame_before: tuple[float, float, float, float] | None = None
         self._stroke_erasing = False
+        self._pending_raster_transform_press: tuple[
+            QPointF, QPointF
+        ] | None = None
         self._model_before: dict | None = None
         self._drag_start_doc = QPointF()
         self._drag_start_value: object = None
@@ -188,6 +193,15 @@ class _CanvasLogic:
         self._touch_anchor_scale = 1.0
         self._touch_anchor_rotation = 0.0
         self._touch_anchor_document = QPointF()
+        self._touch_pending_points: list[QPointF] | None = None
+        self._touch_frame_timer = QTimer(self)
+        self._touch_frame_timer.setSingleShot(True)
+        self._touch_frame_timer.timeout.connect(
+            self._flush_touch_navigation
+        )
+        self._navigation_snapshot = QImage()
+        self._navigation_snapshot_transform = QTransform()
+        self._navigation_snapshot_active = False
         self._pending_raster_press: tuple[QPointF, QPointF, float] | None = None
         self._pending_vector_press: tuple[QPointF, QPointF, float] | None = None
         self._pending_drawing_selection_press: (
@@ -198,20 +212,31 @@ class _CanvasLogic:
         self.secondary_color = "#FFFFFFFF"
         self._predictive: tuple[QPointF, QPointF, float, QColor] | None = None
         self._compound_path_cache: dict[str, QPainterPath] = {}
+        # Stroke images are deliberately cached independently.  A drawing can
+        # contain thousands of strokes, so editing one must not evict every
+        # unrelated image.  The tuple key is intentionally permissive because
+        # preview revisions use a transient token.
         self._vector_render_cache: dict[
-            tuple[str, int, str, float, float], tuple[QImage, QRectF]
+            tuple, tuple[QImage, QRectF]
         ] = {}
         self._gradient_geometry_cache: dict[tuple, object] = {}
         self._gradient_scalar_cache: dict[tuple, tuple[np.ndarray, np.ndarray, QRectF]] = {}
         self._gradient_render_cache: dict[
             tuple, tuple[QImage, QRectF]
         ] = {}
+        self._gradient_preview_active = False
         self._selected_vector_stroke_ids: set[str] = set()
         self._selected_vector_point_ids: set[str] = set()
         self._vector_gesture_mode: str | None = None
         self._vector_samples: list[FreehandSample] = []
         self._vector_sweep: list[FreehandSample] = []
         self._vector_simplify_point_ids: set[str] = set()
+        self._vector_simplify_anchor_grid: dict[
+            tuple[int, int], list[tuple[str, str, tuple[float, float]]]
+        ] = {}
+        self._vector_simplify_grid_size = 12.0
+        self._vector_simplify_last_sample: tuple[float, float] | None = None
+        self._vector_simplify_overlay: list[FreehandSample] = []
         self._vector_before: dict[str, dict | None] | None = None
         self._vector_drag_origin = QPointF()
         self._vector_drag_points: dict[
@@ -235,6 +260,8 @@ class _CanvasLogic:
         self._selection_rotate_start = 0.0
         self._selection_rotate_quad: list[tuple[float, float]] | None = None
         self._selection_vector_points: dict[str, dict] = {}
+        self._selection_vector_preview: dict[str, dict] = {}
+        self._selection_vector_preview_revision = 0
         self._selection_before_tiles: dict[tuple[int, int], QImage] | None = None
         self._selection_before_model: dict | None = None
         self._page_creation_anchor_id = ""
@@ -285,7 +312,12 @@ class _CanvasLogic:
         self._selected_vector_stroke_ids.clear()
         self._selected_vector_point_ids.clear()
         self._vector_render_cache.clear()
+        self._pending_raster_transform_press = None
         self._gradient_render_cache.clear()
+        self._gradient_preview_active = False
+        self._touch_frame_timer.stop()
+        self._touch_pending_points = None
+        self._clear_navigation_snapshot()
         self._cancel_vector_gesture(restore=False)
         self._clear_transform_preview()
         self._page_creation_anchor_id = ""
@@ -379,8 +411,25 @@ class _CanvasLogic:
             for object_id in identifiers
         }
 
-    def _vector_changed(self, hierarchy: bool = False) -> None:
-        self._vector_render_cache.clear()
+    def _vector_changed(
+        self, hierarchy: bool = False,
+        changed_stroke_ids: set[str] | None = None,
+    ) -> None:
+        """Notify vector consumers and invalidate only affected stroke images.
+
+        ``changed_stroke_ids`` is supplied by live editing paths.  A missing
+        value means a structural restore (undo/redo, deletion, or hierarchy
+        change), for which clearing the drawing cache is the safe fallback.
+        This keeps the old behaviour for model restores while making pointer
+        updates cheap for large drawings.
+        """
+        if changed_stroke_ids is None:
+            self._vector_render_cache.clear()
+        elif changed_stroke_ids:
+            self._vector_render_cache = {
+                key: value for key, value in self._vector_render_cache.items()
+                if len(key) < 2 or key[1] not in changed_stroke_ids
+            }
         drawing = self._active_vector_drawing()
         if drawing is not None:
             live_strokes = {stroke.stroke_id for stroke in drawing.strokes}
@@ -516,6 +565,9 @@ class _CanvasLogic:
         self._vector_samples.clear()
         self._vector_sweep.clear()
         self._vector_simplify_point_ids.clear()
+        self._vector_simplify_anchor_grid.clear()
+        self._vector_simplify_last_sample = None
+        self._vector_simplify_overlay.clear()
         self._vector_before = None
         self._vector_drag_points.clear()
         self._vector_connect_endpoints.clear()
@@ -527,6 +579,7 @@ class _CanvasLogic:
     ) -> None:
         if self.chapter is None:
             return
+        previous_tool = self.tool
         if (
             self._page_gap_state is not None
             and self._page_gap_transaction is None
@@ -542,6 +595,8 @@ class _CanvasLogic:
             self._transform_pivot_custom = False
         if entity_id != self.selected_id:
             self._pending_drawing_selection_press = None
+            self._pending_raster_transform_press = None
+            self._gradient_preview_active = False
             self._selected_shape_node_id = ""
             self._selected_shape_node_ids.clear()
             self._shape_hover_insert = None
@@ -587,7 +642,8 @@ class _CanvasLogic:
                 and layer.bound is not None
             ):
                 self.tool = ToolKind.SHAPE_EDIT
-        self.toolChanged.emit(self.tool)
+        if self.tool != previous_tool:
+            self.toolChanged.emit(self.tool)
         self.selectionChanged.emit(kind, entity_id)
         self.update()
 
@@ -611,6 +667,7 @@ class _CanvasLogic:
         self._selected_shape_node_ids.clear()
         self._selected_vector_stroke_ids.clear()
         self._selected_vector_point_ids.clear()
+        self._pending_raster_transform_press = None
         self._clear_drawing_selection()
         self.vectorSelectionChanged.emit(set(), set())
         self.selectionChanged.emit("", "")
@@ -654,6 +711,7 @@ class _CanvasLogic:
         if tool not in {ToolKind.RASTER_PENCIL, ToolKind.RASTER_ERASER}:
             self._pending_raster_press = None
             self._pending_vector_press = None
+            self._pending_raster_transform_press = None
         if tool not in {
             ToolKind.DRAW_SELECT_RECT,
             ToolKind.DRAW_SELECT_LASSO,
@@ -1510,6 +1568,9 @@ class _CanvasLogic:
             painter.setPen(QColor("#8e8e96"))
             painter.drawText(self.rect(), Qt.AlignCenter, "Create or open a series to begin")
             return
+        if self._navigation_snapshot_active and not self._navigation_snapshot.isNull():
+            self._paint_navigation_snapshot(painter)
+            return
         if (
             not self._transform_static_cache.isNull()
             and self._transform_preview_quad is not None
@@ -1562,6 +1623,42 @@ class _CanvasLogic:
         painter.drawPolygon(chapter_poly)
         self._draw_tablet_hover(painter)
         self._draw_simplify_hover(painter)
+
+    def _paint_navigation_snapshot(self, painter: QPainter) -> None:
+        """Paint the captured artwork under the current camera cheaply."""
+        current = self.camera_transform()
+        inverse, invertible = self._navigation_snapshot_transform.inverted()
+        if not invertible:
+            inverse = QTransform()
+        painter.save()
+        painter.setTransform(current * inverse)
+        painter.drawImage(QPointF(0, 0), self._navigation_snapshot)
+        painter.restore()
+        painter.setTransform(current)
+        painter.save()
+        painter.setClipRect(QRectF(0, 0, self.chapter.width, self.chapter.height))
+        visible = self.visible_document_rect()
+        self._draw_grid(painter, visible)
+        self._draw_selection(painter)
+        self._draw_page_gap_overlay(painter)
+        painter.restore()
+        painter.setTransform(QTransform())
+        self._draw_tablet_hover(painter)
+        self._draw_simplify_hover(painter)
+
+    def _capture_navigation_snapshot(self) -> None:
+        if self.chapter is None:
+            return
+        # ``grab`` is performed once at gesture/rebase boundaries.  All
+        # intermediate frames only transform this image, avoiding a complete
+        # layer/vector/gradient render for every touch packet.
+        self._navigation_snapshot = self.grab().toImage()
+        self._navigation_snapshot_transform = self.camera_transform()
+        self._navigation_snapshot_active = not self._navigation_snapshot.isNull()
+
+    def _clear_navigation_snapshot(self) -> None:
+        self._navigation_snapshot_active = False
+        self._navigation_snapshot = QImage()
 
     def _set_live_underlay_context(self) -> None:
         self._live_underlay_object_id = ""
@@ -2036,6 +2133,7 @@ class _CanvasLogic:
 
     def _vector_stroke_image(
         self, drawing: VectorDrawingObject, stroke: VectorStroke,
+        *, cache_token: object | None = None,
     ) -> tuple[QImage, QRectF] | None:
         """Rasterize one stroke opacity mask, then colorize it exactly once."""
         if not stroke.points:
@@ -2044,13 +2142,19 @@ class _CanvasLogic:
         requested_scale = max(0.1, min(8.0, self.scale * device_ratio))
         key = (
             drawing.object_id,
-            drawing.drawing_revision,
             stroke.stroke_id,
+            stroke.render_revision if cache_token is None else cache_token,
+            stroke.color,
+            stroke.closed,
+            stroke.start_cap,
+            stroke.end_cap,
             round(requested_scale, 3),
             device_ratio,
         )
         cached = self._vector_render_cache.get(key)
         if cached is not None:
+            self._vector_render_cache.pop(key, None)
+            self._vector_render_cache[key] = cached
             return cached
         left, top, width, height = stroke.derived_bounds()
         padding = 3.0 / requested_scale
@@ -2209,6 +2313,10 @@ class _CanvasLogic:
         image_painter.end()
         result = image, target
         self._vector_render_cache[key] = result
+        # Keep a bounded insertion-ordered cache without pulling a dependency
+        # into the hot rendering path.  Re-inserting a hit makes it recent.
+        while len(self._vector_render_cache) > 384:
+            self._vector_render_cache.pop(next(iter(self._vector_render_cache)))
         return result
 
     def _render_vector_fill(
@@ -2234,7 +2342,53 @@ class _CanvasLogic:
             if isinstance(fill, VectorFillObject):
                 self._render_vector_fill(painter, fill)
         for stroke in drawing.strokes:
-            rendered = self._vector_stroke_image(drawing, stroke)
+            preview_points = {
+                point.point_id: self._selection_vector_preview[point.point_id]
+                for point in stroke.points
+                if point.point_id in self._selection_vector_preview
+            }
+            render_stroke = stroke
+            cache_token = None
+            if (
+                preview_points
+                and drawing.object_id == self.selected_object_id
+            ):
+                render_stroke = VectorStroke(
+                    stroke_id=stroke.stroke_id,
+                    color=stroke.color,
+                    closed=stroke.closed,
+                    start_cap=stroke.start_cap,
+                    end_cap=stroke.end_cap,
+                    points=[
+                        VectorStrokePoint(
+                            point_id=point.point_id,
+                            x=preview_points.get(point.point_id, {}).get(
+                                "position", point.position
+                            )[0],
+                            y=preview_points.get(point.point_id, {}).get(
+                                "position", point.position
+                            )[1],
+                            incoming=preview_points.get(
+                                point.point_id, {}
+                            ).get("incoming", point.incoming),
+                            outgoing=preview_points.get(
+                                point.point_id, {}
+                            ).get("outgoing", point.outgoing),
+                            width=preview_points.get(
+                                point.point_id, {}
+                            ).get("width", point.width),
+                            opacity=point.opacity,
+                        )
+                        for point in stroke.points
+                    ],
+                    render_revision=stroke.render_revision,
+                )
+                cache_token = (
+                    "selection-preview", self._selection_vector_preview_revision
+                )
+            rendered = self._vector_stroke_image(
+                drawing, render_stroke, cache_token=cache_token
+            )
             if rendered is not None:
                 image, target = rendered
                 painter.drawImage(target, image)
@@ -2329,6 +2483,15 @@ class _CanvasLogic:
         if ratio >= 1:
             return maximum, max(2, round(maximum / ratio))
         return max(2, round(maximum * ratio)), maximum
+
+    def _gradient_grid_for_preview(
+        self, bounds: QRectF,
+    ) -> tuple[int, int]:
+        # Geometry drags should remain interactive.  A final full-resolution
+        # image is rebuilt when the gesture is released.
+        return self._gradient_grid(
+            bounds, 256 if self._gradient_preview_active else 768
+        )
 
     @staticmethod
     def _gradient_coordinates(
@@ -2560,13 +2723,15 @@ class _CanvasLogic:
                 -field.distance, -field.distance,
                 field.distance, field.distance,
             )
-        width, height = self._gradient_grid(bounds)
+        width, height = self._gradient_grid_for_preview(bounds)
         path_signature = self._gradient_path_signature(path)
         scalar_key = (
             "shape", path_signature, width, height,
             field.reverse_direction,
             field.uniform, round(field.distance, 4),
-            field.center_auto, field.manual_center,
+            () if field.reverse_direction else (
+                field.center_auto, field.manual_center,
+            ),
         )
         cached = self._gradient_scalar_cache.get(scalar_key)
         if cached is not None:
@@ -2574,10 +2739,63 @@ class _CanvasLogic:
             return self._gradient_image_from_scalar(
                 scalar, coverage, obj.ramp, cached_bounds, scalar_key
             )
-        _amount, _signed, boundary = self._path_projection_arrays(
-            path, bounds, width, height
-        )
-        inside = self._path_coverage(path, bounds, width, height)
+        if field.reverse_direction:
+            # Outward fields change their visible rectangle as Distance is
+            # edited.  Build one canonical padded boundary field and sample
+            # it for the current viewport so distance drags only redo the
+            # scalar normalization and ramp lookup.
+            canonical_bounds = path.boundingRect().adjusted(
+                -1000.0, -1000.0, 1000.0, 1000.0
+            )
+            canonical_width, canonical_height = (
+                self._gradient_grid_for_preview(canonical_bounds)
+            )
+            boundary_key = (
+                "shape-boundary", path_signature,
+                canonical_width, canonical_height,
+            )
+            boundary_data = self._gradient_geometry_cache.get(boundary_key)
+            if boundary_data is None:
+                _amount, _signed, canonical_boundary = (
+                    self._path_projection_arrays(
+                        path, canonical_bounds,
+                        canonical_width, canonical_height,
+                    )
+                )
+                canonical_inside = self._path_coverage(
+                    path, canonical_bounds,
+                    canonical_width, canonical_height,
+                )
+                boundary_data = (
+                    canonical_boundary, canonical_inside, canonical_bounds,
+                )
+                self._cache_gradient_value(
+                    self._gradient_geometry_cache,
+                    boundary_key, boundary_data,
+                )
+            canonical_boundary, canonical_inside, canonical_bounds = boundary_data
+            target_x, target_y = self._gradient_coordinates(
+                bounds, width, height
+            )
+            x_index = np.clip(
+                ((target_x - canonical_bounds.left())
+                 / max(canonical_bounds.width(), 1e-6)
+                 * (canonical_width - 1)).astype(np.int32),
+                0, canonical_width - 1,
+            )
+            y_index = np.clip(
+                ((target_y - canonical_bounds.top())
+                 / max(canonical_bounds.height(), 1e-6)
+                 * (canonical_height - 1)).astype(np.int32),
+                0, canonical_height - 1,
+            )
+            boundary = canonical_boundary[y_index, x_index]
+            inside = canonical_inside[y_index, x_index]
+        else:
+            _amount, _signed, boundary = self._path_projection_arrays(
+                path, bounds, width, height
+            )
+            inside = self._path_coverage(path, bounds, width, height)
         if field.reverse_direction:
             scalar = np.clip(
                 boundary / max(field.distance, 0.001), 0.0, 1.0
@@ -2632,7 +2850,7 @@ class _CanvasLogic:
         bounds = path.boundingRect()
         if bounds.isEmpty():
             return None
-        width, height = self._gradient_grid(bounds)
+        width, height = self._gradient_grid_for_preview(bounds)
         path_signature = self._gradient_path_signature(path)
         scalar_key = (
             "radial-uniform", path_signature, width, height,
@@ -2665,7 +2883,7 @@ class _CanvasLogic:
     ) -> tuple[QImage, QRectF] | None:
         if bounds.isEmpty():
             return None
-        width, height = self._gradient_grid(bounds)
+        width, height = self._gradient_grid_for_preview(bounds)
         field = obj.line_field
         signature = self._gradient_path_signature(path)
         scalar_key = (
@@ -2715,7 +2933,7 @@ class _CanvasLogic:
             field.origin_x - radius, field.origin_y - radius,
             radius * 2, radius * 2,
         )
-        width, height = self._gradient_grid(bounds)
+        width, height = self._gradient_grid_for_preview(bounds)
         scalar_key = (
             "radial-out", width, height,
             round(field.origin_x, 4), round(field.origin_y, 4),
@@ -3171,15 +3389,16 @@ class _CanvasLogic:
             painter.save()
             painter.translate(layer_x + drawing.x, layer_y + drawing.y)
             overlay = QColor(255, 139, 30, 72)
-            if len(self._vector_sweep) == 1:
+            sweep = self._vector_simplify_overlay or self._vector_sweep
+            if len(sweep) == 1:
                 painter.setPen(Qt.NoPen)
                 painter.setBrush(overlay)
                 painter.drawEllipse(
-                    QPointF(*self._vector_sweep[0].point), radius, radius
+                    QPointF(*sweep[0].point), radius, radius
                 )
             else:
-                path = QPainterPath(QPointF(*self._vector_sweep[0].point))
-                for sample in self._vector_sweep[1:]:
+                path = QPainterPath(QPointF(*sweep[0].point))
+                for sample in sweep[1:]:
                     path.lineTo(QPointF(*sample.point))
                 painter.setBrush(Qt.NoBrush)
                 painter.setPen(QPen(
@@ -3804,6 +4023,7 @@ class _CanvasLogic:
             return True
         self._model_before = self.chapter.to_dict()
         self._active_gradient_control = hit
+        self._gradient_preview_active = True
         self._shape_control_dragged = False
         self._drag_start_doc = QPointF(point)
         if kind == "node":
@@ -4057,6 +4277,11 @@ class _CanvasLogic:
                 painter.setBrush(Qt.NoBrush)
                 painter.drawPath(self._vector_centerline_path(stroke))
             for point in stroke.points:
+                preview = self._selection_vector_preview.get(point.point_id)
+                position = (
+                    preview.get("position", point.position)
+                    if preview is not None else point.position
+                )
                 selected = (
                     point.point_id in self._selected_vector_point_ids
                     or point.point_id in self._vector_simplify_point_ids
@@ -4068,7 +4293,7 @@ class _CanvasLogic:
                 painter.setBrush(QColor("#aeeaff"))
                 radius = (7 if selected else 5.5) / scale
                 painter.drawEllipse(
-                    QPointF(point.x, point.y), radius, radius
+                    QPointF(*position), radius, radius
                 )
         painter.restore()
 
@@ -6219,21 +6444,42 @@ class _CanvasLogic:
     def _touch_event(self, event) -> bool:
         points = [item.position() for item in event.points()]
         if event.type() == QEvent.TouchBegin:
+            self._touch_frame_timer.stop()
+            self._touch_pending_points = None
             self._rebase_touch_navigation(points)
+            self._capture_navigation_snapshot()
             event.accept()
             return True
         if event.type() == QEvent.TouchUpdate and points:
             if len(points) != len(self._touch_anchor_points):
+                self._touch_frame_timer.stop()
+                self._touch_pending_points = None
                 self._rebase_touch_navigation(points)
+                self._capture_navigation_snapshot()
             else:
-                self._apply_touch_navigation(points)
+                # Touch hardware can deliver well over a hundred updates per
+                # second.  Keep only the newest frame and apply it once from
+                # the stable gesture anchor; this removes accumulated camera
+                # work without changing the deterministic transform.
+                self._touch_pending_points = [QPointF(point) for point in points]
+                if not self._touch_frame_timer.isActive():
+                    self._touch_frame_timer.start(0)
             event.accept()
             return True
+        self._touch_frame_timer.stop()
+        self._touch_pending_points = None
+        self._clear_navigation_snapshot()
         self._touch_points.clear()
         self._touch_anchor_points.clear()
         self.interactionFinished.emit()
         event.accept()
         return True
+
+    def _flush_touch_navigation(self) -> None:
+        points = self._touch_pending_points
+        self._touch_pending_points = None
+        if points:
+            self._apply_touch_navigation(points)
 
     @staticmethod
     def _touch_centroid(points: list[QPointF]) -> QPointF:
@@ -6638,6 +6884,9 @@ class _CanvasLogic:
         self._selection_transform_mode = None
         self._selection_transform_handle = None
         self._hover_vector_stroke_id = ""
+        self._selection_vector_preview.clear()
+        self._selection_vector_points.clear()
+        self._selection_vector_preview_revision += 1
         if reset_pivot:
             self._selection_pivot = None
             self._selection_pivot_custom = False
@@ -6794,6 +7043,8 @@ class _CanvasLogic:
         self._selection_rotate_quad = list(quad)
         self._selection_before_model = self.chapter.to_dict()
         self._selection_vector_points = {}
+        self._selection_vector_preview.clear()
+        self._selection_vector_preview_revision += 1
         if isinstance(obj, VectorDrawingObject):
             self._selection_vector_points = {
                 point.point_id: {
@@ -6894,36 +7145,30 @@ class _CanvasLogic:
             offset = QPointF(layer_x + obj.x, layer_y + obj.y)
             transform = self._quad_to_quad_transform(start, target)
             width_scale = math.sqrt(abs(transform.determinant()))
-            for stroke in obj.strokes:
-                for point in stroke.points:
-                    source = self._selection_vector_points.get(
-                        point.point_id
-                    )
-                    if source is None:
-                        continue
-                    mapped = transform.map(
-                        QPointF(*source["position"]) + offset
-                    ) - offset
-                    point.position = mapped.toTuple()
-                    if source["incoming"] is not None:
-                        point.incoming = (
-                            transform.map(
-                                QPointF(*source["incoming"]) + offset
-                            ) - offset
-                        ).toTuple()
-                    if source["outgoing"] is not None:
-                        point.outgoing = (
-                            transform.map(
-                                QPointF(*source["outgoing"]) + offset
-                            ) - offset
-                        ).toTuple()
-                    point.width = max(
-                        1.0, min(
-                            1000.0,
-                            float(source["width"]) * width_scale,
-                        )
-                    )
-            self._vector_changed()
+            self._selection_vector_preview = {}
+            for point_id, source in self._selection_vector_points.items():
+                mapped = transform.map(
+                    QPointF(*source["position"]) + offset
+                ) - offset
+                incoming = source["incoming"]
+                if incoming is not None:
+                    incoming = (
+                        transform.map(QPointF(*incoming) + offset) - offset
+                    ).toTuple()
+                outgoing = source["outgoing"]
+                if outgoing is not None:
+                    outgoing = (
+                        transform.map(QPointF(*outgoing) + offset) - offset
+                    ).toTuple()
+                self._selection_vector_preview[point_id] = {
+                    "position": mapped.toTuple(),
+                    "incoming": incoming,
+                    "outgoing": outgoing,
+                    "width": max(
+                        1.0, min(1000.0, float(source["width"]) * width_scale)
+                    ),
+                }
+            self._selection_vector_preview_revision += 1
         self.update()
 
     def _restore_drawing_transform_model(
@@ -6931,6 +7176,8 @@ class _CanvasLogic:
         pivot: QPointF | None, pivot_custom: bool,
     ) -> None:
         self.replace_chapter(model)
+        self._selection_vector_preview.clear()
+        self._selection_vector_preview_revision += 1
         self._selection_transform_quad = (
             list(quad) if quad is not None else None
         )
@@ -6954,6 +7201,24 @@ class _CanvasLogic:
         before = self._selection_before_model
         self._selection_before_model = None
         if isinstance(obj, VectorDrawingObject):
+            preview = dict(self._selection_vector_preview)
+            changed_strokes: set[str] = set()
+            for stroke in obj.strokes:
+                for point in stroke.points:
+                    mapped = preview.get(point.point_id)
+                    if mapped is None:
+                        continue
+                    point.position = mapped["position"]
+                    point.incoming = mapped["incoming"]
+                    point.outgoing = mapped["outgoing"]
+                    point.width = mapped["width"]
+                    changed_strokes.add(stroke.stroke_id)
+                if stroke.stroke_id in changed_strokes:
+                    stroke.touch_render_revision()
+            if changed_strokes:
+                obj.touch_revision()
+            self._selection_vector_preview.clear()
+            self._selection_vector_preview_revision += 1
             self._selection_vector_points.clear()
             if before is not None:
                 after = self.chapter.to_dict()
@@ -6981,7 +7246,7 @@ class _CanvasLogic:
                         ),
                         already_done=True,
                     )
-            self._vector_changed()
+            self._vector_changed(changed_stroke_ids=changed_strokes)
         elif self._selection_before_tiles is not None:
             self._commit_raster_selection_transform(
                 obj, self._selection_before_tiles
@@ -7700,6 +7965,11 @@ class _CanvasLogic:
         self, drawing: VectorDrawingObject, local: QPointF,
     ) -> None:
         delta = local - self._vector_drag_origin
+        point_strokes = {
+            point.point_id: stroke.stroke_id
+            for stroke in drawing.strokes for point in stroke.points
+        }
+        changed_strokes: set[str] = set()
         for point_id, (position, incoming, outgoing) in (
             self._vector_drag_points.items()
         ):
@@ -7716,8 +7986,15 @@ class _CanvasLogic:
                 point.outgoing = (
                     outgoing[0] + delta.x(), outgoing[1] + delta.y()
                 )
-        drawing.touch_revision()
-        self._vector_changed()
+            stroke_id = point_strokes.get(point_id)
+            if stroke_id:
+                changed_strokes.add(stroke_id)
+        for stroke in drawing.strokes:
+            if stroke.stroke_id in changed_strokes:
+                stroke.touch_render_revision()
+        if changed_strokes:
+            drawing.touch_revision()
+        self._vector_changed(changed_stroke_ids=changed_strokes)
 
     def _vector_pressure_values(self, pressure: float) -> tuple[float, float]:
         pressure = pressure if pressure > 0.001 else 1.0
@@ -7849,6 +8126,7 @@ class _CanvasLogic:
             points=points,
             start_cap=source.start_cap if starts_original else "round",
             end_cap=source.end_cap if ends_original else "round",
+            render_revision=source.render_revision + 1,
         )
         if preserve_id:
             result.stroke_id = source.stroke_id
@@ -7908,6 +8186,7 @@ class _CanvasLogic:
             start_cap=source.start_cap,
             end_cap=source.end_cap,
             points=points,
+            render_revision=source.render_revision + 1,
         )
         if preserve_id:
             result.stroke_id = source.stroke_id
@@ -8106,11 +8385,13 @@ class _CanvasLogic:
         mode = self.settings.vector_eraser_mode
         rebuilt: list[VectorStroke] = []
         changed = False
+        changed_strokes: set[str] = set()
         for stroke in drawing.strokes:
             if not self._vector_stroke_touched(stroke, sweep, radius):
                 rebuilt.append(stroke)
                 continue
             changed = True
+            changed_strokes.add(stroke.stroke_id)
             if mode == "stroke" or len(stroke.points) == 1:
                 continue
             cubics = stroke_cubics(stroke.points, stroke.closed)
@@ -8138,7 +8419,7 @@ class _CanvasLogic:
         if changed:
             drawing.strokes = rebuilt
             drawing.touch_revision()
-            self._vector_changed()
+            self._vector_changed(changed_stroke_ids=changed_strokes)
         return changed
 
     def _manual_redraw_at(
@@ -8155,6 +8436,7 @@ class _CanvasLogic:
             pressure if pressure > 0.001 else 1.0
         )
         changed = False
+        changed_strokes: set[str] = set()
         for stroke in drawing.strokes:
             for point in stroke.points:
                 if math.dist(point.position, (local.x(), local.y())) > radius:
@@ -8180,9 +8462,13 @@ class _CanvasLogic:
                         ),
                     )
                 changed = True
+                changed_strokes.add(stroke.stroke_id)
         if changed:
             drawing.touch_revision()
-            self._vector_changed()
+            for stroke in drawing.strokes:
+                if stroke.stroke_id in changed_strokes:
+                    stroke.touch_render_revision()
+            self._vector_changed(changed_stroke_ids=changed_strokes)
 
     def _vector_target_points(
         self, drawing: VectorDrawingObject,
@@ -8228,6 +8514,11 @@ class _CanvasLogic:
             return False
         if operation not in {"increase", "decrease", "uniform"}:
             return False
+        changed_strokes: set[str] = set()
+        point_strokes = {
+            point.point_id: stroke.stroke_id
+            for stroke in drawing.strokes for point in stroke.points
+        }
         for point in targets:
             current = point.width if parameter == "thickness" else point.opacity
             value = amount if parameter == "thickness" else amount / 100
@@ -8241,7 +8532,13 @@ class _CanvasLogic:
                 point.width = max(1.0, min(1000.0, current))
             else:
                 point.opacity = max(0.0, min(1.0, current))
+            stroke_id = point_strokes.get(point.point_id)
+            if stroke_id:
+                changed_strokes.add(stroke_id)
         drawing.touch_revision()
+        for stroke in drawing.strokes:
+            if stroke.stroke_id in changed_strokes:
+                stroke.touch_render_revision()
         return self._push_vector_change(before, "Redraw vector parameter")
 
     def _simplify_vector_stroke(
@@ -8376,6 +8673,9 @@ class _CanvasLogic:
                 self.settings.vector_simplify_amount = previous_amount
             return False
         drawing.touch_revision()
+        for stroke in drawing.strokes:
+            if stroke.stroke_id in affected_strokes:
+                stroke.render_revision = max(stroke.render_revision, 1)
         if selected_points:
             self._set_vector_selection(
                 drawing, affected_strokes, remapped_points
@@ -8558,9 +8858,17 @@ class _CanvasLogic:
         if changed:
             drawing.strokes = rebuilt
             drawing.touch_revision()
+            for stroke in drawing.strokes:
+                if stroke.stroke_id in affected_strokes:
+                    stroke.render_revision = max(
+                        stroke.render_revision, 1
+                    )
         self._vector_gesture_mode = None
         self._vector_sweep = []
         self._vector_simplify_point_ids.clear()
+        self._vector_simplify_anchor_grid.clear()
+        self._vector_simplify_last_sample = None
+        self._vector_simplify_overlay.clear()
         self._vector_before = None
         self._set_vector_selection(
             drawing, affected_strokes, remapped_points
@@ -8570,19 +8878,67 @@ class _CanvasLogic:
         self.toolChanged.emit(self.tool)
         self.interactionFinished.emit()
 
+    def _build_simplify_anchor_index(
+        self, drawing: VectorDrawingObject,
+    ) -> None:
+        """Build a small document-space grid once per simplify gesture."""
+        cell = max(1.0, 12.0 / max(self.scale, 0.05))
+        self._vector_simplify_grid_size = cell
+        grid: dict[
+            tuple[int, int], list[tuple[str, str, tuple[float, float]]]
+        ] = {}
+        for stroke in drawing.strokes:
+            for point in stroke.points:
+                key = (
+                    math.floor(point.x / cell),
+                    math.floor(point.y / cell),
+                )
+                grid.setdefault(key, []).append((
+                    stroke.stroke_id, point.point_id, point.position
+                ))
+        self._vector_simplify_anchor_grid = grid
+        self._vector_simplify_last_sample = None
+        self._vector_simplify_overlay = []
+
     def _update_simplify_point_sweep(
         self, drawing: VectorDrawingObject,
     ) -> None:
         if not self._vector_sweep:
             return
-        sweep = [sample.point for sample in self._vector_sweep]
-        radius = 12.0 / max(self.scale, 0.05)
-        self._vector_simplify_point_ids = {
-            point.point_id
-            for stroke in drawing.strokes
-            for point in stroke.points
-            if corridor_contains(point.position, sweep, radius)
-        }
+        if not self._vector_simplify_anchor_grid:
+            self._build_simplify_anchor_index(drawing)
+        radius = self._vector_simplify_grid_size
+        sample = self._vector_sweep[-1]
+        current = sample.point
+        previous = self._vector_simplify_last_sample
+        if previous is None:
+            previous = current
+        # Only query cells touched by the newest segment.  This avoids the
+        # previous O(strokes * points * sweep_samples) rescans.
+        min_x = math.floor((min(previous[0], current[0]) - radius) / radius)
+        max_x = math.floor((max(previous[0], current[0]) + radius) / radius)
+        min_y = math.floor((min(previous[1], current[1]) - radius) / radius)
+        max_y = math.floor((max(previous[1], current[1]) + radius) / radius)
+        candidates: dict[str, tuple[float, float]] = {}
+        for gx in range(min_x, max_x + 1):
+            for gy in range(min_y, max_y + 1):
+                for _stroke_id, point_id, position in self._vector_simplify_anchor_grid.get((gx, gy), ()):
+                    candidates[point_id] = position
+        for point_id, position in candidates.items():
+            if self._point_segment_distance(
+                QPointF(*position), previous, current
+            ) <= radius:
+                self._vector_simplify_point_ids.add(point_id)
+        self._vector_simplify_last_sample = current
+        # Keep the visual brush path compact; the model target set remains
+        # exact and is not affected by this decimation.
+        if (
+            not self._vector_simplify_overlay
+            or math.dist(
+                self._vector_simplify_overlay[-1].point, current
+            ) >= max(0.5, radius * 0.35)
+        ):
+            self._vector_simplify_overlay.append(sample)
 
     def _vector_fill_settings(self) -> dict:
         return {
@@ -8926,6 +9282,7 @@ class _CanvasLogic:
             FreehandSample(local.x(), local.y(), pressure)
         ]
         if self._vector_gesture_mode == "simplify":
+            self._build_simplify_anchor_index(drawing)
             self._update_simplify_point_sweep(drawing)
         if self._vector_gesture_mode == "redraw":
             self._manual_redraw_at(drawing, local, pressure)
@@ -9049,8 +9406,22 @@ class _CanvasLogic:
                 and self._begin_drawing_selection_transform(drawing, point)
             ):
                 return
-            if self._begin_selected_raster_transform(point):
-                return
+            # Drawing-selection transforms own their quad.  Raster's outer
+            # translation affordance must not swallow an outside tap here;
+            # only its explicit rotate/pivot/resize handles retain priority.
+            selected_raster = (
+                self.chapter.objects.get(self.selected_object_id)
+                if self.chapter is not None else None
+            )
+            if isinstance(selected_raster, RasterObject):
+                quad = self.object_world_quad(selected_raster.object_id)
+                if quad:
+                    raster_mode, _ = self._raster_transform_control_hit(
+                        quad, point
+                    )
+                    if raster_mode in {"handle", "rotate", "pivot"} \
+                            and self._begin_selected_raster_transform(point):
+                        return
             if (
                 drawing is not None
                 and not self._point_inside_drawing_bounds(drawing, point)
@@ -9063,7 +9434,9 @@ class _CanvasLogic:
                 point, widget_point, test_transform=False
             )
             return
-        if self._begin_selected_raster_transform(point):
+        if self._begin_or_defer_selected_raster_transform(
+            widget_point, point
+        ):
             return
         if self.tool in {ToolKind.RASTER_PENCIL, ToolKind.RASTER_ERASER}:
             obj = self.chapter.objects.get(self.selected_object_id)
@@ -9412,6 +9785,16 @@ class _CanvasLogic:
         if self._vector_gesture_mode is not None:
             self._continue_vector_gesture(point, pressure)
             return
+        if self._pending_raster_transform_press is not None:
+            press_widget, press_document = self._pending_raster_transform_press
+            if math.dist(
+                (widget_point.x(), widget_point.y()),
+                (press_widget.x(), press_widget.y()),
+            ) > 4:
+                self._pending_raster_transform_press = None
+                if self._begin_selected_raster_transform(press_document):
+                    self._update_transform_preview(point)
+            return
         if self._pending_vector_press is not None:
             press_widget, press_document, press_pressure = (
                 self._pending_vector_press
@@ -9571,6 +9954,12 @@ class _CanvasLogic:
         if self._vector_gesture_mode is not None:
             self._end_vector_gesture()
             return
+        if self._pending_raster_transform_press is not None:
+            widget_point, point = self._pending_raster_transform_press
+            self._pending_raster_transform_press = None
+            self._request_object_selection(point, widget_point)
+            self.interactionFinished.emit()
+            return
         if self._pending_vector_press is not None:
             widget_point, point, _pressure = self._pending_vector_press
             self._pending_vector_press = None
@@ -9670,6 +10059,10 @@ class _CanvasLogic:
             before, self._model_before = self._model_before, None
             gradient_control = self._active_gradient_control
             self._active_gradient_control = None
+            self._gradient_preview_active = False
+            # Preview tiles are intentionally low resolution; discard them so
+            # the next paint builds final-resolution visible tiles.
+            self._gradient_render_cache.clear()
             selected = self.chapter.objects.get(self.selected_object_id)
             if isinstance(selected, GradientObject):
                 if (
@@ -11220,11 +11613,26 @@ class _CanvasLogic:
         ]
         if distances and min(distances) <= tolerance:
             return "handle", distances.index(min(distances))
-        if any(
+        edge_distance = min(
             self._point_segment_distance(
                 point, quad[index], quad[(index + 1) % 4]
-            ) <= tolerance
+            )
             for index in range(4)
+        )
+        # Translation is deliberately an outside-frame affordance.  A
+        # pencil stroke on the raster edge must not be mistaken for a move.
+        frame_path = QPainterPath()
+        frame_path.addPolygon(QPolygonF([
+            QPointF(*candidate) for candidate in quad
+        ]))
+        frame_path.closeSubpath()
+        outside_margin = 20.0 / max(self.scale, 0.05)
+        if (
+            edge_distance <= outside_margin
+            and (
+                edge_distance <= 1.0e-6
+                or not frame_path.contains(point)
+            )
         ):
             return "translate", None
         return "", None
@@ -11480,6 +11888,26 @@ class _CanvasLogic:
         )
         self._build_raster_transform_cache()
         return True
+
+    def _begin_or_defer_selected_raster_transform(
+        self, widget_point: QPointF, point: QPointF,
+    ) -> bool:
+        """Reserve an outside-frame translation until a drag is confirmed."""
+        if self.chapter is None or not self.selected_object_id:
+            return False
+        obj = self.chapter.objects.get(self.selected_object_id)
+        if not isinstance(obj, RasterObject):
+            return False
+        quad = self.object_world_quad(obj.object_id)
+        if not quad:
+            return False
+        mode, _handle = self._raster_transform_control_hit(quad, point)
+        if mode == "translate":
+            self._pending_raster_transform_press = (
+                QPointF(widget_point), QPointF(point)
+            )
+            return True
+        return self._begin_selected_raster_transform(point)
 
     @staticmethod
     def _quad_is_valid(quad: list[tuple[float, float]]) -> bool:

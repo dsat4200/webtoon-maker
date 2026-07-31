@@ -1275,6 +1275,8 @@ class VectorStroke:
     start_cap: Literal["point", "square", "round"] = "round"
     end_cap: Literal["point", "square", "round"] = "round"
     points: list[VectorStrokePoint] = field(default_factory=list)
+    # Independent cache revision; older drawings omit it and default to zero.
+    render_revision: int = 0
 
     def validate(self) -> None:
         self.color = canonical_argb(self.color)
@@ -1294,6 +1296,11 @@ class VectorStroke:
             ids.add(point.point_id)
         if len(self.points) == 1:
             self.closed = False
+        self.render_revision = max(0, int(self.render_revision))
+
+    def touch_render_revision(self) -> int:
+        self.render_revision += 1
+        return self.render_revision
 
     def derived_bounds(self) -> tuple[float, float, float, float]:
         """Conservative local bounds including controls and variable width."""
@@ -1322,6 +1329,7 @@ class VectorStroke:
             "closed": self.closed,
             "start_cap": self.start_cap,
             "end_cap": self.end_cap,
+            "render_revision": self.render_revision,
             "points": [point.to_dict() for point in self.points],
         }
 
@@ -1333,6 +1341,7 @@ class VectorStroke:
             closed=bool(data.get("closed", False)),
             start_cap=str(data.get("start_cap", "round")),
             end_cap=str(data.get("end_cap", "round")),
+            render_revision=int(data.get("render_revision", 0)),
             points=[
                 VectorStrokePoint.from_dict(item)
                 for item in data.get("points", [])

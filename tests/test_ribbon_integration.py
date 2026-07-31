@@ -57,7 +57,7 @@ def test_main_window_ribbon_is_contextual_and_tools_are_renamed(qapp):
         assert not window.ribbon.is_page_visible("vector_tools")
         window.canvas.set_selection("object", drawing.object_id)
         assert window.ribbon.is_page_visible("vector_tools")
-        assert window.ribbon.current_key() == "vector_tools"
+        assert window.ribbon.current_key() == "tool_settings"
     finally:
         window.deleteLater()
 
@@ -147,7 +147,7 @@ def test_underlay_slider_coalesces_drag_and_restores_with_undo(qapp):
         window.inspector.refresh()
         assert window.inspector.isHidden()
         assert window.ribbon.is_page_visible("raster_object_settings")
-        assert window.ribbon.current_key() == "raster_object_settings"
+        assert window.ribbon.current_key() == "tool_settings"
         controls = window.raster_object_controls
         controls.underlay.sliderPressed.emit()
         controls.underlay.setValue(25)

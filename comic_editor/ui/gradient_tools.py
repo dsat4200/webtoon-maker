@@ -308,6 +308,8 @@ class GradientToolsControls(QWidget):
         self.distance_slider.valueChanged.connect(
             self._distance_slider_changed
         )
+        self.distance_slider.sliderPressed.connect(self._begin_ramp_edit)
+        self.distance_slider.sliderReleased.connect(self._finish_ramp_edit)
         self.distance_value.valueChanged.connect(
             self._type_parameter_changed
         )
@@ -562,12 +564,20 @@ class GradientToolsControls(QWidget):
             )
         obj.validate_gradient()
         obj.touch_revision()
-        self._commit_change(before, "Change gradient direction")
+        if self._edit_before is None:
+            self._commit_change(before, "Change gradient direction")
+        else:
+            self.canvas.documentChanged.emit(QRectF())
+            self.canvas.update()
         self.refresh()
 
     def _begin_ramp_edit(self) -> None:
         if self._edit_before is None and self.canvas.chapter is not None:
             self._edit_before = self.canvas.chapter.to_dict()
+        # Gradient image generation uses a reduced field while a slider or
+        # stop is being dragged.  The normal-resolution cache is rebuilt on
+        # release by _finish_ramp_edit.
+        self.canvas._gradient_preview_active = True
 
     def _preview_ramp(self, ramp: ColorGradientRamp) -> None:
         obj = self.selected_gradient()
@@ -580,6 +590,8 @@ class GradientToolsControls(QWidget):
 
     def _finish_ramp_edit(self) -> None:
         before, self._edit_before = self._edit_before, None
+        self.canvas._gradient_preview_active = False
+        self.canvas._gradient_render_cache.clear()
         if before is not None:
             self._commit_change(before, "Move gradient stop")
 

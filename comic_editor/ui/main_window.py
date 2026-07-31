@@ -522,6 +522,9 @@ class MainWindow(QMainWindow):
         self._vector_ribbon_context = False
         self._raster_ribbon_context = False
         self._gradient_ribbon_context = False
+        self._selected_gradient_ribbon_id = ""
+        self._manual_ribbon_page = ""
+        self._programmatic_ribbon_selection = 0
         self._expanded_selected_vector_id = ""
 
     def _restore_workspace_layout(self) -> None:
@@ -607,6 +610,7 @@ class MainWindow(QMainWindow):
         self.tablet_mode.toggled.connect(self._settings_changed)
         self.snap_grid.toggled.connect(self._settings_changed)
         self.canvas.documentChanged.connect(self._mark_dirty)
+        self.ribbon.pageChanged.connect(self._ribbon_page_changed)
         self.canvas.hierarchyChanged.connect(self._hierarchy_changed)
         self.canvas.selectionChanged.connect(self._canvas_selection_changed)
         self.canvas.chapterReplaced.connect(self._chapter_replaced)
@@ -1336,7 +1340,18 @@ class MainWindow(QMainWindow):
         if initial_object:
             self.canvas.set_selection("object", initial_object.object_id)
         self._sync_contextual_ribbon()
+        # The first selection establishes the object context.  Keep the
+        # contextual page as the initial landing page; subsequent explicit
+        # Pencil/Eraser activations are routed to Tool Settings.
+        if isinstance(initial_object, VectorDrawingObject):
+            initial_ribbon_page = "vector_tools"
+        elif isinstance(initial_object, RasterObject):
+            initial_ribbon_page = "raster_object_settings"
+        else:
+            initial_ribbon_page = ""
         self._refresh_actions()
+        if initial_ribbon_page:
+            self._select_ribbon_page(initial_ribbon_page)
         self.statusBar().showMessage(f"{chapter.name} — {chapter.width} × {chapter.height}px")
 
     def _sync_chapter_combo(self) -> None:
@@ -1979,6 +1994,19 @@ class MainWindow(QMainWindow):
             if obj.parent_layer_id in self.chapter.layers else ""
         )
 
+    def _ribbon_page_changed(self, key: str) -> None:
+        """Remember an explicit ribbon-tab choice across context refreshes."""
+        if not self._programmatic_ribbon_selection:
+            self._manual_ribbon_page = key
+
+    def _select_ribbon_page(self, key: str) -> bool:
+        """Select a page without treating an automatic route as a user choice."""
+        self._programmatic_ribbon_selection += 1
+        try:
+            return self.ribbon.select_page(key)
+        finally:
+            self._programmatic_ribbon_selection -= 1
+
     def _sync_contextual_ribbon(self) -> None:
         if not hasattr(self, "ribbon"):
             return
@@ -2003,20 +2031,35 @@ class MainWindow(QMainWindow):
         entering_raster = (
             raster_active and not self._raster_ribbon_context
         )
+        selected_gradient_id = (
+            selected_object.object_id if gradient_selected else ""
+        )
+        entering_gradient = bool(
+            selected_gradient_id
+            and selected_gradient_id != self._selected_gradient_ribbon_id
+        )
         self._vector_ribbon_context = active
         self._raster_ribbon_context = raster_active
         self._gradient_ribbon_context = gradient_active
+        self._selected_gradient_ribbon_id = selected_gradient_id
         self.ribbon.set_page_visible("vector_tools", active)
         self.ribbon.set_page_visible(
             "raster_object_settings", raster_active
         )
         self.ribbon.set_page_visible("gradient_tools", gradient_active)
+        if (
+            self._manual_ribbon_page
+            and not self.ribbon.is_page_visible(self._manual_ribbon_page)
+        ):
+            self._manual_ribbon_page = ""
         if entering:
-            self.ribbon.select_page("vector_tools")
+            self._select_ribbon_page("vector_tools")
         elif entering_raster:
-            self.ribbon.select_page("raster_object_settings")
-        elif gradient_selected:
-            self.ribbon.select_page("gradient_tools")
+            self._select_ribbon_page("raster_object_settings")
+        elif entering_gradient:
+            self._select_ribbon_page("gradient_tools")
+        elif self._manual_ribbon_page:
+            self._select_ribbon_page(self._manual_ribbon_page)
         self.tool_settings_controls.set_context(
             self.canvas.tool, vector_active=vector_tool_context
         )
@@ -2158,6 +2201,20 @@ class MainWindow(QMainWindow):
         self.inspector.refresh()
         self.layer_settings.refresh()
         self._sync_tool_buttons()
+        selected_object = (
+            self.chapter.objects.get(entity_id)
+            if self.chapter is not None and kind == "object" else None
+        )
+        if (
+            self.canvas.tool in {
+                ToolKind.RASTER_PENCIL, ToolKind.RASTER_ERASER,
+            }
+            and isinstance(selected_object, (RasterObject, VectorDrawingObject))
+        ):
+            # Selecting another drawing commonly leaves the contextual tool
+            # unchanged, so Canvas does not emit toolChanged.  Route the
+            # ribbon here as well as on explicit tool activation.
+            self._select_ribbon_page("tool_settings")
         self._refresh_actions()
 
     def _canvas_tool_changed(self, tool: ToolKind) -> None:
@@ -2166,6 +2223,11 @@ class MainWindow(QMainWindow):
         else:
             self.inspector.refresh()
         self._sync_tool_buttons()
+        if tool in {ToolKind.RASTER_PENCIL, ToolKind.RASTER_ERASER}:
+            # _sync_tool_buttons() refreshes contextual pages first.  Select
+            # Tool Settings afterward so entering a raster/vector context
+            # cannot immediately replace the user's pencil controls.
+            self._select_ribbon_page("tool_settings")
 
     def _tree_mutated(self, before: dict, after: dict, label: str) -> None:
         self.canvas.push_model_change(before, after, label)

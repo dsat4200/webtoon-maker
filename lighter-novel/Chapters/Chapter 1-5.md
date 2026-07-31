@@ -1,8 +1,18 @@
-establishing shot
-lance goes to work, goes home, we get some lance exposition through his daily life working at a warehouse store as a 
-- he's a serious, goal oriented guy who is a bit neurotic about his job doing bopis at home depot basically. fast paced.
-- he does overtime, skates home
+- establishing shot, home depot bass pro shops
+- low angle of lance, shelves and stuff visible in bg
+- bunch of shots of him scanning stuff, customer order
+- fast pace interrupted by him putting something back on the shelf again and again to align it
+- says bye to somone, runs out door, hops on skateboard on his way out
+- cool shot of him skating past cars and stuff down sidewalk
+
+- gets home to his dinky apartment establishing shot
 - his food is just a protein shake and a vitamin gummy.
+- chug chug chug
+- gets message to hop on
+- in a bit, just got back from work.
+- slumps over backwards mouth agape in that "uhhghghg"
+- limps over to room opens door, lights are off
+	- (slight teeth at edges of the door inside)
 - he goes to his room to plop open the bed, theres a portal there he doesnit notice
 - he plops down in bed 
 - oh boy, can't wait to play more video games
@@ -11,13 +21,17 @@ lance goes to work, goes home, we get some lance exposition through his daily li
 - cant find the lights, feels weird
 - he pulls out his phone and turns on the flashlight
 - FUCKING TEETH
-- lance fanservice shot of him being pushed by tongue
+- lance shocked expression, grimacing teeth clenched, eyes small pupil mode
+- "TEEETH????"
+	"this isn't expired is it"
 - WHAT THE FUCK AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+- lance wrapped up in tongue
 - title card
 - leaves the audience guessing on a cliff hanger
 
 
 chapter 2 takes place from phoebe's perspective.
+- phoebe opens mouth, pulling out lance
 - lance is dangling, phoebe holding him
 - "i can't believe you fell for that. do you have eyes?"
 - thought bubbles (who the hell are you, where the fuck am i, how am i supposed to get back home, am I on drugs, why are you so big)
