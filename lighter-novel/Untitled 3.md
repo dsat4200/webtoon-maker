@@ -59,12 +59,38 @@
 			- in shape, forces the gradient to ignore parent mask. shows gradient outwards up to a max distance, starting from the shape bounds (like a glow effect)
 			- in this case, gradient shows in canvas as if it's below the parent (parent on top) to avoid coloring over the parent or its children
 
-## final? gradient tweaks
+## Gradient tweaks
 - in ellipse and parent shape gradient modes, in gradient type parameters add a "uniform " toggle, that, when enabled, ignores the center dot and instead transitions to a certain distance from the bounds (parent bounds in parent mode, ellipsoid/circle bounds in those.)
 	- instead of an "outward" value, rename it to "distance" so we can use it for uniform in non-reversed cases
 		- in this case, it acts as if "inward" (current outward behavior still should work but just when reversed is enabled)
 - line/curve gradient should have ALL the gizmos and handles that the shape version has, including handle type (vector/bezier), roundness, lock bezier handles, etc.
 
+
+## Bug:
+after creating a filled or open shape, it sometimes locks up and wont let me edit it. below is the error message i got
+KeyError: 'Error calling Python override of QOpenGLWidget::mouseMoveEvent(): x'
+Error calling Python override of QOpenGLWidget::event(): Traceback (most recent call last):
+  File "C:\Users\hopper\Documents\webtoon-maker\comic_editor\ui\canvas.py", line 6403, in event
+    return super().event(event)
+           ~~~~~~~~~~~~~^^^^^^^
+  File "C:\Users\hopper\Documents\webtoon-maker\comic_editor\ui\canvas.py", line 6107, in mouseMoveEvent
+    self._tool_move(event.position(), 1.0)
+    ~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\hopper\Documents\webtoon-maker\comic_editor\ui\canvas.py", line 9869, in _tool_move
+    self._update_shape_edit(point)
+    ~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^
+  File "C:\Users\hopper\Documents\webtoon-maker\comic_editor\ui\canvas.py", line 10815, in _update_shape_edit
+    dx = target.x() - float(primary_start["x"])
+                            ~~~~~~~~~~~~~^^^^^
+KeyError: 'Error calling Python override of QOpenGLWidget::mouseMoveEvent(): x'
+
+New Feature: 
+- object/layer outer outline
+	- in drawing object:
+		- appears in object settings
+		- draws an integer px thickness outline around all pixels that have a drawn-on value
+		- lets you set the color of the outline too. since it has an alpha channel that can control the opacity for us
+test the fill tool dumbass (vector and ras
 
 ## new gradient type: speed lines
 speed lines, includes opacity too

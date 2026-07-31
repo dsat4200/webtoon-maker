@@ -1214,6 +1214,66 @@ def test_roundness_enabled_migrates_from_saved_radius():
     assert rounded.to_dict()["roundness_enabled"] is True
 
 
+def test_node_drag_moves_selected_node_with_control_points(qapp):
+    canvas, chapter, page, layer = _canvas()
+    layer.bound = BoundGeometry.path([
+        PathNode(x=100, y=100),
+        PathNode(
+            x=300, y=100, point_type="bezier",
+            incoming=(250, 150), outgoing=(350, 50),
+        ),
+        PathNode(x=300, y=300),
+    ], closed=False)
+    canvas.set_tool(ToolKind.SHAPE_EDIT)
+    layer_x, layer_y = chapter.layer_world_translation(layer.layer_id)
+    node = layer.bound.nodes[1]
+    press = QPointF(layer_x + node.x, layer_y + node.y)
+    assert canvas._begin_shape_edit(press)
+    assert canvas._active_shape_control == "node"
+
+    canvas._update_shape_edit(QPointF(
+        layer_x + node.x + 40, layer_y + node.y - 25
+    ))
+
+    assert layer.bound.nodes[1].position == pytest.approx((340, 75))
+    assert layer.bound.nodes[1].incoming == pytest.approx((290, 125))
+    assert layer.bound.nodes[1].outgoing == pytest.approx((390, 25))
+    assert layer.bound.nodes[0].position == (100, 100)
+    assert layer.bound.nodes[2].position == (300, 300)
+    canvas._tool_release()
+    assert canvas._active_shape_control is None
+
+
+def test_shift_selected_nodes_drag_together(qapp):
+    canvas, chapter, page, layer = _canvas()
+    layer.bound = BoundGeometry.path([
+        PathNode(x=100, y=100),
+        PathNode(x=300, y=100),
+        PathNode(x=300, y=300),
+    ], closed=False)
+    canvas.set_tool(ToolKind.SHAPE_EDIT)
+    layer_x, layer_y = chapter.layer_world_translation(layer.layer_id)
+    first, second = layer.bound.nodes[0], layer.bound.nodes[1]
+    canvas._selected_shape_node_ids = {
+        first.node_id, second.node_id,
+    }
+    assert canvas._begin_shape_edit(QPointF(
+        layer_x + first.x, layer_y + first.y
+    ))
+    assert canvas._active_shape_control == "node"
+    assert len(canvas._shape_drag_nodes) == 2
+
+    canvas._update_shape_edit(QPointF(
+        layer_x + first.x + 50, layer_y + first.y + 30
+    ))
+
+    assert first.position == pytest.approx((150, 130))
+    assert second.position == pytest.approx((350, 130))
+    assert layer.bound.nodes[2].position == (300, 300)
+    canvas._tool_release()
+    assert canvas._active_shape_control is None
+
+
 def test_shapes_category_stays_open_after_tool_choice(qapp):
     window = MainWindow()
     try:

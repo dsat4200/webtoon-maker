@@ -10812,16 +10812,18 @@ class _CanvasLogic:
             primary_start = self._shape_drag_nodes.get(
                 selected.node_id, self._drag_start_value
             )
-            dx = target.x() - float(primary_start["x"])
-            dy = target.y() - float(primary_start["y"])
+            primary_position = primary_start["position"]
+            dx = target.x() - float(primary_position[0])
+            dy = target.y() - float(primary_position[1])
             for contour in bound.iter_contours():
                 for node in contour.nodes:
                     source = self._shape_drag_nodes.get(node.node_id)
                     if source is None:
                         continue
+                    source_position = source["position"]
                     node.position = (
-                        float(source["x"]) + dx,
-                        float(source["y"]) + dy,
+                        float(source_position[0]) + dx,
+                        float(source_position[1]) + dy,
                     )
                     incoming = source.get("incoming")
                     outgoing = source.get("outgoing")
