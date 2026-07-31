@@ -32,6 +32,7 @@ from PySide6.QtWidgets import (
     QLineEdit,
     QPushButton,
     QSizePolicy,
+    QStyle,
     QToolButton,
     QVBoxLayout,
     QWidget,
@@ -435,6 +436,7 @@ class PrimarySecondaryColorPanel(QWidget):
     colorChanged = Signal(str, str)
     primaryColorChanged = Signal(str)
     secondaryColorChanged = Signal(str)
+    colorsSwapped = Signal(str, str)
 
     def __init__(
         self,
@@ -471,9 +473,17 @@ class PrimarySecondaryColorPanel(QWidget):
         self.primary_well.setChecked(True)
         self.secondary_well = ColorWellButton(self._secondary, self.footer)
         self.secondary_well.setToolTip("Secondary color")
+        self.swap_colors = QPushButton(self.footer)
+        self.swap_colors.setFixedSize(28, 28)
+        self.swap_colors.setIcon(self.style().standardIcon(
+            QStyle.StandardPixmap.SP_BrowserReload
+        ))
+        self.swap_colors.setToolTip("Swap primary and secondary colors")
         wells.addStretch(1)
         wells.addWidget(QLabel("Primary", self.footer))
         wells.addWidget(self.primary_well)
+        wells.addSpacing(4)
+        wells.addWidget(self.swap_colors)
         wells.addSpacing(4)
         wells.addWidget(QLabel("Secondary", self.footer))
         wells.addWidget(self.secondary_well)
@@ -505,6 +515,7 @@ class PrimarySecondaryColorPanel(QWidget):
         self.secondary_well.clicked.connect(
             lambda: self.set_active_slot("secondary")
         )
+        self.swap_colors.clicked.connect(self._swap_colors)
         self.picker.colorChanged.connect(self._picker_changed)
         self.hex_field.editingFinished.connect(self._hex_edited)
         self.hex_copy.clicked.connect(
@@ -560,6 +571,11 @@ class PrimarySecondaryColorPanel(QWidget):
         self, color: str | QColor, *, emit: bool = True
     ) -> None:
         self._set_slot_color(self._active_slot, color, emit=emit)
+
+    def _swap_colors(self) -> None:
+        primary, secondary = self._secondary, self._primary
+        self.set_colors(primary, secondary, emit=False)
+        self.colorsSwapped.emit(primary, secondary)
 
     def _picker_changed(self, color: str) -> None:
         self._set_slot_color(self._active_slot, color, emit=True, sync_picker=False)

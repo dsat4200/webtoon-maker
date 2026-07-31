@@ -127,6 +127,23 @@ def test_primary_secondary_panel_routes_picker_and_palette_colors(qapp):
     assert events[-1] == ("secondary", "#40112233")
 
 
+def test_primary_secondary_swap_button_updates_both_slots_once(qapp):
+    panel = PrimarySecondaryColorPanel("#40112233", "#80445566")
+    swaps: list[tuple[str, str]] = []
+    changes: list[tuple[str, str]] = []
+    panel.colorsSwapped.connect(
+        lambda primary, secondary: swaps.append((primary, secondary))
+    )
+    panel.colorChanged.connect(
+        lambda slot, color: changes.append((slot, color))
+    )
+    panel.swap_colors.click()
+    assert panel.primary_color() == "#80445566"
+    assert panel.secondary_color() == "#40112233"
+    assert swaps == [("#80445566", "#40112233")]
+    assert changes == []
+
+
 def test_swatch_single_click_applies_and_double_click_only_edits(qapp):
     swatch = ColorSwatchButton("ink", "#80112233")
     swatch.resize(30, 30)

@@ -363,3 +363,13 @@ def test_tablet_mode_does_not_hide_toolbars(qapp):
     assert window.tool_toolbar.isVisibleTo(window)
     assert window.hierarchy_dock.isVisibleTo(window)
     window.deleteLater()
+
+
+def test_closed_window_unregisters_application_event_filter(qapp):
+    window = MainWindow()
+    assert window._application_event_filter_installed
+    window._dirty = False
+    window.close()
+    qapp.processEvents()
+    assert not window._application_event_filter_installed
+    window.deleteLater()

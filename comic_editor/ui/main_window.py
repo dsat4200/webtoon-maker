@@ -22,7 +22,8 @@ from PySide6.QtWidgets import (
 
 from comic_editor.core.models import (
     BoundGeometry, ChapterDocument, ColorFillGradientObject,
-    ColorGradientRampPreset, ColorPalette, GradientObject, PaletteSwatch,
+    ColorGradientRamp, ColorGradientRampPreset, ColorGradientStop,
+    ColorPalette, GradientObject, PaletteSwatch,
     RasterObject, TextObject, VectorDrawingObject, VectorFillObject,
 )
 from comic_editor.core.persistence import SeriesRepository
@@ -37,7 +38,9 @@ from comic_editor.ui.hotkeys_dialog import HotkeysDialog
 from comic_editor.ui.hotkeys import (
     MODIFIER_LABELS, chord_keys, chord_text,
 )
-from comic_editor.ui.gradient_tools import GradientToolsControls
+from comic_editor.ui.gradient_tools import (
+    BUILTIN_PRIMARY_SECONDARY_ID, GradientToolsControls,
+)
 from comic_editor.ui.pencil_settings_dialog import PencilSettingsDialog
 from comic_editor.ui.preview import ChapterPreview
 from comic_editor.ui.ribbon import RibbonWidget
@@ -383,22 +386,28 @@ class MainWindow(QMainWindow):
             self.canvas, self.ribbon
         )
         gradient_create_group = self.gradient_tools_page.add_group(
-            "Create Gradient", minimum_width=430
+            "Create Gradient", minimum_width=260
         )
         gradient_create_group.add_widget(
             self.gradient_tools_controls.create_widget
         )
         gradient_parameters_group = self.gradient_tools_page.add_group(
-            "Gradient Parameters", minimum_width=390
+            "Gradient Parameters", minimum_width=235
         )
         gradient_parameters_group.add_widget(
             self.gradient_tools_controls.parameters_widget
         )
         gradient_presets_group = self.gradient_tools_page.add_group(
-            "Gradient Ramp Presets", minimum_width=270
+            "Gradient Ramp Presets", minimum_width=165
         )
         gradient_presets_group.add_widget(
             self.gradient_tools_controls.presets_widget
+        )
+        gradient_type_group = self.gradient_tools_page.add_group(
+            "Gradient Type Parameters", minimum_width=220
+        )
+        gradient_type_group.add_widget(
+            self.gradient_tools_controls.type_parameters_widget
         )
         self.preview = ChapterPreview(self.canvas)
         canvas_layout.addWidget(self.preview)
@@ -739,6 +748,9 @@ class MainWindow(QMainWindow):
         )
 
         self.color_panel.colorChanged.connect(self._series_color_changed)
+        self.color_panel.colorsSwapped.connect(
+            self._series_colors_swapped
+        )
         self.color_panel.activeSlotChanged.connect(
             lambda slot: self.palette_editor.set_new_swatch_color(
                 self.color_panel.active_color()
@@ -820,6 +832,7 @@ class MainWindow(QMainWindow):
                 self._hotkey_prefix_timeout
             )
             QApplication.instance().installEventFilter(self)
+            self._application_event_filter_installed = True
             self.canvas.toolChanged.connect(self._hotkey_tool_changed)
             self._fullscreen_shortcut = QShortcut(
                 QKeySequence("Alt+Return"), self
@@ -2281,13 +2294,31 @@ class MainWindow(QMainWindow):
         ), None)
 
     def _load_gradient_preset(self, preset_id: str) -> None:
-        preset = self._gradient_preset_by_id(preset_id)
         obj = self.gradient_tools_controls.selected_gradient()
-        if preset is None or obj is None or self.chapter is None:
+        if obj is None or self.chapter is None:
             return
+        if preset_id == BUILTIN_PRIMARY_SECONDARY_ID:
+            primary = (
+                self.series.primary_color
+                if self.series is not None else self.color_panel.primary_color()
+            )
+            secondary = (
+                self.series.secondary_color
+                if self.series is not None
+                else self.color_panel.secondary_color()
+            )
+            ramp = ColorGradientRamp(stops=[
+                ColorGradientStop(position=0.0, color=primary),
+                ColorGradientStop(position=1.0, color=secondary),
+            ])
+        else:
+            preset = self._gradient_preset_by_id(preset_id)
+            if preset is None:
+                return
+            ramp = preset.ramp.copy()
         before = self.chapter.to_dict()
-        obj.ramp = preset.ramp.copy()
-        obj.loaded_preset_id = preset.preset_id
+        obj.ramp = ramp
+        obj.loaded_preset_id = preset_id
         obj.touch_revision()
         after = self.chapter.to_dict()
         self.canvas.push_model_change(
@@ -2324,6 +2355,8 @@ class MainWindow(QMainWindow):
         self._sync_gradient_presets()
 
     def _save_gradient_preset(self, preset_id: str) -> None:
+        if preset_id == BUILTIN_PRIMARY_SECONDARY_ID:
+            return
         preset = self._gradient_preset_by_id(preset_id)
         obj = self.gradient_tools_controls.selected_gradient()
         if preset is None or obj is None:
@@ -2337,6 +2370,8 @@ class MainWindow(QMainWindow):
     def _rename_gradient_preset(
         self, preset_id: str, name: str,
     ) -> None:
+        if preset_id == BUILTIN_PRIMARY_SECONDARY_ID:
+            return
         preset = self._gradient_preset_by_id(preset_id)
         if preset is None:
             return
@@ -2359,6 +2394,7 @@ class MainWindow(QMainWindow):
     def _remove_gradient_preset(self, preset_id: str) -> None:
         if (
             self.series is None
+            or preset_id == BUILTIN_PRIMARY_SECONDARY_ID
             or len(self.series.gradient_ramp_presets) <= 1
         ):
             return
@@ -2437,6 +2473,20 @@ class MainWindow(QMainWindow):
         self._apply_series_colors_to_canvas(primary, secondary)
         self.palette_editor.set_new_swatch_color(color)
         self._schedule_series_preferences_save()
+
+    def _series_colors_swapped(
+        self, primary: str, secondary: str,
+    ) -> None:
+        primary = canonical_argb(primary)
+        secondary = canonical_argb(secondary, "#FFFFFFFF")
+        if self.series is not None:
+            self.series.primary_color = primary
+            self.series.secondary_color = secondary
+        self._apply_series_colors_to_canvas(primary, secondary)
+        self.palette_editor.set_new_swatch_color(
+            self.color_panel.active_color()
+        )
+        self._schedule_series_preferences_save(immediate=True)
 
     def _palette_by_id(self, palette_id: str) -> ColorPalette | None:
         if self.series is None:
@@ -2832,4 +2882,9 @@ class MainWindow(QMainWindow):
         self._flush_series_preferences()
         self.layout_settings_timer.stop()
         self._save_workspace_layout()
+        if getattr(self, "_application_event_filter_installed", False):
+            application = QApplication.instance()
+            if application is not None:
+                application.removeEventFilter(self)
+            self._application_event_filter_installed = False
         event.accept()

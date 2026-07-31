@@ -6,8 +6,8 @@ import math
 from PySide6.QtCore import QPointF, QRectF, Qt, Signal
 from PySide6.QtGui import QColor, QLinearGradient, QPainter, QPainterPath, QPen
 from PySide6.QtWidgets import (
-    QComboBox, QHBoxLayout, QLabel, QLineEdit, QPushButton, QVBoxLayout,
-    QWidget,
+    QCheckBox, QComboBox, QDoubleSpinBox, QHBoxLayout, QLabel, QLineEdit,
+    QPushButton, QSlider, QVBoxLayout, QWidget,
 )
 
 from comic_editor.core.models import (
@@ -15,6 +15,8 @@ from comic_editor.core.models import (
     ColorGradientStop, canonical_argb,
 )
 from comic_editor.ui.color_picker import ColorPickerPopup
+
+BUILTIN_PRIMARY_SECONDARY_ID = "builtin:primary-secondary"
 
 
 class GradientRampEditor(QWidget):
@@ -28,7 +30,7 @@ class GradientRampEditor(QWidget):
 
     def __init__(self, parent: QWidget | None = None):
         super().__init__(parent)
-        self.setMinimumSize(300, 70)
+        self.setMinimumSize(180, 70)
         self.setMouseTracking(True)
         self._ramp = ColorGradientRamp()
         self._selected_stop_id = self._ramp.stops[0].stop_id
@@ -200,6 +202,56 @@ class GradientToolsControls(QWidget):
         self.field_type.addItem("Parent Shape", "parent_shape")
         type_row.addWidget(self.field_type, 1)
         create.addLayout(type_row)
+        self.select_gradient = QPushButton(
+            "Select Gradient", self.create_widget
+        )
+        self.select_gradient.setToolTip(
+            "Select the direct gradient matching Selected type"
+        )
+        create.addWidget(self.select_gradient)
+
+        self.type_parameters_widget = QWidget(self)
+        type_parameters = QVBoxLayout(self.type_parameters_widget)
+        type_parameters.setContentsMargins(0, 0, 0, 0)
+        self.direction_row = QWidget(self.type_parameters_widget)
+        direction_layout = QHBoxLayout(self.direction_row)
+        direction_layout.setContentsMargins(0, 0, 0, 0)
+        direction_layout.addWidget(QLabel("Follow", self.direction_row))
+        self.direction_mode = QComboBox(self.direction_row)
+        self.direction_mode.addItem("Parallel", "parallel")
+        self.direction_mode.addItem("Perpendicular", "perpendicular")
+        direction_layout.addWidget(self.direction_mode, 1)
+        type_parameters.addWidget(self.direction_row)
+        self.reverse_direction = QCheckBox(
+            "Reverse direction", self.type_parameters_widget
+        )
+        type_parameters.addWidget(self.reverse_direction)
+        self.uniform = QCheckBox(
+            "Uniform", self.type_parameters_widget
+        )
+        self.uniform.setToolTip(
+            "Transition a fixed distance inward from the boundary"
+        )
+        type_parameters.addWidget(self.uniform)
+        self.distance_row = QWidget(self.type_parameters_widget)
+        distance_layout = QHBoxLayout(self.distance_row)
+        distance_layout.setContentsMargins(0, 0, 0, 0)
+        self.distance_label = QLabel("Distance", self.distance_row)
+        self.distance_slider = QSlider(
+            Qt.Orientation.Horizontal, self.distance_row
+        )
+        self.distance_slider.setRange(1, 1000)
+        self.distance_value = QDoubleSpinBox(self.distance_row)
+        self.distance_value.setRange(-1000, 1000)
+        self.distance_value.setDecimals(0)
+        self.distance_value.setSuffix(" px")
+        self.distance_value.setButtonSymbols(
+            QDoubleSpinBox.ButtonSymbols.NoButtons
+        )
+        distance_layout.addWidget(self.distance_label)
+        distance_layout.addWidget(self.distance_slider, 1)
+        distance_layout.addWidget(self.distance_value)
+        type_parameters.addWidget(self.distance_row)
 
         self.parameters_widget = QWidget(self)
         parameters = QVBoxLayout(self.parameters_widget)
@@ -245,6 +297,20 @@ class GradientToolsControls(QWidget):
             lambda: self.createRequested.emit("parent_shape")
         )
         self.field_type.currentIndexChanged.connect(self._field_changed)
+        self.select_gradient.clicked.connect(self._select_matching_gradient)
+        self.direction_mode.currentIndexChanged.connect(
+            self._type_parameter_changed
+        )
+        self.reverse_direction.toggled.connect(
+            self._type_parameter_changed
+        )
+        self.uniform.toggled.connect(self._type_parameter_changed)
+        self.distance_slider.valueChanged.connect(
+            self._distance_slider_changed
+        )
+        self.distance_value.valueChanged.connect(
+            self._type_parameter_changed
+        )
         self.ramp_editor.editingStarted.connect(self._begin_ramp_edit)
         self.ramp_editor.rampChanged.connect(self._preview_ramp)
         self.ramp_editor.editingFinished.connect(self._finish_ramp_edit)
@@ -271,13 +337,35 @@ class GradientToolsControls(QWidget):
             if isinstance(candidate, ColorFillGradientObject) else None
         )
 
+    def context_parent_id(self) -> str:
+        if self.canvas.chapter is None:
+            return ""
+        if self.canvas.selected_kind == "layer":
+            layer = self.canvas.chapter.layers.get(self.canvas.selected_id)
+            return (
+                layer.layer_id
+                if layer is not None and layer.bound is not None else ""
+            )
+        obj = self.canvas.chapter.objects.get(self.canvas.selected_id)
+        return obj.parent_layer_id if obj is not None else ""
+
+    def matching_gradients(self, field_type: str | None = None):
+        parent_id = self.context_parent_id()
+        if not parent_id:
+            return []
+        return self.canvas.chapter.gradient_children(
+            parent_id, field_type or str(self.field_type.currentData())
+        )
+
     def refresh(self) -> None:
         obj = self.selected_gradient()
         self._loading = True
         enabled = obj is not None
-        self.field_type.setEnabled(enabled)
+        context_parent = self.context_parent_id()
+        self.field_type.setEnabled(bool(context_parent))
         self.parameters_widget.setEnabled(enabled)
         self.presets_widget.setEnabled(enabled)
+        self.type_parameters_widget.setEnabled(enabled)
         if obj is not None:
             self.field_type.setCurrentIndex(max(
                 0, self.field_type.findData(obj.field_type)
@@ -287,6 +375,97 @@ class GradientToolsControls(QWidget):
             self.remove_stop.setEnabled(len(obj.ramp.stops) > 2)
             preset_index = self.preset_combo.findData(obj.loaded_preset_id)
             self.preset_combo.setCurrentIndex(max(0, preset_index))
+            self.direction_mode.setCurrentIndex(max(
+                0, self.direction_mode.findData(
+                    obj.line_field.direction_mode
+                )
+            ))
+            field = (
+                obj.line_field if obj.field_type == "line"
+                else obj.radial_field if obj.field_type == "radial"
+                else obj.shape_field
+            )
+            self.reverse_direction.setChecked(field.reverse_direction)
+            self.uniform.setChecked(
+                bool(getattr(field, "uniform", False))
+            )
+            distance = (
+                obj.line_field.perpendicular_distance
+                if obj.field_type == "line" else field.distance
+            )
+            self.distance_value.setValue(distance)
+            self.distance_slider.setValue(
+                max(1, min(1000, round(abs(distance))))
+            )
+        self.direction_row.setVisible(
+            obj is not None and obj.field_type == "line"
+        )
+        radial_or_shape = (
+            obj is not None
+            and obj.field_type in {"radial", "parent_shape"}
+        )
+        self.uniform.setVisible(
+            radial_or_shape and not obj.radial_field.reverse_direction
+            if obj is not None and obj.field_type == "radial"
+            else radial_or_shape and not (
+                obj.shape_field.reverse_direction
+                if obj is not None else False
+            )
+        )
+        show_distance = bool(
+            obj is not None
+            and (
+                (
+                    obj.field_type == "line"
+                    and obj.line_field.direction_mode == "perpendicular"
+                )
+                or (
+                    obj.field_type == "radial"
+                    and (
+                        obj.radial_field.reverse_direction
+                        or obj.radial_field.uniform
+                    )
+                )
+                or (
+                    obj.field_type == "parent_shape"
+                    and (
+                        obj.shape_field.reverse_direction
+                        or obj.shape_field.uniform
+                    )
+                )
+            )
+        )
+        self.distance_row.setVisible(show_distance)
+        self.distance_label.setText(
+            "Perpendicular"
+            if obj is not None and obj.field_type == "line"
+            else "Distance"
+        )
+        selected_type = str(self.field_type.currentData() or "line")
+        matches = (
+            self.canvas.chapter.gradient_children(
+                context_parent, selected_type
+            ) if context_parent else []
+        )
+        self.select_gradient.setVisible(bool(matches) and obj is None)
+        self.create_line.setEnabled(
+            bool(context_parent)
+            and not self.canvas.chapter.gradient_children(
+                context_parent, "line"
+            )
+        )
+        self.create_radial.setEnabled(
+            bool(context_parent)
+            and not self.canvas.chapter.gradient_children(
+                context_parent, "radial"
+            )
+        )
+        self.create_shape.setEnabled(
+            bool(context_parent)
+            and not self.canvas.chapter.gradient_children(
+                context_parent, "parent_shape"
+            )
+        )
         self._loading = False
 
     def set_presets(
@@ -296,6 +475,9 @@ class GradientToolsControls(QWidget):
         self._loading = True
         self.preset_combo.clear()
         self.preset_combo.addItem("Custom", "")
+        self.preset_combo.addItem(
+            "Primary → Secondary", BUILTIN_PRIMARY_SECONDARY_ID
+        )
         for preset in presets:
             self.preset_combo.addItem(preset.name, preset.preset_id)
         index = self.preset_combo.findData(current)
@@ -316,12 +498,72 @@ class GradientToolsControls(QWidget):
             return
         obj = self.selected_gradient()
         field_type = self.field_type.currentData()
-        if obj is None or not field_type or obj.field_type == field_type:
+        if obj is None:
+            self.refresh()
+            return
+        if not field_type or obj.field_type == field_type:
+            return
+        conflicts = self.canvas.chapter.gradient_children(
+            obj.parent_layer_id, str(field_type), excluding=obj.object_id
+        )
+        if conflicts:
+            window = self.canvas.window()
+            if hasattr(window, "statusBar"):
+                window.statusBar().showMessage(
+                    f"This shape already has a {field_type} gradient", 4000
+                )
+            self.refresh()
             return
         before = self.canvas.chapter.to_dict()
         obj.field_type = str(field_type)
         obj.touch_revision()
         self._commit_change(before, "Change gradient field")
+        self.refresh()
+
+    def _select_matching_gradient(self) -> None:
+        matches = self.matching_gradients()
+        if matches:
+            self.canvas.set_selection("object", matches[0].object_id)
+
+    def _distance_slider_changed(self, value: int) -> None:
+        if self._loading:
+            return
+        sign = -1 if self.distance_value.value() < 0 else 1
+        self.distance_value.setValue(sign * value)
+
+    def _type_parameter_changed(self, *args) -> None:
+        del args
+        if self._loading:
+            return
+        obj = self.selected_gradient()
+        if obj is None:
+            return
+        before = self.canvas.chapter.to_dict()
+        if obj.field_type == "line":
+            obj.line_field.direction_mode = str(
+                self.direction_mode.currentData()
+            )
+            obj.line_field.reverse_direction = (
+                self.reverse_direction.isChecked()
+            )
+            distance = self.distance_value.value()
+            obj.line_field.perpendicular_distance = (
+                distance if abs(distance) >= 1 else 1.0
+            )
+        else:
+            field = (
+                obj.radial_field
+                if obj.field_type == "radial" else obj.shape_field
+            )
+            field.reverse_direction = self.reverse_direction.isChecked()
+            field.uniform = self.uniform.isChecked()
+            field.distance = max(
+                1.0, abs(self.distance_value.value())
+            )
+        obj.validate_gradient()
+        obj.touch_revision()
+        self._commit_change(before, "Change gradient direction")
+        self.refresh()
 
     def _begin_ramp_edit(self) -> None:
         if self._edit_before is None and self.canvas.chapter is not None:
@@ -441,13 +683,15 @@ class GradientToolsControls(QWidget):
 
     def _sync_preset_name(self) -> None:
         preset_id = str(self.preset_combo.currentData() or "")
-        self.preset_name.setEnabled(bool(preset_id))
+        built_in = preset_id == BUILTIN_PRIMARY_SECONDARY_ID
+        self.preset_name.setEnabled(bool(preset_id) and not built_in)
         self.preset_name.setText(
             self.preset_combo.currentText() if preset_id else ""
         )
-        self.save_preset.setEnabled(bool(preset_id))
+        self.save_preset.setEnabled(bool(preset_id) and not built_in)
         self.remove_preset.setEnabled(
-            bool(preset_id) and self.preset_combo.count() > 2
+            bool(preset_id) and not built_in
+            and self.preset_combo.count() > 3
         )
 
     def _save_preset(self) -> None:

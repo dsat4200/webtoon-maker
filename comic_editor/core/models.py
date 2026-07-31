@@ -7,7 +7,7 @@ from dataclasses import dataclass, field
 from typing import Any, Iterable, Iterator, Literal
 
 
-SCHEMA_VERSION = 10
+SCHEMA_VERSION = 12
 CHAPTER_WIDTH = 1080
 DEFAULT_CHAPTER_HEIGHT = 3240
 GROWTH_MARGIN = 1080
@@ -922,6 +922,9 @@ class LineGradientField:
         PathNode(x=270.0, y=540.0),
         PathNode(x=810.0, y=540.0),
     ]))
+    direction_mode: Literal["parallel", "perpendicular"] = "parallel"
+    reverse_direction: bool = False
+    perpendicular_distance: float = 120.0
 
     def validate(self) -> None:
         self.geometry.closed = False
@@ -929,10 +932,26 @@ class LineGradientField:
         self.geometry.validate()
         if len(self.geometry.nodes) < 2:
             raise ValueError("Line gradients require at least two points")
+        if self.direction_mode not in {"parallel", "perpendicular"}:
+            self.direction_mode = "parallel"
+        self.reverse_direction = bool(self.reverse_direction)
+        try:
+            distance = float(self.perpendicular_distance)
+        except (TypeError, ValueError):
+            distance = 120.0
+        self.perpendicular_distance = (
+            distance if math.isfinite(distance) and abs(distance) >= 0.001
+            else 120.0
+        )
 
     def to_dict(self) -> dict[str, Any]:
         self.validate()
-        return {"geometry": self.geometry.to_dict()}
+        return {
+            "geometry": self.geometry.to_dict(),
+            "direction_mode": self.direction_mode,
+            "reverse_direction": self.reverse_direction,
+            "perpendicular_distance": self.perpendicular_distance,
+        }
 
     @classmethod
     def from_dict(cls, data: dict[str, Any] | None) -> "LineGradientField":
@@ -947,7 +966,12 @@ class LineGradientField:
                         {"position": [810, 540]},
                     ],
                 }
-            )
+            ),
+            direction_mode=str(data.get("direction_mode", "parallel")),
+            reverse_direction=bool(data.get("reverse_direction", False)),
+            perpendicular_distance=float(
+                data.get("perpendicular_distance", 120.0)
+            ),
         )
         result.validate()
         return result
@@ -963,6 +987,9 @@ class RadialGradientField:
     ellipse_enabled: bool = False
     center_auto: bool = True
     manual_center: tuple[float, float] | None = None
+    reverse_direction: bool = False
+    uniform: bool = False
+    distance: float = 120.0
 
     def validate(self) -> None:
         values = (
@@ -984,6 +1011,15 @@ class RadialGradientField:
         )
         if self.manual_center is None:
             self.center_auto = True
+        self.reverse_direction = bool(self.reverse_direction)
+        self.uniform = bool(self.uniform)
+        try:
+            distance = float(self.distance)
+        except (TypeError, ValueError):
+            distance = 120.0
+        self.distance = (
+            max(0.001, distance) if math.isfinite(distance) else 120.0
+        )
 
     def center(self) -> tuple[float, float]:
         if self.center_auto or self.manual_center is None:
@@ -1002,6 +1038,9 @@ class RadialGradientField:
                 list(self.manual_center)
                 if self.manual_center is not None else None
             ),
+            "reverse_direction": self.reverse_direction,
+            "uniform": self.uniform,
+            "distance": self.distance,
         }
 
     @classmethod
@@ -1019,6 +1058,11 @@ class RadialGradientField:
                 _point(data["manual_center"])
                 if data.get("manual_center") is not None else None
             ),
+            reverse_direction=bool(data.get("reverse_direction", False)),
+            uniform=bool(data.get("uniform", False)),
+            distance=float(data.get(
+                "distance", data.get("outward_distance", 120.0)
+            )),
         )
         result.validate()
         return result
@@ -1028,6 +1072,9 @@ class RadialGradientField:
 class ShapeGradientField:
     center_auto: bool = True
     manual_center: tuple[float, float] | None = None
+    reverse_direction: bool = False
+    uniform: bool = False
+    distance: float = 120.0
 
     def validate(self) -> None:
         self.center_auto = bool(self.center_auto)
@@ -1037,6 +1084,15 @@ class ShapeGradientField:
         )
         if self.manual_center is None:
             self.center_auto = True
+        self.reverse_direction = bool(self.reverse_direction)
+        self.uniform = bool(self.uniform)
+        try:
+            distance = float(self.distance)
+        except (TypeError, ValueError):
+            distance = 120.0
+        self.distance = (
+            max(0.001, distance) if math.isfinite(distance) else 120.0
+        )
 
     def to_dict(self) -> dict[str, Any]:
         self.validate()
@@ -1046,6 +1102,9 @@ class ShapeGradientField:
                 list(self.manual_center)
                 if self.manual_center is not None else None
             ),
+            "reverse_direction": self.reverse_direction,
+            "uniform": self.uniform,
+            "distance": self.distance,
         }
 
     @classmethod
@@ -1057,6 +1116,11 @@ class ShapeGradientField:
                 _point(data["manual_center"])
                 if data.get("manual_center") is not None else None
             ),
+            reverse_direction=bool(data.get("reverse_direction", False)),
+            uniform=bool(data.get("uniform", False)),
+            distance=float(data.get(
+                "distance", data.get("outward_distance", 120.0)
+            )),
         )
         result.validate()
         return result
@@ -1756,6 +1820,12 @@ class ChapterDocument:
         parent = self.layers[parent_id]
         if parent.layer_kind == "fill":
             raise ValueError("Objects require a container layer")
+        if isinstance(obj, GradientObject) and self.gradient_children(
+            parent_id, obj.field_type
+        ):
+            raise ValueError(
+                f"This shape already has a {obj.field_type} gradient"
+            )
         obj.parent_layer_id = parent_id
         self.objects[obj.object_id] = obj
         reference = ChildRef("object", obj.object_id)
@@ -1768,6 +1838,26 @@ class ChapterDocument:
         if isinstance(obj, RasterObject):
             parent.last_raster_id = obj.object_id
         return obj
+
+    def gradient_children(
+        self, parent_id: str, field_type: str | None = None,
+        *, excluding: str = "",
+    ) -> list[GradientObject]:
+        """Return direct gradient children in frontmost-first hierarchy order."""
+        parent = self.layers.get(parent_id)
+        if parent is None:
+            return []
+        result: list[GradientObject] = []
+        for child in parent.children:
+            if child.kind != "object" or child.entity_id == excluding:
+                continue
+            candidate = self.objects.get(child.entity_id)
+            if (
+                isinstance(candidate, GradientObject)
+                and (field_type is None or candidate.field_type == field_type)
+            ):
+                result.append(candidate)
+        return result
 
     def add_vector_fill(
         self, owner_id: str, fill: VectorFillObject,
@@ -1876,6 +1966,16 @@ class ChapterDocument:
         else:
             entity = self.objects[entity_id]
             old_parent = self.layers[entity.parent_layer_id]
+            if (
+                isinstance(entity, GradientObject)
+                and self.gradient_children(
+                    new_parent_id, entity.field_type,
+                    excluding=entity.object_id,
+                )
+            ):
+                raise ValueError(
+                    f"This shape already has a {entity.field_type} gradient"
+                )
         old_world = (
             self.layer_world_translation(old_parent.layer_id)
             if kind == "object" else (0.0, 0.0)

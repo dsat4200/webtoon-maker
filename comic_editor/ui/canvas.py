@@ -5,6 +5,8 @@ import math
 import time
 from enum import Enum
 
+import numpy as np
+
 from PySide6.QtCore import QEvent, QPoint, QPointF, QRect, QRectF, Qt, Signal
 from PySide6.QtGui import (
     QAbstractTextDocumentLayout, QBrush, QColor, QFont, QFontMetricsF,
@@ -137,6 +139,7 @@ class _CanvasLogic:
         self._transform_rotate_start = 0.0
         self._render_excluded_object_id = ""
         self._rendering_compound_references = False
+        self._rendering_outward_gradient = False
         self._live_underlay_object_id = ""
         self._live_underlay_amount = 0.0
         self._text_editing = False
@@ -166,6 +169,7 @@ class _CanvasLogic:
         self._shape_drag_nodes: dict[str, dict] = {}
         self._active_shape_control: str | None = None
         self._active_gradient_control: tuple[str, str] | None = None
+        self._geometry_transform_target: tuple[str, str] | None = None
         self._shape_control_dragged = False
         self._shape_hover_insert: tuple[int, float, QPointF] | None = None
         self._shape_hover_target: dict | None = None
@@ -197,8 +201,10 @@ class _CanvasLogic:
         self._vector_render_cache: dict[
             tuple[str, int, str, float, float], tuple[QImage, QRectF]
         ] = {}
+        self._gradient_geometry_cache: dict[tuple, object] = {}
+        self._gradient_scalar_cache: dict[tuple, tuple[np.ndarray, np.ndarray, QRectF]] = {}
         self._gradient_render_cache: dict[
-            tuple[str, int, str, int, int], tuple[QImage, QRectF]
+            tuple, tuple[QImage, QRectF]
         ] = {}
         self._selected_vector_stroke_ids: set[str] = set()
         self._selected_vector_point_ids: set[str] = set()
@@ -266,6 +272,9 @@ class _CanvasLogic:
         self.chapter = chapter
         self.tiles = tiles
         self._compound_path_cache.clear()
+        self._gradient_geometry_cache.clear()
+        self._gradient_scalar_cache.clear()
+        self._gradient_render_cache.clear()
         self._ensure_raster_frames()
         self.command_stack.clear()
         self.selected_kind = ""
@@ -308,6 +317,8 @@ class _CanvasLogic:
         self.pageGapConfirmationChanged.emit(False)
         self.chapter = ChapterDocument.from_dict(state)
         self._compound_path_cache.clear()
+        self._gradient_geometry_cache.clear()
+        self._gradient_scalar_cache.clear()
         self._gradient_render_cache.clear()
         valid = (
             self.selected_id in self.chapter.layers
@@ -1426,7 +1437,6 @@ class _CanvasLogic:
 
     def _clear_compound_path_cache(self, *args) -> None:
         self._compound_path_cache.clear()
-        self._gradient_render_cache.clear()
 
     def _layer_operand_path(self, layer: LayerNode) -> QPainterPath:
         if layer.bound is None:
@@ -1675,6 +1685,13 @@ class _CanvasLogic:
             return
         painter.save()
         painter.translate(layer.translate_x, layer.translate_y)
+        world_x, world_y = self.chapter.layer_world_translation(
+            layer.layer_id
+        )
+        local_visible = visible_world.translated(-world_x, -world_y)
+        self._render_outward_gradient_children(
+            painter, layer, parent_opacity * layer.opacity, local_visible
+        )
         if layer.compound_enabled:
             self._render_compound_layer_contents(
                 painter, layer, parent_opacity, visible_world
@@ -1912,6 +1929,41 @@ class _CanvasLogic:
             else self.chapter.objects.get(child.entity_id)
         )
         return bool(entity and entity.ignore_parent_mask)
+
+    @staticmethod
+    def _is_outward_gradient(obj: GradientObject) -> bool:
+        return bool(
+            (
+                obj.field_type == "radial"
+                and obj.radial_field.reverse_direction
+            )
+            or (
+                obj.field_type == "parent_shape"
+                and obj.shape_field.reverse_direction
+            )
+        )
+
+    def _render_outward_gradient_children(
+        self, painter: QPainter, layer: LayerNode, opacity: float,
+        local_visible: QRectF,
+    ) -> None:
+        """Render outward gradients before their direct parent artwork."""
+        previous = self._rendering_outward_gradient
+        self._rendering_outward_gradient = True
+        try:
+            for child in reversed(layer.children):
+                if child.kind != "object":
+                    continue
+                obj = self.chapter.objects.get(child.entity_id)
+                if (
+                    isinstance(obj, GradientObject)
+                    and self._is_outward_gradient(obj)
+                ):
+                    self._render_object(
+                        painter, obj, opacity, local_visible
+                    )
+        finally:
+            self._rendering_outward_gradient = previous
 
     def _render_compound_reference_objects(
         self, painter: QPainter, compound_id: str, parent_opacity: float,
@@ -2242,6 +2294,236 @@ class _CanvasLogic:
                 segments.append((points[-1], points[0]))
         return segments
 
+    @staticmethod
+    def _gradient_path_signature(path: QPainterPath) -> tuple:
+        return tuple(
+            (
+                round(path.elementAt(index).x, 3),
+                round(path.elementAt(index).y, 3),
+                path.elementAt(index).type.value,
+            )
+            for index in range(path.elementCount())
+        )
+
+    @staticmethod
+    def _gradient_ramp_signature(ramp: ColorGradientRamp) -> tuple:
+        ramp.validate()
+        return tuple(
+            (stop.stop_id, round(stop.position, 6), stop.color)
+            for stop in ramp.stops
+        )
+
+    def _cache_gradient_value(
+        self, cache: dict, key: tuple, value: object, limit: int = 32,
+    ) -> object:
+        cache[key] = value
+        while len(cache) > limit:
+            cache.pop(next(iter(cache)))
+        return value
+
+    @staticmethod
+    def _gradient_grid(bounds: QRectF, maximum: int = 768) -> tuple[int, int]:
+        width = max(2.0, bounds.width())
+        height = max(2.0, bounds.height())
+        ratio = width / height
+        if ratio >= 1:
+            return maximum, max(2, round(maximum / ratio))
+        return max(2, round(maximum * ratio)), maximum
+
+    @staticmethod
+    def _gradient_coordinates(
+        bounds: QRectF, width: int, height: int,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        xs = np.linspace(
+            bounds.left() + bounds.width() / (2 * width),
+            bounds.right() - bounds.width() / (2 * width),
+            width,
+            dtype=np.float32,
+        )
+        ys = np.linspace(
+            bounds.top() + bounds.height() / (2 * height),
+            bounds.bottom() - bounds.height() / (2 * height),
+            height,
+            dtype=np.float32,
+        )
+        return np.meshgrid(xs, ys)
+
+    def _path_projection_arrays(
+        self, path: QPainterPath, bounds: QRectF, width: int, height: int,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        signature = self._gradient_path_signature(path)
+        key = (
+            "projection", signature,
+            round(bounds.x(), 3), round(bounds.y(), 3),
+            round(bounds.width(), 3), round(bounds.height(), 3),
+            width, height,
+        )
+        cached = self._gradient_geometry_cache.get(key)
+        if cached is not None:
+            return cached
+        polygons = path.toSubpathPolygons()
+        segment_pairs: list[
+            tuple[tuple[float, float], tuple[float, float]]
+        ] = []
+        for polygon in polygons:
+            points = [(point.x(), point.y()) for point in polygon]
+            segment_pairs.extend(zip(points, points[1:]))
+        if not segment_pairs:
+            empty = np.zeros((height, width), dtype=np.float32)
+            return empty, empty, empty
+        starts = np.asarray(
+            [pair[0] for pair in segment_pairs], dtype=np.float32
+        )
+        ends = np.asarray(
+            [pair[1] for pair in segment_pairs], dtype=np.float32
+        )
+        vectors = ends - starts
+        lengths = np.sqrt(np.sum(vectors * vectors, axis=1))
+        usable = lengths > 1e-5
+        starts, vectors, lengths = (
+            starts[usable], vectors[usable], lengths[usable]
+        )
+        if not len(lengths):
+            empty = np.zeros((height, width), dtype=np.float32)
+            return empty, empty, empty
+        cumulative = np.concatenate((
+            np.zeros(1, dtype=np.float32), np.cumsum(lengths)
+        ))
+        total = max(float(cumulative[-1]), 1e-6)
+        grid_x, grid_y = self._gradient_coordinates(
+            bounds, width, height
+        )
+        best_distance = np.full(
+            (height, width), np.inf, dtype=np.float32
+        )
+        best_amount = np.zeros((height, width), dtype=np.float32)
+        best_signed = np.zeros((height, width), dtype=np.float32)
+        for index, (start, vector, length) in enumerate(
+            zip(starts, vectors, lengths)
+        ):
+            relative_x = grid_x - start[0]
+            relative_y = grid_y - start[1]
+            length_squared = float(length * length)
+            along = np.clip(
+                (relative_x * vector[0] + relative_y * vector[1])
+                / length_squared,
+                0.0, 1.0,
+            )
+            dx = relative_x - along * vector[0]
+            dy = relative_y - along * vector[1]
+            distance = dx * dx + dy * dy
+            replace = distance < best_distance
+            best_distance[replace] = distance[replace]
+            amount = (cumulative[index] + along * length) / total
+            best_amount[replace] = amount[replace]
+            signed = (
+                vector[0] * relative_y - vector[1] * relative_x
+            ) / length
+            best_signed[replace] = signed[replace]
+        result = best_amount, best_signed, np.sqrt(best_distance)
+        return self._cache_gradient_value(
+            self._gradient_geometry_cache, key, result
+        )
+
+    def _path_coverage(
+        self, path: QPainterPath, bounds: QRectF, width: int, height: int,
+    ) -> np.ndarray:
+        signature = self._gradient_path_signature(path)
+        key = (
+            "coverage", signature,
+            round(bounds.x(), 3), round(bounds.y(), 3),
+            round(bounds.width(), 3), round(bounds.height(), 3),
+            width, height,
+        )
+        cached = self._gradient_geometry_cache.get(key)
+        if cached is not None:
+            return cached
+        mask = QImage(width, height, QImage.Format.Format_Alpha8)
+        mask.fill(0)
+        mask_painter = QPainter(mask)
+        transform = QTransform(
+            width / max(bounds.width(), 1e-6), 0, 0,
+            0, height / max(bounds.height(), 1e-6), 0,
+            -bounds.left() * width / max(bounds.width(), 1e-6),
+            -bounds.top() * height / max(bounds.height(), 1e-6), 1,
+        )
+        mask_painter.setTransform(transform)
+        mask_painter.fillPath(path, Qt.GlobalColor.white)
+        mask_painter.end()
+        stride = mask.bytesPerLine()
+        raw = np.frombuffer(mask.bits(), dtype=np.uint8).reshape(
+            height, stride
+        )
+        coverage = raw[:, :width].copy() > 0
+        return self._cache_gradient_value(
+            self._gradient_geometry_cache, key, coverage
+        )
+
+    @staticmethod
+    def _gradient_ramp_lut(
+        ramp: ColorGradientRamp, size: int = 1024,
+    ) -> np.ndarray:
+        ramp.validate()
+        positions = np.asarray(
+            [stop.position for stop in ramp.stops], dtype=np.float32
+        )
+        colors = np.asarray([
+            [
+                QColor(stop.color).red(),
+                QColor(stop.color).green(),
+                QColor(stop.color).blue(),
+                QColor(stop.color).alpha(),
+            ]
+            for stop in ramp.stops
+        ], dtype=np.float32)
+        values = np.linspace(0.0, 1.0, size, dtype=np.float32)
+        right = np.searchsorted(positions, values, side="right")
+        right = np.clip(right, 1, len(positions) - 1)
+        left = right - 1
+        spans = positions[right] - positions[left]
+        amounts = np.divide(
+            values - positions[left], spans,
+            out=np.ones_like(values), where=spans > 1e-8,
+        )
+        result = (
+            colors[left] * (1.0 - amounts[:, None])
+            + colors[right] * amounts[:, None]
+        )
+        result[values <= positions[0]] = colors[0]
+        result[values >= positions[-1]] = colors[-1]
+        return np.clip(np.rint(result), 0, 255).astype(np.uint8)
+
+    def _gradient_image_from_scalar(
+        self, scalar: np.ndarray, coverage: np.ndarray,
+        ramp: ColorGradientRamp, bounds: QRectF, scalar_key: tuple,
+    ) -> tuple[QImage, QRectF]:
+        ramp_key = self._gradient_ramp_signature(ramp)
+        key = ("colored", scalar_key, ramp_key)
+        cached = self._gradient_render_cache.get(key)
+        if cached is not None:
+            return cached
+        lut = self._gradient_ramp_lut(ramp)
+        indices = np.clip(
+            np.rint(np.clip(scalar, 0.0, 1.0) * (len(lut) - 1)),
+            0, len(lut) - 1,
+        ).astype(np.int32)
+        rgba = lut[indices].copy()
+        rgba[~coverage] = 0
+        alpha = rgba[..., 3:4].astype(np.uint16)
+        rgba[..., :3] = (
+            rgba[..., :3].astype(np.uint16) * alpha + 127
+        ) // 255
+        rgba = np.ascontiguousarray(rgba)
+        height, width = scalar.shape
+        image = QImage(
+            rgba.data, width, height, rgba.strides[0],
+            QImage.Format.Format_RGBA8888_Premultiplied,
+        ).copy()
+        result = image, QRectF(bounds)
+        return self._cache_gradient_value(
+            self._gradient_render_cache, key, result
+        )
+
     def _shape_gradient_center(
         self, obj: GradientObject, path: QPainterPath,
     ) -> QPointF:
@@ -2272,58 +2554,207 @@ class _CanvasLogic:
         bounds = path.boundingRect()
         if bounds.isEmpty():
             return None
-        # Shape fields are cached and smoothly scaled; this bounded working
-        # resolution keeps arbitrary-path evaluation interactive in Python.
-        maximum = 160
-        ratio = bounds.width() / max(bounds.height(), 1e-6)
-        if ratio >= 1:
-            width = maximum
-            height = max(2, round(maximum / ratio))
-        else:
-            height = maximum
-            width = max(2, round(maximum * ratio))
-        key = (
-            obj.object_id, obj.gradient_revision, obj.field_type,
-            width, height,
+        field = obj.shape_field
+        if field.reverse_direction:
+            bounds = bounds.adjusted(
+                -field.distance, -field.distance,
+                field.distance, field.distance,
+            )
+        width, height = self._gradient_grid(bounds)
+        path_signature = self._gradient_path_signature(path)
+        scalar_key = (
+            "shape", path_signature, width, height,
+            field.reverse_direction,
+            field.uniform, round(field.distance, 4),
+            field.center_auto, field.manual_center,
         )
-        cached = self._gradient_render_cache.get(key)
+        cached = self._gradient_scalar_cache.get(scalar_key)
         if cached is not None:
-            return cached
-        image = QImage(
-            width, height, QImage.Format.Format_ARGB32_Premultiplied
+            scalar, coverage, cached_bounds = cached
+            return self._gradient_image_from_scalar(
+                scalar, coverage, obj.ramp, cached_bounds, scalar_key
+            )
+        _amount, _signed, boundary = self._path_projection_arrays(
+            path, bounds, width, height
         )
-        image.fill(Qt.GlobalColor.transparent)
-        center = self._shape_gradient_center(obj, path)
-        segments = self._path_line_segments(path)
-        if not segments:
+        inside = self._path_coverage(path, bounds, width, height)
+        if field.reverse_direction:
+            scalar = np.clip(
+                boundary / max(field.distance, 0.001), 0.0, 1.0
+            )
+            coverage = ~inside
+        elif field.uniform:
+            scalar = np.clip(
+                boundary / max(field.distance, 0.001), 0.0, 1.0
+            )
+            coverage = inside
+        else:
+            grid_x, grid_y = self._gradient_coordinates(
+                bounds, width, height
+            )
+            center = self._shape_gradient_center(obj, path)
+            center_distance = np.hypot(
+                grid_x - center.x(), grid_y - center.y()
+            )
+            denominator = boundary + center_distance
+            scalar = np.divide(
+                boundary, denominator,
+                out=np.ones_like(boundary),
+                where=denominator > 1e-6,
+            )
+            coverage = inside
+        self._cache_gradient_value(
+            self._gradient_scalar_cache, scalar_key,
+            (scalar, coverage, QRectF(bounds)),
+        )
+        return self._gradient_image_from_scalar(
+            scalar, coverage, obj.ramp, bounds, scalar_key
+        )
+
+    @staticmethod
+    def _radial_boundary_path(field: RadialGradientField) -> QPainterPath:
+        radius_y = field.radius_y if field.ellipse_enabled else field.radius_x
+        path = QPainterPath()
+        path.addEllipse(QRectF(
+            -field.radius_x, -radius_y,
+            field.radius_x * 2, radius_y * 2,
+        ))
+        transform = QTransform()
+        transform.translate(field.origin_x, field.origin_y)
+        transform.rotate(field.rotation)
+        return transform.map(path)
+
+    def _radial_uniform_image(
+        self, obj: ColorFillGradientObject,
+    ) -> tuple[QImage, QRectF] | None:
+        field = obj.radial_field
+        path = self._radial_boundary_path(field)
+        bounds = path.boundingRect()
+        if bounds.isEmpty():
             return None
-        sx = bounds.width() / width
-        sy = bounds.height() / height
-        for iy in range(height):
-            y = bounds.top() + (iy + 0.5) * sy
-            for ix in range(width):
-                x = bounds.left() + (ix + 0.5) * sx
-                point = QPointF(x, y)
-                if not path.contains(point):
-                    continue
-                boundary = min(
-                    self._point_segment_distance(point, start, end)
-                    for start, end in segments
-                )
-                center_distance = math.dist(
-                    (x, y), (center.x(), center.y())
-                )
-                denominator = boundary + center_distance
-                amount = (
-                    boundary / denominator
-                    if denominator > 1e-9 else 1.0
-                )
-                image.setPixelColor(
-                    ix, iy, self._sample_color_ramp(obj.ramp, amount)
-                )
-        result = image, QRectF(bounds)
-        self._gradient_render_cache[key] = result
-        return result
+        width, height = self._gradient_grid(bounds)
+        path_signature = self._gradient_path_signature(path)
+        scalar_key = (
+            "radial-uniform", path_signature, width, height,
+            round(field.distance, 4),
+        )
+        cached = self._gradient_scalar_cache.get(scalar_key)
+        if cached is not None:
+            scalar, coverage, cached_bounds = cached
+            return self._gradient_image_from_scalar(
+                scalar, coverage, obj.ramp, cached_bounds, scalar_key
+            )
+        _amount, _signed, boundary = self._path_projection_arrays(
+            path, bounds, width, height
+        )
+        coverage = self._path_coverage(path, bounds, width, height)
+        scalar = np.clip(
+            boundary / max(field.distance, 0.001), 0.0, 1.0
+        )
+        self._cache_gradient_value(
+            self._gradient_scalar_cache, scalar_key,
+            (scalar, coverage, QRectF(bounds)),
+        )
+        return self._gradient_image_from_scalar(
+            scalar, coverage, obj.ramp, bounds, scalar_key
+        )
+
+    def _line_gradient_image(
+        self, obj: ColorFillGradientObject, path: QPainterPath,
+        bounds: QRectF,
+    ) -> tuple[QImage, QRectF] | None:
+        if bounds.isEmpty():
+            return None
+        width, height = self._gradient_grid(bounds)
+        field = obj.line_field
+        signature = self._gradient_path_signature(path)
+        scalar_key = (
+            "line", signature, width, height, field.direction_mode,
+            field.reverse_direction,
+            round(field.perpendicular_distance, 4),
+            round(bounds.x(), 3), round(bounds.y(), 3),
+            round(bounds.width(), 3), round(bounds.height(), 3),
+        )
+        cached = self._gradient_scalar_cache.get(scalar_key)
+        if cached is not None:
+            scalar, coverage, cached_bounds = cached
+            return self._gradient_image_from_scalar(
+                scalar, coverage, obj.ramp, cached_bounds, scalar_key
+            )
+        amount, signed, _distance = self._path_projection_arrays(
+            path, bounds, width, height
+        )
+        if field.direction_mode == "perpendicular":
+            direction = 1.0 if field.perpendicular_distance > 0 else -1.0
+            scalar = np.clip(
+                signed * direction / abs(field.perpendicular_distance),
+                0.0, 1.0,
+            )
+        else:
+            scalar = amount
+        if field.reverse_direction:
+            scalar = 1.0 - scalar
+        coverage = np.ones_like(scalar, dtype=bool)
+        self._cache_gradient_value(
+            self._gradient_scalar_cache, scalar_key,
+            (scalar, coverage, QRectF(bounds)),
+        )
+        return self._gradient_image_from_scalar(
+            scalar, coverage, obj.ramp, bounds, scalar_key
+        )
+
+    def _radial_outward_image(
+        self, obj: ColorFillGradientObject,
+    ) -> tuple[QImage, QRectF] | None:
+        field = obj.radial_field
+        radius_y = field.radius_y if field.ellipse_enabled else field.radius_x
+        extent_x = field.radius_x + field.distance
+        extent_y = radius_y + field.distance
+        radius = math.hypot(extent_x, extent_y)
+        bounds = QRectF(
+            field.origin_x - radius, field.origin_y - radius,
+            radius * 2, radius * 2,
+        )
+        width, height = self._gradient_grid(bounds)
+        scalar_key = (
+            "radial-out", width, height,
+            round(field.origin_x, 4), round(field.origin_y, 4),
+            round(field.radius_x, 4), round(radius_y, 4),
+            round(field.rotation, 4), round(field.distance, 4),
+        )
+        cached = self._gradient_scalar_cache.get(scalar_key)
+        if cached is not None:
+            scalar, coverage, cached_bounds = cached
+            return self._gradient_image_from_scalar(
+                scalar, coverage, obj.ramp, cached_bounds, scalar_key
+            )
+        grid_x, grid_y = self._gradient_coordinates(bounds, width, height)
+        angle = math.radians(-field.rotation)
+        dx, dy = grid_x - field.origin_x, grid_y - field.origin_y
+        local_x = dx * math.cos(angle) - dy * math.sin(angle)
+        local_y = dx * math.sin(angle) + dy * math.cos(angle)
+        normalized = np.sqrt(
+            (local_x / field.radius_x) ** 2
+            + (local_y / radius_y) ** 2
+        )
+        ray_length = np.hypot(local_x, local_y)
+        boundary_length = np.divide(
+            ray_length, normalized,
+            out=np.zeros_like(ray_length), where=normalized > 1e-6,
+        )
+        outside_distance = np.maximum(0.0, ray_length - boundary_length)
+        scalar = np.clip(
+            outside_distance / max(field.distance, 0.001),
+            0.0, 1.0,
+        )
+        coverage = normalized >= 1.0
+        self._cache_gradient_value(
+            self._gradient_scalar_cache, scalar_key,
+            (scalar, coverage, QRectF(bounds)),
+        )
+        return self._gradient_image_from_scalar(
+            scalar, coverage, obj.ramp, bounds, scalar_key
+        )
 
     def _render_color_gradient(
         self, painter: QPainter, obj: ColorFillGradientObject,
@@ -2333,19 +2764,34 @@ class _CanvasLogic:
         if parent_path.isEmpty():
             return
         if obj.field_type == "line":
-            nodes = obj.line_field.geometry.nodes
-            if len(nodes) < 2:
-                return
-            gradient = QLinearGradient(
-                QPointF(*nodes[0].position),
-                QPointF(*nodes[-1].position),
+            rendered = self._line_gradient_image(
+                obj, self.bound_path(obj.line_field.geometry),
+                parent_path.boundingRect(),
             )
-            gradient.setSpread(QLinearGradient.Spread.PadSpread)
-            self._apply_ramp_stops(gradient, obj.ramp)
-            painter.fillRect(local_visible, QBrush(gradient))
+            if rendered is not None:
+                painter.setCompositionMode(
+                    QPainter.CompositionMode.CompositionMode_SourceOver
+                )
+                painter.drawImage(rendered[1], rendered[0])
             return
         if obj.field_type == "radial":
             field = obj.radial_field
+            if field.reverse_direction:
+                rendered = self._radial_outward_image(obj)
+                if rendered is not None:
+                    painter.setCompositionMode(
+                        QPainter.CompositionMode.CompositionMode_SourceOver
+                    )
+                    painter.drawImage(rendered[1], rendered[0])
+                return
+            if field.uniform:
+                rendered = self._radial_uniform_image(obj)
+                if rendered is not None:
+                    painter.setCompositionMode(
+                        QPainter.CompositionMode.CompositionMode_SourceOver
+                    )
+                    painter.drawImage(rendered[1], rendered[0])
+                return
             center_x, center_y = field.center()
             angle = math.radians(-field.rotation)
             dx, dy = center_x - field.origin_x, center_y - field.origin_y
@@ -2374,6 +2820,9 @@ class _CanvasLogic:
         if rendered is not None:
             image, target = rendered
             painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
+            painter.setCompositionMode(
+                QPainter.CompositionMode.CompositionMode_SourceOver
+            )
             painter.drawImage(target, image)
 
     def _render_gradient(
@@ -2398,6 +2847,12 @@ class _CanvasLogic:
         ):
             return
         if not obj.visible:
+            return
+        if (
+            isinstance(obj, GradientObject)
+            and self._is_outward_gradient(obj)
+            and not self._rendering_outward_gradient
+        ):
             return
         painter.save()
         opacity = (
@@ -2886,6 +3341,25 @@ class _CanvasLogic:
                 painter.translate(world_x, world_y)
                 if layer.bound is not None:
                     painter.drawPath(self.layer_effective_path(layer.layer_id))
+                if (
+                    self.tool == ToolKind.SHAPE_EDIT
+                    and layer.bound is not None
+                ):
+                    if (
+                        self._geometry_transform_target
+                        == ("layer", layer.layer_id)
+                        and self._transform_preview_quad is not None
+                    ):
+                        control_quad = self._transform_preview_quad
+                    else:
+                        left, top, width, height = layer.bound.bbox()
+                        control_quad = self._rect_quad(QRectF(
+                            left, top, max(1.0, width),
+                            max(1.0, height)
+                        ))
+                    self._draw_transform_controls(
+                        painter, control_quad,
+                    )
                 if self.tool == ToolKind.BOUND_EDIT and layer.bound is not None:
                     self._draw_shape_edit_handles(painter, layer)
         else:
@@ -2896,6 +3370,12 @@ class _CanvasLogic:
                 if (
                     isinstance(selected_object, RasterObject)
                     or self.tool == ToolKind.TRANSFORM
+                    or (
+                        self.tool == ToolKind.SHAPE_EDIT
+                        and isinstance(selected_object, GradientObject)
+                        and selected_object.field_type
+                        in {"line", "radial"}
+                    )
                     or (
                         self.tool == ToolKind.TEXT_EDIT
                         and isinstance(selected_object, TextObject)
@@ -2997,21 +3477,34 @@ class _CanvasLogic:
                 if node.node_id == self._selected_shape_node_id
             ), None)
             if selected is not None:
-                offset = 42 / max(self.scale, 0.05)
-                result[f"type:{selected.node_id}"] = (
-                    self._gradient_local_to_world(
-                        obj, (selected.x + offset, selected.y - offset)
+                for name, point in self._shape_gizmo_positions(
+                    geometry, selected, geometry_only=True
+                ).items():
+                    result[f"{name}:{selected.node_id}"] = (
+                        self._gradient_local_to_world(obj, point.toTuple())
                     )
-                )
-                result[f"delete:{selected.node_id}"] = (
-                    self._gradient_local_to_world(
-                        obj, (selected.x + offset, selected.y + offset)
-                    )
-                )
             for index in range(max(0, len(geometry.nodes) - 1)):
                 point = self._shape_segment_point(geometry, index, 0.5)
                 result[f"insert:{index}"] = (
                     self._gradient_local_to_world(obj, point.toTuple())
+                )
+            if (
+                obj.line_field.direction_mode == "perpendicular"
+                and len(geometry.nodes) >= 2
+            ):
+                path = self.bound_path(geometry)
+                percent = path.percentAtLength(path.length() / 2)
+                midpoint = path.pointAtPercent(percent)
+                angle = math.radians(
+                    -path.angleAtPercent(percent) + 90
+                )
+                distance = obj.line_field.perpendicular_distance
+                result["distance:"] = self._gradient_local_to_world(
+                    obj,
+                    (
+                        midpoint.x() + math.cos(angle) * distance,
+                        midpoint.y() + math.sin(angle) * distance,
+                    ),
                 )
             return result
         if obj.field_type == "radial":
@@ -3035,9 +3528,22 @@ class _CanvasLogic:
                         field.rotation,
                     )
                 )
-            result["center:"] = self._gradient_local_to_world(
-                obj, field.center()
-            )
+            if field.reverse_direction or field.uniform:
+                signed_distance = (
+                    field.distance
+                    if field.reverse_direction else -field.distance
+                )
+                result["distance:"] = self._gradient_local_to_world(
+                    obj, self._rotated_gradient_point(
+                        origin,
+                        (field.radius_x + signed_distance, 0),
+                        field.rotation,
+                    )
+                )
+            else:
+                result["center:"] = self._gradient_local_to_world(
+                    obj, field.center()
+                )
             result["toggle:"] = self._gradient_local_to_world(
                 obj, self._rotated_gradient_point(
                     origin,
@@ -3047,10 +3553,24 @@ class _CanvasLogic:
             )
             return result
         path = self.layer_effective_path(obj.parent_layer_id)
-        center = self._shape_gradient_center(obj, path)
-        result["center:"] = self._gradient_local_to_world(
-            obj, center.toTuple()
-        )
+        if obj.shape_field.reverse_direction or obj.shape_field.uniform:
+            bounds = path.boundingRect()
+            signed_distance = (
+                obj.shape_field.distance
+                if obj.shape_field.reverse_direction
+                else -obj.shape_field.distance
+            )
+            result["distance:"] = self._gradient_local_to_world(
+                obj, (
+                    bounds.right() + signed_distance,
+                    bounds.center().y(),
+                )
+            )
+        else:
+            center = self._shape_gradient_center(obj, path)
+            result["center:"] = self._gradient_local_to_world(
+                obj, center.toTuple()
+            )
         return result
 
     def _draw_gradient_edit_handles(
@@ -3060,7 +3580,7 @@ class _CanvasLogic:
         controls = self._gradient_control_points(obj)
         painter.save()
         painter.setPen(QPen(QColor("#ff9f22"), 2 / scale))
-        painter.setBrush(QColor("#fff4d6"))
+        painter.setBrush(Qt.BrushStyle.NoBrush)
         if obj.field_type == "line":
             layer_x, layer_y = self.chapter.layer_world_translation(
                 obj.parent_layer_id
@@ -3080,7 +3600,7 @@ class _CanvasLogic:
                 insert = self._shape_segment_point(
                     obj.line_field.geometry, index, 0.5
                 )
-                painter.setBrush(QColor("#fff4d6"))
+                painter.setBrush(Qt.BrushStyle.NoBrush)
                 painter.drawEllipse(
                     insert, action_radius * 0.65, action_radius * 0.65
                 )
@@ -3088,7 +3608,7 @@ class _CanvasLogic:
                 node for node in obj.line_field.geometry.nodes
                 if node.node_id == selected_id
             ), None)
-            if selected is not None:
+            if selected is not None and False:
                 offset = 42 / scale
                 type_point = QPointF(
                     selected.x + offset, selected.y - offset
@@ -3120,6 +3640,11 @@ class _CanvasLogic:
                 painter.drawLine(
                     delete_point + QPointF(-cross, cross),
                     delete_point + QPointF(cross, -cross),
+                )
+            if selected is not None:
+                self._draw_selected_shape_gizmos(
+                    painter, obj.line_field.geometry, selected,
+                    geometry_only=True,
                 )
             painter.restore()
             painter.restore()
@@ -3179,7 +3704,8 @@ class _CanvasLogic:
             "toggle": 0, "incoming": 1, "outgoing": 1,
             "center": 2, "rotate": 2, "radius_x": 2,
             "radius_y": 2, "origin": 3, "node": 4,
-            "type": 0, "delete": 0, "insert": 5,
+            "type": 0, "delete": 0, "lock": 0, "roundness": 0,
+            "distance": 2, "insert": 5,
         }
         hits: list[tuple[int, float, str, str]] = []
         for key, candidate in controls.items():
@@ -3187,6 +3713,18 @@ class _CanvasLogic:
             distance = math.dist(
                 point.toTuple(), candidate.toTuple()
             )
+            if kind == "type":
+                type_hit = QRectF(
+                    candidate.x() - 32 / max(self.scale, 0.05),
+                    candidate.y() - 14 / max(self.scale, 0.05),
+                    64 / max(self.scale, 0.05),
+                    28 / max(self.scale, 0.05),
+                )
+                if type_hit.contains(point):
+                    hits.append((
+                        priority[kind], distance, kind, node_id
+                    ))
+                continue
             if (
                 obj.field_type == "radial"
                 and obj.radial_field.center_auto
@@ -3221,7 +3759,7 @@ class _CanvasLogic:
         if hit is None:
             return False
         kind, node_id = hit
-        if kind in {"type", "delete", "insert"}:
+        if kind in {"type", "delete", "insert", "lock"}:
             before = self.chapter.to_dict()
             geometry = obj.line_field.geometry
             if kind == "insert":
@@ -3240,6 +3778,9 @@ class _CanvasLogic:
                 if kind == "type":
                     self._toggle_shape_node_type(geometry, node)
                     label = "Change gradient path point type"
+                elif kind == "lock":
+                    self._toggle_shape_node_lock(geometry, node)
+                    label = "Lock gradient Bézier handles"
                 else:
                     if len(geometry.nodes) <= 2:
                         return True
@@ -3263,6 +3804,7 @@ class _CanvasLogic:
             return True
         self._model_before = self.chapter.to_dict()
         self._active_gradient_control = hit
+        self._shape_control_dragged = False
         self._drag_start_doc = QPointF(point)
         if kind == "node":
             self._selected_shape_node_id = node_id
@@ -3277,6 +3819,9 @@ class _CanvasLogic:
             "center": (
                 "Move gradient center; double-click resets automatic centering"
             ),
+            "roundness": "Drag to adjust roundness; click to toggle",
+            "lock": "Lock or unlock Bézier handles",
+            "distance": "Set gradient distance",
         }.get(kind, "Edit gradient"))
         return True
 
@@ -3292,6 +3837,24 @@ class _CanvasLogic:
         )
         local = self._gradient_world_to_local(obj, snapped_world)
         if obj.field_type == "line":
+            if kind == "distance":
+                path = self.bound_path(obj.line_field.geometry)
+                percent = path.percentAtLength(path.length() / 2)
+                midpoint = path.pointAtPercent(percent)
+                angle = math.radians(
+                    -path.angleAtPercent(percent) + 90
+                )
+                normal = QPointF(math.cos(angle), math.sin(angle))
+                value = QPointF.dotProduct(local - midpoint, normal)
+                obj.line_field.perpendicular_distance = (
+                    value if abs(value) >= 1.0
+                    else 1.0 if value >= 0 else -1.0
+                )
+                obj.line_field.validate()
+                obj.touch_revision()
+                self.documentChanged.emit(QRectF())
+                self.update()
+                return
             node = next((
                 candidate for candidate in obj.line_field.geometry.nodes
                 if candidate.node_id == node_id
@@ -3314,6 +3877,25 @@ class _CanvasLogic:
                     obj.line_field.geometry, node, kind,
                     (local.x(), local.y()),
                 )
+            elif kind == "roundness":
+                if math.dist(
+                    world_point.toTuple(), self._drag_start_doc.toTuple()
+                ) > 3 / max(self.scale, 0.05):
+                    self._shape_control_dragged = True
+                if self._shape_control_dragged:
+                    position = QPointF(node.x, node.y)
+                    node.roundness = min(
+                        self._maximum_shape_roundness(
+                            obj.line_field.geometry, node
+                        ),
+                        math.dist(
+                            position.toTuple(), local.toTuple()
+                        ),
+                    )
+                    if node.roundness < 1e-6:
+                        node.roundness = 0.0
+                    node.roundness_enabled = True
+            obj.line_field.geometry.normalize_bezier_handles()
         elif obj.field_type == "radial":
             field = obj.radial_field
             if kind == "origin":
@@ -3331,6 +3913,16 @@ class _CanvasLogic:
             elif kind == "center":
                 field.center_auto = False
                 field.manual_center = (local.x(), local.y())
+            elif kind == "distance":
+                dx = local.x() - field.origin_x
+                dy = local.y() - field.origin_y
+                angle = math.radians(-field.rotation)
+                rotated_x = dx * math.cos(angle) - dy * math.sin(angle)
+                field.distance = max(1.0, (
+                    rotated_x - field.radius_x
+                    if field.reverse_direction
+                    else field.radius_x - rotated_x
+                ))
             else:
                 dx = local.x() - field.origin_x
                 dy = local.y() - field.origin_y
@@ -3349,6 +3941,16 @@ class _CanvasLogic:
         elif kind == "center":
             obj.shape_field.center_auto = False
             obj.shape_field.manual_center = (local.x(), local.y())
+            obj.shape_field.validate()
+        elif kind == "distance":
+            bounds = self.layer_effective_path(
+                obj.parent_layer_id
+            ).boundingRect()
+            obj.shape_field.distance = max(1.0, (
+                local.x() - bounds.right()
+                if obj.shape_field.reverse_direction
+                else bounds.right() - local.x()
+            ))
             obj.shape_field.validate()
         obj.touch_revision()
         self.documentChanged.emit(QRectF())
@@ -3524,6 +4126,7 @@ class _CanvasLogic:
 
     def _shape_gizmo_positions(
         self, bound: BoundGeometry, node: PathNode,
+        *, geometry_only: bool = False,
     ) -> dict[str, QPointF]:
         bound = self._contour_bound_for_node(bound, node)
         scale = max(self.scale, 0.05)
@@ -3547,7 +4150,7 @@ class _CanvasLogic:
             44 * SHAPE_CONTROL_SCALE / scale,
             -34 * SHAPE_CONTROL_SCALE / scale,
         )}
-        if not bound.closed:
+        if not bound.closed and not geometry_only:
             result["thickness"] = position + side
         if self._can_delete_shape_node(bound, node):
             result["delete"] = position + QPointF(
@@ -3577,7 +4180,11 @@ class _CanvasLogic:
                 58 * SHAPE_CONTROL_SCALE / scale,
                 18 * SHAPE_CONTROL_SCALE / scale,
             )
-        if not bound.closed and index in {0, len(bound.nodes) - 1}:
+        if (
+            not geometry_only
+            and not bound.closed
+            and index in {0, len(bound.nodes) - 1}
+        ):
             result["cap"] = position + QPointF(
                 44 * SHAPE_CONTROL_SCALE / scale,
                 38 * SHAPE_CONTROL_SCALE / scale,
@@ -3694,6 +4301,7 @@ class _CanvasLogic:
     def _shape_hit_test(
         self, bound: BoundGeometry, local: QPointF,
         include_insert: bool = True,
+        *, geometry_only: bool = False,
     ) -> dict | None:
         """Resolve one shape target using the same priority as rendering."""
         if bound.additional_contours:
@@ -3708,7 +4316,8 @@ class _CanvasLogic:
                     primitive="custom",
                 )
                 hit = self._shape_hit_test(
-                    working, local, include_insert=include_insert
+                    working, local, include_insert=include_insert,
+                    geometry_only=geometry_only,
                 )
                 if hit is None:
                     continue
@@ -3733,7 +4342,9 @@ class _CanvasLogic:
                         "position": position,
                     }
         if selected is not None and self._can_delete_shape_node(bound, selected):
-            position = self._shape_gizmo_positions(bound, selected)["delete"]
+            position = self._shape_gizmo_positions(
+                bound, selected, geometry_only=geometry_only
+            )["delete"]
             if math.dist(
                 (local.x(), local.y()), (position.x(), position.y())
             ) <= 12 * SHAPE_CONTROL_SCALE / scale:
@@ -3743,7 +4354,7 @@ class _CanvasLogic:
                 }
         if selected is not None and bound.primitive == "custom":
             for name, position in self._shape_gizmo_positions(
-                bound, selected
+                bound, selected, geometry_only=geometry_only
             ).items():
                 if name == "delete":
                     continue
@@ -3955,9 +4566,12 @@ class _CanvasLogic:
     def _draw_selected_shape_gizmos(
         self, painter: QPainter, bound: BoundGeometry, node: PathNode,
         style: ShapeStyle | None = None,
+        *, geometry_only: bool = False,
     ) -> None:
         scale = max(self.scale, 0.05)
-        positions = self._shape_gizmo_positions(bound, node)
+        positions = self._shape_gizmo_positions(
+            bound, node, geometry_only=geometry_only
+        )
         painter.save()
         painter.setPen(QPen(
             QColor("#FFBE00"), 2 * SHAPE_CONTROL_SCALE / scale
@@ -4143,6 +4757,9 @@ class _CanvasLogic:
                     self._draw_selected_shape_gizmos(
                         painter, geometry, node,
                         self._creation_style or ShapeStyle(),
+                        geometry_only=(
+                            self._gradient_creation_type == "line"
+                        ),
                     )
             if self._shape_hover_insert is not None:
                 point = self._shape_hover_insert[2]
@@ -4212,9 +4829,39 @@ class _CanvasLogic:
                 for x, y in self._rect_quad(local)
             ]
         if isinstance(obj, GradientObject):
-            bounds = self.layer_effective_path(
-                obj.parent_layer_id
-            ).boundingRect()
+            if obj.field_type == "line":
+                bounds = self.bound_path(
+                    obj.line_field.geometry
+                ).boundingRect()
+            elif obj.field_type == "radial":
+                field = obj.radial_field
+                radius_y = (
+                    field.radius_y
+                    if field.ellipse_enabled else field.radius_x
+                )
+                corners = [
+                    self._rotated_gradient_point(
+                        (field.origin_x, field.origin_y), vector,
+                        field.rotation,
+                    )
+                    for vector in (
+                        (-field.radius_x, -radius_y),
+                        (field.radius_x, -radius_y),
+                        (field.radius_x, radius_y),
+                        (-field.radius_x, radius_y),
+                    )
+                ]
+                return [
+                    (x + layer_x, y + layer_y) for x, y in corners
+                ]
+            else:
+                bounds = self.layer_effective_path(
+                    obj.parent_layer_id
+                ).boundingRect()
+            bounds = QRectF(
+                bounds.left(), bounds.top(),
+                max(1.0, bounds.width()), max(1.0, bounds.height()),
+            )
             return [
                 (x + layer_x, y + layer_y)
                 for x, y in self._rect_quad(bounds)
@@ -4227,6 +4874,22 @@ class _CanvasLogic:
         ]
 
     def _selected_world_quad(self) -> list[tuple[float, float]] | None:
+        if (
+            self._geometry_transform_target is not None
+            and self._geometry_transform_target[0] == "object"
+            and self._transform_preview_quad is not None
+        ):
+            obj = self.chapter.objects.get(
+                self._geometry_transform_target[1]
+            )
+            if obj is not None:
+                layer_x, layer_y = self.chapter.layer_world_translation(
+                    obj.parent_layer_id
+                )
+                return [
+                    (x + layer_x, y + layer_y)
+                    for x, y in self._transform_preview_quad
+                ]
         if (
             self.tool == ToolKind.TRANSFORM
             and self._transform_preview_quad is not None
@@ -4287,7 +4950,16 @@ class _CanvasLogic:
                 layers = layers[:index + 1]
         direct_mask_id = (
             layer_id
-            if obj is not None and obj.ignore_parent_mask else ""
+            if (
+                obj is not None
+                and (
+                    obj.ignore_parent_mask
+                    or (
+                        isinstance(obj, GradientObject)
+                        and self._is_outward_gradient(obj)
+                    )
+                )
+            ) else ""
         )
         skipped_masks = {direct_mask_id} if direct_mask_id else set()
         for parent, child in zip(layers, layers[1:]):
@@ -4381,6 +5053,34 @@ class _CanvasLogic:
                 obj.parent_layer_id
             )
             local = QPointF(point.x() - layer_x, point.y() - layer_y)
+            if self._is_outward_gradient(obj):
+                if obj.field_type == "radial":
+                    field = obj.radial_field
+                    angle = math.radians(-field.rotation)
+                    dx, dy = (
+                        local.x() - field.origin_x,
+                        local.y() - field.origin_y,
+                    )
+                    x = dx * math.cos(angle) - dy * math.sin(angle)
+                    y = dx * math.sin(angle) + dy * math.cos(angle)
+                    radius_y = (
+                        field.radius_y
+                        if field.ellipse_enabled else field.radius_x
+                    )
+                    normalized = math.hypot(
+                        x / field.radius_x, y / radius_y
+                    )
+                    if normalized < 1:
+                        return False
+                    ray = math.hypot(x, y)
+                    boundary = ray / max(normalized, 1e-6)
+                    return ray - boundary <= field.distance
+                path = self.layer_effective_path(obj.parent_layer_id)
+                stroker = QPainterPathStroker()
+                stroker.setWidth(obj.shape_field.distance * 2)
+                return stroker.createStroke(path).subtracted(path).contains(
+                    local
+                )
             return self.layer_effective_path(
                 obj.parent_layer_id
             ).contains(local)
@@ -5253,6 +5953,14 @@ class _CanvasLogic:
             event.accept()
             return
         if (
+            self.tool == ToolKind.SHAPE_EDIT
+            and self._geometry_transform_target is not None
+            and self._transform_start_quad is not None
+        ):
+            self._update_geometry_transform_preview(point)
+            self.update()
+            return
+        if (
             event.key() == Qt.Key_Escape
             and self._gradient_creation_parent_id
         ):
@@ -5675,7 +6383,10 @@ class _CanvasLogic:
         previous = self._selected_shape_node_id
         self._selected_shape_node_id = self._creation_selected_node_id
         try:
-            return self._shape_hit_test(geometry, point)
+            return self._shape_hit_test(
+                geometry, point,
+                geometry_only=(self._gradient_creation_type == "line"),
+            )
         finally:
             self._selected_shape_node_id = previous
 
@@ -8436,6 +9147,8 @@ class _CanvasLogic:
                 and self._begin_shape_edit(point, allow_interior=False)
             ):
                 return
+            if self._begin_geometry_transform(point):
+                return
             hits = [
                 hit for hit in self.hit_test_shape_edit_layers(point)
                 if hit["id"] != self.selected_id
@@ -8666,6 +9379,11 @@ class _CanvasLogic:
                         "type": "Switch this point between Vector and Bézier",
                         "delete": "Delete this gradient path point",
                         "insert": "Insert a point on the gradient path",
+                        "lock": "Lock or unlock Bézier handles",
+                        "roundness": (
+                            "Click to toggle roundness; drag to adjust it"
+                        ),
+                        "distance": "Adjust the gradient distance",
                     }.get(hit[0], "Edit gradient"))
                 else:
                     self.unsetCursor()
@@ -8938,14 +9656,39 @@ class _CanvasLogic:
             self.interactionFinished.emit()
             return
         if (
+            self._geometry_transform_target is not None
+            and self._model_before is not None
+            and self._transform_preview_quad is not None
+        ):
+            self._commit_geometry_transform()
+            self.interactionFinished.emit()
+            return
+        if (
             self._model_before is not None
             and self._active_gradient_control is not None
         ):
             before, self._model_before = self._model_before, None
+            gradient_control = self._active_gradient_control
             self._active_gradient_control = None
             selected = self.chapter.objects.get(self.selected_object_id)
             if isinstance(selected, GradientObject):
+                if (
+                    selected.field_type == "line"
+                    and gradient_control[0] == "roundness"
+                    and not self._shape_control_dragged
+                ):
+                    node = next((
+                        candidate
+                        for candidate in selected.line_field.geometry.nodes
+                        if candidate.node_id == gradient_control[1]
+                    ), None)
+                    if node is not None:
+                        self._toggle_shape_node_roundness(
+                            selected.line_field.geometry, node
+                        )
                 selected.validate_gradient()
+                selected.touch_revision()
+            self._shape_control_dragged = False
             after = self.chapter.to_dict()
             if before != after:
                 self.push_model_change(before, after, "Edit gradient geometry")
@@ -9065,6 +9808,8 @@ class _CanvasLogic:
             or self.chapter.layers[parent_id].layer_kind == "fill"
             or field_type not in {"line", "radial", "parent_shape"}
         ):
+            return False
+        if self.chapter.gradient_children(parent_id, field_type):
             return False
         if field_type == "parent_shape":
             return self.create_gradient(parent_id, field_type) is not None
@@ -10483,6 +11228,223 @@ class _CanvasLogic:
         ):
             return "translate", None
         return "", None
+
+    def _begin_geometry_transform(self, point: QPointF) -> bool:
+        if self.chapter is None:
+            return False
+        if self.selected_kind == "layer":
+            layer = self.chapter.layers.get(self.selected_id)
+            if layer is None or layer.bound is None:
+                return False
+            parent_id = layer.layer_id
+            wx, wy = self.chapter.layer_world_translation(parent_id)
+            left, top, width, height = layer.bound.bbox()
+            local_quad = self._rect_quad(QRectF(
+                left, top, max(1.0, width), max(1.0, height)
+            ))
+            world_quad = [(x + wx, y + wy) for x, y in local_quad]
+            target = ("layer", layer.layer_id)
+        else:
+            obj = self.chapter.objects.get(self.selected_id)
+            if (
+                not isinstance(obj, GradientObject)
+                or obj.field_type == "parent_shape"
+            ):
+                return False
+            parent_id = obj.parent_layer_id
+            wx, wy = self.chapter.layer_world_translation(parent_id)
+            world_quad = self.object_world_quad(obj.object_id)
+            if not world_quad:
+                return False
+            local_quad = [(x - wx, y - wy) for x, y in world_quad]
+            target = ("object", obj.object_id)
+        mode, handle = self._raster_transform_control_hit(
+            world_quad, point
+        )
+        if not mode:
+            return False
+        self._geometry_transform_target = target
+        self._transform_handle_index = handle
+        self._transform_drag_mode = mode
+        self._model_before = self.chapter.to_dict()
+        self._drag_start_doc = QPointF(point)
+        self._transform_start_quad = list(local_quad)
+        self._transform_preview_quad = list(local_quad)
+        pivot = self._transform_pivot or QPointF(
+            sum(x for x, _ in world_quad) / 4,
+            sum(y for _, y in world_quad) / 4,
+        )
+        self._transform_rotate_start = math.atan2(
+            point.y() - pivot.y(), point.x() - pivot.x()
+        )
+        return True
+
+    def _geometry_transform_parent_id(self) -> str:
+        if self._geometry_transform_target is None:
+            return ""
+        kind, entity_id = self._geometry_transform_target
+        if kind == "layer":
+            return entity_id
+        obj = self.chapter.objects.get(entity_id)
+        return obj.parent_layer_id if obj is not None else ""
+
+    def _update_geometry_transform_preview(self, point: QPointF) -> None:
+        parent_id = self._geometry_transform_parent_id()
+        if not parent_id or self._transform_start_quad is None:
+            return
+        layer_x, layer_y = self.chapter.layer_world_translation(parent_id)
+        local_point = (point.x() - layer_x, point.y() - layer_y)
+        start = list(self._transform_start_quad)
+        dx = point.x() - self._drag_start_doc.x()
+        dy = point.y() - self._drag_start_doc.y()
+        if self._transform_drag_mode == "pivot":
+            self._transform_pivot = QPointF(point)
+            self._transform_pivot_custom = True
+            return
+        if self._transform_drag_mode == "rotate":
+            world_pivot = self._transform_pivot or QPointF(
+                sum(x for x, _ in start) / 4 + layer_x,
+                sum(y for _, y in start) / 4 + layer_y,
+            )
+            angle = (
+                math.atan2(
+                    point.y() - world_pivot.y(),
+                    point.x() - world_pivot.x(),
+                )
+                - self._transform_rotate_start
+            )
+            cosine, sine = math.cos(angle), math.sin(angle)
+            pivot = QPointF(
+                world_pivot.x() - layer_x, world_pivot.y() - layer_y
+            )
+            candidate = [
+                (
+                    pivot.x() + (x - pivot.x()) * cosine
+                    - (y - pivot.y()) * sine,
+                    pivot.y() + (x - pivot.x()) * sine
+                    + (y - pivot.y()) * cosine,
+                )
+                for x, y in start
+            ]
+        elif self._transform_drag_mode == "translate":
+            candidate = [(x + dx, y + dy) for x, y in start]
+        elif self.settings.transform_mode == "uniform":
+            handle = self._transform_handle_index
+            anchors = start + self._edge_midpoints(start)
+            opposite = [2, 3, 0, 1, 6, 7, 4, 5][handle]
+            origin, initial = anchors[opposite], anchors[handle]
+            target = self._snap_transform_point(local_point, parent_id)
+            factor = math.dist(origin, target) / max(
+                math.dist(origin, initial), 1e-6
+            )
+            candidate = [
+                (
+                    origin[0] + (x - origin[0]) * factor,
+                    origin[1] + (y - origin[1]) * factor,
+                )
+                for x, y in start
+            ]
+        else:
+            handle = self._transform_handle_index
+            target = self._snap_transform_point(local_point, parent_id)
+            candidate = list(start)
+            if handle < 4:
+                candidate[handle] = target
+            else:
+                edge = handle - 4
+                midpoint = self._edge_midpoints(start)[edge]
+                change = target[0] - midpoint[0], target[1] - midpoint[1]
+                for index in (edge, (edge + 1) % 4):
+                    candidate[index] = (
+                        start[index][0] + change[0],
+                        start[index][1] + change[1],
+                    )
+        if self._quad_is_valid(candidate):
+            self._transform_preview_quad = candidate
+
+    def _commit_geometry_transform(self) -> None:
+        target = self._geometry_transform_target
+        before = self._model_before
+        source = self._transform_start_quad
+        destination = self._transform_preview_quad
+        drag_mode = self._transform_drag_mode
+        self._geometry_transform_target = None
+        self._model_before = None
+        self._transform_start_quad = None
+        self._transform_preview_quad = None
+        self._transform_handle_index = None
+        self._transform_drag_mode = None
+        if (
+            target is None or before is None or source is None
+            or destination is None or drag_mode == "pivot"
+        ):
+            self.update()
+            return
+        transform = QTransform.quadToQuad(
+            QPolygonF([QPointF(*value) for value in source]),
+            QPolygonF([QPointF(*value) for value in destination]),
+        )
+
+        def map_point(value: tuple[float, float]) -> tuple[float, float]:
+            mapped = transform.map(QPointF(*value))
+            return mapped.x(), mapped.y()
+
+        kind, entity_id = target
+        if kind == "layer":
+            layer = self.chapter.layers[entity_id]
+            for contour in layer.bound.iter_contours():
+                for node in contour.nodes:
+                    node.position = map_point(node.position)
+                    if node.incoming is not None:
+                        node.incoming = map_point(node.incoming)
+                    if node.outgoing is not None:
+                        node.outgoing = map_point(node.outgoing)
+            if drag_mode not in {"translate"}:
+                layer.bound.primitive = "custom"
+            layer.bound.normalize_bezier_handles()
+            label = "Transform shape"
+        else:
+            obj = self.chapter.objects[entity_id]
+            if obj.field_type == "line":
+                for contour in obj.line_field.geometry.iter_contours():
+                    for node in contour.nodes:
+                        node.position = map_point(node.position)
+                        if node.incoming is not None:
+                            node.incoming = map_point(node.incoming)
+                        if node.outgoing is not None:
+                            node.outgoing = map_point(node.outgoing)
+            else:
+                field = obj.radial_field
+                origin = map_point((field.origin_x, field.origin_y))
+                radius_y = (
+                    field.radius_y if field.ellipse_enabled
+                    else field.radius_x
+                )
+                x_point = map_point(self._rotated_gradient_point(
+                    (field.origin_x, field.origin_y),
+                    (field.radius_x, 0), field.rotation,
+                ))
+                y_point = map_point(self._rotated_gradient_point(
+                    (field.origin_x, field.origin_y),
+                    (0, radius_y), field.rotation,
+                ))
+                field.origin_x, field.origin_y = origin
+                field.radius_x = max(0.001, math.dist(origin, x_point))
+                field.radius_y = max(0.001, math.dist(origin, y_point))
+                field.rotation = math.degrees(math.atan2(
+                    x_point[1] - origin[1], x_point[0] - origin[0]
+                ))
+                field.ellipse_enabled = True
+                if field.manual_center is not None:
+                    field.manual_center = map_point(field.manual_center)
+            obj.touch_revision()
+            label = "Transform gradient"
+        after = self.chapter.to_dict()
+        if before != after:
+            self.push_model_change(before, after, label)
+            self.hierarchyChanged.emit()
+        self.documentChanged.emit(QRectF())
+        self.update()
 
     def _begin_selected_raster_transform(self, point: QPointF) -> bool:
         if self.chapter is None or not self.selected_object_id:

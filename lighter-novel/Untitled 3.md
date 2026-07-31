@@ -1,27 +1,27 @@
 ## Gradient tool / objects:
-- add a gradient object type with its own creation tool
+- [x] add a gradient object type with its own creation tool
 	- dropdown that lets the user create a shape fill gradient, a linear/curve gradient, or a circle/ellipsoid gradient. these are parameterized objects that are the child of a shape
 	- these gradients would fill the screen, but they don't when the child of a page or shape, instead masking beneath that shape like any other child of a shape.
 	- add a "gradient tools" ribbon menu that appears whenever any object that is the child of a shape is selected, or whenever a shape is selected (so pretty much all the time). 
 	- if a gradient object is selected, automatically switch the ribbon to this menu.
 	- in the gradient tools ribbon menu, add a column labeled "create gradient" which lets the user create a gradient as a child of the currently active shape, but at the bottom of its child heirarchy (if there exist children in that shape). there are different types of gradients that dictate how the gradient map is applied, as follows below:
-	- line/curve gradient:
+	- [x] line/curve gradient:
 		- lets the user create an open shape - exact same controls as making a an open shape  in the current "add shape" tool (except without the ability to close it)
 		- has a start point and an end point. the gradient transitions itself along that curve.
 		- colors extend beyond the start and end, as a flat fill of their corresponding color.
-	- circle/ellipsoid gradient:
+	- [x] circle/ellipsoid gradient:
 		- lets the user click and drag to create a circle - same as the circle tool
 		- has handles to change the origin point and radius
 		- has a gizmo that lets it switch between circle and ellipse
 		- if ellipse on, has 2 handles for radius, and another handle for rotation
 		- gradient transition occurs from the outside edges inwards. beyond the outside of the circle is purely just the color of the end of the gradient.
-	- create shape gradient:
+	- [x] create shape gradient:
 		- has no boundary-defining gizmo (besides the gradient center mentioned later)
 		- the boundary is instead defined by the parent, where the start is the borders of the parent shape and the end is the gradient center point.
-	- gradient center gizmo (not part of the ribbon, instead on the canvas)
+	- [x] gradient center gizmo (not part of the ribbon, instead on the canvas)
 		- exists in circle/ellipsoid gradient and in shape fill gradient
 		- has a gizmo that lets you move the "gradient center" which is where the gradient transitions toward. it defaults to the center of the shape and follows changes in the shape, but if this gizmo is moved manually at some point, it doesn't follow those changes. double clicking/tapping this gizmo if its "unlocked" resets it so it goes back to the centerpoint and follows like normal
-	- add a "Gradient parameters" column in the ribbon that shows a rect box that is a live gradient from left to right, with handles that allow you to add and remove colors. the handle should be a box with the current color of the handle and a triangle pointing up at the gradient. clicking and dragging this handle moves it across this linear spectrum. double clicking it bring up the same color picker we use in the bottom left (make sure it also shows the primary and secondary current colors as pickable options).
+	- [x] add a "Gradient parameters" column in the ribbon that shows a rect box that is a live gradient from left to right, with handles that allow you to add and remove colors. the handle should be a box with the current color of the handle and a triangle pointing up at the gradient. clicking and dragging this handle moves it across this linear spectrum. double clicking it bring up the same color picker we use in the bottom left (make sure it also shows the primary and secondary current colors as pickable options).
 		- plus button to add a new gradient point, minus to remove the selected one.
 		- basically, the same controls as blender's colorRamp node.
 		- this is a "gradient ramp" type of data. keep this separate, as its something we may need to call for later features.
@@ -31,13 +31,40 @@
 		- each gradient object has its own parameters and gradient ramp of course, so changing the values of one doesn't change any other gradient objects
 			- this also means that loading a gradient preset and changing it doesn't override it until you hit save.
 			- this means that even if a gradient ramp preset has changed, this change doesn't propogate to any other gradient objects that use that preset, unless the user clicked that gradient, opened the dropdown, and reselected that gradient ramp, which would load the new data. treat loading as loading those values onto the current gradient ramp.
-- gradients may be used later as maps for other things, so make the structure for gradient data and creation generalizable. instead of all gradients having color fill data, make the gradient we just created a subtype of gradient that specifically does fill colors. the gradients parent structure should have all the shape creation/gizmos/ribbon thing, and type of gradient should be an attribute of that structure.
-- make sure to use best practices for programming patterns when designing how gradients work.
+- [x] gradients may be used later as maps for other things, so make the structure for gradient data and creation generalizable. instead of all gradients having color fill data, make the gradient we just created a subtype of gradient that specifically does fill colors. the gradients parent structure should have all the shape creation/gizmos/ribbon thing, and type of gradient should be an attribute of that structure.
+- [x] make sure to use best practices for programming patterns when designing how gradients work.
 
 ## Gradient tweaks:
-- one preset that can't be changed or deleted but can be loaded - primary to secondary
-- add a "swap primary/secondary" button to the main color picker, in the same row. make it a square button with a refresh icon
-- shape gradient has an option that when enabled, instead of using a center inside, points the gradient outwards, with a gizmo for the distance outwards until it reaches its maximum ignoring the masking of its parent (but not its parent's parent). 
+- [x] add a gradient ramp preset that can't be changed or deleted but can be loaded - primary to secondary
+- [x] add a "swap primary/secondary" button to the main color picker, in the same row. make it a square button with a refresh icon
+- [x] shape gradient has an option that when enabled, instead of using a center inside, points the gradient outwards, with a gizmo for the distance outwards until it reaches its maximum ignoring the masking of its parent (but not its parent's parent). 
+- [x] performance on shape gradients is abyssmal - any time a gradient is updated, be it by moving the center or modifying the ramp, it runs super poorly. find ways to optimize this so it runs as close to realtime as possible.
+- [x] gradient colors can have transparency, but currently they aren't showing on the canvas (transparency should work)
+- [x] the circle gradient gizmos have their own fill, which is blocking me from seeing the actual gradient underneath. these should not have fills and should show the gradient that's being modified.
+- [x] the same happens with line/curve for some reason, and the handles aren't selectable, instead they make a point? super bugged. the line/curve creation and editing should be exactly like making a new open shape with the shape tool, with the same adding of points, gizmos, handles, etc.
+- [x] in shape mode, it's not showing any option to translate the shape - this should be available.
+- [x] gradient tool columns in the ribbon menu are too wide. make them about 60 percent the width they currently are.
+- [x] in "create gradient" column in gradient tools ribbon, if the user has a shape selected that has a gradient, expose a "select gradient" button
+- [x] linear gradient curve positions matter - they should be the path along which the gradient color transitions.
+	- [x] add a gradient ribbon menu column called "gradient type parameters" that, if a linear gradient is selected, exposes the following options:
+		- follow direction: 
+			- parallell: the gradient transition occurs from first point to last point
+			- perpindicular: starts from the line and extends outwards on one side of the line. exposes setting for the distance this ends at from the line.
+		- toggle: reverse direction
+			- in parallell, transition occurs from last to first
+			- in perpindicular, transition occurs from max distance from line towards the line.
+	- if a shape gradient is selected (circle or shape-based)
+		- reverse direction:
+			- in circle, transition starts at edges of circle, ends at max distance value
+			- in shape, forces the gradient to ignore parent mask. shows gradient outwards up to a max distance, starting from the shape bounds (like a glow effect)
+			- in this case, gradient shows in canvas as if it's below the parent (parent on top) to avoid coloring over the parent or its children
+
+## final? gradient tweaks
+- in ellipse and parent shape gradient modes, in gradient type parameters add a "uniform " toggle, that, when enabled, ignores the center dot and instead transitions to a certain distance from the bounds (parent bounds in parent mode, ellipsoid/circle bounds in those.)
+	- instead of an "outward" value, rename it to "distance" so we can use it for uniform in non-reversed cases
+		- in this case, it acts as if "inward" (current outward behavior still should work but just when reversed is enabled)
+- line/curve gradient should have ALL the gizmos and handles that the shape version has, including handle type (vector/bezier), roundness, lock bezier handles, etc.
+
 
 ## new gradient type: speed lines
 speed lines, includes opacity too
@@ -151,13 +178,15 @@ test the fill tool dumbass (vector and raster drawing)
 
 ## Bugs:
 - [ ] now the raster pencil doesn't work. instead it just draws a dot. if the issue is that the interaction would translate, instead make the translation handle for the raster 8 handle system happen only when hovering/clickdragging around the outside of the width/height with a 20px outside margin.
+- [ ] where did pencil settings go? I had a pencil settings dialogue somewhere. it had some pretty precise adjustments. is it supposed to be under tool settings? i can't select tool settings while in raster or vector pencil (this must be a bug)
 
 
 ## Performance issues
 - pinch zoom is laggy
-- make sure vector drawing is SNAPPY
+- improve performance for vector drawin
 - sweep simplify is super laggy
 - transforming in stroke select mode is slow
+- shape gradient in reverse direction is very slow to update
 
 ## OG prompt
 - add a drawing selection tools dropdown that has rect select, lasso select, and stroke select. for now, just make it work on only raster drawings or vector drawings - only allowing you to either select pixels or points. if in stroke select (which only appers on a vector drawing), hovering over should show a blue outline around the stroke you're over. clicking it selects all points on that stroke.

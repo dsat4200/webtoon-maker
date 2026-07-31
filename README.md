@@ -190,6 +190,33 @@ higher ancestor masks. Strict text inside a
 compound parent can independently use the parent’s main path or the full
 compiled compound result.
 
+## Gradient objects
+
+Gradient objects are direct children of shapes and are edited through the
+contextual **Gradient Tools** ribbon. A shape can own one Line/Curve, one
+Circle/Ellipse, and one Parent Shape gradient; use **Select Gradient** to
+select the child matching the field-type dropdown. Line gradients follow the
+actual curve by arc length or extend perpendicularly from either side.
+Reverse flips the ramp direction. Reversed radial and Parent Shape gradients
+extend outward to their distance handle, bypass only the direct parent mask,
+and render beneath the parent as an outside glow.
+
+Radial and Parent Shape gradients also support **Uniform** inward distance:
+the ramp starts at the effective boundary and reaches its final color after
+the chosen physical Distance. Reverse takes precedence and uses that same
+Distance outward. Hidden automatic or manual centers are preserved when
+Uniform is toggled. Line/Curve gradients use the full open-path geometry
+editor—including Vector/Bézier conversion, insertion, deletion, handle
+locking, and roundness—without irrelevant cap or thickness controls.
+
+Gradient ramps support translucent ARGB stops and reusable per-series
+presets. **Primary to Secondary** is a built-in, read-only preset that copies
+the current color wells when loaded. The square swap control between those
+wells exchanges the active primary and secondary colors. Gradient geometry,
+scalar distance fields, and ramp colors are cached independently so moving a
+center or editing ramp colors updates interactively without rebuilding the
+parent boundary.
+
 ## Test
 
 ```powershell
