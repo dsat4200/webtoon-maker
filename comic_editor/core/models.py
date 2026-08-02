@@ -7,7 +7,7 @@ from dataclasses import dataclass, field
 from typing import Any, Iterable, Iterator, Literal
 
 
-SCHEMA_VERSION = 12
+SCHEMA_VERSION = 13
 CHAPTER_WIDTH = 1080
 DEFAULT_CHAPTER_HEIGHT = 3240
 GROWTH_MARGIN = 1080
@@ -1127,6 +1127,79 @@ class ShapeGradientField:
 
 
 @dataclass
+class SpeedLinesField:
+    """Impact-line parameters shared by all speed-lines field types."""
+
+    density: float = 0.04
+    gap: float = 0.0
+    close_range: float = 0.0
+    randomness_distance: float = 0.0
+    randomness_scale: float = 10.0
+
+    def validate(self) -> None:
+        try:
+            density = float(self.density)
+        except (TypeError, ValueError):
+            density = 0.04
+        self.density = (
+            max(0.005, min(0.5, density)) if math.isfinite(density) else 0.04
+        )
+        try:
+            gap = float(self.gap)
+        except (TypeError, ValueError):
+            gap = 0.0
+        self.gap = max(0.0, gap) if math.isfinite(gap) else 0.0
+        try:
+            close_range = float(self.close_range)
+        except (TypeError, ValueError):
+            close_range = 0.0
+        self.close_range = (
+            max(0.0, close_range) if math.isfinite(close_range) else 0.0
+        )
+        try:
+            randomness_distance = float(self.randomness_distance)
+        except (TypeError, ValueError):
+            randomness_distance = 0.0
+        self.randomness_distance = (
+            max(0.0, randomness_distance)
+            if math.isfinite(randomness_distance) else 0.0
+        )
+        try:
+            randomness_scale = float(self.randomness_scale)
+        except (TypeError, ValueError):
+            randomness_scale = 10.0
+        self.randomness_scale = (
+            max(1.0, min(100.0, randomness_scale))
+            if math.isfinite(randomness_scale) else 10.0
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        self.validate()
+        return {
+            "density": self.density,
+            "gap": self.gap,
+            "close_range": self.close_range,
+            "randomness_distance": self.randomness_distance,
+            "randomness_scale": self.randomness_scale,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any] | None) -> "SpeedLinesField":
+        data = data or {}
+        result = cls(
+            density=float(data.get("density", 0.04)),
+            gap=float(data.get("gap", 0.0)),
+            close_range=float(data.get("close_range", 0.0)),
+            randomness_distance=float(
+                data.get("randomness_distance", 0.0)
+            ),
+            randomness_scale=float(data.get("randomness_scale", 10.0)),
+        )
+        result.validate()
+        return result
+
+
+@dataclass
 class GradientObject(DocumentObject):
     """Base object: owns field geometry, while subtypes own mapped values."""
 
@@ -1190,6 +1263,67 @@ class ColorFillGradientObject(GradientObject):
         result.update({
             "ramp": self.ramp.to_dict(),
             "loaded_preset_id": self.loaded_preset_id,
+        })
+        return result
+
+
+@dataclass
+class SpeedLinesGradientObject(GradientObject):
+    gradient_type: str = "speed_lines"
+    name: str = "Speed Lines"
+    color_ramp: ColorGradientRamp = field(default_factory=ColorGradientRamp)
+    thickness_ramp: ColorGradientRamp = field(default_factory=ColorGradientRamp)
+    speed_field: SpeedLinesField = field(default_factory=SpeedLinesField)
+    center_shape_id: str = ""
+    loaded_preset_id: str = ""
+
+    def validate_gradient(self) -> None:
+        super().validate_gradient()
+        self.gradient_type = "speed_lines"
+        self.color_ramp.validate()
+        self.thickness_ramp.validate()
+        self.speed_field.validate()
+        self.center_shape_id = str(self.center_shape_id or "")
+        self.loaded_preset_id = str(self.loaded_preset_id or "")
+
+    def to_dict(self) -> dict[str, Any]:
+        result = self.gradient_dict()
+        result.update({
+            "color_ramp": self.color_ramp.to_dict(),
+            "thickness_ramp": self.thickness_ramp.to_dict(),
+            "speed_field": self.speed_field.to_dict(),
+            "center_shape_id": self.center_shape_id,
+            "loaded_preset_id": self.loaded_preset_id,
+        })
+        return result
+
+
+@dataclass
+class SpeedLineCenterObject(DocumentObject):
+    """Bounded reference shape owned by a SpeedLinesGradientObject.
+
+    Lines project toward the closest point on this shape's boundary instead
+    of the point center.  Owned exactly like a vector fill: not a layer child,
+    never movable, deleted independently of its owner gradient.
+    """
+
+    object_type: str = "speed_center"
+    name: str = "Speed Center"
+    owner_gradient_id: str = ""
+    geometry: BoundGeometry = field(
+        default_factory=lambda: BoundGeometry.rectangle(0, 0, 160, 160)
+    )
+
+    def validate_center(self) -> None:
+        self.owner_gradient_id = str(self.owner_gradient_id or "")
+        self.geometry.validate()
+
+    def to_dict(self) -> dict[str, Any]:
+        self.validate_center()
+        result = self.common_dict()
+        result.update({
+            "owner_gradient_id": self.owner_gradient_id,
+            "geometry": self.geometry.to_dict(),
         })
         return result
 
@@ -1453,7 +1587,7 @@ class VectorFillObject(DocumentObject):
 ObjectEntity = (
     RasterObject | TextObject | GradientObject
     | VectorDrawingObject | VectorFillObject
-    | DocumentObject
+    | SpeedLineCenterObject | DocumentObject
 )
 
 
@@ -1492,10 +1626,37 @@ def object_from_dict(data: dict[str, Any]) -> ObjectEntity:
             )
             result.validate_gradient()
             return result
+        if gradient_type == "speed_lines":
+            result = SpeedLinesGradientObject(
+                **gradient_common,
+                color_ramp=ColorGradientRamp.from_dict(
+                    data.get("color_ramp")
+                ),
+                thickness_ramp=ColorGradientRamp.from_dict(
+                    data.get("thickness_ramp")
+                ),
+                speed_field=SpeedLinesField.from_dict(
+                    data.get("speed_field")
+                ),
+                center_shape_id=str(data.get("center_shape_id", "")),
+                loaded_preset_id=str(data.get("loaded_preset_id", "")),
+            )
+            result.validate_gradient()
+            return result
         result = GradientObject(
             **gradient_common, gradient_type=gradient_type
         )
         result.validate_gradient()
+        return result
+    if object_type == "speed_center":
+        result = SpeedLineCenterObject(
+            **common,
+            owner_gradient_id=str(data.get("owner_gradient_id", "")),
+            geometry=BoundGeometry.from_dict(
+                data.get("geometry") or data.get("bound") or {}
+            ),
+        )
+        result.validate_center()
         return result
     if object_type == "vector_drawing":
         return VectorDrawingObject(
@@ -1651,7 +1812,10 @@ class ChapterDocument:
                     candidate_object = self.objects.get(child.entity_id)
                     if (
                         candidate_object is None
-                        or isinstance(candidate_object, VectorFillObject)
+                        or isinstance(
+                            candidate_object,
+                            (VectorFillObject, SpeedLineCenterObject),
+                        )
                         or candidate_object.parent_layer_id != layer.layer_id
                     ):
                         raise ValueError("Invalid child object")
@@ -1691,6 +1855,7 @@ class ChapterDocument:
                         f"Vector fill {fill_id} does not inherit its owner's layer"
                     )
                 owned_fill_ids.add(fill_id)
+        owned_center_ids: set[str] = set()
         for object_id, obj in self.objects.items():
             if isinstance(obj, VectorFillObject):
                 obj.validate_vector_fill()
@@ -1704,6 +1869,23 @@ class ChapterDocument:
                     raise ValueError(
                         f"Vector fill {object_id} is not referenced by its owner"
                     )
+            elif isinstance(obj, SpeedLineCenterObject):
+                obj.validate_center()
+                owner = self.objects.get(obj.owner_gradient_id)
+                if not isinstance(owner, SpeedLinesGradientObject):
+                    raise ValueError(
+                        f"Speed center {object_id} requires a speed-lines owner"
+                    )
+                if owner.center_shape_id != object_id:
+                    raise ValueError(
+                        f"Speed center {object_id} is not referenced by its owner"
+                    )
+                parent = self.layers.get(owner.parent_layer_id)
+                if obj.parent_layer_id != owner.parent_layer_id:
+                    raise ValueError(
+                        f"Speed center {object_id} does not inherit its owner's layer"
+                    )
+                owned_center_ids.add(object_id)
             else:
                 parent = self.layers.get(obj.parent_layer_id)
             if (
@@ -1734,8 +1916,20 @@ class ChapterDocument:
                     raise ValueError("Text transform quad must have four points")
         expected = {("layer", key) for key in self.layers} | {
             ("object", key) for key, obj in self.objects.items()
-            if not isinstance(obj, VectorFillObject)
+            if not isinstance(
+                obj, (VectorFillObject, SpeedLineCenterObject)
+            )
         }
+        for obj in self.objects.values():
+            if (
+                isinstance(obj, SpeedLinesGradientObject)
+                and obj.center_shape_id
+                and obj.center_shape_id not in owned_center_ids
+            ):
+                raise ValueError(
+                    f"Speed lines {obj.object_id} references an invalid "
+                    "center shape"
+                )
         if referenced != expected:
             raise ValueError("Document contains unreachable entities")
         self._assert_acyclic()
@@ -1826,15 +2020,23 @@ class ChapterDocument:
     ) -> ObjectEntity:
         if isinstance(obj, VectorFillObject):
             return self.add_vector_fill(parent_id, obj, index)
+        if isinstance(obj, SpeedLineCenterObject):
+            return self.add_speed_center(parent_id, obj)
         parent = self.layers[parent_id]
         if parent.layer_kind == "fill":
             raise ValueError("Objects require a container layer")
-        if isinstance(obj, GradientObject) and self.gradient_children(
-            parent_id, obj.field_type
-        ):
-            raise ValueError(
-                f"This shape already has a {obj.field_type} gradient"
+        if isinstance(obj, GradientObject):
+            family = (
+                "speed_lines"
+                if isinstance(obj, SpeedLinesGradientObject) else "color_fill"
             )
+            if self.gradient_children(
+                parent_id, obj.field_type, family=family
+            ):
+                raise ValueError(
+                    f"This shape already has a {obj.field_type} "
+                    f"{family} gradient"
+                )
         obj.parent_layer_id = parent_id
         self.objects[obj.object_id] = obj
         reference = ChildRef("object", obj.object_id)
@@ -1851,8 +2053,12 @@ class ChapterDocument:
     def gradient_children(
         self, parent_id: str, field_type: str | None = None,
         *, excluding: str = "",
+        family: str | None = None,
     ) -> list[GradientObject]:
-        """Return direct gradient children in frontmost-first hierarchy order."""
+        """Return direct gradient children in frontmost-first hierarchy order.
+
+        `family` narrows to "color_fill" or "speed_lines" (None = all).
+        """
         parent = self.layers.get(parent_id)
         if parent is None:
             return []
@@ -1864,6 +2070,17 @@ class ChapterDocument:
             if (
                 isinstance(candidate, GradientObject)
                 and (field_type is None or candidate.field_type == field_type)
+                and (
+                    family is None
+                    or (
+                        family == "speed_lines"
+                        and isinstance(candidate, SpeedLinesGradientObject)
+                    )
+                    or (
+                        family == "color_fill"
+                        and isinstance(candidate, ColorFillGradientObject)
+                    )
+                )
             ):
                 result.append(candidate)
         return result
@@ -1903,6 +2120,39 @@ class ChapterDocument:
             if isinstance((fill := self.objects.get(fill_id)), VectorFillObject)
         ]
 
+    def add_speed_center(
+        self, owner_id: str, center: SpeedLineCenterObject,
+    ) -> SpeedLineCenterObject:
+        """Attach a center reference shape to a speed-lines gradient.
+
+        The center is owned like a vector fill: it never becomes a layer
+        child, cannot be moved, and is deleted independently.
+        """
+        owner = self.objects.get(owner_id)
+        if not isinstance(owner, SpeedLinesGradientObject):
+            raise ValueError("Speed centers require a speed-lines owner")
+        if owner.center_shape_id:
+            raise ValueError("This gradient already has a center shape")
+        if center.object_id in self.objects:
+            raise ValueError(f"Duplicate object ID: {center.object_id}")
+        center.owner_gradient_id = owner_id
+        center.parent_layer_id = owner.parent_layer_id
+        center.validate_center()
+        self.objects[center.object_id] = center
+        owner.center_shape_id = center.object_id
+        owner.touch_revision()
+        return center
+
+    def speed_center_for(
+        self, gradient_id: str,
+    ) -> SpeedLineCenterObject | None:
+        gradient = self.objects.get(gradient_id)
+        if not isinstance(gradient, SpeedLinesGradientObject):
+            return None
+        center = self.objects.get(gradient.center_shape_id)
+        return center if isinstance(center, SpeedLineCenterObject) else None
+
+
     def reorder_vector_fill(
         self, owner_id: str, fill_id: str, index: int,
     ) -> None:
@@ -1929,7 +2179,10 @@ class ChapterDocument:
             return None
         if (
             kind == "object"
-            and isinstance(self.objects.get(entity_id), VectorFillObject)
+            and isinstance(
+                self.objects.get(entity_id),
+                (VectorFillObject, SpeedLineCenterObject),
+            )
         ):
             return None
         parent_id = (
@@ -1950,6 +2203,10 @@ class ChapterDocument:
                 raise ValueError("Vector fills require their existing owner")
             self.reorder_vector_fill(new_parent_id, entity_id, index)
             return
+        if kind == "object" and isinstance(
+            self.objects.get(entity_id), SpeedLineCenterObject
+        ):
+            raise ValueError("Speed centers cannot be moved")
         if kind == "layer" and self.layers[entity_id].is_page:
             if new_parent_id is not None:
                 raise ValueError("Page layers cannot be reparented")
@@ -1975,16 +2232,20 @@ class ChapterDocument:
         else:
             entity = self.objects[entity_id]
             old_parent = self.layers[entity.parent_layer_id]
-            if (
-                isinstance(entity, GradientObject)
-                and self.gradient_children(
+            if isinstance(entity, GradientObject):
+                family = (
+                    "speed_lines"
+                    if isinstance(entity, SpeedLinesGradientObject)
+                    else "color_fill"
+                )
+                if self.gradient_children(
                     new_parent_id, entity.field_type,
-                    excluding=entity.object_id,
-                )
-            ):
-                raise ValueError(
-                    f"This shape already has a {entity.field_type} gradient"
-                )
+                    excluding=entity.object_id, family=family,
+                ):
+                    raise ValueError(
+                        f"This shape already has a {entity.field_type} "
+                        f"{family} gradient"
+                    )
         old_world = (
             self.layer_world_translation(old_parent.layer_id)
             if kind == "object" else (0.0, 0.0)
@@ -2034,6 +2295,24 @@ class ChapterDocument:
                         shape.manual_center[0] + dx,
                         shape.manual_center[1] + dy,
                     )
+                if isinstance(entity, SpeedLinesGradientObject):
+                    center = self.speed_center_for(entity.object_id)
+                    if center is not None:
+                        for contour in center.geometry.iter_contours():
+                            for node in contour.nodes:
+                                node.x += dx
+                                node.y += dy
+                                if node.incoming is not None:
+                                    node.incoming = (
+                                        node.incoming[0] + dx,
+                                        node.incoming[1] + dy,
+                                    )
+                                if node.outgoing is not None:
+                                    node.outgoing = (
+                                        node.outgoing[0] + dx,
+                                        node.outgoing[1] + dy,
+                                    )
+                        center.parent_layer_id = new_parent_id
                 entity.touch_revision()
             if isinstance(entity, VectorDrawingObject):
                 for fill in self.vector_fill_children(entity.object_id):
@@ -2054,10 +2333,24 @@ class ChapterDocument:
                 del self.objects[entity_id]
                 deleted_objects.add(entity_id)
                 return deleted_objects
+            if isinstance(obj, SpeedLineCenterObject):
+                owner = self.objects.get(obj.owner_gradient_id)
+                if isinstance(owner, SpeedLinesGradientObject):
+                    owner.center_shape_id = ""
+                    owner.touch_revision()
+                del self.objects[entity_id]
+                deleted_objects.add(entity_id)
+                return deleted_objects
             if isinstance(obj, VectorDrawingObject):
                 for fill_id in list(obj.fill_child_ids):
                     deleted_objects.update(
                         self.delete_entity("object", fill_id)
+                    )
+            if isinstance(obj, SpeedLinesGradientObject):
+                center = self.speed_center_for(obj.object_id)
+                if center is not None:
+                    deleted_objects.update(
+                        self.delete_entity("object", center.object_id)
                     )
             self.objects.pop(entity_id)
             parent = self.layers[obj.parent_layer_id]

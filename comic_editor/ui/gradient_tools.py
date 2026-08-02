@@ -12,7 +12,7 @@ from PySide6.QtWidgets import (
 
 from comic_editor.core.models import (
     ColorFillGradientObject, ColorGradientRamp, ColorGradientRampPreset,
-    ColorGradientStop, canonical_argb,
+    ColorGradientStop, SpeedLinesGradientObject, canonical_argb,
 )
 from comic_editor.ui.color_picker import ColorPickerPopup
 
@@ -169,7 +169,9 @@ class GradientToolsControls(QWidget):
     """Owns reusable widgets placed into the Gradient Tools ribbon groups."""
 
     createRequested = Signal(str)
+    speedCreateRequested = Signal(str)
     objectChanged = Signal()
+    centerShapeRequested = Signal()
     presetLoadRequested = Signal(str)
     presetAddRequested = Signal()
     presetSaveRequested = Signal(str)
@@ -182,6 +184,7 @@ class GradientToolsControls(QWidget):
         self._loading = False
         self._edit_before: dict | None = None
         self._selected_stop_id = ""
+        self._selected_thickness_stop_id = ""
 
         self.create_widget = QWidget(self)
         create = QVBoxLayout(self.create_widget)
@@ -190,9 +193,14 @@ class GradientToolsControls(QWidget):
         self.create_line = QPushButton("Line / Curve", self.create_widget)
         self.create_radial = QPushButton("Circle / Ellipse", self.create_widget)
         self.create_shape = QPushButton("Parent Shape", self.create_widget)
+        self.create_speed = QPushButton("Speed Lines", self.create_widget)
+        self.create_speed.setToolTip(
+            "Create a speed-lines gradient of the Selected type"
+        )
         button_row.addWidget(self.create_line)
         button_row.addWidget(self.create_radial)
         button_row.addWidget(self.create_shape)
+        button_row.addWidget(self.create_speed)
         create.addLayout(button_row)
         type_row = QHBoxLayout()
         type_row.addWidget(QLabel("Selected type", self.create_widget))
@@ -268,6 +276,80 @@ class GradientToolsControls(QWidget):
         stop_row.addStretch(1)
         parameters.addLayout(stop_row)
 
+        self.thickness_widget = QWidget(self)
+        thickness = QVBoxLayout(self.thickness_widget)
+        thickness.setContentsMargins(0, 0, 0, 0)
+        self.thickness_ramp_editor = GradientRampEditor(
+            self.thickness_widget
+        )
+        self.thickness_ramp_editor.setToolTip(
+            "Greyscale of this ramp drives each line's thickness"
+        )
+        thickness.addWidget(self.thickness_ramp_editor)
+        thickness_stop_row = QHBoxLayout()
+        self.add_thickness_stop = QPushButton("+", self.thickness_widget)
+        self.add_thickness_stop.setToolTip(
+            "Add a thickness curve stop"
+        )
+        self.remove_thickness_stop = QPushButton(
+            "−", self.thickness_widget
+        )
+        self.remove_thickness_stop.setToolTip(
+            "Remove the selected thickness stop"
+        )
+        thickness_stop_row.addWidget(self.add_thickness_stop)
+        thickness_stop_row.addWidget(self.remove_thickness_stop)
+        thickness_stop_row.addStretch(1)
+        thickness.addLayout(thickness_stop_row)
+
+        self.impact_widget = QWidget(self)
+        impact = QVBoxLayout(self.impact_widget)
+        impact.setContentsMargins(0, 0, 0, 0)
+        self._speed_sliders: dict[str, tuple[QSlider, QDoubleSpinBox]] = {}
+        for key, label, slider_max, decimals, spin_min, spin_max, default in (
+            ("density", "Density", 500, 3, 0.005, 0.5, 0.04),
+            ("gap", "Gap", 200, 0, 0, 200, 0),
+            ("close_range", "Close range", 500, 0, 0, 500, 0),
+            ("randomness_distance", "Randomness distance", 500, 0, 0, 500, 0),
+            ("randomness_scale", "Randomness scale", 100, 0, 1, 100, 10),
+        ):
+            scale = 10 ** decimals
+            row = QWidget(self.impact_widget)
+            row_layout = QHBoxLayout(row)
+            row_layout.setContentsMargins(0, 0, 0, 0)
+            row_layout.addWidget(QLabel(label, row))
+            slider = QSlider(Qt.Orientation.Horizontal, row)
+            slider.setRange(int(round(spin_min * scale)),
+                            int(round(spin_max * scale)))
+            slider.setValue(int(round(default * scale)))
+            value = QDoubleSpinBox(row)
+            value.setDecimals(decimals)
+            value.setRange(spin_min, spin_max)
+            value.setValue(default)
+            value.setButtonSymbols(
+                QDoubleSpinBox.ButtonSymbols.NoButtons
+            )
+            slider.valueChanged.connect(
+                lambda item, spin=value, scale=scale: spin.setValue(
+                    item / scale
+                )
+            )
+            slider.sliderPressed.connect(self._begin_ramp_edit)
+            slider.sliderReleased.connect(self._finish_ramp_edit)
+            value.valueChanged.connect(self._type_parameter_changed)
+            row_layout.addWidget(slider, 1)
+            row_layout.addWidget(value)
+            impact.addWidget(row)
+            self._speed_sliders[key] = (slider, value)
+        self.center_shape_button = QPushButton(
+            "Custom Center Shape / Line", self.impact_widget
+        )
+        self.center_shape_button.setToolTip(
+            "Create or select the reference shape that speed lines "
+            "converge to"
+        )
+        impact.addWidget(self.center_shape_button)
+
         self.presets_widget = QWidget(self)
         presets = QVBoxLayout(self.presets_widget)
         presets.setContentsMargins(0, 0, 0, 0)
@@ -287,6 +369,10 @@ class GradientToolsControls(QWidget):
 
         self.color_popup = ColorPickerPopup(parent=self)
         self.color_popup.colorApplied.connect(self._apply_stop_color)
+        self.thickness_popup = ColorPickerPopup(parent=self)
+        self.thickness_popup.colorApplied.connect(
+            self._apply_thickness_stop_color
+        )
         self.create_line.clicked.connect(
             lambda: self.createRequested.emit("line")
         )
@@ -295,6 +381,11 @@ class GradientToolsControls(QWidget):
         )
         self.create_shape.clicked.connect(
             lambda: self.createRequested.emit("parent_shape")
+        )
+        self.create_speed.clicked.connect(
+            lambda: self.speedCreateRequested.emit(
+                str(self.field_type.currentData() or "line")
+            )
         )
         self.field_type.currentIndexChanged.connect(self._field_changed)
         self.select_gradient.clicked.connect(self._select_matching_gradient)
@@ -318,8 +409,30 @@ class GradientToolsControls(QWidget):
         self.ramp_editor.editingFinished.connect(self._finish_ramp_edit)
         self.ramp_editor.selectionChanged.connect(self._stop_selected)
         self.ramp_editor.colorEditRequested.connect(self._edit_stop_color)
+        self.thickness_ramp_editor.editingStarted.connect(
+            self._begin_ramp_edit
+        )
+        self.thickness_ramp_editor.rampChanged.connect(
+            self._preview_thickness_ramp
+        )
+        self.thickness_ramp_editor.editingFinished.connect(
+            self._finish_ramp_edit
+        )
+        self.thickness_ramp_editor.selectionChanged.connect(
+            self._thickness_stop_selected
+        )
+        self.thickness_ramp_editor.colorEditRequested.connect(
+            self._edit_thickness_stop_color
+        )
         self.add_stop.clicked.connect(self._add_stop)
         self.remove_stop.clicked.connect(self._remove_stop)
+        self.add_thickness_stop.clicked.connect(self._add_thickness_stop)
+        self.remove_thickness_stop.clicked.connect(
+            self._remove_thickness_stop
+        )
+        self.center_shape_button.clicked.connect(
+            self.centerShapeRequested
+        )
         self.preset_combo.activated.connect(self._preset_activated)
         self.add_preset.clicked.connect(self.presetAddRequested)
         self.save_preset.clicked.connect(self._save_preset)
@@ -327,17 +440,30 @@ class GradientToolsControls(QWidget):
         self.preset_name.editingFinished.connect(self._rename_preset)
         self.refresh()
 
-    def selected_gradient(self) -> ColorFillGradientObject | None:
+    @staticmethod
+    def _color_ramp_of(
+        obj: ColorFillGradientObject | SpeedLinesGradientObject | None,
+    ) -> ColorGradientRamp | None:
+        if isinstance(obj, SpeedLinesGradientObject):
+            return obj.color_ramp
+        if isinstance(obj, ColorFillGradientObject):
+            return obj.ramp
+        return None
+
+    def selected_gradient(
+        self,
+    ) -> ColorFillGradientObject | SpeedLinesGradientObject | None:
         if (
             self.canvas.chapter is None
             or self.canvas.selected_kind != "object"
         ):
             return None
         candidate = self.canvas.chapter.objects.get(self.canvas.selected_id)
-        return (
-            candidate
-            if isinstance(candidate, ColorFillGradientObject) else None
-        )
+        if isinstance(
+            candidate, (ColorFillGradientObject, SpeedLinesGradientObject)
+        ):
+            return candidate
+        return None
 
     def context_parent_id(self) -> str:
         if self.canvas.chapter is None:
@@ -372,9 +498,35 @@ class GradientToolsControls(QWidget):
             self.field_type.setCurrentIndex(max(
                 0, self.field_type.findData(obj.field_type)
             ))
-            self.ramp_editor.setRamp(obj.ramp, self._selected_stop_id)
-            self._selected_stop_id = self.ramp_editor.selected_stop_id()
-            self.remove_stop.setEnabled(len(obj.ramp.stops) > 2)
+            color_ramp = self._color_ramp_of(obj)
+            if color_ramp is not None:
+                self.ramp_editor.setRamp(color_ramp, self._selected_stop_id)
+                self._selected_stop_id = (
+                    self.ramp_editor.selected_stop_id()
+                )
+                self.remove_stop.setEnabled(len(color_ramp.stops) > 2)
+            is_speed = isinstance(obj, SpeedLinesGradientObject)
+            if is_speed:
+                thickness_ramp = obj.thickness_ramp
+                self.thickness_ramp_editor.setRamp(
+                    thickness_ramp, self._selected_thickness_stop_id
+                )
+                self._selected_thickness_stop_id = (
+                    self.thickness_ramp_editor.selected_stop_id()
+                )
+                self.remove_thickness_stop.setEnabled(
+                    len(thickness_ramp.stops) > 2
+                )
+                speed = obj.speed_field
+                for key, (slider, value) in self._speed_sliders.items():
+                    current = float(getattr(speed, key))
+                    scale = 10 ** value.decimals()
+                    slider.blockSignals(True)
+                    value.blockSignals(True)
+                    slider.setValue(int(round(current * scale)))
+                    value.setValue(current)
+                    slider.blockSignals(False)
+                    value.blockSignals(False)
             preset_index = self.preset_combo.findData(obj.loaded_preset_id)
             self.preset_combo.setCurrentIndex(max(0, preset_index))
             self.direction_mode.setCurrentIndex(max(
@@ -399,6 +551,12 @@ class GradientToolsControls(QWidget):
             self.distance_slider.setValue(
                 max(1, min(1000, round(abs(distance))))
             )
+        is_speed = isinstance(obj, SpeedLinesGradientObject)
+        self.thickness_widget.setVisible(is_speed)
+        self.impact_widget.setVisible(is_speed)
+        self.thickness_widget.setEnabled(enabled)
+        self.impact_widget.setEnabled(enabled)
+        self.center_shape_button.setEnabled(is_speed)
         self.direction_row.setVisible(
             obj is not None and obj.field_type == "line"
         )
@@ -407,39 +565,58 @@ class GradientToolsControls(QWidget):
             and obj.field_type in {"radial", "parent_shape"}
         )
         self.uniform.setVisible(
-            radial_or_shape and not obj.radial_field.reverse_direction
-            if obj is not None and obj.field_type == "radial"
-            else radial_or_shape and not (
-                obj.shape_field.reverse_direction
-                if obj is not None else False
+            not is_speed
+            and radial_or_shape
+            and not (
+                obj.radial_field.reverse_direction
+                if obj is not None and obj.field_type == "radial"
+                else (
+                    obj.shape_field.reverse_direction
+                    if obj is not None else False
+                )
             )
+        )
+        self.reverse_direction.setText(
+            "Outwards" if is_speed else "Reverse direction"
+        )
+        self.reverse_direction.setVisible(
+            bool(obj is not None and (not is_speed or radial_or_shape))
         )
         show_distance = bool(
             obj is not None
             and (
                 (
                     obj.field_type == "line"
-                    and obj.line_field.direction_mode == "perpendicular"
+                    and (
+                        obj.line_field.direction_mode == "perpendicular"
+                        or is_speed
+                    )
                 )
                 or (
                     obj.field_type == "radial"
                     and (
                         obj.radial_field.reverse_direction
-                        or obj.radial_field.uniform
+                        or (
+                            not is_speed and obj.radial_field.uniform
+                        )
                     )
                 )
                 or (
                     obj.field_type == "parent_shape"
                     and (
                         obj.shape_field.reverse_direction
-                        or obj.shape_field.uniform
+                        or (
+                            not is_speed and obj.shape_field.uniform
+                        )
                     )
                 )
             )
         )
         self.distance_row.setVisible(show_distance)
         self.distance_label.setText(
-            "Perpendicular"
+            "Side"
+            if is_speed and obj is not None and obj.field_type == "line"
+            else "Perpendicular"
             if obj is not None and obj.field_type == "line"
             else "Distance"
         )
@@ -453,19 +630,25 @@ class GradientToolsControls(QWidget):
         self.create_line.setEnabled(
             bool(context_parent)
             and not self.canvas.chapter.gradient_children(
-                context_parent, "line"
+                context_parent, "line", family="color_fill"
             )
         )
         self.create_radial.setEnabled(
             bool(context_parent)
             and not self.canvas.chapter.gradient_children(
-                context_parent, "radial"
+                context_parent, "radial", family="color_fill"
             )
         )
         self.create_shape.setEnabled(
             bool(context_parent)
             and not self.canvas.chapter.gradient_children(
-                context_parent, "parent_shape"
+                context_parent, "parent_shape", family="color_fill"
+            )
+        )
+        self.create_speed.setEnabled(
+            bool(context_parent)
+            and not self.canvas.chapter.gradient_children(
+                context_parent, selected_type, family="speed_lines"
             )
         )
         self._loading = False
@@ -505,14 +688,21 @@ class GradientToolsControls(QWidget):
             return
         if not field_type or obj.field_type == field_type:
             return
+        family = (
+            "speed_lines"
+            if isinstance(obj, SpeedLinesGradientObject) else "color_fill"
+        )
         conflicts = self.canvas.chapter.gradient_children(
-            obj.parent_layer_id, str(field_type), excluding=obj.object_id
+            obj.parent_layer_id, str(field_type), excluding=obj.object_id,
+            family=family,
         )
         if conflicts:
             window = self.canvas.window()
             if hasattr(window, "statusBar"):
                 window.statusBar().showMessage(
-                    f"This shape already has a {field_type} gradient", 4000
+                    f"This shape already has a {field_type} "
+                    f"{family} gradient",
+                    4000,
                 )
             self.refresh()
             return
@@ -541,7 +731,39 @@ class GradientToolsControls(QWidget):
         if obj is None:
             return
         before = self.canvas.chapter.to_dict()
-        if obj.field_type == "line":
+        if isinstance(obj, SpeedLinesGradientObject):
+            speed = obj.speed_field
+            speed.density = self._speed_sliders["density"][1].value()
+            speed.gap = self._speed_sliders["gap"][1].value()
+            speed.close_range = self._speed_sliders[
+                "close_range"
+            ][1].value()
+            speed.randomness_distance = self._speed_sliders[
+                "randomness_distance"
+            ][1].value()
+            speed.randomness_scale = self._speed_sliders[
+                "randomness_scale"
+            ][1].value()
+            if obj.field_type == "line":
+                obj.line_field.direction_mode = str(
+                    self.direction_mode.currentData()
+                )
+                distance = self.distance_value.value()
+                obj.line_field.perpendicular_distance = (
+                    distance if abs(distance) >= 1 else 1.0
+                )
+            else:
+                field = (
+                    obj.radial_field
+                    if obj.field_type == "radial" else obj.shape_field
+                )
+                field.reverse_direction = (
+                    self.reverse_direction.isChecked()
+                )
+                field.distance = max(
+                    1.0, abs(self.distance_value.value())
+                )
+        elif obj.field_type == "line":
             obj.line_field.direction_mode = str(
                 self.direction_mode.currentData()
             )
@@ -583,7 +805,33 @@ class GradientToolsControls(QWidget):
         obj = self.selected_gradient()
         if obj is None:
             return
-        obj.ramp = ramp.copy()
+        color_ramp = self._color_ramp_of(obj)
+        if color_ramp is None:
+            return
+        color_ramp.stops = [
+            ColorGradientStop(
+                stop_id=stop.stop_id, position=stop.position,
+                color=stop.color,
+            )
+            for stop in ramp.stops
+        ]
+        color_ramp.validate()
+        obj.touch_revision()
+        self.canvas.documentChanged.emit(QRectF())
+        self.canvas.update()
+
+    def _preview_thickness_ramp(self, ramp: ColorGradientRamp) -> None:
+        obj = self.selected_gradient()
+        if not isinstance(obj, SpeedLinesGradientObject):
+            return
+        obj.thickness_ramp.stops = [
+            ColorGradientStop(
+                stop_id=stop.stop_id, position=stop.position,
+                color=stop.color,
+            )
+            for stop in ramp.stops
+        ]
+        obj.thickness_ramp.validate()
         obj.touch_revision()
         self.canvas.documentChanged.emit(QRectF())
         self.canvas.update()
@@ -598,8 +846,17 @@ class GradientToolsControls(QWidget):
     def _stop_selected(self, stop_id: str) -> None:
         self._selected_stop_id = stop_id
         obj = self.selected_gradient()
+        color_ramp = self._color_ramp_of(obj)
         self.remove_stop.setEnabled(
-            obj is not None and len(obj.ramp.stops) > 2
+            color_ramp is not None and len(color_ramp.stops) > 2
+        )
+
+    def _thickness_stop_selected(self, stop_id: str) -> None:
+        self._selected_thickness_stop_id = stop_id
+        obj = self.selected_gradient()
+        self.remove_thickness_stop.setEnabled(
+            isinstance(obj, SpeedLinesGradientObject)
+            and len(obj.thickness_ramp.stops) > 2
         )
 
     @staticmethod
@@ -628,28 +885,32 @@ class GradientToolsControls(QWidget):
         obj = self.selected_gradient()
         if obj is None:
             return
+        color_ramp = self._color_ramp_of(obj)
+        if color_ramp is None:
+            return
         before = self.canvas.chapter.to_dict()
-        stop = self._interpolated_stop(obj.ramp)
-        obj.ramp.stops.append(stop)
-        obj.ramp.validate()
+        stop = self._interpolated_stop(color_ramp)
+        color_ramp.stops.append(stop)
+        color_ramp.validate()
         obj.touch_revision()
         self._selected_stop_id = stop.stop_id
-        self.ramp_editor.setRamp(obj.ramp, stop.stop_id)
+        self.ramp_editor.setRamp(color_ramp, stop.stop_id)
         self._commit_change(before, "Add gradient stop")
         self.refresh()
 
     def _remove_stop(self) -> None:
         obj = self.selected_gradient()
-        if obj is None or len(obj.ramp.stops) <= 2:
+        color_ramp = self._color_ramp_of(obj)
+        if obj is None or color_ramp is None or len(color_ramp.stops) <= 2:
             return
         before = self.canvas.chapter.to_dict()
-        obj.ramp.stops = [
-            stop for stop in obj.ramp.stops
+        color_ramp.stops = [
+            stop for stop in color_ramp.stops
             if stop.stop_id != self._selected_stop_id
         ]
-        obj.ramp.validate()
+        color_ramp.validate()
         obj.touch_revision()
-        self._selected_stop_id = obj.ramp.stops[0].stop_id
+        self._selected_stop_id = color_ramp.stops[0].stop_id
         self._commit_change(before, "Remove gradient stop")
         self.refresh()
 
@@ -657,8 +918,11 @@ class GradientToolsControls(QWidget):
         obj = self.selected_gradient()
         if obj is None:
             return
+        color_ramp = self._color_ramp_of(obj)
+        if color_ramp is None:
+            return
         stop = next((
-            item for item in obj.ramp.stops if item.stop_id == stop_id
+            item for item in color_ramp.stops if item.stop_id == stop_id
         ), None)
         if stop is None:
             return
@@ -673,8 +937,11 @@ class GradientToolsControls(QWidget):
         obj = self.selected_gradient()
         if obj is None:
             return
+        color_ramp = self._color_ramp_of(obj)
+        if color_ramp is None:
+            return
         stop = next((
-            item for item in obj.ramp.stops
+            item for item in color_ramp.stops
             if item.stop_id == self._selected_stop_id
         ), None)
         if stop is None:
@@ -683,6 +950,73 @@ class GradientToolsControls(QWidget):
         stop.color = canonical_argb(color)
         obj.touch_revision()
         self._commit_change(before, "Change gradient color")
+        self.refresh()
+
+    def _add_thickness_stop(self) -> None:
+        obj = self.selected_gradient()
+        if not isinstance(obj, SpeedLinesGradientObject):
+            return
+        before = self.canvas.chapter.to_dict()
+        stop = self._interpolated_stop(obj.thickness_ramp)
+        obj.thickness_ramp.stops.append(stop)
+        obj.thickness_ramp.validate()
+        obj.touch_revision()
+        self._selected_thickness_stop_id = stop.stop_id
+        self.thickness_ramp_editor.setRamp(
+            obj.thickness_ramp, stop.stop_id
+        )
+        self._commit_change(before, "Add thickness stop")
+        self.refresh()
+
+    def _remove_thickness_stop(self) -> None:
+        obj = self.selected_gradient()
+        if (
+            not isinstance(obj, SpeedLinesGradientObject)
+            or len(obj.thickness_ramp.stops) <= 2
+        ):
+            return
+        before = self.canvas.chapter.to_dict()
+        obj.thickness_ramp.stops = [
+            stop for stop in obj.thickness_ramp.stops
+            if stop.stop_id != self._selected_thickness_stop_id
+        ]
+        obj.thickness_ramp.validate()
+        obj.touch_revision()
+        self._selected_thickness_stop_id = obj.thickness_ramp.stops[0].stop_id
+        self._commit_change(before, "Remove thickness stop")
+        self.refresh()
+
+    def _edit_thickness_stop_color(self, stop_id: str) -> None:
+        obj = self.selected_gradient()
+        if not isinstance(obj, SpeedLinesGradientObject):
+            return
+        stop = next((
+            item for item in obj.thickness_ramp.stops
+            if item.stop_id == stop_id
+        ), None)
+        if stop is None:
+            return
+        self._selected_thickness_stop_id = stop_id
+        self.thickness_popup.setColor(stop.color)
+        self.thickness_popup.setQuickColors(
+            self.canvas.primary_color, self.canvas.secondary_color
+        )
+        self.thickness_popup.open()
+
+    def _apply_thickness_stop_color(self, color: str) -> None:
+        obj = self.selected_gradient()
+        if not isinstance(obj, SpeedLinesGradientObject):
+            return
+        stop = next((
+            item for item in obj.thickness_ramp.stops
+            if item.stop_id == self._selected_thickness_stop_id
+        ), None)
+        if stop is None:
+            return
+        before = self.canvas.chapter.to_dict()
+        stop.color = canonical_argb(color)
+        obj.touch_revision()
+        self._commit_change(before, "Change thickness stop")
         self.refresh()
 
     def _preset_activated(self, index: int) -> None:

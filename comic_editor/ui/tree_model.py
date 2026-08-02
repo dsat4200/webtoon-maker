@@ -8,8 +8,8 @@ from PySide6.QtCore import QAbstractItemModel, QMimeData, QModelIndex, Qt, Signa
 from PySide6.QtGui import QColor
 
 from comic_editor.core.models import (
-    ChapterDocument, GradientObject, LayerNode, TextObject,
-    VectorDrawingObject, VectorFillObject,
+    ChapterDocument, GradientObject, LayerNode, SpeedLinesGradientObject,
+    TextObject, VectorDrawingObject, VectorFillObject,
 )
 
 
@@ -157,6 +157,8 @@ class HierarchyModel(QAbstractItemModel):
                 if isinstance(entity, VectorFillObject):
                     return "Vector Fill"
                 if isinstance(entity, GradientObject):
+                    if isinstance(entity, SpeedLinesGradientObject):
+                        return "Speed Lines"
                     return "Gradient"
                 return entity.object_type.title()
             if index.column() == 2:

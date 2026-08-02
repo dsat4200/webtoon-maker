@@ -23,8 +23,9 @@ from PySide6.QtWidgets import (
 from comic_editor.core.models import (
     BoundGeometry, ChapterDocument, ColorFillGradientObject,
     ColorGradientRamp, ColorGradientRampPreset, ColorGradientStop,
-    ColorPalette, GradientObject, PaletteSwatch,
-    RasterObject, TextObject, VectorDrawingObject, VectorFillObject,
+    ColorPalette, GradientObject, PaletteSwatch, PathNode,
+    RasterObject, SpeedLineCenterObject, SpeedLinesGradientObject,
+    TextObject, VectorDrawingObject, VectorFillObject,
 )
 from comic_editor.core.persistence import SeriesRepository
 from comic_editor.core.settings import load_settings, save_settings
@@ -409,6 +410,18 @@ class MainWindow(QMainWindow):
         gradient_type_group.add_widget(
             self.gradient_tools_controls.type_parameters_widget
         )
+        gradient_thickness_group = self.gradient_tools_page.add_group(
+            "Thickness Parameters", minimum_width=235
+        )
+        gradient_thickness_group.add_widget(
+            self.gradient_tools_controls.thickness_widget
+        )
+        gradient_impact_group = self.gradient_tools_page.add_group(
+            "Impact Line Parameters", minimum_width=235
+        )
+        gradient_impact_group.add_widget(
+            self.gradient_tools_controls.impact_widget
+        )
         self.preview = ChapterPreview(self.canvas)
         canvas_layout.addWidget(self.preview)
         canvas_layout.addWidget(self.canvas, 1)
@@ -716,6 +729,14 @@ class MainWindow(QMainWindow):
         )
         self.gradient_tools_controls.createRequested.connect(
             self._create_gradient
+        )
+        self.gradient_tools_controls.speedCreateRequested.connect(
+            lambda field_type: self._create_gradient(
+                field_type, gradient_type="speed_lines"
+            )
+        )
+        self.gradient_tools_controls.centerShapeRequested.connect(
+            self._edit_speed_center_shape
         )
         self.gradient_tools_controls.objectChanged.connect(
             self._hierarchy_changed
@@ -1679,7 +1700,9 @@ class MainWindow(QMainWindow):
         self.canvas.push_model_change(before, after, "Add fill layer")
         self._after_structure(layer.layer_id, "layer")
 
-    def _create_gradient(self, field_type: str) -> None:
+    def _create_gradient(
+        self, field_type: str, gradient_type: str = "color_fill",
+    ) -> None:
         parent_id = self._gradient_context_parent_id()
         if not parent_id:
             self.statusBar().showMessage(
@@ -1687,7 +1710,9 @@ class MainWindow(QMainWindow):
                 5000,
             )
             return
-        if not self.canvas.begin_gradient_creation(parent_id, field_type):
+        if not self.canvas.begin_gradient_creation(
+            parent_id, field_type, gradient_type=gradient_type
+        ):
             self.statusBar().showMessage(
                 "Unable to create a gradient in this shape", 5000
             )
@@ -1701,6 +1726,97 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage(
                 "Drag from the gradient origin to set its radius.", 7000
             )
+        self._sync_contextual_ribbon()
+
+    def _edit_speed_center_shape(self) -> None:
+        obj = self.gradient_tools_controls.selected_gradient()
+        if (
+            not isinstance(obj, SpeedLinesGradientObject)
+            or self.chapter is None
+        ):
+            return
+        existing = self.chapter.speed_center_for(obj.object_id)
+        if existing is not None:
+            self.canvas.set_selection("object", existing.object_id)
+            self.canvas.set_tool(ToolKind.SHAPE_EDIT)
+            self._sync_contextual_ribbon()
+            return
+        is_line = obj.field_type == "line"
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Custom Center Shape / Line")
+        layout = QVBoxLayout(dialog)
+        layout.addWidget(QLabel(
+            "Speed lines converge toward the closest point on this "
+            "shape's boundary."
+        ))
+        choices = [
+            ("Line", "line")
+        ] if is_line else [
+            ("Square", "square"),
+            ("Rectangle", "rectangle"),
+            ("Freeform", "freeform"),
+        ]
+        for label, kind in choices:
+            button = QPushButton(label, dialog)
+            button.clicked.connect(
+                lambda _checked=False, kind=kind, dialog=dialog: (
+                    self._create_speed_center(kind),
+                    dialog.accept(),
+                )
+            )
+            layout.addWidget(button)
+        layout.addWidget(QLabel(
+            "The center shape can be deleted but not moved."
+        ))
+        dialog.exec()
+
+    def _create_speed_center(self, kind: str) -> None:
+        obj = self.gradient_tools_controls.selected_gradient()
+        if (
+            not isinstance(obj, SpeedLinesGradientObject)
+            or self.chapter is None
+            or self.chapter.speed_center_for(obj.object_id) is not None
+        ):
+            return
+        parent = self.chapter.layers[obj.parent_layer_id]
+        left, top, width, height = parent.bound.bbox()
+        center_x, center_y = left + width / 2, top + height / 2
+        if kind == "line":
+            geometry = BoundGeometry.path([
+                PathNode(x=center_x - width * 0.3, y=center_y),
+                PathNode(x=center_x + width * 0.3, y=center_y),
+            ], closed=False)
+        elif kind == "square":
+            size = max(60.0, min(300.0, min(width, height) * 0.35))
+            geometry = BoundGeometry.rectangle(
+                center_x - size / 2, center_y - size / 2,
+                size, size,
+            )
+        elif kind == "rectangle":
+            box_width = max(80.0, width * 0.4)
+            box_height = max(60.0, height * 0.25)
+            geometry = BoundGeometry.rectangle(
+                center_x - box_width / 2, center_y - box_height / 2,
+                box_width, box_height,
+            )
+        else:
+            size = max(60.0, min(300.0, min(width, height) * 0.3))
+            geometry = BoundGeometry.path([
+                PathNode(x=center_x, y=center_y - size / 2),
+                PathNode(x=center_x + size / 2, y=center_y),
+                PathNode(x=center_x, y=center_y + size / 2),
+                PathNode(x=center_x - size / 2, y=center_y),
+            ], closed=True)
+        before = self.chapter.to_dict()
+        center = self.chapter.add_speed_center(
+            obj.object_id,
+            SpeedLineCenterObject(geometry=geometry),
+        )
+        after = self.chapter.to_dict()
+        self.canvas.push_model_change(before, after, "Add speed center")
+        self.canvas.set_selection("object", center.object_id)
+        self.canvas.set_tool(ToolKind.SHAPE_EDIT)
+        self.canvas.documentChanged.emit(None)
         self._sync_contextual_ribbon()
 
     def _add_text(self) -> None:
@@ -2379,7 +2495,15 @@ class MainWindow(QMainWindow):
                 return
             ramp = preset.ramp.copy()
         before = self.chapter.to_dict()
-        obj.ramp = ramp
+        color_ramp = MainWindow._gradient_color_ramp(obj)
+        color_ramp.stops = [
+            ColorGradientStop(
+                stop_id=stop.stop_id, position=stop.position,
+                color=stop.color,
+            )
+            for stop in ramp.stops
+        ]
+        color_ramp.validate()
         obj.loaded_preset_id = preset_id
         obj.touch_revision()
         after = self.chapter.to_dict()
@@ -2388,6 +2512,12 @@ class MainWindow(QMainWindow):
         )
         self.canvas.documentChanged.emit(None)
         self.gradient_tools_controls.refresh()
+
+    @staticmethod
+    def _gradient_color_ramp(obj):
+        if isinstance(obj, SpeedLinesGradientObject):
+            return obj.color_ramp
+        return obj.ramp
 
     def _add_gradient_preset(self) -> None:
         if self.series is None:
@@ -2403,7 +2533,7 @@ class MainWindow(QMainWindow):
         while f"Gradient {number}".casefold() in used:
             number += 1
         preset = ColorGradientRampPreset(
-            name=f"Gradient {number}", ramp=obj.ramp.copy()
+            name=f"Gradient {number}", ramp=MainWindow._gradient_color_ramp(obj).copy()
         )
         self.series.gradient_ramp_presets.append(preset)
         if self.chapter is not None:
@@ -2423,7 +2553,7 @@ class MainWindow(QMainWindow):
         obj = self.gradient_tools_controls.selected_gradient()
         if preset is None or obj is None:
             return
-        preset.ramp = obj.ramp.copy()
+        preset.ramp = MainWindow._gradient_color_ramp(obj).copy()
         preset.validate()
         obj.loaded_preset_id = preset_id
         self._schedule_series_preferences_save(immediate=True)

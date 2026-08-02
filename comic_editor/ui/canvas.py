@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import math
 import time
+import zlib
 from enum import Enum
 
 import numpy as np
@@ -31,7 +32,8 @@ from comic_editor.core.models import (
     ColorGradientRamp, ColorGradientStop, DocumentObject, GradientObject,
     LineGradientField, LayerNode, RadialGradientField,
     PathContour, PathNode, RasterObject, ShapeStyle, TextObject,
-    VectorDrawingObject, VectorFillObject, VectorStroke, VectorStrokePoint,
+    SpeedLineCenterObject, SpeedLinesGradientObject, VectorDrawingObject,
+    VectorFillObject, VectorStroke, VectorStrokePoint,
     canonical_argb, object_from_dict,
 )
 from comic_editor.core.pressure import BrushPreset
@@ -168,6 +170,7 @@ class _CanvasLogic:
         self._raster_creation_index: int | None = None
         self._gradient_creation_parent_id = ""
         self._gradient_creation_type = ""
+        self._gradient_creation_family = "color_fill"
         self._gradient_creation_before: dict | None = None
         self._selected_shape_node_id = ""
         self._selected_shape_node_ids: set[str] = set()
@@ -273,6 +276,7 @@ class _CanvasLogic:
         self._page_creation_base_height = 0
         self._gradient_creation_parent_id = ""
         self._gradient_creation_type = ""
+        self._gradient_creation_family = "color_fill"
         self._gradient_creation_before = None
         self._page_gap_prompt_y: float | None = None
         self._page_gap_state: dict | None = None
@@ -722,7 +726,10 @@ class _CanvasLogic:
             selected = self.chapter.objects[self.selected_object_id]
             if not isinstance(
                 selected,
-                (RasterObject, VectorDrawingObject, GradientObject),
+                (
+                    RasterObject, VectorDrawingObject, GradientObject,
+                    SpeedLineCenterObject,
+                ),
             ):
                 self.set_selection(
                     "layer", selected.parent_layer_id,
@@ -3047,8 +3054,368 @@ class _CanvasLogic:
         self, painter: QPainter, obj: GradientObject,
         local_visible: QRectF,
     ) -> None:
+        if isinstance(obj, SpeedLinesGradientObject):
+            self._render_speed_lines_gradient(painter, obj, local_visible)
+            return
         if isinstance(obj, ColorFillGradientObject):
             self._render_color_gradient(painter, obj, local_visible)
+
+    # ---- Speed lines gradient ----
+
+    @staticmethod
+    def _gradient_thickness_lut(ramp: ColorGradientRamp) -> np.ndarray:
+        """0..1 float LUT of a ramp's greyscale (alpha ignored)."""
+        ramp.validate()
+        colors = np.asarray([
+            [
+                QColor(stop.color).red(),
+                QColor(stop.color).green(),
+                QColor(stop.color).blue(),
+            ]
+            for stop in ramp.stops
+        ], dtype=np.float32)
+        positions = np.asarray(
+            [stop.position for stop in ramp.stops], dtype=np.float32
+        )
+        values = np.linspace(0.0, 1.0, 1024, dtype=np.float32)
+        right = np.clip(
+            np.searchsorted(positions, values, side="right"),
+            1, len(positions) - 1,
+        )
+        left = right - 1
+        spans = positions[right] - positions[left]
+        amounts = np.divide(
+            values - positions[left], spans,
+            out=np.ones_like(values), where=spans > 1e-8,
+        )
+        mixed = (
+            colors[left] * (1.0 - amounts[:, None])
+            + colors[right] * amounts[:, None]
+        )
+        grey = (
+            mixed[:, 0] * 0.2126 + mixed[:, 1] * 0.7152
+            + mixed[:, 2] * 0.0722
+        )
+        grey[values <= positions[0]] = (
+            mixed[0, 0] * 0.2126 + mixed[0, 1] * 0.7152
+            + mixed[0, 2] * 0.0722
+        )
+        grey[values >= positions[-1]] = (
+            mixed[-1, 0] * 0.2126 + mixed[-1, 1] * 0.7152
+            + mixed[-1, 2] * 0.0722
+        )
+        return np.clip(grey / 255.0, 0.0, 1.0).astype(np.float32)
+
+    def _speed_noise(
+        self, count: int, seed: int, distance: float, scale: float,
+    ) -> np.ndarray:
+        """Deterministic per-line endpoint noise with neighbor smoothing."""
+        if count <= 0 or distance <= 0:
+            return np.zeros(max(count, 0), dtype=np.float32)
+        rng = np.random.RandomState(seed)
+        raw = rng.uniform(0.0, 1.0, count).astype(np.float32)
+        window = max(1, min(count, round(scale)))
+        if window > 1:
+            kernel = np.ones(window, dtype=np.float32) / window
+            raw = np.convolve(raw, kernel, mode="same")
+        return raw * float(distance)
+
+    def _speed_thickness_pixels(
+        self, lut: np.ndarray, t: np.ndarray, available: float,
+    ) -> np.ndarray:
+        indices = np.clip(
+            (np.clip(t, 0.0, 1.0) * 1023.0).astype(np.int32), 0, 1023
+        )
+        return lut[indices] * available
+
+    def _render_speed_lines_gradient(
+        self, painter: QPainter, obj: SpeedLinesGradientObject,
+        local_visible: QRectF,
+    ) -> None:
+        parent_path = self.layer_effective_path(obj.parent_layer_id)
+        if parent_path.isEmpty():
+            return
+        painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
+        painter.setCompositionMode(
+            QPainter.CompositionMode.CompositionMode_SourceOver
+        )
+        if obj.field_type == "line":
+            rendered = self._speed_lines_line_image(
+                obj, self.bound_path(obj.line_field.geometry),
+                parent_path.boundingRect(),
+            )
+            if rendered is not None:
+                painter.drawImage(rendered[1], rendered[0])
+            return
+        if obj.field_type == "radial":
+            field = obj.radial_field
+            boundary = self._radial_boundary_path(field)
+            if field.reverse_direction:
+                radius_y = (
+                    field.radius_y if field.ellipse_enabled else field.radius_x
+                )
+                radius = math.hypot(
+                    field.radius_x + field.distance,
+                    radius_y + field.distance,
+                )
+                bounds = QRectF(
+                    field.origin_x - radius, field.origin_y - radius,
+                    radius * 2, radius * 2,
+                )
+            else:
+                bounds = boundary.boundingRect()
+            rendered = self._speed_lines_ring_image(
+                obj, boundary, bounds,
+                outward=field.reverse_direction,
+                center_point=field.center(),
+            )
+            if rendered is not None:
+                painter.drawImage(rendered[1], rendered[0])
+            return
+        field = obj.shape_field
+        bounds = parent_path.boundingRect()
+        if field.reverse_direction:
+            bounds = bounds.adjusted(
+                -field.distance, -field.distance,
+                field.distance, field.distance,
+            )
+        rendered = self._speed_lines_ring_image(
+            obj, parent_path, bounds, outward=field.reverse_direction,
+            center_point=(
+                self._shape_gradient_center(obj, parent_path).toTuple()
+            ),
+        )
+        if rendered is not None:
+            painter.drawImage(rendered[1], rendered[0])
+
+    def _speed_lines_center_geometry(
+        self, obj: SpeedLinesGradientObject, closed_parent: bool,
+    ) -> BoundGeometry | None:
+        if not obj.center_shape_id:
+            return None
+        center = self.chapter.speed_center_for(obj.object_id)
+        if center is not None and center.geometry.closed == closed_parent:
+            return center.geometry
+        return None
+
+    def _speed_lines_line_image(
+        self, obj: SpeedLinesGradientObject, path: QPainterPath,
+        bounds: QRectF,
+    ) -> tuple[QImage, QRectF] | None:
+        if bounds.isEmpty():
+            return None
+        width, height = self._gradient_grid_for_preview(bounds)
+        field = obj.line_field
+        speed = obj.speed_field
+        signature = self._gradient_path_signature(path)
+        thickness_lut = self._gradient_thickness_lut(obj.thickness_ramp)
+        lut_key = self._gradient_ramp_signature(obj.thickness_ramp)
+        scalar_key = (
+            "speed-line", signature, width, height,
+            round(bounds.x(), 3), round(bounds.y(), 3),
+            round(bounds.width(), 3), round(bounds.height(), 3),
+            field.direction_mode,
+            round(field.perpendicular_distance, 4),
+            round(speed.density, 5), round(speed.gap, 4),
+            round(speed.close_range, 4),
+            round(speed.randomness_distance, 4),
+            round(speed.randomness_scale, 4), lut_key,
+        )
+        cached = self._gradient_scalar_cache.get(scalar_key)
+        if cached is not None:
+            scalar, coverage, cached_bounds = cached
+            return self._gradient_image_from_scalar(
+                scalar, coverage, obj.color_ramp, cached_bounds, scalar_key
+            )
+        amount, signed, _distance = self._path_projection_arrays(
+            path, bounds, width, height
+        )
+        spacing = 1.0 / max(speed.density, 0.005)
+        available = max(0.0, spacing - speed.gap)
+        arc = max(float(path.length()), 1e-6)
+        seed = zlib.crc32(f"{signature}|{field.direction_mode}|"
+                          f"{field.perpendicular_distance:.4f}|"
+                          f"{speed.density:.5f}|{speed.gap:.4f}|"
+                          f"{speed.close_range:.4f}|"
+                          f"{speed.randomness_distance:.4f}|"
+                          f"{speed.randomness_scale:.4f}".encode())
+        if field.direction_mode == "parallel":
+            side = float(field.perpendicular_distance)
+            k = np.floor((signed - side) / spacing).astype(np.int32)
+            centerline = side + k.astype(np.float32) * spacing
+            t = amount
+            thickness = self._speed_thickness_pixels(
+                thickness_lut, t, available
+            )
+            count = int(np.max(np.abs(k))) + 4 if len(k) else 4
+            noise = self._speed_noise(
+                count, seed, speed.randomness_distance,
+                speed.randomness_scale,
+            )
+            index = np.clip(k, 0, count - 1)
+            end = (speed.close_range + noise[index]) / arc
+            scalar = np.clip(t, 0.0, 1.0)
+            if side > 0:
+                on_side = k >= 0
+            elif side < 0:
+                on_side = k <= 0
+            else:
+                on_side = np.ones_like(k, dtype=bool)
+            coverage = (
+                on_side
+                & (np.abs(signed - centerline) <= thickness * 0.5)
+                & (t >= end) & (t <= 1.0 - end)
+            )
+        else:
+            side = 1.0 if field.perpendicular_distance >= 0 else -1.0
+            length = abs(float(field.perpendicular_distance))
+            count = max(1, int(round(arc * speed.density)))
+            noise = self._speed_noise(
+                count, seed, speed.randomness_distance,
+                speed.randomness_scale,
+            )
+            cut = np.clip(
+                (speed.close_range + noise).astype(np.float32),
+                0.0, max(0.0, length),
+            )
+            n = np.clip(
+                (amount * count).astype(np.int32), 0, count - 1
+            )
+            center = (n.astype(np.float32) + 0.5) / count
+            u = signed * side
+            length_n = length - cut[n]
+            u_norm = np.divide(
+                u, np.maximum(length_n, 1e-6),
+                out=np.zeros_like(u), where=length_n > 1e-6,
+            )
+            u_norm = np.clip(u_norm, 0.0, 1.0)
+            thickness = self._speed_thickness_pixels(
+                thickness_lut, u_norm, available
+            )
+            band = thickness * 0.5 / arc
+            scalar = u_norm
+            coverage = (
+                (u >= 0.0) & (u <= length_n)
+                & (np.abs(amount - center) <= band) & (length > 0.0)
+            )
+        self._cache_gradient_value(
+            self._gradient_scalar_cache, scalar_key,
+            (scalar, coverage, QRectF(bounds)),
+        )
+        return self._gradient_image_from_scalar(
+            scalar, coverage, obj.color_ramp, bounds, scalar_key
+        )
+
+    def _speed_lines_ring_image(
+        self, obj: SpeedLinesGradientObject, boundary: QPainterPath,
+        bounds: QRectF, *, outward: bool,
+        center_point: tuple[float, float],
+    ) -> tuple[QImage, QRectF] | None:
+        if bounds.isEmpty():
+            return None
+        width, height = self._gradient_grid_for_preview(bounds)
+        speed = obj.speed_field
+        boundary_sig = self._gradient_path_signature(boundary)
+        thickness_lut = self._gradient_thickness_lut(obj.thickness_ramp)
+        lut_key = self._gradient_ramp_signature(obj.thickness_ramp)
+        span_distance = (
+            round(obj.radial_field.distance, 4)
+            if obj.field_type == "radial" else round(obj.shape_field.distance, 4)
+        )
+        center_geometry = None if outward else self._speed_lines_center_geometry(
+            obj, closed_parent=True
+        )
+        center_sig: tuple = ()
+        if center_geometry is not None:
+            center_sig = (
+                "path",
+                self._gradient_path_signature(self.bound_path(center_geometry)),
+            )
+        else:
+            center_sig = ("point", round(center_point[0], 4),
+                          round(center_point[1], 4))
+        scalar_key = (
+            "speed-ring", boundary_sig, width, height,
+            round(bounds.x(), 3), round(bounds.y(), 3),
+            round(bounds.width(), 3), round(bounds.height(), 3),
+            outward, round(span_distance, 4), center_sig,
+            round(speed.density, 5), round(speed.gap, 4),
+            round(speed.close_range, 4),
+            round(speed.randomness_distance, 4),
+            round(speed.randomness_scale, 4), lut_key,
+        )
+        cached = self._gradient_scalar_cache.get(scalar_key)
+        if cached is not None:
+            scalar, coverage, cached_bounds = cached
+            return self._gradient_image_from_scalar(
+                scalar, coverage, obj.color_ramp, cached_bounds, scalar_key
+            )
+        _amount, _signed, boundary_distance = self._path_projection_arrays(
+            boundary, bounds, width, height
+        )
+        grid_x, grid_y = self._gradient_coordinates(bounds, width, height)
+        center_inside: np.ndarray | None = None
+        if center_geometry is not None:
+            _c_amount, _c_signed, center_distance = self._path_projection_arrays(
+                self.bound_path(center_geometry), bounds, width, height
+            )
+            center_inside = self._path_coverage(
+                self.bound_path(center_geometry), bounds, width, height
+            )
+        else:
+            center_distance = np.hypot(
+                grid_x - center_point[0], grid_y - center_point[1]
+            )
+        spacing = 1.0 / max(speed.density, 0.005)
+        available = max(0.0, spacing - speed.gap)
+        if outward:
+            span = max(float(span_distance), 0.001)
+            t = np.clip(boundary_distance / span, 0.0, 1.0)
+            max_k = int(np.ceil(float(np.max(boundary_distance)) / spacing)) + 4
+        else:
+            t = np.divide(
+                boundary_distance,
+                boundary_distance + center_distance,
+                out=np.ones_like(boundary_distance),
+                where=(boundary_distance + center_distance) > 1e-6,
+            )
+            t = np.clip(t, 0.0, 1.0)
+            max_k = int(np.ceil(
+                float(np.max(boundary_distance)) / spacing
+            )) + 4
+        k = np.round(boundary_distance / spacing).astype(np.int32)
+        centerline = k.astype(np.float32) * spacing
+        thickness = self._speed_thickness_pixels(
+            thickness_lut, t, available
+        )
+        seed = zlib.crc32(f"{boundary_sig}|{outward}|{span_distance:.4f}|"
+                          f"{center_sig}|{speed.density:.5f}|{speed.gap:.4f}|"
+                          f"{speed.close_range:.4f}|"
+                          f"{speed.randomness_distance:.4f}|"
+                          f"{speed.randomness_scale:.4f}".encode())
+        count = max(max_k, 4)
+        noise = self._speed_noise(
+            count, seed, speed.randomness_distance, speed.randomness_scale,
+        )
+        index = np.clip(k, 0, count - 1)
+        cut = speed.close_range + noise[index]
+        scalar = t
+        band = np.abs(boundary_distance - centerline) <= thickness * 0.5
+        if outward:
+            coverage = band & (boundary_distance >= 0.0) & (
+                boundary_distance <= span
+            )
+        elif center_inside is not None:
+            coverage = band & (center_distance >= cut) & ~center_inside
+        else:
+            coverage = band & (center_distance >= cut)
+        self._cache_gradient_value(
+            self._gradient_scalar_cache, scalar_key,
+            (scalar, coverage, QRectF(bounds)),
+        )
+        return self._gradient_image_from_scalar(
+            scalar, coverage, obj.color_ramp, bounds, scalar_key
+        )
 
     def _render_object(
         self, painter: QPainter, obj: DocumentObject, parent_opacity: float,
@@ -3580,7 +3947,9 @@ class _CanvasLogic:
                         painter, control_quad,
                     )
                 if self.tool == ToolKind.BOUND_EDIT and layer.bound is not None:
-                    self._draw_shape_edit_handles(painter, layer)
+                    self._draw_shape_edit_handles(
+                        painter, layer.bound, layer.shape_style
+                    )
         else:
             quad = self._selected_world_quad()
             if quad:
@@ -3647,6 +4016,21 @@ class _CanvasLogic:
                     self._draw_gradient_edit_handles(
                         painter, selected_object
                     )
+                if (
+                    self.tool == ToolKind.SHAPE_EDIT
+                    and isinstance(selected_object, SpeedLineCenterObject)
+                ):
+                    layer_x, layer_y = (
+                        self.chapter.layer_world_translation(
+                            selected_object.parent_layer_id
+                        )
+                    )
+                    painter.save()
+                    painter.translate(layer_x, layer_y)
+                    self._draw_shape_edit_handles(
+                        painter, selected_object.geometry
+                    )
+                    painter.restore()
         painter.restore()
 
     def _gradient_local_to_world(
@@ -3707,8 +4091,9 @@ class _CanvasLogic:
                 result[f"insert:{index}"] = (
                     self._gradient_local_to_world(obj, point.toTuple())
                 )
+            is_speed = isinstance(obj, SpeedLinesGradientObject)
             if (
-                obj.line_field.direction_mode == "perpendicular"
+                (obj.line_field.direction_mode == "perpendicular" or is_speed)
                 and len(geometry.nodes) >= 2
             ):
                 path = self.bound_path(geometry)
@@ -3725,6 +4110,14 @@ class _CanvasLogic:
                         midpoint.y() + math.sin(angle) * distance,
                     ),
                 )
+                if is_speed:
+                    result["direction:"] = self._gradient_local_to_world(
+                        obj,
+                        (
+                            midpoint.x() - math.cos(angle) * 60 / self.scale,
+                            midpoint.y() - math.sin(angle) * 60 / self.scale,
+                        ),
+                    )
             return result
         if obj.field_type == "radial":
             field = obj.radial_field
@@ -3800,6 +4193,22 @@ class _CanvasLogic:
         painter.save()
         painter.setPen(QPen(QColor("#ff9f22"), 2 / scale))
         painter.setBrush(Qt.BrushStyle.NoBrush)
+        if isinstance(obj, SpeedLinesGradientObject):
+            center = self.chapter.speed_center_for(obj.object_id)
+            if center is not None:
+                center_x, center_y = (
+                    self.chapter.layer_world_translation(
+                        center.parent_layer_id
+                    )
+                )
+                painter.save()
+                painter.translate(center_x, center_y)
+                painter.setPen(QPen(
+                    QColor("#9BDDF0"), 1.5 / scale, Qt.DashLine
+                ))
+                painter.drawPath(self.bound_path(center.geometry))
+                painter.restore()
+                painter.setPen(QPen(QColor("#ff9f22"), 2 / scale))
         if obj.field_type == "line":
             layer_x, layer_y = self.chapter.layer_world_translation(
                 obj.parent_layer_id
@@ -3898,6 +4307,20 @@ class _CanvasLogic:
                     Qt.AlignmentFlag.AlignCenter,
                     "Ellipse" if obj.radial_field.ellipse_enabled else "Circle",
                 )
+            elif key == "direction:":
+                badge = QRectF(
+                    point.x() - radius * 2.6, point.y() - radius,
+                    radius * 5.2, radius * 2,
+                )
+                painter.drawRoundedRect(
+                    badge, radius / 2, radius / 2
+                )
+                painter.drawText(
+                    badge, Qt.AlignmentFlag.AlignCenter,
+                    "Perpendicular"
+                    if obj.line_field.direction_mode == "perpendicular"
+                    else "Parallel",
+                )
             elif key == "center:":
                 painter.drawEllipse(point, radius, radius)
                 cross = radius * 0.6
@@ -3924,7 +4347,7 @@ class _CanvasLogic:
             "center": 2, "rotate": 2, "radius_x": 2,
             "radius_y": 2, "origin": 3, "node": 4,
             "type": 0, "delete": 0, "lock": 0, "roundness": 0,
-            "distance": 2, "insert": 5,
+            "direction": 0, "distance": 2, "insert": 5,
         }
         hits: list[tuple[int, float, str, str]] = []
         for key, candidate in controls.items():
@@ -3932,14 +4355,15 @@ class _CanvasLogic:
             distance = math.dist(
                 point.toTuple(), candidate.toTuple()
             )
-            if kind == "type":
-                type_hit = QRectF(
-                    candidate.x() - 32 / max(self.scale, 0.05),
+            if kind in {"type", "direction"}:
+                width = 64 if kind == "type" else 92
+                badge_hit = QRectF(
+                    candidate.x() - width / 2 / max(self.scale, 0.05),
                     candidate.y() - 14 / max(self.scale, 0.05),
-                    64 / max(self.scale, 0.05),
+                    width / max(self.scale, 0.05),
                     28 / max(self.scale, 0.05),
                 )
-                if type_hit.contains(point):
+                if badge_hit.contains(point):
                     hits.append((
                         priority[kind], distance, kind, node_id
                     ))
@@ -4009,6 +4433,19 @@ class _CanvasLogic:
             geometry.normalize_bezier_handles()
             obj.touch_revision()
             self._push_immediate_shape_change(before, label)
+            return True
+        if kind == "direction":
+            before = self.chapter.to_dict()
+            obj.line_field.direction_mode = (
+                "perpendicular"
+                if obj.line_field.direction_mode == "parallel"
+                else "parallel"
+            )
+            obj.line_field.validate()
+            obj.touch_revision()
+            self._push_immediate_shape_change(
+                before, "Toggle speed lines direction"
+            )
             return True
         if kind == "toggle":
             before = self.chapter.to_dict()
@@ -4674,9 +5111,9 @@ class _CanvasLogic:
         return None
 
     def _draw_shape_edit_handles(
-        self, painter: QPainter, layer: LayerNode,
+        self, painter: QPainter, bound: BoundGeometry,
+        style: ShapeStyle | None = None,
     ) -> None:
-        bound = layer.bound
         hover = self._shape_hover_target or {}
         if bound.primitive in {"rectangle", "ellipse"}:
             scale = max(self.scale, 0.05)
@@ -4774,7 +5211,7 @@ class _CanvasLogic:
                 )
                 if node.node_id == self._selected_shape_node_id:
                     self._draw_selected_shape_gizmos(
-                        painter, bound, node, layer.shape_style
+                        painter, bound, node, style
                     )
         if self._shape_hover_insert is not None:
             point = self._shape_hover_insert[2]
@@ -5237,6 +5674,8 @@ class _CanvasLogic:
         self, obj: DocumentObject, point: QPointF,
     ) -> bool:
         if not obj.visible:
+            return False
+        if isinstance(obj, SpeedLineCenterObject):
             return False
         if isinstance(obj, VectorDrawingObject):
             if not obj.opacity_locked and obj.opacity <= 0:
@@ -6265,15 +6704,13 @@ class _CanvasLogic:
                 )
                 return
         if (
-            self.tool == ToolKind.BOUND_EDIT and self.selected_kind == "layer"
-            and self._selected_shape_node_id and self.chapter is not None
+            self.tool == ToolKind.BOUND_EDIT and self._selected_shape_node_id
+            and self.chapter is not None
         ):
-            layer = self.chapter.layers[self.selected_id]
-            if (
-                event.key() == Qt.Key_Delete
-                and self._delete_selected_shape_node(layer)
-            ):
-                return
+            target = self._shape_edit_target()
+            if target is not None and event.key() == Qt.Key_Delete:
+                if self._delete_selected_shape_node(target[0]):
+                    return
         super().keyPressEvent(event)
 
     def keyReleaseEvent(self, event) -> None:  # noqa: N802
@@ -9516,6 +9953,11 @@ class _CanvasLogic:
             ):
                 return
             if (
+                isinstance(selected_gradient, SpeedLineCenterObject)
+                and self._begin_shape_edit(point, allow_interior=False)
+            ):
+                return
+            if (
                 self.selected_kind == "layer"
                 and self._begin_shape_edit(point, allow_interior=False)
             ):
@@ -9539,6 +9981,11 @@ class _CanvasLogic:
                 return
             if (
                 self.selected_kind == "layer"
+                and self._begin_shape_edit(point)
+            ):
+                return
+            if (
+                isinstance(selected_gradient, SpeedLineCenterObject)
                 and self._begin_shape_edit(point)
             ):
                 return
@@ -10138,6 +10585,7 @@ class _CanvasLogic:
                     "radial",
                     radial=(first, math.dist(first, second)),
                     before=self._gradient_creation_before,
+                    gradient_type=self._gradient_creation_family,
                 )
                 return
             if self.tool == ToolKind.RASTER_CREATE:
@@ -10194,20 +10642,30 @@ class _CanvasLogic:
 
     def begin_gradient_creation(
         self, parent_id: str, field_type: str,
+        gradient_type: str = "color_fill",
     ) -> bool:
         if (
             self.chapter is None
             or parent_id not in self.chapter.layers
             or self.chapter.layers[parent_id].layer_kind == "fill"
             or field_type not in {"line", "radial", "parent_shape"}
+            or gradient_type not in {"color_fill", "speed_lines"}
         ):
             return False
-        if self.chapter.gradient_children(parent_id, field_type):
+        family = (
+            "speed_lines" if gradient_type == "speed_lines" else "color_fill"
+        )
+        if self.chapter.gradient_children(
+            parent_id, field_type, family=family
+        ):
             return False
         if field_type == "parent_shape":
-            return self.create_gradient(parent_id, field_type) is not None
+            return self.create_gradient(
+                parent_id, field_type, gradient_type=gradient_type
+            ) is not None
         self._gradient_creation_parent_id = parent_id
         self._gradient_creation_type = field_type
+        self._gradient_creation_family = gradient_type
         self._gradient_creation_before = self.chapter.to_dict()
         self._creation_points.clear()
         self._creation_nodes.clear()
@@ -10224,6 +10682,7 @@ class _CanvasLogic:
     def _cancel_gradient_creation(self) -> None:
         self._gradient_creation_parent_id = ""
         self._gradient_creation_type = ""
+        self._gradient_creation_family = "color_fill"
         self._gradient_creation_before = None
         self._creation_points.clear()
         self._creation_nodes.clear()
@@ -10238,12 +10697,14 @@ class _CanvasLogic:
         *, world_geometry: BoundGeometry | None = None,
         radial: tuple[tuple[float, float], float] | None = None,
         before: dict | None = None,
-    ) -> ColorFillGradientObject | None:
+        gradient_type: str = "color_fill",
+    ) -> ColorFillGradientObject | SpeedLinesGradientObject | None:
         if (
             self.chapter is None
             or parent_id not in self.chapter.layers
             or self.chapter.layers[parent_id].layer_kind == "fill"
             or field_type not in {"line", "radial", "parent_shape"}
+            or gradient_type not in {"color_fill", "speed_lines"}
         ):
             return None
         before = before or self.chapter.to_dict()
@@ -10253,18 +10714,32 @@ class _CanvasLogic:
             isinstance(item, GradientObject)
             for item in self.chapter.objects.values()
         ) + 1
-        obj = ColorFillGradientObject(
-            name=f"Gradient {count}",
-            field_type=field_type,
-            ramp=ColorGradientRamp(stops=[
-                ColorGradientStop(
-                    position=0.0, color=self.primary_color
-                ),
-                ColorGradientStop(
-                    position=1.0, color=self.secondary_color
-                ),
-            ]),
-        )
+        if gradient_type == "speed_lines":
+            obj: GradientObject = SpeedLinesGradientObject(
+                name=f"Speed Lines {count}",
+                field_type=field_type,
+                color_ramp=ColorGradientRamp(stops=[
+                    ColorGradientStop(
+                        position=0.0, color=self.primary_color
+                    ),
+                    ColorGradientStop(
+                        position=1.0, color=self.secondary_color
+                    ),
+                ]),
+            )
+        else:
+            obj = ColorFillGradientObject(
+                name=f"Gradient {count}",
+                field_type=field_type,
+                ramp=ColorGradientRamp(stops=[
+                    ColorGradientStop(
+                        position=0.0, color=self.primary_color
+                    ),
+                    ColorGradientStop(
+                        position=1.0, color=self.secondary_color
+                    ),
+                ]),
+            )
         if world_geometry is not None:
             local = BoundGeometry.from_dict(world_geometry.to_dict())
             for contour in local.iter_contours():
@@ -10447,8 +10922,35 @@ class _CanvasLogic:
         minimum = 3 if bound.closed else 2
         return len(bound.nodes) > minimum
 
-    def _delete_selected_shape_node(self, layer: LayerNode) -> bool:
-        bound = layer.bound
+    def _shape_edit_target(
+        self,
+    ) -> tuple[BoundGeometry, float, float, ShapeStyle | None] | None:
+        """Resolve the geometry edited by the shape-edit tool.
+
+        Returns (bound, world offset, world offset, style) for the selected
+        layer's bound or a selected speed-center object's geometry.
+        """
+        if self.selected_kind == "layer":
+            layer = self.chapter.layers.get(self.selected_id)
+            if (
+                layer is None or layer.layer_kind == "fill"
+                or layer.bound is None
+            ):
+                return None
+            wx, wy = self.chapter.layer_world_translation(layer.layer_id)
+            return layer.bound, wx, wy, layer.shape_style
+        if self.selected_kind == "object":
+            obj = self.chapter.objects.get(self.selected_id)
+            if isinstance(obj, SpeedLineCenterObject):
+                wx, wy = self.chapter.layer_world_translation(
+                    obj.parent_layer_id
+                )
+                return obj.geometry, wx, wy, None
+        return None
+
+    def _delete_selected_shape_node(
+        self, bound: BoundGeometry,
+    ) -> bool:
         node = self._selected_shape_node(bound)
         if node is None or not self._can_delete_shape_node(bound, node):
             return False
@@ -10505,14 +11007,15 @@ class _CanvasLogic:
     def _begin_shape_edit(
         self, world_point: QPointF, allow_interior: bool = True,
     ) -> bool:
-        layer = self.chapter.layers[self.selected_id]
-        if layer.layer_kind == "fill" or layer.bound is None:
+        target = self._shape_edit_target()
+        if target is None:
             return False
-        wx, wy = self.chapter.layer_world_translation(layer.layer_id)
+        bound, wx, wy, style = target
         local = QPointF(world_point.x() - wx, world_point.y() - wy)
-        bound = layer.bound
         bound.normalize_bezier_handles()
-        hit = self._shape_hit_test(bound, local)
+        hit = self._shape_hit_test(
+            bound, local, geometry_only=style is None
+        )
         self._shape_hover_target = hit
         self._shape_hover_insert = (
             hit["insert"] if hit and hit["kind"] == "insert" else None
@@ -10536,10 +11039,12 @@ class _CanvasLogic:
                 self._toggle_shape_node_lock(bound, selected)
                 self._push_immediate_shape_change(before, "Toggle Bézier lock")
             elif name == "delete":
-                self._delete_selected_shape_node(layer)
-            elif name == "cap":
+                self._delete_selected_shape_node(bound)
+            elif name == "cap" and style is not None:
                 before = self.chapter.to_dict()
-                self._cycle_shape_cap(layer, selected)
+                self._cycle_shape_cap(
+                    self.chapter.layers[self.selected_id], selected
+                )
                 self._push_immediate_shape_change(before, "Change line cap")
             else:
                 self._model_before = self.chapter.to_dict()
@@ -10617,8 +11122,16 @@ class _CanvasLogic:
         if kind == "insert":
             index, percent, insert_point = hit["insert"]
             if bound.primitive in {"rectangle", "ellipse"}:
+                insert_layer_id = (
+                    self.chapter.objects[
+                        self.selected_id
+                    ].parent_layer_id
+                    if self.selected_kind == "object"
+                    else self.selected_id
+                )
                 self._pending_primitive_insert = (
-                    layer.layer_id, index, percent, QPointF(insert_point),
+                    insert_layer_id, index, percent,
+                    QPointF(insert_point),
                     QPointF(world_point),
                 )
                 self.primitiveConversionRequested.emit(bound.primitive)
@@ -10724,9 +11237,15 @@ class _CanvasLogic:
         )
 
     def _update_shape_edit(self, world_point: QPointF) -> None:
-        layer = self.chapter.layers[self.selected_id]
-        bound = layer.bound
-        wx, wy = self.chapter.layer_world_translation(layer.layer_id)
+        target = self._shape_edit_target()
+        if target is None:
+            return
+        bound, wx, wy, _style = target
+        layer_id = (
+            self.chapter.objects[self.selected_id].parent_layer_id
+            if self.selected_kind == "object"
+            else self.selected_id
+        )
         local = QPointF(world_point.x() - wx, world_point.y() - wy)
         selected = self._selected_shape_node(bound)
         control = self._active_shape_control or ""
@@ -10740,7 +11259,7 @@ class _CanvasLogic:
             self._shape_control_dragged = True
         if control.startswith("primitive:"):
             index = int(control.split(":", 1)[1])
-            snapped = self._snap(world_point, layer.layer_id)
+            snapped = self._snap(world_point, layer_id)
             original = BoundGeometry.from_dict(self._drag_start_value)
             effective_index = self._move_bound_handle(
                 bound, index, QPointF(snapped.x() - wx, snapped.y() - wy),
@@ -10752,7 +11271,7 @@ class _CanvasLogic:
                 )
         elif control.startswith("rectangle_point:"):
             index = int(control.split(":", 1)[1])
-            snapped = self._snap(world_point, layer.layer_id)
+            snapped = self._snap(world_point, layer_id)
             bound.nodes[index].position = (
                 snapped.x() - wx, snapped.y() - wy
             )
@@ -10773,7 +11292,7 @@ class _CanvasLogic:
             )
             if self.settings.snap_to_grid:
                 target = self._snap(
-                    original_midpoint + delta, layer.layer_id
+                    original_midpoint + delta, layer_id
                 )
                 delta = target - original_midpoint
             for node_index in (first_index, second_index):
@@ -10807,7 +11326,7 @@ class _CanvasLogic:
                 bound.nodes[index].roundness > 0
             )
         elif control == "node" and selected is not None:
-            snapped = self._snap(world_point, layer.layer_id)
+            snapped = self._snap(world_point, layer_id)
             target = QPointF(snapped.x() - wx, snapped.y() - wy)
             primary_start = self._shape_drag_nodes.get(
                 selected.node_id, self._drag_start_value
@@ -10847,7 +11366,7 @@ class _CanvasLogic:
                     selected.x * 2 - local.x(), selected.y * 2 - local.y()
                 )
         elif control in {"incoming", "outgoing"} and selected is not None:
-            snapped = self._snap(world_point, layer.layer_id)
+            snapped = self._snap(world_point, layer_id)
             target = (snapped.x() - wx, snapped.y() - wy)
             self._move_shape_bezier_handle(
                 bound, selected, control, target
@@ -10883,7 +11402,7 @@ class _CanvasLogic:
                     wx + original.nodes[0].x + dx,
                     wy + original.nodes[0].y + dy,
                 )
-                snapped = self._snap(anchor, layer.layer_id)
+                snapped = self._snap(anchor, layer_id)
                 dx = snapped.x() - wx - original.nodes[0].x
                 dy = snapped.y() - wy - original.nodes[0].y
             bound.nodes = [
@@ -10910,22 +11429,22 @@ class _CanvasLogic:
         self.update()
 
     def _update_shape_hover(self, world_point: QPointF) -> None:
-        layer = self.chapter.layers.get(self.selected_id)
-        if layer is None or layer.bound is None:
+        target = self._shape_edit_target()
+        if target is None:
             self._shape_hover_target = None
             self._shape_hover_insert = None
             self.setToolTip("")
             return
-        wx, wy = self.chapter.layer_world_translation(layer.layer_id)
+        bound, wx, wy, style = target
         local = QPointF(world_point.x() - wx, world_point.y() - wy)
-        hit = self._shape_hit_test(layer.bound, local)
+        hit = self._shape_hit_test(
+            bound, local, geometry_only=style is None
+        )
         self._shape_hover_target = hit
         self._shape_hover_insert = (
             hit["insert"] if hit and hit["kind"] == "insert" else None
         )
-        self.setToolTip(self._shape_hit_tooltip(
-            layer.bound, hit, layer.shape_style
-        ))
+        self.setToolTip(self._shape_hit_tooltip(bound, hit, style))
         self.update()
 
     def _toggle_shape_node_type(
@@ -11056,6 +11575,7 @@ class _CanvasLogic:
                 "line",
                 world_geometry=bound,
                 before=self._gradient_creation_before,
+                gradient_type=self._gradient_creation_family,
             )
             return
         if self._page_creation_anchor_id:

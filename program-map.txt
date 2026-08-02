@@ -38,6 +38,15 @@ creates a hierarchy of:
     ramp editing, translucent ARGB stops, per-series presets, and a built-in
     Primary-to-Secondary preset. Scalar distance fields cached independently
     from ramp colors for interactive editing.
+  - Speed Lines objects: SpeedLinesGradientObject variant of gradients whose
+    color ramp controls line color/opacity while a second greyscale ramp
+    drives thickness. Impact-line parameters (density with auto-thickness
+    scale, gap, close range, randomness distance/scale with neighbor
+    smoothing) plus a deletable, non-movable custom center shape/line that
+    lines converge toward (openness mismatch or Outwards mode ignores it).
+    Line/curve mode adds a draggable side/length gizmo and a Parallel /
+    Perpendicular text-toggle gizmo; color and speed-lines gradients coexist
+    per field type.
   - Drawing selections: rectangle/lasso/stroke selection for raster pixels or
     vector points (Shift adds, Ctrl removes); 8-handle free/uniform transform,
     edge translation, rotation, movable pivot. Shared by object transforms.
@@ -45,7 +54,7 @@ creates a hierarchy of:
 All edits are backed by a full undo/redo command stack (CallbackCommand,
 TilePatchCommand, ObjectPatchCommand). Projects are saved as portable folders
 with atomic, versioned chapter saves and interrupted-write recovery. Schema
-version is currently 12; settings version 11.
+version is currently 13; settings version 11.
 
 Core design principles:
   - Non-destructive: masks, fills, compound shapes, opacity compose without
@@ -138,9 +147,13 @@ Core design principles:
                             transform with handles, rotation, pivot.
 
   Gradient Tools          - Contextual ribbon: create Line/Curve, Circle/Ellipse,
-                            or Parent Shape gradients; ramp stop editor with
-                            drag + double-click color edit; distance/direction/
-                            uniform/reverse parameters; preset management.
+                            or Parent Shape gradients (color or Speed Lines);
+                            ramp stop editor with drag + double-click color
+                            edit; distance/direction/uniform/reverse parameters;
+                            preset management. Speed Lines adds a greyscale
+                            thickness ramp column and an Impact Line Parameters
+                            column (density/gap/close range/randomness sliders,
+                            Custom Center Shape/Line button, Outwards toggle).
 
 
 3. COMPLETE SCRIPT-BY-SCRIPT, METHOD-BY-METHOD REFERENCE
@@ -180,8 +193,8 @@ CORE MODULES
 
 ================================================================================
 FILE: comic_editor/core/models.py  (2486 lines)
-================================================================================
-UI-independent document model. SCHEMA_VERSION = 12.
+===============================================================================
+UI-independent document model. SCHEMA_VERSION = 13.
 
 Free functions:
   new_id() -> str                     UUID4 hex.
@@ -189,8 +202,8 @@ Free functions:
   canonical_argb(value, fallback) -> str
     Normalizes any color to uppercase #AARRGGBB.
   object_from_dict(data) -> ObjectEntity
-    Dispatches by type: vector_drawing, vector_fill, gradient, raster, text,
-    else base DocumentObject.
+    Dispatches by type: vector_drawing, vector_fill, gradient (color_fill or
+    speed_lines), speed_center, raster, text, else base DocumentObject.
   default_color_palette() -> ColorPalette (black + white swatches).
 
 Class: GridSettings
@@ -295,6 +308,22 @@ Class: GradientObject(DocumentObject)
 Class: ColorFillGradientObject(GradientObject)
   Full gradient with validate_gradient().
 
+Class: SpeedLinesField
+  density (0.005-0.5 lines/px), gap (>=0), close_range (>=0),
+  randomness_distance (>=0), randomness_scale (1-100). validate() /
+  to_dict() / from_dict(data).
+
+Class: SpeedLinesGradientObject(GradientObject)
+  gradient_type "speed_lines"; color_ramp (color/opacity) and thickness_ramp
+  (greyscale -> thickness) ColorGradientRamps, speed_field, center_shape_id
+  ("" = point center), loaded_preset_id. validate_gradient() / to_dict().
+
+Class: SpeedLineCenterObject(DocumentObject)
+  object_type "speed_center"; geometry (layer-local BoundGeometry),
+  owner_gradient_id. Owned like a vector fill: never a layer child, not
+  movable (parent_ref_list -> None, move_entity raises), deletable
+  independently. validate_center() / to_dict().
+
 ---- Vector model types ----
 
 Class: VectorStrokePoint
@@ -328,25 +357,33 @@ Class: ChapterDocument
   validate() - full invariant set: schema/width checks, root pages, per-layer
     kind/compound/fill constraints, unique child refs, vector fill ownership
     (owned by exactly one drawing, matching parent layer, in fill_child_ids),
-    gradient field-type per-parent exclusivity, object container checks,
-    acyclic hierarchy (DFS), expected == referenced entities.
+    speed center ownership (owner is a speed-lines gradient, matching
+    center_shape_id and parent layer, not a layer child), gradient family
+    (color_fill vs speed_lines) + field-type per-parent exclusivity, object
+    container checks, acyclic hierarchy (DFS), expected == referenced
+    entities.
   _assert_acyclic() - DFS cycle detection.
   add_page / add_layer / add_fill_layer / add_object (routes vector fills)
   add_vector_fill(owner_id, fill, index)
   add_gradient(parent_id, field_type)
-  gradient_children(parent_id, field_type, excluding) -> matching gradients.
+  gradient_children(parent_id, field_type, excluding, family) -> matching
+    gradients; family narrows to color_fill or speed_lines (coexistence).
+  add_speed_center(owner_id, center) / speed_center_for(gradient_id) ->
+    owned center reference shape (one per speed-lines gradient).
   vector_fill_children(drawing_id) / reorder_vector_fill(owner, fill, index)
   parent_ref_list / move_entity (page reorder, layer/object moves, vector fill
-    reorder, moves owned fills with drawings) / delete_entity (recursive,
-    cascades to owned fills).
+    reorder, moves owned fills with drawings; speed centers refuse to move;
+    speed-lines moves translate their center geometry) / delete_entity
+    (recursive, cascades to owned fills and speed centers; deleting a center
+    clears the owner reference).
   layer_world_translation / page_for_layer / ancestor_layers
   closest_compound_ancestor / contributing_compound_ancestor
   effective_grid / effective_object_opacity / set_layer_opacity
   ensure_height_for / minimum_safe_height / trim_height
   iter_render_order() - front-to-back; fills behind drawing; gradients part of
     parent layer.
-  to_dict() / from_dict(data) - V1-V12 migration (legacy text alignment,
-    legacy series colors, clamping).
+  to_dict() / from_dict(data) - V1-V13 migration (legacy text alignment,
+    legacy series colors, clamping; speed-lines fields default on load).
 
 Class: ChapterReference - chapter_id + name.
 
@@ -559,6 +596,17 @@ The central interactive canvas - the heart of the application. Mixin
       per viewport so Distance drags only redo normalization + ramp lookup.
       _gradient_geometry_cache / _gradient_render_cache invalidated
       independently (geometry vs ramp color changes).
+    Speed-lines rendering: _render_speed_lines_gradient dispatches to numpy
+      band/coverage builders on the shared projection arrays. Parallel line
+      mode offsets the curve family by the signed side gizmo on its side only
+      (k>=0 / k<=0 / straddle at zero); perpendicular mode strokes normal to
+      the curve at density spacing with signed length. Ring modes (radial/
+      parent shape) lay bands at 1/density spacing from the boundary with
+      thickness = greyscale(thickness_ramp(t)) * (spacing - gap); close range
+      + smoothed per-line noise (deterministic zlib-crc32 seed) truncate each
+      line's endpoint; a closed custom center shape projects the convergence
+      target to its boundary (containment cut; openness mismatch ignored);
+      outwards spans the distance parameter and ignores the center.
 
     ---- Drawing overlays ----
     _draw_grid / _draw_predictive_ink / _draw_selection /
@@ -642,6 +690,14 @@ The central interactive canvas - the heart of the application. Mixin
     _begin_gradient_center_drag / _update_gradient_center_drag /
     _finish_gradient_center_drag - sets _gradient_preview_active during drag,
     clears gradient render cache on release for final-resolution rebuild.
+    Speed-lines gizmos extend the gradient controls: line mode always shows
+    the signed side/length "distance:" gizmo plus a "direction:" text badge
+    that cycles parallel/perpendicular; radial/shape reuse center/distance/
+    toggle gizmos; Outwards reuses reverse_direction. Selecting a speed-center
+    object routes all shape-edit machinery to its geometry via
+    _shape_edit_target() (bound/world-offset/style resolution shared with
+    selected layers; node delete key, hover, gizmos, and insertion all work;
+    primitive insertion resolves the owning layer).
 
     ---- Raster strokes ----
     _begin_stroke / _continue_stroke (dabs, density, antialias, predictive
@@ -703,7 +759,11 @@ Standalone series/chapter application shell (QMainWindow).
         (swappable wells with hex row: accept/copy/paste #RRGGBB/#AARRGGBB).
       - Left sidebar splitter (tools | colors tabs).
       - Resizable right sidebar splitter (layers tree | canvas).
-      - Ribbon: Tool Settings, Gradient Tools, Vector Tools pages.
+      - Ribbon: Tool Settings, Gradient Tools, Vector Tools pages. The
+        Gradient Tools page holds Create (incl. Speed Lines), Gradient
+        Parameters (color ramp), Gradient Ramp Presets, Gradient Type
+        Parameters, plus speed-only Thickness Parameters and Impact Line
+        Parameters groups.
       - Central: canvas + fixed-width chapter preview.
       - Right dock: layer settings + hierarchy tree (drag-drop).
       - Floating ContextInspector.
@@ -741,7 +801,11 @@ Standalone series/chapter application shell (QMainWindow).
 
     Editing actions: _add_page / _add_layer / _add_raster / _add_text /
       _add_fill / _add_vector_drawing / _delete_selected / _trim_height /
-      _activate_tool / _confirm_primitive_conversion.
+      _activate_tool / _confirm_primitive_conversion. _create_gradient takes
+      a gradient_type ("color_fill" / "speed_lines"); _edit_speed_center_shape
+      selects an existing center or prompts Square/Rectangle/Freeform (Line
+      for line-mode gradients) and creates a SpeedLineCenterObject, selecting
+      it in shape edit; _create_speed_center builds the default geometry.
 
     Selection/model sync: bidirectional canvas<->tree, Ctrl+click candidate
       menu, hierarchy refresh preserving expansion/selection.
@@ -750,7 +814,8 @@ Standalone series/chapter application shell (QMainWindow).
       _palette_mutated / _swatch_applied / _sync_series_colors.
 
     Gradient presets: _gradient_preset_load/add/save/rename/remove (per-series
-      gradient_ramp_presets).
+      gradient_ramp_presets); presets apply to the color ramp (speed lines
+      route to color_ramp via _gradient_color_ramp).
 
     Saving: save() (atomic chapter + series), _autosave, _mark_dirty,
       _confirm_discard_or_save. Settings: pencil presets, brush sizes, hotkeys
@@ -848,40 +913,50 @@ Contextual gradient creation, ramp editing, and preset controls.
       selectionChanged / colorEditRequested.
 
   Class: GradientToolsControls(QWidget)
-    Signals: createRequested / objectChanged / presetLoadRequested /
-      presetAddRequested / presetSaveRequested / presetRenameRequested /
-      presetRemoveRequested.
+    Signals: createRequested / speedCreateRequested / objectChanged /
+      centerShapeRequested / presetLoadRequested / presetAddRequested /
+      presetSaveRequested / presetRenameRequested / presetRemoveRequested.
 
-    Create widget: Line/Curve, Circle/Ellipse, Parent Shape buttons, field
+    Create widget: Line/Curve, Circle/Ellipse, Parent Shape, Speed Lines
+      buttons (the Speed Lines button uses the Selected type combo), field
       type combo, Select Gradient button.
-    Type parameters: Follow (parallel/perpendicular), Reverse direction,
-      Uniform checkbox, Distance slider + spinbox. The distance slider's
-      sliderPressed/sliderReleased now route through _begin_ramp_edit /
+    Type parameters: Follow (parallel/perpendicular), Reverse direction
+      (relabeled "Outwards" for speed lines), Uniform checkbox (color
+      gradients only), Distance slider + spinbox. The distance slider's
+      sliderPressed/sliderReleased route through _begin_ramp_edit /
       _finish_ramp_edit so slider drags coalesce into a single undo and use
       the reduced preview gradient grid.
-    Ramp editor: GradientRampEditor + add/remove stop buttons.
-    Presets: combo + name edit + New/Save/Remove.
+    Ramp editor: GradientRampEditor + add/remove stop buttons (color ramp).
+    Thickness Parameters column: second GradientRampEditor + add/remove stops
+      bound to thickness_ramp (greyscale drives line thickness).
+    Impact Line Parameters column: density/gap/close range/randomness
+      distance/randomness scale slider+spinbox rows (coalesced undo) and the
+      Custom Center Shape / Line button (centerShapeRequested).
+    Presets: combo + name edit + New/Save/Remove (color ramp only).
 
-    selected_gradient() / context_parent_id() / matching_gradients().
-    _field_changed() - switch field type with conflict detection (one per
-      type per parent).
+    selected_gradient() / _color_ramp_of() / context_parent_id() /
+      matching_gradients().
+    _field_changed() - switch field type with family-aware conflict detection.
     _select_matching_gradient() - selects the child matching the combo.
-    _type_parameter_changed() - commits direction/distance changes; defers the
-      undo commit while an edit is active (single command on release).
+    _type_parameter_changed() - commits direction/distance/impact sliders;
+      defers the undo commit while an edit is active (single command on
+      release).
     _begin_ramp_edit() - captures before-state and sets
       canvas._gradient_preview_active (reduced-resolution gradient grid).
-    _preview_ramp() - live ramp update without undo.
+    _preview_ramp / _preview_thickness_ramp - live ramp updates without undo.
     _finish_ramp_edit() - clears preview flag + gradient render cache, commits
       one undo command.
     _interpolated_stop() (static) - creates a stop at the largest gap with
       averaged color.
-    _add_stop / _remove_stop (min 2 stops).
-    _edit_stop_color / _apply_stop_color - ColorPickerPopup with quick colors
-      from canvas primary/secondary.
+    _add_stop / _remove_stop (min 2 stops) and _add_thickness_stop /
+      _remove_thickness_stop; _edit_stop_color / _apply_stop_color and
+      thickness variants - ColorPickerPopup with quick colors from canvas
+      primary/secondary.
     _preset_activated / _sync_preset_name / _save_preset / _rename_preset /
       _remove_preset; set_presets() includes "Custom" and built-in
       "Primary to Secondary" entries.
-    refresh() - syncs controls with per-field-type visibility rules.
+    refresh() - syncs controls with per-field-type and per-family visibility
+      rules (thickness/impact columns only for speed lines).
 
 
 ================================================================================
@@ -963,7 +1038,7 @@ tool panel + separator frames.
 
 
 ================================================================================
-TEST FILES (22 files, ~6400 lines total)
+TEST FILES (23 files, ~6900 lines total)
 ================================================================================
 
   conftest.py (25) - offscreen platform, qapp fixture, deferred delete flush.
@@ -1033,6 +1108,12 @@ TEST FILES (22 files, ~6400 lines total)
   test_gradients.py (540) - gradient creation/per-type exclusivity, ramp
     editing, stops, presets CRUD, built-in primary-secondary, uniform/
     reversed distance, center auto/manual, field switching, rendering.
+
+  test_speed_lines.py (270) - speed-lines model round trip, center ownership
+    invariants (one center, immovable, delete cascade, mismatch ignored),
+    color/speed coexistence, V12->V13 migration, parallel/perpendicular/ring/
+    outward/center-shape rendering, deterministic noise, direction gizmo
+    toggle, center shape-edit routing, impact parameter clamping.
 
   test_ribbon_integration.py (297) - ribbon context/tools, vector branch
     open/close, series colors/palette autosave, redraw control persistence.

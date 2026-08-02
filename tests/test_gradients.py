@@ -97,7 +97,7 @@ def test_series_v11_gradient_presets_are_copied_and_migrate_from_v9():
     legacy["schema_version"] = 9
     legacy.pop("gradient_ramp_presets")
     restored = SeriesDocument.from_dict(legacy)
-    assert restored.schema_version == 12
+    assert restored.schema_version == 13
     assert len(restored.gradient_ramp_presets) == 1
 
     preset = restored.gradient_ramp_presets[0]
