@@ -92,6 +92,9 @@ New Feature:
 		- lets you set the color of the outline too. since it has an alpha channel that can control the opacity for us
 test the fill tool dumbass (vector and ras
 
+
+## minor bug
+- start.bat doesn't install PIL or pyside6 (it should)
 ## new gradient type: speed lines
 speed lines, includes opacity too
 	- supports different shapes

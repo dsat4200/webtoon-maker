@@ -39,6 +39,11 @@ workflow.
 
 ## Run
 
+On Windows, run `start.bat`. It installs the required Python packages,
+including PySide6 and Pillow (which provides `PIL`), before starting the app.
+
+Or run the equivalent commands manually:
+
 ```powershell
 python -m pip install -r requirements.txt
 python main.py
