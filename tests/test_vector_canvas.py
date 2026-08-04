@@ -65,6 +65,25 @@ def test_vector_pencil_creates_pressure_stroke_and_undoes(qapp):
     assert len(drawing.strokes) == 1
 
 
+def test_vector_pencil_preserves_zero_pressure_from_capable_pen(qapp):
+    canvas, _chapter, drawing = _canvas_with_drawing()
+    canvas._device_supports_pressure = True
+    canvas._tool_press(
+        canvas.document_to_widget(QPointF(100, 100)), 0.0
+    )
+    canvas._tool_move(
+        canvas.document_to_widget(QPointF(160, 120)), 0.5
+    )
+    canvas._tool_move(
+        canvas.document_to_widget(QPointF(220, 140)), 1.0
+    )
+    canvas._tool_release()
+
+    stroke = drawing.strokes[0]
+    assert stroke.points[0].width < stroke.points[-1].width
+    assert stroke.points[0].opacity < stroke.points[-1].opacity
+
+
 def test_vector_pencil_tap_creates_round_dot(qapp):
     canvas, _chapter, drawing = _canvas_with_drawing()
     canvas._tool_press(

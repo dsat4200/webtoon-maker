@@ -184,6 +184,29 @@ def test_pressure_preset_round_trip_and_independent_channels():
     assert loaded.antialiasing is False
 
 
+def test_pressure_capable_device_preserves_light_raster_samples(qapp):
+    canvas, chapter, _page, layer = _document_canvas()
+    raster = chapter.add_object(
+        layer.layer_id,
+        RasterObject(interaction_rect=(0, 0, 300, 300)),
+    )
+    canvas.set_selection("object", raster.object_id)
+    canvas.set_tool(ToolKind.RASTER_PENCIL)
+    canvas._device_supports_pressure = True
+
+    canvas._begin_stroke(QPointF(100, 100), 0.0)
+    assert canvas._last_pressure == 0.0
+    low_size, low_opacity = canvas._brush_values(canvas._last_pressure)
+    canvas._continue_stroke(QPointF(140, 100), 1.0)
+    high_size, high_opacity = canvas._brush_values(canvas._last_pressure)
+    canvas._end_stroke()
+
+    assert low_size < high_size
+    assert low_opacity < high_opacity
+    canvas._device_supports_pressure = False
+    assert canvas._effective_pressure(0.0) == 1.0
+
+
 def test_text_edit_shortcut_suppression_targets_letters_and_shift(qapp):
     window = MainWindow()
     try:

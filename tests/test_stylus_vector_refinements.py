@@ -1,12 +1,14 @@
 from __future__ import annotations
 
-from PySide6.QtCore import QEvent, QPointF, Qt
+from PySide6.QtCore import QCoreApplication, QEvent, QPointF, Qt
 from PySide6.QtGui import (
     QGuiApplication, QImage, QPainter, QPointingDevice, QTabletEvent,
 )
 from PySide6.QtWidgets import QAbstractSpinBox, QApplication, QMenu
 
-from comic_editor.core.models import BoundGeometry, ChapterDocument
+from comic_editor.core.models import (
+    BoundGeometry, ChapterDocument, RasterObject,
+)
 from comic_editor.core.settings import EditorSettings
 from comic_editor.core.tiles import TileStore
 from comic_editor.ui.canvas import CanvasWidget, ToolKind
@@ -53,6 +55,51 @@ def test_stylus_click_triggers_popup_action_once(qapp):
         assert triggered == [True]
     finally:
         menu.close()
+        window.close()
+
+
+def test_canvas_tablet_press_is_not_forwarded_as_popup(
+    qapp, monkeypatch,
+):
+    window = MainWindow()
+    chapter = ChapterDocument()
+    page = chapter.add_page(
+        bound=BoundGeometry.rectangle(0, 0, 300, 300)
+    )
+    raster = chapter.add_object(
+        page.layer_id,
+        RasterObject(interaction_rect=(0, 0, 300, 300)),
+    )
+    window._set_chapter(chapter, TileStore())
+    received: list[float] = []
+    monkeypatch.setattr(
+        window.canvas, "_tool_press",
+        lambda _position, pressure: received.append(pressure),
+    )
+    monkeypatch.setattr(
+        QApplication, "widgetAt", lambda _position: window.canvas,
+    )
+    try:
+        window.show()
+        qapp.processEvents()
+        local = QPointF(window.canvas.rect().center())
+        global_position = QPointF(
+            window.canvas.mapToGlobal(local.toPoint())
+        )
+        event = _tablet_event(
+            QEvent.TabletPress, local, global_position,
+            0.25, Qt.LeftButton,
+        )
+        release = _tablet_event(
+            QEvent.TabletRelease, local, global_position,
+            0.0, Qt.NoButton,
+        )
+
+        QCoreApplication.sendEvent(window.canvas, event)
+        QCoreApplication.sendEvent(window.canvas, release)
+
+        assert received == [0.25]
+    finally:
         window.close()
 
 

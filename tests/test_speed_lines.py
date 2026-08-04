@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import math
+
 import pytest
 from PySide6.QtCore import QPointF
 from PySide6.QtGui import QImage
@@ -7,12 +9,13 @@ from PySide6.QtGui import QImage
 from comic_editor.core.models import (
     BoundGeometry, ChapterDocument, ColorFillGradientObject,
     ColorGradientRamp, ColorGradientStop, LineGradientField,
-    PathNode, SpeedLineCenterObject, SpeedLinesGradientObject,
+    PathNode, SpeedLineCenterObject, SpeedLinesField, SpeedLinesGradientObject,
     object_from_dict,
 )
 from comic_editor.core.settings import EditorSettings
 from comic_editor.core.tiles import TileStore
 from comic_editor.ui.canvas import CanvasWidget, ToolKind
+from comic_editor.ui.main_window import MainWindow
 
 
 def _ramp() -> ColorGradientRamp:
@@ -140,7 +143,7 @@ def test_v12_chapter_with_speed_lines_migrates_to_v13():
     payload = chapter.to_dict()
     payload["schema_version"] = 12
     restored = ChapterDocument.from_dict(payload)
-    assert restored.schema_version == 13
+    assert restored.schema_version == 14
     restored_gradient = restored.objects[gradient.object_id]
     assert isinstance(restored_gradient, SpeedLinesGradientObject)
     assert restored.speed_center_for(gradient.object_id) is not None
@@ -154,45 +157,96 @@ def _render(chapter, obj):
     return canvas, image
 
 
+def _use_manga_ramps(gradient):
+    gradient.color_ramp = ColorGradientRamp(stops=[
+        ColorGradientStop(position=0, color="#FF000000"),
+        ColorGradientStop(position=1, color="#FF000000"),
+    ])
+    gradient.thickness_ramp = ColorGradientRamp(stops=[
+        ColorGradientStop(position=0, color="#FFFFFFFF"),
+        ColorGradientStop(position=1, color="#FF000000"),
+    ])
+    gradient.speed_field.gap = 2
+    gradient.speed_field.close_range = 8
+    gradient.speed_field.randomness_distance = 24
+    gradient.speed_field.randomness_scale = 8
+
+
+def _ink(image, x, y):
+    return image.pixelColor(int(round(x)), int(round(y))).lightness() < 245
+
+
 def test_line_speed_lines_render_parallel_and_perpendicular(qapp):
     chapter, _page, gradient = _gradient_document("line")
+    _use_manga_ramps(gradient)
     gradient.speed_field.density = 0.1
     gradient.line_field.perpendicular_distance = 40
     _canvas, image = _render(chapter, gradient)
-    # Parallel family sits at +40 and extends downward; above stays clear.
-    assert any(
-        image.pixelColor(100, y).name() != "#ffffff"
-        for y in range(190, 300)
-    )
-    assert all(
-        image.pixelColor(100, y).name() == "#ffffff"
-        for y in range(50, 150)
-    )
+    # Parallel mode fills the parent with offset copies of the guide.
+    assert sum(
+        _ink(image, 100, y) for y in range(20, 280)
+    ) > 8
+    assert sum(
+        _ink(image, 300, y) for y in range(20, 280)
+    ) > 8
 
     gradient.line_field.direction_mode = "perpendicular"
     gradient.line_field.perpendicular_distance = 60
     _canvas, image = _render(chapter, gradient)
-    # Strokes point down from the curve; above the curve stays clear.
-    assert any(
-        image.pixelColor(200, y).name() != "#ffffff"
-        for y in range(151, 210)
+    below = sum(
+        _ink(image, x, y)
+        for x in range(55, 346, 5) for y in range(152, 210, 3)
     )
-    assert all(
-        image.pixelColor(200, y).name() == "#ffffff"
-        for y in range(100, 149)
+    above = sum(
+        _ink(image, x, y)
+        for x in range(55, 346, 5) for y in range(90, 141, 3)
     )
+    assert below > 20
+    assert above == 0
+
+    gradient.line_field.perpendicular_distance = -60
+    _canvas, image = _render(chapter, gradient)
+    assert sum(
+        _ink(image, x, y)
+        for x in range(55, 346, 5) for y in range(90, 141, 3)
+    ) > 20
 
 
-def test_radial_speed_lines_converge_at_center_and_jitter(qapp):
+def test_radial_speed_lines_are_tapered_spokes_not_rings(qapp):
     chapter, _page, gradient = _gradient_document("radial")
+    _use_manga_ramps(gradient)
+    gradient.speed_field.density = 0.07
     gradient.speed_field.randomness_distance = 30
     gradient.speed_field.randomness_scale = 10
     _canvas, image = _render(chapter, gradient)
-    near_boundary = image.pixelColor(100, 150)
-    near_center = image.pixelColor(200, 110)
-    assert near_boundary.name() != "#ffffff"
-    assert near_center.name() != "#ffffff"
-    assert near_center != near_boundary
+    angular_samples = [
+        _ink(
+            image,
+            200 + math.cos(math.radians(angle)) * 105,
+            150 + math.sin(math.radians(angle)) * 105,
+        )
+        for angle in range(0, 360, 3)
+    ]
+    # Individual rays leave alternating ink and paper around one radius.
+    assert 10 < sum(angular_samples) < len(angular_samples) - 10
+
+    ink_angle = next(
+        angle for angle in range(0, 360, 3)
+        if _ink(
+            image,
+            200 + math.cos(math.radians(angle)) * 105,
+            150 + math.sin(math.radians(angle)) * 105,
+        )
+    )
+    # A selected ray continues toward the center instead of forming a band.
+    assert sum(
+        _ink(
+            image,
+            200 + math.cos(math.radians(ink_angle)) * radius,
+            150 + math.sin(math.radians(ink_angle)) * radius,
+        )
+        for radius in range(65, 111, 5)
+    ) >= 6
 
     # Deterministic across identical renders.
     first = image
@@ -202,6 +256,7 @@ def test_radial_speed_lines_converge_at_center_and_jitter(qapp):
 
 def test_shape_speed_lines_outward_ignores_center(qapp):
     chapter, _page, gradient = _gradient_document("parent_shape")
+    _use_manga_ramps(gradient)
     gradient.speed_field.density = 0.1
     gradient.shape_field.reverse_direction = True
     gradient.shape_field.distance = 80
@@ -212,13 +267,20 @@ def test_shape_speed_lines_outward_ignores_center(qapp):
         )),
     )
     _canvas, image = _render(chapter, gradient)
-    assert image.pixelColor(450, 150).name() != "#ffffff"
-    assert image.pixelColor(550, 150).name() == "#ffffff"
+    assert sum(
+        _ink(image, x, y)
+        for x in range(405, 480, 3) for y in range(15, 286, 5)
+    ) > 10
+    gradient.center_shape_id = ""
+    _canvas, without_center = _render(chapter, gradient)
+    assert image == without_center
+    gradient.center_shape_id = center.object_id
     assert center.object_id in chapter.objects
 
 
 def test_center_shape_truncates_lines_and_mismatch_is_ignored(qapp):
     chapter, _page, gradient = _gradient_document("parent_shape")
+    _use_manga_ramps(gradient)
     gradient.speed_field.density = 0.1
     center = chapter.add_speed_center(
         gradient.object_id,
@@ -227,8 +289,14 @@ def test_center_shape_truncates_lines_and_mismatch_is_ignored(qapp):
         )),
     )
     _canvas, image = _render(chapter, gradient)
-    assert image.pixelColor(200, 150).name() == "#ffffff"
-    assert image.pixelColor(150, 150).name() != "#ffffff"
+    assert all(
+        not _ink(image, x, y)
+        for x in range(170, 231, 10) for y in range(110, 171, 10)
+    )
+    assert sum(
+        _ink(image, x, y)
+        for x in range(120, 160, 2) for y in range(95, 186, 3)
+    ) > 10
 
     # Open center under a closed parent has no effect; still renders.
     second_layer = chapter.add_layer(
@@ -239,14 +307,17 @@ def test_center_shape_truncates_lines_and_mismatch_is_ignored(qapp):
         second_layer.layer_id,
         SpeedLinesGradientObject(field_type="parent_shape"),
     )
+    _use_manga_ramps(gradient2)
     chapter.add_speed_center(
         gradient2.object_id,
         SpeedLineCenterObject(geometry=BoundGeometry.path([
             PathNode(x=100, y=100), PathNode(x=300, y=100),
         ], closed=False)),
     )
-    _canvas, image = _render(chapter, gradient2)
-    assert image.pixelColor(200, 150).name() != "#ffffff"
+    _canvas, with_mismatch = _render(chapter, gradient2)
+    gradient2.center_shape_id = ""
+    _canvas, without_mismatch = _render(chapter, gradient2)
+    assert with_mismatch == without_mismatch
 
 
 def test_speed_lines_gizmos_and_direction_toggle(qapp):
@@ -257,8 +328,15 @@ def test_speed_lines_gizmos_and_direction_toggle(qapp):
     canvas.set_tool(ToolKind.SHAPE_EDIT)
 
     controls = canvas._gradient_control_points(gradient)
-    assert "distance:" in controls
+    assert "flow:" in controls
     assert "direction:" in controls
+
+    assert canvas._begin_gradient_edit(gradient, controls["flow:"])
+    canvas._update_gradient_edit(
+        gradient, canvas._gradient_local_to_world(gradient, (50, 150))
+    )
+    canvas._tool_release()
+    assert gradient.line_field.reverse_direction
 
     hit = canvas._gradient_control_hit(
         gradient, controls["direction:"]
@@ -266,6 +344,137 @@ def test_speed_lines_gizmos_and_direction_toggle(qapp):
     assert hit == ("direction", "")
     assert canvas._begin_gradient_edit(gradient, controls["direction:"])
     assert gradient.line_field.direction_mode == "perpendicular"
+    assert "distance:" in canvas._gradient_control_points(gradient)
+
+
+def test_parallel_speed_lines_reverse_color_travel(qapp):
+    chapter, _page, gradient = _gradient_document("line")
+    gradient.speed_field.density = 0.08
+    gradient.speed_field.gap = 3
+    gradient.speed_field.close_range = 0
+    gradient.speed_field.randomness_distance = 0
+    gradient.thickness_ramp = ColorGradientRamp(stops=[
+        ColorGradientStop(position=0, color="#FFFFFFFF"),
+        ColorGradientStop(position=1, color="#FFFFFFFF"),
+    ])
+
+    def color_balance(image, x):
+        colors = [
+            image.pixelColor(x, y) for y in range(15, 286)
+            if image.pixelColor(x, y).name() != "#ffffff"
+        ]
+        return sum(color.red() - color.blue() for color in colors)
+
+    _canvas, forward = _render(chapter, gradient)
+    assert color_balance(forward, 80) > 0
+    assert color_balance(forward, 320) < 0
+
+    gradient.line_field.reverse_direction = True
+    _canvas, reversed_image = _render(chapter, gradient)
+    assert color_balance(reversed_image, 80) < 0
+    assert color_balance(reversed_image, 320) > 0
+
+
+def test_open_custom_center_retargets_perpendicular_lines(qapp):
+    chapter, _page, gradient = _gradient_document("line")
+    _use_manga_ramps(gradient)
+    gradient.line_field.direction_mode = "perpendicular"
+    gradient.line_field.perpendicular_distance = 40
+    gradient.speed_field.density = 0.08
+    _canvas, default_image = _render(chapter, gradient)
+
+    center = chapter.add_speed_center(
+        gradient.object_id,
+        SpeedLineCenterObject(geometry=BoundGeometry.path([
+            PathNode(x=40, y=245), PathNode(x=360, y=245),
+        ], closed=False)),
+    )
+    _canvas, centered_image = _render(chapter, gradient)
+    default_far = sum(
+        _ink(default_image, x, y)
+        for x in range(55, 346, 5) for y in range(215, 241, 3)
+    )
+    centered_far = sum(
+        _ink(centered_image, x, y)
+        for x in range(55, 346, 5) for y in range(215, 241, 3)
+    )
+    assert default_far == 0
+    assert centered_far > 15
+    assert center.object_id in chapter.objects
+
+
+def test_speed_line_defaults_are_manga_ready():
+    field = SpeedLinesField()
+    gradient = SpeedLinesGradientObject()
+    assert field.to_dict() == {
+        "density": 0.06,
+        "gap": 3.0,
+        "close_range": 8.0,
+        "randomness_distance": 24.0,
+        "randomness_scale": 8.0,
+    }
+    assert gradient.color_ramp.stops[0].color == "#FF000000"
+    assert gradient.color_ramp.stops[-1].color == "#00000000"
+    assert gradient.thickness_ramp.stops[0].color == "#FFFFFFFF"
+    assert gradient.thickness_ramp.stops[-1].color == "#FF000000"
+
+
+def test_canvas_creates_speed_lines_from_primary_to_transparent(qapp):
+    chapter = ChapterDocument(height=300)
+    page = chapter.add_page(bound=BoundGeometry.rectangle(0, 0, 400, 300))
+    canvas = CanvasWidget(EditorSettings(snap_to_grid=False))
+    canvas.set_document(chapter, TileStore())
+    canvas.primary_color = "#80445566"
+    gradient = canvas.create_gradient(
+        page.layer_id, "parent_shape", gradient_type="speed_lines"
+    )
+    assert isinstance(gradient, SpeedLinesGradientObject)
+    assert gradient.color_ramp.stops[0].color == "#80445566"
+    assert gradient.color_ramp.stops[-1].color == "#00445566"
+
+
+def test_speed_line_ribbon_is_contextual_and_center_keeps_owner(qapp):
+    window = MainWindow()
+    chapter, page, gradient = _gradient_document("radial")
+    window._set_chapter(chapter, TileStore())
+    window.resize(1600, 900)
+    window.show()
+    try:
+        window.canvas.set_selection("layer", page.layer_id)
+        qapp.processEvents()
+        assert not window.gradient_create_group.isHidden()
+        assert window.gradient_parameters_group.isHidden()
+        assert window.gradient_impact_group.isHidden()
+
+        window.canvas.set_selection("object", gradient.object_id)
+        qapp.processEvents()
+        assert window.gradient_create_group.isHidden()
+        assert not window.gradient_type_group.isHidden()
+        assert not window.gradient_parameters_group.isHidden()
+        assert not window.gradient_thickness_group.isHidden()
+        assert not window.gradient_impact_group.isHidden()
+
+        window.gradient_tools_page.resize(1200, 220)
+        qapp.processEvents()
+        assert window.gradient_tools_page.horizontalScrollBar().maximum() == 0
+
+        center = chapter.add_speed_center(
+            gradient.object_id,
+            SpeedLineCenterObject(geometry=BoundGeometry.rectangle(
+                170, 120, 60, 60
+            )),
+        )
+        window.canvas.set_selection("object", center.object_id)
+        window._sync_contextual_ribbon()
+        qapp.processEvents()
+        assert window.gradient_tools_controls.selected_gradient() is gradient
+        assert not window.gradient_impact_group.isHidden()
+        assert window.gradient_tools_controls.center_shape_button.text() == (
+            "Edit Custom Center"
+        )
+    finally:
+        window._dirty = False
+        window.close()
 
 
 def test_speed_center_shape_edit_routes_to_center_geometry(qapp):

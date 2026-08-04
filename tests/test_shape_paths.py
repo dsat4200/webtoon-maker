@@ -9,6 +9,7 @@ from PySide6.QtGui import (
     QColor, QImage, QPainter, QPainterPath, QPointingDevice, QTabletEvent,
 )
 from PySide6.QtTest import QTest
+from PySide6.QtWidgets import QApplication
 
 from comic_editor.core import settings as settings_module
 from comic_editor.core.models import (
@@ -72,7 +73,7 @@ def test_path_node_shape_style_round_trip_and_open_leaf_invariants():
     )
     loaded = ChapterDocument.from_dict(chapter.to_dict())
     result = loaded.layers[line.layer_id]
-    assert loaded.schema_version == 13
+    assert loaded.schema_version == 14
     assert result.layer_kind == "open_shape"
     assert result.bound.closed is False
     assert result.bound.nodes[1].incoming == (70, 30)
@@ -266,6 +267,148 @@ def test_shape_creation_open_close_and_bezier_drag(qapp):
     assert closed.shape_style.outline_color == canvas.primary_color
     assert closed.shape_style.outline_thickness == 4
     assert canvas.tool == ToolKind.SHAPE_EDIT
+
+
+def test_free_shape_close_hit_precedes_handles_and_gradient_lines_stay_open(qapp):
+    canvas, _chapter, page, _layer = _canvas()
+    canvas.set_selection("layer", page.layer_id, False)
+    canvas.set_tool(ToolKind.SHAPE_CREATE)
+    first = PathNode(
+        x=100, y=100, point_type="bezier", outgoing=(100, 100)
+    )
+    canvas._creation_nodes = [
+        first, PathNode(x=300, y=100), PathNode(x=250, y=300),
+    ]
+    canvas._creation_selected_node_id = canvas._creation_nodes[-1].node_id
+
+    hit = canvas._creation_hit_test(QPointF(100, 100))
+    assert hit is not None
+    assert hit["kind"] == "node"
+    assert hit["node_id"] == first.node_id
+    assert hit["close"] is True
+    assert "close" in canvas._shape_hit_tooltip(
+        BoundGeometry.path(canvas._creation_nodes, False), hit
+    ).lower()
+
+    canvas._gradient_creation_parent_id = page.layer_id
+    canvas._gradient_creation_type = "line"
+    hit = canvas._creation_hit_test(QPointF(100, 100))
+    assert not (hit and hit.get("close"))
+
+
+def test_free_shape_close_allows_pointer_jitter_but_drag_moves_first_point(qapp):
+    canvas, chapter, page, _layer = _canvas()
+    canvas.set_selection("layer", page.layer_id, False)
+    canvas.set_tool(ToolKind.SHAPE_CREATE)
+    canvas._creation_nodes = [
+        PathNode(x=100, y=100), PathNode(x=300, y=100),
+        PathNode(x=250, y=300),
+    ]
+    canvas._creation_selected_node_id = canvas._creation_nodes[-1].node_id
+    start = canvas.document_to_widget(QPointF(100, 100))
+    canvas._tool_press(start, 1.0)
+    assert canvas._creation_close_candidate
+    jitter = max(1, QApplication.startDragDistance() - 1)
+    canvas._tool_move(start + QPointF(jitter, 0), 1.0)
+    canvas._tool_release()
+    closed = chapter.layers[canvas.selected_id]
+    assert closed.bound.closed
+    assert not canvas._creation_nodes
+
+    canvas.set_selection("layer", page.layer_id, False)
+    canvas.set_tool(ToolKind.SHAPE_CREATE)
+    canvas._creation_nodes = [
+        PathNode(x=100, y=100), PathNode(x=300, y=100),
+        PathNode(x=250, y=300),
+    ]
+    canvas._creation_selected_node_id = canvas._creation_nodes[-1].node_id
+    start = canvas.document_to_widget(QPointF(100, 100))
+    canvas._tool_press(start, 1.0)
+    drag = QApplication.startDragDistance() + 5
+    canvas._tool_move(start + QPointF(drag, 0), 1.0)
+    canvas._tool_release()
+    assert len(canvas._creation_nodes) == 3
+    assert canvas._creation_nodes[0].x > 100
+    assert not canvas._creation_close_candidate
+
+
+def test_free_shape_stylus_jitter_still_closes(qapp):
+    canvas, chapter, page, _layer = _canvas()
+    canvas.set_selection("layer", page.layer_id, False)
+    canvas.set_tool(ToolKind.SHAPE_CREATE)
+    canvas._creation_nodes = [
+        PathNode(x=100, y=100), PathNode(x=300, y=100),
+        PathNode(x=250, y=300),
+    ]
+    canvas._creation_selected_node_id = canvas._creation_nodes[-1].node_id
+    canvas.show()
+    qapp.processEvents()
+    start = canvas.document_to_widget(QPointF(100, 100))
+    jitter = max(1, QApplication.startDragDistance() - 1)
+    _send_tablet(
+        canvas, QEvent.TabletPress, start, 0.6,
+        Qt.LeftButton, Qt.LeftButton,
+    )
+    _send_tablet(canvas, QEvent.TabletMove, start + QPointF(jitter, 0), 0.6)
+    _send_tablet(
+        canvas, QEvent.TabletRelease, start + QPointF(jitter, 0), 0.0,
+        Qt.LeftButton,
+    )
+    closed = chapter.layers[canvas.selected_id]
+    assert closed.bound.closed
+    assert not canvas._creation_nodes
+
+
+def test_custom_page_shape_closes_from_first_anchor(qapp):
+    canvas, _chapter, page, _layer = _canvas()
+    finished = []
+    canvas.pageCreationFinished.connect(
+        lambda bound, before, anchor: finished.append((bound, before, anchor))
+    )
+    assert canvas.begin_page_creation(page.layer_id, "custom")
+    canvas._creation_nodes = [
+        PathNode(x=100, y=1200), PathNode(x=300, y=1200),
+        PathNode(x=250, y=1400),
+    ]
+    canvas._creation_selected_node_id = canvas._creation_nodes[-1].node_id
+    start = canvas.document_to_widget(QPointF(100, 1200))
+    canvas._tool_press(start, 1.0)
+    canvas._tool_release()
+    assert len(finished) == 1
+    assert finished[0][0].closed
+    assert finished[0][2] == page.layer_id
+
+
+def test_shape_draft_cleanup_and_no_document_pointer_events_are_safe(qapp):
+    canvas, _chapter, _page, _layer = _canvas()
+    canvas.set_tool(ToolKind.SHAPE_CREATE)
+    canvas._creation_nodes = [
+        PathNode(x=100, y=100), PathNode(x=300, y=100),
+        PathNode(x=250, y=300),
+    ]
+    canvas._creation_active_control = "draft_node"
+    canvas._creation_close_candidate = True
+    canvas._pen_contact_active = True
+    canvas._tablet_tool_active = True
+
+    state = canvas.capture_session_state()
+    assert state is not None
+    assert not canvas._creation_nodes
+    assert canvas._creation_active_control is None
+    canvas.restore_session_state(state)
+    assert not canvas._creation_nodes
+
+    canvas.clear_document()
+    assert canvas.chapter is None
+    canvas._tool_press(QPointF(10, 10), 1.0)
+    canvas._tool_move(QPointF(20, 20), 1.0)
+    canvas._tool_release()
+    canvas._pen_contact_active = True
+    canvas._tablet_tool_active = True
+    _send_tablet(canvas, QEvent.TabletMove, QPointF(20, 20), 0.5)
+    assert canvas.chapter is None
+    assert not canvas._pen_contact_active
+    assert not canvas._tablet_tool_active
 
 
 @pytest.mark.parametrize(

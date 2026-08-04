@@ -6,13 +6,14 @@ import math
 from PySide6.QtCore import QPointF, QRectF, Qt, Signal
 from PySide6.QtGui import QColor, QLinearGradient, QPainter, QPainterPath, QPen
 from PySide6.QtWidgets import (
-    QCheckBox, QComboBox, QDoubleSpinBox, QHBoxLayout, QLabel, QLineEdit,
-    QPushButton, QSlider, QVBoxLayout, QWidget,
+    QCheckBox, QComboBox, QDoubleSpinBox, QGridLayout, QHBoxLayout, QLabel,
+    QLineEdit, QPushButton, QSlider, QVBoxLayout, QWidget,
 )
 
 from comic_editor.core.models import (
     ColorFillGradientObject, ColorGradientRamp, ColorGradientRampPreset,
-    ColorGradientStop, SpeedLinesGradientObject, canonical_argb,
+    ColorGradientStop, SpeedLineCenterObject, SpeedLinesGradientObject,
+    canonical_argb,
 )
 from comic_editor.ui.color_picker import ColorPickerPopup
 
@@ -177,6 +178,7 @@ class GradientToolsControls(QWidget):
     presetSaveRequested = Signal(str)
     presetRenameRequested = Signal(str, str)
     presetRemoveRequested = Signal(str)
+    contextChanged = Signal(str)
 
     def __init__(self, canvas, parent: QWidget | None = None):
         super().__init__(parent)
@@ -185,38 +187,35 @@ class GradientToolsControls(QWidget):
         self._edit_before: dict | None = None
         self._selected_stop_id = ""
         self._selected_thickness_stop_id = ""
+        self._context_kind = "create"
 
         self.create_widget = QWidget(self)
         create = QVBoxLayout(self.create_widget)
         create.setContentsMargins(0, 0, 0, 0)
-        button_row = QHBoxLayout()
-        self.create_line = QPushButton("Line / Curve", self.create_widget)
-        self.create_radial = QPushButton("Circle / Ellipse", self.create_widget)
-        self.create_shape = QPushButton("Parent Shape", self.create_widget)
-        self.create_speed = QPushButton("Speed Lines", self.create_widget)
-        self.create_speed.setToolTip(
-            "Create a speed-lines gradient of the Selected type"
-        )
-        button_row.addWidget(self.create_line)
-        button_row.addWidget(self.create_radial)
-        button_row.addWidget(self.create_shape)
-        button_row.addWidget(self.create_speed)
-        create.addLayout(button_row)
         type_row = QHBoxLayout()
-        type_row.addWidget(QLabel("Selected type", self.create_widget))
+        type_row.addWidget(QLabel("Field", self.create_widget))
         self.field_type = QComboBox(self.create_widget)
         self.field_type.addItem("Line / Curve", "line")
         self.field_type.addItem("Circle / Ellipse", "radial")
         self.field_type.addItem("Parent Shape", "parent_shape")
         type_row.addWidget(self.field_type, 1)
         create.addLayout(type_row)
+        button_row = QHBoxLayout()
+        self.create_color = QPushButton("Add Color Fill", self.create_widget)
+        self.create_speed = QPushButton("Add Speed Lines", self.create_widget)
+        self.create_speed.setToolTip(
+            "Create manga speed lines using the selected field"
+        )
         self.select_gradient = QPushButton(
-            "Select Gradient", self.create_widget
+            "Select Existing", self.create_widget
         )
         self.select_gradient.setToolTip(
             "Select the direct gradient matching Selected type"
         )
-        create.addWidget(self.select_gradient)
+        button_row.addWidget(self.create_color)
+        button_row.addWidget(self.create_speed)
+        button_row.addWidget(self.select_gradient)
+        create.addLayout(button_row)
 
         self.type_parameters_widget = QWidget(self)
         type_parameters = QVBoxLayout(self.type_parameters_widget)
@@ -303,29 +302,38 @@ class GradientToolsControls(QWidget):
         thickness.addLayout(thickness_stop_row)
 
         self.impact_widget = QWidget(self)
-        impact = QVBoxLayout(self.impact_widget)
+        impact = QGridLayout(self.impact_widget)
         impact.setContentsMargins(0, 0, 0, 0)
+        impact.setHorizontalSpacing(6)
+        impact.setVerticalSpacing(3)
         self._speed_sliders: dict[str, tuple[QSlider, QDoubleSpinBox]] = {}
-        for key, label, slider_max, decimals, spin_min, spin_max, default in (
-            ("density", "Density", 500, 3, 0.005, 0.5, 0.04),
-            ("gap", "Gap", 200, 0, 0, 200, 0),
-            ("close_range", "Close range", 500, 0, 0, 500, 0),
-            ("randomness_distance", "Randomness distance", 500, 0, 0, 500, 0),
-            ("randomness_scale", "Randomness scale", 100, 0, 1, 100, 10),
-        ):
+        speed_parameters = (
+            ("density", "Density", 3, 0.005, 0.5, 0.06),
+            ("gap", "Gap", 0, 0, 200, 3),
+            ("close_range", "Close", 0, 0, 500, 8),
+            ("randomness_distance", "Random distance", 0, 0, 500, 24),
+            ("randomness_scale", "Random scale", 0, 1, 100, 8),
+        )
+        for index, (
+            key, label, decimals, spin_min, spin_max, default,
+        ) in enumerate(speed_parameters):
             scale = 10 ** decimals
-            row = QWidget(self.impact_widget)
-            row_layout = QHBoxLayout(row)
-            row_layout.setContentsMargins(0, 0, 0, 0)
-            row_layout.addWidget(QLabel(label, row))
-            slider = QSlider(Qt.Orientation.Horizontal, row)
+            card = QWidget(self.impact_widget)
+            card_layout = QVBoxLayout(card)
+            card_layout.setContentsMargins(0, 0, 0, 0)
+            card_layout.setSpacing(1)
+            header = QHBoxLayout()
+            header.setContentsMargins(0, 0, 0, 0)
+            header.addWidget(QLabel(label, card))
+            slider = QSlider(Qt.Orientation.Horizontal, card)
             slider.setRange(int(round(spin_min * scale)),
                             int(round(spin_max * scale)))
             slider.setValue(int(round(default * scale)))
-            value = QDoubleSpinBox(row)
+            value = QDoubleSpinBox(card)
             value.setDecimals(decimals)
             value.setRange(spin_min, spin_max)
             value.setValue(default)
+            value.setMaximumWidth(68)
             value.setButtonSymbols(
                 QDoubleSpinBox.ButtonSymbols.NoButtons
             )
@@ -337,35 +345,39 @@ class GradientToolsControls(QWidget):
             slider.sliderPressed.connect(self._begin_ramp_edit)
             slider.sliderReleased.connect(self._finish_ramp_edit)
             value.valueChanged.connect(self._type_parameter_changed)
-            row_layout.addWidget(slider, 1)
-            row_layout.addWidget(value)
-            impact.addWidget(row)
+            header.addStretch(1)
+            header.addWidget(value)
+            card_layout.addLayout(header)
+            card_layout.addWidget(slider)
+            impact.addWidget(card, index // 3, index % 3)
             self._speed_sliders[key] = (slider, value)
         self.center_shape_button = QPushButton(
-            "Custom Center Shape / Line", self.impact_widget
+            "Add Custom Center", self.impact_widget
         )
         self.center_shape_button.setToolTip(
             "Create or select the reference shape that speed lines "
             "converge to"
         )
-        impact.addWidget(self.center_shape_button)
+        impact.addWidget(self.center_shape_button, 1, 2)
 
         self.presets_widget = QWidget(self)
-        presets = QVBoxLayout(self.presets_widget)
+        presets = QGridLayout(self.presets_widget)
         presets.setContentsMargins(0, 0, 0, 0)
+        presets.setHorizontalSpacing(3)
+        presets.setVerticalSpacing(2)
         self.preset_combo = QComboBox(self.presets_widget)
-        presets.addWidget(self.preset_combo)
+        presets.addWidget(self.preset_combo, 0, 0, 1, 2)
         self.preset_name = QLineEdit(self.presets_widget)
         self.preset_name.setPlaceholderText("Preset name")
-        presets.addWidget(self.preset_name)
-        preset_buttons = QHBoxLayout()
+        self.preset_name.setMaximumWidth(110)
+        presets.addWidget(self.preset_name, 0, 2)
         self.add_preset = QPushButton("New", self.presets_widget)
         self.save_preset = QPushButton("Save", self.presets_widget)
         self.remove_preset = QPushButton("Remove", self.presets_widget)
-        preset_buttons.addWidget(self.add_preset)
-        preset_buttons.addWidget(self.save_preset)
-        preset_buttons.addWidget(self.remove_preset)
-        presets.addLayout(preset_buttons)
+        presets.addWidget(self.add_preset, 1, 0)
+        presets.addWidget(self.save_preset, 1, 1)
+        presets.addWidget(self.remove_preset, 1, 2)
+        parameters.addWidget(self.presets_widget)
 
         self.color_popup = ColorPickerPopup(parent=self)
         self.color_popup.colorApplied.connect(self._apply_stop_color)
@@ -373,14 +385,10 @@ class GradientToolsControls(QWidget):
         self.thickness_popup.colorApplied.connect(
             self._apply_thickness_stop_color
         )
-        self.create_line.clicked.connect(
-            lambda: self.createRequested.emit("line")
-        )
-        self.create_radial.clicked.connect(
-            lambda: self.createRequested.emit("radial")
-        )
-        self.create_shape.clicked.connect(
-            lambda: self.createRequested.emit("parent_shape")
+        self.create_color.clicked.connect(
+            lambda: self.createRequested.emit(
+                str(self.field_type.currentData() or "line")
+            )
         )
         self.create_speed.clicked.connect(
             lambda: self.speedCreateRequested.emit(
@@ -459,6 +467,9 @@ class GradientToolsControls(QWidget):
         ):
             return None
         candidate = self.canvas.chapter.objects.get(self.canvas.selected_id)
+        if isinstance(candidate, SpeedLineCenterObject):
+            owner = self.canvas.chapter.objects.get(candidate.owner_gradient_id)
+            return owner if isinstance(owner, SpeedLinesGradientObject) else None
         if isinstance(
             candidate, (ColorFillGradientObject, SpeedLinesGradientObject)
         ):
@@ -487,6 +498,13 @@ class GradientToolsControls(QWidget):
 
     def refresh(self) -> None:
         obj = self.selected_gradient()
+        context_kind = (
+            "speed" if isinstance(obj, SpeedLinesGradientObject)
+            else "color" if isinstance(obj, ColorFillGradientObject)
+            else "create"
+        )
+        context_changed = context_kind != self._context_kind
+        self._context_kind = context_kind
         self._loading = True
         enabled = obj is not None
         context_parent = self.context_parent_id()
@@ -527,6 +545,11 @@ class GradientToolsControls(QWidget):
                     value.setValue(current)
                     slider.blockSignals(False)
                     value.blockSignals(False)
+                center = self.canvas.chapter.speed_center_for(obj.object_id)
+                self.center_shape_button.setText(
+                    "Edit Custom Center" if center is not None
+                    else "Add Custom Center"
+                )
             preset_index = self.preset_combo.findData(obj.loaded_preset_id)
             self.preset_combo.setCurrentIndex(max(0, preset_index))
             self.direction_mode.setCurrentIndex(max(
@@ -577,10 +600,24 @@ class GradientToolsControls(QWidget):
             )
         )
         self.reverse_direction.setText(
-            "Outwards" if is_speed else "Reverse direction"
+            "Travel toward start"
+            if is_speed and obj is not None
+            and obj.field_type == "line"
+            and obj.line_field.direction_mode == "parallel"
+            else "Outwards" if is_speed else "Reverse direction"
         )
         self.reverse_direction.setVisible(
-            bool(obj is not None and (not is_speed or radial_or_shape))
+            bool(
+                obj is not None
+                and (
+                    not is_speed
+                    or radial_or_shape
+                    or (
+                        obj.field_type == "line"
+                        and obj.line_field.direction_mode == "parallel"
+                    )
+                )
+            )
         )
         show_distance = bool(
             obj is not None
@@ -589,7 +626,6 @@ class GradientToolsControls(QWidget):
                     obj.field_type == "line"
                     and (
                         obj.line_field.direction_mode == "perpendicular"
-                        or is_speed
                     )
                 )
                 or (
@@ -627,22 +663,10 @@ class GradientToolsControls(QWidget):
             ) if context_parent else []
         )
         self.select_gradient.setVisible(bool(matches) and obj is None)
-        self.create_line.setEnabled(
+        self.create_color.setEnabled(
             bool(context_parent)
             and not self.canvas.chapter.gradient_children(
-                context_parent, "line", family="color_fill"
-            )
-        )
-        self.create_radial.setEnabled(
-            bool(context_parent)
-            and not self.canvas.chapter.gradient_children(
-                context_parent, "radial", family="color_fill"
-            )
-        )
-        self.create_shape.setEnabled(
-            bool(context_parent)
-            and not self.canvas.chapter.gradient_children(
-                context_parent, "parent_shape", family="color_fill"
+                context_parent, selected_type, family="color_fill"
             )
         )
         self.create_speed.setEnabled(
@@ -652,6 +676,8 @@ class GradientToolsControls(QWidget):
             )
         )
         self._loading = False
+        if context_changed:
+            self.contextChanged.emit(context_kind)
 
     def set_presets(
         self, presets: list[ColorGradientRampPreset],
@@ -747,6 +773,9 @@ class GradientToolsControls(QWidget):
             if obj.field_type == "line":
                 obj.line_field.direction_mode = str(
                     self.direction_mode.currentData()
+                )
+                obj.line_field.reverse_direction = (
+                    self.reverse_direction.isChecked()
                 )
                 distance = self.distance_value.value()
                 obj.line_field.perpendicular_distance = (

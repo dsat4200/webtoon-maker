@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import pytest
-from PySide6.QtCore import QPointF, QRectF, Qt
+from PySide6.QtCore import QEvent, QPointF, QRectF, Qt
 from PySide6.QtGui import QColor, QInputMethodEvent
 from PySide6.QtTest import QTest
 
@@ -90,6 +90,78 @@ def test_tablet_touch_pan_zoom_rotation_preserves_centroid_anchor(qapp):
     assert (
         canvas.center_x, canvas.center_y, canvas.rotation, canvas.scale
     ) == before
+
+
+def test_touch_navigation_live_renders_without_viewport_snapshot(
+    qapp, monkeypatch,
+):
+    canvas, _chapter, _page, _layer = _canvas_document(
+        EditorSettings(tablet_mode=True, snap_to_grid=False)
+    )
+    canvas.center_x = 300
+    canvas.center_y = 300
+    canvas.rotation = 0
+    canvas.scale = 1
+
+    class TouchPoint:
+        def __init__(self, position: QPointF):
+            self._position = position
+
+        def position(self) -> QPointF:
+            return QPointF(self._position)
+
+    class TouchEvent:
+        def __init__(self, event_type, positions):
+            self._type = event_type
+            self._points = [TouchPoint(point) for point in positions]
+            self.accepted = False
+
+        def type(self):
+            return self._type
+
+        def points(self):
+            return self._points
+
+        def accept(self):
+            self.accepted = True
+
+    monkeypatch.setattr(
+        type(canvas), "grab",
+        lambda _self: pytest.fail(
+            "touch navigation must not capture the rectangular viewport"
+        ),
+    )
+    begin = TouchEvent(
+        QEvent.TouchBegin, [QPointF(100, 100), QPointF(200, 100)]
+    )
+    update = TouchEvent(
+        QEvent.TouchUpdate, [QPointF(100, 100), QPointF(100, 300)]
+    )
+    end = TouchEvent(QEvent.TouchEnd, [])
+
+    assert canvas._touch_event(begin)
+    assert canvas._touch_event(update)
+    canvas._flush_touch_navigation()
+    assert canvas.rotation == pytest.approx(90)
+    assert canvas.scale == pytest.approx(2)
+    assert canvas._touch_event(end)
+    assert begin.accepted and update.accepted and end.accepted
+
+
+def test_tablet_navigation_configures_top_level_window(qapp, monkeypatch):
+    canvas, _chapter, _page, _layer = _canvas_document(
+        EditorSettings(tablet_mode=True, snap_to_grid=False)
+    )
+    calls = []
+    monkeypatch.setattr(
+        "comic_editor.ui.canvas.configure_simultaneous_pen_touch",
+        lambda hwnd, enabled: calls.append((hwnd, enabled)) or True,
+    )
+
+    assert canvas.configure_tablet_navigation()
+    assert calls == [(int(canvas.window().winId()), True)]
+    assert canvas.configure_tablet_navigation()
+    assert len(calls) == 1
 
 
 def test_free_text_transform_persists_quad_and_preserves_content(qapp):

@@ -118,7 +118,7 @@ Marks the UI package with a PySide6 interface docstring. It has no runtime logic
 
 The canonical saved-data model and invariant layer.
 
-- Declares schema version 12, chapter width 1080, default height 3240, and growth margin 1080.
+- Declares schema version 14, chapter width 1080, default height 3240, growth margin 1080, and chapter/asset document kinds.
 - Normalizes colors to canonical ARGB and generates stable UUID IDs.
 - Defines grids, path nodes/contours, shape style, and unified rectangle/ellipse/custom `BoundGeometry`.
 - Defines mixed layer/object child references and `LayerNode` with shape, fill, page, mask, grid, and compound fields.
@@ -149,6 +149,10 @@ Implements portable series/chapter storage through `SeriesRepository`.
 - Manual saves validate, create `last_good`, mark `.save_pending`, publish tiles before the manifest, clear the marker, and remove autosave recovery.
 - Autosaves write an independent complete snapshot under `autosave/`.
 - Loading can restore a detected interrupted save or explicitly load recovery.
+
+### `comic_editor/core/assets.py`
+
+Implements per-series asset manifests, subtree extraction, fresh-ID fragment placement, fitted visual bounds, sparse-raster copying, and atomic asset save/recovery storage.
 
 ### `comic_editor/core/pressure.py`
 
@@ -208,6 +212,7 @@ The application shell and workflow coordinator.
 - Defines reusable collapsible and scrollable left-tool containers.
 - Builds the project toolbar, tool sidebar, Shapes/Drawing Selection groups, colors, contextual ribbon pages, canvas/navigator, right hierarchy dock, layer settings, floating inspector, timers, and persisted splitters.
 - Opens/creates series and chapters, prompts for autosave recovery, creates/deletes/reorders entities, and orchestrates transactional page insertion.
+- Manages cached, closable series/asset tabs and the per-series Asset Library workflows.
 - Connects canvas/model signals to the outliner, inspectors, status bar, dirty state, and contextual ribbon routing.
 - Implements the global chord/hold hotkey event filter, prefix timeout, text-edit suppression, and stylus forwarding to popups/outliner.
 - Owns per-series color/palette/gradient-preset CRUD and debounce saves.
@@ -424,4 +429,3 @@ An image asset that is not referenced by the current Python/QSS source. Current 
 | Change gradients | models, canvas, `ui/gradient_tools.py`, main window presets | gradients, ribbon/color tests |
 | Change colors/palettes | models, `ui/color_picker.py`, main window | color/ribbon, vector models |
 | Change text | models, canvas, inspector | interaction, UI, models |
-

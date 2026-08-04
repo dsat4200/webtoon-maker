@@ -261,7 +261,7 @@ def test_outliner_reset_preserves_expansion_and_selection_by_entity_id(qapp):
         window.deleteLater()
 
 
-def test_text_labels_are_content_derived_and_not_editable(qapp):
+def test_text_labels_are_content_derived_until_custom_rename(qapp):
     chapter, page, layer, raster, text = _chapter()
     text.name = "Legacy serialized name"
     text.text = "  Hello \n   wide webcomic world  "
@@ -270,9 +270,11 @@ def test_text_labels_are_content_derived_and_not_editable(qapp):
     layer_index = model.index(0, 0, page_index)
     text_index = model.index(1, 0, layer_index)
     assert model.data(text_index, Qt.DisplayRole) == "Hello wide webco"
-    assert not (model.flags(text_index) & Qt.ItemIsEditable)
-    assert not model.setData(text_index, "Renamed", Qt.EditRole)
-    assert text.name == "Legacy serialized name"
+    assert model.flags(text_index) & Qt.ItemIsEditable
+    assert model.setData(text_index, "Renamed", Qt.EditRole)
+    assert text.name == "Renamed"
+    assert text.custom_name is True
+    assert model.data(text_index, Qt.DisplayRole) == "Renamed"
 
 
 def test_compact_text_inspector_layout_visibility_and_quad_restore(qapp):

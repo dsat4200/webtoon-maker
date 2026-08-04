@@ -4,6 +4,8 @@ from __future__ import annotations
 import math
 import time
 import zlib
+import json
+from dataclasses import dataclass
 from enum import Enum
 
 import numpy as np
@@ -26,6 +28,9 @@ from PySide6.QtWidgets import QApplication, QWidget
 
 from comic_editor.core.commands import (
     CallbackCommand, CommandStack, ObjectPatchCommand, TilePatchCommand,
+)
+from comic_editor.core.assets import (
+    AssetManifest, AssetRepository, entity_visual_bounds, instantiate_asset,
 )
 from comic_editor.core.models import (
     BoundGeometry, ChapterDocument, ChildRef, ColorFillGradientObject,
@@ -50,6 +55,7 @@ from comic_editor.core.vector_geometry import (
     path_intersections, simplify_cubic_segments,
     stroke_cubics, tangent_bridge, trace_cubic_faces,
 )
+from comic_editor.ui.windows_input import configure_simultaneous_pen_touch
 
 
 class ToolKind(Enum):
@@ -78,6 +84,29 @@ class ToolKind(Enum):
 
 RASTER_FRAME_MARGIN = 24.0
 SHAPE_CONTROL_SCALE = 1.5
+ASSET_MIME = "application/x-webtoon-asset"
+
+
+@dataclass
+class CanvasSessionState:
+    chapter: ChapterDocument
+    tiles: TileStore
+    command_stack: CommandStack
+    tool: ToolKind
+    selected_kind: str
+    selected_id: str
+    active_page_id: str
+    active_layer_id: str
+    selected_object_id: str
+    center_x: float
+    center_y: float
+    scale: float
+    rotation: float
+    compound_cache: dict
+    vector_cache: dict
+    gradient_geometry_cache: dict
+    gradient_scalar_cache: dict
+    gradient_render_cache: dict
 
 
 class _CanvasLogic:
@@ -185,6 +214,8 @@ class _CanvasLogic:
             tuple[str, int, float, QPointF, QPointF] | None
         ) = None
         self._tablet_tool_active = False
+        self._pen_contact_active = False
+        self._device_supports_pressure = False
         self._last_gradient_tablet_tap: tuple[float, QPointF] | None = None
         self._tablet_hover_widget: QPointF | None = None
         self._pointer_hover_widget: QPointF | None = None
@@ -202,9 +233,7 @@ class _CanvasLogic:
         self._touch_frame_timer.timeout.connect(
             self._flush_touch_navigation
         )
-        self._navigation_snapshot = QImage()
-        self._navigation_snapshot_transform = QTransform()
-        self._navigation_snapshot_active = False
+        self._windows_touch_configuration: tuple[int, bool] | None = None
         self._pending_raster_press: tuple[QPointF, QPointF, float] | None = None
         self._pending_vector_press: tuple[QPointF, QPointF, float] | None = None
         self._pending_drawing_selection_press: (
@@ -288,18 +317,90 @@ class _CanvasLogic:
         self._page_gap_drag_start_top = 0.0
         self._page_gap_drag_start_bottom = 0.0
         self._page_gap_drag_translations: dict[str, float] = {}
+        self.asset_repository: AssetRepository | None = None
+        self._asset_drag_manifest: AssetManifest | None = None
+        self._asset_drag_tiles: TileStore | None = None
+        self._asset_drag_image = QImage()
+        self._asset_drag_world = QPointF()
+        self._asset_drag_parent_id = ""
+        self._asset_drag_valid = False
+        self._asset_drag_clip_cache: dict[str, QPainterPath | None] = {}
         self.documentChanged.connect(self._clear_compound_path_cache)
         self.hierarchyChanged.connect(self._clear_compound_path_cache)
         self.setMinimumSize(480, 480)
         self.setFocusPolicy(Qt.StrongFocus)
         self.setAttribute(Qt.WA_AcceptTouchEvents, True)
         self.setAttribute(Qt.WA_TabletTracking, True)
+        self.setAcceptDrops(True)
         self.setMouseTracking(True)
 
+    def showEvent(self, event) -> None:  # noqa: N802
+        super().showEvent(event)
+        self.configure_tablet_navigation()
+
+    def configure_tablet_navigation(self) -> bool:
+        """Apply native touch delivery policy for the current tablet mode."""
+        top_level = self.window()
+        hwnd = int(top_level.winId())
+        configuration = (hwnd, bool(self.settings.tablet_mode))
+        if configuration == self._windows_touch_configuration:
+            return True
+        configured = configure_simultaneous_pen_touch(*configuration)
+        if configured:
+            self._windows_touch_configuration = configuration
+        return configured
+
     # ---- document and commands -----------------------------------------
+    def _clear_creation_gesture(self) -> None:
+        """Discard an incomplete creation gesture without committing it."""
+        self._creation_points.clear()
+        self._creation_nodes.clear()
+        self._creation_selected_node_id = ""
+        self._creation_active_control = None
+        self._creation_close_candidate = False
+        self._creation_node_dragged = False
+        self._creation_style = None
+        self._raster_creation_parent_id = ""
+        self._raster_creation_index = None
+        self._pending_primitive_insert = None
+        self._shape_hover_target = None
+        self._shape_hover_insert = None
+        self.setToolTip("")
+
+    def _clear_detached_input_state(self) -> None:
+        """Reset transient pointer state that cannot survive without a document."""
+        self._clear_creation_gesture()
+        self._pending_raster_press = None
+        self._pending_vector_press = None
+        self._pending_raster_transform_press = None
+        self._pending_drawing_selection_press = None
+        self._outside_click_candidate = False
+        self._tablet_tool_active = False
+        self._pen_contact_active = False
+        self._nav_mode = None
+        self._pointer_hover_widget = None
+        self._tablet_hover_widget = None
+        self._touch_frame_timer.stop()
+        self._touch_pending_points = None
+        self._touch_points.clear()
+        self._touch_anchor_points.clear()
+        self._page_creation_anchor_id = ""
+        self._page_creation_before = None
+        self._page_creation_kind = ""
+        self._page_creation_draft = None
+        self._page_creation_committing = False
+        self._page_creation_gap_bounds = None
+        self._page_creation_base_height = 0
+        self._gradient_creation_parent_id = ""
+        self._gradient_creation_type = ""
+        self._gradient_creation_family = "color_fill"
+        self._gradient_creation_before = None
+        self.unsetCursor()
+
     def set_document(
         self, chapter: ChapterDocument, tiles: TileStore, reset_view: bool = True,
     ) -> None:
+        self._clear_detached_input_state()
         self.chapter = chapter
         self.tiles = tiles
         self._compound_path_cache.clear()
@@ -321,7 +422,6 @@ class _CanvasLogic:
         self._gradient_preview_active = False
         self._touch_frame_timer.stop()
         self._touch_pending_points = None
-        self._clear_navigation_snapshot()
         self._cancel_vector_gesture(restore=False)
         self._clear_transform_preview()
         self._page_creation_anchor_id = ""
@@ -337,6 +437,82 @@ class _CanvasLogic:
             self.reset_view()
         self.update()
         self.hierarchyChanged.emit()
+
+    def capture_session_state(self) -> CanvasSessionState | None:
+        """Detach the committed document state without discarding warm caches."""
+        if self.chapter is None:
+            return None
+        self._commit_text_edit()
+        if self._vector_gesture_mode is not None or self._vector_before:
+            self._cancel_vector_gesture(restore=True)
+        if self._page_creation_anchor_id:
+            self._cancel_page_creation()
+        if self._gradient_creation_parent_id:
+            self._cancel_gradient_creation()
+        self._clear_creation_gesture()
+        self._clear_transform_preview()
+        self._clear_asset_drag_preview()
+        return CanvasSessionState(
+            chapter=self.chapter, tiles=self.tiles,
+            command_stack=self.command_stack, tool=self.tool,
+            selected_kind=self.selected_kind, selected_id=self.selected_id,
+            active_page_id=self.active_page_id,
+            active_layer_id=self.active_layer_id,
+            selected_object_id=self.selected_object_id,
+            center_x=self.center_x, center_y=self.center_y,
+            scale=self.scale, rotation=self.rotation,
+            compound_cache=self._compound_path_cache,
+            vector_cache=self._vector_render_cache,
+            gradient_geometry_cache=self._gradient_geometry_cache,
+            gradient_scalar_cache=self._gradient_scalar_cache,
+            gradient_render_cache=self._gradient_render_cache,
+        )
+
+    def restore_session_state(self, state: CanvasSessionState) -> None:
+        """Activate a previously captured tab without loading it again."""
+        self._clear_detached_input_state()
+        self.chapter, self.tiles = state.chapter, state.tiles
+        self.command_stack = state.command_stack
+        self.tool = state.tool
+        self.selected_kind, self.selected_id = state.selected_kind, state.selected_id
+        self.active_page_id, self.active_layer_id = (
+            state.active_page_id, state.active_layer_id
+        )
+        self.selected_object_id = state.selected_object_id
+        self.center_x, self.center_y = state.center_x, state.center_y
+        self.scale, self.rotation = state.scale, state.rotation
+        self._compound_path_cache = state.compound_cache
+        self._vector_render_cache = state.vector_cache
+        self._gradient_geometry_cache = state.gradient_geometry_cache
+        self._gradient_scalar_cache = state.gradient_scalar_cache
+        self._gradient_render_cache = state.gradient_render_cache
+        self._touch_frame_timer.stop()
+        self._touch_pending_points = None
+        self._clear_asset_drag_preview()
+        self.update()
+        self.hierarchyChanged.emit()
+        self.selectionChanged.emit(self.selected_kind, self.selected_id)
+        self.toolChanged.emit(self.tool)
+
+    def clear_document(self) -> None:
+        if self.chapter is not None and self._page_creation_anchor_id:
+            self._cancel_page_creation()
+        if self._gradient_creation_parent_id:
+            self._cancel_gradient_creation()
+        self._clear_detached_input_state()
+        self.chapter = None
+        self.tiles = TileStore()
+        self.command_stack = CommandStack()
+        self.selected_kind = self.selected_id = ""
+        self.active_page_id = self.active_layer_id = ""
+        self.selected_object_id = ""
+        self._compound_path_cache.clear()
+        self._vector_render_cache.clear()
+        self._gradient_geometry_cache.clear()
+        self._gradient_scalar_cache.clear()
+        self._gradient_render_cache.clear()
+        self._clear_asset_drag_preview()
+        self.update()
 
     def set_active_colors(self, primary: str, secondary: str) -> None:
         """Set the per-series colors used by contextual drawing tools."""
@@ -704,12 +880,7 @@ class _CanvasLogic:
         if self.tool == ToolKind.TRANSFORM and tool != ToolKind.TRANSFORM:
             self._clear_transform_preview()
         if self.tool == ToolKind.SHAPE_CREATE and tool != ToolKind.SHAPE_CREATE:
-            self._creation_nodes.clear()
-            self._creation_selected_node_id = ""
-            self._creation_active_control = None
-            self._creation_style = None
-            self._shape_hover_target = None
-            self._shape_hover_insert = None
+            self._clear_creation_gesture()
         if tool != ToolKind.TEXT_EDIT:
             self._commit_text_edit()
         if tool not in {ToolKind.RASTER_PENCIL, ToolKind.RASTER_ERASER}:
@@ -1502,6 +1673,7 @@ class _CanvasLogic:
 
     def _clear_compound_path_cache(self, *args) -> None:
         self._compound_path_cache.clear()
+        self._asset_drag_clip_cache.clear()
 
     def _layer_operand_path(self, layer: LayerNode) -> QPainterPath:
         if layer.bound is None:
@@ -1513,14 +1685,21 @@ class _CanvasLogic:
             )
         return self.bound_path(layer.bound, layer.vertex_radius)
 
-    def layer_effective_path(self, layer_id: str) -> QPainterPath:
-        layer = self.chapter.layers[layer_id]
+    def _document_layer_effective_path(
+        self, document: ChapterDocument, layer_id: str,
+        cache: dict[str, QPainterPath], *,
+        virtual_parent_id: str = "",
+        virtual_path_world: QPainterPath | None = None,
+        virtual_operation: str = "add",
+    ) -> QPainterPath:
+        """Build one effective shape, optionally including a virtual child."""
+        layer = document.layers[layer_id]
         if not layer.compound_enabled:
             return self.layer_shape_path(layer)
-        cached = self._compound_path_cache.get(layer_id)
+        cached = cache.get(layer_id)
         if cached is not None:
             return QPainterPath(cached)
-        root_x, root_y = self.chapter.layer_world_translation(layer_id)
+        root_x, root_y = document.layer_world_translation(layer_id)
         additions = QPainterPath(self._layer_operand_path(layer))
         additions.setFillRule(Qt.OddEvenFill)
         subtractions = QPainterPath()
@@ -1534,18 +1713,23 @@ class _CanvasLogic:
             for reference in parent.children:
                 if reference.kind != "layer":
                     continue
-                child = self.chapter.layers[reference.entity_id]
+                child = document.layers[reference.entity_id]
                 if (
                     not child.visible or child.layer_kind == "fill"
                     or child.compound_operation == "ignore"
                 ):
                     continue
                 operand = (
-                    self.layer_effective_path(child.layer_id)
+                    self._document_layer_effective_path(
+                        document, child.layer_id, cache,
+                        virtual_parent_id=virtual_parent_id,
+                        virtual_path_world=virtual_path_world,
+                        virtual_operation=virtual_operation,
+                    )
                     if child.compound_enabled
                     else self._layer_operand_path(child)
                 )
-                child_x, child_y = self.chapter.layer_world_translation(
+                child_x, child_y = document.layer_world_translation(
                     child.layer_id
                 )
                 transform = QTransform()
@@ -1558,14 +1742,32 @@ class _CanvasLogic:
                 if not child.compound_enabled:
                     collect(child)
 
+            if (
+                parent.layer_id == virtual_parent_id
+                and virtual_path_world is not None
+                and not virtual_path_world.isEmpty()
+            ):
+                transform = QTransform()
+                transform.translate(-root_x, -root_y)
+                operand = transform.map(virtual_path_world)
+                if virtual_operation == "subtract":
+                    subtractions = combine(subtractions, operand)
+                elif virtual_operation != "ignore":
+                    additions = combine(additions, operand)
+
         collect(layer)
         result = (
             additions.subtracted(subtractions)
             if not subtractions.isEmpty() else additions
         )
         result.setFillRule(Qt.OddEvenFill)
-        self._compound_path_cache[layer_id] = QPainterPath(result)
+        cache[layer_id] = QPainterPath(result)
         return result
+
+    def layer_effective_path(self, layer_id: str) -> QPainterPath:
+        return self._document_layer_effective_path(
+            self.chapter, layer_id, self._compound_path_cache
+        )
 
     def paintEvent(self, event) -> None:  # noqa: N802
         painter = QPainter(self)
@@ -1574,9 +1776,6 @@ class _CanvasLogic:
         if self.chapter is None:
             painter.setPen(QColor("#8e8e96"))
             painter.drawText(self.rect(), Qt.AlignCenter, "Create or open a series to begin")
-            return
-        if self._navigation_snapshot_active and not self._navigation_snapshot.isNull():
-            self._paint_navigation_snapshot(painter)
             return
         if (
             not self._transform_static_cache.isNull()
@@ -1621,6 +1820,7 @@ class _CanvasLogic:
         self._draw_selection(painter)
         self._draw_page_gap_overlay(painter)
         self._draw_creation_preview(painter)
+        self._draw_asset_drag_preview(painter)
         painter.restore()
         painter.setTransform(QTransform())
         painter.setPen(QPen(QColor("#44444d"), 1))
@@ -1631,41 +1831,333 @@ class _CanvasLogic:
         self._draw_tablet_hover(painter)
         self._draw_simplify_hover(painter)
 
-    def _paint_navigation_snapshot(self, painter: QPainter) -> None:
-        """Paint the captured artwork under the current camera cheaply."""
-        current = self.camera_transform()
-        inverse, invertible = self._navigation_snapshot_transform.inverted()
-        if not invertible:
-            inverse = QTransform()
-        painter.save()
-        painter.setTransform(current * inverse)
-        painter.drawImage(QPointF(0, 0), self._navigation_snapshot)
-        painter.restore()
-        painter.setTransform(current)
-        painter.save()
-        painter.setClipRect(QRectF(0, 0, self.chapter.width, self.chapter.height))
-        visible = self.visible_document_rect()
-        self._draw_grid(painter, visible)
-        self._draw_selection(painter)
-        self._draw_page_gap_overlay(painter)
-        painter.restore()
-        painter.setTransform(QTransform())
-        self._draw_tablet_hover(painter)
-        self._draw_simplify_hover(painter)
-
-    def _capture_navigation_snapshot(self) -> None:
-        if self.chapter is None:
+    def _draw_asset_drag_preview(self, painter: QPainter) -> None:
+        if (
+            not self._asset_drag_valid
+            or self._asset_drag_manifest is None
+            or self._asset_drag_image.isNull()
+        ):
             return
-        # ``grab`` is performed once at gesture/rebase boundaries.  All
-        # intermediate frames only transform this image, avoiding a complete
-        # layer/vector/gradient render for every touch packet.
-        self._navigation_snapshot = self.grab().toImage()
-        self._navigation_snapshot_transform = self.camera_transform()
-        self._navigation_snapshot_active = not self._navigation_snapshot.isNull()
+        _x, _y, width, height = self._asset_drag_manifest.visual_bounds
+        destination = QRectF(
+            self._asset_drag_world.x() - width / 2,
+            self._asset_drag_world.y() - height / 2,
+            width, height,
+        )
+        painter.save()
+        clip_path = self._asset_drag_clip_path(self._asset_drag_parent_id)
+        if clip_path is not None:
+            painter.setClipPath(clip_path, Qt.IntersectClip)
+        painter.setOpacity(0.70)
+        painter.setRenderHint(QPainter.SmoothPixmapTransform, True)
+        painter.drawImage(destination, self._asset_drag_image)
+        painter.restore()
 
-    def _clear_navigation_snapshot(self) -> None:
-        self._navigation_snapshot_active = False
-        self._navigation_snapshot = QImage()
+        # Keep the destination affordance readable even where the asset ghost
+        # is clipped away by the prospective parent hierarchy.
+        painter.save()
+        layer = self.chapter.layers.get(self._asset_drag_parent_id)
+        if layer is not None and layer.bound is not None:
+            wx, wy = self.chapter.layer_world_translation(layer.layer_id)
+            painter.translate(wx, wy)
+            pen = QPen(QColor("#56a8ff"), 2.0 / max(self.scale, 0.05), Qt.DashLine)
+            painter.setPen(pen)
+            painter.setBrush(Qt.NoBrush)
+            painter.drawPath(self.layer_effective_path(layer.layer_id))
+        painter.restore()
+
+    def _clear_asset_drag_preview(self) -> None:
+        changed = self._asset_drag_manifest is not None
+        self._asset_drag_manifest = None
+        self._asset_drag_tiles = None
+        self._asset_drag_image = QImage()
+        self._asset_drag_parent_id = ""
+        self._asset_drag_valid = False
+        self._asset_drag_clip_cache.clear()
+        if changed:
+            self.update()
+
+    def _asset_root_bypasses_parent_mask(self) -> bool:
+        manifest = self._asset_drag_manifest
+        if manifest is None:
+            return False
+        if manifest.root_kind == "layer":
+            root = manifest.document.layers.get(manifest.root_id)
+        else:
+            root = manifest.document.objects.get(manifest.root_id)
+        return bool(
+            root
+            and (
+                root.ignore_parent_mask
+                or (
+                    isinstance(root, GradientObject)
+                    and self._is_outward_gradient(root)
+                )
+            )
+        )
+
+    def _asset_virtual_compound_operand(
+        self, layers: list[LayerNode],
+    ) -> tuple[QPainterPath | None, str]:
+        """Map the prospective root layer shape into target world space."""
+        manifest = self._asset_drag_manifest
+        if (
+            manifest is None or manifest.root_kind != "layer"
+            or not any(layer.compound_enabled for layer in layers)
+        ):
+            return None, "ignore"
+        source = manifest.document
+        root = source.layers.get(manifest.root_id)
+        if (
+            root is None or not root.visible or root.layer_kind == "fill"
+            or root.compound_operation == "ignore"
+        ):
+            return None, "ignore"
+        source_path = self._document_layer_effective_path(
+            source, root.layer_id, {}
+        )
+        source_x, source_y = source.layer_world_translation(root.layer_id)
+        bounds_x, bounds_y, bounds_width, bounds_height = manifest.visual_bounds
+        transform = QTransform()
+        transform.translate(
+            source_x + self._asset_drag_world.x()
+            - (bounds_x + bounds_width / 2),
+            source_y + self._asset_drag_world.y()
+            - (bounds_y + bounds_height / 2),
+        )
+        return transform.map(source_path), root.compound_operation
+
+    def _asset_drag_changes_compound_path(self, parent_id: str) -> bool:
+        manifest = self._asset_drag_manifest
+        if (
+            self.chapter is None or manifest is None
+            or manifest.root_kind != "layer" or not parent_id
+        ):
+            return False
+        root = manifest.document.layers.get(manifest.root_id)
+        return bool(
+            root and root.visible and root.layer_kind != "fill"
+            and root.compound_operation != "ignore"
+            and any(
+                layer.compound_enabled
+                for layer in self.chapter.ancestor_layers(parent_id)
+            )
+        )
+
+    def _asset_drag_clip_path(self, parent_id: str) -> QPainterPath | None:
+        """Return the non-mutating world-space mask for a prospective drop."""
+        if parent_id in self._asset_drag_clip_cache:
+            cached = self._asset_drag_clip_cache[parent_id]
+            return QPainterPath(cached) if cached is not None else None
+        if self.chapter is None or self._asset_drag_manifest is None:
+            return None
+
+        layers = self.chapter.ancestor_layers(parent_id)
+        manifest = self._asset_drag_manifest
+        root_object = (
+            manifest.document.objects.get(manifest.root_id)
+            if manifest.root_kind == "object" else None
+        )
+        if root_object is not None and root_object.geometry_reference == "compound":
+            compound = self.chapter.closest_compound_ancestor(
+                parent_id, include_self=True
+            )
+            if compound is not None:
+                compound_index = next(
+                    index for index, layer in enumerate(layers)
+                    if layer.layer_id == compound.layer_id
+                )
+                layers = layers[:compound_index + 1]
+
+        virtual_path, virtual_operation = self._asset_virtual_compound_operand(
+            layers
+        )
+        prospective_cache: dict[str, QPainterPath] = {}
+
+        skipped_masks: set[str] = set()
+        if self._asset_root_bypasses_parent_mask():
+            skipped_masks.add(parent_id)
+        for parent, child in zip(layers, layers[1:]):
+            if child.ignore_parent_mask:
+                skipped_masks.add(parent.layer_id)
+
+        result: QPainterPath | None = None
+        for layer in layers:
+            if not layer.visible:
+                result = QPainterPath()
+                break
+            if layer.bound is None or layer.layer_id in skipped_masks:
+                continue
+            path = self._document_layer_effective_path(
+                self.chapter, layer.layer_id, prospective_cache,
+                virtual_parent_id=parent_id,
+                virtual_path_world=virtual_path,
+                virtual_operation=virtual_operation,
+            )
+            world_x, world_y = self.chapter.layer_world_translation(
+                layer.layer_id
+            )
+            transform = QTransform()
+            transform.translate(world_x, world_y)
+            path = transform.map(path)
+            result = path if result is None else result.intersected(path)
+
+        stored = QPainterPath(result) if result is not None else None
+        self._asset_drag_clip_cache[parent_id] = stored
+        return QPainterPath(stored) if stored is not None else None
+
+    def _asset_parent_accepts(self, layer_id: str, manifest: AssetManifest) -> bool:
+        layer = self.chapter.layers.get(layer_id)
+        if (
+            layer is None or layer.layer_kind == "fill"
+            or any(
+                not ancestor.visible
+                for ancestor in self.chapter.ancestor_layers(layer_id)
+            )
+        ):
+            return False
+        if manifest.root_kind != "object":
+            return True
+        root = manifest.document.objects.get(manifest.root_id)
+        if not isinstance(root, GradientObject):
+            return not isinstance(root, (VectorFillObject, SpeedLineCenterObject))
+        family = "speed_lines" if isinstance(root, SpeedLinesGradientObject) else "color_fill"
+        return not self.chapter.gradient_children(
+            layer_id, root.field_type, family=family
+        )
+
+    def _asset_target_parent(self, world: QPointF, manifest: AssetManifest) -> str:
+        candidates: list[tuple[int, int, str]] = []
+
+        def walk(layer_id: str, depth: int, order: int) -> int:
+            layer = self.chapter.layers[layer_id]
+            next_order = order + 1
+            if not layer.visible:
+                return next_order
+            if layer.bound is not None and layer.layer_kind != "fill":
+                wx, wy = self.chapter.layer_world_translation(layer_id)
+                if self.layer_effective_path(layer_id).contains(
+                    QPointF(world.x() - wx, world.y() - wy)
+                ):
+                    candidates.append((depth, -order, layer_id))
+            for child in layer.children:
+                if child.kind == "layer":
+                    next_order = walk(child.entity_id, depth + 1, next_order)
+            return next_order
+
+        order = 0
+        for page_id in self.chapter.root_page_ids:
+            order = walk(page_id, 0, order)
+        for _depth, _order, layer_id in sorted(candidates, reverse=True):
+            if self._asset_parent_accepts(layer_id, manifest):
+                return layer_id
+        fallback = self.active_page_id
+        if not fallback and self.chapter.root_page_ids:
+            fallback = self.chapter.root_page_ids[0]
+        return fallback if fallback and self._asset_parent_accepts(fallback, manifest) else ""
+
+    def dragEnterEvent(self, event) -> None:  # noqa: N802
+        if (
+            self.chapter is None or self.asset_repository is None
+            or not event.mimeData().hasFormat(ASSET_MIME)
+        ):
+            event.ignore()
+            return
+        try:
+            payload = json.loads(bytes(
+                event.mimeData().data(ASSET_MIME)
+            ).decode("utf-8"))
+            manifest, tiles = self.asset_repository.load(str(payload["asset_id"]))
+            image = self._render_entity_crop(
+                manifest.document, tiles, manifest.root_kind, manifest.root_id
+            )
+        except (OSError, ValueError, KeyError, json.JSONDecodeError):
+            event.ignore()
+            return
+        self._asset_drag_manifest = manifest
+        self._asset_drag_tiles = tiles
+        self._asset_drag_image = image
+        self._asset_drag_clip_cache.clear()
+        self._update_asset_drag(event.position())
+        event.acceptProposedAction()
+
+    def _update_asset_drag(self, widget_point: QPointF) -> None:
+        if self._asset_drag_manifest is None:
+            return
+        self._asset_drag_world = self.widget_to_document(widget_point)
+        self._asset_drag_parent_id = self._asset_target_parent(
+            self._asset_drag_world, self._asset_drag_manifest
+        )
+        if self._asset_drag_changes_compound_path(self._asset_drag_parent_id):
+            self._asset_drag_clip_cache.clear()
+        self._asset_drag_valid = bool(self._asset_drag_parent_id)
+        self.update()
+
+    def dragMoveEvent(self, event) -> None:  # noqa: N802
+        if self._asset_drag_manifest is None:
+            event.ignore()
+            return
+        self._update_asset_drag(event.position())
+        if self._asset_drag_valid:
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
+    def dragLeaveEvent(self, event) -> None:  # noqa: N802
+        self._clear_asset_drag_preview()
+        event.accept()
+
+    def dropEvent(self, event) -> None:  # noqa: N802
+        if (
+            not self._asset_drag_valid
+            or self._asset_drag_manifest is None
+            or self._asset_drag_tiles is None
+        ):
+            self._clear_asset_drag_preview()
+            event.ignore()
+            return
+        manifest = self._asset_drag_manifest
+        source_tiles = self._asset_drag_tiles
+        parent_id = self._asset_drag_parent_id
+        world = QPointF(self._asset_drag_world)
+        before = self.chapter.to_dict()
+        try:
+            kind, root_id, created_objects = instantiate_asset(
+                manifest, source_tiles, self.chapter, self.tiles,
+                parent_id, world.x(), world.y(),
+            )
+        except (KeyError, ValueError):
+            self._clear_asset_drag_preview()
+            event.ignore()
+            return
+        after = self.chapter.to_dict()
+        tile_payload = {
+            object_id: self.tiles.object_tiles(object_id)
+            for object_id in created_objects
+        }
+
+        def restore(state: dict, with_tiles: bool) -> None:
+            self.replace_chapter(state)
+            for object_id in created_objects:
+                if with_tiles:
+                    self.tiles.replace_object_tiles(
+                        object_id, tile_payload.get(object_id, {})
+                    )
+                else:
+                    self.tiles.remove_object(object_id)
+            self.documentChanged.emit(QRectF())
+            self.hierarchyChanged.emit()
+
+        self.command_stack.push(CallbackCommand(
+            f"Place asset {manifest.name}",
+            lambda: restore(after, True),
+            lambda: restore(before, False),
+        ), already_done=True)
+        self.set_selection(kind, root_id, activate_default_tool=True)
+        self.documentChanged.emit(QRectF())
+        self.hierarchyChanged.emit()
+        self._clear_asset_drag_preview()
+        event.acceptProposedAction()
 
     def _set_live_underlay_context(self) -> None:
         self._live_underlay_object_id = ""
@@ -1751,6 +2243,89 @@ class _CanvasLogic:
                 QPointF(0, bottom), QPointF(self.chapter.width, bottom)
             )
         painter.restore()
+
+    def _render_entity_crop(
+        self, document: ChapterDocument, tiles: TileStore,
+        kind: str, entity_id: str, maximum: int = 1024,
+    ) -> QImage:
+        bounds = entity_visual_bounds(document, tiles, kind, entity_id)
+        if bounds.isEmpty():
+            return QImage()
+        scale = min(
+            1.0,
+            maximum / max(1.0, bounds.width()),
+            maximum / max(1.0, bounds.height()),
+        )
+        width = max(1, math.ceil(bounds.width() * scale))
+        height = max(1, math.ceil(bounds.height() * scale))
+        image = QImage(width, height, QImage.Format_ARGB32_Premultiplied)
+        image.fill(Qt.transparent)
+        previous = (
+            self.chapter, self.tiles,
+            self._compound_path_cache, self._vector_render_cache,
+            self._gradient_geometry_cache, self._gradient_scalar_cache,
+            self._gradient_render_cache,
+        )
+        try:
+            self.chapter, self.tiles = document, tiles
+            self._compound_path_cache = {}
+            self._vector_render_cache = {}
+            self._gradient_geometry_cache = {}
+            self._gradient_scalar_cache = {}
+            self._gradient_render_cache = {}
+            painter = QPainter(image)
+            painter.setRenderHint(QPainter.Antialiasing, True)
+            painter.setRenderHint(QPainter.SmoothPixmapTransform, True)
+            painter.setTransform(QTransform(
+                scale, 0.0, 0.0, scale,
+                -bounds.left() * scale, -bounds.top() * scale,
+            ))
+            if kind == "layer":
+                self._render_layer(
+                    painter, document.layers[entity_id], 1.0, bounds
+                )
+            else:
+                obj = document.objects[entity_id]
+                wx, wy = document.layer_world_translation(obj.parent_layer_id)
+                painter.translate(wx, wy)
+                self._render_object(
+                    painter, obj, 1.0, bounds.translated(-wx, -wy)
+                )
+            painter.end()
+        finally:
+            (
+                self.chapter, self.tiles,
+                self._compound_path_cache, self._vector_render_cache,
+                self._gradient_geometry_cache, self._gradient_scalar_cache,
+                self._gradient_render_cache,
+            ) = previous
+        return image
+
+    def render_asset_thumbnail(
+        self, manifest: AssetManifest, tiles: TileStore,
+        size: int = 256, padding: int = 12,
+    ) -> QImage:
+        crop = self._render_entity_crop(
+            manifest.document, tiles, manifest.root_kind, manifest.root_id
+        )
+        result = QImage(size, size, QImage.Format_ARGB32_Premultiplied)
+        result.fill(Qt.transparent)
+        if crop.isNull():
+            return result
+        alpha = TileStore._alpha_bbox(crop)
+        source = QRect(*alpha) if alpha is not None else crop.rect()
+        available = max(1, size - padding * 2)
+        factor = min(available / source.width(), available / source.height())
+        width = max(1, round(source.width() * factor))
+        height = max(1, round(source.height() * factor))
+        destination = QRect(
+            (size - width) // 2, (size - height) // 2, width, height
+        )
+        painter = QPainter(result)
+        painter.setRenderHint(QPainter.SmoothPixmapTransform, True)
+        painter.drawImage(destination, crop, source)
+        painter.end()
+        return result
 
     def render_preview(self, image: QImage, clip: QRect | None = None) -> None:
         if self.chapter is None or image.isNull():
@@ -2678,7 +3253,15 @@ class _CanvasLogic:
             0, len(lut) - 1,
         ).astype(np.int32)
         rgba = lut[indices].copy()
-        rgba[~coverage] = 0
+        if coverage.dtype == np.bool_:
+            rgba[~coverage] = 0
+        else:
+            coverage_alpha = np.clip(
+                coverage.astype(np.float32), 0.0, 1.0
+            )
+            rgba[..., 3] = np.clip(np.rint(
+                rgba[..., 3].astype(np.float32) * coverage_alpha
+            ), 0, 255).astype(np.uint8)
         alpha = rgba[..., 3:4].astype(np.uint16)
         rgba[..., :3] = (
             rgba[..., :3].astype(np.uint16) * alpha + 127
@@ -3108,6 +3691,7 @@ class _CanvasLogic:
 
     def _speed_noise(
         self, count: int, seed: int, distance: float, scale: float,
+        *, closed: bool = False,
     ) -> np.ndarray:
         """Deterministic per-line endpoint noise with neighbor smoothing."""
         if count <= 0 or distance <= 0:
@@ -3117,8 +3701,346 @@ class _CanvasLogic:
         window = max(1, min(count, round(scale)))
         if window > 1:
             kernel = np.ones(window, dtype=np.float32) / window
-            raw = np.convolve(raw, kernel, mode="same")
+            before = window // 2
+            after = window - before - 1
+            padded = np.pad(
+                raw, (before, after), mode="wrap" if closed else "edge"
+            )
+            raw = np.convolve(padded, kernel, mode="valid")
         return raw * float(distance)
+
+    @staticmethod
+    def _speed_closest_points(
+        points: np.ndarray, path: QPainterPath,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Closest flattened-path boundary point for each input point."""
+        segment_starts: list[tuple[float, float]] = []
+        segment_ends: list[tuple[float, float]] = []
+        for polygon in path.toSubpathPolygons():
+            polygon_points = [(point.x(), point.y()) for point in polygon]
+            for start, end in zip(polygon_points, polygon_points[1:]):
+                if math.dist(start, end) > 1e-6:
+                    segment_starts.append(start)
+                    segment_ends.append(end)
+        if not segment_starts:
+            return points.copy(), np.zeros(len(points), dtype=np.float32)
+        starts = np.asarray(segment_starts, dtype=np.float32)
+        vectors = np.asarray(segment_ends, dtype=np.float32) - starts
+        lengths_squared = np.sum(vectors * vectors, axis=1)
+        nearest = np.empty_like(points, dtype=np.float32)
+        distances = np.empty(len(points), dtype=np.float32)
+        for index, point in enumerate(points):
+            relative = point[None, :] - starts
+            along = np.clip(
+                np.sum(relative * vectors, axis=1) / lengths_squared,
+                0.0, 1.0,
+            )
+            projected = starts + vectors * along[:, None]
+            squared = np.sum((projected - point[None, :]) ** 2, axis=1)
+            winner = int(np.argmin(squared))
+            nearest[index] = projected[winner]
+            distances[index] = math.sqrt(float(squared[winner]))
+        return nearest, distances
+
+    @staticmethod
+    def _speed_boundary_contours(
+        path: QPainterPath, spacing: float,
+    ) -> list[np.ndarray]:
+        """Sample every closed painter-path contour at equal arc intervals."""
+        contours: list[np.ndarray] = []
+        for polygon in path.toSubpathPolygons():
+            points = np.asarray(
+                [(point.x(), point.y()) for point in polygon],
+                dtype=np.float32,
+            )
+            if len(points) < 3:
+                continue
+            if np.linalg.norm(points[0] - points[-1]) > 1e-4:
+                points = np.vstack((points, points[0]))
+            vectors = points[1:] - points[:-1]
+            lengths = np.sqrt(np.sum(vectors * vectors, axis=1))
+            usable = lengths > 1e-5
+            starts = points[:-1][usable]
+            vectors = vectors[usable]
+            lengths = lengths[usable]
+            if not len(lengths):
+                continue
+            cumulative = np.concatenate((
+                np.zeros(1, dtype=np.float32), np.cumsum(lengths)
+            ))
+            total = float(cumulative[-1])
+            count = max(3, int(round(total / max(spacing, 1e-3))))
+            distances = (
+                np.arange(count, dtype=np.float32) + 0.5
+            ) * total / count
+            segments = np.clip(
+                np.searchsorted(cumulative, distances, side="right") - 1,
+                0, len(lengths) - 1,
+            )
+            local = (
+                distances - cumulative[segments]
+            ) / lengths[segments]
+            contours.append(
+                starts[segments] + vectors[segments] * local[:, None]
+            )
+        return contours
+
+    @staticmethod
+    def _speed_open_path_samples(
+        path: QPainterPath, count: int,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Return arc-length path samples and unit normals."""
+        total = max(float(path.length()), 1e-6)
+        count = max(2, int(count))
+        distances = np.linspace(0.0, total, count, dtype=np.float32)
+        points: list[tuple[float, float]] = []
+        normals: list[tuple[float, float]] = []
+        for distance in distances:
+            percent = path.percentAtLength(float(distance))
+            point = path.pointAtPercent(percent)
+            angle = math.radians(-path.angleAtPercent(percent) + 90.0)
+            points.append((point.x(), point.y()))
+            normals.append((math.cos(angle), math.sin(angle)))
+        return (
+            np.asarray(points, dtype=np.float32),
+            np.asarray(normals, dtype=np.float32),
+        )
+
+    @staticmethod
+    def _speed_neighbor_widths(
+        starts: np.ndarray, targets: np.ndarray, spacing: float,
+        gap: float, *, closed: bool,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Maximum safe line widths at source and target without overlap."""
+        count = len(starts)
+        maximum = max(0.0, spacing - gap)
+        source = np.full(count, maximum, dtype=np.float32)
+        target = np.full(count, maximum, dtype=np.float32)
+        if count <= 1:
+            return source, target
+        for index in range(count):
+            neighbors: list[int] = []
+            if closed or index > 0:
+                neighbors.append((index - 1) % count)
+            if closed or index + 1 < count:
+                neighbors.append((index + 1) % count)
+            source_distances = [
+                float(np.linalg.norm(starts[index] - starts[neighbor]))
+                for neighbor in neighbors
+            ]
+            target_distances = [
+                float(np.linalg.norm(targets[index] - targets[neighbor]))
+                for neighbor in neighbors
+            ]
+            if source_distances:
+                source[index] = max(
+                    0.0, min(maximum, min(source_distances) - gap)
+                )
+            if target_distances:
+                target[index] = max(
+                    0.0, min(maximum, min(target_distances) - gap)
+                )
+        return source, target
+
+    @staticmethod
+    def _speed_monotone_lane(
+        points: np.ndarray, normals: np.ndarray,
+    ) -> np.ndarray | None:
+        """Drop offset-curve cusp loops and retain the longest forward run."""
+        if len(points) < 2:
+            return None
+        tangents = np.column_stack((normals[:, 1], -normals[:, 0]))
+        segments = points[1:] - points[:-1]
+        midpoint_tangents = tangents[1:] + tangents[:-1]
+        tangent_lengths = np.sqrt(
+            np.sum(midpoint_tangents * midpoint_tangents, axis=1)
+        )
+        segment_lengths = np.sqrt(np.sum(segments * segments, axis=1))
+        forward = np.sum(segments * midpoint_tangents, axis=1)
+        valid = forward > (
+            segment_lengths * np.maximum(tangent_lengths, 1e-6) * 0.02
+        )
+        runs: list[tuple[float, int, int]] = []
+        start: int | None = None
+        for index, usable in enumerate(valid):
+            if usable and start is None:
+                start = index
+            if start is not None and (not usable or index == len(valid) - 1):
+                end = index + 1 if usable and index == len(valid) - 1 else index
+                if end > start:
+                    runs.append((
+                        float(np.sum(segment_lengths[start:end])),
+                        start, end + 1,
+                    ))
+                start = None
+        if not runs:
+            return None
+        _length, first, last = max(runs, key=lambda item: item[0])
+        return points[first:last].copy()
+
+    @staticmethod
+    def _speed_trim_stroke(
+        points: np.ndarray, available: np.ndarray, cut: float,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray] | None:
+        vectors = points[1:] - points[:-1]
+        lengths = np.sqrt(np.sum(vectors * vectors, axis=1))
+        usable = lengths > 1e-5
+        if not np.any(usable):
+            return None
+        cumulative = np.concatenate((
+            np.zeros(1, dtype=np.float32), np.cumsum(lengths)
+        ))
+        total = float(cumulative[-1])
+        terminal = max(0.75, total - max(0.0, float(cut)))
+        terminal = min(total, terminal)
+        segment = min(
+            len(lengths) - 1,
+            max(0, int(np.searchsorted(cumulative, terminal, side="right") - 1)),
+        )
+        fraction = (
+            (terminal - float(cumulative[segment]))
+            / max(float(lengths[segment]), 1e-6)
+        )
+        kept_points = [point.copy() for point in points[:segment + 1]]
+        kept_available = [float(value) for value in available[:segment + 1]]
+        endpoint = points[segment] + vectors[segment] * fraction
+        endpoint_available = (
+            float(available[segment]) * (1.0 - fraction)
+            + float(available[segment + 1]) * fraction
+        )
+        if not kept_points or np.linalg.norm(endpoint - kept_points[-1]) > 1e-5:
+            kept_points.append(endpoint)
+            kept_available.append(endpoint_available)
+        if len(kept_points) < 2:
+            return None
+        kept = np.asarray(kept_points, dtype=np.float32)
+        avail = np.asarray(kept_available, dtype=np.float32)
+        effective_vectors = kept[1:] - kept[:-1]
+        effective_lengths = np.sqrt(
+            np.sum(effective_vectors * effective_vectors, axis=1)
+        )
+        effective_cumulative = np.concatenate((
+            np.zeros(1, dtype=np.float32), np.cumsum(effective_lengths)
+        ))
+        color_t = np.clip(effective_cumulative / max(total, 1e-6), 0.0, 1.0)
+        thickness_t = np.clip(
+            effective_cumulative / max(float(effective_cumulative[-1]), 1e-6),
+            0.0, 1.0,
+        )
+        return kept, avail, color_t, thickness_t
+
+    def _speed_strokes_image(
+        self, obj: SpeedLinesGradientObject,
+        strokes: list[tuple[np.ndarray, np.ndarray]],
+        cuts: np.ndarray, bounds: QRectF, scalar_key: tuple,
+    ) -> tuple[QImage, QRectF] | None:
+        """Rasterize variable-width stroke centerlines into scalar/coverage."""
+        if bounds.isEmpty() or not strokes:
+            return None
+        width, height = self._gradient_grid_for_preview(bounds)
+        cache_key = scalar_key + (width, height)
+        cached = self._gradient_scalar_cache.get(cache_key)
+        if cached is not None:
+            scalar, coverage, cached_bounds = cached
+            return self._gradient_image_from_scalar(
+                scalar, coverage, obj.color_ramp, cached_bounds, cache_key
+            )
+        scalar = np.zeros((height, width), dtype=np.float32)
+        coverage = np.zeros((height, width), dtype=np.float32)
+        thickness_lut = self._gradient_thickness_lut(obj.thickness_ramp)
+        pixel_width = bounds.width() / width
+        pixel_height = bounds.height() / height
+        antialias = max(pixel_width, pixel_height, 1e-4)
+        for stroke_index, (raw_points, raw_available) in enumerate(strokes):
+            trimmed = self._speed_trim_stroke(
+                raw_points, raw_available,
+                float(cuts[stroke_index]) if stroke_index < len(cuts) else 0.0,
+            )
+            if trimmed is None:
+                continue
+            points, available, color_t, thickness_t = trimmed
+            for index in range(len(points) - 1):
+                start, end = points[index], points[index + 1]
+                vector = end - start
+                length_squared = float(np.dot(vector, vector))
+                if length_squared <= 1e-8:
+                    continue
+                maximum_width = max(
+                    float(available[index]), float(available[index + 1])
+                )
+                padding = maximum_width * 0.5 + antialias
+                left = min(float(start[0]), float(end[0])) - padding
+                right = max(float(start[0]), float(end[0])) + padding
+                top = min(float(start[1]), float(end[1])) - padding
+                bottom = max(float(start[1]), float(end[1])) + padding
+                x0 = max(0, int(math.floor(
+                    (left - bounds.left()) / max(pixel_width, 1e-6)
+                )))
+                x1 = min(width, int(math.ceil(
+                    (right - bounds.left()) / max(pixel_width, 1e-6)
+                )))
+                y0 = max(0, int(math.floor(
+                    (top - bounds.top()) / max(pixel_height, 1e-6)
+                )))
+                y1 = min(height, int(math.ceil(
+                    (bottom - bounds.top()) / max(pixel_height, 1e-6)
+                )))
+                if x0 >= x1 or y0 >= y1:
+                    continue
+                xs = bounds.left() + (
+                    np.arange(x0, x1, dtype=np.float32) + 0.5
+                ) * pixel_width
+                ys = bounds.top() + (
+                    np.arange(y0, y1, dtype=np.float32) + 0.5
+                ) * pixel_height
+                grid_x, grid_y = np.meshgrid(xs, ys)
+                relative_x = grid_x - float(start[0])
+                relative_y = grid_y - float(start[1])
+                raw_along = (
+                    (relative_x * float(vector[0])
+                     + relative_y * float(vector[1])) / length_squared
+                )
+                along = np.clip(raw_along, 0.0, 1.0)
+                nearest_x = float(start[0]) + along * float(vector[0])
+                nearest_y = float(start[1]) + along * float(vector[1])
+                distance = np.hypot(grid_x - nearest_x, grid_y - nearest_y)
+                segment_thickness_t = (
+                    float(thickness_t[index]) * (1.0 - along)
+                    + float(thickness_t[index + 1]) * along
+                )
+                lut_indices = np.clip(
+                    np.rint(segment_thickness_t * 1023.0), 0, 1023
+                ).astype(np.int32)
+                safe_width = (
+                    float(available[index]) * (1.0 - along)
+                    + float(available[index + 1]) * along
+                )
+                half_width = thickness_lut[lut_indices] * safe_width * 0.5
+                segment_coverage = np.clip(
+                    (half_width - distance) / antialias + 0.5,
+                    0.0, 1.0,
+                ).astype(np.float32)
+                segment_coverage *= (
+                    (raw_along >= 0.0) & (raw_along <= 1.0)
+                )
+                target_coverage = coverage[y0:y1, x0:x1]
+                replace = segment_coverage > target_coverage
+                if not np.any(replace):
+                    continue
+                segment_color_t = (
+                    float(color_t[index]) * (1.0 - along)
+                    + float(color_t[index + 1]) * along
+                )
+                target_scalar = scalar[y0:y1, x0:x1]
+                target_scalar[replace] = segment_color_t[replace]
+                target_coverage[replace] = segment_coverage[replace]
+        self._cache_gradient_value(
+            self._gradient_scalar_cache, cache_key,
+            (scalar, coverage, QRectF(bounds)),
+        )
+        return self._gradient_image_from_scalar(
+            scalar, coverage, obj.color_ramp, bounds, cache_key
+        )
 
     def _speed_thickness_pixels(
         self, lut: np.ndarray, t: np.ndarray, available: float,
@@ -3151,20 +4073,13 @@ class _CanvasLogic:
             field = obj.radial_field
             boundary = self._radial_boundary_path(field)
             if field.reverse_direction:
-                radius_y = (
-                    field.radius_y if field.ellipse_enabled else field.radius_x
-                )
-                radius = math.hypot(
-                    field.radius_x + field.distance,
-                    radius_y + field.distance,
-                )
-                bounds = QRectF(
-                    field.origin_x - radius, field.origin_y - radius,
-                    radius * 2, radius * 2,
+                bounds = boundary.boundingRect().adjusted(
+                    -field.distance, -field.distance,
+                    field.distance, field.distance,
                 )
             else:
                 bounds = boundary.boundingRect()
-            rendered = self._speed_lines_ring_image(
+            rendered = self._speed_lines_ray_image(
                 obj, boundary, bounds,
                 outward=field.reverse_direction,
                 center_point=field.center(),
@@ -3179,7 +4094,7 @@ class _CanvasLogic:
                 -field.distance, -field.distance,
                 field.distance, field.distance,
             )
-        rendered = self._speed_lines_ring_image(
+        rendered = self._speed_lines_ray_image(
             obj, parent_path, bounds, outward=field.reverse_direction,
             center_point=(
                 self._shape_gradient_center(obj, parent_path).toTuple()
@@ -3198,7 +4113,193 @@ class _CanvasLogic:
             return center.geometry
         return None
 
+    def _speed_parallel_field_image(
+        self, obj: SpeedLinesGradientObject, path: QPainterPath,
+        bounds: QRectF, scalar_key: tuple, seed: int,
+    ) -> tuple[QImage, QRectF] | None:
+        """Render robust mathematical offset curves without cusp loops."""
+        width, height = self._gradient_grid_for_preview(bounds)
+        cache_key = scalar_key + ("parallel-field", width, height)
+        cached = self._gradient_scalar_cache.get(cache_key)
+        if cached is not None:
+            scalar, coverage, cached_bounds = cached
+            return self._gradient_image_from_scalar(
+                scalar, coverage, obj.color_ramp, cached_bounds, cache_key
+            )
+        amount, signed, _distance = self._path_projection_arrays(
+            path, bounds, width, height
+        )
+        speed = obj.speed_field
+        spacing = 1.0 / max(speed.density, 0.005)
+        available = max(0.0, spacing - speed.gap)
+        lane = np.rint(signed / spacing).astype(np.int32)
+        minimum_lane = int(np.min(lane))
+        maximum_lane = int(np.max(lane))
+        lane_count = maximum_lane - minimum_lane + 1
+        noise = self._speed_noise(
+            lane_count, seed, speed.randomness_distance,
+            speed.randomness_scale, closed=False,
+        )
+        lane_index = lane - minimum_lane
+        arc = max(float(path.length()), 1e-6)
+        terminal = np.clip(
+            1.0 - (speed.close_range + noise[lane_index]) / arc,
+            1e-3, 1.0,
+        )
+        travel = 1.0 - amount if obj.line_field.reverse_direction else amount
+        thickness_t = np.clip(
+            np.divide(
+                travel, terminal, out=np.ones_like(travel),
+                where=terminal > 1e-6,
+            ),
+            0.0, 1.0,
+        )
+        thickness_lut = self._gradient_thickness_lut(obj.thickness_ramp)
+        thickness_indices = np.clip(
+            np.rint(thickness_t * 1023.0), 0, 1023
+        ).astype(np.int32)
+        half_width = thickness_lut[thickness_indices] * available * 0.5
+        distance_to_lane = np.abs(
+            signed - lane.astype(np.float32) * spacing
+        )
+        antialias = max(
+            bounds.width() / width, bounds.height() / height, 1e-4
+        )
+        coverage = np.clip(
+            (half_width - distance_to_lane) / antialias + 0.5,
+            0.0, 1.0,
+        ).astype(np.float32)
+        coverage *= travel <= terminal
+        scalar = np.clip(travel, 0.0, 1.0).astype(np.float32)
+        self._cache_gradient_value(
+            self._gradient_scalar_cache, cache_key,
+            (scalar, coverage, QRectF(bounds)),
+        )
+        return self._gradient_image_from_scalar(
+            scalar, coverage, obj.color_ramp, bounds, cache_key
+        )
+
     def _speed_lines_line_image(
+        self, obj: SpeedLinesGradientObject, path: QPainterPath,
+        bounds: QRectF,
+    ) -> tuple[QImage, QRectF] | None:
+        if bounds.isEmpty() or path.isEmpty() or path.length() <= 1e-5:
+            return None
+        field = obj.line_field
+        speed = obj.speed_field
+        speed.validate()
+        spacing = 1.0 / max(speed.density, 0.005)
+        guide_signature = self._gradient_path_signature(path)
+        parent_signature = self._gradient_path_signature(
+            self.layer_effective_path(obj.parent_layer_id)
+        )
+        center_geometry = self._speed_lines_center_geometry(
+            obj, closed_parent=False
+        )
+        center_path = (
+            self.bound_path(center_geometry)
+            if center_geometry is not None else None
+        )
+        center_signature = (
+            self._gradient_path_signature(center_path)
+            if center_path is not None else ()
+        )
+        scalar_key = (
+            "manga-speed-line", obj.object_id, guide_signature,
+            parent_signature, center_signature,
+            round(bounds.x(), 3), round(bounds.y(), 3),
+            round(bounds.width(), 3), round(bounds.height(), 3),
+            field.direction_mode, field.reverse_direction,
+            round(field.perpendicular_distance, 4),
+            round(speed.density, 5), round(speed.gap, 4),
+            round(speed.close_range, 4),
+            round(speed.randomness_distance, 4),
+            round(speed.randomness_scale, 4),
+            self._gradient_ramp_signature(obj.thickness_ramp),
+        )
+        seed = zlib.crc32(
+            f"{obj.object_id}|{field.direction_mode}".encode()
+        )
+        if field.direction_mode == "parallel" and center_path is None:
+            return self._speed_parallel_field_image(
+                obj, path, bounds, scalar_key, seed
+            )
+        strokes: list[tuple[np.ndarray, np.ndarray]] = []
+        if field.direction_mode == "perpendicular":
+            count = max(2, int(round(float(path.length()) / spacing)) + 1)
+            starts, normals = self._speed_open_path_samples(path, count)
+            if center_path is not None:
+                targets, _distances = self._speed_closest_points(
+                    starts, center_path
+                )
+            else:
+                distance = float(field.perpendicular_distance)
+                targets = starts + normals * distance
+            source_width, target_width = self._speed_neighbor_widths(
+                starts, targets, spacing, speed.gap, closed=False
+            )
+            for index in range(len(starts)):
+                strokes.append((
+                    np.asarray((starts[index], targets[index]), dtype=np.float32),
+                    np.asarray(
+                        (source_width[index], target_width[index]),
+                        dtype=np.float32,
+                    ),
+                ))
+        else:
+            sample_step = max(2.0, min(6.0, spacing * 0.4))
+            sample_count = max(
+                16, int(math.ceil(float(path.length()) / sample_step)) + 1
+            )
+            base_points, normals = self._speed_open_path_samples(
+                path, sample_count
+            )
+            diagonal = max(
+                math.hypot(bounds.width(), bounds.height()), spacing
+            )
+            lane_count = max(1, int(math.ceil(diagonal / spacing)))
+            offsets = np.arange(
+                -lane_count, lane_count + 1, dtype=np.float32
+            ) * spacing
+            for offset in offsets:
+                lane = self._speed_monotone_lane(
+                    base_points + normals * float(offset), normals
+                )
+                if lane is None:
+                    continue
+                if (
+                    float(np.max(lane[:, 0])) < bounds.left() - spacing
+                    or float(np.min(lane[:, 0])) > bounds.right() + spacing
+                    or float(np.max(lane[:, 1])) < bounds.top() - spacing
+                    or float(np.min(lane[:, 1])) > bounds.bottom() + spacing
+                ):
+                    continue
+                if field.reverse_direction:
+                    lane = lane[::-1].copy()
+                if center_path is not None:
+                    closest, distances = self._speed_closest_points(
+                        lane, center_path
+                    )
+                    terminal_index = int(np.argmin(distances))
+                    terminal_index = max(1, terminal_index)
+                    lane = lane[:terminal_index + 1].copy()
+                    terminal = closest[min(terminal_index, len(closest) - 1)]
+                    if np.linalg.norm(lane[-1] - terminal) > 1e-4:
+                        lane = np.vstack((lane, terminal))
+                available = np.full(
+                    len(lane), max(0.0, spacing - speed.gap),
+                    dtype=np.float32,
+                )
+                strokes.append((lane, available))
+        cuts = speed.close_range + self._speed_noise(
+            len(strokes), seed, speed.randomness_distance,
+            speed.randomness_scale, closed=False,
+        )
+        return self._speed_strokes_image(
+            obj, strokes, cuts, bounds, scalar_key
+        )
+
+    def _speed_lines_line_image_legacy(
         self, obj: SpeedLinesGradientObject, path: QPainterPath,
         bounds: QRectF,
     ) -> tuple[QImage, QRectF] | None:
@@ -3306,7 +4407,99 @@ class _CanvasLogic:
             scalar, coverage, obj.color_ramp, bounds, scalar_key
         )
 
-    def _speed_lines_ring_image(
+    def _speed_lines_ray_image(
+        self, obj: SpeedLinesGradientObject, boundary: QPainterPath,
+        bounds: QRectF, *, outward: bool,
+        center_point: tuple[float, float],
+    ) -> tuple[QImage, QRectF] | None:
+        if bounds.isEmpty() or boundary.isEmpty():
+            return None
+        speed = obj.speed_field
+        speed.validate()
+        spacing = 1.0 / max(speed.density, 0.005)
+        center_geometry = None if outward else self._speed_lines_center_geometry(
+            obj, closed_parent=True
+        )
+        center_path = (
+            self.bound_path(center_geometry)
+            if center_geometry is not None else None
+        )
+        if not outward:
+            target_bounds = (
+                center_path.boundingRect()
+                if center_path is not None
+                else QRectF(center_point[0], center_point[1], 0.001, 0.001)
+            )
+            bounds = bounds.united(target_bounds)
+        boundary_signature = self._gradient_path_signature(boundary)
+        center_signature: tuple = (
+            ("path", self._gradient_path_signature(center_path))
+            if center_path is not None
+            else ("point", round(center_point[0], 4), round(center_point[1], 4))
+        )
+        span_distance = (
+            float(obj.radial_field.distance)
+            if obj.field_type == "radial" else float(obj.shape_field.distance)
+        )
+        scalar_key = (
+            "manga-speed-rays", obj.object_id, boundary_signature,
+            round(bounds.x(), 3), round(bounds.y(), 3),
+            round(bounds.width(), 3), round(bounds.height(), 3),
+            outward, round(span_distance, 4), center_signature,
+            round(speed.density, 5), round(speed.gap, 4),
+            round(speed.close_range, 4),
+            round(speed.randomness_distance, 4),
+            round(speed.randomness_scale, 4),
+            self._gradient_ramp_signature(obj.thickness_ramp),
+        )
+        contours = self._speed_boundary_contours(boundary, spacing)
+        strokes: list[tuple[np.ndarray, np.ndarray]] = []
+        cuts: list[float] = []
+        center = np.asarray(center_point, dtype=np.float32)
+        for contour_index, starts in enumerate(contours):
+            if outward:
+                directions = starts - center[None, :]
+                lengths = np.sqrt(np.sum(directions * directions, axis=1))
+                fallback = starts - np.mean(starts, axis=0, keepdims=True)
+                missing = lengths <= 1e-5
+                if np.any(missing):
+                    directions[missing] = fallback[missing]
+                    lengths = np.sqrt(np.sum(directions * directions, axis=1))
+                directions = np.divide(
+                    directions, np.maximum(lengths[:, None], 1e-6)
+                )
+                targets = starts + directions * max(span_distance, 0.001)
+            elif center_path is not None:
+                targets, _distances = self._speed_closest_points(
+                    starts, center_path
+                )
+            else:
+                targets = np.repeat(center[None, :], len(starts), axis=0)
+            source_width, target_width = self._speed_neighbor_widths(
+                starts, targets, spacing, speed.gap, closed=True
+            )
+            for index in range(len(starts)):
+                strokes.append((
+                    np.asarray((starts[index], targets[index]), dtype=np.float32),
+                    np.asarray(
+                        (source_width[index], target_width[index]),
+                        dtype=np.float32,
+                    ),
+                ))
+            contour_seed = zlib.crc32(
+                f"{obj.object_id}|{contour_index}|{outward}".encode()
+            )
+            contour_noise = self._speed_noise(
+                len(starts), contour_seed, speed.randomness_distance,
+                speed.randomness_scale, closed=True,
+            )
+            cuts.extend((speed.close_range + contour_noise).tolist())
+        return self._speed_strokes_image(
+            obj, strokes, np.asarray(cuts, dtype=np.float32),
+            bounds, scalar_key,
+        )
+
+    def _speed_lines_ring_image_legacy(
         self, obj: SpeedLinesGradientObject, boundary: QPainterPath,
         bounds: QRectF, *, outward: bool,
         center_point: tuple[float, float],
@@ -4093,7 +5286,7 @@ class _CanvasLogic:
                 )
             is_speed = isinstance(obj, SpeedLinesGradientObject)
             if (
-                (obj.line_field.direction_mode == "perpendicular" or is_speed)
+                obj.line_field.direction_mode == "perpendicular"
                 and len(geometry.nodes) >= 2
             ):
                 path = self.bound_path(geometry)
@@ -4110,12 +5303,32 @@ class _CanvasLogic:
                         midpoint.y() + math.sin(angle) * distance,
                     ),
                 )
-                if is_speed:
-                    result["direction:"] = self._gradient_local_to_world(
+            if is_speed and len(geometry.nodes) >= 2:
+                path = self.bound_path(geometry)
+                percent = path.percentAtLength(path.length() / 2)
+                midpoint = path.pointAtPercent(percent)
+                angle = math.radians(-path.angleAtPercent(percent) + 90)
+                result["direction:"] = self._gradient_local_to_world(
+                    obj,
+                    (
+                        midpoint.x() - math.cos(angle) * 60 / self.scale,
+                        midpoint.y() - math.sin(angle) * 60 / self.scale,
+                    ),
+                )
+                if obj.line_field.direction_mode == "parallel":
+                    target_percent = (
+                        0.0 if obj.line_field.reverse_direction else 1.0
+                    )
+                    target = path.pointAtPercent(target_percent)
+                    tangent_angle = math.radians(
+                        -path.angleAtPercent(target_percent)
+                    )
+                    sign = -1.0 if obj.line_field.reverse_direction else 1.0
+                    result["flow:"] = self._gradient_local_to_world(
                         obj,
                         (
-                            midpoint.x() - math.cos(angle) * 60 / self.scale,
-                            midpoint.y() - math.sin(angle) * 60 / self.scale,
+                            target.x() + math.cos(tangent_angle) * sign * 28 / self.scale,
+                            target.y() + math.sin(tangent_angle) * sign * 28 / self.scale,
                         ),
                     )
             return result
@@ -4275,6 +5488,35 @@ class _CanvasLogic:
                     geometry_only=True,
                 )
             painter.restore()
+            for key in ("distance:", "direction:", "flow:"):
+                point = controls.get(key)
+                if point is None:
+                    continue
+                if key == "direction:":
+                    badge = QRectF(
+                        point.x() - action_radius * 3.0,
+                        point.y() - action_radius,
+                        action_radius * 6.0, action_radius * 2.0,
+                    )
+                    painter.drawRoundedRect(
+                        badge, action_radius / 2, action_radius / 2
+                    )
+                    painter.drawText(
+                        badge, Qt.AlignmentFlag.AlignCenter,
+                        "Perpendicular"
+                        if obj.line_field.direction_mode == "perpendicular"
+                        else "Parallel",
+                    )
+                elif key == "flow:":
+                    diamond = QPolygonF([
+                        point + QPointF(0, -action_radius),
+                        point + QPointF(action_radius, 0),
+                        point + QPointF(0, action_radius),
+                        point + QPointF(-action_radius, 0),
+                    ])
+                    painter.drawPolygon(diamond)
+                else:
+                    painter.drawEllipse(point, action_radius, action_radius)
             painter.restore()
             return
         if obj.field_type == "radial":
@@ -4347,7 +5589,7 @@ class _CanvasLogic:
             "center": 2, "rotate": 2, "radius_x": 2,
             "radius_y": 2, "origin": 3, "node": 4,
             "type": 0, "delete": 0, "lock": 0, "roundness": 0,
-            "direction": 0, "distance": 2, "insert": 5,
+            "direction": 0, "flow": 0, "distance": 2, "insert": 5,
         }
         hits: list[tuple[int, float, str, str]] = []
         for key, candidate in controls.items():
@@ -4479,6 +5721,7 @@ class _CanvasLogic:
             "roundness": "Drag to adjust roundness; click to toggle",
             "lock": "Lock or unlock Bézier handles",
             "distance": "Set gradient distance",
+            "flow": "Drag to the other endpoint to reverse the speed lines",
         }.get(kind, "Edit gradient"))
         return True
 
@@ -4494,6 +5737,19 @@ class _CanvasLogic:
         )
         local = self._gradient_world_to_local(obj, snapped_world)
         if obj.field_type == "line":
+            if kind == "flow":
+                path = self.bound_path(obj.line_field.geometry)
+                start = path.pointAtPercent(0.0)
+                end = path.pointAtPercent(1.0)
+                obj.line_field.reverse_direction = (
+                    math.dist(local.toTuple(), start.toTuple())
+                    < math.dist(local.toTuple(), end.toTuple())
+                )
+                obj.line_field.validate()
+                obj.touch_revision()
+                self.documentChanged.emit(QRectF())
+                self.update()
+                return
             if kind == "distance":
                 path = self.bound_path(obj.line_field.geometry)
                 percent = path.percentAtLength(path.length() / 2)
@@ -6001,10 +7257,7 @@ class _CanvasLogic:
             self.chapter.height,
             math.ceil(anchor.bottom() + 120 + 1080),
         )
-        self._creation_points.clear()
-        self._creation_nodes.clear()
-        self._creation_selected_node_id = ""
-        self._creation_active_control = None
+        self._clear_creation_gesture()
         target = {
             "rectangle": ToolKind.BOX_BOUND,
             "circle": ToolKind.CIRCLE_BOUND,
@@ -6026,11 +7279,7 @@ class _CanvasLogic:
         self._page_creation_committing = False
         self._page_creation_gap_bounds = None
         self._page_creation_base_height = 0
-        self._creation_points.clear()
-        self._creation_nodes.clear()
-        self._creation_selected_node_id = ""
-        self._creation_active_control = None
-        self._creation_style = None
+        self._clear_creation_gesture()
         self._page_gap_transaction = None
         self._clear_page_gap_editor()
         self.pageGapConfirmationChanged.emit(False)
@@ -6102,14 +7351,7 @@ class _CanvasLogic:
         self._page_creation_draft = None
         self._page_creation_gap_bounds = None
         self._page_creation_base_height = 0
-        self._creation_points.clear()
-        self._creation_nodes.clear()
-        self._creation_selected_node_id = ""
-        self._creation_active_control = None
-        self._creation_close_candidate = False
-        self._creation_style = None
-        self._shape_hover_target = None
-        self._shape_hover_insert = None
+        self._clear_creation_gesture()
         self.update()
 
     def page_creation_base_height(self) -> int:
@@ -6450,10 +7692,14 @@ class _CanvasLogic:
         return None
 
     def mousePressEvent(self, event: QMouseEvent) -> None:  # noqa: N802
+        if self.chapter is None:
+            self._clear_detached_input_state()
+            event.accept()
+            return
         if self._is_touch_mouse(event) or self._tablet_tool_active:
             event.accept()
             return
-        if event.button() != Qt.LeftButton or self.chapter is None:
+        if event.button() != Qt.LeftButton:
             return
         nav = self._navigation_mode()
         if nav:
@@ -6462,6 +7708,10 @@ class _CanvasLogic:
         self._tool_press(event.position(), 1.0)
 
     def mouseMoveEvent(self, event: QMouseEvent) -> None:  # noqa: N802
+        if self.chapter is None:
+            self._clear_detached_input_state()
+            event.accept()
+            return
         if self._is_touch_mouse(event) or self._tablet_tool_active:
             event.accept()
             return
@@ -6546,6 +7796,10 @@ class _CanvasLogic:
         self._tool_move(event.position(), 1.0)
 
     def mouseReleaseEvent(self, event: QMouseEvent) -> None:  # noqa: N802
+        if self.chapter is None:
+            self._clear_detached_input_state()
+            event.accept()
+            return
         if self._is_touch_mouse(event) or self._tablet_tool_active:
             event.accept()
             return
@@ -6605,6 +7859,10 @@ class _CanvasLogic:
     def keyPressEvent(self, event) -> None:  # noqa: N802
         if event.key() in {Qt.Key_Shift, Qt.Key_Control}:
             self.update()
+        if event.key() == Qt.Key_Escape and self._asset_drag_manifest is not None:
+            self._clear_asset_drag_preview()
+            event.accept()
+            return
         if event.key() == Qt.Key_Escape and self._page_gap_state is not None:
             if self._page_gap_transaction is not None:
                 self.cancel_page_gap_transaction()
@@ -6653,13 +7911,7 @@ class _CanvasLogic:
                     self._cancel_gradient_creation()
                     self.set_tool(ToolKind.SHAPE_EDIT)
                     return
-                self._creation_nodes.clear()
-                self._creation_points.clear()
-                self._creation_selected_node_id = ""
-                self._creation_active_control = None
-                self._creation_style = None
-                self._shape_hover_target = None
-                self._shape_hover_insert = None
+                self._clear_creation_gesture()
                 self.update()
                 return
             if event.key() == Qt.Key_Backspace and self._creation_nodes:
@@ -6767,7 +8019,13 @@ class _CanvasLogic:
         event.accept()
 
     def tabletEvent(self, event) -> None:  # noqa: N802
+        device = event.pointingDevice()
+        if device is not None:
+            self._device_supports_pressure = bool(
+                device.capabilities() & QInputDevice.Capability.Pressure
+            )
         if self.chapter is None:
+            self._clear_detached_input_state()
             event.accept()
             return
         self._tablet_hover_widget = QPointF(event.position())
@@ -6808,12 +8066,13 @@ class _CanvasLogic:
                         return
                 else:
                     self._last_gradient_tablet_tap = None
+                self._pen_contact_active = True
                 self._tablet_tool_active = True
                 self._tool_press(event.position(), event.pressure())
         elif event.type() == QEvent.TabletMove:
             if self._nav_mode:
                 self._update_navigation(event.position())
-            elif self._tablet_tool_active:
+            elif self._pen_contact_active:
                 self._tool_move(event.position(), event.pressure())
             elif self.tool == ToolKind.DRAW_SELECT_STROKE:
                 self._continue_drawing_selection(
@@ -6823,7 +8082,8 @@ class _CanvasLogic:
         elif event.type() == QEvent.TabletRelease:
             if self._nav_mode:
                 self._end_navigation()
-            elif self._tablet_tool_active:
+            elif self._pen_contact_active:
+                self._pen_contact_active = False
                 self._tablet_tool_active = False
                 self._tool_release()
         self.update()
@@ -6884,7 +8144,6 @@ class _CanvasLogic:
             self._touch_frame_timer.stop()
             self._touch_pending_points = None
             self._rebase_touch_navigation(points)
-            self._capture_navigation_snapshot()
             event.accept()
             return True
         if event.type() == QEvent.TouchUpdate and points:
@@ -6892,7 +8151,6 @@ class _CanvasLogic:
                 self._touch_frame_timer.stop()
                 self._touch_pending_points = None
                 self._rebase_touch_navigation(points)
-                self._capture_navigation_snapshot()
             else:
                 # Touch hardware can deliver well over a hundred updates per
                 # second.  Keep only the newest frame and apply it once from
@@ -6905,7 +8163,6 @@ class _CanvasLogic:
             return True
         self._touch_frame_timer.stop()
         self._touch_pending_points = None
-        self._clear_navigation_snapshot()
         self._touch_points.clear()
         self._touch_anchor_points.clear()
         self.interactionFinished.emit()
@@ -7022,7 +8279,7 @@ class _CanvasLogic:
             return None
         self._normalize_creation_handles()
         if (
-            self._page_creation_anchor_id
+            not self._gradient_creation_parent_id
             and len(self._creation_nodes) >= 3
         ):
             first = self._creation_nodes[0]
@@ -7036,6 +8293,7 @@ class _CanvasLogic:
                     "kind": "node", "index": 0,
                     "node_id": first.node_id,
                     "position": QPointF(first.x, first.y),
+                    "close": True,
                 }
         if len(self._creation_nodes) == 1:
             node = self._creation_nodes[0]
@@ -7081,6 +8339,8 @@ class _CanvasLogic:
         if not hit:
             return ""
         kind = hit["kind"]
+        if kind == "node" and hit.get("close"):
+            return "Click to close this shape; drag to move the first point"
         labels = {
             "radius": "Drag to adjust this corner's roundness",
             "node": "Click to select; drag to move this point",
@@ -7197,12 +8457,7 @@ class _CanvasLogic:
             self._creation_active_control = "draft_node"
             self._creation_press_widget = QPointF(widget_point)
             self._creation_node_dragged = False
-            self._creation_close_candidate = (
-                not self._gradient_creation_parent_id
-                and
-                hit["node_id"] == self._creation_nodes[0].node_id
-                and len(self._creation_nodes) >= 3
-            )
+            self._creation_close_candidate = bool(hit.get("close"))
             return True
         if kind == "insert":
             index, percent, _insert_point = hit["insert"]
@@ -7226,13 +8481,18 @@ class _CanvasLogic:
         node = self._creation_selected_node()
         if not control or node is None:
             return False
-        moved = math.dist(
+        movement = math.dist(
             (widget_point.x(), widget_point.y()),
             (
                 self._creation_press_widget.x(),
                 self._creation_press_widget.y(),
             ),
-        ) > 3
+        )
+        movement_threshold = (
+            max(3, QApplication.startDragDistance())
+            if self._creation_close_candidate else 3
+        )
+        moved = movement > movement_threshold
         if moved:
             self._creation_node_dragged = True
             self._creation_close_candidate = False
@@ -8434,7 +9694,7 @@ class _CanvasLogic:
         self._vector_changed(changed_stroke_ids=changed_strokes)
 
     def _vector_pressure_values(self, pressure: float) -> tuple[float, float]:
-        pressure = pressure if pressure > 0.001 else 1.0
+        pressure = self._effective_pressure(pressure)
         width = float(self.settings.pencil_size())
         opacity = 1.0
         if self._preset.pressure_size:
@@ -8451,7 +9711,7 @@ class _CanvasLogic:
     ) -> None:
         sample = FreehandSample(
             local.x(), local.y(),
-            pressure if pressure > 0.001 else 1.0,
+            self._effective_pressure(pressure),
         )
         if (
             self._vector_samples
@@ -8870,7 +10130,7 @@ class _CanvasLogic:
             else self._preset.opacity_curve
         )
         mapped = curve.evaluate_fast(
-            pressure if pressure > 0.001 else 1.0
+            self._effective_pressure(pressure)
         )
         changed = False
         changed_strokes: set[str] = set()
@@ -9822,6 +11082,9 @@ class _CanvasLogic:
 
     # ---- tool actions --------------------------------------------------
     def _tool_press(self, widget_point: QPointF, pressure: float) -> None:
+        if self.chapter is None:
+            self._clear_detached_input_state()
+            return
         point = self.widget_to_document(widget_point)
         self._press_widget_point = QPointF(widget_point)
         self._press_document_point = QPointF(point)
@@ -10134,6 +11397,9 @@ class _CanvasLogic:
             self.update()
 
     def _tool_move(self, widget_point: QPointF, pressure: float) -> None:
+        if self.chapter is None:
+            self._clear_detached_input_state()
+            return
         point = self.widget_to_document(widget_point)
         if self._page_gap_drag_mode is not None:
             self._move_page_gap_interaction(point)
@@ -10367,6 +11633,9 @@ class _CanvasLogic:
             self._update_shape_hover(point)
 
     def _tool_release(self) -> None:
+        if self.chapter is None:
+            self._clear_detached_input_state()
+            return
         if self._finish_page_gap_interaction():
             return
         if self.tool == ToolKind.INSERT_PAGE_GAP:
@@ -10667,10 +11936,7 @@ class _CanvasLogic:
         self._gradient_creation_type = field_type
         self._gradient_creation_family = gradient_type
         self._gradient_creation_before = self.chapter.to_dict()
-        self._creation_points.clear()
-        self._creation_nodes.clear()
-        self._creation_selected_node_id = ""
-        self._creation_active_control = None
+        self._clear_creation_gesture()
         self.set_selection(
             "layer", parent_id, activate_default_tool=False
         )
@@ -10684,12 +11950,7 @@ class _CanvasLogic:
         self._gradient_creation_type = ""
         self._gradient_creation_family = "color_fill"
         self._gradient_creation_before = None
-        self._creation_points.clear()
-        self._creation_nodes.clear()
-        self._creation_selected_node_id = ""
-        self._creation_active_control = None
-        self._shape_hover_target = None
-        self._shape_hover_insert = None
+        self._clear_creation_gesture()
         self.update()
 
     def create_gradient(
@@ -10715,15 +11976,24 @@ class _CanvasLogic:
             for item in self.chapter.objects.values()
         ) + 1
         if gradient_type == "speed_lines":
+            source_color = QColor(self.primary_color)
+            target_color = QColor(source_color)
+            target_color.setAlpha(0)
             obj: GradientObject = SpeedLinesGradientObject(
                 name=f"Speed Lines {count}",
                 field_type=field_type,
                 color_ramp=ColorGradientRamp(stops=[
                     ColorGradientStop(
-                        position=0.0, color=self.primary_color
+                        position=0.0,
+                        color=source_color.name(
+                            QColor.NameFormat.HexArgb
+                        ).upper(),
                     ),
                     ColorGradientStop(
-                        position=1.0, color=self.secondary_color
+                        position=1.0,
+                        color=target_color.name(
+                            QColor.NameFormat.HexArgb
+                        ).upper(),
                     ),
                 ]),
             )
@@ -11886,7 +13156,7 @@ class _CanvasLogic:
         local = QPointF(round(point.x() - layer_x - obj.x), round(point.y() - layer_y - obj.y))
         self._drawing = True
         self._last_draw_point = local
-        self._last_pressure = pressure if pressure > 0.001 else 1.0
+        self._last_pressure = self._effective_pressure(pressure)
         self._stroke_before = {}
         self._stroke_frame_before = tuple(obj.interaction_rect)
         self._stroke_erasing = self.tool == ToolKind.RASTER_ERASER
@@ -11910,7 +13180,7 @@ class _CanvasLogic:
         obj = self.chapter.objects[self.selected_id]
         layer_x, layer_y = self.chapter.layer_world_translation(obj.parent_layer_id)
         local = QPointF(round(point.x() - layer_x - obj.x), round(point.y() - layer_y - obj.y))
-        actual_pressure = pressure if pressure > 0.001 else 1.0
+        actual_pressure = self._effective_pressure(pressure)
         size_start, opacity_start = self._brush_values(self._last_pressure)
         size_end, opacity_end = self._brush_values(actual_pressure)
         size = (size_start + size_end) / 2
@@ -12022,6 +13292,15 @@ class _CanvasLogic:
             opacity = self._preset.opacity_curve.evaluate_fast(pressure)
         opacity *= QColor(self.primary_color).alphaF()
         return max(0.5, size), opacity
+
+    def _effective_pressure(self, pressure: float) -> float:
+        """Normalize pressure without destroying valid light pen samples."""
+        pressure = max(0.0, min(1.0, float(pressure)))
+        if self._device_supports_pressure:
+            return pressure
+        # Mouse input and tablet devices without a pressure axis conventionally
+        # report zero. Preserve their historical full-pressure drawing behavior.
+        return pressure if pressure > 0.001 else 1.0
 
     def refresh_brush_settings(self) -> None:
         self._preset = self.settings.active_brush_preset()

@@ -7,7 +7,7 @@ from dataclasses import dataclass, field
 from typing import Any, Iterable, Iterator, Literal
 
 
-SCHEMA_VERSION = 13
+SCHEMA_VERSION = 14
 CHAPTER_WIDTH = 1080
 DEFAULT_CHAPTER_HEIGHT = 3240
 GROWTH_MARGIN = 1080
@@ -742,6 +742,7 @@ class DocumentObject:
     object_id: str = field(default_factory=new_id)
     object_type: str = "object"
     name: str = "Object"
+    custom_name: bool = False
     parent_layer_id: str = ""
     x: float = 0.0
     y: float = 0.0
@@ -755,6 +756,7 @@ class DocumentObject:
     def common_dict(self) -> dict[str, Any]:
         return {
             "id": self.object_id, "type": self.object_type, "name": self.name,
+            "custom_name": self.custom_name,
             "parent_layer_id": self.parent_layer_id, "position": [self.x, self.y],
             "visible": self.visible, "opacity": self.opacity,
             "opacity_locked": self.opacity_locked,
@@ -1130,19 +1132,19 @@ class ShapeGradientField:
 class SpeedLinesField:
     """Impact-line parameters shared by all speed-lines field types."""
 
-    density: float = 0.04
-    gap: float = 0.0
-    close_range: float = 0.0
-    randomness_distance: float = 0.0
-    randomness_scale: float = 10.0
+    density: float = 0.06
+    gap: float = 3.0
+    close_range: float = 8.0
+    randomness_distance: float = 24.0
+    randomness_scale: float = 8.0
 
     def validate(self) -> None:
         try:
             density = float(self.density)
         except (TypeError, ValueError):
-            density = 0.04
+            density = 0.06
         self.density = (
-            max(0.005, min(0.5, density)) if math.isfinite(density) else 0.04
+            max(0.005, min(0.5, density)) if math.isfinite(density) else 0.06
         )
         try:
             gap = float(self.gap)
@@ -1167,10 +1169,10 @@ class SpeedLinesField:
         try:
             randomness_scale = float(self.randomness_scale)
         except (TypeError, ValueError):
-            randomness_scale = 10.0
+            randomness_scale = 8.0
         self.randomness_scale = (
             max(1.0, min(100.0, randomness_scale))
-            if math.isfinite(randomness_scale) else 10.0
+            if math.isfinite(randomness_scale) else 8.0
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -1187,13 +1189,13 @@ class SpeedLinesField:
     def from_dict(cls, data: dict[str, Any] | None) -> "SpeedLinesField":
         data = data or {}
         result = cls(
-            density=float(data.get("density", 0.04)),
-            gap=float(data.get("gap", 0.0)),
-            close_range=float(data.get("close_range", 0.0)),
+            density=float(data.get("density", 0.06)),
+            gap=float(data.get("gap", 3.0)),
+            close_range=float(data.get("close_range", 8.0)),
             randomness_distance=float(
-                data.get("randomness_distance", 0.0)
+                data.get("randomness_distance", 24.0)
             ),
-            randomness_scale=float(data.get("randomness_scale", 10.0)),
+            randomness_scale=float(data.get("randomness_scale", 8.0)),
         )
         result.validate()
         return result
@@ -1271,8 +1273,18 @@ class ColorFillGradientObject(GradientObject):
 class SpeedLinesGradientObject(GradientObject):
     gradient_type: str = "speed_lines"
     name: str = "Speed Lines"
-    color_ramp: ColorGradientRamp = field(default_factory=ColorGradientRamp)
-    thickness_ramp: ColorGradientRamp = field(default_factory=ColorGradientRamp)
+    color_ramp: ColorGradientRamp = field(default_factory=lambda: ColorGradientRamp(
+        stops=[
+            ColorGradientStop(position=0.0, color="#FF000000"),
+            ColorGradientStop(position=1.0, color="#00000000"),
+        ]
+    ))
+    thickness_ramp: ColorGradientRamp = field(default_factory=lambda: ColorGradientRamp(
+        stops=[
+            ColorGradientStop(position=0.0, color="#FFFFFFFF"),
+            ColorGradientStop(position=1.0, color="#FF000000"),
+        ]
+    ))
     speed_field: SpeedLinesField = field(default_factory=SpeedLinesField)
     center_shape_id: str = ""
     loaded_preset_id: str = ""
@@ -1595,6 +1607,7 @@ def object_from_dict(data: dict[str, Any]) -> ObjectEntity:
     position = data.get("position", [0, 0])
     common = dict(
         object_id=str(data["id"]), name=str(data.get("name", "Object")),
+        custom_name=bool(data.get("custom_name", False)),
         parent_layer_id=str(data.get("parent_layer_id", "")), x=float(position[0]),
         y=float(position[1]), visible=bool(data.get("visible", True)),
         opacity=float(data.get("opacity", 1.0)),
@@ -1733,6 +1746,7 @@ class ChapterDocument:
     root_page_ids: list[str] = field(default_factory=list)
     layers: dict[str, LayerNode] = field(default_factory=dict)
     objects: dict[str, ObjectEntity] = field(default_factory=dict)
+    document_kind: Literal["chapter", "asset"] = "chapter"
     schema_version: int = SCHEMA_VERSION
 
     def validate(self) -> None:
@@ -1740,8 +1754,11 @@ class ChapterDocument:
             raise ValueError(
                 f"Chapter schema {self.schema_version} is newer than supported {SCHEMA_VERSION}"
             )
-        if self.width != CHAPTER_WIDTH:
+        if self.document_kind not in {"chapter", "asset"}:
+            raise ValueError(f"Unknown document kind: {self.document_kind}")
+        if self.document_kind == "chapter" and self.width != CHAPTER_WIDTH:
             raise ValueError(f"Chapter width must be {CHAPTER_WIDTH}")
+        self.width = max(1, int(self.width))
         self.height = max(1, int(self.height))
         self.grid.validate()
         if len(set(self.root_page_ids)) != len(self.root_page_ids):
@@ -2504,6 +2521,7 @@ class ChapterDocument:
         return {
             "schema_version": self.schema_version, "id": self.chapter_id,
             "name": self.name, "size": [self.width, self.height],
+            "document_kind": self.document_kind,
             "background": self.background, "grid": self.grid.to_dict(),
             "root_page_ids": list(self.root_page_ids),
             "layers": [layer.to_dict() for layer in self.layers.values()],
@@ -2521,6 +2539,7 @@ class ChapterDocument:
         result = cls(
             chapter_id=str(data["id"]), name=str(data.get("name", "Chapter")),
             width=int(size[0]), height=int(size[1]),
+            document_kind=str(data.get("document_kind", "chapter")),
             background=str(data.get("background", "#ffffff")),
             grid=GridSettings.from_dict(data.get("grid")),
             root_page_ids=[str(item) for item in data.get("root_page_ids", [])],

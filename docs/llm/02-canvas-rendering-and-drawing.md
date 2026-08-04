@@ -40,15 +40,14 @@ Layer world translation is calculated by walking `parent_id` links and summing e
 
 1. Fill the widget outside the document with dark gray.
 2. If no chapter exists, draw the empty-state message.
-3. Use the navigation snapshot fast path during an active touch gesture, if available.
-4. Use the static-background fast path during a raster transform preview, if available.
-5. Set the camera transform and fill the chapter rectangle with its background color.
-6. Clip to the chapter bounds.
-7. Walk root pages in reverse hierarchy order and recursively render them.
-8. Draw the selected raster/vector underlay, if enabled.
-9. Draw the effective grid.
-10. Draw predictive raster ink and the live vector gesture preview.
-11. Draw selection controls, page-gap overlay, and shape/raster creation previews.
+3. Use the static-background fast path during a raster transform preview, if available.
+4. Set the camera transform and fill the chapter rectangle with its background color.
+5. Clip to the chapter bounds.
+6. Walk root pages in reverse hierarchy order and recursively render them.
+7. Draw the selected raster/vector underlay, if enabled.
+8. Draw the effective grid.
+9. Draw predictive raster ink and the live vector gesture preview.
+10. Draw selection controls, page-gap overlay, and shape/raster creation previews.
 12. Remove the chapter clip, reset to widget coordinates, outline the chapter, and draw screen-space tablet/simplify hover overlays.
 
 `render_preview()` uses the same recursive page/layer/object render functions but maps the complete chapter into the small navigator image. It omits editing overlays and live underlay.
@@ -219,6 +218,8 @@ Path signatures round element coordinates to three decimals. Ramp signatures inc
 
 Reversed radial and parent-shape fields create an outward padded boundary image. They are painted before the parent shape so the parent artwork covers their inner edge. During slider/handle drags, `_gradient_preview_active` selects the smaller grid; release clears the render cache for a full-resolution rebuild.
 
+Speed lines use a separate manga-stroke pipeline. Closed contours are sampled at density-derived arc intervals and joined to a point center, the closest compatible custom-center boundary point, or an outward destination. Perpendicular line fields sample the guide and follow its local normal; Parallel fields use signed-distance offset curves and endpoint-oriented ramp travel. Each stroke keeps independent color and thickness coordinates, with close range and deterministic neighbor-smoothed noise moving only the thickness endpoint. Safe width is capped by neighboring stroke separation minus Gap. The rasterizer produces fractional edge coverage, then the shared RGBA LUT compositor applies color and opacity.
+
 ## Text rendering and editing
 
 Text is laid out by `QTextDocument` with a pixel-size `QFont`, absolute letter spacing, plain text, block alignment, and a fixed text width.
@@ -242,7 +243,7 @@ All mouse, tablet, wheel, touch, key, double-click, and IME events enter the can
 
 ## Navigation performance
 
-Touch hardware may report more events than a full recursive render can sustain. The canvas therefore keeps only the newest touch packet and applies it with a zero-delay single-shot timer. At gesture/rebase boundaries it captures the current widget image and camera transform. Intermediate frames map that snapshot under the new camera, then redraw only inexpensive overlays. Gesture end clears the snapshot and resumes full rendering.
+Touch hardware may report more events than a full recursive render can sustain. The canvas therefore keeps only the newest touch packet and applies it with a zero-delay single-shot timer. Each applied packet updates the camera and live-renders the document, avoiding transformed viewport-screenshot boundaries during pan, zoom, and rotation.
 
 ## Rendering invariants and limitations
 

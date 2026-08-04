@@ -38,15 +38,14 @@ creates a hierarchy of:
     ramp editing, translucent ARGB stops, per-series presets, and a built-in
     Primary-to-Secondary preset. Scalar distance fields cached independently
     from ramp colors for interactive editing.
-  - Speed Lines objects: SpeedLinesGradientObject variant of gradients whose
-    color ramp controls line color/opacity while a second greyscale ramp
-    drives thickness. Impact-line parameters (density with auto-thickness
-    scale, gap, close range, randomness distance/scale with neighbor
-    smoothing) plus a deletable, non-movable custom center shape/line that
-    lines converge toward (openness mismatch or Outwards mode ignores it).
-    Line/curve mode adds a draggable side/length gizmo and a Parallel /
-    Perpendicular text-toggle gizmo; color and speed-lines gradients coexist
-    per field type.
+  - Speed Lines objects: SpeedLinesGradientObject variant of gradients that
+    renders discrete tapered manga strokes. An RGBA ramp drives color/opacity;
+    a greyscale ramp drives safe neighbor-capped thickness. Closed fields
+    sample boundary origins and converge on a point/custom boundary or reverse
+    outward. Line/curve mode provides offset-curve Parallel lanes with an
+    endpoint flow gizmo and sampled-normal Perpendicular strokes with a signed
+    reach gizmo. Deterministic neighbor-correlated endpoint variation, custom
+    center openness rules, and color/speed family coexistence are preserved.
   - Drawing selections: rectangle/lasso/stroke selection for raster pixels or
     vector points (Shift adds, Ctrl removes); 8-handle free/uniform transform,
     edge translation, rotation, movable pivot. Shared by object transforms.
@@ -54,7 +53,7 @@ creates a hierarchy of:
 All edits are backed by a full undo/redo command stack (CallbackCommand,
 TilePatchCommand, ObjectPatchCommand). Projects are saved as portable folders
 with atomic, versioned chapter saves and interrupted-write recovery. Schema
-version is currently 13; settings version 11.
+version is currently 14; settings version 11.
 
 Core design principles:
   - Non-destructive: masks, fills, compound shapes, opacity compose without
@@ -146,14 +145,12 @@ Core design principles:
                             unmodified replaces; Select All (Ctrl+A by default);
                             transform with handles, rotation, pivot.
 
-  Gradient Tools          - Contextual ribbon: create Line/Curve, Circle/Ellipse,
-                            or Parent Shape gradients (color or Speed Lines);
-                            ramp stop editor with drag + double-click color
-                            edit; distance/direction/uniform/reverse parameters;
-                            preset management. Speed Lines adds a greyscale
-                            thickness ramp column and an Impact Line Parameters
-                            column (density/gap/close range/randomness sliders,
-                            Custom Center Shape/Line button, Outwards toggle).
+  Gradient Tools          - Contextual ribbon. A selected parent shows compact
+                            field + Add Color Fill/Add Speed Lines actions; a
+                            color gradient shows Field and Color; Speed Lines
+                            shows Field & Direction, Color, Thickness, and a
+                            two-row Impact grid. The selected custom-center
+                            child resolves back to its owner controls.
 
 
 3. COMPLETE SCRIPT-BY-SCRIPT, METHOD-BY-METHOD REFERENCE
@@ -534,8 +531,7 @@ The central interactive canvas - the heart of the application. Mixin
       simplify anchor grid, overlay), fill state, drawing-selection state,
       page creation/gap state, touch state (incl. _touch_pending_points +
       _touch_frame_timer for frame coalescing), brush preset, predictive
-      ink, gradient state (_gradient_preview_active flag), navigation
-      snapshot (_navigation_snapshot QImage + transform), and
+      ink, gradient state (_gradient_preview_active flag), and
       _pending_raster_transform_press for deferred outside-frame drags.
 
     ---- Document & commands ----
@@ -568,15 +564,8 @@ The central interactive canvas - the heart of the application. Mixin
     ---- Rendering ----
     paintEvent - main loop: transform static cache fast path; background;
       camera transform; pages front-to-back; grid; predictive ink; selection;
-      creation preview; chapter outline. Navigation snapshot fast path when
-      _navigation_snapshot_active.
-    _paint_navigation_snapshot(painter) - draws the captured artwork image
-      under the current camera via (current * inverse) transform, then only
-      overlays grid/selection/page-gap/tablet-hover/simplify-hover. Used
-      during touch navigation so intermediate frames skip full rendering.
-    _capture_navigation_snapshot() - grabs the widget once at gesture/rebase
-      boundaries and stores it with its camera transform.
-    _clear_navigation_snapshot() - resets snapshot state.
+      creation preview; chapter outline. Touch navigation uses this same live
+      pipeline after its coalesced camera updates.
     render_preview / _render_layer (recursive, compound pipeline:
       _render_compound_layer_contents / _render_compound_contributor /
       _render_compound_reference_objects) / _render_object.
@@ -596,17 +585,16 @@ The central interactive canvas - the heart of the application. Mixin
       per viewport so Distance drags only redo normalization + ramp lookup.
       _gradient_geometry_cache / _gradient_render_cache invalidated
       independently (geometry vs ramp color changes).
-    Speed-lines rendering: _render_speed_lines_gradient dispatches to numpy
-      band/coverage builders on the shared projection arrays. Parallel line
-      mode offsets the curve family by the signed side gizmo on its side only
-      (k>=0 / k<=0 / straddle at zero); perpendicular mode strokes normal to
-      the curve at density spacing with signed length. Ring modes (radial/
-      parent shape) lay bands at 1/density spacing from the boundary with
-      thickness = greyscale(thickness_ramp(t)) * (spacing - gap); close range
-      + smoothed per-line noise (deterministic zlib-crc32 seed) truncate each
-      line's endpoint; a closed custom center shape projects the convergence
-      target to its boundary (containment cut; openness mismatch ignored);
-      outwards spans the distance parameter and ignores the center.
+    Speed-lines rendering: _render_speed_lines_gradient builds discrete manga
+      strokes. Radial/parent fields sample closed boundaries at arc-length
+      density spacing and target the point center, closest compatible center
+      boundary, or reversed outward destination. Perpendicular line fields
+      sample signed normals; Parallel uses robust signed-distance offset curves
+      and reverse_direction for endpoint travel (explicit lanes handle an open
+      custom center). Color and thickness coordinates are independent; close
+      range plus object-stable neighbor-smoothed noise shifts only thickness
+      endpoints. Neighbor distance minus Gap caps width, fractional coverage
+      antialiases edges, and geometry/color caches remain separate.
 
     ---- Drawing overlays ----
     _draw_grid / _draw_predictive_ink / _draw_selection /
@@ -915,11 +903,11 @@ Contextual gradient creation, ramp editing, and preset controls.
   Class: GradientToolsControls(QWidget)
     Signals: createRequested / speedCreateRequested / objectChanged /
       centerShapeRequested / presetLoadRequested / presetAddRequested /
-      presetSaveRequested / presetRenameRequested / presetRemoveRequested.
+      presetSaveRequested / presetRenameRequested / presetRemoveRequested /
+      contextChanged.
 
-    Create widget: Line/Curve, Circle/Ellipse, Parent Shape, Speed Lines
-      buttons (the Speed Lines button uses the Selected type combo), field
-      type combo, Select Gradient button.
+    Create widget: field-type combo plus Add Color Fill, Add Speed Lines, and
+      Select Existing actions. It is hidden once an effect is selected.
     Type parameters: Follow (parallel/perpendicular), Reverse direction
       (relabeled "Outwards" for speed lines), Uniform checkbox (color
       gradients only), Distance slider + spinbox. The distance slider's
@@ -929,10 +917,9 @@ Contextual gradient creation, ramp editing, and preset controls.
     Ramp editor: GradientRampEditor + add/remove stop buttons (color ramp).
     Thickness Parameters column: second GradientRampEditor + add/remove stops
       bound to thickness_ramp (greyscale drives line thickness).
-    Impact Line Parameters column: density/gap/close range/randomness
-      distance/randomness scale slider+spinbox rows (coalesced undo) and the
-      Custom Center Shape / Line button (centerShapeRequested).
-    Presets: combo + name edit + New/Save/Remove (color ramp only).
+    Impact Line Parameters column: a compact two-row grid of density/gap/close
+      range/randomness distance/randomness scale slider+spinbox cards and the
+      Add/Edit Custom Center button. Presets share one inline Color row.
 
     selected_gradient() / _color_ramp_of() / context_parent_id() /
       matching_gradients().

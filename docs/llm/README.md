@@ -16,7 +16,7 @@ This folder is a source-verified guide to the current `webtoon-maker` codebase. 
 - `lighter-novel/` contains story/planning material and Obsidian workspace files. It is not imported by the editor.
 - `paint/handles.png` is an unreferenced image asset in the current source.
 - `program-map.txt` is a useful historical generated map, but it is not authoritative. Some names and counts in it lag the current source. These documents follow the current code.
-- The current document schema is version 12, editor settings are version 11, and the package reports version `0.1.0`.
+- The current document schema is version 14, editor settings are version 11, and the package reports version `0.1.0`.
 
 ## One-paragraph architecture
 
@@ -33,4 +33,3 @@ Webtoon Maker is a native PySide6 desktop editor for fixed-width, vertically gro
 - **Compound mask**: the Boolean result of a compound layer and contributing descendants.
 - **Interaction frame**: a raster object's editable rectangle; it does not crop or clip stored pixels.
 - **Underlay**: a live editing aid that redraws the selected raster/vector drawing outside its normal mask at reduced opacity. It is not part of preview output.
-

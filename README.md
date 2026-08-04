@@ -10,6 +10,8 @@ workflow.
 ## Current foundation
 
 - Portable series folders and versioned chapter manifests
+- Portable per-series Asset Libraries with fitted rendered thumbnails
+- Cached, closable project tabs for open series and editable assets
 - Growable 1080px-wide chapters
 - Editable Vector Drawing objects with pressure-sensitive cubic strokes and
   drawing-owned Vector Fill children
@@ -27,6 +29,8 @@ workflow.
   culled projective commits
 - Global formatting-only text presets
 - Drag-reorderable layer/object tree
+- Outliner Rename and Copy as Asset context actions
+- Drag-to-place detached assets with a transparent on-canvas preview
 - Named, bounded layers with non-destructive bound translation/editing
 - Rounded layer masks, optional fills/borders, and boundless fill leaves
 - Unified rectangle, circle, and open/closed vector-Bézier Shape paths
@@ -213,6 +217,15 @@ Distance outward. Hidden automatic or manual centers are preserved when
 Uniform is toggled. Line/Curve gradients use the full open-path geometry
 editor—including Vector/Bézier conversion, insertion, deletion, handle
 locking, and roundness—without irrelevant cap or thickness controls.
+
+Speed Lines use the same three field types but render discrete manga strokes
+instead of filled distance bands. Circle/Ellipse and Parent Shape effects
+sample their boundary and taper toward a movable point or compatible custom
+center shape. Line/Curve effects either follow offset copies of the guide or
+project along its normals. Independent RGBA color and greyscale-thickness ramps
+combine with density, gap, close-range, and neighbor-smoothed endpoint
+variation; Outwards reverses closed-field trajectories and ignores the custom
+center.
 
 Gradient ramps support translucent ARGB stops and reusable per-series
 presets. **Primary to Secondary** is a built-in, read-only preset that copies

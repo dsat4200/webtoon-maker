@@ -106,6 +106,38 @@ QTabBar#ribbonTabs::tab:selected {
     color: #ffffff;
     border-bottom-color: #80c8ff;
 }
+QTabBar#projectTabs {
+    background: #18181c;
+    border-bottom: 1px solid #36363d;
+}
+QTabBar#projectTabs::tab {
+    background: #25252b;
+    color: #b8bac2;
+    border-right: 1px solid #383840;
+    padding: 6px 12px;
+    min-width: 110px;
+}
+QTabBar#projectTabs::tab:hover { background: #303037; color: #ffffff; }
+QTabBar#projectTabs::tab:selected {
+    background: #343d48;
+    color: #ffffff;
+    border-bottom: 2px solid #80c8ff;
+}
+QListWidget#assetLibraryGallery {
+    background: #202026;
+    border: none;
+    outline: none;
+}
+QListWidget#assetLibraryGallery::item {
+    border: 1px solid transparent;
+    border-radius: 5px;
+    padding: 3px;
+}
+QListWidget#assetLibraryGallery::item:hover { background: #303037; }
+QListWidget#assetLibraryGallery::item:selected {
+    background: #34495d;
+    border-color: #80c8ff;
+}
 QScrollArea#ribbonPage, QWidget#ribbonPageGroups {
     background: #202026;
     border: none;

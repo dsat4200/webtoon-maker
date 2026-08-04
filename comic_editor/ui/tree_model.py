@@ -50,6 +50,18 @@ class HierarchyModel(QAbstractItemModel):
         if self.chapter is None:
             return
 
+        def build_object(object_id: str, parent: TreeItem) -> TreeItem:
+            object_item = TreeItem("object", object_id, parent)
+            self._items[("object", object_id)] = object_item
+            parent.children.append(object_item)
+            obj = self.chapter.objects[object_id]
+            if isinstance(obj, VectorDrawingObject):
+                for fill in self.chapter.vector_fill_children(obj.object_id):
+                    fill_item = TreeItem("object", fill.object_id, object_item)
+                    self._items[("object", fill.object_id)] = fill_item
+                    object_item.children.append(fill_item)
+            return object_item
+
         def build_layer(layer_id: str, parent: TreeItem) -> TreeItem:
             item = TreeItem("layer", layer_id, parent)
             self._items[("layer", layer_id)] = item
@@ -59,25 +71,19 @@ class HierarchyModel(QAbstractItemModel):
                 if child.kind == "layer":
                     build_layer(child.entity_id, item)
                 else:
-                    object_item = TreeItem("object", child.entity_id, item)
-                    self._items[("object", child.entity_id)] = object_item
-                    item.children.append(object_item)
-                    obj = self.chapter.objects[child.entity_id]
-                    if isinstance(obj, VectorDrawingObject):
-                        for fill in self.chapter.vector_fill_children(
-                            obj.object_id
-                        ):
-                            fill_item = TreeItem(
-                                "object", fill.object_id, object_item
-                            )
-                            self._items[
-                                ("object", fill.object_id)
-                            ] = fill_item
-                            object_item.children.append(fill_item)
+                    build_object(child.entity_id, item)
             return item
 
-        for page_id in self.chapter.root_page_ids:
-            build_layer(page_id, self.root)
+        if self.chapter.document_kind == "asset" and self.chapter.root_page_ids:
+            container = self.chapter.layers[self.chapter.root_page_ids[0]]
+            for child in container.children:
+                if child.kind == "layer":
+                    build_layer(child.entity_id, self.root)
+                else:
+                    build_object(child.entity_id, self.root)
+        else:
+            for page_id in self.chapter.root_page_ids:
+                build_layer(page_id, self.root)
 
     def item_for_index(self, index: QModelIndex) -> TreeItem:
         return index.internalPointer() if index.isValid() else self.root
@@ -136,10 +142,11 @@ class HierarchyModel(QAbstractItemModel):
         )
         if role in (Qt.DisplayRole, Qt.EditRole):
             if index.column() == 0:
-                return (
-                    entity.display_name
-                    if isinstance(entity, TextObject) else entity.name
-                )
+                if isinstance(entity, TextObject):
+                    if role == Qt.EditRole:
+                        return entity.name
+                    return entity.name if entity.custom_name else entity.display_name
+                return entity.name
             if index.column() == 1:
                 if item.kind == "layer":
                     if entity.layer_kind == "fill":
@@ -208,9 +215,11 @@ class HierarchyModel(QAbstractItemModel):
             label = "Toggle visibility"
         elif (
             role == Qt.EditRole and index.column() == 0
-            and not isinstance(entity, TextObject) and str(value).strip()
+            and str(value).strip()
         ):
             entity.name = str(value).strip()
+            if isinstance(entity, TextObject):
+                entity.custom_name = True
             label = "Rename entity"
         else:
             return False
@@ -231,15 +240,16 @@ class HierarchyModel(QAbstractItemModel):
             and item.entity_id not in self.chapter.objects
         ):
             return Qt.NoItemFlags
-        flags = (
-            Qt.ItemIsEnabled | Qt.ItemIsSelectable | Qt.ItemIsDragEnabled
-            | Qt.ItemIsUserCheckable
-        )
+        flags = Qt.ItemIsEnabled | Qt.ItemIsSelectable | Qt.ItemIsUserCheckable
+        if not (
+            self.chapter.document_kind == "asset" and item.parent is self.root
+        ):
+            flags |= Qt.ItemIsDragEnabled
         entity = (
             self.chapter.objects.get(item.entity_id)
             if item.kind == "object" else None
         )
-        if index.column() == 0 and not isinstance(entity, TextObject):
+        if index.column() == 0:
             flags |= Qt.ItemIsEditable
         if (
             item.kind == "layer"

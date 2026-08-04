@@ -11,6 +11,7 @@ The application intentionally does not implement scheduling, reference libraries
 ## Main workspace
 
 - The top project toolbar creates/opens series, saves, undoes/redoes, switches or creates chapters, trims height, toggles fullscreen, edits hotkeys, and opens recent series.
+- A closable project-tab row keeps multiple series and assets open. Switching tabs restores the document, sparse tiles, dirty state, undo/redo, camera, selection, tool, hierarchy expansion, ribbon choice, and render caches without reopening from disk.
 - The left sidebar contains the tool list, expandable Shapes and Drawing Selection groups, add-object actions, navigation/grid toggles, and resizable Picker/Palette color tabs.
 - The ribbon contains Tool Settings and contextual Vector Tools, Raster Object Settings, and Gradient Tools pages.
 - The center contains a narrow whole-chapter navigator and the interactive canvas.
@@ -21,6 +22,9 @@ The application intentionally does not implement scheduling, reference libraries
 ## Project and page workflow
 
 - A **series** is a portable folder. It stores its chapter list, primary/secondary colors, palettes, and gradient ramp presets.
+- Each series also owns an `assets/` library. An asset is a fitted asset document containing one root layer/object, its descendants and owned helper objects, sparse raster tiles, and a rendered square thumbnail.
+- The always-visible **Asset Library** ribbon lists the active series' assets in a horizontal gallery. Double-click edits an asset in its own tab; dragging shows a 70%-opacity preview and creates an independent, freshly-IDed copy only on release.
+- Right-clicking an outliner row offers Rename and Copy as Asset. Asset names are unique within their series and can be renamed from the gallery without changing the stable asset folder ID.
 - A new **chapter** gets one 1080×1080 page, one matching drawing layer, and one empty raster object.
 - Pages are root bounded layers. They may be rectangles, ellipses, or closed custom paths and may be freely positioned or overlap.
 - **Add Page** uses the selected page or selected descendant as an anchor, then asks for a rectangle, circle, or custom closed shape below it. The new page is inserted immediately after the anchor page in hierarchy order.
@@ -126,6 +130,9 @@ The application intentionally does not implement scheduling, reference libraries
 - Gradient ramps contain at least two stable-ID ARGB stops, allow hard transitions at equal positions, support drag/add/remove/double-click color edit, and preserve dormant fields when switching field type.
 - Per-series ramp presets support create/load/save/rename/remove. The built-in **Primary → Secondary** preset is read-only and resolves the current color wells when loaded.
 - Gradient geometry, scalar fields, and ramp-colored images have independent bounded caches. Dragging uses a reduced grid and rebuilds full resolution on release.
+- **Speed Lines** render discrete tapered manga strokes. Closed fields sample their outside boundary and converge on a movable center or compatible custom-center shape; Outwards reverses the trajectories and ignores that center.
+- Line/Curve speed lines either follow offset guide curves toward a selected endpoint or project along signed local normals. Separate RGBA color and greyscale-thickness ramps combine with density, gap, close range, and deterministic neighbor-correlated endpoint variation.
+- Gradient Tools is contextual: creation controls appear for a selected parent, color gradients show Field and Color groups, and speed lines show only Field, Color, Thickness, and compact Impact groups. Selecting a custom-center child retains its owner’s speed-line controls.
 
 ## Color and palette features
 
@@ -152,7 +159,7 @@ The application intentionally does not implement scheduling, reference libraries
 - Mouse wheel scrolls vertically; Ctrl+wheel zooms.
 - The camera transform is centered, rotated, uniformly scaled, then translated to the document center. Camera centers are snapped in device space to reduce blur.
 - **Tablet navigation** enables touch navigation. One finger pans with the finger; two fingers pan, pinch, and twist around a stable centroid.
-- Touch input is coalesced to one application per event-loop turn and uses a captured navigation snapshot during the gesture.
+- Touch input is coalesced to one application per event-loop turn and live-renders the document under the updated camera transform.
 - Stylus events are handled separately from synthesized mouse events. Popup and outliner forwarding allow buttonless stylus taps.
 - The narrow preview provides whole-chapter navigation independently of camera rotation.
 

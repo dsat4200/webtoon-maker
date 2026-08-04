@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import re
 import time
+import math
 from pathlib import Path
 
 from PySide6.QtCore import (
@@ -16,7 +17,7 @@ from PySide6.QtWidgets import (
     QApplication, QCheckBox, QComboBox, QDockWidget, QFileDialog, QHBoxLayout,
     QDialog, QDialogButtonBox, QFormLayout, QHeaderView, QInputDialog, QLabel,
     QLineEdit, QMainWindow, QMenu, QMessageBox, QPlainTextEdit, QPushButton,
-    QScrollArea, QSizePolicy, QSpinBox, QSplitter, QTabWidget, QTextEdit,
+    QScrollArea, QSizePolicy, QSpinBox, QSplitter, QTabBar, QTabWidget, QTextEdit,
     QToolBar, QToolButton, QToolTip, QTreeView, QVBoxLayout, QWidget, QFrame,
 )
 
@@ -27,7 +28,11 @@ from comic_editor.core.models import (
     RasterObject, SpeedLineCenterObject, SpeedLinesGradientObject,
     TextObject, VectorDrawingObject, VectorFillObject,
 )
+from comic_editor.core.assets import (
+    AssetManifest, AssetRepository, entity_visual_bounds, extract_asset,
+)
 from comic_editor.core.persistence import SeriesRepository
+from comic_editor.core.commands import CommandStack
 from comic_editor.core.settings import load_settings, save_settings
 from comic_editor.ui.canvas import ToolKind, create_canvas
 from comic_editor.ui.inspector import ContextInspector
@@ -49,6 +54,8 @@ from comic_editor.ui.tool_ribbon_pages import (
     RasterObjectControls, ToolSettingsControls, VectorToolsControls,
 )
 from comic_editor.ui.tree_model import HierarchyModel
+from comic_editor.ui.asset_library import AssetLibraryWidget
+from comic_editor.ui.sessions import EditorSession, ProjectContext
 
 
 class CollapsibleToolCategory(QWidget):
@@ -150,6 +157,9 @@ class MainWindow(QMainWindow):
         self.repository: SeriesRepository | None = None
         self.series = None
         self.chapter: ChapterDocument | None = None
+        self.sessions: dict[str, EditorSession] = {}
+        self.active_session: EditorSession | None = None
+        self._switching_session = False
         self._dirty = False
         self._last_autosave = 0.0
         self._loading_chapter = False
@@ -330,6 +340,16 @@ class MainWindow(QMainWindow):
         )
         settings_group.add_widget(self.tool_settings_controls)
 
+        self.asset_library_page = self.ribbon.add_page(
+            "asset_library", "Asset Library"
+        )
+        asset_group = self.asset_library_page.add_group(
+            "Series Assets", minimum_width=760
+        )
+        self.asset_library = AssetLibraryWidget(self.ribbon)
+        self.asset_library.setMinimumHeight(108)
+        asset_group.add_widget(self.asset_library)
+
         self.vector_tools_page = self.ribbon.add_page(
             "vector_tools", "Vector Tools", visible=False
         )
@@ -386,42 +406,40 @@ class MainWindow(QMainWindow):
         self.gradient_tools_controls = GradientToolsControls(
             self.canvas, self.ribbon
         )
-        gradient_create_group = self.gradient_tools_page.add_group(
-            "Create Gradient", minimum_width=260
+        self.gradient_create_group = self.gradient_tools_page.add_group(
+            "Create Gradient", minimum_width=420
         )
-        gradient_create_group.add_widget(
+        self.gradient_create_group.add_widget(
             self.gradient_tools_controls.create_widget
         )
-        gradient_parameters_group = self.gradient_tools_page.add_group(
-            "Gradient Parameters", minimum_width=235
+        self.gradient_type_group = self.gradient_tools_page.add_group(
+            "Field & Direction", minimum_width=220
         )
-        gradient_parameters_group.add_widget(
-            self.gradient_tools_controls.parameters_widget
-        )
-        gradient_presets_group = self.gradient_tools_page.add_group(
-            "Gradient Ramp Presets", minimum_width=165
-        )
-        gradient_presets_group.add_widget(
-            self.gradient_tools_controls.presets_widget
-        )
-        gradient_type_group = self.gradient_tools_page.add_group(
-            "Gradient Type Parameters", minimum_width=220
-        )
-        gradient_type_group.add_widget(
+        self.gradient_type_group.add_widget(
             self.gradient_tools_controls.type_parameters_widget
         )
-        gradient_thickness_group = self.gradient_tools_page.add_group(
-            "Thickness Parameters", minimum_width=235
+        self.gradient_parameters_group = self.gradient_tools_page.add_group(
+            "Color Parameters", minimum_width=230
         )
-        gradient_thickness_group.add_widget(
+        self.gradient_parameters_group.add_widget(
+            self.gradient_tools_controls.parameters_widget
+        )
+        self.gradient_thickness_group = self.gradient_tools_page.add_group(
+            "Thickness Parameters", minimum_width=230
+        )
+        self.gradient_thickness_group.add_widget(
             self.gradient_tools_controls.thickness_widget
         )
-        gradient_impact_group = self.gradient_tools_page.add_group(
-            "Impact Line Parameters", minimum_width=235
+        self.gradient_impact_group = self.gradient_tools_page.add_group(
+            "Impact Line Parameters", minimum_width=460
         )
-        gradient_impact_group.add_widget(
+        self.gradient_impact_group.add_widget(
             self.gradient_tools_controls.impact_widget
         )
+        self.gradient_tools_controls.contextChanged.connect(
+            self._update_gradient_group_visibility
+        )
+        self._update_gradient_group_visibility("create")
         self.preview = ChapterPreview(self.canvas)
         canvas_layout.addWidget(self.preview)
         canvas_layout.addWidget(self.canvas, 1)
@@ -457,7 +475,19 @@ class MainWindow(QMainWindow):
         self.workspace_splitter.addWidget(self.ribbon_canvas_splitter)
         self.workspace_splitter.setStretchFactor(0, 0)
         self.workspace_splitter.setStretchFactor(1, 1)
-        self.setCentralWidget(self.workspace_splitter)
+        central = QWidget(self)
+        central_layout = QVBoxLayout(central)
+        central_layout.setContentsMargins(0, 0, 0, 0)
+        central_layout.setSpacing(0)
+        self.project_tabs = QTabBar(central)
+        self.project_tabs.setObjectName("projectTabs")
+        self.project_tabs.setTabsClosable(True)
+        self.project_tabs.setMovable(True)
+        self.project_tabs.setExpanding(False)
+        self.project_tabs.setUsesScrollButtons(True)
+        central_layout.addWidget(self.project_tabs)
+        central_layout.addWidget(self.workspace_splitter, 1)
+        self.setCentralWidget(central)
         self._restore_workspace_layout()
 
         self.hierarchy_dock = QDockWidget("Layers and Objects", self)
@@ -480,6 +510,7 @@ class MainWindow(QMainWindow):
         )
         self.hierarchy_model = HierarchyModel()
         self.tree.setModel(self.hierarchy_model)
+        self.tree.setContextMenuPolicy(Qt.CustomContextMenu)
         self._tablet_outliner_press: dict | None = None
         self._hierarchy_reset_expanded: set[str] = set()
         self._hierarchy_reset_selection: tuple[str, str] = ("", "")
@@ -607,6 +638,8 @@ class MainWindow(QMainWindow):
         save_settings(self.settings)
 
     def _connect(self) -> None:
+        self.project_tabs.currentChanged.connect(self._project_tab_selected)
+        self.project_tabs.tabCloseRequested.connect(self._close_project_tab)
         self.new_series_action.triggered.connect(self._create_series)
         self.open_series_action.triggered.connect(self._open_series_dialog)
         self.save_action.triggered.connect(self.save)
@@ -676,6 +709,11 @@ class MainWindow(QMainWindow):
         )
         self.hierarchy_model.mutationCommitted.connect(self._tree_mutated)
         self.tree.selectionModel().selectionChanged.connect(self._tree_selection_changed)
+        self.tree.customContextMenuRequested.connect(
+            self._show_tree_context_menu
+        )
+        self.asset_library.assetActivated.connect(self._open_asset)
+        self.asset_library.renameRequested.connect(self._rename_asset)
         self.autosave_timer.timeout.connect(self._autosave)
         self.series_preferences_timer.timeout.connect(
             self._flush_series_preferences
@@ -1073,7 +1111,7 @@ class MainWindow(QMainWindow):
         popup = target.window()
         if not (
             isinstance(popup, QMenu)
-            or bool(popup.windowFlags() & Qt.Popup)
+            or popup.windowType() == Qt.Popup
         ):
             return False
         local = QPointF(target.mapFromGlobal(global_position.toPoint()))
@@ -1228,6 +1266,227 @@ class MainWindow(QMainWindow):
         )
         return handled or super().eventFilter(watched, event)
 
+    # ---- project tabs and sessions ------------------------------------
+    @staticmethod
+    def _series_session_key(root: str | Path) -> str:
+        return f"series:{str(Path(root).expanduser().resolve()).casefold()}"
+
+    @staticmethod
+    def _asset_session_key(context: ProjectContext, asset_id: str) -> str:
+        root = str(context.repository.root).casefold()
+        return f"asset:{root}:{asset_id}"
+
+    def _tab_index_for_key(self, key: str) -> int:
+        for index in range(self.project_tabs.count()):
+            if self.project_tabs.tabData(index) == key:
+                return index
+        return -1
+
+    def _refresh_project_tabs(self) -> None:
+        for index in range(self.project_tabs.count()):
+            session = self.sessions.get(str(self.project_tabs.tabData(index)))
+            if session is not None:
+                self.project_tabs.setTabText(index, session.tab_text)
+
+    def _add_editor_session(self, session: EditorSession) -> None:
+        existing = self._tab_index_for_key(session.key)
+        if existing >= 0:
+            self.project_tabs.setCurrentIndex(existing)
+            return
+        self.sessions[session.key] = session
+        index = self.project_tabs.addTab(session.tab_text)
+        self.project_tabs.setTabData(index, session.key)
+        self.project_tabs.setTabToolTip(index, str(session.context.repository.root))
+        self.project_tabs.setCurrentIndex(index)
+        if self.active_session is None:
+            self._activate_editor_session(session)
+
+    def _capture_active_session(self) -> None:
+        session = self.active_session
+        if session is None or self.chapter is None:
+            return
+        state = self.canvas.capture_session_state()
+        if state is not None:
+            session.canvas_state = state
+            session.chapter, session.tiles = state.chapter, state.tiles
+        session.dirty = self._dirty
+        session.last_autosave = self._last_autosave
+        session.expanded_entities = self._expanded_layer_ids()
+        session.manual_ribbon_page = self._manual_ribbon_page
+        self._refresh_project_tabs()
+
+    def _project_tab_selected(self, index: int) -> None:
+        if self._switching_session:
+            return
+        if index < 0:
+            self._clear_active_session()
+            return
+        session = self.sessions.get(str(self.project_tabs.tabData(index)))
+        if session is not None and session is not self.active_session:
+            self._activate_editor_session(session)
+
+    def _activate_editor_session(self, session: EditorSession) -> None:
+        if session is self.active_session:
+            return
+        self._switching_session = True
+        try:
+            self._capture_active_session()
+            self._adopt_series(session.context.repository, session.context.series)
+            self.active_session = session
+            self.repository = session.context.repository
+            self.series = session.context.series
+            self.chapter = session.chapter
+            self._dirty = session.dirty
+            self._last_autosave = session.last_autosave
+            self.canvas.asset_repository = session.context.assets
+            self.asset_library.set_repository(session.context.assets)
+            if session.canvas_state is None:
+                self.canvas.command_stack = CommandStack()
+                self.canvas.set_document(session.chapter, session.tiles)
+                initial_kind, initial_id = (
+                    (session.asset_manifest.root_kind, session.asset_manifest.root_id)
+                    if session.kind == "asset" and session.asset_manifest is not None
+                    else ("", "")
+                )
+                if initial_id:
+                    self.canvas.set_selection(initial_kind, initial_id)
+            else:
+                self.canvas.restore_session_state(session.canvas_state)
+            self.canvas.command_stack.changed_callback = self._command_stack_changed
+            self.chapter = self.canvas.chapter
+            session.chapter, session.tiles = self.chapter, self.canvas.tiles
+            self.hierarchy_model.set_chapter(self.chapter)
+            for entity_id in session.expanded_entities:
+                kind = "layer" if entity_id in self.chapter.layers else "object"
+                index = self.hierarchy_model.index_for_entity(kind, entity_id)
+                if index.isValid():
+                    self.tree.setExpanded(index, True)
+            self._manual_ribbon_page = session.manual_ribbon_page
+            if session.kind == "asset":
+                self.chapter_combo.blockSignals(True)
+                self.chapter_combo.clear()
+                self.chapter_combo.addItem(f"Asset: {session.name}", "")
+                self.chapter_combo.setEnabled(False)
+            else:
+                self.chapter_combo.setEnabled(True)
+                self._sync_chapter_combo()
+            self.setWindowTitle(f"{session.name} — Vertical Comic Editor")
+            self.preview.invalidate_all()
+            self.inspector.refresh()
+            self.layer_settings.refresh()
+            self._sync_contextual_ribbon()
+            self._refresh_actions()
+            self._refresh_project_tabs()
+            self.statusBar().showMessage(
+                f"{session.name} — {self.chapter.width} × {self.chapter.height}px"
+            )
+        finally:
+            self._switching_session = False
+
+    def _clear_active_session(self) -> None:
+        if self.project_tabs.count() > 0:
+            return
+        self.active_session = None
+        self.repository = None
+        self.series = None
+        self.chapter = None
+        self._dirty = False
+        self.canvas.asset_repository = None
+        self.canvas.clear_document()
+        self.hierarchy_model.set_chapter(None)
+        self.asset_library.set_repository(None)
+        self.chapter_combo.clear()
+        self.chapter_combo.setEnabled(False)
+        self.setWindowTitle("Vertical Comic Editor")
+        self._refresh_actions()
+
+    def _save_editor_session(self, session: EditorSession) -> bool:
+        if session is self.active_session:
+            self._capture_active_session()
+        try:
+            if session.kind == "series":
+                session.context.repository.save_chapter(
+                    session.chapter, session.tiles
+                )
+                for reference in session.context.series.chapters:
+                    if reference.chapter_id == session.chapter.chapter_id:
+                        reference.name = session.chapter.name
+                session.context.repository.save_series(session.context.series)
+            else:
+                manifest = session.asset_manifest
+                if manifest is None:
+                    raise ValueError("Asset session has no manifest")
+                manifest.document = session.chapter
+                bounds = entity_visual_bounds(
+                    session.chapter, session.tiles,
+                    manifest.root_kind, manifest.root_id,
+                )
+                manifest.visual_bounds = (
+                    bounds.x(), bounds.y(), bounds.width(), bounds.height()
+                )
+                session.chapter.width = max(
+                    session.chapter.width,
+                    math.ceil(bounds.right() + 64),
+                )
+                session.chapter.height = max(
+                    session.chapter.height,
+                    math.ceil(bounds.bottom() + 64),
+                )
+                container = session.chapter.layers[
+                    session.chapter.root_page_ids[0]
+                ]
+                container.bound = BoundGeometry.rectangle(
+                    0, 0, session.chapter.width, session.chapter.height
+                )
+                thumbnail = self.canvas.render_asset_thumbnail(
+                    manifest, session.tiles
+                )
+                session.context.assets.save(
+                    manifest, session.tiles, thumbnail
+                )
+        except (OSError, ValueError) as error:
+            QMessageBox.critical(self, "Save failed", str(error))
+            return False
+        session.dirty = False
+        if session is self.active_session:
+            self._dirty = False
+            self.autosave_timer.stop()
+        self.asset_library.refresh()
+        self._refresh_project_tabs()
+        self.statusBar().showMessage("Saved", 3000)
+        self._refresh_actions()
+        return True
+
+    def _close_project_tab(self, index: int) -> None:
+        session = self.sessions.get(str(self.project_tabs.tabData(index)))
+        if session is None:
+            return
+        if session is self.active_session:
+            self._capture_active_session()
+        if session.dirty:
+            answer = QMessageBox.question(
+                self, "Unsaved changes",
+                f"Save {session.name} before closing?",
+                QMessageBox.Save | QMessageBox.Discard | QMessageBox.Cancel,
+                QMessageBox.Save,
+            )
+            if answer == QMessageBox.Cancel:
+                return
+            if answer == QMessageBox.Save and not self._save_editor_session(session):
+                return
+        was_active = session is self.active_session
+        self.sessions.pop(session.key, None)
+        if was_active:
+            self.active_session = None
+        self.project_tabs.removeTab(index)
+        if self.project_tabs.count() == 0:
+            self._clear_active_session()
+        elif was_active:
+            current = self.project_tabs.currentIndex()
+            next_session = self.sessions.get(str(self.project_tabs.tabData(current)))
+            if next_session is not None:
+                self._activate_editor_session(next_session)
+
     # ---- series and chapters ------------------------------------------
     @staticmethod
     def _folder_name(name: str) -> str:
@@ -1249,8 +1508,11 @@ class MainWindow(QMainWindow):
         except (OSError, ValueError) as error:
             QMessageBox.critical(self, "Unable to create series", str(error))
             return
-        self._adopt_series(repository, series)
-        self._set_chapter(chapter, tiles)
+        context = ProjectContext.create(repository, series)
+        self._add_editor_session(EditorSession(
+            key=self._series_session_key(root), kind="series",
+            context=context, chapter=chapter, tiles=tiles,
+        ))
         self._remember_series(root)
 
     def _open_series_dialog(self) -> None:
@@ -1259,8 +1521,11 @@ class MainWindow(QMainWindow):
             self.open_series(root)
 
     def open_series(self, root: str | Path) -> bool:
-        if not self._confirm_discard_or_save():
-            return False
+        key = self._series_session_key(root)
+        existing = self._tab_index_for_key(key)
+        if existing >= 0:
+            self.project_tabs.setCurrentIndex(existing)
+            return True
         try:
             repository = SeriesRepository(root)
             series = repository.load_series(
@@ -1269,10 +1534,28 @@ class MainWindow(QMainWindow):
         except (OSError, ValueError) as error:
             QMessageBox.critical(self, "Unable to open series", str(error))
             return False
-        self._adopt_series(repository, series)
         self._remember_series(repository.root)
-        if series.chapters:
-            self._load_chapter(series.chapters[0].chapter_id)
+        if not series.chapters:
+            QMessageBox.warning(self, "Unable to open series", "The series has no chapters")
+            return False
+        chapter_id = series.chapters[0].chapter_id
+        recover = False
+        if repository.has_recovery(chapter_id):
+            recover = QMessageBox.question(
+                self, "Recover autosave",
+                "A newer autosave exists for this chapter. Recover it?",
+            ) == QMessageBox.Yes
+        try:
+            chapter, tiles = repository.load_chapter(chapter_id, recover=recover)
+        except (OSError, ValueError) as error:
+            QMessageBox.critical(self, "Unable to open chapter", str(error))
+            return False
+        context = ProjectContext.create(repository, series)
+        session = EditorSession(
+            key=key, kind="series", context=context,
+            chapter=chapter, tiles=tiles, dirty=recover,
+        )
+        self._add_editor_session(session)
         return True
 
     def _open_recent(self, index: int) -> None:
@@ -1292,11 +1575,19 @@ class MainWindow(QMainWindow):
             self.chapter_combo.addItem(reference.name, reference.chapter_id)
         self.chapter_combo.blockSignals(False)
         self._sync_series_color_ui()
+        if self.active_session is None:
+            assets = AssetRepository(repository.root)
+            self.canvas.asset_repository = assets
+            self.asset_library.set_repository(assets)
         self.setWindowTitle(f"{series.name} — Vertical Comic Editor")
         self._refresh_actions()
 
     def _new_chapter(self) -> None:
-        if self.repository is None or self.series is None:
+        if (
+            self.repository is None or self.series is None
+            or self.active_session is not None
+            and self.active_session.kind != "series"
+        ):
             return
         if not self._save_if_dirty():
             return
@@ -1316,7 +1607,11 @@ class MainWindow(QMainWindow):
         self._set_chapter(chapter, tiles)
 
     def _chapter_selected(self, index: int) -> None:
-        if self._loading_chapter or index < 0:
+        if (
+            self._loading_chapter or index < 0
+            or self.active_session is not None
+            and self.active_session.kind != "series"
+        ):
             return
         chapter_id = self.chapter_combo.itemData(index)
         if self.chapter and chapter_id == self.chapter.chapter_id:
@@ -1347,8 +1642,14 @@ class MainWindow(QMainWindow):
     def _set_chapter(self, chapter, tiles) -> None:
         self.chapter = chapter
         self.canvas.set_document(chapter, tiles)
+        if self.active_session is not None:
+            self.active_session.chapter = chapter
+            self.active_session.tiles = tiles
+            self.active_session.canvas_state = None
         self.hierarchy_model.set_chapter(chapter)
         self._dirty = False
+        if self.active_session is not None:
+            self.active_session.dirty = False
         self._last_autosave = 0
         self._sync_chapter_combo()
         initial_object = next(
@@ -1394,6 +1695,12 @@ class MainWindow(QMainWindow):
             layer = self.chapter.layers.get(obj.parent_layer_id) if obj else None
         else:
             layer = None
+        if (
+            layer is not None
+            and self.chapter.document_kind == "asset"
+            and layer.layer_id in self.chapter.root_page_ids
+        ):
+            return None
         if (
             layer and layer.layer_kind != "fill"
             and (allow_page or not layer.is_page)
@@ -1870,6 +2177,14 @@ class MainWindow(QMainWindow):
     def _delete_selected(self) -> None:
         if self.chapter is None or not self.canvas.selected_id:
             return
+        if (
+            self.active_session is not None
+            and self.active_session.kind == "asset"
+            and self.active_session.asset_manifest is not None
+            and self.canvas.selected_id == self.active_session.asset_manifest.root_id
+        ):
+            self.statusBar().showMessage("The asset root cannot be deleted", 4000)
+            return
         if QMessageBox.question(
             self, "Delete selection",
             "Delete the selected entity and all of its descendants?",
@@ -2123,6 +2438,17 @@ class MainWindow(QMainWindow):
         finally:
             self._programmatic_ribbon_selection -= 1
 
+    def _update_gradient_group_visibility(self, context: str) -> None:
+        """Show only the controls relevant to the current gradient context."""
+        creating = context == "create"
+        editing = context in {"color", "speed"}
+        speed = context == "speed"
+        self.gradient_create_group.setVisible(creating)
+        self.gradient_type_group.setVisible(editing)
+        self.gradient_parameters_group.setVisible(editing)
+        self.gradient_thickness_group.setVisible(speed)
+        self.gradient_impact_group.setVisible(speed)
+
     def _sync_contextual_ribbon(self) -> None:
         if not hasattr(self, "ribbon"):
             return
@@ -2140,7 +2466,8 @@ class MainWindow(QMainWindow):
             selected_object, (VectorDrawingObject, VectorFillObject)
         )
         raster_active = isinstance(selected_object, RasterObject)
-        gradient_selected = isinstance(selected_object, GradientObject)
+        selected_gradient = self.gradient_tools_controls.selected_gradient()
+        gradient_selected = selected_gradient is not None
         gradient_parent_id = self._gradient_context_parent_id()
         gradient_active = bool(gradient_parent_id)
         entering = active and not self._vector_ribbon_context
@@ -2148,7 +2475,7 @@ class MainWindow(QMainWindow):
             raster_active and not self._raster_ribbon_context
         )
         selected_gradient_id = (
-            selected_object.object_id if gradient_selected else ""
+            selected_gradient.object_id if gradient_selected else ""
         )
         entering_gradient = bool(
             selected_gradient_id
@@ -2230,6 +2557,126 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage(
                 "No vector strokes matched the current selection", 3000
             )
+
+    # ---- asset library -------------------------------------------------
+    def _current_project_context(self) -> ProjectContext | None:
+        if self.active_session is not None:
+            return self.active_session.context
+        if self.repository is not None and self.series is not None:
+            return ProjectContext.create(self.repository, self.series)
+        return None
+
+    def _show_tree_context_menu(self, point) -> None:
+        index = self.tree.indexAt(point)
+        if not index.isValid() or self.chapter is None:
+            return
+        index = index.siblingAtColumn(0)
+        self.tree.setCurrentIndex(index)
+        item = self.hierarchy_model.item_for_index(index)
+        self.canvas.set_selection(item.kind, item.entity_id, activate_default_tool=True)
+        menu = QMenu(self)
+        rename = menu.addAction("Rename")
+        copy_asset = menu.addAction("Copy as Asset")
+        copy_asset.setEnabled(self._current_project_context() is not None)
+        selected = menu.exec(self.tree.viewport().mapToGlobal(point))
+        if selected is rename:
+            self.tree.edit(index)
+        elif selected is copy_asset:
+            self._copy_selected_as_asset(item.kind, item.entity_id)
+
+    def _copy_selected_as_asset(self, kind: str, entity_id: str) -> None:
+        context = self._current_project_context()
+        if context is None or self.chapter is None:
+            return
+        entity = (
+            self.chapter.layers.get(entity_id)
+            if kind == "layer" else self.chapter.objects.get(entity_id)
+        )
+        if entity is None:
+            return
+        default_name = getattr(entity, "name", "Asset")
+        name, accepted = QInputDialog.getText(
+            self, "Copy as Asset", "Asset name", text=default_name
+        )
+        if not accepted or not name.strip():
+            return
+        try:
+            manifest, tiles = extract_asset(
+                self.chapter, self.canvas.tiles, kind, entity_id, name
+            )
+            thumbnail = self.canvas.render_asset_thumbnail(manifest, tiles)
+            context.assets.create(manifest, tiles, thumbnail)
+        except (OSError, KeyError, ValueError) as error:
+            QMessageBox.warning(self, "Unable to create asset", str(error))
+            return
+        self.asset_library.refresh()
+        self.ribbon.select_page("asset_library")
+        self.statusBar().showMessage(f"Created asset {manifest.name}", 4000)
+
+    def _open_asset(self, asset_id: str) -> None:
+        context = self._current_project_context()
+        if context is None:
+            return
+        key = self._asset_session_key(context, asset_id)
+        existing = self._tab_index_for_key(key)
+        if existing >= 0:
+            self.project_tabs.setCurrentIndex(existing)
+            return
+        recover = False
+        if context.assets.has_recovery(asset_id):
+            recover = QMessageBox.question(
+                self, "Recover autosave",
+                "A newer autosave exists for this asset. Recover it?",
+            ) == QMessageBox.Yes
+        try:
+            manifest, tiles = context.assets.load(asset_id, recover=recover)
+        except (OSError, ValueError, KeyError) as error:
+            QMessageBox.critical(self, "Unable to open asset", str(error))
+            return
+        self._add_editor_session(EditorSession(
+            key=key, kind="asset", context=context,
+            chapter=manifest.document, tiles=tiles,
+            asset_manifest=manifest, dirty=recover,
+        ))
+
+    def _rename_asset(self, asset_id: str) -> None:
+        context = self._current_project_context()
+        if context is None:
+            return
+        manifest = next((
+            asset for asset in context.assets.list_assets()
+            if asset.asset_id == asset_id
+        ), None)
+        if manifest is None:
+            return
+        name, accepted = QInputDialog.getText(
+            self, "Rename Asset", "Asset name", text=manifest.name
+        )
+        if not accepted or not name.strip() or name.strip() == manifest.name:
+            return
+        try:
+            renamed = context.assets.rename(asset_id, name)
+        except (OSError, ValueError) as error:
+            QMessageBox.warning(self, "Unable to rename asset", str(error))
+            return
+        for session in self.sessions.values():
+            if (
+                session.kind == "asset"
+                and session.context.repository.root == context.repository.root
+                and session.asset_manifest is not None
+                and session.asset_manifest.asset_id == asset_id
+            ):
+                session.asset_manifest.name = renamed.name
+        if (
+            self.active_session is not None
+            and self.active_session.kind == "asset"
+            and self.active_session.asset_manifest is not None
+            and self.active_session.asset_manifest.asset_id == asset_id
+        ):
+            self.chapter_combo.setItemText(0, f"Asset: {renamed.name}")
+            self.setWindowTitle(f"{renamed.name} — Vertical Comic Editor")
+        self.asset_library.refresh()
+        self._refresh_project_tabs()
 
     # ---- selection and model synchronization --------------------------
     def _tree_selection_changed(self, selected: QItemSelection, deselected) -> None:
@@ -2354,6 +2801,11 @@ class MainWindow(QMainWindow):
 
     def _chapter_replaced(self, chapter: ChapterDocument) -> None:
         self.chapter = chapter
+        if self.active_session is not None:
+            self.active_session.chapter = chapter
+            self.active_session.tiles = self.canvas.tiles
+            if self.active_session.asset_manifest is not None:
+                self.active_session.asset_manifest.document = chapter
         self._refresh_hierarchy()
         self.inspector.refresh()
         self.layer_settings.refresh()
@@ -2824,7 +3276,10 @@ class MainWindow(QMainWindow):
         if self.chapter is None:
             return
         self._dirty = True
+        if self.active_session is not None:
+            self.active_session.dirty = True
         self.autosave_timer.start(2000)
+        self._refresh_project_tabs()
         self._refresh_actions()
         self.inspector.reposition()
 
@@ -2833,6 +3288,8 @@ class MainWindow(QMainWindow):
         self._refresh_actions()
 
     def save(self) -> bool:
+        if self.active_session is not None:
+            return self._save_editor_session(self.active_session)
         if self.repository is None or self.chapter is None:
             return False
         try:
@@ -2851,6 +3308,43 @@ class MainWindow(QMainWindow):
         return True
 
     def _autosave(self) -> None:
+        if self.sessions:
+            now = time.monotonic()
+            deferred: list[float] = []
+            saved = False
+            for session in self.sessions.values():
+                if not session.dirty:
+                    continue
+                elapsed = now - session.last_autosave
+                if session.last_autosave and elapsed < 30:
+                    deferred.append(30 - elapsed)
+                    continue
+                try:
+                    if session.kind == "asset" and session.asset_manifest is not None:
+                        session.asset_manifest.document = session.chapter
+                        session.context.assets.save(
+                            session.asset_manifest, session.tiles,
+                            autosave=True,
+                        )
+                    else:
+                        session.context.repository.save_chapter(
+                            session.chapter, session.tiles, autosave=True
+                        )
+                    session.last_autosave = now
+                    saved = True
+                except (OSError, ValueError) as error:
+                    self.statusBar().showMessage(
+                        f"Autosave failed for {session.name}: {error}", 7000
+                    )
+            if self.active_session is not None:
+                self._last_autosave = self.active_session.last_autosave
+            if deferred:
+                self.autosave_timer.start(
+                    max(1, round(min(deferred) * 1000))
+                )
+            if saved:
+                self.statusBar().showMessage("Recovery autosave updated", 2000)
+            return
         if not self._dirty or self.repository is None or self.chapter is None:
             return
         elapsed = time.monotonic() - self._last_autosave
@@ -2858,8 +3352,23 @@ class MainWindow(QMainWindow):
             self.autosave_timer.start(round((30 - elapsed) * 1000))
             return
         try:
-            self.repository.save_chapter(self.chapter, self.canvas.tiles, autosave=True)
+            if (
+                self.active_session is not None
+                and self.active_session.kind == "asset"
+                and self.active_session.asset_manifest is not None
+            ):
+                self.active_session.asset_manifest.document = self.chapter
+                self.active_session.context.assets.save(
+                    self.active_session.asset_manifest,
+                    self.canvas.tiles, autosave=True,
+                )
+            else:
+                self.repository.save_chapter(
+                    self.chapter, self.canvas.tiles, autosave=True
+                )
             self._last_autosave = time.monotonic()
+            if self.active_session is not None:
+                self.active_session.last_autosave = self._last_autosave
             self.statusBar().showMessage("Recovery autosave updated", 2000)
         except (OSError, ValueError) as error:
             self.statusBar().showMessage(f"Autosave failed: {error}", 7000)
@@ -2868,6 +3377,7 @@ class MainWindow(QMainWindow):
         self.settings.tablet_mode = self.tablet_mode.isChecked()
         self.settings.snap_to_grid = self.snap_grid.isChecked()
         save_settings(self.settings)
+        self.canvas.configure_tablet_navigation()
         self.canvas.update()
 
     def _ribbon_settings_changed(self) -> None:
@@ -3050,13 +3560,16 @@ class MainWindow(QMainWindow):
 
     def _refresh_actions(self) -> None:
         active = self.chapter is not None
+        series_active = active and (
+            self.active_session is None or self.active_session.kind == "series"
+        )
         self.save_action.setEnabled(active and self._dirty)
-        self.new_chapter_action.setEnabled(self.series is not None)
-        self.trim_action.setEnabled(active)
+        self.new_chapter_action.setEnabled(series_active and self.series is not None)
+        self.trim_action.setEnabled(series_active)
+        self.add_page_button.setEnabled(series_active)
         self.undo_action.setEnabled(self.canvas.command_stack.can_undo)
         self.redo_action.setEnabled(self.canvas.command_stack.can_redo)
         self.delete_button.setEnabled(active and bool(self.canvas.selected_id))
-        self.add_page_button.setEnabled(active)
         self.add_layer_button.setEnabled(active)
         self.add_raster_button.setEnabled(active)
         self.add_vector_button.setEnabled(active)
@@ -3068,7 +3581,24 @@ class MainWindow(QMainWindow):
         self.showNormal() if self.isFullScreen() else self.showFullScreen()
 
     def closeEvent(self, event: QCloseEvent) -> None:  # noqa: N802
-        if not self._confirm_discard_or_save():
+        if self.sessions:
+            self._capture_active_session()
+            for session in list(self.sessions.values()):
+                if not session.dirty:
+                    continue
+                answer = QMessageBox.question(
+                    self, "Unsaved changes",
+                    f"Save {session.name} before exiting?",
+                    QMessageBox.Save | QMessageBox.Discard | QMessageBox.Cancel,
+                    QMessageBox.Save,
+                )
+                if answer == QMessageBox.Cancel:
+                    event.ignore()
+                    return
+                if answer == QMessageBox.Save and not self._save_editor_session(session):
+                    event.ignore()
+                    return
+        elif not self._confirm_discard_or_save():
             event.ignore()
             return
         self._flush_series_preferences()
