@@ -345,7 +345,7 @@ class ContextInspector(QFrame):
             return
         self._updating = True
         entity = chapter.objects[self.canvas.selected_id]
-        if isinstance(entity, (RasterObject, GradientObject)):
+        if isinstance(entity, (RasterObject, GradientObject, TextObject)):
             self._updating = False
             self.hide()
             return

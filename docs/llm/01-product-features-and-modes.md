@@ -13,10 +13,10 @@ The application intentionally does not implement scheduling, reference libraries
 - The top project toolbar creates/opens series, saves, undoes/redoes, switches or creates chapters, trims height, toggles fullscreen, edits hotkeys, and opens recent series.
 - A closable project-tab row keeps multiple series and assets open. Switching tabs restores the document, sparse tiles, dirty state, undo/redo, camera, selection, tool, hierarchy expansion, ribbon choice, and render caches without reopening from disk.
 - The left sidebar contains the tool list, expandable Shapes and Drawing Selection groups, add-object actions, navigation/grid toggles, and resizable Picker/Palette color tabs.
-- The ribbon contains Tool Settings and contextual Vector Tools, Raster Object Settings, and Gradient Tools pages.
+- The ribbon contains Tool Settings and contextual Vector Tools, Raster Object Settings, and Gradient Tools pages. Selecting text opens Tool Settings and replaces its ordinary tool group with Object/Presets, Typography, and Layout groups.
 - The center contains a narrow whole-chapter navigator and the interactive canvas.
 - The right dock contains layer settings, the drag-reorderable hierarchy tree, page/layer creation, and deletion.
-- A compact floating inspector follows selected non-raster/non-gradient objects. Raster and gradient properties live in their ribbon pages.
+- A compact floating inspector follows eligible vector/fill/shape selections. Text, Raster, and Gradient properties live in ribbon controls instead.
 - Three splitter sizes — sidebar/workspace, tools/colors, and ribbon/canvas — persist across restarts.
 
 ## Project and page workflow
@@ -114,9 +114,12 @@ The application intentionally does not implement scheduling, reference libraries
 - Text selection/caret drawing, drag selection, clipboard operations, keyboard editing, and IME input are implemented on the canvas.
 - One Text Edit session has its own local history and commits as one document-level undo command.
 - The outliner label is derived from the first 16 normalized characters of content and is not separately renamed.
-- Text presets store formatting only: font family, pixel size, bold, italic, kerning, layout mode, 3×3 alignment, and margin.
+- Text Tool Settings expose presets, font family, optional per-family dropdown previews, integer pixel size, bold/italic, kerning, visibility, opacity/lock, layout mode, 3×3 alignment, margin, geometry reference, and free/uniform transform mode. Layout- and compound-specific controls appear only when applicable.
+- Text presets store formatting only: font family, integer pixel size, bold, italic, kerning, layout mode, 3×3 alignment, and margin. Preset sizes are normalized to 6–250.
+- In Text Edit, the selected text alone receives an on-canvas `− size + B I` strip. Its size field commits on Enter/focus loss and cancels on Escape. Two orange circles on the right edge scrub size (10–100, integer) and kerning (1.0–10.0, tenths) at one step per four screen pixels; a drag becomes one undo command.
 - **Strict** layout wraps and clips text to the selected direct or compound shape bounds with a uniform margin. Edge-midpoint dragging edits the margin.
 - **Free** layout uses a four-point projective quad. It supports the shared eight-handle transform, rotation, pivot, and 3×3 alignment within its local transformed rectangle.
+- A free-text drag caches the scene without the selection and rasterizes the selected text once at device-aware resolution. Pointer moves reproject that image through the live quad; commit/cancel returns to normal high-quality text layout.
 - Double-clicking a transformed free text object re-enters Text Edit at the clicked position.
 
 ## Gradient features
@@ -230,6 +233,7 @@ These are not separate `ToolKind` values but materially change behavior.
 - S: Object Select
 - T: Transform
 - B: Shape Edit
+- Delete: Delete Selected
 - Ctrl+A: Select All
 - Ctrl+S: Save
 - Ctrl+Z: Undo
@@ -238,4 +242,4 @@ These are not separate `ToolKind` values but materially change behavior.
 - Alt+G: Toggle Grid
 - Alt+Return: Fullscreen (installed directly by the main window)
 
-Vector Redraw, Connect, Simplify, the three drawing-selection tools, and Insert Page Gap have no default chord. The hotkey dialog supports single simultaneous chords, modifier-only chords, duplicate validation, clearing, and optional Hold behavior for tools.
+Vector Redraw, Connect, Simplify, the three drawing-selection tools, and Insert Page Gap have no default chord. The hotkey dialog supports single simultaneous chords, modifier-only chords, duplicate validation, clearing, and optional Hold behavior for tools. Delete Selected yields Delete to focused editors, active canvas text editing, and shape/gradient point editing.

@@ -1444,6 +1444,6 @@ def test_bound_edit_hotkey_migrates_to_shape_edit(monkeypatch, tmp_path):
     }), encoding="utf-8")
     monkeypatch.setattr(settings_module, "settings_path", lambda: path)
     loaded = load_settings()
-    assert loaded.settings_version == 11
+    assert loaded.settings_version == 12
     assert loaded.hotkeys["shape_edit"] == "Ctrl+B"
     assert "bound_edit" not in loaded.hotkeys

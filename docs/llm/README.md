@@ -16,7 +16,7 @@ This folder is a source-verified guide to the current `webtoon-maker` codebase. 
 - `lighter-novel/` contains story/planning material and Obsidian workspace files. It is not imported by the editor.
 - `paint/handles.png` is an unreferenced image asset in the current source.
 - `program-map.txt` is a useful historical generated map, but it is not authoritative. Some names and counts in it lag the current source. These documents follow the current code.
-- The current document schema is version 14, editor settings are version 11, and the package reports version `0.1.0`.
+- The current document schema is version 14, editor settings are version 12, and the package reports version `0.1.0`.
 
 ## One-paragraph architecture
 

@@ -30,6 +30,7 @@ LABELS = {
     "reset_view": "Reset View",
     "toggle_grid": "Toggle Grid",
     "select_all": "Select All Drawing",
+    "delete_selected": "Delete Selected",
 }
 
 

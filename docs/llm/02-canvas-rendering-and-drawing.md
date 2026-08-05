@@ -229,6 +229,9 @@ Text is laid out by `QTextDocument` with a pixel-size `QFont`, absolute letter s
 - Selection highlighting uses `QAbstractTextDocumentLayout.PaintContext`. The caret comes from the active block layout's cursor position.
 - Canvas hit testing inversely maps a click into text layout coordinates and asks the document layout for a text position.
 - Keyboard, clipboard, and IME changes update the live object. A local text history handles in-session undo; the entire session becomes one chapter command on commit.
+- Text-only canvas controls are derived from the current selection and exist only in Text Edit. The overlay edits integer size and bold/italic; two screen-space right-edge handles scrub snapped size and kerning from their drag-start values and coalesce each drag into one chapter command.
+- Before any ribbon, gizmo, or transform edit, an active typing transaction is committed so document undo order matches user action order.
+- A free-text transform captures a static viewport without the selected object and rasterizes that object once into a device/zoom-aware transparent image. Each move projectively maps the cached image into the preview quad and derives selection controls from that quad; release or Escape clears both caches and restores normal `QTextDocument` rendering.
 
 ## Hit testing and tool input
 

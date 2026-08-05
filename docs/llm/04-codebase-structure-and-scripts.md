@@ -210,11 +210,11 @@ Changes here should retain the dependency-light design and be covered by `test_v
 The application shell and workflow coordinator.
 
 - Defines reusable collapsible and scrollable left-tool containers.
-- Builds the project toolbar, tool sidebar, Shapes/Drawing Selection groups, colors, contextual ribbon pages, canvas/navigator, right hierarchy dock, layer settings, floating inspector, timers, and persisted splitters.
+- Builds the project toolbar, tool sidebar, Shapes/Drawing Selection groups, colors, contextual ribbon pages (including text-only Tool Settings groups), canvas/navigator, right hierarchy dock, layer settings, floating inspector, timers, and persisted splitters.
 - Opens/creates series and chapters, prompts for autosave recovery, creates/deletes/reorders entities, and orchestrates transactional page insertion.
 - Manages cached, closable series/asset tabs and the per-series Asset Library workflows.
 - Connects canvas/model signals to the outliner, inspectors, status bar, dirty state, and contextual ribbon routing.
-- Implements the global chord/hold hotkey event filter, prefix timeout, text-edit suppression, and stylus forwarding to popups/outliner.
+- Implements the global chord/hold hotkey event filter, prefix timeout, Delete Selected routing/editor suppression, and stylus forwarding to popups/outliner.
 - Owns per-series color/palette/gradient-preset CRUD and debounce saves.
 - Owns manual save, recovery autosave, recent series, brush-size/preset dialogs, settings writes, fullscreen, and close confirmation.
 
@@ -228,7 +228,7 @@ The largest and most central runtime script.
 - Recursively renders layers, masks, objects, vector strokes/fills, gradients, sparse raster tiles, and text.
 - Draws grids, selections, transform/shape/gradient handles, hover indicators, creation previews, and page-gap UI.
 - Implements hit testing and all mouse, tablet, touch, key, wheel, IME, and navigation behavior.
-- Implements page creation/gutters, drawing selections/transforms, vector pencil/eraser/redraw/connect/simplify/fill, shape creation/edit/flatten, raster creation/strokes/transforms, and text editing.
+- Implements page creation/gutters, drawing selections/transforms, vector pencil/eraser/redraw/connect/simplify/fill, shape creation/edit/flatten, raster creation/strokes/transforms, text editing, selection-scoped typography gizmos, and cached free-text transform previews.
 - Provides software and OpenGL-backed widget classes plus the OpenGL probe/factory.
 
 See the dedicated canvas document for the rendering pipeline.
@@ -264,10 +264,10 @@ Maps user-visible action names to hotkey keys, creates one capture editor per ac
 
 ### `comic_editor/ui/inspector.py`
 
-The floating contextual inspector for selected text, vector, fill, and eligible shape-linked properties. Raster and Gradient objects are intentionally handled by ribbon pages.
+The floating contextual inspector for vector, fill, and eligible shape-linked properties. Its legacy text panel remains available internally for compatibility, but selected text suppresses the popup and uses Tool Settings.
 
 - Edits name where permitted, visibility, opacity lock/value, mask escape, underlay, and direct/compound geometry reference.
-- Provides text font/style/kerning/layout/alignment/margin and text-preset CRUD.
+- Retains legacy text font/style/kerning/layout/alignment/margin and preset handlers; the active text UI is `TextObjectControls` in `tool_ribbon_pages.py`.
 - Provides transform mode and legacy raster-tool control compatibility.
 - Coalesces underlay slider drag into one undo command.
 - Repositions above or below the current selection in screen space.
@@ -294,11 +294,12 @@ Generic ribbon primitives: titled groups, horizontally scrolling pages, and a ta
 
 ### `comic_editor/ui/tool_ribbon_pages.py`
 
-Defines three contextual ribbon control owners.
+Defines four contextual ribbon control owners.
 
 - `ToolSettingsControls`: Pencil preset/size, Eraser size/shape/vector mode, Fill tracing/area/mode settings, and drawing-selection transform mode.
 - `VectorToolsControls`: free/uniform transform mode; thickness/opacity Redraw parameter, interaction, operation, amount and pressure maximum; Connect; and Simplify amount/tool/apply.
 - `RasterObjectControls`: Raster name, visibility, opacity lock/value, mask escape, underlay, geometry reference, and transform mode, with coalesced slider changes.
+- `TextObjectControls`: selected-text preset CRUD, visibility/opacity, font preview mode, integer size, bold/italic, manual kerning, strict/free layout, alignment, margin, geometry reference, and transform mode.
 
 ### `comic_editor/ui/tree_model.py`
 
@@ -316,6 +317,10 @@ Qt item model for the layer/object outliner.
 The application-wide dark Qt stylesheet. It styles toolbars, scroll areas, splitters, color tabs, buttons, inputs, trees, docks, status bar, sliders, ribbon pages/groups/tabs, and tool-panel separators. The main colors are near-black gray surfaces, blue selection/accent, and hover/pressed variants.
 
 ## Test scripts, one by one
+
+### `tests/smoke_canvas_latency.py`
+
+An opt-in offscreen performance gate for 800-move raster/vector pencil and eraser gestures plus cached free-text transforms. It reports median-run input/frame P95, commit latency, and long-gesture growth; the input and frame limits are 8 ms and 16.7 ms respectively.
 
 ### `tests/conftest.py`
 
@@ -367,7 +372,11 @@ Covers contextual page visibility/routing, workspace splitter resizing, bottom-l
 
 ### `tests/test_settings.py`
 
-Covers missing/partial/null settings, default hotkey merging, clean-window configuration, migrations, vector/fill value clamping, splitter normalization, rectangle-mode clamping, and protected formatting-only text presets.
+Covers missing/partial/null settings, default hotkey merging, clean-window configuration, migrations through version 12, vector/fill value clamping, splitter normalization, rectangle-mode clamping, font-preview persistence, and protected integer-sized text presets.
+
+### `tests/test_text_updates.py`
+
+Covers complete text Tool Settings migration, 250-size entry/clamping, per-family font previews, selected-object isolation, canvas overlay visibility/editing, size/kerning scrub ranges and snapping, Delete Selected suppression, undo/redo, and cached live free-text transforms.
 
 ### `tests/test_shape_paths.py`
 
@@ -428,4 +437,4 @@ An image asset that is not referenced by the current Python/QSS source. Current 
 | Change hierarchy behavior | `core/models.py`, `ui/tree_model.py`, `ui/main_window.py` | models, UI, vector tree |
 | Change gradients | models, canvas, `ui/gradient_tools.py`, main window presets | gradients, ribbon/color tests |
 | Change colors/palettes | models, `ui/color_picker.py`, main window | color/ribbon, vector models |
-| Change text | models, canvas, inspector | interaction, UI, models |
+| Change text | models, canvas, `ui/tool_ribbon_pages.py` | text updates, interaction, UI, models |

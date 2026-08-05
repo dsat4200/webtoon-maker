@@ -277,7 +277,7 @@ def test_text_labels_are_content_derived_until_custom_rename(qapp):
     assert model.data(text_index, Qt.DisplayRole) == "Renamed"
 
 
-def test_compact_text_inspector_layout_visibility_and_quad_restore(qapp):
+def test_text_settings_ribbon_layout_visibility_and_quad_restore(qapp):
     window = MainWindow()
     chapter, page, layer, raster, text = _chapter()
     text.text = "Inspector label content"
@@ -285,31 +285,32 @@ def test_compact_text_inspector_layout_visibility_and_quad_restore(qapp):
     window._set_chapter(chapter, TileStore())
     try:
         window.canvas.set_selection("object", text.object_id)
-        window.inspector.refresh()
-        assert window.inspector.width() == 390
-        assert window.inspector.title.text() == "Inspector label"
-        assert window.inspector.name_row.isHidden()
-        assert not window.inspector.transform_panel.isHidden()
-        assert window.inspector.margin_row.isHidden()
-        assert not window.inspector.align_button.isHidden()
+        controls = window.text_object_controls
+        assert window.inspector.isHidden()
+        assert window.ribbon.current_key() == "tool_settings"
+        assert not window.text_object_group.isHidden()
+        assert not window.text_typography_group.isHidden()
+        assert not window.text_layout_group.isHidden()
+        assert controls.transform_mode.isVisibleTo(window.ribbon)
+        assert controls.margin.isHidden()
 
-        window.inspector.layout_mode.setCurrentIndex(
-            window.inspector.layout_mode.findData("strict")
+        controls.layout_mode.setCurrentIndex(
+            controls.layout_mode.findData("strict")
         )
-        assert window.inspector.transform_panel.isHidden()
-        assert not window.inspector.margin_row.isHidden()
+        assert controls.transform_mode.isHidden()
+        assert not controls.margin.isHidden()
         assert text.transform_quad == original_quad
 
-        window.inspector._set_alignment("right", "bottom")
+        controls._set_alignment("right", "bottom")
         assert (text.horizontal_alignment, text.vertical_alignment) == (
             "right", "bottom"
         )
-        window.inspector.layout_mode.setCurrentIndex(
-            window.inspector.layout_mode.findData("free")
+        controls.layout_mode.setCurrentIndex(
+            controls.layout_mode.findData("free")
         )
         assert text.transform_quad == original_quad
-        assert not window.inspector.transform_panel.isHidden()
-        assert window.inspector.margin_row.isHidden()
+        assert not controls.transform_mode.isHidden()
+        assert controls.margin.isHidden()
     finally:
         window.deleteLater()
 

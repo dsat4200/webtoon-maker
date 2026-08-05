@@ -647,7 +647,9 @@ def test_outliner_colors_collapsed_add_and_dynamic_tools(qapp):
     window.canvas.set_selection("object", object_id)
     assert not window.tool_buttons[ToolKind.TEXT_EDIT].isHidden()
     qapp.processEvents()
-    assert window.inspector.isVisible()
+    assert window.inspector.isHidden()
+    assert window.ribbon.current_key() == "tool_settings"
+    assert window.text_object_group.isVisible()
     window._activate_tool(ToolKind.OBJECT_SELECT)
     assert window.inspector.isHidden()
     window.hide()

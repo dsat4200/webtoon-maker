@@ -31,6 +31,7 @@ def default_hotkeys() -> dict[str, str]:
         "redo": "Ctrl+Shift+Z",
         "reset_view": "Ctrl+0",
         "toggle_grid": "Alt+G",
+        "delete_selected": "Delete",
     }
 
 
@@ -56,7 +57,7 @@ def default_hotkey_hold() -> dict[str, bool]:
 class TextPreset:
     name: str = "Default"
     font_family: str = "Segoe UI"
-    font_size: float = 32.0
+    font_size: int = 32
     bold: bool = False
     italic: bool = False
     kerning: float = 0.0
@@ -67,7 +68,7 @@ class TextPreset:
 
     def clamp(self) -> None:
         self.name = self.name.strip() or "Preset"
-        self.font_size = max(6.0, min(288.0, float(self.font_size)))
+        self.font_size = max(6, min(250, round(float(self.font_size))))
         self.kerning = max(-20.0, min(100.0, float(self.kerning)))
         if self.layout_mode not in {"free", "strict"}:
             self.layout_mode = "strict"
@@ -97,7 +98,7 @@ def default_text_presets() -> list[dict]:
 
 @dataclass
 class EditorSettings:
-    settings_version: int = 11
+    settings_version: int = 12
     tablet_mode: bool = False
     brush_size: int = 12
     eraser_size: int = 28
@@ -111,6 +112,7 @@ class EditorSettings:
     rectangle_edit_mode: str = "normal"
     text_presets: list[dict] = field(default_factory=default_text_presets)
     active_text_preset: str = "Default"
+    preview_font_names: bool = False
     pencil_presets: list[dict] = field(default_factory=default_pencil_presets)
     active_pencil_preset: str = "Linear"
     pencil_size_px: dict[str, int] = field(default_factory=lambda: {
@@ -151,7 +153,8 @@ class EditorSettings:
         self.clamp()
 
     def clamp(self) -> None:
-        self.settings_version = 11
+        self.settings_version = 12
+        self.preview_font_names = bool(self.preview_font_names)
         self.brush_size = max(1, min(200, int(self.brush_size)))
         self.eraser_size = max(2, min(400, int(self.eraser_size)))
         defaults = {
@@ -372,13 +375,17 @@ def load_settings() -> EditorSettings:
                 holds = raw.setdefault("hotkey_hold", {})
                 hotkeys.setdefault("insert_page_gap", "")
                 holds.setdefault("insert_page_gap", False)
+            if int(raw.get("settings_version", 1)) < 12:
+                raw.setdefault("preview_font_names", False)
+                hotkeys = raw.setdefault("hotkeys", {})
+                hotkeys.setdefault("delete_selected", "Delete")
             raw.pop("transform_snap_to_grid", None)
             stored_presets = raw.get("text_presets")
             if isinstance(stored_presets, list):
                 for preset in stored_presets:
                     if isinstance(preset, dict):
                         preset.pop("transform_snap", None)
-            raw["settings_version"] = 11
+            raw["settings_version"] = 12
             valid = {item.name for item in dataclasses.fields(EditorSettings)}
             result = EditorSettings(**{
                 key: value for key, value in raw.items() if key in valid

@@ -1,4 +1,4 @@
-"""Opt-in offscreen latency gate for raster/vector Pencil and Eraser.
+"""Opt-in offscreen latency gate for drawing and live text transforms.
 
 Run directly from the repository root:
     python tests/smoke_canvas_latency.py
@@ -22,7 +22,7 @@ from PySide6.QtWidgets import QApplication  # noqa: E402
 
 from comic_editor.core.models import (  # noqa: E402
     BoundGeometry, ChapterDocument, RasterObject, VectorDrawingObject,
-    VectorStroke, VectorStrokePoint,
+    TextObject, VectorStroke, VectorStrokePoint,
 )
 from comic_editor.core.settings import EditorSettings  # noqa: E402
 from comic_editor.core.tiles import TileStore  # noqa: E402
@@ -174,6 +174,71 @@ def run_eraser(kind: str) -> dict[str, float]:
     return result
 
 
+def run_text_transform() -> dict[str, float]:
+    chapter = ChapterDocument()
+    page = chapter.add_page(
+        "Page", BoundGeometry.rectangle(0, 0, 1800, 1800)
+    )
+    layer = chapter.add_layer(
+        page.layer_id, "Text", BoundGeometry.rectangle(0, 0, 1800, 1800)
+    )
+    obj = chapter.add_object(
+        layer.layer_id,
+        TextObject(
+            text="Cached live transform " * 80,
+            layout_mode="free",
+            width=720,
+            height=420,
+            transform_quad=[
+                (240, 180), (960, 180), (960, 600), (240, 600),
+            ],
+        ),
+    )
+    settings = EditorSettings(
+        snap_to_grid=False, canvas_renderer="raster"
+    )
+    canvas = CanvasWidget(settings)
+    canvas.resize(1000, 800)
+    canvas.set_document(chapter, TileStore())
+    canvas.center_x = 600
+    canvas.center_y = 400
+    canvas.scale = 1.0
+    canvas.set_selection("object", obj.object_id)
+    canvas.set_tool(ToolKind.TRANSFORM)
+    canvas.show()
+    QApplication.processEvents()
+
+    start = canvas.document_to_widget(QPointF(600, 390))
+    canvas._tool_press(start, 1.0)
+    QApplication.processEvents()
+    moves: list[float] = []
+    for index in range(1, MOVES + 1):
+        point = start + QPointF(
+            30 * math.sin(index * 0.05),
+            20 * math.cos(index * 0.05),
+        )
+        started = time.perf_counter_ns()
+        canvas._tool_move(point, 1.0)
+        QApplication.processEvents()
+        moves.append((time.perf_counter_ns() - started) / 1_000_000)
+    started = time.perf_counter_ns()
+    canvas._tool_release()
+    QApplication.processEvents()
+    commit = (time.perf_counter_ns() - started) / 1_000_000
+    result = {
+        "input_p95_ms": percentile(moves, 0.95),
+        "frame_p95_ms": canvas.performance_snapshot()["frame_p95_ms"],
+        "commit_ms": commit,
+        "growth": (
+            statistics.mean(moves[-100:])
+            / max(0.001, statistics.mean(moves[:100]))
+        ),
+    }
+    canvas.close()
+    QApplication.processEvents()
+    return result
+
+
 def median_runs(function) -> dict[str, float]:
     function()  # warm Qt, painters, caches, and imports
     runs = [function() for _ in range(3)]
@@ -190,6 +255,7 @@ def main() -> int:
         "raster_eraser": median_runs(lambda: run_eraser("raster")),
         "vector_pencil": median_runs(lambda: run_pencil("vector")),
         "vector_eraser": median_runs(lambda: run_eraser("vector")),
+        "text_transform": median_runs(run_text_transform),
     }
     print(json.dumps(results, indent=2, sort_keys=True))
     failures: list[str] = []

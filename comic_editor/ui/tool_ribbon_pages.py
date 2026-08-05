@@ -2,28 +2,58 @@
 from __future__ import annotations
 
 from PySide6.QtCore import QObject, QSignalBlocker, Qt, Signal
+from PySide6.QtGui import QFont, QFontDatabase, QValidator
 from PySide6.QtWidgets import (
     QAbstractSpinBox,
+    QApplication,
     QCheckBox,
     QComboBox,
     QDoubleSpinBox,
     QFormLayout,
+    QGridLayout,
     QHBoxLayout,
+    QInputDialog,
     QLabel,
     QLineEdit,
+    QMenu,
+    QMessageBox,
     QPushButton,
     QSlider,
     QSpinBox,
     QStackedWidget,
+    QToolButton,
     QVBoxLayout,
     QWidget,
+    QWidgetAction,
 )
 
-from comic_editor.core.models import RasterObject
+from comic_editor.core.models import RasterObject, TextObject
+from comic_editor.core.settings import TextPreset
 
 
 def _tool_value(tool: object) -> str:
     return str(getattr(tool, "value", tool or ""))
+
+
+class _FontSizeSpinBox(QSpinBox):
+    """Integer editor that accepts large input before clamping on commit."""
+
+    def validate(self, text: str, position: int):
+        raw = text.strip()
+        if raw in {"", "+", "-"}:
+            return QValidator.State.Intermediate, text, position
+        try:
+            int(raw)
+        except ValueError:
+            return QValidator.State.Invalid, text, position
+        return QValidator.State.Acceptable, text, position
+
+    def valueFromText(self, text: str) -> int:  # noqa: N802
+        try:
+            value = int(text.strip())
+        except ValueError:
+            value = self.minimum()
+        return max(self.minimum(), min(self.maximum(), value))
 
 
 class ToolSettingsControls(QWidget):
@@ -337,6 +367,537 @@ class ToolSettingsControls(QWidget):
         self.fill_area_mode.setEnabled(self.settings.fill_area_scaling)
         self.settingsChanged.emit()
         self.fillSettingsChanged.emit()
+
+
+class TextObjectControls(QObject):
+    """Selected-text properties hosted by Tool Settings ribbon groups."""
+
+    settingsChanged = Signal()
+    objectChanged = Signal()
+
+    def __init__(self, canvas, settings, parent: QObject | None = None):
+        super().__init__(parent)
+        self.canvas = canvas
+        self.settings = settings
+        self._loading = False
+        self._opacity_before: dict | None = None
+        self._preview_roles_enabled: bool | None = None
+        self._alignment_buttons: dict[tuple[str, str], QToolButton] = {}
+        self.object_widget = self._build_object_widget()
+        self.typography_widget = self._build_typography_widget()
+        self.layout_widget = self._build_layout_widget()
+        self.refresh()
+
+    @staticmethod
+    def _small_button(text: str, tooltip: str, parent: QWidget) -> QToolButton:
+        button = QToolButton(parent)
+        button.setText(text)
+        button.setToolTip(tooltip)
+        button.setFixedWidth(24)
+        return button
+
+    def _build_object_widget(self) -> QWidget:
+        widget = QWidget()
+        layout = QVBoxLayout(widget)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(3)
+
+        preset_row = QHBoxLayout()
+        preset_row.setContentsMargins(0, 0, 0, 0)
+        preset_row.addWidget(QLabel("Preset", widget))
+        self.preset_combo = QComboBox(widget)
+        self.preset_combo.setMinimumWidth(120)
+        preset_row.addWidget(self.preset_combo, 1)
+        self.preset_save = self._small_button(
+            "S", "Overwrite selected preset", widget
+        )
+        self.preset_rename = self._small_button(
+            "R", "Rename selected preset", widget
+        )
+        self.preset_remove = self._small_button(
+            "X", "Remove selected preset", widget
+        )
+        self.preset_add = self._small_button("+", "Create preset", widget)
+        for button in (
+            self.preset_save, self.preset_rename,
+            self.preset_remove, self.preset_add,
+        ):
+            preset_row.addWidget(button)
+        layout.addLayout(preset_row)
+
+        flags = QHBoxLayout()
+        self.visible = QCheckBox("Visible", widget)
+        self.opacity_lock = QCheckBox("Lock opacity", widget)
+        flags.addWidget(self.visible)
+        flags.addWidget(self.opacity_lock)
+        flags.addWidget(QLabel("Opacity", widget))
+        self.opacity = QSlider(Qt.Orientation.Horizontal, widget)
+        self.opacity.setRange(0, 100)
+        self.opacity.setMinimumWidth(90)
+        flags.addWidget(self.opacity, 1)
+        self.opacity_value = QLabel("100%", widget)
+        self.opacity_value.setMinimumWidth(36)
+        flags.addWidget(self.opacity_value)
+        layout.addLayout(flags)
+
+        self.preset_combo.activated.connect(self._apply_preset)
+        self.preset_save.clicked.connect(self._save_preset)
+        self.preset_rename.clicked.connect(self._rename_preset)
+        self.preset_remove.clicked.connect(self._remove_preset)
+        self.preset_add.clicked.connect(self._add_preset)
+        self.visible.toggled.connect(
+            lambda checked: self._apply_field("visible", bool(checked))
+        )
+        self.opacity_lock.toggled.connect(self._opacity_lock_changed)
+        self.opacity.sliderPressed.connect(self._begin_opacity_drag)
+        self.opacity.valueChanged.connect(self._opacity_changed)
+        self.opacity.sliderReleased.connect(self._finish_opacity_drag)
+        return widget
+
+    def _build_typography_widget(self) -> QWidget:
+        widget = QWidget()
+        layout = QVBoxLayout(widget)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(3)
+
+        font_row = QHBoxLayout()
+        font_row.addWidget(QLabel("Font", widget))
+        self.font_family = QComboBox(widget)
+        self.font_family.setMinimumWidth(180)
+        families = QFontDatabase.families()
+        # Some headless Qt platforms do not expose the system font database.
+        # Keep the editor usable (and the preview mode meaningful) there too.
+        self.font_family.addItems(
+            families or [QApplication.font().family() or "Sans Serif"]
+        )
+        font_row.addWidget(self.font_family, 1)
+        self.preview_fonts = QCheckBox("Preview fonts", widget)
+        font_row.addWidget(self.preview_fonts)
+        layout.addLayout(font_row)
+
+        metrics = QHBoxLayout()
+        metrics.addWidget(QLabel("Size", widget))
+        self.font_size = _FontSizeSpinBox(widget)
+        self.font_size.setRange(6, 250)
+        self.font_size.setSingleStep(1)
+        self.font_size.setKeyboardTracking(False)
+        self.font_size.setMaximumWidth(72)
+        metrics.addWidget(self.font_size)
+        self.bold = QCheckBox("Bold", widget)
+        self.italic = QCheckBox("Italic", widget)
+        metrics.addWidget(self.bold)
+        metrics.addWidget(self.italic)
+        metrics.addWidget(QLabel("Kerning", widget))
+        self.kerning = QDoubleSpinBox(widget)
+        self.kerning.setRange(-20, 100)
+        self.kerning.setSingleStep(0.1)
+        self.kerning.setMaximumWidth(78)
+        metrics.addWidget(self.kerning)
+        layout.addLayout(metrics)
+
+        self.font_family.currentTextChanged.connect(
+            lambda value: self._apply_field("font_family", value)
+        )
+        self.preview_fonts.toggled.connect(self._preview_fonts_changed)
+        self.font_size.editingFinished.connect(
+            lambda: self._apply_field("font_size", int(self.font_size.value()))
+        )
+        self.bold.toggled.connect(
+            lambda checked: self._apply_field("bold", bool(checked))
+        )
+        self.italic.toggled.connect(
+            lambda checked: self._apply_field("italic", bool(checked))
+        )
+        self.kerning.editingFinished.connect(
+            lambda: self._apply_field("kerning", float(self.kerning.value()))
+        )
+        return widget
+
+    def _build_layout_widget(self) -> QWidget:
+        widget = QWidget()
+        layout = QVBoxLayout(widget)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(3)
+
+        first = QHBoxLayout()
+        first.addWidget(QLabel("Layout", widget))
+        self.layout_mode = QComboBox(widget)
+        self.layout_mode.addItem("Strict to parent", "strict")
+        self.layout_mode.addItem("Free transform", "free")
+        first.addWidget(self.layout_mode)
+        self.align_button = QToolButton(widget)
+        self.align_button.setText("Align")
+        self.align_button.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        self.align_menu = QMenu(self.align_button)
+        self.align_button.setMenu(self.align_menu)
+        alignment_widget = QWidget(self.align_menu)
+        alignment_grid = QGridLayout(alignment_widget)
+        alignment_grid.setContentsMargins(5, 5, 5, 5)
+        alignment_grid.setSpacing(2)
+        for row, vertical in enumerate(("top", "middle", "bottom")):
+            for column, horizontal in enumerate(("left", "center", "right")):
+                button = QToolButton(alignment_widget)
+                button.setText("●")
+                button.setCheckable(True)
+                button.setToolTip(f"{vertical.title()} / {horizontal.title()}")
+                button.clicked.connect(
+                    lambda checked=False, h=horizontal, v=vertical:
+                    self._set_alignment(h, v)
+                )
+                alignment_grid.addWidget(button, row, column)
+                self._alignment_buttons[(horizontal, vertical)] = button
+        action = QWidgetAction(self.align_menu)
+        action.setDefaultWidget(alignment_widget)
+        self.align_menu.addAction(action)
+        first.addWidget(self.align_button)
+        first.addStretch(1)
+        layout.addLayout(first)
+
+        second = QHBoxLayout()
+        self.margin_label = QLabel("Margin", widget)
+        self.margin = QDoubleSpinBox(widget)
+        self.margin.setRange(0, 500)
+        self.margin.setSuffix(" px")
+        self.margin.setKeyboardTracking(False)
+        second.addWidget(self.margin_label)
+        second.addWidget(self.margin)
+        self.geometry_reference_label = QLabel("Shape reference", widget)
+        self.geometry_reference = QComboBox(widget)
+        self.geometry_reference.addItem("Direct parent", "direct")
+        self.geometry_reference.addItem("Closest compound", "compound")
+        second.addWidget(self.geometry_reference_label)
+        second.addWidget(self.geometry_reference)
+        self.transform_label = QLabel("Transform", widget)
+        self.transform_mode = QComboBox(widget)
+        self.transform_mode.addItem("Free Projective", "free")
+        self.transform_mode.addItem("Uniform", "uniform")
+        second.addWidget(self.transform_label)
+        second.addWidget(self.transform_mode)
+        layout.addLayout(second)
+
+        self.layout_mode.currentIndexChanged.connect(self._layout_mode_changed)
+        self.margin.editingFinished.connect(
+            lambda: self._apply_field("margin", float(self.margin.value()))
+        )
+        self.geometry_reference.currentIndexChanged.connect(
+            lambda: self._apply_field(
+                "geometry_reference", str(self.geometry_reference.currentData())
+            )
+        )
+        self.transform_mode.currentIndexChanged.connect(
+            self._transform_mode_changed
+        )
+        return widget
+
+    def _selected(self) -> TextObject | None:
+        if (
+            self.canvas.chapter is None
+            or self.canvas.selected_kind != "object"
+        ):
+            return None
+        entity = self.canvas.chapter.objects.get(self.canvas.selected_id)
+        return entity if isinstance(entity, TextObject) else None
+
+    def _set_font_preview_roles(self) -> None:
+        role = Qt.ItemDataRole.FontRole
+        preview = bool(self.settings.preview_font_names)
+        if preview == self._preview_roles_enabled:
+            return
+        for index in range(self.font_family.count()):
+            self.font_family.setItemData(
+                index,
+                QFont(self.font_family.itemText(index)) if preview else None,
+                role,
+            )
+        self._preview_roles_enabled = preview
+
+    def refresh(self) -> None:
+        entity = self._selected()
+        self._loading = True
+        controls = (
+            self.preset_combo, self.visible, self.opacity_lock, self.opacity,
+            self.font_family, self.preview_fonts, self.font_size, self.bold,
+            self.italic, self.kerning, self.layout_mode, self.margin,
+            self.geometry_reference, self.transform_mode,
+        )
+        blockers = [QSignalBlocker(control) for control in controls]
+        self._refresh_presets()
+        self.preview_fonts.setChecked(bool(self.settings.preview_font_names))
+        self._set_font_preview_roles()
+        self.transform_mode.setCurrentIndex(max(
+            0, self.transform_mode.findData(self.settings.transform_mode)
+        ))
+        if entity is not None:
+            self.visible.setChecked(entity.visible)
+            self.opacity_lock.setChecked(entity.opacity_locked)
+            self.opacity.setValue(round(entity.opacity * 100))
+            self.opacity_value.setText(f"{self.opacity.value()}%")
+            self.opacity.setEnabled(not entity.opacity_locked)
+            self.font_family.setCurrentText(entity.font_family)
+            self.font_size.setValue(max(6, min(250, round(entity.font_size))))
+            self.bold.setChecked(entity.bold)
+            self.italic.setChecked(entity.italic)
+            self.kerning.setValue(entity.kerning)
+            self.layout_mode.setCurrentIndex(max(
+                0, self.layout_mode.findData(entity.layout_mode)
+            ))
+            self.margin.setValue(entity.margin)
+            self.geometry_reference.setCurrentIndex(max(
+                0, self.geometry_reference.findData(entity.geometry_reference)
+            ))
+            for key, button in self._alignment_buttons.items():
+                button.setChecked(key == (
+                    entity.horizontal_alignment, entity.vertical_alignment
+                ))
+            strict = entity.layout_mode == "strict"
+            self.margin_label.setVisible(strict)
+            self.margin.setVisible(strict)
+            self.transform_label.setVisible(not strict)
+            self.transform_mode.setVisible(not strict)
+            compound = self.canvas.chapter.closest_compound_ancestor(
+                entity.parent_layer_id, include_self=True
+            )
+            reference_visible = compound is not None
+            self.geometry_reference_label.setVisible(reference_visible)
+            self.geometry_reference.setVisible(reference_visible)
+        del blockers
+        self._loading = False
+
+    def _refresh_presets(self) -> None:
+        current = self.settings.active_text_preset
+        self.preset_combo.clear()
+        for item in self.settings.text_presets:
+            self.preset_combo.addItem(item["name"])
+        self.preset_combo.setCurrentIndex(max(0, self.preset_combo.findText(current)))
+        protected = self.preset_combo.currentText() == "Default"
+        self.preset_rename.setEnabled(not protected)
+        self.preset_remove.setEnabled(not protected)
+
+    def _commit_text_session(self) -> None:
+        self.canvas.commit_active_text_edit()
+
+    def _push_change(self, before: dict, label: str) -> None:
+        after = self.canvas.chapter.to_dict()
+        if before != after:
+            self.canvas.push_model_change(before, after, label)
+            self.canvas.documentChanged.emit(None)
+            self.canvas.update()
+            self.objectChanged.emit()
+
+    def _apply_field(self, key: str, value) -> None:
+        entity = self._selected()
+        if self._loading or entity is None:
+            return
+        self._commit_text_session()
+        entity = self._selected()
+        if entity is None:
+            return
+        before = self.canvas.chapter.to_dict()
+        if key == "font_size":
+            value = max(6, min(250, int(value)))
+        elif key == "geometry_reference" and value not in {"direct", "compound"}:
+            value = "direct"
+        setattr(entity, key, value)
+        if key == "layout_mode" and value == "free" and entity.transform_quad is None:
+            entity.transform_quad = self.canvas._rect_quad(
+                self.canvas._strict_text_rect(entity)
+            )
+        self._push_change(before, "Edit text properties")
+        self.refresh()
+
+    def _layout_mode_changed(self, *args) -> None:
+        del args
+        if not self._loading:
+            self._apply_field("layout_mode", str(self.layout_mode.currentData()))
+
+    def _set_alignment(self, horizontal: str, vertical: str) -> None:
+        entity = self._selected()
+        if entity is None:
+            return
+        self._commit_text_session()
+        entity = self._selected()
+        if entity is None:
+            return
+        before = self.canvas.chapter.to_dict()
+        entity.horizontal_alignment = horizontal
+        entity.vertical_alignment = vertical
+        self.align_menu.close()
+        self._push_change(before, "Align text")
+        self.refresh()
+
+    def _preview_fonts_changed(self, checked: bool) -> None:
+        if self._loading:
+            return
+        self._commit_text_session()
+        self.settings.preview_font_names = bool(checked)
+        self._set_font_preview_roles()
+        self.settingsChanged.emit()
+
+    def _transform_mode_changed(self, *args) -> None:
+        del args
+        if self._loading:
+            return
+        mode = str(self.transform_mode.currentData())
+        if mode not in {"free", "uniform"}:
+            return
+        self._commit_text_session()
+        self.settings.transform_mode = mode
+        self.settings.clamp()
+        self.settingsChanged.emit()
+        self.canvas.update()
+
+    def _opacity_lock_changed(self, checked: bool) -> None:
+        entity = self._selected()
+        if self._loading or entity is None:
+            return
+        self._commit_text_session()
+        entity = self._selected()
+        if entity is None:
+            return
+        before = self.canvas.chapter.to_dict()
+        entity.opacity_locked = bool(checked)
+        if entity.opacity_locked:
+            entity.opacity = self.canvas.chapter.layers[
+                entity.parent_layer_id
+            ].opacity
+        self._push_change(before, "Change text opacity lock")
+        self.refresh()
+
+    def _begin_opacity_drag(self) -> None:
+        if self._loading or self._selected() is None:
+            return
+        self._commit_text_session()
+        self._opacity_before = self.canvas.chapter.to_dict()
+
+    def _opacity_changed(self, value: int) -> None:
+        self.opacity_value.setText(f"{int(value)}%")
+        entity = self._selected()
+        if self._loading or entity is None or entity.opacity_locked:
+            return
+        before = None if self._opacity_before is not None else self.canvas.chapter.to_dict()
+        entity.opacity = value / 100.0
+        self.canvas.documentChanged.emit(None)
+        self.canvas.update()
+        if before is not None:
+            self._push_change(before, "Change text opacity")
+
+    def _finish_opacity_drag(self) -> None:
+        before, self._opacity_before = self._opacity_before, None
+        if before is not None:
+            self._push_change(before, "Change text opacity")
+        self.refresh()
+
+    def _current_preset(self) -> TextPreset | None:
+        entity = self._selected()
+        if entity is None:
+            return None
+        return TextPreset(
+            name=self.preset_combo.currentText() or "Default",
+            font_family=entity.font_family,
+            font_size=max(6, min(250, round(entity.font_size))),
+            bold=entity.bold,
+            italic=entity.italic,
+            kerning=entity.kerning,
+            layout_mode=entity.layout_mode,
+            horizontal_alignment=entity.horizontal_alignment,
+            vertical_alignment=entity.vertical_alignment,
+            margin=entity.margin,
+        )
+
+    def _apply_preset(self, index: int) -> None:
+        entity = self._selected()
+        if entity is None or index < 0:
+            return
+        self._commit_text_session()
+        entity = self._selected()
+        if entity is None:
+            return
+        preset = TextPreset.from_dict(self.settings.text_presets[index])
+        before = self.canvas.chapter.to_dict()
+        for key in (
+            "font_family", "font_size", "bold", "italic", "kerning",
+            "layout_mode", "horizontal_alignment", "vertical_alignment", "margin",
+        ):
+            setattr(entity, key, getattr(preset, key))
+        if entity.layout_mode == "free" and entity.transform_quad is None:
+            entity.transform_quad = self.canvas._rect_quad(
+                self.canvas._strict_text_rect(entity)
+            )
+        self.settings.active_text_preset = preset.name
+        self.settingsChanged.emit()
+        self._push_change(before, "Apply text preset")
+        self.refresh()
+
+    def _save_preset(self) -> None:
+        self._commit_text_session()
+        preset = self._current_preset()
+        index = self.preset_combo.currentIndex()
+        if preset is None or index < 0:
+            return
+        self.settings.text_presets[index] = preset.to_dict()
+        self.settings.active_text_preset = preset.name
+        self.settingsChanged.emit()
+        self.refresh()
+
+    def _add_preset(self) -> None:
+        self._commit_text_session()
+        preset = self._current_preset()
+        if preset is None:
+            return
+        name, accepted = QInputDialog.getText(
+            self.object_widget, "New text preset", "Preset name"
+        )
+        name = name.strip()
+        if not accepted or not name:
+            return
+        if any(item["name"].casefold() == name.casefold()
+               for item in self.settings.text_presets):
+            QMessageBox.warning(
+                self.object_widget, "Text preset",
+                "That preset name already exists.",
+            )
+            return
+        preset.name = name
+        self.settings.text_presets.append(preset.to_dict())
+        self.settings.active_text_preset = name
+        self.settingsChanged.emit()
+        self.refresh()
+
+    def _rename_preset(self) -> None:
+        self._commit_text_session()
+        index = self.preset_combo.currentIndex()
+        if index <= 0:
+            return
+        current = self.settings.text_presets[index]["name"]
+        name, accepted = QInputDialog.getText(
+            self.object_widget, "Rename text preset", "Preset name", text=current
+        )
+        name = name.strip()
+        if not accepted or not name:
+            return
+        if any(
+            item_index != index and item["name"].casefold() == name.casefold()
+            for item_index, item in enumerate(self.settings.text_presets)
+        ):
+            QMessageBox.warning(
+                self.object_widget, "Text preset",
+                "That preset name already exists.",
+            )
+            return
+        self.settings.text_presets[index]["name"] = name
+        self.settings.active_text_preset = name
+        self.settingsChanged.emit()
+        self.refresh()
+
+    def _remove_preset(self) -> None:
+        self._commit_text_session()
+        index = self.preset_combo.currentIndex()
+        if index <= 0:
+            return
+        self.settings.text_presets.pop(index)
+        self.settings.active_text_preset = "Default"
+        self.settingsChanged.emit()
+        self.refresh()
 
 
 class VectorToolsControls(QObject):

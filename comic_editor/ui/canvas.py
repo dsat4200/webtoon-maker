@@ -23,10 +23,12 @@ from PySide6.QtGui import (
     QMouseEvent, QOffscreenSurface, QOpenGLContext, QPainter, QPainterPath,
     QPainterPathStroker, QPalette,
     QPen, QPolygonF, QRadialGradient, QSurfaceFormat, QTextBlockFormat,
-    QTextCursor, QTextDocument, QTransform,
+    QTextCursor, QTextDocument, QTransform, QValidator,
 )
 from PySide6.QtOpenGLWidgets import QOpenGLWidget
-from PySide6.QtWidgets import QApplication, QWidget
+from PySide6.QtWidgets import (
+    QAbstractSpinBox, QApplication, QHBoxLayout, QSpinBox, QToolButton, QWidget,
+)
 
 from comic_editor.core.commands import (
     CallbackCommand, CommandStack, ObjectPatchCommand, TilePatchCommand,
@@ -87,6 +89,128 @@ class ToolKind(Enum):
 RASTER_FRAME_MARGIN = 24.0
 SHAPE_CONTROL_SCALE = 1.5
 ASSET_MIME = "application/x-webtoon-asset"
+
+
+class _TextSizeSpinBox(QSpinBox):
+    editStarted = Signal(int)
+    editCanceled = Signal()
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._focus_value = 32
+        self.setRange(6, 250)
+        self.setSingleStep(1)
+        self.setKeyboardTracking(False)
+        self.setButtonSymbols(QAbstractSpinBox.ButtonSymbols.NoButtons)
+        self.setAlignment(Qt.AlignmentFlag.AlignCenter)
+
+    def focusInEvent(self, event) -> None:  # noqa: N802
+        self._focus_value = self.value()
+        super().focusInEvent(event)
+        self.editStarted.emit(self._focus_value)
+        QTimer.singleShot(0, self.selectAll)
+
+    def validate(self, text: str, position: int):
+        raw = text.strip()
+        if raw in {"", "+", "-"}:
+            return QValidator.State.Intermediate, text, position
+        try:
+            int(raw)
+        except ValueError:
+            return QValidator.State.Invalid, text, position
+        return QValidator.State.Acceptable, text, position
+
+    def valueFromText(self, text: str) -> int:  # noqa: N802
+        try:
+            value = int(text.strip())
+        except ValueError:
+            value = self.minimum()
+        return max(self.minimum(), min(self.maximum(), value))
+
+    def mousePressEvent(self, event) -> None:  # noqa: N802
+        super().mousePressEvent(event)
+        QTimer.singleShot(0, self.selectAll)
+
+    def keyPressEvent(self, event) -> None:  # noqa: N802
+        if event.key() == Qt.Key.Key_Escape:
+            self.setValue(self._focus_value)
+            self.editCanceled.emit()
+            self.clearFocus()
+            event.accept()
+            return
+        super().keyPressEvent(event)
+
+
+class _TextGizmoOverlay(QWidget):
+    sizeDecreaseRequested = Signal()
+    sizeIncreaseRequested = Signal()
+    boldRequested = Signal()
+    italicRequested = Signal()
+    sizeEditStarted = Signal(int)
+    sizeEditCanceled = Signal()
+    sizeCommitted = Signal(int)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setObjectName("textGizmoOverlay")
+        self.setStyleSheet(
+            "#textGizmoOverlay { background: rgba(32,32,36,235); "
+            "border: 1px solid #f2a23a; border-radius: 6px; }"
+            "#textGizmoOverlay QToolButton { color: #f2a23a; "
+            "font-weight: bold; border: 1px solid #8f6626; "
+            "border-radius: 4px; padding: 1px 5px; }"
+            "#textGizmoOverlay QToolButton:checked { color: #202024; "
+            "background: #f2a23a; }"
+            "#textGizmoOverlay QSpinBox { color: #f6f6f6; "
+            "background: #1f1f23; border: 1px solid #8f6626; "
+            "border-radius: 4px; padding: 1px 3px; }"
+        )
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(4, 3, 4, 3)
+        layout.setSpacing(3)
+        self.decrease = self._button("−", "Decrease font size by 1")
+        self.size = _TextSizeSpinBox(self)
+        self.size.setFixedWidth(52)
+        self.size.setToolTip("Font size (6–250)")
+        self.increase = self._button("+", "Increase font size by 1")
+        self.bold = self._button("B", "Toggle bold", checkable=True)
+        self.italic = self._button("I", "Toggle italic", checkable=True)
+        italic_font = self.italic.font()
+        italic_font.setItalic(True)
+        self.italic.setFont(italic_font)
+        for control in (
+            self.decrease, self.size, self.increase, self.bold, self.italic,
+        ):
+            layout.addWidget(control)
+        self.decrease.clicked.connect(self.sizeDecreaseRequested)
+        self.increase.clicked.connect(self.sizeIncreaseRequested)
+        self.bold.clicked.connect(self.boldRequested)
+        self.italic.clicked.connect(self.italicRequested)
+        self.size.editStarted.connect(self.sizeEditStarted)
+        self.size.editCanceled.connect(self.sizeEditCanceled)
+        self.size.editingFinished.connect(
+            lambda: self.sizeCommitted.emit(self.size.value())
+        )
+        self.hide()
+
+    def _button(
+        self, text: str, tooltip: str, *, checkable: bool = False,
+    ) -> QToolButton:
+        button = QToolButton(self)
+        button.setText(text)
+        button.setToolTip(tooltip)
+        button.setCheckable(checkable)
+        button.setFixedSize(27, 24)
+        return button
+
+    def set_state(self, size: int, bold: bool, italic: bool) -> None:
+        for control in (self.size, self.bold, self.italic):
+            control.blockSignals(True)
+        self.size.setValue(max(6, min(250, int(size))))
+        self.bold.setChecked(bool(bold))
+        self.italic.setChecked(bool(italic))
+        for control in (self.size, self.bold, self.italic):
+            control.blockSignals(False)
 
 
 @dataclass
@@ -207,6 +331,7 @@ class _CanvasLogic:
         self._transform_handle_index: int | None = None
         self._transform_drag_mode: str | None = None
         self._transform_static_cache = QImage()
+        self._text_transform_cache = QImage()
         self._transform_pivot: QPointF | None = None
         self._transform_pivot_custom = False
         self._transform_rotate_start = 0.0
@@ -218,6 +343,36 @@ class _CanvasLogic:
         self._text_editing = False
         self._text_cursor_position = 0
         self._text_selection_anchor = 0
+        self._text_property_drag: dict | None = None
+        self._text_size_edit_before: dict | None = None
+        self._text_size_edit_object_id = ""
+        self._text_size_edit_canceled = False
+        self._text_gizmo_overlay = _TextGizmoOverlay(self)
+        self._text_gizmo_overlay.sizeDecreaseRequested.connect(
+            lambda: self._change_selected_text_property(
+                "font_size", -1, relative=True, label="Decrease text size"
+            )
+        )
+        self._text_gizmo_overlay.sizeIncreaseRequested.connect(
+            lambda: self._change_selected_text_property(
+                "font_size", 1, relative=True, label="Increase text size"
+            )
+        )
+        self._text_gizmo_overlay.boldRequested.connect(
+            lambda: self._toggle_selected_text_property("bold", "Toggle bold")
+        )
+        self._text_gizmo_overlay.italicRequested.connect(
+            lambda: self._toggle_selected_text_property("italic", "Toggle italic")
+        )
+        self._text_gizmo_overlay.sizeEditStarted.connect(
+            self._begin_text_size_edit
+        )
+        self._text_gizmo_overlay.sizeEditCanceled.connect(
+            self._cancel_text_size_edit
+        )
+        self._text_gizmo_overlay.sizeCommitted.connect(
+            self._commit_text_size_edit
+        )
         self._text_dragging = False
         self._text_before_state: dict | None = None
         self._text_local_history: list[tuple[str, int, int]] = []
@@ -1033,6 +1188,7 @@ class _CanvasLogic:
         ):
             self._clear_page_gap_editor()
         if entity_id != self.selected_object_id:
+            self._cancel_text_property_drag()
             self._clear_transform_preview()
             self._transform_pivot = None
             self._transform_pivot_custom = False
@@ -1101,6 +1257,7 @@ class _CanvasLogic:
         ):
             self._clear_page_gap_editor()
         self._commit_text_edit()
+        self._cancel_text_property_drag()
         self._clear_transform_preview()
         self.selected_kind = ""
         self.selected_id = ""
@@ -1123,6 +1280,8 @@ class _CanvasLogic:
             self.chapter.objects.get(self.selected_object_id)
             if self.chapter is not None else None
         )
+        if tool != ToolKind.TEXT_EDIT:
+            self._cancel_text_property_drag()
         creation_tools = {
             ToolKind.BOX_BOUND, ToolKind.CIRCLE_BOUND,
             ToolKind.SHAPE_CREATE,
@@ -2041,6 +2200,7 @@ class _CanvasLogic:
 
     def paintEvent(self, event) -> None:  # noqa: N802
         frame_started = time.perf_counter_ns()
+        self._update_text_gizmo_overlay()
         painter = QPainter(self)
         painter.fillRect(self.rect(), QColor("#242428"))
         painter.setRenderHint(QPainter.Antialiasing, True)
@@ -2054,8 +2214,16 @@ class _CanvasLogic:
         if (
             not self._transform_static_cache.isNull()
             and self._transform_preview_quad is not None
-            and isinstance(
-                self.chapter.objects.get(self.selected_object_id), RasterObject
+            and (
+                isinstance(
+                    self.chapter.objects.get(self.selected_object_id), RasterObject
+                )
+                or (
+                    isinstance(
+                        self.chapter.objects.get(self.selected_object_id), TextObject
+                    )
+                    and not self._text_transform_cache.isNull()
+                )
             )
         ):
             painter.drawImage(0, 0, self._transform_static_cache)
@@ -2066,9 +2234,11 @@ class _CanvasLogic:
             )
             visible = self.visible_document_rect()
             self._set_live_underlay_context()
-            self._render_selected_raster_preview(
-                painter, visible
-            )
+            selected = self.chapter.objects.get(self.selected_object_id)
+            if isinstance(selected, RasterObject):
+                self._render_selected_raster_preview(painter, visible)
+            else:
+                self._render_selected_text_preview(painter)
             self._render_selected_drawing_underlay(painter, visible)
             self._draw_grid(painter, visible)
             self._draw_selection(painter)
@@ -5517,6 +5687,43 @@ class _CanvasLogic:
                         painter, selected_object.geometry
                     )
                     painter.restore()
+                if isinstance(selected_object, TextObject):
+                    self._draw_text_property_handles(painter)
+        painter.restore()
+
+    def _draw_text_property_handles(self, painter: QPainter) -> None:
+        positions = self._text_property_handle_positions()
+        if not positions:
+            return
+        scale = max(self.scale, 0.05)
+        radius = 7 / scale
+        drag = self._text_property_drag
+        painter.save()
+        painter.setPen(QPen(QColor("#f2a23a"), 2 / scale))
+        painter.setBrush(QColor("#f2a23a"))
+        font = painter.font()
+        font.setPixelSize(max(1, round(10 / scale)))
+        font.setBold(True)
+        painter.setFont(font)
+        for key, anchor in positions.items():
+            center = QPointF(anchor)
+            if drag is not None and drag["key"] == key:
+                anchor_widget = self.document_to_widget(anchor)
+                center = self.widget_to_document(QPointF(
+                    drag["current_x"], anchor_widget.y()
+                ))
+                painter.drawLine(anchor, center)
+            painter.drawEllipse(center, radius, radius)
+            painter.setPen(QPen(QColor("#4a3212"), 1 / scale))
+            painter.drawText(
+                QRectF(
+                    center.x() - radius, center.y() - radius,
+                    radius * 2, radius * 2,
+                ),
+                Qt.AlignmentFlag.AlignCenter,
+                "S" if key == "font_size" else "K",
+            )
+            painter.setPen(QPen(QColor("#f2a23a"), 2 / scale))
         painter.restore()
 
     def _gradient_local_to_world(
@@ -7102,7 +7309,7 @@ class _CanvasLogic:
                     for x, y in self._transform_preview_quad
                 ]
         if (
-            self.tool == ToolKind.TRANSFORM
+            self.tool in {ToolKind.TRANSFORM, ToolKind.TEXT_EDIT}
             and self._transform_preview_quad is not None
             and self.selected_object_id
         ):
@@ -8013,6 +8220,9 @@ class _CanvasLogic:
             return
         self._pointer_hover_widget = QPointF(event.position())
         world = self.widget_to_document(event.position())
+        over_text_property = bool(
+            self._text_property_handle_hit(QPointF(event.position()))
+        )
         transform_quad = (
             self._selection_transform_quad
             if self.tool in {
@@ -8072,7 +8282,9 @@ class _CanvasLogic:
             over_transform_edge = stroker.createStroke(
                 outline
             ).contains(world)
-        if over_transform_handle:
+        if over_text_property:
+            self.setCursor(Qt.CursorShape.SizeHorCursor)
+        elif over_transform_handle:
             self.setCursor(Qt.PointingHandCursor)
         elif over_transform_edge:
             self.setCursor(Qt.SizeAllCursor)
@@ -8157,6 +8369,9 @@ class _CanvasLogic:
     def keyPressEvent(self, event) -> None:  # noqa: N802
         if event.key() in {Qt.Key_Shift, Qt.Key_Control}:
             self.update()
+        if event.key() == Qt.Key_Escape and self._cancel_text_property_drag():
+            event.accept()
+            return
         if event.key() == Qt.Key_Escape and self._asset_drag_manifest is not None:
             self._clear_asset_drag_preview()
             event.accept()
@@ -11686,6 +11901,8 @@ class _CanvasLogic:
             self._update_page_gap_hover(point)
             self._insert_hovered_page_gap()
             return
+        if self._begin_text_property_drag(widget_point):
+            return
         if self.tool in {
             ToolKind.DRAW_SELECT_RECT,
             ToolKind.DRAW_SELECT_LASSO,
@@ -11877,6 +12094,9 @@ class _CanvasLogic:
             world_quad = self.object_world_quad(obj.object_id)
             mode, handle = self._transform_control_hit(world_quad, point)
             if mode in {"handle", "rotate", "pivot"}:
+                self.commit_active_text_edit()
+                obj = self.chapter.objects[self.selected_object_id]
+                world_quad = self.object_world_quad(obj.object_id)
                 layer_x, layer_y = self.chapter.layer_world_translation(
                     obj.parent_layer_id
                 )
@@ -11897,6 +12117,8 @@ class _CanvasLogic:
                 self._transform_rotate_start = math.atan2(
                     point.y() - pivot.y(), point.x() - pivot.x()
                 )
+                self._build_raster_transform_cache()
+                self._build_text_transform_cache(obj)
                 return
         if self.tool == ToolKind.TEXT_EDIT and self.selected_object_id:
             if self._begin_text_pointer(point):
@@ -11928,6 +12150,9 @@ class _CanvasLogic:
             )
             if isinstance(obj, RasterObject):
                 self._build_raster_transform_cache()
+            elif isinstance(obj, TextObject):
+                self._build_raster_transform_cache()
+                self._build_text_transform_cache(obj)
             return
         if (
             self.tool == ToolKind.BOUND_EDIT
@@ -11993,6 +12218,9 @@ class _CanvasLogic:
             self._clear_detached_input_state()
             return
         point = self.widget_to_document(widget_point)
+        if self._text_property_drag is not None:
+            self._update_text_property_drag(widget_point)
+            return
         if self._page_gap_drag_mode is not None:
             self._move_page_gap_interaction(point)
             return
@@ -12225,6 +12453,8 @@ class _CanvasLogic:
             self._update_shape_hover(point)
 
     def _tool_release(self) -> None:
+        if self._finish_text_property_drag():
+            return
         if self.chapter is None:
             self._clear_detached_input_state()
             return
@@ -14482,6 +14712,7 @@ class _CanvasLogic:
         self._transform_handle_index = None
         self._transform_drag_mode = None
         self._transform_static_cache = QImage()
+        self._text_transform_cache = QImage()
         if drag_mode == "pivot":
             self.update()
             return
@@ -14561,6 +14792,7 @@ class _CanvasLogic:
         self._transform_handle_index = None
         self._transform_drag_mode = None
         self._transform_static_cache = QImage()
+        self._text_transform_cache = QImage()
         self._render_excluded_object_id = ""
 
     def _build_raster_transform_cache(self) -> None:
@@ -14620,6 +14852,271 @@ class _CanvasLogic:
             painter, obj, opacity, visible.translated(-world_x, -world_y)
         )
         painter.restore()
+
+    def _build_text_transform_cache(self, obj: TextObject) -> None:
+        source = QRectF(0, 0, max(1.0, obj.width), max(1.0, obj.height))
+        ratio = max(1.0, float(self.devicePixelRatioF()) * self.scale)
+        largest = max(source.width(), source.height())
+        if largest * ratio > 8192:
+            ratio = max(0.1, 8192 / largest)
+        image = QImage(
+            max(1, math.ceil(source.width() * ratio)),
+            max(1, math.ceil(source.height() * ratio)),
+            QImage.Format_ARGB32_Premultiplied,
+        )
+        image.fill(Qt.GlobalColor.transparent)
+        document = self._text_document(obj, source.width())
+        offset = self._text_vertical_offset(obj, document, source.height())
+        painter = QPainter(image)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        painter.scale(ratio, ratio)
+        painter.setClipRect(source)
+        painter.translate(0, offset)
+        self._draw_text_document(painter, obj, document)
+        painter.end()
+        self._text_transform_cache = image
+
+    def _render_selected_text_preview(self, painter: QPainter) -> None:
+        obj = self.chapter.objects.get(self.selected_object_id)
+        if (
+            not isinstance(obj, TextObject)
+            or not obj.visible
+            or self._text_transform_cache.isNull()
+            or self._transform_preview_quad is None
+        ):
+            return
+        painter.save()
+        opacity = 1.0
+        for layer in self.chapter.ancestor_layers(obj.parent_layer_id):
+            if not layer.visible or layer.opacity <= 0 or layer.bound is None:
+                painter.restore()
+                return
+            painter.translate(layer.translate_x, layer.translate_y)
+            painter.setClipPath(
+                self.layer_effective_path(layer.layer_id), Qt.ClipOperation.IntersectClip
+            )
+            opacity *= layer.opacity
+        painter.setOpacity(opacity if obj.opacity_locked else opacity * obj.opacity)
+        source = QRectF(0, 0, max(1.0, obj.width), max(1.0, obj.height))
+        transform = self._quad_transform(source, self._transform_preview_quad)
+        painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
+        painter.setTransform(transform, True)
+        painter.drawImage(source, self._text_transform_cache)
+        painter.restore()
+
+    def commit_active_text_edit(self) -> None:
+        """Finish the current typing transaction before another text edit."""
+        self._commit_text_edit()
+
+    def reserves_delete_key(self) -> bool:
+        """Whether Delete currently belongs to an in-canvas sub-editor."""
+        return bool(
+            self._text_editing
+            or (
+                self._selected_shape_node_id
+                and self.tool in {ToolKind.SHAPE_EDIT, ToolKind.BOUND_EDIT}
+            )
+        )
+
+    def _selected_text_for_gizmos(self) -> TextObject | None:
+        if (
+            self.chapter is None
+            or self.tool != ToolKind.TEXT_EDIT
+            or self.selected_kind != "object"
+        ):
+            return None
+        obj = self.chapter.objects.get(self.selected_object_id)
+        return obj if isinstance(obj, TextObject) else None
+
+    def _update_text_gizmo_overlay(self) -> None:
+        overlay = self._text_gizmo_overlay
+        obj = self._selected_text_for_gizmos()
+        quad = self._selected_world_quad() if obj is not None else None
+        if obj is None or not quad:
+            overlay.hide()
+            return
+        if not overlay.size.hasFocus():
+            overlay.set_state(round(obj.font_size), obj.bold, obj.italic)
+        overlay.adjustSize()
+        bounds = self.camera_transform().map(
+            QPolygonF([QPointF(*point) for point in quad])
+        ).boundingRect()
+        x = round(bounds.center().x() - overlay.width() / 2)
+        y = round(bounds.top() - overlay.height() - 8)
+        if y < 8:
+            y = round(bounds.bottom() + 8)
+        x = max(8, min(max(8, self.width() - overlay.width() - 8), x))
+        y = max(8, min(max(8, self.height() - overlay.height() - 8), y))
+        overlay.move(x, y)
+        overlay.show()
+        overlay.raise_()
+
+    def _finish_text_property_change(self, before: dict, label: str) -> None:
+        if self.chapter is None:
+            return
+        after = self.chapter.to_dict()
+        if before != after:
+            self.push_model_change(before, after, label)
+            self.documentChanged.emit(QRectF())
+        self.update()
+        self.interactionFinished.emit()
+
+    def _change_selected_text_property(
+        self, key: str, value, *, relative: bool = False, label: str,
+    ) -> None:
+        obj = self._selected_text_for_gizmos()
+        if obj is None:
+            return
+        self.commit_active_text_edit()
+        obj = self._selected_text_for_gizmos()
+        if obj is None:
+            return
+        before = self.chapter.to_dict()
+        if key == "font_size":
+            current = round(float(obj.font_size))
+            target = current + int(value) if relative else int(value)
+            obj.font_size = max(6, min(250, target))
+        else:
+            setattr(obj, key, value)
+        self._finish_text_property_change(before, label)
+
+    def _toggle_selected_text_property(self, key: str, label: str) -> None:
+        obj = self._selected_text_for_gizmos()
+        if obj is not None:
+            self._change_selected_text_property(
+                key, not bool(getattr(obj, key)), label=label
+            )
+
+    def _begin_text_size_edit(self, value: int) -> None:
+        del value
+        obj = self._selected_text_for_gizmos()
+        if obj is None:
+            return
+        self.commit_active_text_edit()
+        obj = self._selected_text_for_gizmos()
+        if obj is None:
+            return
+        self._text_size_edit_before = self.chapter.to_dict()
+        self._text_size_edit_object_id = obj.object_id
+        self._text_size_edit_canceled = False
+
+    def _cancel_text_size_edit(self) -> None:
+        self._text_size_edit_canceled = True
+        self._text_size_edit_before = None
+        self._text_size_edit_object_id = ""
+        self.update()
+
+    def _commit_text_size_edit(self, value: int) -> None:
+        if self._text_size_edit_canceled:
+            self._text_size_edit_canceled = False
+            self._update_text_gizmo_overlay()
+            return
+        before, self._text_size_edit_before = self._text_size_edit_before, None
+        object_id, self._text_size_edit_object_id = (
+            self._text_size_edit_object_id, ""
+        )
+        if before is None or self.chapter is None:
+            return
+        obj = self.chapter.objects.get(object_id)
+        if not isinstance(obj, TextObject) or object_id != self.selected_object_id:
+            return
+        obj.font_size = max(6, min(250, int(value)))
+        self._finish_text_property_change(before, "Set text size")
+
+    def _text_property_handle_positions(self) -> dict[str, QPointF]:
+        obj = self._selected_text_for_gizmos()
+        quad = self._selected_world_quad() if obj is not None else None
+        if not quad:
+            return {}
+        top_right = QPointF(*quad[1])
+        bottom_right = QPointF(*quad[2])
+        edge = bottom_right - top_right
+        return {
+            "font_size": top_right + edge / 3.0,
+            "kerning": top_right + edge * (2.0 / 3.0),
+        }
+
+    def _text_property_handle_hit(self, widget_point: QPointF) -> str:
+        for key, world in self._text_property_handle_positions().items():
+            position = self.document_to_widget(world)
+            if math.dist(position.toTuple(), widget_point.toTuple()) <= 14:
+                return key
+        return ""
+
+    def _begin_text_property_drag(self, widget_point: QPointF) -> bool:
+        key = self._text_property_handle_hit(widget_point)
+        obj = self._selected_text_for_gizmos()
+        if not key or obj is None:
+            return False
+        self.commit_active_text_edit()
+        obj = self._selected_text_for_gizmos()
+        if obj is None:
+            return False
+        self._text_property_drag = {
+            "key": key,
+            "object_id": obj.object_id,
+            "before": self.chapter.to_dict(),
+            "start_x": widget_point.x(),
+            "current_x": widget_point.x(),
+            "start_value": float(getattr(obj, key)),
+            "steps": 0,
+        }
+        self.setCursor(Qt.CursorShape.SizeHorCursor)
+        return True
+
+    def _update_text_property_drag(self, widget_point: QPointF) -> None:
+        state = self._text_property_drag
+        if state is None or self.chapter is None:
+            return
+        obj = self.chapter.objects.get(state["object_id"])
+        if not isinstance(obj, TextObject):
+            return
+        state["current_x"] = widget_point.x()
+        delta = widget_point.x() - state["start_x"]
+        steps = math.trunc(delta / 4.0)
+        if steps == state["steps"]:
+            self.update()
+            return
+        state["steps"] = steps
+        if steps == 0:
+            value = state["start_value"]
+        elif state["key"] == "font_size":
+            value = max(
+                10, min(100, round(state["start_value"]) + steps)
+            )
+        else:
+            value = max(
+                1.0,
+                min(10.0, round((state["start_value"] + steps * 0.1) * 10) / 10),
+            )
+        setattr(obj, state["key"], value)
+        self.documentChanged.emit(QRectF())
+        self.update()
+
+    def _finish_text_property_drag(self) -> bool:
+        state, self._text_property_drag = self._text_property_drag, None
+        if state is None or self.chapter is None:
+            return False
+        self.unsetCursor()
+        label = (
+            "Drag text size" if state["key"] == "font_size"
+            else "Drag text kerning"
+        )
+        self._finish_text_property_change(state["before"], label)
+        return True
+
+    def _cancel_text_property_drag(self) -> bool:
+        state, self._text_property_drag = self._text_property_drag, None
+        if state is None or self.chapter is None:
+            return False
+        obj = self.chapter.objects.get(state["object_id"])
+        if isinstance(obj, TextObject):
+            setattr(obj, state["key"], state["start_value"])
+        self.unsetCursor()
+        self.documentChanged.emit(QRectF())
+        self.update()
+        self.interactionFinished.emit()
+        return True
 
     def _editing_text_object(self) -> TextObject | None:
         if (

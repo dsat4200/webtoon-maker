@@ -23,10 +23,11 @@ workflow.
 - Explicit, non-clipping raster interaction frames with drag-to-create
 - Named pressure-curve pencil presets, independent pressure channels,
   density/taper/antialias controls, and configurable S/M/L sizes
-- Live on-canvas text editing with free/projective and strict wrapped layouts
+- Live on-canvas text editing with selection-scoped size/style gizmos and
+  free/projective or strict wrapped layouts
 - Eight-handle free/uniform transforms for text and sparse raster objects
-- Cached raster transform previews, fast sparse translation, and spatially
-  culled projective commits
+- Cached raster/text transform previews, fast sparse translation, and
+  spatially culled projective commits
 - Global formatting-only text presets
 - Drag-reorderable layer/object tree
 - Outliner Rename and Copy as Asset context actions
@@ -62,6 +63,8 @@ Navigation defaults:
 - `Ctrl` + mouse wheel: zoom
 - `P`, `E`, `F`, `S`, `T`, `B`: Pencil, Eraser, Fill, Object Select,
   Transform, Shape Edit
+- `Delete`: delete the selected layer or object when no field or canvas
+  sub-editor owns the key
 
 Hotkeys are editable as single simultaneous chords, including modifier-only
 bindings such as `Ctrl` or `Ctrl+Shift`. Tool bindings can enable **Hold**:
@@ -98,15 +101,17 @@ compiles the visible Boolean result into one editable multi-contour shape,
 preserving holes, disconnected regions, ignored branches, and object
 positions as one undoable operation.
 
-Select a text object to enter Text Edit. Its UI label is derived from the
-first 16 normalized characters of its content. Strict text wraps to its
-parent layer with a uniform margin; Free text keeps its own projective
-transform rectangle. The compact inspector's Align popup provides the same
-3×3 alignment choices in both modes, using the free text rectangle as the
-alignment frame when transformed. Double-click inside a free text transform
-to return to Text Edit at that position. Raster translations preserve their
-sparse tiles, while scale/projective transforms bake into sparse tiles. Both
-use the program's standard Undo and Redo commands.
+Select a text object to enter Text Edit and open its Object/Presets,
+Typography, and Layout groups in Tool Settings. Its UI label is derived from
+the first 16 normalized characters of its content. The canvas shows selected-
+text size, bold, and italic controls plus right-edge size and kerning scrub
+handles. Strict text wraps to its parent layer with a uniform margin; Free
+text keeps its own projective transform rectangle. Both modes provide 3×3
+alignment, using the free text rectangle as the alignment frame when
+transformed. Double-click inside a free text transform to return to Text Edit
+at that position. Raster translations preserve their sparse tiles, while
+scale/projective transforms bake into sparse tiles. Both use the program's
+standard Undo and Redo commands.
 
 Raster and text objects may live directly under a page or under another
 container layer. Use Add Raster and drag a frame before drawing. The selected

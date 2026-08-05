@@ -4,7 +4,7 @@ import json
 
 from comic_editor.core import settings as settings_module
 from comic_editor.core.settings import (
-    default_hotkey_hold, default_hotkeys, load_settings,
+    default_hotkey_hold, default_hotkeys, load_settings, save_settings,
 )
 from comic_editor.ui.main_window import MainWindow
 
@@ -72,7 +72,7 @@ def test_settings_v8_migration_removes_transform_snap_and_disables_hold(
     }), encoding="utf-8")
     _use_settings_file(monkeypatch, path)
     loaded = load_settings()
-    assert loaded.settings_version == 11
+    assert loaded.settings_version == 12
     assert loaded.page_scope_select is False
     assert loaded.transform_mode == "uniform"
     assert loaded.snap_to_grid is False
@@ -95,7 +95,7 @@ def test_vector_and_fill_settings_are_normalized(monkeypatch, tmp_path):
         "fill_mode": "other",
     }), encoding="utf-8")
     loaded = load_settings()
-    assert loaded.settings_version == 11
+    assert loaded.settings_version == 12
     assert loaded.vector_eraser_mode == "stroke"
     assert loaded.vector_simplify_amount == 100
     assert loaded.vector_redraw_opacity_max == 0
@@ -119,7 +119,7 @@ def test_settings_v9_normalizes_splitter_sizes(monkeypatch, tmp_path):
 
     loaded = load_settings()
 
-    assert loaded.settings_version == 11
+    assert loaded.settings_version == 12
     assert loaded.ui_splitter_sizes == {
         "sidebar_workspace": [260, 1100],
         "tools_colors": [0, 440],
@@ -157,3 +157,29 @@ def test_default_text_preset_is_protected_and_formatting_only():
     assert loaded.text_presets[0]["name"] == "Default"
     assert loaded.text_presets[0]["font_size"] == 48
     assert "text" not in loaded.text_presets[0]
+
+
+def test_settings_v12_adds_font_preview_delete_and_integer_text_sizes(
+    monkeypatch, tmp_path,
+):
+    path = tmp_path / "settings.json"
+    _use_settings_file(monkeypatch, path)
+    path.write_text(json.dumps({
+        "settings_version": 11,
+        "text_presets": [
+            {"name": "Default", "font_size": 32.6},
+            {"name": "Large", "font_size": 999},
+        ],
+        "hotkeys": {"save": "Ctrl+S"},
+    }), encoding="utf-8")
+
+    loaded = load_settings()
+
+    assert loaded.settings_version == 12
+    assert loaded.preview_font_names is False
+    assert loaded.hotkeys["delete_selected"] == "Delete"
+    assert [item["font_size"] for item in loaded.text_presets] == [33, 250]
+
+    loaded.preview_font_names = True
+    save_settings(loaded)
+    assert load_settings().preview_font_names is True

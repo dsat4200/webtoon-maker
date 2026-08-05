@@ -14,7 +14,8 @@ from PySide6.QtGui import (
     QAction, QCloseEvent, QCursor, QKeySequence, QMouseEvent, QShortcut,
 )
 from PySide6.QtWidgets import (
-    QApplication, QCheckBox, QComboBox, QDockWidget, QFileDialog, QHBoxLayout,
+    QAbstractSpinBox, QApplication, QCheckBox, QComboBox, QDockWidget,
+    QFileDialog, QHBoxLayout,
     QDialog, QDialogButtonBox, QFormLayout, QHeaderView, QInputDialog, QLabel,
     QLineEdit, QMainWindow, QMenu, QMessageBox, QPlainTextEdit, QPushButton,
     QScrollArea, QSizePolicy, QSpinBox, QSplitter, QTabBar, QTabWidget, QTextEdit,
@@ -51,7 +52,8 @@ from comic_editor.ui.pencil_settings_dialog import PencilSettingsDialog
 from comic_editor.ui.preview import ChapterPreview
 from comic_editor.ui.ribbon import RibbonWidget
 from comic_editor.ui.tool_ribbon_pages import (
-    RasterObjectControls, ToolSettingsControls, VectorToolsControls,
+    RasterObjectControls, TextObjectControls, ToolSettingsControls,
+    VectorToolsControls,
 )
 from comic_editor.ui.tree_model import HierarchyModel
 from comic_editor.ui.asset_library import AssetLibraryWidget
@@ -344,13 +346,13 @@ class MainWindow(QMainWindow):
         self.tool_settings_page = self.ribbon.add_page(
             "tool_settings", "Tool Settings"
         )
-        settings_group = self.tool_settings_page.add_group(
+        self.tool_settings_group = self.tool_settings_page.add_group(
             "Current tool", minimum_width=720
         )
         self.tool_settings_controls = ToolSettingsControls(
             self.settings, self.ribbon
         )
-        settings_group.add_widget(self.tool_settings_controls)
+        self.tool_settings_group.add_widget(self.tool_settings_controls)
 
         self.asset_library_page = self.ribbon.add_page(
             "asset_library", "Asset Library"
@@ -397,6 +399,33 @@ class MainWindow(QMainWindow):
         canvas_layout.setContentsMargins(0, 0, 0, 0)
         canvas_layout.setSpacing(0)
         self.canvas = create_canvas(self.settings)
+        self.text_object_controls = TextObjectControls(
+            self.canvas, self.settings, self.ribbon
+        )
+        self.text_object_group = self.tool_settings_page.add_group(
+            "Text Object & Presets", minimum_width=360
+        )
+        self.text_object_group.add_widget(
+            self.text_object_controls.object_widget
+        )
+        self.text_typography_group = self.tool_settings_page.add_group(
+            "Typography", minimum_width=430
+        )
+        self.text_typography_group.add_widget(
+            self.text_object_controls.typography_widget
+        )
+        self.text_layout_group = self.tool_settings_page.add_group(
+            "Text Layout", minimum_width=430
+        )
+        self.text_layout_group.add_widget(
+            self.text_object_controls.layout_widget
+        )
+        for group in (
+            self.text_object_group,
+            self.text_typography_group,
+            self.text_layout_group,
+        ):
+            group.hide()
         self.raster_object_controls = RasterObjectControls(
             self.canvas, self.settings, self.ribbon
         )
@@ -577,6 +606,7 @@ class MainWindow(QMainWindow):
         self.layout_settings_timer.setSingleShot(True)
         self._vector_ribbon_context = False
         self._raster_ribbon_context = False
+        self._text_ribbon_context = False
         self._gradient_ribbon_context = False
         self._selected_gradient_ribbon_id = ""
         self._manual_ribbon_page = ""
@@ -676,6 +706,9 @@ class MainWindow(QMainWindow):
         self.canvas.toolChanged.connect(self._canvas_tool_changed)
         self.canvas.interactionFinished.connect(self.inspector.refresh)
         self.canvas.interactionFinished.connect(self.layer_settings.refresh)
+        self.canvas.interactionFinished.connect(
+            self.text_object_controls.refresh
+        )
         self.canvas.selectionCandidatesRequested.connect(
             self._show_selection_candidates
         )
@@ -767,6 +800,12 @@ class MainWindow(QMainWindow):
         )
         self.tool_settings_controls.settingsChanged.connect(
             self._ribbon_settings_changed
+        )
+        self.text_object_controls.settingsChanged.connect(
+            self._ribbon_settings_changed
+        )
+        self.text_object_controls.objectChanged.connect(
+            self._hierarchy_changed
         )
         self.vector_tools_controls.settingsChanged.connect(
             self._ribbon_settings_changed
@@ -887,6 +926,7 @@ class MainWindow(QMainWindow):
             "reset_view": self.canvas.reset_view,
             "toggle_grid": self._toggle_grid,
             "select_all": self.canvas.select_all_drawing,
+            "delete_selected": self._delete_selected,
         }
         self._hotkey_bindings = {
             action_id: chord_keys(value)
@@ -941,9 +981,13 @@ class MainWindow(QMainWindow):
     def _hotkey_is_suppressed(
         self, action_id: str, chord: frozenset[int],
     ) -> bool:
+        if action_id == "delete_selected":
+            return (
+                self._hotkey_text_input_active()
+                or self.canvas.reserves_delete_key()
+            )
         if not self._hotkey_text_input_active():
             return False
-        display = chord_text(chord)
         regular = [key for key in chord if key not in MODIFIER_LABELS]
         contains_letter = any(
             len(QKeySequence(key).toString(QKeySequence.PortableText)) == 1
@@ -957,7 +1001,7 @@ class MainWindow(QMainWindow):
     def _hotkey_text_input_active(self) -> bool:
         focus = QApplication.focusWidget()
         return self._hotkey_text_editing or isinstance(
-            focus, (QLineEdit, QPlainTextEdit, QTextEdit)
+            focus, (QAbstractSpinBox, QLineEdit, QPlainTextEdit, QTextEdit)
         )
 
     def _trigger_hotkey(
@@ -1026,6 +1070,14 @@ class MainWindow(QMainWindow):
         self._hotkey_pressed.add(key)
         chord = frozenset(self._hotkey_pressed)
         if (
+            key == int(Qt.Key_Delete)
+            and (
+                self._hotkey_text_input_active()
+                or self.canvas.reserves_delete_key()
+            )
+        ):
+            return False
+        if (
             self._hotkey_active_hold is not None
             and self._hotkey_active_hold["chord"] < chord
         ):
@@ -1035,6 +1087,12 @@ class MainWindow(QMainWindow):
             self._hotkey_pending = None
         action_id = self._hotkey_action_for_chord(chord)
         prefix = self._hotkey_is_prefix(chord)
+        if (
+            action_id is not None
+            and self._hotkey_is_suppressed(action_id, chord)
+        ):
+            action_id = None
+            prefix = False
         text_conflict = (
             self._hotkey_text_input_active()
             and (
@@ -1044,9 +1102,6 @@ class MainWindow(QMainWindow):
                     and len(QKeySequence(candidate).toString(
                         QKeySequence.PortableText
                     )) == 1
-                    and QKeySequence(candidate).toString(
-                        QKeySequence.PortableText
-                    ).isalpha()
                     for candidate in chord
                 )
             )
@@ -1070,6 +1125,20 @@ class MainWindow(QMainWindow):
     def _hotkey_release(self, key: int) -> bool:
         chord = frozenset(self._hotkey_pressed)
         consumed = any(key in binding for binding in self._hotkey_bindings.values())
+        if (
+            key == int(Qt.Key_Delete)
+            and (
+                self._hotkey_text_input_active()
+                or self.canvas.reserves_delete_key()
+            )
+        ):
+            consumed = False
+        release_action = self._hotkey_action_for_chord(chord)
+        if (
+            release_action is not None
+            and self._hotkey_is_suppressed(release_action, chord)
+        ):
+            consumed = False
         if self._hotkey_text_input_active() and (
             int(Qt.Key_Shift) in chord
             or any(
@@ -1077,9 +1146,6 @@ class MainWindow(QMainWindow):
                 and len(QKeySequence(candidate).toString(
                     QKeySequence.PortableText
                 )) == 1
-                and QKeySequence(candidate).toString(
-                    QKeySequence.PortableText
-                ).isalpha()
                 for candidate in chord
             )
         ):
@@ -2478,6 +2544,7 @@ class MainWindow(QMainWindow):
             selected_object, (VectorDrawingObject, VectorFillObject)
         )
         raster_active = isinstance(selected_object, RasterObject)
+        text_active = isinstance(selected_object, TextObject)
         selected_gradient = self.gradient_tools_controls.selected_gradient()
         gradient_selected = selected_gradient is not None
         gradient_parent_id = self._gradient_context_parent_id()
@@ -2486,6 +2553,7 @@ class MainWindow(QMainWindow):
         entering_raster = (
             raster_active and not self._raster_ribbon_context
         )
+        entering_text = text_active and not self._text_ribbon_context
         selected_gradient_id = (
             selected_gradient.object_id if gradient_selected else ""
         )
@@ -2495,6 +2563,7 @@ class MainWindow(QMainWindow):
         )
         self._vector_ribbon_context = active
         self._raster_ribbon_context = raster_active
+        self._text_ribbon_context = text_active
         self._gradient_ribbon_context = gradient_active
         self._selected_gradient_ribbon_id = selected_gradient_id
         self.ribbon.set_page_visible("vector_tools", active)
@@ -2502,12 +2571,21 @@ class MainWindow(QMainWindow):
             "raster_object_settings", raster_active
         )
         self.ribbon.set_page_visible("gradient_tools", gradient_active)
+        self.tool_settings_group.setVisible(not text_active)
+        for group in (
+            self.text_object_group,
+            self.text_typography_group,
+            self.text_layout_group,
+        ):
+            group.setVisible(text_active)
         if (
             self._manual_ribbon_page
             and not self.ribbon.is_page_visible(self._manual_ribbon_page)
         ):
             self._manual_ribbon_page = ""
-        if entering:
+        if entering_text:
+            self._select_ribbon_page("tool_settings")
+        elif entering:
             self._select_ribbon_page("vector_tools")
         elif entering_raster:
             self._select_ribbon_page("raster_object_settings")
@@ -2518,6 +2596,8 @@ class MainWindow(QMainWindow):
         self.tool_settings_controls.set_context(
             self.canvas.tool, vector_active=vector_tool_context
         )
+        if text_active:
+            self.text_object_controls.refresh()
         if drawing is not None:
             selected_points = len(
                 getattr(
@@ -2851,6 +2931,8 @@ class MainWindow(QMainWindow):
             self.chapter.objects.get(entity_id)
             if self.chapter is not None and kind == "object" else None
         )
+        if isinstance(selected_object, TextObject):
+            self._select_ribbon_page("tool_settings")
         if (
             self.canvas.tool in {
                 ToolKind.RASTER_PENCIL, ToolKind.RASTER_ERASER,
@@ -2869,7 +2951,9 @@ class MainWindow(QMainWindow):
         else:
             self.inspector.refresh()
         self._sync_tool_buttons()
-        if tool in {ToolKind.RASTER_PENCIL, ToolKind.RASTER_ERASER}:
+        if tool in {
+            ToolKind.RASTER_PENCIL, ToolKind.RASTER_ERASER, ToolKind.TEXT_EDIT,
+        }:
             # _sync_tool_buttons() refreshes contextual pages first.  Select
             # Tool Settings afterward so entering a raster/vector context
             # cannot immediately replace the user's pencil controls.
@@ -3467,6 +3551,7 @@ class MainWindow(QMainWindow):
         self.settings.clamp()
         save_settings(self.settings)
         self.tool_settings_controls.refresh()
+        self.text_object_controls.refresh()
         self.vector_tools_controls.refresh()
         self.raster_object_controls.refresh()
         self.canvas.refresh_brush_settings()

@@ -254,7 +254,7 @@ On chapter open, `has_recovery()` compares the recovery manifest modification ti
 
 ## Editor settings data
 
-`EditorSettings` is version 11 and is written to the platform path returned by Qt's `QStandardPaths.AppConfigLocation`, in `settings.json`. It is not stored in the portable series folder.
+`EditorSettings` is version 12 and is written to the platform path returned by Qt's `QStandardPaths.AppConfigLocation`, in `settings.json`. It is not stored in the portable series folder.
 
 It contains:
 
@@ -263,14 +263,16 @@ It contains:
 - pencil presets and active preset;
 - eraser shape;
 - transform and rectangle edit modes;
-- text formatting presets and active preset;
+- text formatting presets, active preset, and whether font-list entries preview their own families;
 - all hotkey chords and Hold flags;
 - vector eraser, fitting, redraw, and simplify settings;
 - fill tracing/area settings;
 - three workspace splitter states; and
 - up to 12 recent series paths.
 
-Loading progressively backfills/migrates settings from earlier versions, filters unknown fields, clamps values, protects the default Linear pencil and Default text presets, and always emits version 11 on save. Settings save through a temporary file followed by replace.
+Loading progressively backfills/migrates settings from earlier versions, filters unknown fields, clamps values, protects the default Linear pencil and Default text presets, adds the default Delete Selected binding, and always emits version 12 on save. Text-preset sizes normalize to integers from 6 through 250. Settings save through a temporary file followed by replace.
+
+The chapter `TextObject.font_size` field remains numeric and the chapter schema stays at version 14. Fractional or out-of-range legacy document values continue rendering unchanged until a user edits that specific object's size through a ribbon or canvas control; such edits store an integer from 6 through 250.
 
 Primary/secondary colors, palettes, and gradient presets are **series** preferences, not editor settings. `brush_color` remains as a compatibility/current-primary bridge for drawing behavior.
 
