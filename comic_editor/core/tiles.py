@@ -17,6 +17,10 @@ class TileStore:
     def __init__(self, tile_size: int = TILE_SIZE) -> None:
         self.tile_size = tile_size
         self._tiles: dict[str, dict[tuple[int, int], QImage]] = {}
+        self._alpha_bounds: dict[
+            str, dict[tuple[int, int], tuple[int, int, int, int] | None]
+        ] = {}
+        self._alpha_bounds_dirty: set[tuple[str, int, int]] = set()
         self.dirty: set[tuple[str, int, int]] = set()
 
     @staticmethod
@@ -31,14 +35,22 @@ class TileStore:
         if image is None and create:
             image = self._empty(self.tile_size)
             object_tiles[key] = image
+            self._alpha_bounds.setdefault(object_id, {})[key] = None
         return image
 
     def set_tile(self, object_id: str, key: tuple[int, int], image: QImage | None) -> None:
         object_tiles = self._tiles.setdefault(object_id, {})
-        if image is None or image.isNull() or self.is_empty(image):
+        bounds = (
+            None if image is None or image.isNull()
+            else self._alpha_bbox(image)
+        )
+        if bounds is None:
             object_tiles.pop(key, None)
+            self._alpha_bounds.setdefault(object_id, {}).pop(key, None)
         else:
             object_tiles[key] = QImage(image)
+            self._alpha_bounds.setdefault(object_id, {})[key] = bounds
+        self._alpha_bounds_dirty.discard((object_id, key[0], key[1]))
         self.dirty.add((object_id, key[0], key[1]))
 
     def snapshot(self, object_id: str, keys: set[tuple[int, int]]) -> dict[tuple[int, int], QImage | None]:
@@ -63,37 +75,47 @@ class TileStore:
         antialias: bool = True,
         before: dict[tuple[int, int], QImage | None] | None = None,
     ) -> QRectF:
-        half = max(0.5, size / 2)
-        rect = QRectF(point.x() - half - 2, point.y() - half - 2, size + 4, size + 4)
-        for key in self.keys_for_rect(rect):
-            image = self.tile(object_id, key)
-            if before is not None and key not in before:
-                before[key] = QImage(image) if image is not None else None
-            image = self.tile(object_id, key, create=True)
-            painter = QPainter(image)
-            painter.setRenderHint(QPainter.Antialiasing, antialias)
-            painter.setCompositionMode(
-                QPainter.CompositionMode_Clear if erase else QPainter.CompositionMode_SourceOver
-            )
-            local = QPointF(
-                point.x() - key[0] * self.tile_size,
-                point.y() - key[1] * self.tile_size,
-            )
-            if erase:
-                painter.setPen(Qt.NoPen)
-                painter.setBrush(Qt.black)
-            else:
-                actual = QColor(color)
-                actual.setAlphaF(max(0.0, min(1.0, opacity)))
-                painter.setPen(Qt.NoPen)
-                painter.setBrush(actual)
-            if square:
-                painter.drawRect(QRectF(local.x() - half, local.y() - half, size, size))
-            else:
-                painter.drawEllipse(local, half, half)
-            painter.end()
-            self.dirty.add((object_id, key[0], key[1]))
-        return rect
+        return self._paint_samples(
+            object_id, [(QPointF(point), float(size), float(opacity))],
+            color, erase=erase, square=square, antialias=antialias,
+            before=before,
+        )
+
+    def paint_segment(
+        self, object_id: str, start: QPointF, end: QPointF,
+        size_start: float, size_end: float, color: QColor,
+        opacity_start: float = 1.0, opacity_end: float = 1.0,
+        erase: bool = False, square: bool = False,
+        antialias: bool = True, density: float = 1.0,
+        before: dict[tuple[int, int], QImage | None] | None = None,
+    ) -> QRectF:
+        """Paint one pressure-varying segment with one painter per tile.
+
+        The starting endpoint is deliberately omitted because the preceding
+        segment (or the initial dab) already painted it.
+        """
+        distance = math.hypot(end.x() - start.x(), end.y() - start.y())
+        reference_size = max(0.5, min(float(size_start), float(size_end)))
+        spacing = max(
+            0.5,
+            max(0.75, reference_size / 4) / max(0.1, float(density)),
+        )
+        steps = max(1, int(math.ceil(distance / spacing)))
+        samples: list[tuple[QPointF, float, float]] = []
+        for index in range(1, steps + 1):
+            ratio = index / steps
+            samples.append((
+                QPointF(
+                    start.x() + (end.x() - start.x()) * ratio,
+                    start.y() + (end.y() - start.y()) * ratio,
+                ),
+                size_start + (size_end - size_start) * ratio,
+                opacity_start + (opacity_end - opacity_start) * ratio,
+            ))
+        return self._paint_samples(
+            object_id, samples, color, erase=erase, square=square,
+            antialias=antialias, before=before,
+        )
 
     def paint_line(
         self, object_id: str, start: QPointF, end: QPointF, size: float,
@@ -102,37 +124,121 @@ class TileStore:
         density: float = 1.0,
         before: dict[tuple[int, int], QImage | None] | None = None,
     ) -> QRectF:
-        distance = math.hypot(end.x() - start.x(), end.y() - start.y())
-        spacing = max(0.5, max(0.75, size / 4) / max(0.1, density))
-        steps = max(1, int(math.ceil(distance / spacing)))
+        return self.paint_segment(
+            object_id, start, end, size, size, color,
+            opacity_start, opacity_end, erase, square, antialias,
+            density, before,
+        )
+
+    def _paint_samples(
+        self, object_id: str,
+        samples: list[tuple[QPointF, float, float]], color: QColor,
+        *, erase: bool, square: bool, antialias: bool,
+        before: dict[tuple[int, int], QImage | None] | None,
+    ) -> QRectF:
+        if not samples:
+            return QRectF()
+        object_tiles = self._tiles.setdefault(object_id, {})
+        grouped: dict[
+            tuple[int, int], list[tuple[QPointF, float, float]]
+        ] = {}
         dirty = QRectF()
-        for index in range(1, steps + 1):
-            ratio = index / steps
-            point = QPointF(
-                start.x() + (end.x() - start.x()) * ratio,
-                start.y() + (end.y() - start.y()) * ratio,
+        for point, size, opacity in samples:
+            size = max(1.0, float(size))
+            half = max(0.5, size / 2)
+            dab_rect = QRectF(
+                point.x() - half - 2, point.y() - half - 2,
+                size + 4, size + 4,
             )
-            opacity = opacity_start + (opacity_end - opacity_start) * ratio
-            dab = self.paint_dab(
-                object_id, point, size, color, opacity, erase, square,
-                antialias, before,
+            dirty = dab_rect if dirty.isEmpty() else dirty.united(dab_rect)
+            for key in self.keys_for_rect(dab_rect):
+                if erase and key not in object_tiles:
+                    continue
+                grouped.setdefault(key, []).append((point, size, opacity))
+        if not grouped:
+            return QRectF()
+        bounds_cache = self._alpha_bounds.setdefault(object_id, {})
+        for key, dabs in grouped.items():
+            image = object_tiles.get(key)
+            if before is not None and key not in before:
+                before[key] = QImage(image) if image is not None else None
+            if image is None:
+                image = self._empty(self.tile_size)
+                object_tiles[key] = image
+                bounds_cache[key] = None
+            painter = QPainter(image)
+            painter.setRenderHint(QPainter.Antialiasing, antialias)
+            painter.setCompositionMode(
+                QPainter.CompositionMode_Clear
+                if erase else QPainter.CompositionMode_SourceOver
             )
-            dirty = dab if dirty.isEmpty() else dirty.united(dab)
+            painter.setPen(Qt.NoPen)
+            if erase:
+                painter.setBrush(Qt.black)
+            approximate = bounds_cache.get(key)
+            cache_known = (
+                key in bounds_cache
+                and (object_id, key[0], key[1])
+                not in self._alpha_bounds_dirty
+            )
+            for point, size, opacity in dabs:
+                half = max(0.5, size / 2)
+                local = QPointF(
+                    point.x() - key[0] * self.tile_size,
+                    point.y() - key[1] * self.tile_size,
+                )
+                if not erase:
+                    actual = QColor(color)
+                    actual.setAlphaF(max(0.0, min(1.0, opacity)))
+                    painter.setBrush(actual)
+                if square:
+                    painter.drawRect(QRectF(
+                        local.x() - half, local.y() - half, size, size
+                    ))
+                else:
+                    painter.drawEllipse(local, half, half)
+                if not erase and cache_known and opacity > 0:
+                    dab_bounds = (
+                        max(0, math.floor(local.x() - half)),
+                        max(0, math.floor(local.y() - half)),
+                        min(self.tile_size, math.ceil(local.x() + half)),
+                        min(self.tile_size, math.ceil(local.y() + half)),
+                    )
+                    if approximate is None:
+                        approximate = dab_bounds
+                    else:
+                        approximate = (
+                            min(approximate[0], dab_bounds[0]),
+                            min(approximate[1], dab_bounds[1]),
+                            max(approximate[2], dab_bounds[2]),
+                            max(approximate[3], dab_bounds[3]),
+                        )
+            painter.end()
+            if erase or not cache_known:
+                self._alpha_bounds_dirty.add((object_id, key[0], key[1]))
+            else:
+                bounds_cache[key] = approximate
+            self.dirty.add((object_id, key[0], key[1]))
         return dirty
 
     def iter_tiles(
         self, object_id: str, local_rect: QRectF | None = None,
     ) -> Iterator[tuple[tuple[int, int], QImage]]:
-        for key, image in self._tiles.get(object_id, {}).items():
-            tile_rect = QRectF(
-                key[0] * self.tile_size, key[1] * self.tile_size,
-                self.tile_size, self.tile_size,
-            )
-            if local_rect is None or tile_rect.intersects(local_rect):
+        object_tiles = self._tiles.get(object_id, {})
+        if local_rect is None:
+            yield from object_tiles.items()
+            return
+        for key in self.keys_for_rect(local_rect):
+            image = object_tiles.get(key)
+            if image is not None:
                 yield key, image
 
     def remove_object(self, object_id: str) -> None:
         self._tiles.pop(object_id, None)
+        self._alpha_bounds.pop(object_id, None)
+        self._alpha_bounds_dirty = {
+            item for item in self._alpha_bounds_dirty if item[0] != object_id
+        }
         self.dirty = {item for item in self.dirty if item[0] != object_id}
 
     def object_tiles(self, object_id: str) -> dict[tuple[int, int], QImage]:
@@ -151,6 +257,13 @@ class TileStore:
             if image is not None and not image.isNull() and not self.is_empty(image)
         }
         self._tiles[object_id] = replacement
+        bounds_cache = self._alpha_bounds.setdefault(object_id, {})
+        bounds_cache.clear()
+        for key, image in replacement.items():
+            bounds_cache[key] = self._alpha_bbox(image)
+        self._alpha_bounds_dirty = {
+            item for item in self._alpha_bounds_dirty if item[0] != object_id
+        }
         for x, y in previous | set(replacement):
             self.dirty.add((object_id, x, y))
 
@@ -158,7 +271,7 @@ class TileStore:
         result = QRectF()
         found = False
         for (tile_x, tile_y), image in self._tiles.get(object_id, {}).items():
-            bbox = self._alpha_bbox(image)
+            bbox = self._cached_alpha_bbox(object_id, (tile_x, tile_y), image)
             if bbox is None:
                 continue
             left, top, right, bottom = bbox
@@ -231,21 +344,33 @@ class TileStore:
 
     def prune_empty(self, object_id: str, keys: set[tuple[int, int]]) -> None:
         object_tiles = self._tiles.get(object_id, {})
+        bounds_cache = self._alpha_bounds.setdefault(object_id, {})
         for key in keys:
             image = object_tiles.get(key)
-            if image is not None and self.is_empty(image):
+            if (
+                image is not None
+                and self._cached_alpha_bbox(object_id, key, image) is None
+            ):
                 object_tiles.pop(key, None)
+                bounds_cache.pop(key, None)
+                self._alpha_bounds_dirty.discard(
+                    (object_id, key[0], key[1])
+                )
                 self.dirty.add((object_id, key[0], key[1]))
 
     @staticmethod
     def is_empty(image: QImage) -> bool:
-        # QImage has no cheap alpha bounding box API; a small downscale rejects
-        # most empty tiles before the exact scan used only after erasing.
-        for y in range(image.height()):
-            for x in range(image.width()):
-                if image.pixelColor(x, y).alpha() != 0:
-                    return False
-        return True
+        return TileStore._alpha_bbox(image) is None
+
+    def _cached_alpha_bbox(
+        self, object_id: str, key: tuple[int, int], image: QImage,
+    ) -> tuple[int, int, int, int] | None:
+        marker = (object_id, key[0], key[1])
+        cache = self._alpha_bounds.setdefault(object_id, {})
+        if key not in cache or marker in self._alpha_bounds_dirty:
+            cache[key] = self._alpha_bbox(image)
+            self._alpha_bounds_dirty.discard(marker)
+        return cache[key]
 
     @staticmethod
     def _alpha_bbox(image: QImage) -> tuple[int, int, int, int] | None:
@@ -271,6 +396,8 @@ class TileStore:
 
     def load_directory(self, root: Path, object_ids: set[str]) -> None:
         self._tiles.clear()
+        self._alpha_bounds.clear()
+        self._alpha_bounds_dirty.clear()
         for object_id in object_ids:
             directory = root / object_id
             if not directory.is_dir():
@@ -286,6 +413,7 @@ class TileStore:
                     self._tiles.setdefault(object_id, {})[key] = image.convertToFormat(
                         QImage.Format_ARGB32_Premultiplied
                     )
+                    self._alpha_bounds_dirty.add((object_id, key[0], key[1]))
         self.dirty.clear()
 
     def save_directory(self, root: Path, object_ids: set[str], complete: bool = False) -> None:

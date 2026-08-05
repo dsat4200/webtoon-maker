@@ -19,6 +19,7 @@ class ChapterPreview(QWidget):
         self.setMinimumHeight(200)
         self.setCursor(Qt.PointingHandCursor)
         canvas.documentChanged.connect(self.invalidate)
+        canvas.visualChanged.connect(self.invalidate)
         canvas.hierarchyChanged.connect(self.invalidate_all)
         canvas.cameraChanged.connect(self.update)
 

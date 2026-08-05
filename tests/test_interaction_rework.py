@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import pytest
 from PySide6.QtCore import QEvent, QPointF, QRectF, Qt
-from PySide6.QtGui import QColor, QInputMethodEvent
+from PySide6.QtGui import (
+    QColor, QInputMethodEvent, QPointingDevice, QTabletEvent,
+)
 from PySide6.QtTest import QTest
 
 from comic_editor.core.models import (
@@ -28,6 +30,39 @@ def _canvas_document(settings: EditorSettings | None = None):
 
 def _widget(canvas, x: float, y: float) -> QPointF:
     return canvas.document_to_widget(QPointF(x, y))
+
+
+class _TouchPoint:
+    def __init__(self, position: QPointF):
+        self._position = position
+
+    def position(self) -> QPointF:
+        return QPointF(self._position)
+
+
+class _TouchEvent:
+    def __init__(self, event_type, positions):
+        self._type = event_type
+        self._points = [_TouchPoint(point) for point in positions]
+        self.accepted = False
+
+    def type(self):
+        return self._type
+
+    def points(self):
+        return self._points
+
+    def accept(self):
+        self.accepted = True
+
+
+def _tablet_event(event_type, position, pressure, button, buttons):
+    return QTabletEvent(
+        event_type, QPointingDevice.primaryPointingDevice(),
+        position, position, pressure,
+        0.0, 0.0, 0.0, 0.0, 0.0,
+        Qt.NoModifier, button, buttons,
+    )
 
 
 def test_bound_center_drag_translates_only_mask_and_is_undoable(qapp):
@@ -103,41 +138,19 @@ def test_touch_navigation_live_renders_without_viewport_snapshot(
     canvas.rotation = 0
     canvas.scale = 1
 
-    class TouchPoint:
-        def __init__(self, position: QPointF):
-            self._position = position
-
-        def position(self) -> QPointF:
-            return QPointF(self._position)
-
-    class TouchEvent:
-        def __init__(self, event_type, positions):
-            self._type = event_type
-            self._points = [TouchPoint(point) for point in positions]
-            self.accepted = False
-
-        def type(self):
-            return self._type
-
-        def points(self):
-            return self._points
-
-        def accept(self):
-            self.accepted = True
-
     monkeypatch.setattr(
         type(canvas), "grab",
         lambda _self: pytest.fail(
             "touch navigation must not capture the rectangular viewport"
         ),
     )
-    begin = TouchEvent(
+    begin = _TouchEvent(
         QEvent.TouchBegin, [QPointF(100, 100), QPointF(200, 100)]
     )
-    update = TouchEvent(
+    update = _TouchEvent(
         QEvent.TouchUpdate, [QPointF(100, 100), QPointF(100, 300)]
     )
-    end = TouchEvent(QEvent.TouchEnd, [])
+    end = _TouchEvent(QEvent.TouchEnd, [])
 
     assert canvas._touch_event(begin)
     assert canvas._touch_event(update)
@@ -146,6 +159,98 @@ def test_touch_navigation_live_renders_without_viewport_snapshot(
     assert canvas.scale == pytest.approx(2)
     assert canvas._touch_event(end)
     assert begin.accepted and update.accepted and end.accepted
+
+
+def test_pen_hover_keeps_touch_pan_zoom_and_rotation_active(qapp):
+    canvas, _chapter, _page, _layer = _canvas_document(
+        EditorSettings(tablet_mode=True, snap_to_grid=False)
+    )
+    canvas.resize(600, 600)
+    canvas.center_x = canvas.center_y = 300
+    canvas.scale = 1
+    canvas.rotation = 0
+
+    hover = _tablet_event(
+        QEvent.TabletMove, QPointF(250, 250), 0.0,
+        Qt.NoButton, Qt.NoButton,
+    )
+    canvas.tabletEvent(hover)
+    assert canvas._tablet_hover_widget == QPointF(250, 250)
+    assert not canvas._pen_contact_active
+
+    canvas._touch_event(_TouchEvent(
+        QEvent.TouchBegin, [QPointF(100, 100)],
+    ))
+    canvas._touch_event(_TouchEvent(
+        QEvent.TouchUpdate, [QPointF(130, 120)],
+    ))
+    canvas._flush_touch_navigation()
+    assert (canvas.center_x, canvas.center_y) == pytest.approx((270, 280))
+    canvas._touch_event(_TouchEvent(QEvent.TouchEnd, []))
+
+    canvas.center_x = canvas.center_y = 300
+    canvas.scale = 1
+    canvas.rotation = 0
+    canvas._touch_event(_TouchEvent(
+        QEvent.TouchBegin, [QPointF(100, 100), QPointF(200, 100)],
+    ))
+    canvas._touch_event(_TouchEvent(
+        QEvent.TouchUpdate, [QPointF(100, 100), QPointF(100, 300)],
+    ))
+    canvas._flush_touch_navigation()
+    assert canvas.rotation == pytest.approx(90)
+    assert canvas.scale == pytest.approx(2)
+
+
+def test_pen_contact_cancels_and_blocks_touch_until_release(qapp):
+    canvas, _chapter, _page, _layer = _canvas_document(
+        EditorSettings(tablet_mode=True, snap_to_grid=False)
+    )
+    canvas.resize(600, 600)
+    canvas.center_x = canvas.center_y = 300
+    canvas.scale = 1
+    canvas.rotation = 0
+
+    canvas._touch_event(_TouchEvent(
+        QEvent.TouchBegin, [QPointF(100, 100)],
+    ))
+    canvas._touch_event(_TouchEvent(
+        QEvent.TouchUpdate, [QPointF(140, 130)],
+    ))
+    assert canvas._touch_pending_points is not None
+
+    canvas.tabletEvent(_tablet_event(
+        QEvent.TabletPress, QPointF(250, 250), 0.5,
+        Qt.LeftButton, Qt.LeftButton,
+    ))
+    assert canvas._pen_contact_active
+    assert canvas._touch_pending_points is None
+    assert not canvas._touch_anchor_points
+
+    before = (canvas.center_x, canvas.center_y, canvas.rotation, canvas.scale)
+    canvas._touch_event(_TouchEvent(
+        QEvent.TouchBegin, [QPointF(100, 100)],
+    ))
+    canvas._touch_event(_TouchEvent(
+        QEvent.TouchUpdate, [QPointF(180, 160)],
+    ))
+    canvas._flush_touch_navigation()
+    assert (canvas.center_x, canvas.center_y, canvas.rotation, canvas.scale) == before
+
+    canvas.tabletEvent(_tablet_event(
+        QEvent.TabletRelease, QPointF(250, 250), 0.0,
+        Qt.NoButton, Qt.NoButton,
+    ))
+    assert not canvas._pen_contact_active
+
+    canvas._touch_event(_TouchEvent(
+        QEvent.TouchBegin, [QPointF(100, 100)],
+    ))
+    canvas._touch_event(_TouchEvent(
+        QEvent.TouchUpdate, [QPointF(130, 120)],
+    ))
+    canvas._flush_touch_navigation()
+    assert (canvas.center_x, canvas.center_y) == pytest.approx((270, 280))
 
 
 def test_tablet_navigation_configures_top_level_window(qapp, monkeypatch):
@@ -480,6 +585,7 @@ def test_text_edit_accepts_keyboard_clipboard_and_ime(qapp):
     QTest.keyClick(canvas, Qt.Key_A, Qt.ControlModifier)
     QTest.keyClick(canvas, Qt.Key_C, Qt.ControlModifier)
     assert qapp.clipboard().text() == "abc\ndef語"
+    QTest.keyRelease(canvas, Qt.Key_Control)
     canvas.hide()
 
 

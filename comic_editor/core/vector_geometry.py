@@ -885,8 +885,14 @@ def fit_freehand(
     error: float = 2.0,
     *,
     resample_spacing: float | None = 1.0,
+    attribute_error: float | None = 0.025,
 ) -> list[FittedPoint]:
-    """Return editable anchors with hidden cubic controls and pressure."""
+    """Return editable cubic anchors while retaining pressure changes.
+
+    Geometry and pressure are fitted independently. Additional pressure
+    anchors split an already-fitted cubic exactly, so expressive pressure
+    peaks survive without changing the fitted centerline.
+    """
     source = (
         deduplicate_samples(samples)
         if resample_spacing is None
@@ -898,24 +904,88 @@ def fit_freehand(
         sample = source[0]
         return [FittedPoint(sample.x, sample.y, sample.pressure)]
     fitted = fit_cubic_path([sample.point for sample in source], error)
-    anchors: list[FittedPoint] = [
-        FittedPoint(
-            source[0].x, source[0].y, source[0].pressure,
-            outgoing=fitted[0].cubic[1],
+    cumulative = [0.0]
+    for first, second in zip(source, source[1:]):
+        cumulative.append(
+            cumulative[-1] + distance(first.point, second.point)
         )
-    ]
-    for segment_index, segment in enumerate(fitted):
-        source_sample = source[segment.end_sample]
+
+    def attribute_knots(first: int, last: int) -> list[int]:
+        tolerance = (
+            None if attribute_error is None
+            else max(0.0, float(attribute_error))
+        )
+        if tolerance is None or last - first < 2:
+            return []
+        selected: set[int] = set()
+        pending = [(first, last)]
+        while pending:
+            left, right = pending.pop()
+            span = cumulative[right] - cumulative[left]
+            maximum = tolerance
+            split_at = -1
+            for index in range(left + 1, right):
+                amount = (
+                    (index - left) / (right - left)
+                    if span <= EPSILON
+                    else (cumulative[index] - cumulative[left]) / span
+                )
+                expected = (
+                    source[left].pressure
+                    + (source[right].pressure - source[left].pressure) * amount
+                )
+                deviation = abs(source[index].pressure - expected)
+                if deviation > maximum:
+                    maximum = deviation
+                    split_at = index
+            if split_at >= 0:
+                selected.add(split_at)
+                pending.append((left, split_at))
+                pending.append((split_at, right))
+        return sorted(selected)
+
+    pieces: list[tuple[Cubic, float]] = []
+    for segment in fitted:
+        indices = attribute_knots(
+            segment.start_sample, segment.end_sample
+        )
+        span = (
+            cumulative[segment.end_sample]
+            - cumulative[segment.start_sample]
+        )
+        parameters: list[float] = []
+        for index in indices:
+            parameters.append((
+                (index - segment.start_sample)
+                / max(1, segment.end_sample - segment.start_sample)
+                if span <= EPSILON
+                else (
+                    cumulative[index] - cumulative[segment.start_sample]
+                ) / span
+            ))
+        starts = [0.0, *parameters]
+        ends = [*parameters, 1.0]
+        pressures = [
+            *[source[index].pressure for index in indices],
+            source[segment.end_sample].pressure,
+        ]
+        pieces.extend(
+            (cubic_subsegment(segment.cubic, start, end), pressure)
+            for start, end, pressure in zip(starts, ends, pressures)
+        )
+
+    anchors: list[FittedPoint] = [FittedPoint(
+        pieces[0][0][0][0], pieces[0][0][0][1], source[0].pressure,
+        outgoing=pieces[0][0][1],
+    )]
+    for index, (cubic, pressure) in enumerate(pieces):
         outgoing = (
-            fitted[segment_index + 1].cubic[1]
-            if segment_index + 1 < len(fitted) else None
+            pieces[index + 1][0][1]
+            if index + 1 < len(pieces) else None
         )
         anchors.append(FittedPoint(
-            segment.cubic[3][0],
-            segment.cubic[3][1],
-            source_sample.pressure,
-            incoming=segment.cubic[2],
-            outgoing=outgoing,
+            cubic[3][0], cubic[3][1], pressure,
+            incoming=cubic[2], outgoing=outgoing,
         ))
     return anchors
 

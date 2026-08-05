@@ -1,10 +1,12 @@
 """Tiled vertical document viewport, renderer, and drawing tools."""
 from __future__ import annotations
 
+import gc
 import math
 import time
 import zlib
 import json
+from collections import deque
 from dataclasses import dataclass
 from enum import Enum
 
@@ -109,8 +111,39 @@ class CanvasSessionState:
     gradient_render_cache: dict
 
 
+class CanvasPerformanceMonitor:
+    """Small bounded recorder for drawing-handler and frame timings."""
+
+    def __init__(self, capacity: int = 512) -> None:
+        self.input_ms: deque[float] = deque(maxlen=capacity)
+        self.submit_ms: deque[float] = deque(maxlen=capacity)
+        self.frame_ms: deque[float] = deque(maxlen=capacity)
+
+    @staticmethod
+    def _percentile(values: deque[float], amount: float) -> float:
+        if not values:
+            return 0.0
+        ordered = sorted(values)
+        index = max(
+            0, min(len(ordered) - 1, round((len(ordered) - 1) * amount))
+        )
+        return ordered[index]
+
+    def snapshot(self, renderer: str) -> dict:
+        return {
+            "renderer": renderer,
+            "input_p50_ms": self._percentile(self.input_ms, 0.50),
+            "input_p95_ms": self._percentile(self.input_ms, 0.95),
+            "input_p99_ms": self._percentile(self.input_ms, 0.99),
+            "submit_p95_ms": self._percentile(self.submit_ms, 0.95),
+            "frame_p95_ms": self._percentile(self.frame_ms, 0.95),
+            "samples": len(self.input_ms),
+        }
+
+
 class _CanvasLogic:
     documentChanged = Signal(object)
+    visualChanged = Signal(object)
     selectionChanged = Signal(str, str)
     hierarchyChanged = Signal()
     chapterReplaced = Signal(object)
@@ -152,6 +185,10 @@ class _CanvasLogic:
         self._stroke_before: dict[tuple[int, int], QImage | None] = {}
         self._stroke_frame_before: tuple[float, float, float, float] | None = None
         self._stroke_erasing = False
+        self._stroke_preset: BrushPreset | None = None
+        self._stroke_base_size = float(settings.pencil_size())
+        self._stroke_dirty_world = QRectF()
+        self._gc_was_enabled = False
         self._pending_raster_transform_press: tuple[
             QPointF, QPointF
         ] | None = None
@@ -261,7 +298,17 @@ class _CanvasLogic:
         self._selected_vector_point_ids: set[str] = set()
         self._vector_gesture_mode: str | None = None
         self._vector_samples: list[FreehandSample] = []
+        self._vector_preview_tiles = TileStore()
+        self._vector_preview_id = "live-vector-preview"
+        self._vector_preview_dirty = QRectF()
+        self._promoted_vector_preview: dict | None = None
         self._vector_sweep: list[FreehandSample] = []
+        self._vector_eraser_grid: dict[tuple[int, int], set[str]] = {}
+        self._vector_eraser_bounds: dict[str, QRectF] = {}
+        self._vector_eraser_grid_size = 64.0
+        self._vector_eraser_grid_revision: tuple[str, int] | None = None
+        self._vector_eraser_preview: dict[str, list[VectorStroke]] = {}
+        self._vector_eraser_preview_revision = 0
         self._vector_simplify_point_ids: set[str] = set()
         self._vector_simplify_anchor_grid: dict[
             tuple[int, int], list[tuple[str, str, tuple[float, float]]]
@@ -325,8 +372,21 @@ class _CanvasLogic:
         self._asset_drag_parent_id = ""
         self._asset_drag_valid = False
         self._asset_drag_clip_cache: dict[str, QPainterPath | None] = {}
+        self._scene_cache = QImage()
+        self._scene_cache_key: tuple | None = None
+        self._scene_dirty_full = True
+        self._scene_dirty_widget = QRect()
+        self._preserve_scene_cache_once = False
+        self._visual_pending_world = QRectF()
+        self._visual_pending_widget = QRect()
+        self._visual_frame_timer = QTimer(self)
+        self._visual_frame_timer.setSingleShot(True)
+        self._visual_frame_timer.timeout.connect(self._flush_visual_dirty)
+        self._performance = CanvasPerformanceMonitor()
         self.documentChanged.connect(self._clear_compound_path_cache)
+        self.documentChanged.connect(self._document_visual_changed)
         self.hierarchyChanged.connect(self._clear_compound_path_cache)
+        self.hierarchyChanged.connect(self._invalidate_scene_cache)
         self.setMinimumSize(480, 480)
         self.setFocusPolicy(Qt.StrongFocus)
         self.setAttribute(Qt.WA_AcceptTouchEvents, True)
@@ -367,6 +427,183 @@ class _CanvasLogic:
         self._shape_hover_insert = None
         self.setToolTip("")
 
+    def performance_snapshot(self) -> dict:
+        renderer = "gpu" if isinstance(self, QOpenGLWidget) else "raster"
+        return self._performance.snapshot(renderer)
+
+    def _suspend_gc_for_stroke(self) -> None:
+        if self._gc_was_enabled:
+            return
+        self._gc_was_enabled = gc.isenabled()
+        if self._gc_was_enabled:
+            gc.disable()
+
+    def _restore_gc_after_stroke(self) -> None:
+        if self._gc_was_enabled and not gc.isenabled():
+            gc.enable()
+        self._gc_was_enabled = False
+
+    def _abort_raster_stroke_after_error(self) -> None:
+        """Restore the pre-stroke tiles and leave no drawing state behind."""
+        object_id = self.selected_id
+        for key, image in self._stroke_before.items():
+            self.tiles.set_tile(object_id, key, image)
+        self._stroke_before = {}
+        self._stroke_frame_before = None
+        self._stroke_erasing = False
+        self._stroke_dirty_world = QRectF()
+        self._drawing = False
+        self._stroke_preset = None
+        self._predictive = None
+        self._restore_gc_after_stroke()
+
+    def _invalidate_scene_cache(self, *args) -> None:
+        self._scene_dirty_full = True
+        self._scene_dirty_widget = QRect()
+        self._scene_cache_key = None
+
+    def _world_dirty_to_widget(self, world: QRectF) -> QRect:
+        if world.isEmpty():
+            return QRect()
+        mapped = self.camera_transform().mapRect(world).adjusted(-4, -4, 4, 4)
+        return mapped.toAlignedRect().intersected(self.rect())
+
+    def _mark_scene_dirty_world(self, world: QRectF) -> QRect:
+        widget = self._world_dirty_to_widget(world)
+        if widget.isEmpty():
+            return widget
+        self._scene_dirty_widget = (
+            QRect(widget) if self._scene_dirty_widget.isEmpty()
+            else self._scene_dirty_widget.united(widget)
+        )
+        return widget
+
+    def _document_visual_changed(self, world_rect) -> None:
+        if self._preserve_scene_cache_once:
+            self._preserve_scene_cache_once = False
+            return
+        if (
+            world_rect is None
+            or not hasattr(world_rect, "isEmpty")
+            or world_rect.isEmpty()
+        ):
+            self._invalidate_scene_cache()
+            self.update()
+            return
+        widget = self._mark_scene_dirty_world(QRectF(world_rect))
+        if not widget.isEmpty():
+            self.update(widget)
+
+    def _queue_visual_dirty(
+        self, world: QRectF, *, scene: bool = True,
+        notify_preview: bool = True,
+    ) -> None:
+        if world.isEmpty():
+            return
+        widget = (
+            self._mark_scene_dirty_world(world)
+            if scene else self._world_dirty_to_widget(world)
+        )
+        if widget.isEmpty():
+            return
+        if notify_preview:
+            self._visual_pending_world = (
+                QRectF(world) if self._visual_pending_world.isEmpty()
+                else self._visual_pending_world.united(world)
+            )
+        self._visual_pending_widget = (
+            QRect(widget) if self._visual_pending_widget.isEmpty()
+            else self._visual_pending_widget.united(widget)
+        )
+        if not self._visual_frame_timer.isActive():
+            self._visual_frame_timer.start(0)
+
+    def _flush_visual_dirty(self) -> None:
+        world = QRectF(self._visual_pending_world)
+        widget = QRect(self._visual_pending_widget)
+        self._visual_pending_world = QRectF()
+        self._visual_pending_widget = QRect()
+        if not world.isEmpty():
+            self.visualChanged.emit(world)
+        if not widget.isEmpty():
+            self.update(widget)
+
+    def _scene_key(self) -> tuple:
+        return (
+            id(self.chapter), self.width(), self.height(),
+            round(float(self.devicePixelRatioF()), 4),
+            round(self.center_x, 6), round(self.center_y, 6),
+            round(self.scale, 8), round(self.rotation, 6),
+        )
+
+    def _ensure_scene_cache(self) -> None:
+        if self.chapter is None or self.width() <= 0 or self.height() <= 0:
+            return
+        key = self._scene_key()
+        ratio = max(1.0, float(self.devicePixelRatioF()))
+        pixel_width = max(1, round(self.width() * ratio))
+        pixel_height = max(1, round(self.height() * ratio))
+        size_changed = (
+            self._scene_cache.isNull()
+            or self._scene_cache.width() != pixel_width
+            or self._scene_cache.height() != pixel_height
+        )
+        if size_changed:
+            self._scene_cache = QImage(
+                pixel_width, pixel_height,
+                QImage.Format_ARGB32_Premultiplied,
+            )
+            self._scene_cache.setDevicePixelRatio(ratio)
+        if size_changed or self._scene_cache_key != key:
+            self._scene_cache_key = key
+            self._scene_dirty_full = True
+            self._scene_dirty_widget = QRect()
+        dirty = (
+            QRect(self.rect()) if self._scene_dirty_full
+            else QRect(self._scene_dirty_widget)
+        )
+        if dirty.isEmpty():
+            return
+        self._render_scene_cache_rect(dirty)
+        self._scene_dirty_full = False
+        self._scene_dirty_widget = QRect()
+
+    def _render_scene_cache_rect(self, dirty: QRect) -> None:
+        painter = QPainter(self._scene_cache)
+        painter.setClipRect(dirty)
+        painter.fillRect(dirty, QColor("#242428"))
+        painter.setRenderHint(QPainter.Antialiasing, True)
+        painter.setTransform(self.camera_transform())
+        painter.fillRect(
+            QRectF(0, 0, self.chapter.width, self.chapter.height),
+            QColor(self.chapter.background),
+        )
+        painter.save()
+        painter.setClipRect(
+            QRectF(0, 0, self.chapter.width, self.chapter.height),
+            Qt.IntersectClip,
+        )
+        inverse, valid = self.camera_transform().inverted()
+        visible = (
+            inverse.map(QPolygonF(QRectF(dirty))).boundingRect()
+            if valid else self.visible_document_rect()
+        )
+        self._set_live_underlay_context()
+        for page_id in reversed(self.chapter.root_page_ids):
+            self._render_layer(
+                painter, self.chapter.layers[page_id], 1.0, visible
+            )
+        self._render_selected_drawing_underlay(painter, visible)
+        self._clear_live_underlay_context()
+        self._draw_grid(painter, visible)
+        painter.restore()
+        painter.setTransform(QTransform())
+        painter.setPen(QPen(QColor("#44444d"), 1))
+        painter.drawPolygon(self.camera_transform().map(QPolygonF(QRectF(
+            0, 0, self.chapter.width, self.chapter.height
+        ))))
+        painter.end()
+
     def _clear_detached_input_state(self) -> None:
         """Reset transient pointer state that cannot survive without a document."""
         self._clear_creation_gesture()
@@ -384,6 +621,16 @@ class _CanvasLogic:
         self._touch_pending_points = None
         self._touch_points.clear()
         self._touch_anchor_points.clear()
+        self._drawing = False
+        self._stroke_preset = None
+        self._stroke_dirty_world = QRectF()
+        self._stroke_before.clear()
+        self._vector_preview_tiles = TileStore()
+        self._vector_preview_dirty = QRectF()
+        self._vector_eraser_grid.clear()
+        self._vector_eraser_bounds.clear()
+        self._vector_eraser_preview.clear()
+        self._restore_gc_after_stroke()
         self._page_creation_anchor_id = ""
         self._page_creation_before = None
         self._page_creation_kind = ""
@@ -407,6 +654,8 @@ class _CanvasLogic:
         self._gradient_geometry_cache.clear()
         self._gradient_scalar_cache.clear()
         self._gradient_render_cache.clear()
+        self._promoted_vector_preview = None
+        self._invalidate_scene_cache()
         self._ensure_raster_frames()
         self.command_stack.clear()
         self.selected_kind = ""
@@ -486,6 +735,8 @@ class _CanvasLogic:
         self._gradient_geometry_cache = state.gradient_geometry_cache
         self._gradient_scalar_cache = state.gradient_scalar_cache
         self._gradient_render_cache = state.gradient_render_cache
+        self._promoted_vector_preview = None
+        self._invalidate_scene_cache()
         self._touch_frame_timer.stop()
         self._touch_pending_points = None
         self._clear_asset_drag_preview()
@@ -511,6 +762,8 @@ class _CanvasLogic:
         self._gradient_geometry_cache.clear()
         self._gradient_scalar_cache.clear()
         self._gradient_render_cache.clear()
+        self._promoted_vector_preview = None
+        self._invalidate_scene_cache()
         self._clear_asset_drag_preview()
         self.update()
 
@@ -532,6 +785,8 @@ class _CanvasLogic:
         self._gradient_geometry_cache.clear()
         self._gradient_scalar_cache.clear()
         self._gradient_render_cache.clear()
+        self._promoted_vector_preview = None
+        self._invalidate_scene_cache()
         valid = (
             self.selected_id in self.chapter.layers
             if self.selected_kind == "layer"
@@ -743,7 +998,13 @@ class _CanvasLogic:
             self._restore_vector_payloads(self._vector_before)
         self._vector_gesture_mode = None
         self._vector_samples.clear()
+        self._vector_preview_tiles = TileStore()
+        self._vector_preview_dirty = QRectF()
         self._vector_sweep.clear()
+        self._vector_eraser_grid.clear()
+        self._vector_eraser_bounds.clear()
+        self._vector_eraser_grid_revision = None
+        self._vector_eraser_preview.clear()
         self._vector_simplify_point_ids.clear()
         self._vector_simplify_anchor_grid.clear()
         self._vector_simplify_last_sample = None
@@ -752,6 +1013,8 @@ class _CanvasLogic:
         self._vector_drag_points.clear()
         self._vector_connect_endpoints.clear()
         self._drawing = False
+        self._stroke_preset = None
+        self._restore_gc_after_stroke()
         self._vector_changed()
 
     def set_selection(
@@ -825,6 +1088,7 @@ class _CanvasLogic:
         if self.tool != previous_tool:
             self.toolChanged.emit(self.tool)
         self.selectionChanged.emit(kind, entity_id)
+        self._invalidate_scene_cache()
         self.update()
 
     def clear_selection(self) -> None:
@@ -851,6 +1115,7 @@ class _CanvasLogic:
         self._clear_drawing_selection()
         self.vectorSelectionChanged.emit(set(), set())
         self.selectionChanged.emit("", "")
+        self._invalidate_scene_cache()
         self.update()
 
     def set_tool(self, tool: ToolKind) -> bool:
@@ -966,6 +1231,7 @@ class _CanvasLogic:
                 )
         self.tool = tool
         self.toolChanged.emit(tool)
+        self._invalidate_scene_cache()
         self.update()
         return True
 
@@ -1013,6 +1279,10 @@ class _CanvasLogic:
 
     def document_to_widget(self, point: QPointF) -> QPointF:
         return self.camera_transform().map(point)
+
+    def _set_centered_scale(self, scale: float) -> None:
+        """Scale around the visible viewport center without moving the camera."""
+        self.scale = max(0.05, min(8.0, float(scale)))
 
     def visible_document_rect(self) -> QRectF:
         inverse, valid = self.camera_transform().inverted()
@@ -1770,12 +2040,16 @@ class _CanvasLogic:
         )
 
     def paintEvent(self, event) -> None:  # noqa: N802
+        frame_started = time.perf_counter_ns()
         painter = QPainter(self)
         painter.fillRect(self.rect(), QColor("#242428"))
         painter.setRenderHint(QPainter.Antialiasing, True)
         if self.chapter is None:
             painter.setPen(QColor("#8e8e96"))
             painter.drawText(self.rect(), Qt.AlignCenter, "Create or open a series to begin")
+            self._performance.frame_ms.append(
+                (time.perf_counter_ns() - frame_started) / 1_000_000
+            )
             return
         if (
             not self._transform_static_cache.isNull()
@@ -1800,21 +2074,16 @@ class _CanvasLogic:
             self._draw_selection(painter)
             self._clear_live_underlay_context()
             painter.restore()
+            self._performance.frame_ms.append(
+                (time.perf_counter_ns() - frame_started) / 1_000_000
+            )
             return
+        self._ensure_scene_cache()
+        painter.setTransform(QTransform())
+        painter.drawImage(0, 0, self._scene_cache)
         painter.setTransform(self.camera_transform())
-        painter.fillRect(
-            QRectF(0, 0, self.chapter.width, self.chapter.height),
-            QColor(self.chapter.background),
-        )
         painter.save()
         painter.setClipRect(QRectF(0, 0, self.chapter.width, self.chapter.height))
-        visible = self.visible_document_rect()
-        self._set_live_underlay_context()
-        for page_id in reversed(self.chapter.root_page_ids):
-            self._render_layer(painter, self.chapter.layers[page_id], 1.0, visible)
-        self._render_selected_drawing_underlay(painter, visible)
-        self._clear_live_underlay_context()
-        self._draw_grid(painter, visible)
         self._draw_predictive_ink(painter)
         self._draw_live_vector_gesture(painter)
         self._draw_selection(painter)
@@ -1823,13 +2092,11 @@ class _CanvasLogic:
         self._draw_asset_drag_preview(painter)
         painter.restore()
         painter.setTransform(QTransform())
-        painter.setPen(QPen(QColor("#44444d"), 1))
-        chapter_poly = self.camera_transform().map(QPolygonF(QRectF(
-            0, 0, self.chapter.width, self.chapter.height
-        )))
-        painter.drawPolygon(chapter_poly)
         self._draw_tablet_hover(painter)
         self._draw_simplify_hover(painter)
+        self._performance.frame_ms.append(
+            (time.perf_counter_ns() - frame_started) / 1_000_000
+        )
 
     def _draw_asset_drag_preview(self, painter: QPainter) -> None:
         if (
@@ -2204,7 +2471,9 @@ class _CanvasLogic:
         )
         painter.translate(world_x, world_y)
         if isinstance(obj, VectorDrawingObject):
-            self._render_vector_drawing(painter, obj)
+            self._render_vector_drawing(
+                painter, obj, visible.translated(-world_x, -world_y)
+            )
         else:
             self._render_raster_content(
                 painter, obj, visible.translated(-world_x, -world_y),
@@ -2915,15 +3184,65 @@ class _CanvasLogic:
 
     def _render_vector_drawing(
         self, painter: QPainter, drawing: VectorDrawingObject,
+        local_visible: QRectF | None = None,
     ) -> None:
         painter.save()
         painter.translate(drawing.x, drawing.y)
+        drawing_visible = (
+            local_visible.translated(-drawing.x, -drawing.y)
+            if local_visible is not None else None
+        )
         # Fill IDs are frontmost-first, so paint them back-to-front.
         for fill_id in reversed(drawing.fill_child_ids):
             fill = self.chapter.objects.get(fill_id)
             if isinstance(fill, VectorFillObject):
                 self._render_vector_fill(painter, fill)
         for stroke in drawing.strokes:
+            if (
+                drawing_visible is not None
+                and not QRectF(*stroke.derived_bounds()).intersects(
+                    drawing_visible
+                )
+            ):
+                continue
+            if (
+                self._vector_gesture_mode == "eraser"
+                and drawing.object_id == self.selected_object_id
+                and stroke.stroke_id in self._vector_eraser_preview
+            ):
+                for replacement in self._vector_eraser_preview[
+                    stroke.stroke_id
+                ]:
+                    rendered = self._vector_stroke_image(
+                        drawing, replacement,
+                        cache_token=(
+                            "eraser-preview",
+                            self._vector_eraser_preview_revision,
+                            replacement.stroke_id,
+                        ),
+                    )
+                    if rendered is not None:
+                        image, target = rendered
+                        painter.drawImage(target, image)
+                continue
+            promoted = self._promoted_vector_preview
+            requested_scale = max(
+                0.1,
+                min(8.0, self.scale * max(1.0, self.devicePixelRatioF())),
+            )
+            if (
+                promoted is not None
+                and promoted["drawing_id"] == drawing.object_id
+                and promoted["stroke_id"] == stroke.stroke_id
+                and promoted["render_revision"] == stroke.render_revision
+                and requested_scale <= 1.25
+            ):
+                tile_size = promoted["tile_size"]
+                for (tile_x, tile_y), image in promoted["tiles"].items():
+                    painter.drawImage(
+                        tile_x * tile_size, tile_y * tile_size, image
+                    )
+                continue
             preview_points = {
                 point.point_id: self._selection_vector_preview[point.point_id]
                 for point in stroke.points
@@ -4641,7 +4960,7 @@ class _CanvasLogic:
             opacity *= 1.0 - self._live_underlay_amount
         painter.setOpacity(opacity)
         if isinstance(obj, VectorDrawingObject):
-            self._render_vector_drawing(painter, obj)
+            self._render_vector_drawing(painter, obj, local_visible)
         elif isinstance(obj, GradientObject):
             self._render_gradient(painter, obj, local_visible)
         elif isinstance(obj, RasterObject):
@@ -4980,40 +5299,14 @@ class _CanvasLogic:
         )
         painter.save()
         painter.translate(layer_x + drawing.x, layer_y + drawing.y)
-        color = QColor(self.primary_color)
-        if len(self._vector_samples) == 1:
-            sample = self._vector_samples[0]
-            width, opacity = self._vector_pressure_values(sample.pressure)
-            color.setAlphaF(color.alphaF() * opacity)
-            painter.setPen(Qt.NoPen)
-            painter.setBrush(color)
-            painter.drawEllipse(
-                QPointF(*sample.point), width / 2, width / 2
-            )
-        else:
-            for first, second in zip(
-                self._vector_samples, self._vector_samples[1:]
-            ):
-                width_a, opacity_a = self._vector_pressure_values(
-                    first.pressure
-                )
-                width_b, opacity_b = self._vector_pressure_values(
-                    second.pressure
-                )
-                segment_color = QColor(color)
-                segment_color.setAlphaF(
-                    color.alphaF() * (opacity_a + opacity_b) / 2
-                )
-                painter.setPen(QPen(
-                    segment_color,
-                    (width_a + width_b) / 2,
-                    Qt.PenStyle.SolidLine,
-                    Qt.PenCapStyle.RoundCap,
-                    Qt.PenJoinStyle.RoundJoin,
-                ))
-                painter.drawLine(
-                    QPointF(*first.point), QPointF(*second.point)
-                )
+        local_visible = self.visible_document_rect().translated(
+            -layer_x - drawing.x, -layer_y - drawing.y
+        )
+        tile_size = self._vector_preview_tiles.tile_size
+        for (tile_x, tile_y), image in self._vector_preview_tiles.iter_tiles(
+            self._vector_preview_id, local_visible
+        ):
+            painter.drawImage(tile_x * tile_size, tile_y * tile_size, image)
         painter.restore()
 
     def _draw_simplify_hover(self, painter: QPainter) -> None:
@@ -7793,7 +8086,12 @@ class _CanvasLogic:
             self.setCursor(Qt.SizeAllCursor)
         else:
             self.unsetCursor()
+        input_started = time.perf_counter_ns()
         self._tool_move(event.position(), 1.0)
+        if self._drawing or self._vector_gesture_mode in {"pencil", "eraser"}:
+            elapsed = (time.perf_counter_ns() - input_started) / 1_000_000
+            self._performance.input_ms.append(elapsed)
+            self._performance.submit_ms.append(elapsed)
 
     def mouseReleaseEvent(self, event: QMouseEvent) -> None:  # noqa: N802
         if self.chapter is None:
@@ -8004,16 +8302,11 @@ class _CanvasLogic:
         if self.chapter is None:
             return
         if event.modifiers() & Qt.ControlModifier:
-            anchor_doc = self.widget_to_document(event.position())
             factor = math.pow(1.0015, event.angleDelta().y())
-            self.scale = max(0.05, min(8.0, self.scale * factor))
-            mapped = self.document_to_widget(anchor_doc)
-            delta = mapped - event.position()
-            self.center_x += delta.x() / self.scale
-            self.center_y += delta.y() / self.scale
+            self._set_centered_scale(self.scale * factor)
         else:
             self.center_y -= event.angleDelta().y() / max(0.05, self.scale)
-        self._snap_camera()
+            self._snap_camera()
         self.update()
         self.cameraChanged.emit()
         event.accept()
@@ -8031,6 +8324,10 @@ class _CanvasLogic:
         self._tablet_hover_widget = QPointF(event.position())
         nav = self._navigation_mode()
         if event.type() == QEvent.TabletPress:
+            # A real pen-down wins over any finger gesture already in flight.
+            # Hover-only TabletMove events deliberately leave touch navigation
+            # intact so fingers can pan, pinch, and rotate with the pen nearby.
+            self._cancel_touch_navigation(emit_finished=True)
             if nav:
                 self._begin_navigation(nav, event.position())
             elif event.button() == Qt.LeftButton or event.pressure() > 0:
@@ -8073,7 +8370,17 @@ class _CanvasLogic:
             if self._nav_mode:
                 self._update_navigation(event.position())
             elif self._pen_contact_active:
+                input_started = time.perf_counter_ns()
                 self._tool_move(event.position(), event.pressure())
+                if (
+                    self._drawing
+                    or self._vector_gesture_mode in {"pencil", "eraser"}
+                ):
+                    elapsed = (
+                        time.perf_counter_ns() - input_started
+                    ) / 1_000_000
+                    self._performance.input_ms.append(elapsed)
+                    self._performance.submit_ms.append(elapsed)
             elif self.tool == ToolKind.DRAW_SELECT_STROKE:
                 self._continue_drawing_selection(
                     self.widget_to_document(event.position()),
@@ -8086,7 +8393,11 @@ class _CanvasLogic:
                 self._pen_contact_active = False
                 self._tablet_tool_active = False
                 self._tool_release()
-        self.update()
+        if not (
+            self._drawing
+            or self._vector_gesture_mode in {"pencil", "eraser"}
+        ):
+            self.update()
         event.accept()
 
     def event(self, event) -> bool:
@@ -8123,22 +8434,31 @@ class _CanvasLogic:
             self.center_x = self._nav_anchor_center.x() - dx
             self.center_y = self._nav_anchor_center.y() - dy
         elif self._nav_mode == "zoom":
-            self.scale = max(0.05, min(8.0, self._nav_anchor_scale * (1 + delta.x() * 0.005)))
+            self._set_centered_scale(
+                self._nav_anchor_scale * (1 + delta.x() * 0.005)
+            )
         elif self._nav_mode == "rotate":
             center = QPointF(self.rect().center())
             start_angle = math.atan2(self._nav_anchor.y() - center.y(), self._nav_anchor.x() - center.x())
             current = math.atan2(point.y() - center.y(), point.x() - center.x())
             self.rotation = self._nav_anchor_rotation + math.degrees(current - start_angle)
-        self._snap_camera()
+        if self._nav_mode != "zoom":
+            self._snap_camera()
         self.update()
         self.cameraChanged.emit()
 
     def _end_navigation(self) -> None:
+        mode = self._nav_mode
         self._nav_mode = None
-        self._snap_camera()
+        if mode != "zoom":
+            self._snap_camera()
         self.interactionFinished.emit()
 
     def _touch_event(self, event) -> bool:
+        if self._pen_contact_active or self._nav_mode:
+            self._cancel_touch_navigation(emit_finished=True)
+            event.accept()
+            return True
         points = [item.position() for item in event.points()]
         if event.type() == QEvent.TouchBegin:
             self._touch_frame_timer.stop()
@@ -8161,13 +8481,24 @@ class _CanvasLogic:
                     self._touch_frame_timer.start(0)
             event.accept()
             return True
+        self._cancel_touch_navigation()
+        self.interactionFinished.emit()
+        event.accept()
+        return True
+
+    def _cancel_touch_navigation(self, *, emit_finished: bool = False) -> None:
+        active = bool(
+            self._touch_frame_timer.isActive()
+            or self._touch_pending_points
+            or self._touch_points
+            or self._touch_anchor_points
+        )
         self._touch_frame_timer.stop()
         self._touch_pending_points = None
         self._touch_points.clear()
         self._touch_anchor_points.clear()
-        self.interactionFinished.emit()
-        event.accept()
-        return True
+        if emit_finished and active:
+            self.interactionFinished.emit()
 
     def _flush_touch_navigation(self) -> None:
         points = self._touch_pending_points
@@ -9695,12 +10026,17 @@ class _CanvasLogic:
 
     def _vector_pressure_values(self, pressure: float) -> tuple[float, float]:
         pressure = self._effective_pressure(pressure)
-        width = float(self.settings.pencil_size())
+        preset = self._stroke_preset or self._preset
+        width = (
+            self._stroke_base_size
+            if self._stroke_preset is not None
+            else float(self.settings.pencil_size())
+        )
         opacity = 1.0
-        if self._preset.pressure_size:
-            width *= self._preset.size_curve.evaluate_fast(pressure)
-        if self._preset.pressure_opacity:
-            opacity = self._preset.opacity_curve.evaluate_fast(pressure)
+        if preset.pressure_size:
+            width *= preset.size_curve.evaluate_fast(pressure)
+        if preset.pressure_opacity:
+            opacity = preset.opacity_curve.evaluate_fast(pressure)
         return (
             max(1.0, min(1000.0, width)),
             max(0.0, min(1.0, opacity)),
@@ -9720,8 +10056,53 @@ class _CanvasLogic:
             ) < 0.2
         ):
             self._vector_samples[-1] = sample
-        else:
-            self._vector_samples.append(sample)
+            return
+        previous = self._vector_samples[-1] if self._vector_samples else None
+        self._vector_samples.append(sample)
+        if self._vector_gesture_mode != "pencil":
+            return
+        width, opacity = self._vector_pressure_values(sample.pressure)
+        color_alpha = QColor(self.primary_color).alphaF()
+        opacity *= color_alpha
+        try:
+            if previous is None:
+                dirty = self._vector_preview_tiles.paint_dab(
+                    self._vector_preview_id, QPointF(*sample.point), width,
+                    QColor(self.primary_color), opacity,
+                    antialias=self._stroke_preset.antialiasing,
+                )
+            else:
+                previous_width, previous_opacity = self._vector_pressure_values(
+                    previous.pressure
+                )
+                previous_opacity *= color_alpha
+                dirty = self._vector_preview_tiles.paint_segment(
+                    self._vector_preview_id,
+                    QPointF(*previous.point), QPointF(*sample.point),
+                    previous_width, width, QColor(self.primary_color),
+                    previous_opacity, opacity,
+                    antialias=self._stroke_preset.antialiasing,
+                    density=self._stroke_preset.density,
+                )
+        except Exception:
+            self._cancel_vector_gesture(restore=True)
+            raise
+        if dirty.isEmpty():
+            return
+        self._vector_preview_dirty = (
+            QRectF(dirty) if self._vector_preview_dirty.isEmpty()
+            else self._vector_preview_dirty.united(dirty)
+        )
+        drawing = self._active_vector_drawing()
+        if drawing is None:
+            return
+        layer_x, layer_y = self.chapter.layer_world_translation(
+            drawing.parent_layer_id
+        )
+        self._queue_visual_dirty(
+            dirty.translated(layer_x + drawing.x, layer_y + drawing.y),
+            scene=False, notify_preview=False,
+        )
 
     def _begin_vector_pencil(
         self, drawing: VectorDrawingObject, local: QPointF, pressure: float,
@@ -9729,17 +10110,40 @@ class _CanvasLogic:
         self._vector_before = {drawing.object_id: drawing.to_dict()}
         self._vector_gesture_mode = "pencil"
         self._vector_samples = []
-        self._append_vector_sample(local, pressure)
+        self._vector_preview_tiles = TileStore()
+        self._vector_preview_dirty = QRectF()
+        self._stroke_preset = BrushPreset.from_dict(self._preset.to_dict())
+        self._stroke_base_size = float(self.settings.pencil_size())
+        self._drawing = True
+        self._suspend_gc_for_stroke()
+        try:
+            self._append_vector_sample(local, pressure)
+        except Exception:
+            self._restore_gc_after_stroke()
+            raise
 
     def _finish_vector_pencil(
+        self, drawing: VectorDrawingObject,
+    ) -> None:
+        try:
+            self._finish_vector_pencil_impl(drawing)
+        except Exception:
+            try:
+                self._cancel_vector_gesture(restore=True)
+            finally:
+                self._restore_gc_after_stroke()
+            raise
+        finally:
+            self._restore_gc_after_stroke()
+
+    def _finish_vector_pencil_impl(
         self, drawing: VectorDrawingObject,
     ) -> None:
         fitted = fit_freehand(
             self._vector_samples,
             error=self.settings.vector_fit_error,
-            resample_spacing=max(
-                0.5, min(2.0, self.settings.vector_fit_error / 2)
-            ),
+            resample_spacing=None,
+            attribute_error=0.025,
         )
         if fitted:
             points: list[VectorStrokePoint] = []
@@ -9763,11 +10167,25 @@ class _CanvasLogic:
             )
             drawing.strokes.append(stroke)
             drawing.touch_revision()
+            self._promoted_vector_preview = {
+                "drawing_id": drawing.object_id,
+                "stroke_id": stroke.stroke_id,
+                "render_revision": stroke.render_revision,
+                "tiles": self._vector_preview_tiles.object_tiles(
+                    self._vector_preview_id
+                ),
+                "tile_size": self._vector_preview_tiles.tile_size,
+            }
         before = self._vector_before or {}
         self._vector_gesture_mode = None
         self._vector_samples = []
+        self._vector_preview_tiles = TileStore()
+        self._vector_preview_dirty = QRectF()
         self._vector_before = None
+        self._stroke_preset = None
+        self._drawing = False
         self._push_vector_change(before, "Vector pencil stroke")
+        self._restore_gc_after_stroke()
         self.interactionFinished.emit()
 
     def _stroke_from_spans(
@@ -9889,6 +10307,152 @@ class _CanvasLogic:
             result.stroke_id = source.stroke_id
         return result
 
+    def _build_vector_eraser_index(
+        self, drawing: VectorDrawingObject,
+    ) -> None:
+        revision = (drawing.object_id, drawing.drawing_revision)
+        if self._vector_eraser_grid_revision == revision:
+            return
+        cell = self._vector_eraser_grid_size
+        grid: dict[tuple[int, int], set[str]] = {}
+        bounds_by_stroke: dict[str, QRectF] = {}
+        for stroke in drawing.strokes:
+            if not stroke.points:
+                continue
+            bounds = QRectF(*stroke.derived_bounds())
+            bounds_by_stroke[stroke.stroke_id] = bounds
+            left = math.floor(bounds.left() / cell)
+            right = math.floor(bounds.right() / cell)
+            top = math.floor(bounds.top() / cell)
+            bottom = math.floor(bounds.bottom() / cell)
+            for y in range(top, bottom + 1):
+                for x in range(left, right + 1):
+                    grid.setdefault((x, y), set()).add(stroke.stroke_id)
+        self._vector_eraser_grid = grid
+        self._vector_eraser_bounds = bounds_by_stroke
+        self._vector_eraser_grid_revision = revision
+
+    def _vector_eraser_candidates(
+        self, sweep: list[tuple[float, float]], radius: float,
+    ) -> set[str]:
+        if not sweep:
+            return set()
+        points = sweep[-2:] if len(sweep) > 1 else sweep
+        xs = [point[0] for point in points]
+        ys = [point[1] for point in points]
+        bounds = QRectF(
+            min(xs) - radius, min(ys) - radius,
+            max(xs) - min(xs) + radius * 2,
+            max(ys) - min(ys) + radius * 2,
+        )
+        cell = self._vector_eraser_grid_size
+        result: set[str] = set()
+        for y in range(
+            math.floor(bounds.top() / cell),
+            math.floor(bounds.bottom() / cell) + 1,
+        ):
+            for x in range(
+                math.floor(bounds.left() / cell),
+                math.floor(bounds.right() / cell) + 1,
+            ):
+                result.update(self._vector_eraser_grid.get((x, y), ()))
+        return result
+
+    def _update_vector_eraser_preview(
+        self, drawing: VectorDrawingObject,
+    ) -> None:
+        sweep = [sample.point for sample in self._vector_sweep]
+        if not sweep:
+            return
+        radius = self.settings.active_eraser_pixels() / 2
+        segment = sweep[-2:] if len(sweep) > 1 else sweep
+        segment_x = [point[0] for point in segment]
+        segment_y = [point[1] for point in segment]
+        segment_bounds = QRectF(
+            min(segment_x) - radius, min(segment_y) - radius,
+            max(segment_x) - min(segment_x) + radius * 2,
+            max(segment_y) - min(segment_y) + radius * 2,
+        )
+        strokes = {stroke.stroke_id: stroke for stroke in drawing.strokes}
+        changed_bounds = QRectF()
+        changed = False
+        for stroke_id in self._vector_eraser_candidates(sweep, radius):
+            original = strokes.get(stroke_id)
+            if (
+                original is None
+                or not self._vector_eraser_bounds.get(
+                    stroke_id, QRectF(*original.derived_bounds())
+                ).intersects(segment_bounds)
+                or not self._vector_stroke_touched(original, segment, radius)
+            ):
+                continue
+            mode = self.settings.vector_eraser_mode
+            if mode == "intersection" and stroke_id in self._vector_eraser_preview:
+                continue
+            replacements: list[VectorStroke] = []
+            if mode == "stroke" or len(original.points) == 1:
+                replacements = []
+            elif mode == "intersection":
+                groups = self._erase_vector_intersection_groups(
+                    drawing, original,
+                    stroke_cubics(original.points, original.closed),
+                    sweep, radius,
+                )
+                for index, group in enumerate(groups):
+                    replacement = self._stroke_from_spans(
+                        original, group, preserve_id=index == 0
+                    )
+                    if replacement is not None:
+                        replacements.append(replacement)
+            else:
+                sources = self._vector_eraser_preview.get(
+                    stroke_id, [original]
+                )
+                for source in sources:
+                    groups = erase_stroke_by_corridor(
+                        source.points, segment, radius,
+                        shape=(
+                            "square" if self.settings.eraser_square
+                            else "round"
+                        ),
+                        closed=source.closed,
+                    )
+                    for index, group in enumerate(groups):
+                        replacement = self._stroke_from_spans(
+                            source, group, preserve_id=index == 0
+                        )
+                        if replacement is not None:
+                            replacements.append(replacement)
+            self._vector_eraser_preview[stroke_id] = replacements
+            if mode == "point":
+                xs = [point[0] for point in segment]
+                ys = [point[1] for point in segment]
+                padding = radius + max(
+                    (point.width for point in original.points), default=1.0
+                ) / 2 + 3
+                bounds = QRectF(
+                    min(xs) - padding, min(ys) - padding,
+                    max(xs) - min(xs) + padding * 2,
+                    max(ys) - min(ys) + padding * 2,
+                )
+            else:
+                bounds = QRectF(*original.derived_bounds())
+            changed_bounds = (
+                bounds if changed_bounds.isEmpty()
+                else changed_bounds.united(bounds)
+            )
+            changed = True
+        if not changed:
+            return
+        self._vector_eraser_preview_revision += 1
+        layer_x, layer_y = self.chapter.layer_world_translation(
+            drawing.parent_layer_id
+        )
+        self._queue_visual_dirty(
+            changed_bounds.translated(layer_x + drawing.x, layer_y + drawing.y),
+            scene=True, notify_preview=False,
+        )
+
     def _vector_stroke_touched(
         self, stroke: VectorStroke, sweep: list[tuple[float, float]],
         radius: float,
@@ -9963,6 +10527,10 @@ class _CanvasLogic:
             ))
         for other in drawing.strokes:
             if other is stroke or len(other.points) < 2:
+                continue
+            if not QRectF(*stroke.derived_bounds()).intersects(
+                QRectF(*other.derived_bounds())
+            ):
                 continue
             for intersection in path_intersections(
                 cubics, stroke_cubics(other.points, other.closed)
@@ -10061,15 +10629,37 @@ class _CanvasLogic:
         self, drawing: VectorDrawingObject,
     ) -> None:
         before = self._vector_before or {}
-        if before:
-            self._restore_vector_payloads(before)
-            drawing = self._selected_vector_drawing() or drawing
-        self._apply_vector_eraser_sweep(drawing)
+        preview = dict(self._vector_eraser_preview)
+        changed_strokes = set(preview)
+        if changed_strokes:
+            rebuilt: list[VectorStroke] = []
+            for stroke in drawing.strokes:
+                replacements = preview.get(stroke.stroke_id)
+                if replacements is None:
+                    rebuilt.append(stroke)
+                else:
+                    rebuilt.extend(replacements)
+            drawing.strokes = rebuilt
+            drawing.touch_revision()
+        self._vector_eraser_preview.clear()
+        self._vector_eraser_grid.clear()
+        self._vector_eraser_bounds.clear()
+        self._vector_eraser_grid_revision = None
         self._set_vector_selection(drawing)
         self._vector_gesture_mode = None
         self._vector_sweep = []
         self._vector_before = None
-        self._push_vector_change(before, "Vector eraser")
+        if (
+            changed_strokes
+            and not self._scene_cache.isNull()
+            and not self._scene_dirty_full
+            and self._scene_dirty_widget.isEmpty()
+            and not self._visual_frame_timer.isActive()
+        ):
+            self._preserve_scene_cache_once = True
+        pushed = self._push_vector_change(before, "Vector eraser")
+        if not pushed:
+            self._preserve_scene_cache_once = False
         self.interactionFinished.emit()
 
     def _apply_vector_eraser_sweep(
@@ -10959,6 +11549,10 @@ class _CanvasLogic:
         if self.tool == ToolKind.RASTER_ERASER:
             self._vector_before = {drawing.object_id: drawing.to_dict()}
             self._vector_gesture_mode = "eraser"
+            self._vector_eraser_preview.clear()
+            self._vector_eraser_preview_revision += 1
+            self._vector_eraser_grid_revision = None
+            self._build_vector_eraser_index(drawing)
         elif self.tool == ToolKind.VECTOR_REDRAW:
             if self.settings.vector_redraw_interaction == "point":
                 self._begin_vector_point_select(drawing, local)
@@ -10978,6 +11572,8 @@ class _CanvasLogic:
         self._vector_sweep = [
             FreehandSample(local.x(), local.y(), pressure)
         ]
+        if self._vector_gesture_mode == "eraser":
+            self._update_vector_eraser_preview(drawing)
         if self._vector_gesture_mode == "simplify":
             self._build_simplify_anchor_index(drawing)
             self._update_simplify_point_sweep(drawing)
@@ -11005,9 +11601,9 @@ class _CanvasLogic:
             return
         if self._vector_gesture_mode == "pencil":
             self._append_vector_sample(local, pressure)
-            self.update()
             return
         sample = FreehandSample(local.x(), local.y(), pressure)
+        sweep_count = len(self._vector_sweep)
         if not self._vector_sweep:
             self._vector_sweep.append(sample)
         elif self._vector_gesture_mode == "fill":
@@ -11031,14 +11627,10 @@ class _CanvasLogic:
             self._manual_redraw_at(drawing, local, pressure)
         elif self._vector_gesture_mode == "connect":
             self._collect_vector_endpoint(drawing, local)
-        elif (
-            self._vector_gesture_mode == "eraser"
-            and len(self._vector_sweep) % 2 == 0
-            and self._vector_before
-        ):
-            self._restore_vector_payloads(self._vector_before)
-            drawing = self._selected_vector_drawing() or drawing
-            self._apply_vector_eraser_sweep(drawing)
+        elif self._vector_gesture_mode == "eraser":
+            if len(self._vector_sweep) != sweep_count:
+                self._update_vector_eraser_preview(drawing)
+            return
         self.update()
 
     def _end_vector_gesture(self) -> None:
@@ -13153,52 +13745,81 @@ class _CanvasLogic:
         if not isinstance(obj, RasterObject):
             return
         layer_x, layer_y = self.chapter.layer_world_translation(obj.parent_layer_id)
-        local = QPointF(round(point.x() - layer_x - obj.x), round(point.y() - layer_y - obj.y))
+        local = QPointF(
+            point.x() - layer_x - obj.x,
+            point.y() - layer_y - obj.y,
+        )
+        self._suspend_gc_for_stroke()
         self._drawing = True
         self._last_draw_point = local
         self._last_pressure = self._effective_pressure(pressure)
+        self._stroke_preset = BrushPreset.from_dict(self._preset.to_dict())
+        self._stroke_base_size = float(
+            self.settings.active_eraser_pixels()
+            if self.tool == ToolKind.RASTER_ERASER
+            else self.settings.pencil_size()
+        )
+        self._stroke_dirty_world = QRectF()
         self._stroke_before = {}
         self._stroke_frame_before = tuple(obj.interaction_rect)
         self._stroke_erasing = self.tool == ToolKind.RASTER_ERASER
         self._predictive = None
         size, opacity = self._brush_values(self._last_pressure)
         if self.tool == ToolKind.RASTER_PENCIL:
-            size *= self._preset.stroke_start_ratio
-        dirty = self.tiles.paint_dab(
-            obj.object_id, local, size, QColor(self.primary_color), opacity,
-            erase=self.tool == ToolKind.RASTER_ERASER,
-            square=self.settings.eraser_square and self.tool == ToolKind.RASTER_ERASER,
-            antialias=(
-                self._preset.antialiasing
-                if self.tool == ToolKind.RASTER_PENCIL else False
-            ),
-            before=self._stroke_before,
-        )
+            size *= self._stroke_preset.stroke_start_ratio
+        try:
+            dirty = self.tiles.paint_dab(
+                obj.object_id, local, size, QColor(self.primary_color), opacity,
+                erase=self.tool == ToolKind.RASTER_ERASER,
+                square=(
+                    self.settings.eraser_square
+                    and self.tool == ToolKind.RASTER_ERASER
+                ),
+                antialias=(
+                    self._stroke_preset.antialiasing
+                    if self.tool == ToolKind.RASTER_PENCIL else False
+                ),
+                before=self._stroke_before,
+            )
+        except Exception:
+            self._abort_raster_stroke_after_error()
+            raise
         self._emit_raster_dirty(obj, dirty)
 
     def _continue_stroke(self, point: QPointF, pressure: float) -> None:
         obj = self.chapter.objects[self.selected_id]
         layer_x, layer_y = self.chapter.layer_world_translation(obj.parent_layer_id)
-        local = QPointF(round(point.x() - layer_x - obj.x), round(point.y() - layer_y - obj.y))
+        local = QPointF(
+            point.x() - layer_x - obj.x,
+            point.y() - layer_y - obj.y,
+        )
         actual_pressure = self._effective_pressure(pressure)
         size_start, opacity_start = self._brush_values(self._last_pressure)
         size_end, opacity_end = self._brush_values(actual_pressure)
         size = (size_start + size_end) / 2
-        dirty = self.tiles.paint_line(
-            obj.object_id, self._last_draw_point, local, size,
-            QColor(self.primary_color), opacity_start, opacity_end,
-            erase=self.tool == ToolKind.RASTER_ERASER,
-            square=self.settings.eraser_square and self.tool == ToolKind.RASTER_ERASER,
-            antialias=(
-                self._preset.antialiasing
-                if self.tool == ToolKind.RASTER_PENCIL else False
-            ),
-            density=(
-                self._preset.density
-                if self.tool == ToolKind.RASTER_PENCIL else 1.0
-            ),
-            before=self._stroke_before,
-        )
+        try:
+            dirty = self.tiles.paint_segment(
+                obj.object_id, self._last_draw_point, local,
+                size_start, size_end,
+                QColor(self.primary_color), opacity_start, opacity_end,
+                erase=self.tool == ToolKind.RASTER_ERASER,
+                square=(
+                    self.settings.eraser_square
+                    and self.tool == ToolKind.RASTER_ERASER
+                ),
+                antialias=(
+                    self._stroke_preset.antialiasing
+                    if self.tool == ToolKind.RASTER_PENCIL else False
+                ),
+                density=(
+                    self._stroke_preset.density
+                    if self.tool == ToolKind.RASTER_PENCIL else 1.0
+                ),
+                before=self._stroke_before,
+            )
+        except Exception:
+            self._abort_raster_stroke_after_error()
+            raise
         previous_local = QPointF(self._last_draw_point)
         self._last_draw_point = local
         self._last_pressure = actual_pressure
@@ -13220,22 +13841,32 @@ class _CanvasLogic:
         self._emit_raster_dirty(obj, dirty)
 
     def _end_stroke(self) -> None:
+        try:
+            self._end_stroke_impl()
+        except Exception:
+            self._abort_raster_stroke_after_error()
+            raise
+        finally:
+            self._restore_gc_after_stroke()
+
+    def _end_stroke_impl(self) -> None:
         obj = self.chapter.objects[self.selected_id]
         if (
             not self._stroke_erasing
-            and self._preset.stroke_end_ratio < 0.999
+            and self._stroke_preset.stroke_end_ratio < 0.999
         ):
             size, opacity = self._brush_values(self._last_pressure)
             dirty = self.tiles.paint_dab(
                 obj.object_id, self._last_draw_point,
-                size * self._preset.stroke_end_ratio,
+                size * self._stroke_preset.stroke_end_ratio,
                 QColor(self.primary_color), opacity,
-                antialias=self._preset.antialiasing,
+                antialias=self._stroke_preset.antialiasing,
                 before=self._stroke_before,
             )
             self._emit_raster_dirty(obj, dirty)
         keys = set(self._stroke_before)
-        self.tiles.prune_empty(obj.object_id, keys)
+        if self._stroke_erasing:
+            self.tiles.prune_empty(obj.object_id, keys)
         frame_before = (
             self._stroke_frame_before
             if self._stroke_frame_before is not None
@@ -13273,12 +13904,18 @@ class _CanvasLogic:
         self._stroke_frame_before = None
         self._stroke_erasing = False
         self._drawing = False
+        committed_dirty = QRectF(self._stroke_dirty_world)
+        self._stroke_dirty_world = QRectF()
+        self._stroke_preset = None
         self._predictive = None
+        if not committed_dirty.isEmpty():
+            self.documentChanged.emit(committed_dirty)
+        self._restore_gc_after_stroke()
         self.interactionFinished.emit()
 
     def _brush_values(self, pressure: float) -> tuple[float, float]:
         erasing = self.tool == ToolKind.RASTER_ERASER
-        base = (
+        base = self._stroke_base_size if self._stroke_preset is not None else (
             self.settings.active_eraser_pixels()
             if erasing else self.settings.pencil_size()
         )
@@ -13286,10 +13923,11 @@ class _CanvasLogic:
             return float(base), 1.0
         size = float(base)
         opacity = 1.0
-        if self._preset.pressure_size:
-            size *= self._preset.size_curve.evaluate_fast(pressure)
-        if self._preset.pressure_opacity:
-            opacity = self._preset.opacity_curve.evaluate_fast(pressure)
+        preset = self._stroke_preset or self._preset
+        if preset.pressure_size:
+            size *= preset.size_curve.evaluate_fast(pressure)
+        if preset.pressure_opacity:
+            opacity = preset.opacity_curve.evaluate_fast(pressure)
         opacity *= QColor(self.primary_color).alphaF()
         return max(0.5, size), opacity
 
@@ -13319,12 +13957,15 @@ class _CanvasLogic:
         )
         layer_x, layer_y = self.chapter.layer_world_translation(obj.parent_layer_id)
         world = local.translated(layer_x + obj.x, layer_y + obj.y)
+        self._stroke_dirty_world = (
+            QRectF(world) if self._stroke_dirty_world.isEmpty()
+            else self._stroke_dirty_world.united(world)
+        )
         bottom = math.ceil(world.bottom())
         if bottom > self.chapter.height:
             self.chapter.height = bottom + 1080
             self.hierarchyChanged.emit()
-        self.documentChanged.emit(world)
-        self.update()
+        self._queue_visual_dirty(world)
 
     def _restore_raster_frame(
         self, object_id: str, frame: object,

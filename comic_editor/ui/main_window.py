@@ -56,6 +56,7 @@ from comic_editor.ui.tool_ribbon_pages import (
 from comic_editor.ui.tree_model import HierarchyModel
 from comic_editor.ui.asset_library import AssetLibraryWidget
 from comic_editor.ui.sessions import EditorSession, ProjectContext
+from comic_editor.ui.windows_input import tablet_multitouch_native_result
 
 
 class CollapsibleToolCategory(QWidget):
@@ -168,6 +169,17 @@ class MainWindow(QMainWindow):
         self._install_shortcuts()
         self._refresh_actions()
         self.statusBar().showMessage("Create or open a series")
+
+    def nativeEvent(self, event_type, message):  # noqa: N802
+        """Opt this window into finger input while a pen is hovering."""
+        settings = getattr(self, "settings", None)
+        result = tablet_multitouch_native_result(
+            event_type, message,
+            bool(settings is not None and settings.tablet_mode),
+        )
+        if result is not None:
+            return True, result
+        return super().nativeEvent(event_type, message)
 
     # ---- UI ------------------------------------------------------------
     def _build_ui(self) -> None:
