@@ -6,7 +6,7 @@ import json
 from PySide6.QtCore import QMimeData, QPointF, Qt
 from PySide6.QtGui import QColor, QImage, QPainter
 from PySide6.QtTest import QTest
-from PySide6.QtWidgets import QMessageBox
+from PySide6.QtWidgets import QInputDialog, QMessageBox
 
 from comic_editor.core.assets import (
     AssetRepository, extract_asset, instantiate_asset,
@@ -58,6 +58,29 @@ def _solid_asset():
         style=ShapeStyle(primary_color="#FFFF0000"),
     )
     return extract_asset(chapter, TileStore(), "layer", layer.layer_id, "Solid")
+
+
+def _window_with_asset(tmp_path, name="Hero"):
+    repository = SeriesRepository(tmp_path / "Series")
+    series = repository.create("Series")
+    chapter, tiles = repository.create_chapter(series, "Chapter")
+    source_layer = next(layer for layer in chapter.layers.values() if not layer.is_page)
+    manifest, asset_tiles = extract_asset(
+        chapter, tiles, "layer", source_layer.layer_id, name
+    )
+    thumbnail = QImage(32, 32, QImage.Format_ARGB32_Premultiplied)
+    thumbnail.fill(Qt.transparent)
+    AssetRepository(repository.root).create(manifest, asset_tiles, thumbnail)
+    window = MainWindow()
+    assert window.open_series(repository.root)
+    return window, repository, manifest
+
+
+def _dispose_window(window):
+    for session in window.sessions.values():
+        session.dirty = False
+    window._dirty = False
+    window.deleteLater()
 
 
 def test_asset_documents_allow_fitted_width_and_old_docs_default_to_chapter():
@@ -129,6 +152,212 @@ def test_asset_repository_is_per_series_and_rename_keeps_stable_folder(
         )
         repository.create(second, second_tiles, thumbnail)
     assert AssetRepository(tmp_path / "Other Series").list_assets() == []
+
+
+def test_asset_repository_replace_preserves_identity_and_replaces_contents(
+    qapp, tmp_path,
+):
+    chapter, layer, raster, _drawing, _fill, tiles = _asset_source()
+    repository = AssetRepository(tmp_path / "Series")
+    original, original_tiles = extract_asset(
+        chapter, tiles, "layer", layer.layer_id, "Hero"
+    )
+    original_thumbnail = QImage(16, 16, QImage.Format_ARGB32_Premultiplied)
+    original_thumbnail.fill(Qt.transparent)
+    repository.create(original, original_tiles, original_thumbnail)
+    original_root = repository.asset_root(original.asset_id)
+    original_bounds = repository.load(original.asset_id)[1].content_bounds(
+        raster.object_id
+    )
+
+    chapter.layers[layer.layer_id].name = "Replacement"
+    tiles.paint_dab(raster.object_id, QPointF(190, 140), 18, QColor("#2266ff"))
+    replacement, replacement_tiles = extract_asset(
+        chapter, tiles, "layer", layer.layer_id, " hero "
+    )
+    replacement_thumbnail = QImage(16, 16, QImage.Format_ARGB32_Premultiplied)
+    replacement_thumbnail.fill(QColor("#2266ff"))
+    result = repository.replace(
+        original.asset_id, replacement, replacement_tiles, replacement_thumbnail
+    )
+
+    assert result.asset_id == original.asset_id
+    assert result.name == "Hero"
+    assert repository.asset_root(result.asset_id) == original_root
+    assert len(repository.list_assets()) == 1
+    loaded, loaded_tiles = repository.load(result.asset_id)
+    assert loaded.document.layers[loaded.root_id].name == "Replacement"
+    assert loaded_tiles.content_bounds(raster.object_id) != original_bounds
+    saved_thumbnail = QImage(str(repository.thumbnail_path(result.asset_id)))
+    assert saved_thumbnail.pixelColor(0, 0) == QColor("#2266ff")
+    assert repository.find_by_name("  hErO  ").asset_id == original.asset_id
+
+
+def test_copy_as_asset_duplicate_decline_leaves_existing_asset_unchanged(
+    qapp, tmp_path, monkeypatch,
+):
+    window, _repository, existing = _window_with_asset(tmp_path)
+    try:
+        before, _tiles = window.active_session.context.assets.load(existing.asset_id)
+        source = next(
+            layer for layer in window.chapter.layers.values() if not layer.is_page
+        )
+        source.name = "Replacement"
+        questions = []
+        warnings = []
+        monkeypatch.setattr(
+            QInputDialog, "getText", lambda *args, **kwargs: ("  hErO  ", True)
+        )
+        monkeypatch.setattr(
+            QMessageBox, "question",
+            lambda *args, **kwargs: questions.append(args) or QMessageBox.No,
+        )
+        monkeypatch.setattr(
+            QMessageBox, "warning",
+            lambda *args, **kwargs: warnings.append(args) or QMessageBox.Ok,
+        )
+
+        window._copy_selected_as_asset("layer", source.layer_id)
+
+        after, _tiles = window.active_session.context.assets.load(existing.asset_id)
+        assert after.to_dict() == before.to_dict()
+        assert len(window.active_session.context.assets.list_assets()) == 1
+        assert len(questions) == 1
+        assert questions[0][1] == "Replace asset?"
+        assert "Asset Library version" in questions[0][2]
+        assert questions[0][4] == QMessageBox.No
+        assert warnings == []
+    finally:
+        _dispose_window(window)
+
+
+def test_copy_as_asset_reloads_clean_active_asset_tab_and_clears_undo(
+    qapp, tmp_path, monkeypatch,
+):
+    window, _repository, existing = _window_with_asset(tmp_path)
+    try:
+        window._open_asset(existing.asset_id)
+        session = window.active_session
+        root = window.chapter.layers[session.asset_manifest.root_id]
+        before = window.chapter.to_dict()
+        root.name = "Edited asset"
+        window.canvas.push_model_change(before, window.chapter.to_dict(), "Edit asset")
+        assert window.canvas.command_stack.can_undo
+        assert window.save()
+        assert not session.dirty
+
+        monkeypatch.setattr(
+            QInputDialog, "getText", lambda *args, **kwargs: ("hero", True)
+        )
+        monkeypatch.setattr(
+            QMessageBox, "question", lambda *args, **kwargs: QMessageBox.Yes
+        )
+        window._copy_selected_as_asset(
+            session.asset_manifest.root_kind, session.asset_manifest.root_id
+        )
+
+        assert session is window.active_session
+        assert session.asset_manifest.asset_id == existing.asset_id
+        assert session.chapter is window.chapter is window.canvas.chapter
+        assert session.chapter.layers[session.asset_manifest.root_id].name == "Edited asset"
+        assert not session.dirty
+        assert not window._dirty
+        assert not window.canvas.command_stack.can_undo
+        assert not window.canvas.command_stack.can_redo
+        assert window.canvas.selected_id == session.asset_manifest.root_id
+        assert window.statusBar().currentMessage() == "Replaced asset Hero"
+    finally:
+        _dispose_window(window)
+
+
+def test_copy_as_asset_dirty_tab_requires_discard_before_replacement(
+    qapp, tmp_path, monkeypatch,
+):
+    window, repository, existing = _window_with_asset(tmp_path)
+    try:
+        window._open_asset(existing.asset_id)
+        asset_session = window.active_session
+        asset_root = asset_session.chapter.layers[asset_session.asset_manifest.root_id]
+        asset_root.name = "Unsaved asset edit"
+        window._mark_dirty(None)
+        asset_tab = window.project_tabs.currentIndex()
+        series_tab = window._tab_index_for_key(window._series_session_key(repository.root))
+        window.project_tabs.setCurrentIndex(series_tab)
+        source = next(
+            layer for layer in window.chapter.layers.values() if not layer.is_page
+        )
+        source.name = "Replacement"
+        stored_before, _tiles = asset_session.context.assets.load(existing.asset_id)
+        answers = [QMessageBox.Yes, QMessageBox.No]
+        monkeypatch.setattr(
+            QInputDialog, "getText", lambda *args, **kwargs: (" HERO ", True)
+        )
+        monkeypatch.setattr(
+            QMessageBox, "question", lambda *args, **kwargs: answers.pop(0)
+        )
+
+        window._copy_selected_as_asset("layer", source.layer_id)
+
+        stored_after, _tiles = asset_session.context.assets.load(existing.asset_id)
+        assert stored_after.to_dict() == stored_before.to_dict()
+        assert asset_session.dirty
+        assert asset_session.chapter.layers[asset_session.asset_manifest.root_id].name == (
+            "Unsaved asset edit"
+        )
+
+        answers.extend([QMessageBox.Yes, QMessageBox.Yes])
+        window._copy_selected_as_asset("layer", source.layer_id)
+
+        assert window._tab_index_for_key(asset_session.key) == asset_tab
+        assert asset_session.asset_manifest.asset_id == existing.asset_id
+        assert asset_session.chapter.layers[asset_session.asset_manifest.root_id].name == (
+            "Replacement"
+        )
+        assert asset_session.canvas_state is None
+        assert not asset_session.dirty
+        window.project_tabs.setCurrentIndex(asset_tab)
+        assert window.active_session is asset_session
+        assert not window.canvas.command_stack.can_undo
+    finally:
+        _dispose_window(window)
+
+
+def test_copy_as_asset_replace_error_preserves_existing_asset(
+    qapp, tmp_path, monkeypatch,
+):
+    window, _repository, existing = _window_with_asset(tmp_path)
+    try:
+        assets = window.active_session.context.assets
+        before, _tiles = assets.load(existing.asset_id)
+        source = next(
+            layer for layer in window.chapter.layers.values() if not layer.is_page
+        )
+        source.name = "Replacement"
+        warnings = []
+        monkeypatch.setattr(
+            QInputDialog, "getText", lambda *args, **kwargs: ("Hero", True)
+        )
+        monkeypatch.setattr(
+            QMessageBox, "question", lambda *args, **kwargs: QMessageBox.Yes
+        )
+        monkeypatch.setattr(
+            assets, "replace",
+            lambda *args, **kwargs: (_ for _ in ()).throw(OSError("disk full")),
+        )
+        monkeypatch.setattr(
+            QMessageBox, "warning",
+            lambda *args, **kwargs: warnings.append(args) or QMessageBox.Ok,
+        )
+
+        window._copy_selected_as_asset("layer", source.layer_id)
+
+        after, _tiles = assets.load(existing.asset_id)
+        assert after.to_dict() == before.to_dict()
+        assert len(warnings) == 1
+        assert warnings[0][1] == "Unable to create asset"
+        assert warnings[0][2] == "disk full"
+    finally:
+        _dispose_window(window)
 
 
 def test_project_tabs_reuse_paths_and_restore_full_canvas_state(qapp, tmp_path):

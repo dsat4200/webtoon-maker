@@ -135,7 +135,20 @@ speed lines, includes opacity too
 	- another option should be "copy as asset". this brings up a popup asking you to name the asset. clicking OK then creates a folder for that asset which contains, essentially a project of its own, but with only that object and its children as they were when copied. this should also refresh the assets ribbon viewer and show its square thumbnail, which should have been rendered as a finished image, whose view is cropped to a fitted box around the bounds of the selected object
 
 
-
+## Misc features
+- add a delete layer hotkey
+- text size, add gizmos for increasing, decreasing by 1, direct font size field gizmo that lets you change it by typing in after clicking.
+	- text size should be integer, not fractional (at least not in the tool setting or gizmo interface)
+- include a toggle in tool settings to display the fonts in the font list dropdown in either their own font, each, or all using the same default font.
+- move the stuff thats currently in the text window popup to "tool settings" ribbon menu (all of it)
+- include bool, italic toggle gizmos
+- gizmos only appear when a text object is selected, and only apply to that text item
+- 2 handles that let you drag - circle handles, horizontal, attached to the right hand side of the text box, orange colored like gizmos
+	- these let you adjust the font size and kerning.
+	- font size handle goes from 10 to 100. (snap to integer)
+	- kerning handle should go from 1 to 10 (snap to 1 decimal place)
+- also, there's currently a bug where i cant make the font size above 99. typed in manual values should be 250 max.
+- also, optimize the free transform feature of text layout so that it transforms smoothly in realtime.
 
 ## Dont forget
 - object/layer outer outline

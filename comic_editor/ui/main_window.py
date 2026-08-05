@@ -2612,18 +2612,89 @@ class MainWindow(QMainWindow):
         )
         if not accepted or not name.strip():
             return
+        existing = context.assets.find_by_name(name)
+        open_session = (
+            self.sessions.get(self._asset_session_key(context, existing.asset_id))
+            if existing is not None else None
+        )
+        if existing is not None:
+            answer = QMessageBox.question(
+                self, "Replace asset?",
+                f'An asset named "{existing.name}" already exists. '
+                "Replace the Asset Library version with the selected content?",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No,
+            )
+            if answer != QMessageBox.Yes:
+                return
+            if open_session is not None and (
+                open_session.dirty
+                or open_session is self.active_session and self._dirty
+            ):
+                answer = QMessageBox.question(
+                    self, "Discard unsaved asset changes?",
+                    f'"{existing.name}" is open with unsaved changes. '
+                    "Replace it and discard those changes?",
+                    QMessageBox.Yes | QMessageBox.No,
+                    QMessageBox.No,
+                )
+                if answer != QMessageBox.Yes:
+                    return
         try:
             manifest, tiles = extract_asset(
                 self.chapter, self.canvas.tiles, kind, entity_id, name
             )
             thumbnail = self.canvas.render_asset_thumbnail(manifest, tiles)
-            context.assets.create(manifest, tiles, thumbnail)
+            if existing is None:
+                context.assets.create(manifest, tiles, thumbnail)
+            else:
+                manifest = context.assets.replace(
+                    existing.asset_id, manifest, tiles, thumbnail
+                )
         except (OSError, KeyError, ValueError) as error:
             QMessageBox.warning(self, "Unable to create asset", str(error))
             return
+        if existing is not None and open_session is not None:
+            self._reload_replaced_asset_session(open_session, manifest, tiles)
         self.asset_library.refresh()
         self.ribbon.select_page("asset_library")
-        self.statusBar().showMessage(f"Created asset {manifest.name}", 4000)
+        action = "Replaced" if existing is not None else "Created"
+        self.statusBar().showMessage(f"{action} asset {manifest.name}", 4000)
+
+    def _reload_replaced_asset_session(
+        self, session: EditorSession, manifest: AssetManifest, tiles: TileStore,
+    ) -> None:
+        """Reload an open asset tab after its repository entry is replaced."""
+        session.asset_manifest = manifest
+        session.chapter = manifest.document
+        session.tiles = tiles
+        session.canvas_state = None
+        session.dirty = False
+        session.last_autosave = 0.0
+        session.expanded_entities.clear()
+        if session is not self.active_session:
+            self._refresh_project_tabs()
+            return
+
+        self.chapter = manifest.document
+        self._dirty = False
+        self._last_autosave = 0.0
+        self.autosave_timer.stop()
+        self.canvas.command_stack = CommandStack()
+        self.canvas.set_document(manifest.document, tiles)
+        self.canvas.command_stack.changed_callback = self._command_stack_changed
+        self.canvas.set_selection(manifest.root_kind, manifest.root_id)
+        self.chapter_combo.setItemText(0, f"Asset: {manifest.name}")
+        self.setWindowTitle(f"{manifest.name} — Vertical Comic Editor")
+        self.preview.invalidate_all()
+        self.inspector.refresh()
+        self.layer_settings.refresh()
+        self._sync_contextual_ribbon()
+        session.dirty = False
+        self._dirty = False
+        self.autosave_timer.stop()
+        self._refresh_project_tabs()
+        self._refresh_actions()
 
     def _open_asset(self, asset_id: str) -> None:
         context = self._current_project_context()

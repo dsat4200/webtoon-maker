@@ -455,6 +455,16 @@ class AssetRepository:
                 continue
         return sorted(result, key=lambda asset: (asset.name.casefold(), asset.asset_id))
 
+    def find_by_name(self, name: str) -> AssetManifest | None:
+        """Return the asset with a trimmed, case-insensitive name match."""
+        folded = name.strip().casefold()
+        if not folded:
+            return None
+        return next(
+            (asset for asset in self.list_assets() if asset.name.casefold() == folded),
+            None,
+        )
+
     def _ensure_unique_name(self, name: str, excluding: str = "") -> str:
         name = name.strip()
         if not name:
@@ -471,6 +481,20 @@ class AssetRepository:
         manifest.name = self._ensure_unique_name(manifest.name)
         if (self.asset_root(manifest.asset_id) / ASSET_FILE).exists():
             raise FileExistsError("Asset already exists")
+        self.save(manifest, tiles, thumbnail)
+        return manifest
+
+    def replace(self, asset_id: str, manifest: AssetManifest, tiles: TileStore,
+                thumbnail: QImage) -> AssetManifest:
+        """Replace an asset's contents while preserving its stable identity."""
+        existing = next(
+            (asset for asset in self.list_assets() if asset.asset_id == asset_id),
+            None,
+        )
+        if existing is None:
+            raise FileNotFoundError(f"Asset {asset_id!r} does not exist")
+        manifest.asset_id = existing.asset_id
+        manifest.name = existing.name
         self.save(manifest, tiles, thumbnail)
         return manifest
 
