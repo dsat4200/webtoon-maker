@@ -158,9 +158,23 @@ more text tweaks
 - [x] undo doesn't let me undo a shape creation (bug)
 - [x] bug during shape editing, now the canvas is just grey and i can't change or open anything
 
-## Brushes
+## Raster/Vector object / pencil features
 psd brush support?
 - add brushes to tool settings ribbon (raster/vector pencil) (with preview of a small, curved stroke segment in a square live preview icon, from zero pressure to 100, swoop curve )
+
+smoothing support
+
+
+Object features
+- outline support
+	- has a color, thickness.
+	- no anti-aliasing
+
+
+bugs
+- trying to free transform a raster layer crashed the program
+	- also, changes made to the 8-handle cage around the transformed raster/vector object should stay so you know how you transformed it, until you deselect the object (instead of resetting the transform bounds position)
+	- also, vector objects should be able to free/uniform with 8 handles just like raster objects do.
 
 
 general tweaks
@@ -185,6 +199,7 @@ general tweaks
 
 
 ## New feature - repeating texture mode
+
 
 ## shape tweaks
 - for shape creation, add a "finish" button gizmo that confirms the shape.
