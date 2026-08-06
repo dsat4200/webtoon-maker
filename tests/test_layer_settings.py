@@ -87,10 +87,11 @@ def test_layer_settings_kind_rows_and_position_above_tree(qapp, monkeypatch):
     )
     window._refresh_hierarchy()
     layout = window.hierarchy_dock.widget().layout()
-    assert layout.indexOf(window.selection_common) < layout.indexOf(
-        window.outliner_splitter
-    )
-    assert window.outliner_splitter.widget(0) is window.settings_scroll
+    assert layout.indexOf(window.outliner_splitter) >= 0
+    settings_host = window.outliner_splitter.widget(0)
+    assert settings_host.layout().indexOf(window.settings_scroll) >= 0
+    assert settings_host.layout().indexOf(window.selection_common) >= 0
+    assert settings_host.layout().indexOf(window.settings_scroll) < settings_host.layout().indexOf(window.selection_common)
     assert isinstance(window.settings_scroll, QScrollArea)
     assert window.settings_scroll.widget() is window.selection_settings
     assert window.outliner_splitter.widget(1) is window.tree
@@ -372,10 +373,9 @@ def test_common_selection_row_targets_exact_entity_and_coalesces_opacity(
         raster.opacity_locked = True
         window.canvas.set_selection("object", raster.object_id)
         common.refresh()
-        assert not common.opacity.isEnabled()
-        controls = window.raster_object_controls
-        controls.refresh()
-        controls.opacity_lock.setChecked(False)
+        assert common.opacity.isEnabled()
+        assert common.opacity_lock.isChecked()
+        common.opacity_lock.setChecked(False)
         qapp.processEvents()
         assert common.opacity.isEnabled()
 
@@ -422,9 +422,9 @@ def test_selection_settings_switches_object_pages_and_uses_parent_for_contextual
             assert panel.stack.currentWidget() is panel.layer_page
             assert panel.layer_page.title() == "Parent Layer Settings"
             assert panel.layer_page.name.text() == "Panel"
-        assert window.gradient_tools_controls.opacity_lock.isChecked()
-        assert not window.selection_common.opacity.isEnabled()
-        window.gradient_tools_controls.opacity_lock.setChecked(False)
+        assert window.selection_common.opacity_lock.isChecked()
+        assert window.selection_common.opacity.isEnabled()
+        window.selection_common.opacity_lock.setChecked(False)
         qapp.processEvents()
         assert window.selection_common.opacity.isEnabled()
     finally:

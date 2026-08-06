@@ -389,6 +389,10 @@ class TextObjectControls(QObject):
 
         flags = QHBoxLayout()
         self.opacity_lock = QCheckBox("Lock opacity", widget)
+        # Opacity inheritance is owned by the pinned outliner row.  Retain a
+        # hidden compatibility widget so older integrations can still inspect
+        # the state without exposing a second editor.
+        self.opacity_lock.hide()
         flags.addWidget(self.opacity_lock)
         flags.addStretch(1)
         layout.addLayout(flags)
@@ -398,7 +402,6 @@ class TextObjectControls(QObject):
         self.preset_rename.clicked.connect(self._rename_preset)
         self.preset_remove.clicked.connect(self._remove_preset)
         self.preset_add.clicked.connect(self._add_preset)
-        self.opacity_lock.toggled.connect(self._opacity_lock_changed)
         return widget
 
     def _build_typography_widget(self) -> QWidget:
@@ -1127,6 +1130,8 @@ class RasterObjectControls(QObject):
         flags_layout.setContentsMargins(0, 0, 0, 0)
         self.visible = QCheckBox("Visible", flags)
         self.opacity_lock = QCheckBox("Lock opacity", flags)
+        self.visible.hide()
+        self.opacity_lock.hide()
         flags_layout.addWidget(self.visible)
         flags_layout.addWidget(self.opacity_lock)
         form.addRow(flags)
@@ -1149,13 +1154,10 @@ class RasterObjectControls(QObject):
         )
 
         self.name.editingFinished.connect(self._apply_discrete)
-        self.visible.toggled.connect(self._apply_discrete)
-        self.opacity_lock.toggled.connect(self._apply_discrete)
         self.ignore_parent_mask.toggled.connect(self._apply_discrete)
         self.geometry_reference.currentIndexChanged.connect(
             self._apply_discrete
         )
-        self._connect_slider("opacity", self.opacity)
         self._connect_slider("underlay", self.underlay)
         return widget
 
@@ -1202,7 +1204,7 @@ class RasterObjectControls(QObject):
             self.opacity_lock.setChecked(entity.opacity_locked)
             self.opacity.setValue(round(entity.opacity * 100))
             self.opacity_value.setText(f"{self.opacity.value()}%")
-            self.opacity.setEnabled(not entity.opacity_locked)
+            self.opacity.setEnabled(False)
             self.ignore_parent_mask.setChecked(entity.ignore_parent_mask)
             self.underlay.setValue(round(entity.underlay_opacity * 100))
             self.underlay_value.setText(f"{self.underlay.value()}%")
@@ -1221,12 +1223,6 @@ class RasterObjectControls(QObject):
 
     def _write_controls(self, entity: RasterObject) -> None:
         entity.name = self.name.text().strip() or entity.name
-        entity.visible = self.visible.isChecked()
-        entity.opacity_locked = self.opacity_lock.isChecked()
-        entity.opacity = (
-            self.canvas.chapter.layers[entity.parent_layer_id].opacity
-            if entity.opacity_locked else self.opacity.value() / 100.0
-        )
         entity.ignore_parent_mask = self.ignore_parent_mask.isChecked()
         reference = self.geometry_reference.currentData()
         entity.geometry_reference = (

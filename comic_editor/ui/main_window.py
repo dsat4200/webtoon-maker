@@ -458,10 +458,25 @@ class MainWindow(QMainWindow):
             "asset_library", "Asset Library"
         )
         asset_group = self.asset_library_page.add_group(
-            "Series Assets", minimum_width=760
+            "", minimum_width=760
+        )
+        asset_group.title_label.hide()
+        # The vertical ribbon page has spare viewport height below its
+        # minimum-sized groups.  Let this page's sole group consume that
+        # space so the grid grows and its footer remains docked at the bottom
+        # instead of floating above the color palette.
+        asset_group.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding
+        )
+        self.asset_library_page.groups_layout.setStretch(0, 1)
+        self.asset_library_page.groups_layout.setStretch(
+            self.asset_library_page.groups_layout.count() - 1, 0
         )
         self.asset_library = AssetLibraryWidget(self.ribbon)
-        self.asset_library.setMinimumHeight(108)
+        self.asset_library.setMinimumHeight(220)
+        self.asset_library.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding
+        )
         asset_group.add_widget(self.asset_library)
 
         self.vector_tools_page = self.ribbon.add_page(
@@ -621,7 +636,6 @@ class MainWindow(QMainWindow):
         self.selection_common = SelectionCommonControls(
             self.canvas, hierarchy_panel
         )
-        hierarchy_layout.addWidget(self.selection_common)
         self.selection_settings = SelectionSettingsPanel(
             self.canvas, self.settings, save_settings, hierarchy_panel
         )
@@ -669,7 +683,15 @@ class MainWindow(QMainWindow):
         self.outliner_splitter.setObjectName("outlinerSettingsSplitter")
         self.outliner_splitter.setChildrenCollapsible(False)
         self.outliner_splitter.setHandleWidth(5)
-        self.outliner_splitter.addWidget(self.settings_scroll)
+        settings_host = QWidget(hierarchy_panel)
+        settings_host.setObjectName("selectionSettingsHost")
+        settings_host_layout = QVBoxLayout(settings_host)
+        settings_host_layout.setContentsMargins(0, 0, 0, 0)
+        settings_host_layout.setSpacing(2)
+        settings_host_layout.addWidget(self.settings_scroll, 1)
+        self.selection_common.setMinimumHeight(30)
+        settings_host_layout.addWidget(self.selection_common, 0)
+        self.outliner_splitter.addWidget(settings_host)
         self.outliner_splitter.addWidget(self.tree)
         self.outliner_splitter.setStretchFactor(0, 0)
         self.outliner_splitter.setStretchFactor(1, 1)
@@ -852,6 +874,12 @@ class MainWindow(QMainWindow):
         )
         self.asset_library.assetActivated.connect(self._open_asset)
         self.asset_library.renameRequested.connect(self._rename_asset)
+        self.asset_library.deleteRequested.connect(self._delete_asset)
+        self.asset_library.folderRenameRequested.connect(self._rename_asset_folder)
+        self.asset_library.folderDeleteRequested.connect(self._delete_asset_folder)
+        self.asset_library.statusMessage.connect(
+            lambda message: self.statusBar().showMessage(message, 5000)
+        )
         self.autosave_timer.timeout.connect(self._autosave)
         self.series_preferences_timer.timeout.connect(
             self._flush_series_preferences
@@ -907,14 +935,6 @@ class MainWindow(QMainWindow):
         )
         self.gradient_tools_controls.createRequested.connect(
             self._create_gradient
-        )
-        self.gradient_tools_controls.speedCreateRequested.connect(
-            lambda field_type: self._create_gradient(
-                field_type, gradient_type="speed_lines"
-            )
-        )
-        self.gradient_tools_controls.centerShapeRequested.connect(
-            self._edit_speed_center_shape
         )
         self.gradient_tools_controls.objectChanged.connect(
             self._hierarchy_changed
@@ -1747,10 +1767,17 @@ class MainWindow(QMainWindow):
         except (OSError, ValueError) as error:
             QMessageBox.critical(self, "Unable to open chapter", str(error))
             return False
+        load_warnings = list(repository.last_load_warnings)
+        if load_warnings:
+            QMessageBox.warning(
+                self, "Unsupported content omitted",
+                "\n".join(load_warnings),
+            )
         context = ProjectContext.create(repository, series)
         session = EditorSession(
             key=key, kind="series", context=context,
-            chapter=chapter, tiles=tiles, images=images, dirty=recover,
+            chapter=chapter, tiles=tiles, images=images,
+            dirty=recover or bool(load_warnings),
         )
         self._add_editor_session(session)
         return True
@@ -1841,8 +1868,14 @@ class MainWindow(QMainWindow):
         except (OSError, ValueError) as error:
             QMessageBox.critical(self, "Unable to open chapter", str(error))
             return
+        load_warnings = list(self.repository.last_load_warnings)
+        if load_warnings:
+            QMessageBox.warning(
+                self, "Unsupported content omitted",
+                "\n".join(load_warnings),
+            )
         self._set_chapter(chapter, tiles, images)
-        if recover:
+        if recover or load_warnings:
             self._mark_dirty(None)
 
     def _set_chapter(
@@ -2631,13 +2664,12 @@ class MainWindow(QMainWindow):
     def _update_gradient_group_visibility(self, context: str) -> None:
         """Show only the controls relevant to the current gradient context."""
         creating = context == "create"
-        editing = context in {"color", "speed"}
-        speed = context == "speed"
+        editing = context == "color"
         self.gradient_create_group.setVisible(creating)
         self.gradient_type_group.setVisible(editing)
         self.gradient_parameters_group.setVisible(editing)
-        self.gradient_thickness_group.setVisible(speed)
-        self.gradient_impact_group.setVisible(speed)
+        self.gradient_thickness_group.setVisible(False)
+        self.gradient_impact_group.setVisible(False)
 
     def _sync_contextual_ribbon(self) -> None:
         if not hasattr(self, "ribbon"):
@@ -2842,7 +2874,8 @@ class MainWindow(QMainWindow):
             )
             if existing is None:
                 context.assets.create(
-                    manifest, tiles, thumbnail, images=images
+                    manifest, tiles, thumbnail, images=images,
+                    folder_id=self.asset_library.selected_folder_id(),
                 )
             else:
                 manifest = context.assets.replace(
@@ -2984,10 +3017,16 @@ class MainWindow(QMainWindow):
         except (OSError, ValueError, KeyError) as error:
             QMessageBox.critical(self, "Unable to open asset", str(error))
             return
+        load_warnings = list(context.assets.last_load_warnings)
+        if load_warnings:
+            QMessageBox.warning(
+                self, "Unsupported content omitted",
+                "\n".join(load_warnings),
+            )
         self._add_editor_session(EditorSession(
             key=key, kind="asset", context=context,
             chapter=manifest.document, tiles=tiles, images=images,
-            asset_manifest=manifest, dirty=recover,
+            asset_manifest=manifest, dirty=recover or bool(load_warnings),
         ))
 
     def _rename_asset(self, asset_id: str) -> None:
@@ -3028,6 +3067,111 @@ class MainWindow(QMainWindow):
             self.setWindowTitle(f"{renamed.name} — Vertical Comic Editor")
         self.asset_library.refresh()
         self._refresh_project_tabs()
+
+    def _delete_asset(self, asset_id: str) -> None:
+        context = self._current_project_context()
+        if context is None:
+            return
+        manifest = next(
+            (asset for asset in context.assets.list_assets()
+             if asset.asset_id == asset_id), None
+        )
+        if manifest is None:
+            return
+        answer = QMessageBox.question(
+            self, "Delete Asset",
+            f'Delete the asset "{manifest.name}"? This cannot be undone.',
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        try:
+            context.assets.delete(asset_id)
+        except (OSError, ValueError, FileNotFoundError) as error:
+            QMessageBox.warning(self, "Unable to delete asset", str(error))
+            return
+        for key, session in list(self.sessions.items()):
+            if (
+                session.kind == "asset"
+                and session.context.repository.root == context.repository.root
+                and session.asset_manifest is not None
+                and session.asset_manifest.asset_id == asset_id
+            ):
+                index = self._tab_index_for_key(key)
+                self.sessions.pop(key, None)
+                if index >= 0:
+                    self.project_tabs.removeTab(index)
+                if session is self.active_session:
+                    self.active_session = None
+        self.asset_library.refresh()
+        if not self.project_tabs.count():
+            self._clear_active_session()
+        elif self.active_session is None:
+            session = self.sessions.get(str(self.project_tabs.tabData(
+                self.project_tabs.currentIndex()
+            )))
+            if session is not None:
+                self._activate_editor_session(session)
+
+    def _rename_asset_folder(self, folder_id: str) -> None:
+        folder = self.asset_library.repository.get_folder(folder_id) if self.asset_library.repository else None
+        if folder is None:
+            return
+        name, accepted = QInputDialog.getText(
+            self, "Rename Folder", "Folder name", text=folder.name
+        )
+        if not accepted or not name.strip() or name.strip() == folder.name:
+            return
+        try:
+            self.asset_library.repository.rename_folder(folder_id, name)
+        except (OSError, ValueError, FileNotFoundError) as error:
+            QMessageBox.warning(self, "Unable to rename folder", str(error))
+            return
+        self.asset_library.refresh()
+
+    def _delete_asset_folder(self, folder_id: str) -> None:
+        repository = self.asset_library.repository
+        folder = repository.get_folder(folder_id) if repository else None
+        if repository is None or folder is None:
+            return
+        assets = repository.assets_in_folder(folder_id, recursive=True)
+        answer = QMessageBox.question(
+            self, "Delete Folder",
+            f'Delete "{folder.name}" and its {len(assets)} asset(s)?',
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        try:
+            deleted_ids = repository.delete_folder(folder_id, recursive=True)
+        except (OSError, ValueError, FileNotFoundError) as error:
+            QMessageBox.warning(self, "Unable to delete folder", str(error))
+            return
+        deleted = set(deleted_ids)
+        for key, session in list(self.sessions.items()):
+            if (
+                session.kind == "asset"
+                and session.context.repository.root == repository.series_root
+                and session.asset_manifest is not None
+                and session.asset_manifest.asset_id in deleted
+            ):
+                index = self._tab_index_for_key(key)
+                self.sessions.pop(key, None)
+                if index >= 0:
+                    self.project_tabs.removeTab(index)
+                if session is self.active_session:
+                    self.active_session = None
+        self.asset_library.refresh()
+        if not self.project_tabs.count():
+            self._clear_active_session()
+        elif self.active_session is None:
+            session = self.sessions.get(str(self.project_tabs.tabData(
+                self.project_tabs.currentIndex()
+            )))
+            if session is not None:
+                self._activate_editor_session(session)
 
     @staticmethod
     def _image_file_filter() -> str:

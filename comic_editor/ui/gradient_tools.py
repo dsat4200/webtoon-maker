@@ -223,6 +223,9 @@ class GradientToolsControls(QWidget):
         self.opacity_lock = QCheckBox(
             "Lock opacity", self.type_parameters_widget
         )
+        # The shared outliner row is the sole opacity-lock editor.  Keep this
+        # hidden for compatibility with existing integrations.
+        self.opacity_lock.hide()
         type_parameters.addWidget(self.opacity_lock)
         self.direction_row = QWidget(self.type_parameters_widget)
         direction_layout = QHBoxLayout(self.direction_row)
@@ -394,6 +397,13 @@ class GradientToolsControls(QWidget):
                 str(self.field_type.currentData() or "line")
             )
         )
+        # Speed Lines is no longer a supported tool.  Keep the legacy model
+        # readers below for migration, but do not expose any creation or
+        # editing controls in the ribbon.
+        self.create_speed.hide()
+        self.thickness_widget.hide()
+        self.impact_widget.hide()
+        self.center_shape_button.hide()
         self.create_speed.clicked.connect(
             lambda: self.speedCreateRequested.emit(
                 str(self.field_type.currentData() or "line")
@@ -401,7 +411,6 @@ class GradientToolsControls(QWidget):
         )
         self.field_type.currentIndexChanged.connect(self._field_changed)
         self.select_gradient.clicked.connect(self._select_matching_gradient)
-        self.opacity_lock.toggled.connect(self._opacity_lock_changed)
         self.direction_mode.currentIndexChanged.connect(
             self._type_parameter_changed
         )
@@ -472,12 +481,7 @@ class GradientToolsControls(QWidget):
         ):
             return None
         candidate = self.canvas.chapter.objects.get(self.canvas.selected_id)
-        if isinstance(candidate, SpeedLineCenterObject):
-            owner = self.canvas.chapter.objects.get(candidate.owner_gradient_id)
-            return owner if isinstance(owner, SpeedLinesGradientObject) else None
-        if isinstance(
-            candidate, (ColorFillGradientObject, SpeedLinesGradientObject)
-        ):
+        if isinstance(candidate, ColorFillGradientObject):
             return candidate
         return None
 

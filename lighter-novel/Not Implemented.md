@@ -40,17 +40,11 @@ Object features
 - asset library shouldn't have a column - just put all the assets there in a grid (items wide -  however many fit, vertical with scroll bar.) and let the user scroll vertically instead of horizontally to traverse them. also include folders. let the user click an "add folder" button at the bottom of the assets window to add a folder (plus folder icon), with a delete folder button next to it (trash icon), and the name of the folder (editable text field) between the two in that row (these operations only apply to the selected folder, only one folder selectable at a time)
 	- folder icon should be, well, a folder icon, fitting the square icons of the rest of the items in the asset browser but with a visible 2x2 grid of the icons of the first 4 items in the folder, with a 8px margin between them. (and the name of the folder below the folder icon as well)
 	- right clicking any asset or folder should let you rename or delete them as well.
-## Image mode tweaks
-- bounds should live update while dragging, intsead of doing it after release
-- increase transform hover/drag area to include inside of image while it's selected
-- if in pencil mode, click dragging 8-handle gizmos shouldn't draw.
-- any transform that has 8-handle bounds should have a text gizmo with text label that lets you toggle between uniform and free transform. (be it vector, raster, free transform text, rects, circle/ellipse, or image)
-	- in those 8-handles, any area that would let you translate an object should turn the cursor into an open palm. any drag operation should be a closed hand while dragging. 
-	- make the rotation pivot a circle with a crosshair in the center. if you double click it, it should snap back to whatever center it should be in, and return to following that center until it's manually moved again.
-	- hovering over circle-shaped handles (such as the main 8, or points in a shape) should turn the pointer into a crosshair.
-	- if there's a corresponding free/uniform toggle in a menu somewhere, like the ribbon or the selected object properties panel, for a transform mode gizmo toggle you add, remove the non-gizmo one to free up UI space.
-- pasting images and importing from the dialogue works, but dragging images in from file explorer or google images does not show preview and does not import (bug)
-- selecting image objects while another object is selected should work like any other object (text, shapes). currently, clicking from outside like that (with the image under the cursor) is selecting the page when it should be selecting the image.
+
+
+## more tweaks
+- dragging assets into folders isn't working (bug)
+
 
 ## New feature - repeating texture editor
 ## New Feature - Image Imports

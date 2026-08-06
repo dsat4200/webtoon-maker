@@ -25,6 +25,8 @@ from .tiles import TileStore
 
 ASSET_SCHEMA_VERSION = 2
 ASSET_FILE = "asset.json"
+LIBRARY_SCHEMA_VERSION = 1
+LIBRARY_FILE = "library.json"
 THUMBNAIL_FILE = "thumbnail.png"
 PENDING_FILE = ".save_pending"
 LAST_GOOD_DIR = "last_good"
@@ -258,7 +260,9 @@ class AssetManifest:
         }
 
     @classmethod
-    def from_dict(cls, data: dict[str, Any]) -> "AssetManifest":
+    def from_dict(
+        cls, data: dict[str, Any], warnings: list[str] | None = None,
+    ) -> "AssetManifest":
         schema = int(data.get("asset_schema_version", 1))
         if schema > ASSET_SCHEMA_VERSION:
             raise ValueError(f"Unsupported future asset schema: {schema}")
@@ -268,12 +272,43 @@ class AssetManifest:
             root_kind=str(root.get("kind", "layer")),
             root_id=str(root.get("id", "")),
             visual_bounds=tuple(data.get("visual_bounds", [0, 0, 1, 1])),
-            document=ChapterDocument.from_dict(data["document"]),
+            document=ChapterDocument.from_dict(
+                data["document"], warnings=warnings
+            ),
             schema_version=schema,
         )
         result.validate()
         result.schema_version = ASSET_SCHEMA_VERSION
         return result
+
+
+@dataclass
+class AssetFolder:
+    """A nested folder in the per-series asset library."""
+
+    folder_id: str = field(default_factory=new_id)
+    name: str = "Folder"
+    parent_id: str | None = None
+    order: int = 0
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "id": self.folder_id,
+            "name": self.name,
+            "parent_id": self.parent_id,
+            "order": self.order,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "AssetFolder":
+        return cls(
+            folder_id=str(data.get("id") or new_id()),
+            name=str(data.get("name") or "Folder").strip() or "Folder",
+            parent_id=(
+                str(data["parent_id"]) if data.get("parent_id") else None
+            ),
+            order=int(data.get("order", 0)),
+        )
 
 
 def extract_asset(
@@ -282,6 +317,11 @@ def extract_asset(
     include_images: bool = False,
 ) -> tuple[AssetManifest, TileStore] | tuple[AssetManifest, TileStore, ImageStore]:
     """Copy one entity subtree into a fitted, self-contained asset document."""
+    if kind == "object" and isinstance(
+        document.objects.get(entity_id),
+        (SpeedLinesGradientObject, SpeedLineCenterObject),
+    ):
+        raise ValueError("Speed Lines are no longer supported")
     if kind == "object" and isinstance(document.objects.get(entity_id), VectorFillObject):
         entity_id = document.objects[entity_id].owner_drawing_id
     if kind not in {"layer", "object"}:
@@ -396,6 +436,13 @@ def instantiate_asset(
     target_images: ImageStore | None = None,
 ) -> tuple[str, str, set[str]]:
     """Instantiate an independent asset copy centered on a world point."""
+    root_entity = (
+        manifest.document.layers.get(manifest.root_id)
+        if manifest.root_kind == "layer"
+        else manifest.document.objects.get(manifest.root_id)
+    )
+    if isinstance(root_entity, (SpeedLinesGradientObject, SpeedLineCenterObject)):
+        raise ValueError("Speed Lines are no longer supported")
     parent = target.layers.get(parent_id)
     if parent is None or parent.layer_kind == "fill":
         raise ValueError("Asset destination must be a container layer")
@@ -438,6 +485,15 @@ def instantiate_asset(
         layer_map[manifest.root_id]
         if manifest.root_kind == "layer" else object_map[manifest.root_id]
     )
+    # The library name is the user-facing identity of the dropped asset.
+    # Preserve child names, but make the cloned root explicitly custom-named
+    # so hierarchy display logic cannot replace it with a generic type label.
+    if manifest.root_kind == "layer":
+        cloned_layers[root_id].name = manifest.name
+        cloned_layers[root_id].custom_name = True
+    else:
+        cloned_objects[root_id].name = manifest.name
+        cloned_objects[root_id].custom_name = True
     target.layers.update(cloned_layers)
     target.objects.update(cloned_objects)
     parent.children.insert(0, ChildRef(manifest.root_kind, root_id))
@@ -483,6 +539,205 @@ class AssetRepository:
     def __init__(self, series_root: str | Path):
         self.series_root = Path(series_root).expanduser().resolve()
         self.root = self.series_root / "assets"
+        self.last_load_warnings: list[str] = []
+
+    @property
+    def library_path(self) -> Path:
+        return self.root / LIBRARY_FILE
+
+    def _load_library(self) -> tuple[dict[str, AssetFolder], dict[str, str]]:
+        """Read and normalize folder metadata without failing old libraries."""
+        if not self.library_path.is_file():
+            return {}, {}
+        try:
+            data = json.loads(self.library_path.read_text(encoding="utf-8"))
+        except (OSError, TypeError, ValueError, json.JSONDecodeError):
+            return {}, {}
+        if not isinstance(data, dict):
+            return {}, {}
+        folders: dict[str, AssetFolder] = {}
+        for raw in data.get("folders", []):
+            if not isinstance(raw, dict):
+                continue
+            folder = AssetFolder.from_dict(raw)
+            if folder.folder_id in folders:
+                continue
+            folders[folder.folder_id] = folder
+        # Ignore broken parent links and cycles rather than making a library
+        # impossible to open after a partial write or manual edit.
+        for folder in folders.values():
+            seen: set[str] = set()
+            parent = folder.parent_id
+            while parent is not None:
+                if parent not in folders or parent in seen:
+                    folder.parent_id = None
+                    break
+                seen.add(parent)
+                parent = folders[parent].parent_id
+        raw_memberships = data.get("memberships") or {}
+        if not isinstance(raw_memberships, dict):
+            raw_memberships = {}
+        memberships = {
+            str(asset_id): str(folder_id)
+            for asset_id, folder_id in raw_memberships.items()
+            if str(folder_id) in folders
+        }
+        return folders, memberships
+
+    def _save_library(
+        self, folders: dict[str, AssetFolder], memberships: dict[str, str],
+    ) -> None:
+        self.root.mkdir(parents=True, exist_ok=True)
+        atomic_json(self.library_path, {
+            "library_schema_version": LIBRARY_SCHEMA_VERSION,
+            "folders": [
+                folder.to_dict()
+                for folder in sorted(
+                    folders.values(), key=lambda item: (item.order, item.name.casefold(), item.folder_id)
+                )
+            ],
+            "memberships": dict(sorted(memberships.items())),
+        })
+
+    def list_folders(self, parent_id: str | None = None) -> list[AssetFolder]:
+        folders, _memberships = self._load_library()
+        return sorted(
+            (folder for folder in folders.values() if folder.parent_id == parent_id),
+            key=lambda item: (item.order, item.name.casefold(), item.folder_id),
+        )
+
+    def get_folder(self, folder_id: str) -> AssetFolder | None:
+        folders, _memberships = self._load_library()
+        return folders.get(str(folder_id))
+
+    def folder_for_asset(self, asset_id: str) -> str | None:
+        _folders, memberships = self._load_library()
+        return memberships.get(str(asset_id))
+
+    def assets_in_folder(
+        self, folder_id: str | None = None, *, recursive: bool = False,
+    ) -> list[AssetManifest]:
+        assets = self.list_assets()
+        folders, memberships = self._load_library()
+        allowed: set[str | None] = {folder_id}
+        if recursive and folder_id is not None:
+            pending = [folder_id]
+            while pending:
+                current = pending.pop()
+                children = [
+                    folder.folder_id for folder in folders.values()
+                    if folder.parent_id == current
+                ]
+                allowed.update(children)
+                pending.extend(children)
+        return [
+            asset for asset in assets
+            if memberships.get(asset.asset_id) in allowed
+        ]
+
+    def _ensure_folder_name(
+        self, name: str, folders: dict[str, AssetFolder],
+        parent_id: str | None, excluding: str = "",
+    ) -> str:
+        clean = str(name).strip()
+        if not clean:
+            raise ValueError("Folder name cannot be empty")
+        if any(
+            folder.folder_id != excluding
+            and folder.parent_id == parent_id
+            and folder.name.casefold() == clean.casefold()
+            for folder in folders.values()
+        ):
+            raise ValueError(f"A folder named {clean!r} already exists here")
+        return clean
+
+    def create_folder(
+        self, name: str, parent_id: str | None = None,
+    ) -> AssetFolder:
+        folders, memberships = self._load_library()
+        if parent_id is not None and parent_id not in folders:
+            raise KeyError(parent_id)
+        clean = self._ensure_folder_name(name, folders, parent_id)
+        order = max(
+            (folder.order for folder in folders.values()
+             if folder.parent_id == parent_id), default=-1
+        ) + 1
+        folder = AssetFolder(name=clean, parent_id=parent_id, order=order)
+        folders[folder.folder_id] = folder
+        self._save_library(folders, memberships)
+        return folder
+
+    def rename_folder(self, folder_id: str, name: str) -> AssetFolder:
+        folders, memberships = self._load_library()
+        folder = folders.get(str(folder_id))
+        if folder is None:
+            raise FileNotFoundError(f"Folder {folder_id!r} does not exist")
+        folder.name = self._ensure_folder_name(
+            name, folders, folder.parent_id, folder.folder_id
+        )
+        self._save_library(folders, memberships)
+        return folder
+
+    def move_asset(self, asset_id: str, folder_id: str | None) -> None:
+        if not any(asset.asset_id == str(asset_id) for asset in self.list_assets()):
+            raise FileNotFoundError(f"Asset {asset_id!r} does not exist")
+        folders, memberships = self._load_library()
+        if folder_id is not None and str(folder_id) not in folders:
+            raise KeyError(folder_id)
+        if folder_id is None:
+            memberships.pop(str(asset_id), None)
+        else:
+            memberships[str(asset_id)] = str(folder_id)
+        self._save_library(folders, memberships)
+
+    def delete_folder(self, folder_id: str, *, recursive: bool = True) -> list[str]:
+        folders, memberships = self._load_library()
+        folder_id = str(folder_id)
+        if folder_id not in folders:
+            raise FileNotFoundError(f"Folder {folder_id!r} does not exist")
+        if not recursive and any(
+            folder.parent_id == folder_id for folder in folders.values()
+        ):
+            raise ValueError("Folder is not empty")
+        doomed = {folder_id}
+        pending = [folder_id]
+        while pending:
+            current = pending.pop()
+            children = {
+                folder.folder_id for folder in folders.values()
+                if folder.parent_id == current
+            }
+            doomed.update(children)
+            pending.extend(children)
+        doomed_assets = [
+            asset_id for asset_id, parent in memberships.items()
+            if parent in doomed
+        ]
+        for asset_id in doomed_assets:
+            root = self.asset_root(asset_id).resolve()
+            if root.parent != self.root.resolve():
+                raise OSError("Invalid asset path")
+            if root.exists():
+                shutil.rmtree(root)
+        for asset_id in doomed_assets:
+            memberships.pop(asset_id, None)
+        for item in doomed:
+            folders.pop(item, None)
+        self._save_library(folders, memberships)
+        return doomed_assets
+
+    def delete(self, asset_id: str) -> None:
+        asset_id = str(asset_id)
+        if not any(asset.asset_id == asset_id for asset in self.list_assets()):
+            raise FileNotFoundError(f"Asset {asset_id!r} does not exist")
+        root = self.asset_root(asset_id).resolve()
+        if root.parent != self.root.resolve():
+            raise OSError("Invalid asset path")
+        if root.exists():
+            shutil.rmtree(root)
+        folders, memberships = self._load_library()
+        memberships.pop(asset_id, None)
+        self._save_library(folders, memberships)
 
     def asset_root(self, asset_id: str) -> Path:
         return self.root / asset_id
@@ -491,16 +746,26 @@ class AssetRepository:
         return self.asset_root(asset_id) / THUMBNAIL_FILE
 
     def list_assets(self) -> list[AssetManifest]:
+        self.last_load_warnings = []
         if not self.root.is_dir():
             return []
         result: list[AssetManifest] = []
         for path in self.root.glob(f"*/{ASSET_FILE}"):
+            local_warnings: list[str] = []
             try:
                 result.append(AssetManifest.from_dict(
-                    json.loads(path.read_text(encoding="utf-8"))
+                    json.loads(path.read_text(encoding="utf-8")),
+                    warnings=local_warnings,
                 ))
             except (OSError, TypeError, ValueError, KeyError, json.JSONDecodeError):
+                if local_warnings:
+                    self.last_load_warnings.extend(
+                        [f"Asset {path.parent.name}: {message}" for message in local_warnings]
+                    )
                 continue
+            self.last_load_warnings.extend(
+                [f"Asset {path.parent.name}: {message}" for message in local_warnings]
+            )
         return sorted(result, key=lambda asset: (asset.name.casefold(), asset.asset_id))
 
     def find_by_name(self, name: str) -> AssetManifest | None:
@@ -526,12 +791,16 @@ class AssetRepository:
 
     def create(
         self, manifest: AssetManifest, tiles: TileStore, thumbnail: QImage,
-        images: ImageStore | None = None,
+        images: ImageStore | None = None, *, folder_id: str | None = None,
     ) -> AssetManifest:
         manifest.name = self._ensure_unique_name(manifest.name)
         if (self.asset_root(manifest.asset_id) / ASSET_FILE).exists():
             raise FileExistsError("Asset already exists")
+        if folder_id is not None and self.get_folder(folder_id) is None:
+            raise KeyError(folder_id)
         self.save(manifest, tiles, thumbnail, images=images)
+        if folder_id is not None:
+            self.move_asset(manifest.asset_id, folder_id)
         return manifest
 
     def replace(
@@ -560,9 +829,10 @@ class AssetRepository:
         if not recover:
             self._recover_interrupted_save(root)
         source = root / "autosave" if recover else root
+        self.last_load_warnings = []
         manifest = AssetManifest.from_dict(json.loads(
             (source / ASSET_FILE).read_text(encoding="utf-8")
-        ))
+        ), warnings=self.last_load_warnings)
         tiles = TileStore()
         raster_ids = {
             object_id for object_id, obj in manifest.document.objects.items()

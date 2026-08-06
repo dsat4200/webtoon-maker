@@ -36,6 +36,7 @@ class SeriesRepository:
     def __init__(self, root: str | Path):
         self.root = Path(root).expanduser().resolve()
         self.series_path = self.root / SERIES_FILE
+        self.last_load_warnings: list[str] = []
 
     @property
     def exists(self) -> bool:
@@ -232,7 +233,8 @@ class SeriesRepository:
             self._recover_interrupted_save(root)
         source = root / "autosave" if recover else root
         data = json.loads((source / CHAPTER_FILE).read_text(encoding="utf-8"))
-        chapter = ChapterDocument.from_dict(data)
+        self.last_load_warnings = []
+        chapter = ChapterDocument.from_dict(data, warnings=self.last_load_warnings)
         tiles = TileStore()
         object_ids = {
             object_id for object_id, obj in chapter.objects.items()

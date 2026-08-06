@@ -204,7 +204,9 @@ def test_vendored_iconoir_assets_cover_every_tool_strip_command():
         "split-square-dashed", "text-square", "text",
     }
     root = Path(icons_module.__file__).with_name("icons") / "iconoir"
-    assert {path.stem for path in root.glob("*.svg")} == required
+    available = {path.stem for path in root.glob("*.svg")}
+    assert required <= available
+    assert {"folder", "folder-plus", "trash", "nav-arrow-up", "eye", "eye-closed"} <= available
     assert "MIT License" in (root / "LICENSE").read_text(encoding="utf-8")
     for name in required:
         icon = icons_module.iconoir(name)

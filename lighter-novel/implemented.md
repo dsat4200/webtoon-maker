@@ -1,3 +1,16 @@
+
+## Image mode tweaks
+- bounds should live update while dragging, intsead of doing it after release
+- increase transform hover/drag area to include inside of image while it's selected
+- if in pencil mode, click dragging 8-handle gizmos shouldn't draw.
+- any transform that has 8-handle bounds should have a text gizmo with text label that lets you toggle between uniform and free transform. (be it vector, raster, free transform text, rects, circle/ellipse, or image)
+	- in those 8-handles, any area that would let you translate an object should turn the cursor into an open palm. any drag operation should be a closed hand while dragging. 
+	- make the rotation pivot a circle with a crosshair in the center. if you double click it, it should snap back to whatever center it should be in, and return to following that center until it's manually moved again.
+	- hovering over circle-shaped handles (such as the main 8, or points in a shape) should turn the pointer into a crosshair.
+	- if there's a corresponding free/uniform toggle in a menu somewhere, like the ribbon or the selected object properties panel, for a transform mode gizmo toggle you add, remove the non-gizmo one to free up UI space.
+- pasting images and importing from the dialogue works, but dragging images in from file explorer or google images does not show preview and does not import (bug)
+- selecting image objects while another object is selected should work like any other object (text, shapes). currently, clicking from outside like that (with the image under the cursor) is selecting the page when it should be selecting the image.
+
 ## shape tweaks
 - for shape creation, add a "finish" button gizmo that confirms the shape.
 - adding a shape to a compound shape should be additive compound by default. it should affect the shape creation preview stage too.

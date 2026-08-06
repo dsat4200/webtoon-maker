@@ -92,6 +92,20 @@
             }
           },
           {
+            "id": "77bf8cab7e289028",
+            "type": "leaf",
+            "state": {
+              "type": "markdown",
+              "state": {
+                "file": "Not Implemented.md",
+                "mode": "source",
+                "source": false
+              },
+              "icon": "lucide-file",
+              "title": "Not Implemented"
+            }
+          },
+          {
             "id": "629367fbd752c6cd",
             "type": "leaf",
             "state": {
@@ -120,7 +134,7 @@
             }
           }
         ],
-        "currentTab": 5
+        "currentTab": 6
       }
     ],
     "direction": "vertical"
@@ -284,17 +298,19 @@
       "bases:Create new base": false
     }
   },
-  "active": "9bfed7f8725ec282",
+  "active": "77bf8cab7e289028",
   "lastOpenFiles": [
-    "Untitled.md",
-    "Asset Ideas.md",
+    "implemented.md",
     "Not Implemented.md",
+    "Pasted image 20260806082328.png",
+    "Asset Ideas.md",
+    "tooltips.md",
+    "Untitled.md",
     "story settings.md",
     "Steal Clip Studio Paint Models and Params, poses.md",
     "planning/lighter novel/what is the lighter novel.md",
     "characters.md",
     "resources.md",
-    "implemented.md",
     "planning.md",
     "Ideal Process notes.md",
     "Pasted image 20260728213053.png",
@@ -315,7 +331,6 @@
     "Giantess Arc.md",
     "How the portals work.md",
     "Pasted image 20260729180630.png",
-    "Pasted image 20260729180627.png",
-    "planning/lighter novel/Pasted image 20260728173737.png"
+    "Pasted image 20260729180627.png"
   ]
 }

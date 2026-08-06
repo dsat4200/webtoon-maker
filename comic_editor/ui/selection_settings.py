@@ -4,7 +4,7 @@ from __future__ import annotations
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
     QCheckBox, QComboBox, QFormLayout, QGroupBox, QHBoxLayout, QLabel,
-    QLineEdit, QSlider, QStackedWidget, QVBoxLayout, QWidget,
+    QLineEdit, QSlider, QStackedWidget, QToolButton, QVBoxLayout, QWidget,
 )
 
 from comic_editor.core.models import (
@@ -12,6 +12,7 @@ from comic_editor.core.models import (
 )
 from comic_editor.ui.layer_settings import LayerSettingsPanel
 from comic_editor.ui.tool_ribbon_pages import RasterObjectControls
+from comic_editor.ui.icons import iconoir
 
 
 class SelectionCommonControls(QWidget):
@@ -24,10 +25,20 @@ class SelectionCommonControls(QWidget):
         self.canvas = canvas
         self._updating = False
         self._opacity_before: dict | None = None
+        self._opacity_start_value = 100
         layout = QHBoxLayout(self)
         layout.setContentsMargins(4, 2, 4, 2)
         layout.setSpacing(5)
-        self.visible = QCheckBox("Visible", self)
+        self.visible_button = QToolButton(self)
+        self.visible_button.setCheckable(True)
+        self.visible_button.setAutoRaise(True)
+        self.visible_button.setFixedSize(30, 28)
+        self.visible_button.setAccessibleName("Visibility")
+        self.visible_button.setToolTip("Visible (click to hide)")
+        # Keep the historical attribute name for integrations that access the
+        # common control directly.
+        self.visible = self.visible_button
+        self.opacity_lock = QCheckBox("Lock opacity", self)
         self.opacity = QSlider(Qt.Orientation.Horizontal, self)
         self.opacity.setRange(0, 100)
         self.opacity_value = QLabel("100%", self)
@@ -35,11 +46,13 @@ class SelectionCommonControls(QWidget):
         self.opacity_value.setAlignment(
             Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
         )
-        layout.addWidget(self.visible)
+        layout.addWidget(self.visible_button)
+        layout.addWidget(self.opacity_lock)
         layout.addWidget(QLabel("Opacity", self))
         layout.addWidget(self.opacity, 1)
         layout.addWidget(self.opacity_value)
-        self.visible.toggled.connect(self._visibility_changed)
+        self.visible_button.toggled.connect(self._visibility_changed)
+        self.opacity_lock.toggled.connect(self._opacity_lock_changed)
         self.opacity.sliderPressed.connect(self._begin_opacity_drag)
         self.opacity.valueChanged.connect(self._opacity_changed)
         self.opacity.sliderReleased.connect(self._finish_opacity_drag)
@@ -64,19 +77,51 @@ class SelectionCommonControls(QWidget):
         self._updating = True
         enabled = target is not None
         self.visible.setEnabled(enabled)
-        self.opacity.setEnabled(
-            enabled and not bool(getattr(target, "opacity_locked", False))
+        object_target = (
+            enabled
+            and self.canvas.selected_kind == "object"
+            and hasattr(target, "opacity_locked")
         )
+        self.opacity_lock.setVisible(object_target)
+        self.opacity_lock.setEnabled(object_target)
+        # Opacity locking controls inheritance during rendering.  It does
+        # not disable the common edit path: the first real value change
+        # snapshots the effective value and unlocks the object atomically.
+        self.opacity.setEnabled(enabled)
         if target is not None:
             self.visible.setChecked(bool(target.visible))
-            value = round(float(target.opacity) * 100)
+            self._update_visibility_button(bool(target.visible))
+            self.opacity_lock.setChecked(
+                bool(getattr(target, "opacity_locked", False))
+            )
+            if self.canvas.selected_kind == "object":
+                try:
+                    opacity = self.canvas.chapter.effective_object_opacity(
+                        target.object_id
+                    )
+                except (AttributeError, KeyError):
+                    opacity = float(getattr(target, "opacity", 1.0))
+            else:
+                opacity = float(getattr(target, "opacity", 1.0))
+            value = max(0, min(100, round(opacity * 100)))
             self.opacity.setValue(value)
             self.opacity_value.setText(f"{value}%")
+            self._opacity_start_value = value
         else:
             self.visible.setChecked(False)
+            self._update_visibility_button(False)
+            self.opacity_lock.setChecked(False)
             self.opacity.setValue(100)
+            self._opacity_start_value = 100
             self.opacity_value.setText("—")
         self._updating = False
+
+    def _update_visibility_button(self, visible: bool) -> None:
+        self.visible_button.setIcon(iconoir("eye" if visible else "eye-closed"))
+        self.visible_button.setToolTip(
+            "Visible (click to hide)" if visible
+            else "Hidden (click to show)"
+        )
 
     def _visibility_changed(self, checked: bool) -> None:
         target = self._selected()
@@ -88,7 +133,29 @@ class SelectionCommonControls(QWidget):
             return
         before = self.canvas.chapter.to_dict()
         target.visible = bool(checked)
+        self._update_visibility_button(bool(checked))
         self._push(before, "Change visibility", hierarchy=True)
+
+    def _opacity_lock_changed(self, checked: bool) -> None:
+        target = self._selected()
+        if (
+            self._updating
+            or target is None
+            or self.canvas.selected_kind != "object"
+            or not hasattr(target, "opacity_locked")
+        ):
+            return
+        self._commit_text(target)
+        target = self._selected()
+        if target is None or not hasattr(target, "opacity_locked"):
+            return
+        before = self.canvas.chapter.to_dict()
+        target.opacity_locked = bool(checked)
+        if target.opacity_locked:
+            parent = self.canvas.chapter.layers.get(target.parent_layer_id)
+            if parent is not None:
+                target.opacity = float(parent.opacity)
+        self._push(before, "Change opacity lock")
 
     def _begin_opacity_drag(self) -> None:
         target = self._selected()
@@ -96,17 +163,17 @@ class SelectionCommonControls(QWidget):
             return
         self._commit_text(target)
         target = self._selected()
-        if target is None or bool(getattr(target, "opacity_locked", False)):
+        if target is None:
             return
         self._opacity_before = self.canvas.chapter.to_dict()
+        self._opacity_start_value = int(self.opacity.value())
 
     def _opacity_changed(self, value: int) -> None:
         self.opacity_value.setText(f"{int(value)}%")
         target = self._selected()
-        if (
-            self._updating or target is None
-            or bool(getattr(target, "opacity_locked", False))
-        ):
+        if self._updating or target is None:
+            return
+        if int(value) == int(self._opacity_start_value):
             return
         if self._opacity_before is None:
             self._commit_text(target)
@@ -114,8 +181,12 @@ class SelectionCommonControls(QWidget):
             if target is None:
                 return
             before = self.canvas.chapter.to_dict()
+            self._opacity_before = before
         else:
             before = None
+        if bool(getattr(target, "opacity_locked", False)):
+            target.opacity = self._opacity_start_value / 100.0
+            target.opacity_locked = False
         if self.canvas.selected_kind == "layer":
             self.canvas.chapter.set_layer_opacity(
                 target.layer_id, value / 100.0
@@ -124,7 +195,7 @@ class SelectionCommonControls(QWidget):
             target.opacity = value / 100.0
         self.canvas.documentChanged.emit(None)
         self.canvas.update()
-        if before is not None:
+        if before is not None and self._opacity_before is None:
             self._push(before, "Change opacity")
 
     def _finish_opacity_drag(self) -> None:
@@ -166,6 +237,10 @@ class VectorObjectSettings(QWidget):
         self.name = QLineEdit(self)
         form.addRow("Name", self.name)
         self.opacity_lock = QCheckBox("Lock opacity", self)
+        # Opacity inheritance is edited only by the pinned common row.  Keep
+        # this compatibility widget hidden for integrations that still hold a
+        # reference to the old page control.
+        self.opacity_lock.hide()
         form.addRow(self.opacity_lock)
         self.ignore_parent_mask = QCheckBox(
             "Ignore direct parent mask", self
@@ -184,7 +259,6 @@ class VectorObjectSettings(QWidget):
         self.underlay_label = QLabel("Show underlay", self)
         form.addRow(self.underlay_label, underlay_row)
         self.name.editingFinished.connect(self._apply_discrete)
-        self.opacity_lock.toggled.connect(self._apply_discrete)
         self.ignore_parent_mask.toggled.connect(self._apply_discrete)
         self.underlay.sliderPressed.connect(self._begin_underlay)
         self.underlay.valueChanged.connect(self._underlay_changed)
@@ -233,11 +307,6 @@ class VectorObjectSettings(QWidget):
             return
         before = self.canvas.chapter.to_dict()
         target.name = self.name.text().strip() or target.name
-        target.opacity_locked = self.opacity_lock.isChecked()
-        if target.opacity_locked:
-            target.opacity = self.canvas.chapter.layers[
-                target.parent_layer_id
-            ].opacity
         if isinstance(target, VectorDrawingObject):
             target.ignore_parent_mask = self.ignore_parent_mask.isChecked()
         self._push(before, "Edit vector object")
@@ -299,6 +368,7 @@ class ImageObjectSettings(QWidget):
         self.name = QLineEdit(self)
         form.addRow("Name", self.name)
         self.opacity_lock = QCheckBox("Lock opacity", self)
+        self.opacity_lock.hide()
         form.addRow(self.opacity_lock)
         self.ignore_parent_mask = QCheckBox("Ignore direct parent mask", self)
         form.addRow(self.ignore_parent_mask)
@@ -331,7 +401,6 @@ class ImageObjectSettings(QWidget):
         self.dimensions = QLabel("â€”", self)
         form.addRow("Dimensions", self.dimensions)
         self.name.editingFinished.connect(self._apply)
-        self.opacity_lock.toggled.connect(self._apply)
         self.ignore_parent_mask.toggled.connect(self._apply)
         self.geometry_reference.currentIndexChanged.connect(self._apply)
         self.placement_mode.currentIndexChanged.connect(self._apply)
@@ -378,7 +447,6 @@ class ImageObjectSettings(QWidget):
         before = self.canvas.chapter.to_dict()
         old_placement = obj.placement_mode
         obj.name = self.name.text().strip() or obj.name
-        obj.opacity_locked = self.opacity_lock.isChecked()
         obj.ignore_parent_mask = self.ignore_parent_mask.isChecked()
         reference = self.geometry_reference.currentData()
         obj.geometry_reference = str(reference or "direct")

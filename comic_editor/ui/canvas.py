@@ -4785,7 +4785,9 @@ class _CanvasLogic:
         local_visible: QRectF,
     ) -> None:
         if isinstance(obj, SpeedLinesGradientObject):
-            self._render_speed_lines_gradient(painter, obj, local_visible)
+            # Legacy Speed Lines records are omitted during load.  Keep this
+            # guard for in-memory documents created by older integrations so
+            # the removed feature can never re-enter the renderer.
             return
         if isinstance(obj, ColorFillGradientObject):
             self._render_color_gradient(painter, obj, local_visible)
@@ -7199,6 +7201,45 @@ class _CanvasLogic:
             self.camera_transform().map(rotate),
             self.camera_transform().map(pivot),
         ]
+        # Typography handles live on the selected text's right edge.  Keep
+        # the mode button out of their screen-space hit targets so the two
+        # controls remain visually and interactively independent.
+        typography_points = [
+            self.document_to_widget(point)
+            for point in self._text_property_handle_positions().values()
+        ]
+        control_points.extend(typography_points)
+        overlay_rect = QRectF()
+        text_overlay = getattr(self, "_text_gizmo_overlay", None)
+        if text_overlay is not None and text_overlay.isVisible():
+            overlay_rect = QRectF(text_overlay.geometry())
+        if typography_points or not overlay_rect.isEmpty():
+            candidates.extend([
+                QRectF(
+                    bounds.left() - width - gap,
+                    bounds.center().y() - height / 2,
+                    width,
+                    height,
+                ),
+                QRectF(
+                    bounds.right() + gap,
+                    bounds.center().y() - height / 2,
+                    width,
+                    height,
+                ),
+                QRectF(
+                    bounds.center().x() - width / 2,
+                    bounds.top() - height - gap,
+                    width,
+                    height,
+                ),
+                QRectF(
+                    bounds.center().x() - width / 2,
+                    bounds.bottom() + gap,
+                    width,
+                    height,
+                ),
+            ])
         viewport = QRectF(self.rect()).adjusted(6, 6, -6, -6)
 
         def clamped(rect: QRectF) -> QRectF:
@@ -7207,10 +7248,34 @@ class _CanvasLogic:
             return QRectF(x, y, width, height)
 
         candidates = [clamped(candidate) for candidate in candidates]
-        return min(candidates, key=lambda rect: sum(
-            1 for point in control_points
-            if rect.adjusted(-8, -8, 8, 8).contains(point)
-        ))
+
+        def overlap_area(first: QRectF, second: QRectF) -> float:
+            if not first.intersects(second):
+                return 0.0
+            overlap = first.intersected(second)
+            return max(0.0, overlap.width()) * max(0.0, overlap.height())
+
+        def score(rect: QRectF) -> tuple[int, float, float]:
+            collisions = 0
+            area = 0.0
+            for index, point in enumerate(control_points):
+                padding = 30.0 if index >= len(handles) + 2 else 8.0
+                expanded = rect.adjusted(
+                    -padding, -padding, padding, padding
+                )
+                if expanded.contains(point):
+                    collisions += 1
+                    area += overlap_area(rect, expanded)
+            if not overlay_rect.isEmpty():
+                area += overlap_area(rect, overlay_rect.adjusted(-4, -4, 4, 4))
+                if rect.intersects(overlay_rect.adjusted(-4, -4, 4, 4)):
+                    collisions += 1
+            distance = abs(rect.center().x() - bounds.center().x()) + abs(
+                rect.center().y() - bounds.center().y()
+            )
+            return collisions, area, distance
+
+        return min(candidates, key=score)
 
     def _draw_transform_mode_gizmo(self, painter: QPainter) -> None:
         rect = self._transform_mode_gizmo_rect()
@@ -14166,12 +14231,10 @@ class _CanvasLogic:
             or parent_id not in self.chapter.layers
             or self.chapter.layers[parent_id].layer_kind == "fill"
             or field_type not in {"line", "radial", "parent_shape"}
-            or gradient_type not in {"color_fill", "speed_lines"}
+            or gradient_type != "color_fill"
         ):
             return False
-        family = (
-            "speed_lines" if gradient_type == "speed_lines" else "color_fill"
-        )
+        family = "color_fill"
         if self.chapter.gradient_children(
             parent_id, field_type, family=family
         ):
@@ -14213,7 +14276,7 @@ class _CanvasLogic:
             or parent_id not in self.chapter.layers
             or self.chapter.layers[parent_id].layer_kind == "fill"
             or field_type not in {"line", "radial", "parent_shape"}
-            or gradient_type not in {"color_fill", "speed_lines"}
+            or gradient_type != "color_fill"
         ):
             return None
         before = before or self.chapter.to_dict()
@@ -14223,41 +14286,18 @@ class _CanvasLogic:
             isinstance(item, GradientObject)
             for item in self.chapter.objects.values()
         ) + 1
-        if gradient_type == "speed_lines":
-            source_color = QColor(self.primary_color)
-            target_color = QColor(source_color)
-            target_color.setAlpha(0)
-            obj: GradientObject = SpeedLinesGradientObject(
-                name=f"Speed Lines {count}",
-                field_type=field_type,
-                color_ramp=ColorGradientRamp(stops=[
-                    ColorGradientStop(
-                        position=0.0,
-                        color=source_color.name(
-                            QColor.NameFormat.HexArgb
-                        ).upper(),
-                    ),
-                    ColorGradientStop(
-                        position=1.0,
-                        color=target_color.name(
-                            QColor.NameFormat.HexArgb
-                        ).upper(),
-                    ),
-                ]),
-            )
-        else:
-            obj = ColorFillGradientObject(
-                name=f"Gradient {count}",
-                field_type=field_type,
-                ramp=ColorGradientRamp(stops=[
-                    ColorGradientStop(
-                        position=0.0, color=self.primary_color
-                    ),
-                    ColorGradientStop(
-                        position=1.0, color=self.secondary_color
-                    ),
-                ]),
-            )
+        obj = ColorFillGradientObject(
+            name=f"Gradient {count}",
+            field_type=field_type,
+            ramp=ColorGradientRamp(stops=[
+                ColorGradientStop(
+                    position=0.0, color=self.primary_color
+                ),
+                ColorGradientStop(
+                    position=1.0, color=self.secondary_color
+                ),
+            ]),
+        )
         if world_geometry is not None:
             local = BoundGeometry.from_dict(world_geometry.to_dict())
             for contour in local.iter_contours():

@@ -2161,6 +2161,8 @@ class ChapterDocument:
     def add_object(
         self, parent_id: str, obj: ObjectEntity, index: int | None = None,
     ) -> ObjectEntity:
+        if isinstance(obj, (SpeedLinesGradientObject, SpeedLineCenterObject)):
+            raise ValueError("Speed Lines are no longer supported")
         if isinstance(obj, VectorFillObject):
             return self.add_vector_fill(parent_id, obj, index)
         if isinstance(obj, SpeedLineCenterObject):
@@ -2271,9 +2273,8 @@ class ChapterDocument:
         The center is owned like a vector fill: it never becomes a layer
         child, cannot be moved, and is deleted independently.
         """
+        raise ValueError("Speed Lines are no longer supported")
         owner = self.objects.get(owner_id)
-        if not isinstance(owner, SpeedLinesGradientObject):
-            raise ValueError("Speed centers require a speed-lines owner")
         if owner.center_shape_id:
             raise ValueError("This gradient already has a center shape")
         if center.object_id in self.objects:
@@ -2655,13 +2656,55 @@ class ChapterDocument:
         }
 
     @classmethod
-    def from_dict(cls, data: dict[str, Any]) -> "ChapterDocument":
+    def from_dict(
+        cls, data: dict[str, Any], warnings: list[str] | None = None,
+    ) -> "ChapterDocument":
         schema = int(data.get("schema_version", 1))
         if schema > SCHEMA_VERSION:
             raise ValueError(f"Unsupported future chapter schema: {schema}")
         size = data.get("size", [CHAPTER_WIDTH, DEFAULT_CHAPTER_HEIGHT])
+        unsupported_ids: set[str] = set()
+        unsupported_count = 0
+        for item in data.get("objects", []):
+            if not isinstance(item, dict):
+                continue
+            object_type = str(item.get("type", ""))
+            if object_type == "speed_center" or (
+                object_type == "gradient"
+                and str(item.get("gradient_type", "")) == "speed_lines"
+            ):
+                unsupported_ids.add(str(item.get("id", "")))
+                unsupported_count += 1
         layers = [LayerNode.from_dict(item) for item in data.get("layers", [])]
-        objects = [object_from_dict(item) for item in data.get("objects", [])]
+        for layer in layers:
+            layer.children = [
+                child for child in layer.children
+                if not (
+                    child.kind == "object"
+                    and child.entity_id in unsupported_ids
+                )
+            ]
+        objects = [
+            object_from_dict(item) for item in data.get("objects", [])
+            if isinstance(item, dict)
+            and str(item.get("id", "")) not in unsupported_ids
+        ]
+        # Legacy Speed Lines records can also be referenced from vector
+        # drawing children or custom-center fields.  Drop those references
+        # before validation so an otherwise usable document still opens.
+        for obj in objects:
+            if isinstance(obj, VectorDrawingObject):
+                obj.fill_child_ids = [
+                    child_id for child_id in obj.fill_child_ids
+                    if child_id not in unsupported_ids
+                ]
+            if getattr(obj, "center_shape_id", "") in unsupported_ids:
+                obj.center_shape_id = ""
+        if warnings is not None and unsupported_count:
+            warnings.append(
+                f"Omitted {unsupported_count} unsupported Speed Lines object"
+                f"{'s' if unsupported_count != 1 else ''}."
+            )
         result = cls(
             chapter_id=str(data["id"]), name=str(data.get("name", "Chapter")),
             width=int(size[0]), height=int(size[1]),
