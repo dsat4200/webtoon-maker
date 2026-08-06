@@ -155,22 +155,22 @@ class _TextGizmoOverlay(QWidget):
         self.setObjectName("textGizmoOverlay")
         self.setStyleSheet(
             "#textGizmoOverlay { background: rgba(32,32,36,235); "
-            "border: 1px solid #f2a23a; border-radius: 6px; }"
+            "border: 1px solid #f2a23a; border-radius: 8px; }"
             "#textGizmoOverlay QToolButton { color: #f2a23a; "
             "font-weight: bold; border: 1px solid #8f6626; "
-            "border-radius: 4px; padding: 1px 5px; }"
+            "border-radius: 6px; padding: 1px 7px; }"
             "#textGizmoOverlay QToolButton:checked { color: #202024; "
             "background: #f2a23a; }"
             "#textGizmoOverlay QSpinBox { color: #f6f6f6; "
             "background: #1f1f23; border: 1px solid #8f6626; "
-            "border-radius: 4px; padding: 1px 3px; }"
+            "border-radius: 6px; padding: 1px 4px; }"
         )
         layout = QHBoxLayout(self)
-        layout.setContentsMargins(4, 3, 4, 3)
-        layout.setSpacing(3)
+        layout.setContentsMargins(6, 4, 6, 4)
+        layout.setSpacing(4)
         self.decrease = self._button("−", "Decrease font size by 1")
         self.size = _TextSizeSpinBox(self)
-        self.size.setFixedWidth(52)
+        self.size.setFixedSize(73, 34)
         self.size.setToolTip("Font size (6–250)")
         self.increase = self._button("+", "Increase font size by 1")
         self.bold = self._button("B", "Toggle bold", checkable=True)
@@ -182,6 +182,9 @@ class _TextGizmoOverlay(QWidget):
             self.decrease, self.size, self.increase, self.bold, self.italic,
         ):
             layout.addWidget(control)
+            font = control.font()
+            font.setPointSizeF(max(1.0, font.pointSizeF() * 1.4))
+            control.setFont(font)
         self.decrease.clicked.connect(self.sizeDecreaseRequested)
         self.increase.clicked.connect(self.sizeIncreaseRequested)
         self.bold.clicked.connect(self.boldRequested)
@@ -200,7 +203,7 @@ class _TextGizmoOverlay(QWidget):
         button.setText(text)
         button.setToolTip(tooltip)
         button.setCheckable(checkable)
-        button.setFixedSize(27, 24)
+        button.setFixedSize(38, 34)
         return button
 
     def set_state(self, size: int, bold: bool, italic: bool) -> None:
@@ -374,6 +377,7 @@ class _CanvasLogic:
             self._commit_text_size_edit
         )
         self._text_dragging = False
+        self._last_text_double_click: tuple[float, QPointF, str] | None = None
         self._text_before_state: dict | None = None
         self._text_local_history: list[tuple[str, int, int]] = []
         self._strict_margin_start: float | None = None
@@ -387,6 +391,10 @@ class _CanvasLogic:
         self._creation_active_control: str | None = None
         self._creation_close_candidate = False
         self._creation_style: ShapeStyle | None = None
+        self._creation_parent_id = ""
+        self._creation_insertion_index: int | None = None
+        self._creation_compound_operation = "add"
+        self._shape_property_drag: dict | None = None
         self._raster_creation_parent_id = ""
         self._raster_creation_index: int | None = None
         self._gradient_creation_parent_id = ""
@@ -575,6 +583,10 @@ class _CanvasLogic:
         self._creation_close_candidate = False
         self._creation_node_dragged = False
         self._creation_style = None
+        self._creation_parent_id = ""
+        self._creation_insertion_index = None
+        self._creation_compound_operation = "add"
+        self._shape_property_drag = None
         self._raster_creation_parent_id = ""
         self._raster_creation_index = None
         self._pending_primitive_insert = None
@@ -1282,6 +1294,11 @@ class _CanvasLogic:
         )
         if tool != ToolKind.TEXT_EDIT:
             self._cancel_text_property_drag()
+        if (
+            tool not in {ToolKind.SHAPE_CREATE, ToolKind.SHAPE_EDIT}
+            or tool != self.tool
+        ):
+            self._cancel_shape_property_drag()
         creation_tools = {
             ToolKind.BOX_BOUND, ToolKind.CIRCLE_BOUND,
             ToolKind.SHAPE_CREATE,
@@ -1930,6 +1947,8 @@ class _CanvasLogic:
         start_cap: str = "round", end_cap: str = "round",
     ) -> QPainterPath:
         """Build a filled, variable-width ribbon for an open path."""
+        if base_width <= 0 and extra_width <= 0:
+            return QPainterPath()
         curve = cls.bound_path(bound)
         if curve.isEmpty():
             return QPainterPath()
@@ -2018,6 +2037,9 @@ class _CanvasLogic:
                 offset = unit * (direction * width / 2)
                 left[target_index] += offset
                 right[target_index] += offset
+        # Shared by both endpoint branches.  A round start must not depend on
+        # the end cap also being round.
+        round_cap_kappa = 0.5522847498307936
         mesh = QPainterPath()
         mesh.setFillRule(Qt.WindingFill)
         if start_cap == "point":
@@ -2049,16 +2071,15 @@ class _CanvasLogic:
                 1e-6, math.hypot(normal.x(), normal.y())
             )
             normal = normal / normal_length
-            kappa = 0.5522847498307936
             outward = center + tangent * radius
             mesh.cubicTo(
-                left[-1] + tangent * (kappa * radius),
-                outward + normal * (kappa * radius),
+                left[-1] + tangent * (round_cap_kappa * radius),
+                outward + normal * (round_cap_kappa * radius),
                 outward,
             )
             mesh.cubicTo(
-                outward - normal * (kappa * radius),
-                right[-1] + tangent * (kappa * radius),
+                outward - normal * (round_cap_kappa * radius),
+                right[-1] + tangent * (round_cap_kappa * radius),
                 right[-1],
             )
         for point in reversed(right):
@@ -2078,13 +2099,13 @@ class _CanvasLogic:
             outward_tangent = tangent * -1
             outward = center + outward_tangent * radius
             mesh.cubicTo(
-                right[0] + outward_tangent * (kappa * radius),
-                outward - normal * (kappa * radius),
+                right[0] + outward_tangent * (round_cap_kappa * radius),
+                outward - normal * (round_cap_kappa * radius),
                 outward,
             )
             mesh.cubicTo(
-                outward + normal * (kappa * radius),
-                left[0] + outward_tangent * (kappa * radius),
+                outward + normal * (round_cap_kappa * radius),
+                left[0] + outward_tangent * (round_cap_kappa * radius),
                 left[0],
             )
         mesh.closeSubpath()
@@ -2240,7 +2261,6 @@ class _CanvasLogic:
             else:
                 self._render_selected_text_preview(painter)
             self._render_selected_drawing_underlay(painter, visible)
-            self._draw_grid(painter, visible)
             self._draw_selection(painter)
             self._clear_live_underlay_context()
             painter.restore()
@@ -5339,8 +5359,9 @@ class _CanvasLogic:
             cursor.setPosition(self._text_selection_anchor)
             cursor.setPosition(self._text_cursor_position, QTextCursor.KeepAnchor)
             selection.cursor = cursor
-            selection.format.setBackground(QColor(70, 145, 210, 150))
-            selection.format.setForeground(QColor("#ffffff"))
+            highlight = QColor("#F2A23A")
+            highlight.setAlphaF(0.4)
+            selection.format.setBackground(highlight)
             context.selections = [selection]
         document.documentLayout().draw(painter, context)
         if editing and self.hasFocus() and self._text_cursor_position == self._text_selection_anchor:
@@ -5580,6 +5601,8 @@ class _CanvasLogic:
             layer = self.chapter.layers.get(self.selected_id)
             if layer:
                 world_x, world_y = self.chapter.layer_world_translation(layer.layer_id)
+                if self.tool == ToolKind.SHAPE_EDIT and layer.bound is not None:
+                    self._draw_shape_overlay(painter)
                 painter.translate(world_x, world_y)
                 if layer.bound is not None:
                     painter.drawPath(self.layer_effective_path(layer.layer_id))
@@ -5696,13 +5719,13 @@ class _CanvasLogic:
         if not positions:
             return
         scale = max(self.scale, 0.05)
-        radius = 7 / scale
+        radius = 14 / scale
         drag = self._text_property_drag
         painter.save()
-        painter.setPen(QPen(QColor("#f2a23a"), 2 / scale))
+        painter.setPen(QPen(QColor("#f2a23a"), 4 / scale))
         painter.setBrush(QColor("#f2a23a"))
         font = painter.font()
-        font.setPixelSize(max(1, round(10 / scale)))
+        font.setPixelSize(max(1, round(20 / scale)))
         font.setBold(True)
         painter.setFont(font)
         for key, anchor in positions.items():
@@ -5714,7 +5737,7 @@ class _CanvasLogic:
                 ))
                 painter.drawLine(anchor, center)
             painter.drawEllipse(center, radius, radius)
-            painter.setPen(QPen(QColor("#4a3212"), 1 / scale))
+            painter.setPen(QPen(QColor("#4a3212"), 2 / scale))
             painter.drawText(
                 QRectF(
                     center.x() - radius, center.y() - radius,
@@ -5723,7 +5746,7 @@ class _CanvasLogic:
                 Qt.AlignmentFlag.AlignCenter,
                 "S" if key == "font_size" else "K",
             )
-            painter.setPen(QPen(QColor("#f2a23a"), 2 / scale))
+            painter.setPen(QPen(QColor("#f2a23a"), 4 / scale))
         painter.restore()
 
     def _gradient_local_to_world(
@@ -7139,6 +7162,306 @@ class _CanvasLogic:
         )
         painter.restore()
 
+    def _compound_parent_for_child_parent(
+        self, parent_id: str,
+    ) -> LayerNode | None:
+        """Return the compound that an immediate child would contribute to."""
+        cursor_id = parent_id
+        while cursor_id and cursor_id in self.chapter.layers:
+            layer = self.chapter.layers[cursor_id]
+            if layer.compound_enabled:
+                return layer
+            if layer.compound_operation == "ignore":
+                return None
+            cursor_id = layer.parent_id
+        return None
+
+    def _shape_overlay_context(self) -> dict | None:
+        if self.chapter is None:
+            return None
+        if (
+            self.tool == ToolKind.SHAPE_CREATE
+            and len(self._creation_nodes) >= 2
+            and not self._gradient_creation_parent_id
+            and not self._page_creation_anchor_id
+        ):
+            return {
+                "mode": "creation",
+                "bound": BoundGeometry.path(self._creation_nodes, False),
+                "style": self._creation_style or ShapeStyle(),
+                "offset": QPointF(),
+                "layer": None,
+                "compound_parent": self._compound_parent_for_child_parent(
+                    self._creation_parent_id
+                ) if self._creation_parent_id else None,
+                "operation": self._creation_compound_operation,
+            }
+        if self.tool == ToolKind.SHAPE_EDIT and self.selected_kind == "layer":
+            layer = self.chapter.layers.get(self.selected_id)
+            if layer is None or layer.bound is None or layer.layer_kind == "fill":
+                return None
+            wx, wy = self.chapter.layer_world_translation(layer.layer_id)
+            return {
+                "mode": "edit",
+                "bound": layer.bound,
+                "style": layer.shape_style,
+                "offset": QPointF(wx, wy),
+                "layer": layer,
+                "compound_parent": self._compound_parent_for_child_parent(
+                    layer.parent_id
+                ) if layer.parent_id else None,
+                "operation": layer.compound_operation,
+            }
+        return None
+
+    def _shape_overlay_geometry(self) -> dict | None:
+        context = self._shape_overlay_context()
+        if context is None:
+            return None
+        left, top, width, height = context["bound"].bbox()
+        offset = context["offset"]
+        top_right = QPointF(left + width, top) + offset
+        bottom_right = QPointF(left + width, top + height) + offset
+        edge = bottom_right - top_right
+        handles: dict[str, QPointF] = {}
+        if not context["bound"].closed:
+            handles["base_thickness"] = self.document_to_widget(
+                top_right + edge / 3.0
+            )
+        handles["outline_thickness"] = self.document_to_widget(
+            top_right + edge * (2.0 / 3.0)
+        )
+        if "base_thickness" in handles:
+            first = handles["base_thickness"]
+            second = handles["outline_thickness"]
+            delta = second - first
+            distance = math.hypot(delta.x(), delta.y())
+            if distance < 48:
+                midpoint = (first + second) / 2
+                direction = (
+                    delta / distance if distance > 1e-6 else QPointF(0, 1)
+                )
+                handles["base_thickness"] = midpoint - direction * 24
+                handles["outline_thickness"] = midpoint + direction * 24
+
+        world_corners = [
+            QPointF(left, top) + offset,
+            QPointF(left + width, top) + offset,
+            QPointF(left + width, top + height) + offset,
+            QPointF(left, top + height) + offset,
+        ]
+        bounds = self.camera_transform().map(
+            QPolygonF(world_corners)
+        ).boundingRect()
+        button_specs: list[tuple[str, str, float]] = []
+        if context["mode"] == "creation":
+            button_specs.append(("finish", "Finish", 76.0))
+        if context["compound_parent"] is not None:
+            button_specs.append((
+                "compound", str(context["operation"]).title(), 92.0
+            ))
+        buttons: dict[str, tuple[QRectF, str]] = {}
+        if button_specs:
+            spacing = 6.0
+            total = sum(item[2] for item in button_specs) + spacing * (
+                len(button_specs) - 1
+            )
+            x = bounds.center().x() - total / 2
+            x = max(8.0, min(max(8.0, self.width() - total - 8.0), x))
+            y = bounds.top() - 38.0
+            if y < 8.0:
+                y = bounds.bottom() + 8.0
+            y = max(8.0, min(max(8.0, self.height() - 38.0), y))
+            for name, label, width_px in button_specs:
+                buttons[name] = (QRectF(x, y, width_px, 30.0), label)
+                x += width_px + spacing
+        return {"context": context, "handles": handles, "buttons": buttons}
+
+    def _draw_shape_overlay(self, painter: QPainter) -> None:
+        geometry = self._shape_overlay_geometry()
+        if geometry is None:
+            return
+        painter.save()
+        painter.resetTransform()
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        font = painter.font()
+        font.setPixelSize(14)
+        font.setBold(True)
+        painter.setFont(font)
+        for rect, label in geometry["buttons"].values():
+            painter.setPen(QPen(QColor("#8f6626"), 2))
+            painter.setBrush(QColor("#f2a23a"))
+            painter.drawRoundedRect(rect, 7, 7)
+            painter.setPen(QPen(QColor("#342309"), 1))
+            painter.drawText(rect, Qt.AlignmentFlag.AlignCenter, label)
+
+        drag = self._shape_property_drag
+        font.setPixelSize(20)
+        painter.setFont(font)
+        for key, anchor in geometry["handles"].items():
+            center = QPointF(anchor)
+            if drag is not None and drag["key"] == key:
+                center.setX(drag["current_x"])
+                painter.setPen(QPen(QColor("#f2a23a"), 4))
+                painter.drawLine(anchor, center)
+            painter.setPen(QPen(QColor("#f2a23a"), 4))
+            painter.setBrush(QColor("#f2a23a"))
+            painter.drawEllipse(center, 14, 14)
+            painter.setPen(QPen(QColor("#4a3212"), 2))
+            painter.drawText(
+                QRectF(center.x() - 14, center.y() - 14, 28, 28),
+                Qt.AlignmentFlag.AlignCenter,
+                "S" if key == "base_thickness" else "O",
+            )
+        painter.restore()
+
+    def _shape_overlay_hit(self, widget_point: QPointF) -> str:
+        geometry = self._shape_overlay_geometry()
+        if geometry is None:
+            return ""
+        for name, (rect, _label) in geometry["buttons"].items():
+            if rect.adjusted(-3, -3, 3, 3).contains(widget_point):
+                return name
+        for key, center in geometry["handles"].items():
+            if math.dist(center.toTuple(), widget_point.toTuple()) <= 28:
+                return key
+        return ""
+
+    def _cycle_shape_compound_operation(self, context: dict) -> None:
+        values = ("add", "subtract", "ignore")
+        current = context["operation"]
+        target = values[(values.index(current) + 1) % len(values)]
+        if context["mode"] == "creation":
+            self._creation_compound_operation = target
+            self.update()
+            return
+        layer = context["layer"]
+        before = self.chapter.to_dict()
+        layer.compound_operation = target
+        self._push_immediate_shape_change(before, "Change compound operation")
+
+    def _begin_shape_overlay_interaction(self, widget_point: QPointF) -> bool:
+        hit = self._shape_overlay_hit(widget_point)
+        geometry = self._shape_overlay_geometry()
+        if not hit or geometry is None:
+            return False
+        context = geometry["context"]
+        if hit == "finish":
+            self._finish_shape(False)
+            self.interactionFinished.emit()
+            return True
+        if hit == "compound":
+            self._cycle_shape_compound_operation(context)
+            self.interactionFinished.emit()
+            return True
+        if hit not in {"base_thickness", "outline_thickness"}:
+            return False
+        if context["mode"] == "creation" and self._creation_style is None:
+            self._creation_style = ShapeStyle()
+            context["style"] = self._creation_style
+        style = context["style"]
+        self._shape_property_drag = {
+            "mode": context["mode"],
+            "layer_id": (
+                context["layer"].layer_id if context["layer"] is not None else ""
+            ),
+            "key": hit,
+            "before": (
+                self.chapter.to_dict() if context["mode"] == "edit" else None
+            ),
+            "start_x": widget_point.x(),
+            "current_x": widget_point.x(),
+            "start_value": float(getattr(style, hit)),
+            "steps": 0,
+        }
+        self.setCursor(Qt.CursorShape.SizeHorCursor)
+        return True
+
+    def _shape_property_drag_style(self, state: dict) -> ShapeStyle | None:
+        if state["mode"] == "creation":
+            return self._creation_style
+        layer = self.chapter.layers.get(state["layer_id"])
+        return layer.shape_style if layer is not None else None
+
+    def _update_shape_property_drag(self, widget_point: QPointF) -> None:
+        state = self._shape_property_drag
+        if state is None:
+            return
+        style = self._shape_property_drag_style(state)
+        if style is None:
+            return
+        state["current_x"] = widget_point.x()
+        steps = math.trunc((widget_point.x() - state["start_x"]) / 4.0)
+        if steps == state["steps"]:
+            self.update()
+            return
+        state["steps"] = steps
+        if steps == 0:
+            value = state["start_value"]
+        else:
+            maximum = 150 if state["key"] == "base_thickness" else 100
+            value = max(0, min(maximum, round(state["start_value"]) + steps))
+        setattr(style, state["key"], value)
+        if state["mode"] == "edit":
+            self.documentChanged.emit(QRectF())
+        self.update()
+
+    def _finish_shape_property_drag(self) -> bool:
+        state, self._shape_property_drag = self._shape_property_drag, None
+        if state is None:
+            return False
+        self.unsetCursor()
+        if state["mode"] == "edit":
+            label = (
+                "Drag stroke thickness"
+                if state["key"] == "base_thickness"
+                else "Drag outline thickness"
+            )
+            self._push_immediate_shape_change(state["before"], label)
+        self.update()
+        self.interactionFinished.emit()
+        return True
+
+    def _cancel_shape_property_drag(self) -> bool:
+        state, self._shape_property_drag = self._shape_property_drag, None
+        if state is None:
+            return False
+        style = self._shape_property_drag_style(state)
+        if style is not None:
+            setattr(style, state["key"], state["start_value"])
+        self.unsetCursor()
+        if state["mode"] == "edit":
+            self.documentChanged.emit(QRectF())
+        self.update()
+        self.interactionFinished.emit()
+        return True
+
+    def _creation_compound_preview_paths(
+        self, geometry: BoundGeometry, style: ShapeStyle,
+    ) -> tuple[QPainterPath, QPainterPath] | None:
+        if not self._creation_parent_id:
+            return None
+        parent = self._compound_parent_for_child_parent(
+            self._creation_parent_id
+        )
+        if parent is None or self._creation_compound_operation == "ignore":
+            return None
+        operand = self.open_shape_mesh(
+            geometry, style.base_thickness, 0,
+            style.start_cap, style.end_cap,
+        )
+        prospective = self._document_layer_effective_path(
+            self.chapter, parent.layer_id, {},
+            virtual_parent_id=self._creation_parent_id,
+            virtual_path_world=operand,
+            virtual_operation=self._creation_compound_operation,
+        )
+        original = self.layer_effective_path(parent.layer_id)
+        wx, wy = self.chapter.layer_world_translation(parent.layer_id)
+        transform = QTransform()
+        transform.translate(wx, wy)
+        return transform.map(original), transform.map(prospective)
+
     def _draw_creation_preview(self, painter: QPainter) -> None:
         if not self._creation_points and not self._creation_nodes:
             return
@@ -7151,12 +7474,45 @@ class _CanvasLogic:
                 BoundGeometry.path(self._creation_nodes, False)
                 if len(self._creation_nodes) >= 2 else None
             )
-            painter.setPen(QPen(
-                QColor("#111111"), 2 / max(self.scale, 0.05),
-                Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin,
-            ))
-            painter.setBrush(Qt.NoBrush)
             if geometry is not None:
+                style = self._creation_style or ShapeStyle()
+                compound_paths = self._creation_compound_preview_paths(
+                    geometry, style
+                )
+                if compound_paths is not None:
+                    original, prospective = compound_paths
+                    painter.setPen(Qt.PenStyle.NoPen)
+                    painter.setBrush(QColor(24, 24, 28, 125))
+                    painter.drawPath(original)
+                    painter.setBrush(QColor(242, 162, 58, 65))
+                    painter.drawPath(prospective)
+                    painter.setBrush(Qt.BrushStyle.NoBrush)
+                    painter.setPen(QPen(
+                        QColor("#f2a23a"), 2 / max(self.scale, 0.05),
+                        Qt.DashLine,
+                    ))
+                    painter.drawPath(prospective)
+                core = self.open_shape_mesh(
+                    geometry, style.base_thickness, 0,
+                    style.start_cap, style.end_cap,
+                )
+                expanded = self.open_shape_mesh(
+                    geometry, style.base_thickness,
+                    style.outline_thickness * 2,
+                    style.start_cap, style.end_cap,
+                )
+                primary = QColor(style.primary_color or "#111111")
+                primary.setAlpha(145)
+                painter.fillPath(core, primary)
+                if style.outline_thickness > 0:
+                    outline = QColor(style.outline_color)
+                    outline.setAlpha(165)
+                    painter.fillPath(expanded.subtracted(core), outline)
+                painter.setBrush(Qt.NoBrush)
+                painter.setPen(QPen(
+                    QColor("#ffb347"), 2 / max(self.scale, 0.05),
+                    Qt.DashLine,
+                ))
                 painter.drawPath(self.bound_path(geometry))
             for node in self._creation_nodes:
                 selected = (
@@ -7187,6 +7543,7 @@ class _CanvasLogic:
                 ))
                 painter.setBrush(QColor("#ffffff"))
                 painter.drawEllipse(point, radius, radius)
+            self._draw_shape_overlay(painter)
         elif len(self._creation_points) >= 2:
             first, second = self._creation_points[0], self._creation_points[-1]
             if self.tool in {ToolKind.BOX_BOUND, ToolKind.RASTER_CREATE}:
@@ -8205,6 +8562,9 @@ class _CanvasLogic:
         if nav:
             self._begin_navigation(nav, event.position())
             return
+        if self._select_all_text_from_triple_click(QPointF(event.position())):
+            event.accept()
+            return
         self._tool_press(event.position(), 1.0)
 
     def mouseMoveEvent(self, event: QMouseEvent) -> None:  # noqa: N802
@@ -8220,9 +8580,19 @@ class _CanvasLogic:
             return
         self._pointer_hover_widget = QPointF(event.position())
         world = self.widget_to_document(event.position())
+        shape_overlay_hit = self._shape_overlay_hit(QPointF(event.position()))
         over_text_property = bool(
             self._text_property_handle_hit(QPointF(event.position()))
         )
+        selected_text = self.chapter.objects.get(self.selected_object_id)
+        over_selected_text = False
+        if self.tool == ToolKind.TEXT_EDIT and isinstance(selected_text, TextObject):
+            text_path = QPainterPath()
+            text_path.addPolygon(QPolygonF([
+                QPointF(*point)
+                for point in self.object_world_quad(selected_text.object_id)
+            ]))
+            over_selected_text = text_path.contains(world)
         transform_quad = (
             self._selection_transform_quad
             if self.tool in {
@@ -8282,7 +8652,11 @@ class _CanvasLogic:
             over_transform_edge = stroker.createStroke(
                 outline
             ).contains(world)
-        if over_text_property:
+        if shape_overlay_hit in {"base_thickness", "outline_thickness"}:
+            self.setCursor(Qt.CursorShape.SizeHorCursor)
+        elif shape_overlay_hit:
+            self.setCursor(Qt.PointingHandCursor)
+        elif over_text_property:
             self.setCursor(Qt.CursorShape.SizeHorCursor)
         elif over_transform_handle:
             self.setCursor(Qt.PointingHandCursor)
@@ -8296,6 +8670,8 @@ class _CanvasLogic:
             self.setCursor(Qt.CrossCursor)
         elif self.tool == ToolKind.TRANSFORM:
             self.setCursor(Qt.SizeAllCursor)
+        elif over_selected_text:
+            self.setCursor(Qt.CursorShape.IBeamCursor)
         else:
             self.unsetCursor()
         input_started = time.perf_counter_ns()
@@ -8320,6 +8696,16 @@ class _CanvasLogic:
             self._tool_release()
 
     def mouseDoubleClickEvent(self, event: QMouseEvent) -> None:  # noqa: N802
+        if self.tool == ToolKind.TEXT_EDIT and self.chapter is not None:
+            world = self.widget_to_document(event.position())
+            if self._select_text_word_at(world):
+                obj = self._editing_text_object()
+                if obj is not None:
+                    self._last_text_double_click = (
+                        time.monotonic(), QPointF(event.position()), obj.object_id
+                    )
+                event.accept()
+                return
         if (
             self.tool == ToolKind.SHAPE_EDIT
             and self.chapter is not None
@@ -8348,8 +8734,7 @@ class _CanvasLogic:
                 ]))
                 if path.contains(world):
                     self.set_tool(ToolKind.TEXT_EDIT)
-                    self._begin_text_pointer(world)
-                    self._text_dragging = False
+                    self._select_text_word_at(world)
                     event.accept()
                     return
         if self.tool == ToolKind.SHAPE_CREATE and len(self._creation_nodes) >= 2:
@@ -8369,6 +8754,9 @@ class _CanvasLogic:
     def keyPressEvent(self, event) -> None:  # noqa: N802
         if event.key() in {Qt.Key_Shift, Qt.Key_Control}:
             self.update()
+        if event.key() == Qt.Key_Escape and self._cancel_shape_property_drag():
+            event.accept()
+            return
         if event.key() == Qt.Key_Escape and self._cancel_text_property_drag():
             event.accept()
             return
@@ -9047,7 +9435,8 @@ class _CanvasLogic:
                 node.point_type = "bezier"
                 node.handles_locked = False
                 snapped = self._snap(
-                    point, self._target_parent_for_new_layer()
+                    point, self._creation_parent_id
+                    or self._target_parent_for_new_layer()
                 )
                 target = (snapped.x(), snapped.y())
                 if node is self._creation_nodes[0]:
@@ -9061,7 +9450,8 @@ class _CanvasLogic:
                 node.point_type = "bezier"
                 node.handles_locked = True
                 snapped = self._snap(
-                    point, self._target_parent_for_new_layer()
+                    point, self._creation_parent_id
+                    or self._target_parent_for_new_layer()
                 )
                 node.incoming = (snapped.x(), snapped.y())
                 node.outgoing = (
@@ -9069,7 +9459,8 @@ class _CanvasLogic:
                 )
             elif control == "draft_node" and moved:
                 snapped = self._snap(
-                    point, self._target_parent_for_new_layer()
+                    point, self._creation_parent_id
+                    or self._target_parent_for_new_layer()
                 )
                 dx, dy = snapped.x() - node.x, snapped.y() - node.y
                 node.x, node.y = snapped.x(), snapped.y()
@@ -9085,7 +9476,8 @@ class _CanvasLogic:
             return True
         if control in {"incoming", "outgoing"}:
             snapped = self._snap(
-                point, self._target_parent_for_new_layer()
+                point, self._creation_parent_id
+                or self._target_parent_for_new_layer()
             )
             geometry = BoundGeometry.path(self._creation_nodes, False)
             self._move_shape_bezier_handle(
@@ -9664,6 +10056,20 @@ class _CanvasLogic:
         self._refresh_drawing_selection_transform()
         self.update()
         return True
+
+    def has_active_text_edit(self) -> bool:
+        """Return whether keyboard commands currently belong to canvas text."""
+        return bool(self._text_editing and self._editing_text_object() is not None)
+
+    def select_all(self) -> bool:
+        """Select text in an active editor, otherwise the active drawing."""
+        obj = self._editing_text_object()
+        if self._text_editing and obj is not None:
+            self._text_selection_anchor = 0
+            self._text_cursor_position = len(obj.text)
+            self.update()
+            return True
+        return self.select_all_drawing()
 
     def _refresh_drawing_selection_transform(self) -> None:
         obj = self._drawing_selection_object()
@@ -11901,6 +12307,8 @@ class _CanvasLogic:
             self._update_page_gap_hover(point)
             self._insert_hovered_page_gap()
             return
+        if self._begin_shape_overlay_interaction(widget_point):
+            return
         if self._begin_text_property_drag(widget_point):
             return
         if self.tool in {
@@ -12092,8 +12500,8 @@ class _CanvasLogic:
         ):
             obj = self.chapter.objects[self.selected_object_id]
             world_quad = self.object_world_quad(obj.object_id)
-            mode, handle = self._transform_control_hit(world_quad, point)
-            if mode in {"handle", "rotate", "pivot"}:
+            mode, handle = self._text_transform_control_hit(world_quad, point)
+            if mode:
                 self.commit_active_text_edit()
                 obj = self.chapter.objects[self.selected_object_id]
                 world_quad = self.object_world_quad(obj.object_id)
@@ -12184,7 +12592,21 @@ class _CanvasLogic:
         if self.tool == ToolKind.SHAPE_CREATE:
             if self._begin_creation_shape_interaction(point, widget_point):
                 return
-            target = self._target_parent_for_new_layer()
+            if not self._creation_nodes:
+                if self._page_creation_anchor_id:
+                    self._creation_parent_id = self._page_creation_anchor_id
+                    self._creation_insertion_index = 0
+                elif self._gradient_creation_parent_id:
+                    self._creation_parent_id = self._gradient_creation_parent_id
+                    self._creation_insertion_index = 0
+                else:
+                    placement = self._target_placement_for_new_bound()
+                    if placement is None:
+                        return
+                    self._creation_parent_id = placement[0]
+                    self._creation_insertion_index = placement[1]
+                self._creation_compound_operation = "add"
+            target = self._creation_parent_id
             snapped = self._snap(point, target)
             if self._creation_nodes:
                 previous = self._creation_nodes[-1]
@@ -12218,6 +12640,9 @@ class _CanvasLogic:
             self._clear_detached_input_state()
             return
         point = self.widget_to_document(widget_point)
+        if self._shape_property_drag is not None:
+            self._update_shape_property_drag(widget_point)
+            return
         if self._text_property_drag is not None:
             self._update_text_property_drag(widget_point)
             return
@@ -12453,6 +12878,8 @@ class _CanvasLogic:
             self._update_shape_hover(point)
 
     def _tool_release(self) -> None:
+        if self._finish_shape_property_drag():
+            return
         if self._finish_text_property_drag():
             return
         if self.chapter is None:
@@ -13691,6 +14118,13 @@ class _CanvasLogic:
         nodes = [PathNode.from_dict(node.to_dict()) for node in self._creation_nodes]
         bound = BoundGeometry.path(nodes, closed)
         bound.normalize_bezier_handles()
+        placement = (
+            (self._creation_parent_id, self._creation_insertion_index)
+            if self._creation_parent_id
+            and self._creation_insertion_index is not None
+            else None
+        )
+        compound_operation = self._creation_compound_operation
         self._creation_nodes = []
         self._creation_points = []
         self._creation_selected_node_id = ""
@@ -13707,16 +14141,22 @@ class _CanvasLogic:
             style = ShapeStyle.from_dict(style.to_dict())
             style.primary_color = self.secondary_color
         self._creation_style = None
+        self._creation_parent_id = ""
+        self._creation_insertion_index = None
+        self._creation_compound_operation = "add"
         created = self._create_layer_from_world_bound(
-            bound, style=style,
+            bound, style=style, placement=placement,
+            compound_operation=compound_operation,
         )
         if created is not None:
             self.set_tool(ToolKind.SHAPE_EDIT)
 
     def _create_layer_from_world_bound(
         self, bound: BoundGeometry, style: ShapeStyle | None = None,
+        *, placement: tuple[str, int] | None = None,
+        compound_operation: str = "add",
     ) -> LayerNode | None:
-        placement = self._target_placement_for_new_bound()
+        placement = placement or self._target_placement_for_new_bound()
         if placement is None:
             return None
         parent_id, insertion_index = placement
@@ -13749,6 +14189,11 @@ class _CanvasLogic:
             index=insertion_index,
             layer_kind="bounded" if local.closed else "open_shape",
             style=style,
+        )
+        layer.compound_operation = (
+            compound_operation
+            if compound_operation in {"add", "subtract", "ignore"}
+            else "add"
         )
         after = self.chapter.to_dict()
         self.set_selection("layer", layer.layer_id)
@@ -14250,6 +14695,21 @@ class _CanvasLogic:
         path = QPainterPath()
         path.addPolygon(QPolygonF([QPointF(*candidate) for candidate in quad]))
         return ("translate", None) if path.contains(point) else ("", None)
+
+    def _text_transform_control_hit(
+        self, quad: list[tuple[float, float]], point: QPointF,
+    ) -> tuple[str, int | None]:
+        """Reserve only the dotted boundary, not the text interior, for moving."""
+        mode, handle = self._transform_control_hit(quad, point)
+        if mode in {"handle", "rotate", "pivot"}:
+            return mode, handle
+        outline = QPainterPath()
+        outline.addPolygon(QPolygonF([QPointF(*candidate) for candidate in quad]))
+        stroker = QPainterPathStroker()
+        stroker.setWidth(16 / max(self.scale, 0.05))
+        if stroker.createStroke(outline).contains(point):
+            return "translate", None
+        return "", None
 
     @staticmethod
     def _point_segment_distance(
@@ -14823,6 +15283,7 @@ class _CanvasLogic:
                 painter, self.chapter.layers[page_id], 1.0, visible
             )
         self._render_excluded_object_id = ""
+        self._draw_grid(painter, visible)
         painter.restore()
         painter.end()
         self._transform_static_cache = image
@@ -15039,7 +15500,7 @@ class _CanvasLogic:
     def _text_property_handle_hit(self, widget_point: QPointF) -> str:
         for key, world in self._text_property_handle_positions().items():
             position = self.document_to_widget(world)
-            if math.dist(position.toTuple(), widget_point.toTuple()) <= 14:
+            if math.dist(position.toTuple(), widget_point.toTuple()) <= 28:
                 return key
         return ""
 
@@ -15161,6 +15622,70 @@ class _CanvasLogic:
             return None
         return inverse.map(world - origin), document
 
+    def _text_position_at(
+        self, obj: TextObject, point: QPointF, *, require_inside: bool,
+    ) -> tuple[QTextDocument, int] | None:
+        mapped = self._text_local_point(obj, point)
+        if mapped is None:
+            return None
+        local, document = mapped
+        if require_inside:
+            object_path = QPainterPath()
+            object_path.addPolygon(QPolygonF([
+                QPointF(*candidate)
+                for candidate in self.object_world_quad(obj.object_id)
+            ]))
+            if not object_path.contains(point):
+                return None
+        local.setX(max(0.0, min(local.x(), max(0.0, document.textWidth()))))
+        local.setY(max(0.0, min(local.y(), document.size().height())))
+        position = document.documentLayout().hitTest(local, Qt.FuzzyHit)
+        return document, max(0, min(len(obj.text), position))
+
+    def _select_text_word_at(self, point: QPointF) -> bool:
+        obj = self._editing_text_object()
+        if obj is None:
+            return False
+        hit = self._text_position_at(obj, point, require_inside=True)
+        if hit is None:
+            return False
+        document, position = hit
+        self._begin_text_session(obj)
+        cursor = QTextCursor(document)
+        cursor.setPosition(position)
+        cursor.select(QTextCursor.SelectionType.WordUnderCursor)
+        self._text_selection_anchor = max(0, cursor.selectionStart())
+        self._text_cursor_position = min(len(obj.text), cursor.selectionEnd())
+        self._text_dragging = False
+        self.setFocus(Qt.MouseFocusReason)
+        self.update()
+        return True
+
+    def _select_all_text_from_triple_click(self, widget_point: QPointF) -> bool:
+        state = self._last_text_double_click
+        obj = self._editing_text_object()
+        if state is None or obj is None or state[2] != obj.object_id:
+            return False
+        elapsed_ms = (time.monotonic() - state[0]) * 1000
+        if elapsed_ms > QApplication.doubleClickInterval():
+            self._last_text_double_click = None
+            return False
+        if math.dist(state[1].toTuple(), widget_point.toTuple()) > max(
+            3, QApplication.startDragDistance()
+        ):
+            return False
+        world = self.widget_to_document(widget_point)
+        if self._text_position_at(obj, world, require_inside=True) is None:
+            return False
+        self._begin_text_session(obj)
+        self._text_selection_anchor = 0
+        self._text_cursor_position = len(obj.text)
+        self._text_dragging = True
+        self._last_text_double_click = None
+        self.setFocus(Qt.MouseFocusReason)
+        self.update()
+        return True
+
     def _begin_text_pointer(self, point: QPointF) -> bool:
         obj = self._editing_text_object()
         if obj is None:
@@ -15176,21 +15701,12 @@ class _CanvasLogic:
                 self._strict_margin_press = QPointF(point)
                 self._text_dragging = True
                 return True
-        mapped = self._text_local_point(obj, point)
-        if mapped is None:
+        hit = self._text_position_at(obj, point, require_inside=True)
+        if hit is None:
             return False
-        local, document = mapped
-        object_path = QPainterPath()
-        object_path.addPolygon(QPolygonF([
-            QPointF(*candidate) for candidate in self.object_world_quad(obj.object_id)
-        ]))
-        if not object_path.contains(point):
-            return False
-        local.setX(max(0.0, min(local.x(), document.textWidth())))
-        local.setY(max(0.0, min(local.y(), document.size().height())))
+        _document, position = hit
         self._begin_text_session(obj)
-        position = document.documentLayout().hitTest(local, Qt.FuzzyHit)
-        self._text_cursor_position = max(0, position)
+        self._text_cursor_position = position
         self._text_selection_anchor = self._text_cursor_position
         self._text_dragging = True
         self.setFocus(Qt.MouseFocusReason)
@@ -15216,13 +15732,11 @@ class _CanvasLogic:
             self.documentChanged.emit(QRectF())
             self.update()
             return
-        mapped = self._text_local_point(obj, point)
-        if mapped is None:
+        hit = self._text_position_at(obj, point, require_inside=False)
+        if hit is None:
             return
-        local, document = mapped
-        self._text_cursor_position = max(
-            0, document.documentLayout().hitTest(local, Qt.FuzzyHit)
-        )
+        _document, position = hit
+        self._text_cursor_position = position
         self.update()
 
     def _begin_text_session(self, obj: TextObject) -> None:

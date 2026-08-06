@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import pytest
 from PySide6.QtCore import QPointF
 from PySide6.QtGui import QColor, QImage
 
@@ -11,6 +12,7 @@ from comic_editor.core.settings import EditorSettings
 from comic_editor.core.tiles import TileStore
 from comic_editor.ui.canvas import CanvasWidget, ToolKind
 from comic_editor.ui.inspector import ContextInspector
+from comic_editor.ui.preview import ChapterPreview
 
 
 def _compound_canvas():
@@ -120,6 +122,46 @@ def test_open_shape_contributes_core_stroke_without_child_outline(qapp):
 
     assert path.contains(QPointF(550, 505))
     assert not path.contains(QPointF(550, 530))
+
+
+@pytest.mark.parametrize("start_cap", ["point", "square", "round"])
+@pytest.mark.parametrize("end_cap", ["point", "square", "round"])
+def test_open_shape_cap_pairs_render_in_compound_and_chapter_preview(
+    qapp, start_cap, end_cap,
+):
+    canvas, chapter, _page, root = _compound_canvas()
+    line = chapter.add_layer(
+        root.layer_id, "Line",
+        BoundGeometry.path([
+            PathNode(x=150, y=220), PathNode(x=350, y=220),
+        ], False),
+        layer_kind="open_shape",
+    )
+    line.shape_style.base_thickness = 30
+    line.shape_style.start_cap = start_cap
+    line.shape_style.end_cap = end_cap
+    canvas._clear_compound_path_cache()
+
+    assert not canvas.layer_effective_path(root.layer_id).isEmpty()
+    canvas.resize(640, 480)
+    canvas.show()
+    qapp.processEvents()
+    canvas_image = QImage(
+        canvas.size(), QImage.Format_ARGB32_Premultiplied
+    )
+    canvas_image.fill(QColor("#000000"))
+    canvas.render(canvas_image)
+
+    preview = ChapterPreview(canvas)
+    preview.resize(92, 240)
+    preview.show()
+    qapp.processEvents()
+    preview_image = preview.grab().toImage()
+    assert not canvas_image.isNull()
+    assert not preview_image.isNull()
+    assert not preview._cache.isNull()
+    preview.hide()
+    canvas.hide()
 
 
 def test_compound_renders_parent_style_without_internal_outline(qapp):

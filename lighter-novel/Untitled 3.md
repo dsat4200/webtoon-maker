@@ -152,8 +152,56 @@ speed lines, includes opacity too
 
 
 more text tweaks
-- make the text gizmos twice as large.
-- add the ability to select orange - (light )
+- [x] make the text gizmos twice as large.
+- [x] add the ability to select text (and a select all hotkey, which selects all text) (light orange transparent overlay on selected text). typing when text is selected deletes that selected text and types.
+- [x] add an "open recent" feature (file dropdown should contain new series, open series, and open recent, save, save as)
+- [x] undo doesn't let me undo a shape creation (bug)
+- [x] bug during shape editing, now the canvas is just grey and i can't change or open anything
+
+## Brushes
+psd brush support?
+- add brushes to tool settings ribbon (raster/vector pencil) (with preview of a small, curved stroke segment in a square live preview icon, from zero pressure to 100, swoop curve )
+
+
+general tweaks
+- holding control while click-dragging a corner smoothness handle in a rect object should force all 4 corners to copy smoothness of the handle being manipulated.
+- move the opacity slider to a row at the top of, inside of, the object/layer outliner.
+	- put the "visible" toggle there too
+- the space between the top row window and layer/object outliner should be able to move up to cover up elements, but introduce a scroll bar if this happens
+- move tablet navigation, reset view, and snap to grid to the top row, to the right of the hotkeys button
+- use iconoir icons to replace the toolbar buttons with buttons that show an icon, and show the name of the command upon hover.
+	- https://iconoir.com/
+	- that includes all of the tools and options that are normally on the tool bar (except the ones I just moved)
+		- add an "add page" button
+- remove the "delete selected" , add page, and add layer buttons from the outliner.
+- make the full page preview/scrollbar ui element instead a collapsable to the right of the drawing canvas element, that is collapsed by default.
+- where the scrollbar is currently (but thinner) is where the new, smaller, tool buttons will live, in a verical column that can be click-dragged at the right side to grow it horizontally right. if large enough, it should show both the icon and tool name simultaneously. if too narrow, the buttons should stay the same height but auto width, hiding the text when not all of it can fit, and minimal width is the width that would make the icons square.
+- where the tool settings vertical menu currently is, instead put the ribbon menu there but make it vertical. all the ribbon menu switching buttons should now be vertical on the right side of the new ribbon location. text should be right to left but rotated 90 degrees on this menu. of course, instead of scrolling horizontally, it should now scroll vertically.
+	- this will give the canvas more room.
+- remove the "layers and objects" header with the popout and x button.
+- instead of having "raster object settings" and "vector object settings" be in a separate window from layer settings, just have the layer settings window switch to showing raster object or vector object settings, depending on the selected object type. 
+	- this way, when eraser or raster are selected, the ribbon can default to tool settings instead of raster/vector object settings
+	- remove raster/layer object settings from the ribbon, but all of their settings should instead be where layer settings are now, when a raster or vector object is selected.
+
+
+## New feature - repeating texture mode
+
+## shape tweaks
+- for shape creation, add a "finish" button gizmo that confirms the shape.
+- adding a shape to a compound shape should be additive compound by default. it should affect the shape creation preview stage too.
+	- assume the shape is an open shape during free shape creation unless closed (for preview purposes)
+- these gizmos should be added to shape edit / shape creation:
+	- if the shape is a compound shape: show a gizmo button with text that shows the type of compounding going on (add, subtract, ignore). clicking or tapping this button cycles between them. also, these set compound types should be previewable during shape creation pre-confirmation.
+	- also, include a gizmo (similar to the text size or kerning text gizmos in appearance and behavior) that alters the thickness of the stroke, and another for the thickness of the outline, of the preview shape
+		- (0px to 150px total for stroke thickness)
+		- (0px to 100 px for outline thickness)
+- closing the shape or double clicking the last point still also confirms the shape.
+- confirming the shape also sets the preview parameters as the params of the new shape of course
+- clicking and dragging the translate boundary in text free transform mode isn't letting me translate the shape. the 8 handle corners and edges let me transform, but not the dotted line to translate the whole text object.
+- move the file dropdown to the same row as the undo/redo/etc
+- the text selection should let me double click a word to select it, triple click to select all text in that box. hovering over text in a currently selected text box should change the cursor to a text insertion icon, and clicking and dragging should select from the click point to the release point (select characters) live, like any normal text input field in any program.
+- make the text gizmos a little smaller (maybe 30 percent smaller), except the kerning/font size drag handles 
+
 
 ## Dont forget
 - object/layer outer outline

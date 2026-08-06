@@ -1,6 +1,7 @@
 """Standalone series/chapter application shell."""
 from __future__ import annotations
 
+import copy
 import re
 import time
 import math
@@ -27,7 +28,7 @@ from comic_editor.core.models import (
     ColorGradientRamp, ColorGradientRampPreset, ColorGradientStop,
     ColorPalette, GradientObject, PaletteSwatch, PathNode,
     RasterObject, SpeedLineCenterObject, SpeedLinesGradientObject,
-    TextObject, VectorDrawingObject, VectorFillObject,
+    TextObject, VectorDrawingObject, VectorFillObject, new_id,
 )
 from comic_editor.core.assets import (
     AssetManifest, AssetRepository, entity_visual_bounds, extract_asset,
@@ -35,6 +36,7 @@ from comic_editor.core.assets import (
 from comic_editor.core.persistence import SeriesRepository
 from comic_editor.core.commands import CommandStack
 from comic_editor.core.settings import load_settings, save_settings
+from comic_editor.core.tiles import TileStore
 from comic_editor.ui.canvas import ToolKind, create_canvas
 from comic_editor.ui.inspector import ContextInspector
 from comic_editor.ui.color_picker import (
@@ -189,12 +191,23 @@ class MainWindow(QMainWindow):
         if style.is_file():
             QApplication.instance().setStyleSheet(style.read_text(encoding="utf-8"))
 
+        self.file_menu = QMenu("File", self)
+        self.new_series_action = self.file_menu.addAction("New Series")
+        self.open_series_action = self.file_menu.addAction("Open Series")
+        self.open_recent_menu = self.file_menu.addMenu("Open Recent")
+        self.file_menu.addSeparator()
+        self.save_action = self.file_menu.addAction("Save")
+        self.save_as_action = self.file_menu.addAction("Save As")
+        self._rebuild_recent_menu()
+
         self.file_toolbar = QToolBar("Project", self)
         self.file_toolbar.setMovable(False)
         self.addToolBar(self.file_toolbar)
-        self.new_series_action = self.file_toolbar.addAction("New Series")
-        self.open_series_action = self.file_toolbar.addAction("Open Series")
-        self.save_action = self.file_toolbar.addAction("Save")
+        self.file_button = QToolButton(self.file_toolbar)
+        self.file_button.setText("File")
+        self.file_button.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        self.file_button.setMenu(self.file_menu)
+        self.file_toolbar.addWidget(self.file_button)
         self.file_toolbar.addSeparator()
         self.undo_action = self.file_toolbar.addAction("Undo")
         self.redo_action = self.file_toolbar.addAction("Redo")
@@ -207,13 +220,6 @@ class MainWindow(QMainWindow):
         self.trim_action = self.file_toolbar.addAction("Trim Height")
         self.fullscreen_action = self.file_toolbar.addAction("Fullscreen")
         self.hotkeys_action = self.file_toolbar.addAction("Hotkeys…")
-        self.file_toolbar.addWidget(QLabel("Recent"))
-        self.recent_combo = QComboBox()
-        self.recent_combo.setMinimumWidth(180)
-        self.recent_combo.addItem("Open recent…", "")
-        for path in self.settings.recent_series or []:
-            self.recent_combo.addItem(Path(path).name, path)
-        self.file_toolbar.addWidget(self.recent_combo)
 
         self.tool_toolbar = ScrollableToolPanel(self)
         self.tool_toolbar.setMinimumHeight(120)
@@ -685,13 +691,13 @@ class MainWindow(QMainWindow):
         self.new_series_action.triggered.connect(self._create_series)
         self.open_series_action.triggered.connect(self._open_series_dialog)
         self.save_action.triggered.connect(self.save)
+        self.save_as_action.triggered.connect(self._save_as)
         self.new_chapter_action.triggered.connect(self._new_chapter)
         self.trim_action.triggered.connect(self._trim_height)
         self.fullscreen_action.triggered.connect(self._toggle_fullscreen)
         self.hotkeys_action.triggered.connect(self._edit_hotkeys)
-        self.recent_combo.activated.connect(self._open_recent)
-        self.undo_action.triggered.connect(self.canvas.command_stack.undo)
-        self.redo_action.triggered.connect(self.canvas.command_stack.redo)
+        self.undo_action.triggered.connect(self._undo)
+        self.redo_action.triggered.connect(self._redo)
         self.chapter_combo.currentIndexChanged.connect(self._chapter_selected)
         self.reset_view_button.clicked.connect(self.canvas.reset_view)
         self.preview.scrollRequested.connect(self.canvas.scroll_to_fraction)
@@ -921,11 +927,11 @@ class MainWindow(QMainWindow):
                 self._tool_hotkey_actions[action_id] = tool
         self._command_hotkey_actions = {
             "save": self.save,
-            "undo": self.canvas.command_stack.undo,
-            "redo": self.canvas.command_stack.redo,
+            "undo": self._undo,
+            "redo": self._redo,
             "reset_view": self.canvas.reset_view,
             "toggle_grid": self._toggle_grid,
-            "select_all": self.canvas.select_all_drawing,
+            "select_all": self.canvas.select_all,
             "delete_selected": self._delete_selected,
         }
         self._hotkey_bindings = {
@@ -986,6 +992,14 @@ class MainWindow(QMainWindow):
                 self._hotkey_text_input_active()
                 or self.canvas.reserves_delete_key()
             )
+        if action_id == "select_all":
+            focus = QApplication.focusWidget()
+            if isinstance(
+                focus, (QAbstractSpinBox, QLineEdit, QPlainTextEdit, QTextEdit),
+            ):
+                return True
+            if focus is self.canvas and self.canvas.has_active_text_edit():
+                return False
         if not self._hotkey_text_input_active():
             return False
         regular = [key for key in chord if key not in MODIFIER_LABELS]
@@ -1093,8 +1107,14 @@ class MainWindow(QMainWindow):
         ):
             action_id = None
             prefix = False
+        canvas_text_select_all = bool(
+            action_id == "select_all"
+            and QApplication.focusWidget() is self.canvas
+            and self.canvas.has_active_text_edit()
+        )
         text_conflict = (
             self._hotkey_text_input_active()
+            and not canvas_text_select_all
             and (
                 int(Qt.Key_Shift) in chord
                 or any(
@@ -1139,7 +1159,12 @@ class MainWindow(QMainWindow):
             and self._hotkey_is_suppressed(release_action, chord)
         ):
             consumed = False
-        if self._hotkey_text_input_active() and (
+        canvas_text_select_all = bool(
+            release_action == "select_all"
+            and QApplication.focusWidget() is self.canvas
+            and self.canvas.has_active_text_edit()
+        )
+        if self._hotkey_text_input_active() and not canvas_text_select_all and (
             int(Qt.Key_Shift) in chord
             or any(
                 candidate not in MODIFIER_LABELS
@@ -1636,13 +1661,20 @@ class MainWindow(QMainWindow):
         self._add_editor_session(session)
         return True
 
-    def _open_recent(self, index: int) -> None:
-        path = self.recent_combo.itemData(index)
-        if path:
+    def _open_recent_path(self, path: str) -> None:
+        if (Path(path).expanduser() / "series.json").is_file():
             self.open_series(path)
-        self.recent_combo.blockSignals(True)
-        self.recent_combo.setCurrentIndex(0)
-        self.recent_combo.blockSignals(False)
+            return
+        QMessageBox.warning(
+            self, "Recent series unavailable",
+            f"The series folder no longer exists or is invalid:\n{path}",
+        )
+        self.settings.recent_series = [
+            item for item in self.settings.recent_series or []
+            if str(Path(item)).casefold() != str(Path(path)).casefold()
+        ]
+        save_settings(self.settings)
+        self._rebuild_recent_menu()
 
     def _adopt_series(self, repository: SeriesRepository, series) -> None:
         self._flush_series_preferences()
@@ -3474,6 +3506,168 @@ class MainWindow(QMainWindow):
         self._refresh_actions()
         return True
 
+    @staticmethod
+    def _copy_session_tiles(
+        chapter: ChapterDocument, source: TileStore,
+    ) -> TileStore:
+        copied = TileStore(source.tile_size)
+        for object_id, obj in chapter.objects.items():
+            if isinstance(obj, RasterObject):
+                copied.replace_object_tiles(
+                    object_id, source.object_tiles(object_id)
+                )
+        return copied
+
+    def _write_session_to_clone(
+        self, session: EditorSession, repository: SeriesRepository,
+        series,
+    ) -> None:
+        """Write one session through detached models and tiles."""
+        chapter = copy.deepcopy(session.chapter)
+        tiles = self._copy_session_tiles(chapter, session.tiles)
+        if session.kind == "series":
+            repository.save_chapter(chapter, tiles)
+            for reference in series.chapters:
+                if reference.chapter_id == chapter.chapter_id:
+                    reference.name = chapter.name
+            return
+
+        if session.asset_manifest is None:
+            raise ValueError("Asset session has no manifest")
+        manifest = copy.deepcopy(session.asset_manifest)
+        manifest.document = chapter
+        bounds = entity_visual_bounds(
+            chapter, tiles, manifest.root_kind, manifest.root_id,
+        )
+        manifest.visual_bounds = (
+            bounds.x(), bounds.y(), bounds.width(), bounds.height()
+        )
+        chapter.width = max(chapter.width, math.ceil(bounds.right() + 64))
+        chapter.height = max(chapter.height, math.ceil(bounds.bottom() + 64))
+        container = chapter.layers[chapter.root_page_ids[0]]
+        container.bound = BoundGeometry.rectangle(
+            0, 0, chapter.width, chapter.height
+        )
+        thumbnail = self.canvas.render_asset_thumbnail(manifest, tiles)
+        AssetRepository(repository.root).save(manifest, tiles, thumbnail)
+
+    def _rebind_sessions_to_clone(
+        self,
+        sessions: list[EditorSession],
+        repository: SeriesRepository,
+        series,
+    ) -> None:
+        clone_context = ProjectContext.create(repository, series)
+        replacements: dict[str, str] = {}
+        session_ids = {id(session) for session in sessions}
+        for session in sessions:
+            old_key = session.key
+            session.context = clone_context
+            session.key = (
+                self._series_session_key(repository.root)
+                if session.kind == "series"
+                else self._asset_session_key(
+                    clone_context, session.asset_manifest.asset_id
+                )
+            )
+            replacements[old_key] = session.key
+            session.dirty = False
+            session.last_autosave = 0.0
+            session.tiles.dirty.clear()
+
+        rebound: dict[str, EditorSession] = {}
+        for old_key, session in self.sessions.items():
+            rebound[replacements.get(old_key, old_key)] = session
+        self.sessions = rebound
+        for index in range(self.project_tabs.count()):
+            old_key = str(self.project_tabs.tabData(index))
+            if old_key in replacements:
+                self.project_tabs.setTabData(index, replacements[old_key])
+                self.project_tabs.setTabToolTip(index, str(repository.root))
+
+        if self.active_session is not None and id(self.active_session) in session_ids:
+            self.repository = repository
+            self.series = series
+            self._dirty = False
+            self._last_autosave = 0.0
+            self.autosave_timer.stop()
+            self.canvas.asset_repository = clone_context.assets
+            self.asset_library.set_repository(clone_context.assets)
+            self.setWindowTitle(
+                f"{self.active_session.name} — Vertical Comic Editor"
+            )
+        self.asset_library.refresh()
+        self.preview.invalidate_all()
+        self._refresh_project_tabs()
+        self._refresh_actions()
+
+    def _save_as(self) -> bool:
+        context = self._current_project_context()
+        if context is None:
+            return False
+        parent = QFileDialog.getExistingDirectory(
+            self, "Choose parent folder for the series clone",
+            str(context.repository.root.parent),
+        )
+        if not parent:
+            return False
+        default_name = f"{context.repository.root.name}-copy"
+        folder_name, accepted = QInputDialog.getText(
+            self, "Save Series As", "New folder name", text=default_name,
+        )
+        if not accepted or not folder_name.strip():
+            return False
+        folder_name = folder_name.strip()
+        if (
+            Path(folder_name).name != folder_name
+            or folder_name in {".", ".."}
+            or any(character in folder_name for character in '<>:"/\\|?*')
+        ):
+            QMessageBox.warning(
+                self, "Save As failed", "Enter a valid single folder name."
+            )
+            return False
+        destination = Path(parent).expanduser().resolve() / folder_name
+        if destination.exists():
+            QMessageBox.warning(
+                self, "Save As failed",
+                f"The destination folder already exists:\n{destination}",
+            )
+            return False
+
+        self._capture_active_session()
+        source_root = context.repository.root
+        project_sessions = [
+            session for session in self.sessions.values()
+            if session.context.repository.root == source_root
+        ]
+        cloned_series = copy.deepcopy(context.series)
+        cloned_series.series_id = new_id()
+
+        def overlay(staged_repository: SeriesRepository) -> None:
+            for session in project_sessions:
+                self._write_session_to_clone(
+                    session, staged_repository, cloned_series
+                )
+            staged_repository.save_series(cloned_series)
+
+        try:
+            cloned_repository = context.repository.clone_to(
+                destination, cloned_series, overlay,
+            )
+        except Exception as error:
+            QMessageBox.critical(self, "Save As failed", str(error))
+            return False
+
+        self._rebind_sessions_to_clone(
+            project_sessions, cloned_repository, cloned_series,
+        )
+        self._remember_series(cloned_repository.root)
+        self.statusBar().showMessage(
+            f"Saved clone to {cloned_repository.root}", 5000
+        )
+        return True
+
     def _autosave(self) -> None:
         if self.sessions:
             now = time.monotonic()
@@ -3666,6 +3860,14 @@ class MainWindow(QMainWindow):
     def _set_text_shortcut_suppression(self, editing: bool) -> None:
         self._hotkey_text_editing = editing
 
+    def _undo(self) -> None:
+        """Undo on the command stack owned by the currently active canvas."""
+        self.canvas.command_stack.undo()
+
+    def _redo(self) -> None:
+        """Redo on the command stack owned by the currently active canvas."""
+        self.canvas.command_stack.redo()
+
     def _toggle_grid(self) -> None:
         if self.chapter is None:
             return
@@ -3704,12 +3906,21 @@ class MainWindow(QMainWindow):
         paths = [str(path), *(self.settings.recent_series or [])]
         self.settings.recent_series = list(dict.fromkeys(paths))[:12]
         save_settings(self.settings)
-        self.recent_combo.blockSignals(True)
-        self.recent_combo.clear()
-        self.recent_combo.addItem("Open recent…", "")
-        for recent in self.settings.recent_series:
-            self.recent_combo.addItem(Path(recent).name, recent)
-        self.recent_combo.blockSignals(False)
+        self._rebuild_recent_menu()
+
+    def _rebuild_recent_menu(self) -> None:
+        self.open_recent_menu.clear()
+        recent_paths = self.settings.recent_series or []
+        if not recent_paths:
+            empty = self.open_recent_menu.addAction("No Recent Series")
+            empty.setEnabled(False)
+            return
+        for recent in recent_paths:
+            action = self.open_recent_menu.addAction(Path(recent).name)
+            action.setToolTip(recent)
+            action.triggered.connect(
+                lambda checked=False, path=recent: self._open_recent_path(path)
+            )
 
     def _save_if_dirty(self) -> bool:
         return not self._dirty or self.save()
@@ -3732,6 +3943,7 @@ class MainWindow(QMainWindow):
             self.active_session is None or self.active_session.kind == "series"
         )
         self.save_action.setEnabled(active and self._dirty)
+        self.save_as_action.setEnabled(self._current_project_context() is not None)
         self.new_chapter_action.setEnabled(series_active and self.series is not None)
         self.trim_action.setEnabled(series_active)
         self.add_page_button.setEnabled(series_active)

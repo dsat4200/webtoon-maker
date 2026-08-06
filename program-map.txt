@@ -97,7 +97,10 @@ Core design principles:
   Text Edit               - Click to position cursor, drag to select, IME
                             input, clipboard paste, local undo within session.
                             Edge midpoint drag for strict margins. Free text
-                            handles visible while editing.
+                            handles visible while editing. Double-click selects
+                            a word; triple-click selects the box. The dotted
+                            free-text boundary translates without claiming the
+                            editable interior.
 
   Transform (T)           - 8-handle free projective or uniform scaling; grid
                             snap; rotation and movable pivot; static background
@@ -109,7 +112,8 @@ Core design principles:
                             controls, gizmos (type, lock, roundness, thickness,
                             delete, cap), insertion, translation. Rectangle
                             per-corner radius with normal/free modes. Contour
-                            editing. Compound construction-path editing.
+                            editing. Compound construction-path editing with
+                            Add/Subtract/Ignore and global S/O scrub gizmos.
 
   Vector Edit             - Auto-activated for a selected Vector Drawing. Blue
                             anchor circles for the selected stroke; Ctrl+click
@@ -560,6 +564,8 @@ The central interactive canvas - the heart of the application. Mixin
     open_shape_mesh(bound, base_width, extra_width, start_cap, end_cap)
       -> variable-width ribbon (point/square/round caps).
     layer_shape_path / layer_effective_path (compound Boolean).
+    Creation overlay: real open-stroke preview, prospective virtual compound
+      operand, Finish/operation buttons, and global stroke/outline scrubbers.
 
     ---- Rendering ----
     paintEvent - main loop: transform static cache fast path; background;
@@ -739,8 +745,9 @@ Standalone series/chapter application shell (QMainWindow).
 
     _build_ui():
       - style.qss stylesheet.
-      - File toolbar: New/Open Series, Save, Undo/Redo, chapter combo,
-        New Chapter, Trim Height, Fullscreen, Hotkeys..., Recent combo.
+      - Project toolbar: instant-popup File button (New/Open Series, dynamic
+        Open Recent, Save, atomic whole-series Save As), Undo/Redo, chapter
+        combo, New Chapter, Trim Height, Fullscreen, Hotkeys....
       - Left tool toolbar: Select/Pencil/Eraser/Fill/Text/Transform/Shape
         Edit + collapsible Shapes + Add Fill/Text/Raster/Vector Drawing +
         Reset View + tablet/page-scope/snap toggles + PrimarySecondaryColorPanel

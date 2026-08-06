@@ -26,7 +26,7 @@ def test_shape_style_thickness_values_are_integer_pixels():
 
     style = ShapeStyle(base_thickness=0.2, outline_thickness=900)
     style.validate()
-    assert style.base_thickness == 1
+    assert style.base_thickness == 0
     assert style.outline_thickness == 500
 
 

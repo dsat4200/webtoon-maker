@@ -29,7 +29,7 @@ LABELS = {
     "redo": "Redo",
     "reset_view": "Reset View",
     "toggle_grid": "Toggle Grid",
-    "select_all": "Select All Drawing",
+    "select_all": "Select All",
     "delete_selected": "Delete Selected",
 }
 

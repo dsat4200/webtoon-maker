@@ -2,8 +2,11 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
-from PySide6.QtCore import QPointF, Qt
-from PySide6.QtGui import QFont
+import pytest
+from PySide6.QtCore import QEvent, QPointF, Qt
+from PySide6.QtGui import (
+    QColor, QFont, QImage, QMouseEvent, QPainter, QPolygonF,
+)
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import (
     QApplication, QInputDialog, QMessageBox, QSpinBox,
@@ -163,6 +166,10 @@ def test_text_gizmo_overlay_edits_only_selected_text_and_supports_cancel(qapp):
         overlay = canvas._text_gizmo_overlay
         assert canvas.tool == ToolKind.TEXT_EDIT
         assert overlay.isVisible()
+        assert overlay.decrease.size().toTuple() == (38, 34)
+        assert overlay.size.size().toTuple() == (73, 34)
+        assert overlay.layout().contentsMargins().left() == 6
+        assert overlay.layout().spacing() == 4
 
         overlay.increase.click()
         assert canvas.chapter.objects[first.object_id].font_size == 33
@@ -194,6 +201,253 @@ def test_text_gizmo_overlay_edits_only_selected_text_and_supports_cancel(qapp):
     finally:
         canvas.hide()
         canvas.deleteLater()
+
+
+@pytest.mark.parametrize("layout_mode", ["strict", "free"])
+def test_mouse_drag_and_shift_navigation_select_text(qapp, layout_mode):
+    canvas, first, _second = _canvas_with_text()
+    try:
+        first.layout_mode = layout_mode
+        document, origin, transform = canvas._text_edit_layout(first)
+        start = canvas._text_caret_rect(document, 0).center()
+        end = canvas._text_caret_rect(document, len(first.text)).center()
+        start_world = origin + transform.map(start + QPointF(1, 0))
+        end_world = origin + transform.map(end - QPointF(1, 0))
+
+        assert canvas._begin_text_pointer(start_world)
+        canvas._update_text_pointer(end_world)
+        selected = canvas._text_selection_range()
+        assert selected[0] == 0
+        assert selected[1] >= len(first.text) - 1
+
+        canvas._text_cursor_position = 1
+        canvas._text_selection_anchor = 1
+        canvas.setFocus()
+        QTest.keyClick(
+            canvas, Qt.Key.Key_Right, Qt.KeyboardModifier.ShiftModifier
+        )
+        assert canvas._text_selection_anchor == 1
+        assert canvas._text_cursor_position == 2
+    finally:
+        canvas.hide()
+        canvas.deleteLater()
+
+
+def test_free_text_boundary_translates_while_interior_edits(qapp):
+    canvas, first, _second = _canvas_with_text()
+    try:
+        quad = canvas.object_world_quad(first.object_id)
+        boundary = QPointF(
+            quad[0][0] * 0.75 + quad[1][0] * 0.25,
+            quad[0][1] * 0.75 + quad[1][1] * 0.25,
+        )
+        mode, handle = canvas._text_transform_control_hit(quad, boundary)
+        assert (mode, handle) == ("translate", None)
+
+        before = list(first.transform_quad)
+        canvas._tool_press(canvas.document_to_widget(boundary), 1.0)
+        assert canvas._transform_drag_mode == "translate"
+        canvas._tool_move(canvas.document_to_widget(boundary + QPointF(35, 24)), 1.0)
+        assert canvas._transform_preview_quad != before
+        canvas._tool_release()
+        assert first.transform_quad[0] == pytest.approx((115, 104))
+        canvas.command_stack.undo()
+        assert canvas.chapter.objects[first.object_id].transform_quad == before
+
+        center = QPolygonF([
+            QPointF(*point) for point in canvas.object_world_quad(first.object_id)
+        ]).boundingRect().center()
+        canvas._tool_press(canvas.document_to_widget(center), 1.0)
+        assert canvas._text_dragging
+        assert canvas._model_before is None
+        canvas._tool_release()
+    finally:
+        canvas.hide()
+        canvas.deleteLater()
+
+
+@pytest.mark.parametrize("layout_mode", ["strict", "free"])
+def test_text_double_click_word_triple_click_all_and_live_drag(
+    qapp, layout_mode,
+):
+    canvas, first, _second = _canvas_with_text()
+    try:
+        first.text = "alpha beta"
+        first.layout_mode = layout_mode
+        document, origin, transform = canvas._text_edit_layout(first)
+        beta = canvas._text_caret_rect(document, 7).center()
+        beta_world = origin + transform.map(beta)
+        beta_widget = canvas.document_to_widget(beta_world).toPoint()
+
+        QTest.mouseDClick(canvas, Qt.MouseButton.LeftButton, pos=beta_widget)
+        qapp.processEvents()
+        assert canvas._text_selection_range() == [6, 10]
+
+        QTest.mouseClick(canvas, Qt.MouseButton.LeftButton, pos=beta_widget)
+        qapp.processEvents()
+        assert canvas._text_selection_range() == [0, len(first.text)]
+
+        start = canvas._text_caret_rect(document, 0).center()
+        end = canvas._text_caret_rect(document, 5).center()
+        start_widget = canvas.document_to_widget(
+            origin + transform.map(start)
+        ).toPoint()
+        end_widget = canvas.document_to_widget(
+            origin + transform.map(end)
+        ).toPoint()
+        QTest.mousePress(canvas, Qt.MouseButton.LeftButton, pos=start_widget)
+        QTest.mouseMove(canvas, end_widget)
+        qapp.processEvents()
+        assert canvas._text_selection_range()[1] >= 4
+        QTest.mouseRelease(canvas, Qt.MouseButton.LeftButton, pos=end_widget)
+    finally:
+        canvas.hide()
+        canvas.deleteLater()
+
+
+def test_text_hover_uses_ibeam_but_boundary_keeps_translate_cursor(qapp):
+    canvas, first, _second = _canvas_with_text()
+    try:
+        quad = canvas.object_world_quad(first.object_id)
+        interior = QPointF(
+            quad[0][0] * 0.65 + quad[2][0] * 0.35,
+            quad[0][1] * 0.65 + quad[2][1] * 0.35,
+        )
+        def hover(world):
+            widget = canvas.document_to_widget(world)
+            canvas.mouseMoveEvent(QMouseEvent(
+                QEvent.Type.MouseMove,
+                widget,
+                QPointF(canvas.mapToGlobal(widget.toPoint())),
+                Qt.MouseButton.NoButton,
+                Qt.MouseButton.NoButton,
+                Qt.KeyboardModifier.NoModifier,
+            ))
+
+        hover(interior)
+        assert canvas.cursor().shape() == Qt.CursorShape.IBeamCursor
+
+        boundary = QPointF(
+            quad[0][0] * 0.75 + quad[1][0] * 0.25,
+            quad[0][1] * 0.75 + quad[1][1] * 0.25,
+        )
+        hover(boundary)
+        assert canvas.cursor().shape() == Qt.CursorShape.SizeAllCursor
+    finally:
+        canvas.hide()
+        canvas.deleteLater()
+
+
+def test_text_selection_uses_translucent_orange_without_white_foreground(qapp):
+    canvas, first, _second = _canvas_with_text()
+    try:
+        canvas._begin_text_session(first)
+        assert canvas.select_all()
+        document = canvas._text_document(first, first.width)
+        image = QImage(300, 120, QImage.Format_ARGB32_Premultiplied)
+        image.fill(Qt.GlobalColor.transparent)
+        painter = QPainter(image)
+        canvas._draw_text_document(painter, first, document)
+        painter.end()
+
+        colors = [
+            image.pixelColor(x, y)
+            for y in range(image.height())
+            for x in range(image.width())
+            if image.pixelColor(x, y).alpha() > 0
+        ]
+        assert any(
+            color.red() > 225
+            and 130 < color.green() < 185
+            and color.blue() < 90
+            and 85 <= color.alpha() <= 120
+            for color in colors
+        )
+        assert any(
+            color.red() < 80 and color.green() < 80 and color.blue() < 80
+            for color in colors
+        )
+        assert not any(
+            color.red() > 245 and color.green() > 245 and color.blue() > 245
+            for color in colors
+        )
+    finally:
+        canvas.hide()
+        canvas.deleteLater()
+
+
+@pytest.mark.parametrize("operation", ["typing", "paste", "delete", "backspace"])
+def test_selected_text_is_replaced_as_one_edit_transaction(
+    qapp, operation,
+):
+    canvas, first, _second = _canvas_with_text()
+    try:
+        first.text = "abcd"
+        canvas._begin_text_session(first)
+        canvas._text_selection_anchor = 1
+        canvas._text_cursor_position = 3
+        before_commands = len(canvas.command_stack._undo)
+        canvas.setFocus()
+        if operation == "typing":
+            QTest.keyClicks(canvas, "X")
+            expected = "aXd"
+        elif operation == "paste":
+            qapp.clipboard().setText("XY")
+            QTest.keyClick(canvas, Qt.Key.Key_V, Qt.KeyboardModifier.ControlModifier)
+            QTest.keyRelease(canvas, Qt.Key.Key_Control)
+            expected = "aXYd"
+        else:
+            key = (
+                Qt.Key.Key_Delete
+                if operation == "delete" else Qt.Key.Key_Backspace
+            )
+            QTest.keyClick(canvas, key)
+            expected = "ad"
+        assert first.text == expected
+        canvas.commit_active_text_edit()
+        assert len(canvas.command_stack._undo) == before_commands + 1
+        canvas.command_stack.undo()
+        assert canvas.chapter.objects[first.object_id].text == "abcd"
+    finally:
+        canvas.hide()
+        canvas.deleteLater()
+
+
+def test_configurable_select_all_targets_canvas_text_but_yields_to_fields(
+    qapp, monkeypatch,
+):
+    monkeypatch.setattr(main_window_module, "save_settings", lambda _value: None)
+    window = MainWindow()
+    chapter, _page, first, _second = _chapter_with_texts()
+    window._set_chapter(chapter, TileStore())
+    window.show()
+    try:
+        window.canvas.set_selection("object", first.object_id)
+        window.canvas._begin_text_session(first)
+        window.canvas._text_cursor_position = 2
+        window.canvas._text_selection_anchor = 2
+        window.canvas.setFocus()
+        qapp.processEvents()
+        QTest.keyClick(
+            window.canvas, Qt.Key.Key_A, Qt.KeyboardModifier.ControlModifier
+        )
+        QTest.keyRelease(window.canvas, Qt.Key.Key_Control)
+        assert window.canvas._text_selection_range() == [0, len(first.text)]
+
+        window.canvas._text_cursor_position = 2
+        window.canvas._text_selection_anchor = 2
+        field = window.text_object_controls.font_size
+        field.setFocus()
+        qapp.processEvents()
+        QTest.keyClick(
+            field.lineEdit(), Qt.Key.Key_A, Qt.KeyboardModifier.ControlModifier
+        )
+        QTest.keyRelease(field.lineEdit(), Qt.Key.Key_Control)
+        assert field.lineEdit().selectedText() == field.lineEdit().text()
+        assert window.canvas._text_selection_range() == [2, 2]
+    finally:
+        window.hide()
+        window.deleteLater()
 
 
 def test_legacy_text_size_is_preserved_until_size_itself_is_edited(
@@ -412,7 +666,9 @@ def test_free_text_transform_reuses_cached_render_until_commit(qapp, monkeypatch
     canvas, first, _second = _canvas_with_text()
     canvas.set_tool(ToolKind.TRANSFORM)
     calls = 0
+    grid_calls = 0
     original = canvas._text_document
+    original_grid = canvas._draw_grid
 
     def counted(*args, **kwargs):
         nonlocal calls
@@ -424,12 +680,20 @@ def test_free_text_transform_reuses_cached_render_until_commit(qapp, monkeypatch
         return original(*args, **kwargs)
 
     monkeypatch.setattr(canvas, "_text_document", counted)
+
+    def counted_grid(*args, **kwargs):
+        nonlocal grid_calls
+        grid_calls += 1
+        return original_grid(*args, **kwargs)
+
+    monkeypatch.setattr(canvas, "_draw_grid", counted_grid)
     try:
         start = canvas.document_to_widget(QPointF(80, 80))
         canvas._tool_press(start, 1)
         assert not canvas._transform_static_cache.isNull()
         assert not canvas._text_transform_cache.isNull()
         assert calls == 1
+        assert grid_calls == 1
 
         for offset in range(4, 44, 4):
             canvas._tool_move(start + QPointF(-offset, -offset), 1)
@@ -438,6 +702,7 @@ def test_free_text_transform_reuses_cached_render_until_commit(qapp, monkeypatch
                 80 - offset, 80 - offset
             )
         assert calls == 1
+        assert grid_calls == 1
         assert not canvas.grab().toImage().isNull()
         assert calls == 1
 

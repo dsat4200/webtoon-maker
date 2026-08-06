@@ -78,7 +78,7 @@ Outward reversed radial/parent-shape gradients are rendered before their direct 
 - Unlocked Bezier rounding uses shared tangent construction for a smooth C1 join.
 - De Casteljau subdivision is used when inserting/splitting curve segments.
 
-Open shapes use `open_shape_mesh()` rather than a fixed-width QPen. The centerline is sampled, width multipliers are interpolated between nodes, normals generate left/right ribbon edges, and explicit point/square/round cap geometry closes the mesh. That same core silhouette can be used as a compound operand.
+Open shapes use `open_shape_mesh()` rather than a fixed-width QPen. The centerline is sampled, width multipliers are interpolated between nodes, normals generate left/right ribbon edges, and explicit point/square/round cap geometry closes the mesh. A zero-width core is empty, though extra outline width can still form a visible ribbon. That same core silhouette can be used as a compound operand.
 
 ### Compound paths
 
@@ -193,7 +193,7 @@ Rectangle, lasso, and stroke selection share one subsystem for Raster and Vector
 - Selected content gets a persistent four-corner frame with eight corner/edge handles, edge translation, a rotation affordance, and a movable pivot.
 - Free mode edits individual corners/edge pairs. Uniform mode scales around the opposite anchor or pivot.
 - The vector preview stores temporary point/control/width payloads and a revision token; commit pushes one undoable object patch.
-- Select All chooses all raster alpha content or all vector points/strokes as appropriate.
+- Select All chooses the complete active text while the canvas owns a text-edit session; otherwise it chooses all raster alpha content or all vector points/strokes as appropriate.
 
 ## Vector fill computation
 
@@ -228,16 +228,19 @@ Text is laid out by `QTextDocument` with a pixel-size `QFont`, absolute letter s
 - Free text lays the document out in an axis-aligned local rectangle, maps it into a four-point destination quad, and clips before painting.
 - Selection highlighting uses `QAbstractTextDocumentLayout.PaintContext`. The caret comes from the active block layout's cursor position.
 - Canvas hit testing inversely maps a click into text layout coordinates and asks the document layout for a text position.
+- Pointer drag updates the character range live; Qt word selection powers double-click, and a same-object third click within the platform interval selects the full text.
 - Keyboard, clipboard, and IME changes update the live object. A local text history handles in-session undo; the entire session becomes one chapter command on commit.
 - Text-only canvas controls are derived from the current selection and exist only in Text Edit. The overlay edits integer size and bold/italic; two screen-space right-edge handles scrub snapped size and kerning from their drag-start values and coalesce each drag into one chapter command.
 - Before any ribbon, gizmo, or transform edit, an active typing transaction is committed so document undo order matches user action order.
 - A free-text transform captures a static viewport without the selected object and rasterizes that object once into a device/zoom-aware transparent image. Each move projectively maps the cached image into the preview quad and derives selection controls from that quad; release or Escape clears both caches and restores normal `QTextDocument` rendering.
+- In Text Edit, only a screen-space band around the dotted free-transform boundary begins translation. Transform handles keep priority and the quad interior remains an I-beam text target.
 
 ## Hit testing and tool input
 
 All mouse, tablet, wheel, touch, key, double-click, and IME events enter the canvas and are dispatched according to `ToolKind` plus selected entity type.
 
 - Shape hit targets are scaled inversely with zoom so handles and border tolerance stay screen-stable.
+- Free-shape previews render their real open core/outline and can inject the draft as a virtual Add/Subtract operand into an ancestor compound. Finish and operation buttons plus global S/O scrubbers are painted and hit-tested in screen space.
 - Shape Edit prioritizes radius/delete/gizmo/control/node/primitive-handle/edge/insertion/interior targets.
 - Object Select traverses the hierarchy front-to-back and respects visibility, opacity, ancestor masks, direct-mask escape, compound references, and page placement.
 - Raster hits use the interaction frame and actual alpha behavior where required. Vector hits prefer visible stroke corridors before fill interiors.

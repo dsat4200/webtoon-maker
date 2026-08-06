@@ -5,7 +5,9 @@ import json
 import os
 import shutil
 import time
+import uuid
 from pathlib import Path
+from typing import Callable
 
 from .models import (
     ChapterDocument, ChapterReference, RasterObject, SeriesDocument,
@@ -61,6 +63,87 @@ class SeriesRepository:
 
     def save_series(self, series: SeriesDocument) -> None:
         atomic_json(self.series_path, series.to_dict())
+
+    @staticmethod
+    def _clone_ignored_names(_directory: str, names: list[str]) -> set[str]:
+        """Exclude recovery and incomplete-write artifacts from a clone."""
+        ignored: set[str] = set()
+        for name in names:
+            folded = name.casefold()
+            if folded in {"autosave", LAST_GOOD_DIR, PENDING_FILE}:
+                ignored.add(name)
+            elif folded.endswith(".tmp") or folded.endswith("~"):
+                ignored.add(name)
+        return ignored
+
+    @classmethod
+    def _remove_clone_transients(cls, root: Path) -> None:
+        """Remove artifacts an overlay save may have regenerated."""
+        candidates = sorted(
+            root.rglob("*"), key=lambda item: len(item.parts), reverse=True,
+        )
+        for path in candidates:
+            folded = path.name.casefold()
+            transient = (
+                folded in {"autosave", LAST_GOOD_DIR, PENDING_FILE}
+                or folded.endswith(".tmp")
+                or folded.endswith("~")
+            )
+            if not transient:
+                continue
+            if path.is_dir():
+                shutil.rmtree(path)
+            else:
+                path.unlink(missing_ok=True)
+
+    def clone_to(
+        self,
+        destination: str | Path,
+        series: SeriesDocument,
+        overlay: Callable[["SeriesRepository"], None] | None = None,
+    ) -> "SeriesRepository":
+        """Clone a series through a sibling staging directory, then publish.
+
+        ``overlay`` can write newer in-memory documents into the staging
+        repository.  The original project and destination remain untouched if
+        any copy or overlay operation fails.
+        """
+        destination = Path(destination).expanduser().resolve()
+        if destination.exists():
+            raise FileExistsError(f"Destination already exists: {destination}")
+        if not destination.name:
+            raise ValueError("A destination folder name is required")
+        if not destination.parent.is_dir():
+            raise FileNotFoundError(
+                f"Destination parent does not exist: {destination.parent}"
+            )
+        try:
+            destination.relative_to(self.root)
+        except ValueError:
+            pass
+        else:
+            raise ValueError("The clone destination cannot be inside the source series")
+        if not self.series_path.is_file():
+            raise FileNotFoundError(f"Series manifest not found: {self.series_path}")
+
+        staging = destination.parent / (
+            f".{destination.name}.clone-{uuid.uuid4().hex}.tmpdir"
+        )
+        try:
+            shutil.copytree(
+                self.root, staging, ignore=self._clone_ignored_names,
+            )
+            staged_repository = SeriesRepository(staging)
+            staged_repository.save_series(series)
+            if overlay is not None:
+                overlay(staged_repository)
+            self._remove_clone_transients(staging)
+            os.replace(staging, destination)
+        except Exception:
+            if staging.exists():
+                shutil.rmtree(staging)
+            raise
+        return SeriesRepository(destination)
 
     def chapter_root(self, chapter_id: str) -> Path:
         return self.root / "chapters" / chapter_id

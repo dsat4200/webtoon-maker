@@ -210,13 +210,13 @@ Changes here should retain the dependency-light design and be covered by `test_v
 The application shell and workflow coordinator.
 
 - Defines reusable collapsible and scrollable left-tool containers.
-- Builds the project toolbar, tool sidebar, Shapes/Drawing Selection groups, colors, contextual ribbon pages (including text-only Tool Settings groups), canvas/navigator, right hierarchy dock, layer settings, floating inspector, timers, and persisted splitters.
+- Builds the toolbar File dropdown and project controls, tool sidebar, Shapes/Drawing Selection groups, colors, contextual ribbon pages (including text-only Tool Settings groups), canvas/navigator, right hierarchy dock, layer settings, floating inspector, timers, and persisted splitters.
 - Opens/creates series and chapters, prompts for autosave recovery, creates/deletes/reorders entities, and orchestrates transactional page insertion.
 - Manages cached, closable series/asset tabs and the per-series Asset Library workflows.
 - Connects canvas/model signals to the outliner, inspectors, status bar, dirty state, and contextual ribbon routing.
 - Implements the global chord/hold hotkey event filter, prefix timeout, Delete Selected routing/editor suppression, and stylus forwarding to popups/outliner.
 - Owns per-series color/palette/gradient-preset CRUD and debounce saves.
-- Owns manual save, recovery autosave, recent series, brush-size/preset dialogs, settings writes, fullscreen, and close confirmation.
+- Owns manual save, transactional whole-series Save As cloning/rebinding, recovery autosave, recent series, brush-size/preset dialogs, settings writes, fullscreen, and close confirmation.
 
 ### `comic_editor/ui/canvas.py`
 
@@ -228,7 +228,7 @@ The largest and most central runtime script.
 - Recursively renders layers, masks, objects, vector strokes/fills, gradients, sparse raster tiles, and text.
 - Draws grids, selections, transform/shape/gradient handles, hover indicators, creation previews, and page-gap UI.
 - Implements hit testing and all mouse, tablet, touch, key, wheel, IME, and navigation behavior.
-- Implements page creation/gutters, drawing selections/transforms, vector pencil/eraser/redraw/connect/simplify/fill, shape creation/edit/flatten, raster creation/strokes/transforms, text editing, selection-scoped typography gizmos, and cached free-text transform previews.
+- Implements page creation/gutters, drawing selections/transforms, vector pencil/eraser/redraw/connect/simplify/fill, shape creation/edit/flatten with draft compound/style gizmos, raster creation/strokes/transforms, text editing/word selection, selection-scoped typography gizmos, and cached free-text transform previews.
 - Provides software and OpenGL-backed widget classes plus the OpenGL probe/factory.
 
 See the dedicated canvas document for the rendering pipeline.
@@ -376,11 +376,11 @@ Covers missing/partial/null settings, default hotkey merging, clean-window confi
 
 ### `tests/test_text_updates.py`
 
-Covers complete text Tool Settings migration, 250-size entry/clamping, per-family font previews, selected-object isolation, canvas overlay visibility/editing, size/kerning scrub ranges and snapping, Delete Selected suppression, undo/redo, and cached live free-text transforms.
+Covers complete text Tool Settings migration, 250-size entry/clamping, per-family font previews, selected-object isolation, canvas overlay visibility/editing, word/all/drag selection, size/kerning scrub ranges, boundary translation, Delete Selected suppression, undo/redo, and cached live free-text transforms.
 
 ### `tests/test_shape_paths.py`
 
-The broad shape system suite. It covers serialization/migration, Bezier topology validation/repair, variable-width open shapes/caps, shape creation and editing, primitive colors/conversion, rectangle normal/free handles and rounding, grid snapping, tablet drafting, node type/lock/roundness/width/cap/delete/insertion gizmos, multi-selection, C1 smoothing, constant-screen handles/tooltips, and legacy Shape Edit hotkey migration.
+The broad shape system suite. It covers serialization/migration, Bezier topology validation/repair, variable-width open shapes/caps, zero-width cores, creation confirmation and compound previews, global stroke/outline gizmos, primitive colors/conversion, rectangle normal/free handles and rounding, grid snapping, tablet drafting, node type/lock/roundness/width/cap/delete/insertion gizmos, multi-selection, C1 smoothing, constant-screen handles/tooltips, and legacy Shape Edit hotkey migration.
 
 ### `tests/test_stylus_vector_refinements.py`
 

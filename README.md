@@ -10,6 +10,8 @@ workflow.
 ## Current foundation
 
 - Portable series folders and versioned chapter manifests
+- Toolbar File dropdown with New/Open/Recent/Save plus atomic whole-series
+  Save As cloning
 - Portable per-series Asset Libraries with fitted rendered thumbnails
 - Cached, closable project tabs for open series and editable assets
 - Growable 1080px-wide chapters
@@ -73,9 +75,11 @@ switches temporarily and restores the previous tool on release.
 
 Expand Shapes to choose Rectangle, Circle, or Shape. In Shape creation,
 clicking adds vector points, dragging creates Bézier points, clicking the
-first point closes the shape, and Enter or double-click commits an open line.
-Shape Edit exposes point, curve, roundness, width, type, lock, and end-cap
-gizmos using the blue/orange visual language. Selected points also expose a
+first point closes the shape, and Finish, Enter, or double-click commits an
+open line. Orange S/O scrubbers edit the draft's global stroke and outline.
+Shape Edit exposes the same global controls plus point, curve, roundness,
+width, type, lock, and end-cap gizmos using the blue/orange visual language.
+Selected points also expose a
 circular X gizmo for deletion. New shapes use the active secondary color for
 their fill/core and an enabled 4px active-primary outline (white and black by
 default). Unlocked Bézier roundness smooths through the selected point;
@@ -100,6 +104,9 @@ mask; strict text also uses the selected mask's bounds. **Flatten Compound**
 compiles the visible Boolean result into one editable multi-contour shape,
 preserving holes, disconnected regions, ignored branches, and object
 positions as one undoable operation.
+New contributors default to Add. During free-shape creation, an Add/Subtract/
+Ignore gizmo cycles the draft operation and the canvas previews the prospective
+Boolean result before Finish or another confirmation gesture commits it.
 
 Select a text object to enter Text Edit and open its Object/Presets,
 Typography, and Layout groups in Tool Settings. Its UI label is derived from
@@ -108,8 +115,13 @@ text size, bold, and italic controls plus right-edge size and kerning scrub
 handles. Strict text wraps to its parent layer with a uniform margin; Free
 text keeps its own projective transform rectangle. Both modes provide 3×3
 alignment, using the free text rectangle as the alignment frame when
-transformed. Double-click inside a free text transform to return to Text Edit
-at that position. Raster translations preserve their sparse tiles, while
+transformed. Drag or Shift-navigate to select text; double-click selects a word
+and triple-click selects the entire box. The selection is shown in translucent
+orange, and the configurable Select All command targets the active text editor
+while native fields retain their own Select All. The dotted free-text boundary
+translates the box while its interior retains normal I-beam editing. Double-click
+inside a free text transform to return to Text Edit at that position. Raster
+translations preserve their sparse tiles, while
 scale/projective transforms bake into sparse tiles. Both use the program's
 standard Undo and Redo commands.
 

@@ -223,7 +223,7 @@ class ShapeStyle:
 
     def validate(self) -> None:
         self.base_thickness = max(
-            1, min(1000, math.floor(float(self.base_thickness) + 0.5))
+            0, min(1000, math.floor(float(self.base_thickness) + 0.5))
         )
         self.outline_thickness = max(
             0, min(500, math.floor(float(self.outline_thickness) + 0.5))

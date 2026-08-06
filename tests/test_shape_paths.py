@@ -53,6 +53,175 @@ def _send_tablet(
     QCoreApplication.sendEvent(canvas, event)
 
 
+def test_shape_creation_finish_and_global_style_gizmos(qapp):
+    canvas, chapter, page, _layer = _canvas()
+    canvas.show()
+    try:
+        canvas.set_tool(ToolKind.SHAPE_CREATE)
+        canvas._creation_nodes = [
+            PathNode(x=180, y=180), PathNode(x=420, y=260),
+        ]
+        canvas._creation_selected_node_id = canvas._creation_nodes[-1].node_id
+        canvas._creation_style = ShapeStyle(
+            primary_color="#334455", base_thickness=12,
+            outline_color="#abcdef", outline_thickness=5,
+        )
+        canvas._creation_parent_id = page.layer_id
+        canvas._creation_insertion_index = 0
+
+        geometry = canvas._shape_overlay_geometry()
+        assert geometry is not None
+        assert "finish" in geometry["buttons"]
+        assert set(geometry["handles"]) == {
+            "base_thickness", "outline_thickness",
+        }
+        finish_rect = geometry["buttons"]["finish"][0]
+        assert canvas.rect().contains(finish_rect.toAlignedRect())
+
+        stroke = geometry["handles"]["base_thickness"]
+        assert canvas._begin_shape_overlay_interaction(stroke)
+        canvas._update_shape_property_drag(stroke + QPointF(40, 0))
+        assert canvas._creation_style.base_thickness == 22
+        assert canvas._finish_shape_property_drag()
+
+        outline = canvas._shape_overlay_geometry()["handles"]["outline_thickness"]
+        assert canvas._begin_shape_overlay_interaction(outline)
+        canvas._update_shape_property_drag(outline + QPointF(800, 0))
+        assert canvas._creation_style.outline_thickness == 100
+        assert canvas._cancel_shape_property_drag()
+        assert canvas._creation_style.outline_thickness == 5
+
+        before_commands = len(canvas.command_stack._undo)
+        assert canvas._begin_shape_overlay_interaction(finish_rect.center())
+        created = chapter.layers[canvas.selected_id]
+        assert created.layer_kind == "open_shape"
+        assert created.bound.closed is False
+        assert created.shape_style.base_thickness == 22
+        assert created.shape_style.outline_thickness == 5
+        assert created.compound_operation == "add"
+        assert len(canvas.command_stack._undo) == before_commands + 1
+        canvas.command_stack.undo()
+        assert created.layer_id not in canvas.chapter.layers
+    finally:
+        canvas.hide()
+        canvas.deleteLater()
+
+
+def test_shape_edit_global_style_and_nested_compound_gizmos(qapp):
+    canvas, chapter, _page, root = _canvas()
+    root.compound_enabled = True
+    intermediary = chapter.add_layer(
+        root.layer_id, "Nested", BoundGeometry.rectangle(80, 80, 500, 500)
+    )
+    line = chapter.add_layer(
+        intermediary.layer_id, "Line",
+        BoundGeometry.path([
+            PathNode(x=100, y=140), PathNode(x=360, y=140),
+        ], False),
+        layer_kind="open_shape",
+        style=ShapeStyle(base_thickness=20, outline_thickness=4),
+    )
+    root_id = root.layer_id
+    intermediary_id = intermediary.layer_id
+    line_id = line.layer_id
+    canvas.set_selection("layer", line.layer_id, False)
+    canvas.set_tool(ToolKind.SHAPE_EDIT)
+    canvas.show()
+    try:
+        geometry = canvas._shape_overlay_geometry()
+        assert geometry["context"]["compound_parent"].layer_id == root.layer_id
+        assert geometry["buttons"]["compound"][1] == "Add"
+
+        before_commands = len(canvas.command_stack._undo)
+        assert canvas._begin_shape_overlay_interaction(
+            geometry["buttons"]["compound"][0].center()
+        )
+        assert line.compound_operation == "subtract"
+        assert len(canvas.command_stack._undo) == before_commands + 1
+        canvas.command_stack.undo()
+        line = canvas.chapter.layers[line_id]
+        assert line.compound_operation == "add"
+
+        geometry = canvas._shape_overlay_geometry()
+        stroke = geometry["handles"]["base_thickness"]
+        before_commands = len(canvas.command_stack._undo)
+        assert canvas._begin_shape_overlay_interaction(stroke)
+        assert canvas._finish_shape_property_drag()
+        assert len(canvas.command_stack._undo) == before_commands
+
+        before_commands = len(canvas.command_stack._undo)
+        assert canvas._begin_shape_overlay_interaction(stroke)
+        canvas._update_shape_property_drag(stroke - QPointF(800, 0))
+        assert canvas.chapter.layers[line_id].shape_style.base_thickness == 0
+        assert canvas._finish_shape_property_drag()
+        assert len(canvas.command_stack._undo) == before_commands + 1
+        canvas.command_stack.undo()
+        assert canvas.chapter.layers[line_id].shape_style.base_thickness == 20
+
+        chapter = canvas.chapter
+        root = chapter.layers[root_id]
+        intermediary = chapter.layers[intermediary_id]
+        closed = chapter.add_layer(
+            root.layer_id, "Closed", BoundGeometry.rectangle(120, 120, 90, 90)
+        )
+        canvas.set_selection("layer", closed.layer_id, False)
+        assert set(canvas._shape_overlay_geometry()["handles"]) == {
+            "outline_thickness"
+        }
+
+        intermediary.compound_operation = "ignore"
+        canvas.set_selection("layer", line_id, False)
+        assert "compound" not in canvas._shape_overlay_geometry()["buttons"]
+    finally:
+        canvas.hide()
+        canvas.deleteLater()
+
+
+def test_zero_width_open_shape_and_compound_creation_preview(qapp):
+    canvas, chapter, _page, root = _canvas()
+    root.compound_enabled = True
+    root.fill_color = "#ff0000"
+    canvas.set_selection("layer", root.layer_id, False)
+    canvas.set_tool(ToolKind.SHAPE_CREATE)
+    canvas._creation_nodes = [
+        PathNode(x=200, y=250), PathNode(x=820, y=250),
+    ]
+    canvas._creation_style = ShapeStyle(base_thickness=40, outline_thickness=30)
+    canvas._creation_parent_id = root.layer_id
+    canvas._creation_insertion_index = 0
+
+    geometry = BoundGeometry.path(canvas._creation_nodes, False)
+    assert geometry.closed is False
+    original, added = canvas._creation_compound_preview_paths(
+        geometry, canvas._creation_style
+    )
+    assert not original.contains(QPointF(800, 250))
+    assert added.contains(QPointF(800, 250))
+
+    canvas._creation_compound_operation = "subtract"
+    original, subtracted = canvas._creation_compound_preview_paths(
+        geometry, canvas._creation_style
+    )
+    assert original.contains(QPointF(250, 250))
+    assert not subtracted.contains(QPointF(250, 250))
+
+    canvas._creation_compound_operation = "ignore"
+    assert canvas._creation_compound_preview_paths(
+        geometry, canvas._creation_style
+    ) is None
+
+    assert CanvasWidget.open_shape_mesh(geometry, 0, 0).isEmpty()
+    assert not CanvasWidget.open_shape_mesh(geometry, 0, 20).isEmpty()
+    canvas._creation_compound_operation = "subtract"
+    canvas._finish_shape(False)
+    created = canvas.chapter.layers[canvas.selected_id]
+    assert created.parent_id == root.layer_id
+    assert created.compound_operation == "subtract"
+    assert created.shape_style.base_thickness == 40
+    assert created.shape_style.outline_thickness == 30
+    canvas.deleteLater()
+
+
 def test_path_node_shape_style_round_trip_and_open_leaf_invariants():
     chapter = ChapterDocument()
     page = chapter.add_page()
@@ -1343,6 +1512,24 @@ def test_round_cap_is_one_tangent_aligned_ribbon_subpath():
     ) == 1
     assert mesh.contains(QPointF(91, 100))
     assert mesh.contains(QPointF(309, 100))
+
+
+@pytest.mark.parametrize("start_cap", ["point", "square", "round"])
+@pytest.mark.parametrize("end_cap", ["point", "square", "round"])
+def test_open_shape_mesh_supports_every_endpoint_cap_pair(
+    start_cap, end_cap,
+):
+    bound = BoundGeometry.path([
+        PathNode(x=100, y=100, width_multiplier=0.75),
+        PathNode(x=300, y=130, width_multiplier=1.25),
+    ], False)
+
+    mesh = CanvasWidget.open_shape_mesh(
+        bound, 24, start_cap=start_cap, end_cap=end_cap,
+    )
+
+    assert not mesh.isEmpty()
+    assert mesh.boundingRect().isValid()
 
 
 def test_roundness_enabled_migrates_from_saved_radius():

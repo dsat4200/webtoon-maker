@@ -10,7 +10,8 @@ The application intentionally does not implement scheduling, reference libraries
 
 ## Main workspace
 
-- The top project toolbar creates/opens series, saves, undoes/redoes, switches or creates chapters, trims height, toggles fullscreen, edits hotkeys, and opens recent series.
+- The top project toolbar starts with an instant-popup File button containing New Series, Open Series, a dynamic Open Recent submenu, Save, and Save As. Save As atomically clones the complete owning series with a new series ID and rebinds its open series/asset tabs to the clone.
+- The same toolbar contains Undo/Redo, chapter switching/creation, Trim Height, Fullscreen, and Hotkeys.
 - A closable project-tab row keeps multiple series and assets open. Switching tabs restores the document, sparse tiles, dirty state, undo/redo, camera, selection, tool, hierarchy expansion, ribbon choice, and render caches without reopening from disk.
 - The left sidebar contains the tool list, expandable Shapes and Drawing Selection groups, add-object actions, navigation/grid toggles, and resizable Picker/Palette color tabs.
 - The ribbon contains Tool Settings and contextual Vector Tools, Raster Object Settings, and Gradient Tools pages. Selecting text opens Tool Settings and replaces its ordinary tool group with Object/Presets, Typography, and Layout groups.
@@ -49,9 +50,9 @@ The application intentionally does not implement scheduling, reference libraries
 - Bezier controls can be locked; valid locked handles are normalized as linked, symmetric tangents.
 - Nodes store independent roundness and width multipliers. Rectangle roundness is editable per corner.
 - Rectangle editing has **Normal** mode, which scales the complete primitive, and **Free** mode, which moves corners or attached edge pairs.
-- Shape creation uses click for a vector point and drag for a Bezier point. Clicking the first point closes a path. Enter or double-click commits an open path.
+- Shape creation uses click for a vector point and drag for a Bezier point. Clicking the first point closes and confirms a path; Finish, Enter, or double-click confirms an open path.
 - Adding a point to a rectangle or ellipse requires confirmation because it converts the primitive to a custom shape.
-- Shape Edit exposes node, control, point-type, handle-lock, roundness, thickness, deletion, insertion, and cap affordances. Shift can extend node selection.
+- Shape creation and Shape Edit expose screen-space S/O scrubbers for global open-stroke thickness (0-150) and outline thickness (0-100), with one integer pixel per four screen pixels. Shape Edit also exposes node, control, point-type, handle-lock, roundness, per-node width, deletion, insertion, and cap affordances. Shift can extend node selection.
 - New shapes use the active secondary color for fill/core and an enabled four-pixel active-primary outline.
 
 ### Masks and compound shapes
@@ -62,6 +63,7 @@ The application intentionally does not implement scheduling, reference libraries
 - A compound parent supplies the visible fill, outline, visibility, and opacity. Contributor styling is construction-only.
 - Open shapes contribute their core stroke silhouette to a compound.
 - An ignored branch is isolated from the compound and renders normally.
+- New contributors default to Add. A selected or drafted active contributor receives an Add/Subtract/Ignore cycle button; a free-shape draft is treated as open and previews its prospective Boolean result before commit.
 - Eligible objects choose a geometry reference of **Direct parent** or **Closest compound**. This changes clipping and, for strict text, the layout bounds.
 - **Flatten Compound** converts the current Boolean result into one editable custom multi-contour shape, preserves holes/disconnected regions and object positions, removes construction layers, and records one undo command.
 
@@ -117,8 +119,9 @@ The application intentionally does not implement scheduling, reference libraries
 - Text Tool Settings expose presets, font family, optional per-family dropdown previews, integer pixel size, bold/italic, kerning, visibility, opacity/lock, layout mode, 3×3 alignment, margin, geometry reference, and free/uniform transform mode. Layout- and compound-specific controls appear only when applicable.
 - Text presets store formatting only: font family, integer pixel size, bold, italic, kerning, layout mode, 3×3 alignment, and margin. Preset sizes are normalized to 6–250.
 - In Text Edit, the selected text alone receives an on-canvas `− size + B I` strip. Its size field commits on Enter/focus loss and cancels on Escape. Two orange circles on the right edge scrub size (10–100, integer) and kerning (1.0–10.0, tenths) at one step per four screen pixels; a drag becomes one undo command.
+- Text drag-selection updates character highlighting live. Double-click selects a word, triple-click selects the entire box, and the selected box uses an I-beam cursor away from higher-priority controls.
 - **Strict** layout wraps and clips text to the selected direct or compound shape bounds with a uniform margin. Edge-midpoint dragging edits the margin.
-- **Free** layout uses a four-point projective quad. It supports the shared eight-handle transform, rotation, pivot, and 3×3 alignment within its local transformed rectangle.
+- **Free** layout uses a four-point projective quad. It supports the shared eight-handle transform, rotation, pivot, and 3×3 alignment within its local transformed rectangle. Dragging the dotted boundary translates the object while the interior remains available for text selection.
 - A free-text drag caches the scene without the selection and rasterizes the selected text once at device-aware resolution. Pointer moves reproject that image through the live quad; commit/cancel returns to normal high-quality text layout.
 - Double-clicking a transformed free text object re-enters Text Edit at the clicked position.
 
@@ -153,7 +156,7 @@ The application intentionally does not implement scheduling, reference libraries
 - Tree rebuilds preserve expanded entities and selection by stable ID.
 - Object Select searches the complete chapter. Shape borders are selectable within 12 screen pixels while filled interiors remain click-through so descendants are reachable.
 - Ctrl-click opens an ordered menu for overlapping candidates. Vector strokes are preferred to vector-fill interiors.
-- Drawing Selection supports replace, Shift-add, and Ctrl-remove. The default Select All chord is Ctrl+A.
+- Drawing Selection supports replace, Shift-add, and Ctrl-remove. The default Select All chord is Ctrl+A; during active canvas text editing it selects all text instead, while native text/numeric fields keep their native behavior.
 - Undo/redo covers graph changes, text sessions, raster tile/frame patches, vector edits, transforms, page gaps, and hierarchy moves. The in-memory stack retains 200 commands.
 
 ## Navigation and input
