@@ -51,7 +51,7 @@ def test_file_menu_replaces_project_file_controls_and_handles_stale_recent(
     try:
         actions = window.file_menu.actions()
         assert [action.text() for action in actions] == [
-            "New Series", "Open Series", "Open Recent", "", "Save", "Save As",
+            "New Series", "Open Series", "Open Recent", "Import Images…", "", "Save", "Save As",
         ]
         toolbar_labels = [
             action.text() for action in window.file_toolbar.actions()

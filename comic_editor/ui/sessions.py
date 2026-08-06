@@ -8,6 +8,7 @@ from comic_editor.core.assets import AssetManifest, AssetRepository
 from comic_editor.core.models import ChapterDocument, SeriesDocument
 from comic_editor.core.persistence import SeriesRepository
 from comic_editor.core.tiles import TileStore
+from comic_editor.core.images import ImageStore
 from comic_editor.ui.canvas import CanvasSessionState
 
 
@@ -30,6 +31,7 @@ class EditorSession:
     context: ProjectContext
     chapter: ChapterDocument
     tiles: TileStore
+    images: ImageStore = field(default_factory=ImageStore)
     asset_manifest: AssetManifest | None = None
     canvas_state: CanvasSessionState | None = None
     dirty: bool = False

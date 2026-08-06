@@ -143,7 +143,7 @@ def test_v12_chapter_with_speed_lines_migrates_to_v13():
     payload = chapter.to_dict()
     payload["schema_version"] = 12
     restored = ChapterDocument.from_dict(payload)
-    assert restored.schema_version == 14
+    assert restored.schema_version == 15
     restored_gradient = restored.objects[gradient.object_id]
     assert isinstance(restored_gradient, SpeedLinesGradientObject)
     assert restored.speed_center_for(gradient.object_id) is not None

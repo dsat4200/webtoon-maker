@@ -3,12 +3,12 @@ from __future__ import annotations
 
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
-    QCheckBox, QFormLayout, QGroupBox, QHBoxLayout, QLabel, QLineEdit,
-    QSlider, QStackedWidget, QVBoxLayout, QWidget,
+    QCheckBox, QComboBox, QFormLayout, QGroupBox, QHBoxLayout, QLabel,
+    QLineEdit, QSlider, QStackedWidget, QVBoxLayout, QWidget,
 )
 
 from comic_editor.core.models import (
-    RasterObject, TextObject, VectorDrawingObject, VectorFillObject,
+    ImageObject, RasterObject, TextObject, VectorDrawingObject, VectorFillObject,
 )
 from comic_editor.ui.layer_settings import LayerSettingsPanel
 from comic_editor.ui.tool_ribbon_pages import RasterObjectControls
@@ -280,6 +280,150 @@ class VectorObjectSettings(QWidget):
         self.refresh()
 
 
+class ImageObjectSettings(QWidget):
+    """Embedded-image metadata, masking, and parent-fit behavior."""
+
+    changed = Signal()
+
+    def __init__(self, canvas, parent: QWidget | None = None):
+        super().__init__(parent)
+        self.canvas = canvas
+        self._updating = False
+        self._underlay_before: dict | None = None
+        form = QFormLayout(self)
+        form.setContentsMargins(8, 8, 8, 8)
+        form.setSpacing(5)
+        title = QLabel("Image Object", self)
+        title.setStyleSheet("font-weight: bold; color: #80c8ff")
+        form.addRow(title)
+        self.name = QLineEdit(self)
+        form.addRow("Name", self.name)
+        self.opacity_lock = QCheckBox("Lock opacity", self)
+        form.addRow(self.opacity_lock)
+        self.ignore_parent_mask = QCheckBox("Ignore direct parent mask", self)
+        form.addRow(self.ignore_parent_mask)
+        self.underlay = QSlider(Qt.Orientation.Horizontal, self)
+        self.underlay.setRange(0, 100)
+        self.underlay_value = QLabel("0%", self)
+        underlay_row = QWidget(self)
+        underlay_layout = QHBoxLayout(underlay_row)
+        underlay_layout.setContentsMargins(0, 0, 0, 0)
+        underlay_layout.addWidget(self.underlay, 1)
+        underlay_layout.addWidget(self.underlay_value)
+        form.addRow("Show underlay", underlay_row)
+        self.geometry_reference = QComboBox(self)
+        self.geometry_reference.addItem("Direct parent", "direct")
+        self.geometry_reference.addItem("Closest compound", "compound")
+        form.addRow("Shape reference", self.geometry_reference)
+        self.placement_mode = QComboBox(self)
+        self.placement_mode.addItem("Free transform", "free")
+        self.placement_mode.addItem("Fit to parent", "fit_parent")
+        form.addRow("Placement", self.placement_mode)
+        self.fit_mode = QComboBox(self)
+        self.fit_mode.addItem("Auto width", "auto_width")
+        self.fit_mode.addItem("Auto height", "auto_height")
+        self.fit_mode.addItem("Stretch", "stretch")
+        self.fit_mode.addItem("Fit inside", "fit_inside")
+        form.addRow("Fit mode", self.fit_mode)
+        self.filename = QLabel("â€”", self)
+        self.filename.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        form.addRow("Original", self.filename)
+        self.dimensions = QLabel("â€”", self)
+        form.addRow("Dimensions", self.dimensions)
+        self.name.editingFinished.connect(self._apply)
+        self.opacity_lock.toggled.connect(self._apply)
+        self.ignore_parent_mask.toggled.connect(self._apply)
+        self.geometry_reference.currentIndexChanged.connect(self._apply)
+        self.placement_mode.currentIndexChanged.connect(self._apply)
+        self.fit_mode.currentIndexChanged.connect(self._apply)
+        self.underlay.sliderPressed.connect(self._begin_underlay)
+        self.underlay.valueChanged.connect(self._underlay_changed)
+        self.underlay.sliderReleased.connect(self._finish_underlay)
+
+    def _selected(self) -> ImageObject | None:
+        if self.canvas.chapter is None or self.canvas.selected_kind != "object":
+            return None
+        obj = self.canvas.chapter.objects.get(self.canvas.selected_id)
+        return obj if isinstance(obj, ImageObject) else None
+
+    def refresh(self) -> None:
+        obj = self._selected()
+        self._updating = True
+        if obj is not None:
+            self.name.setText(obj.name)
+            self.opacity_lock.setChecked(obj.opacity_locked)
+            self.ignore_parent_mask.setChecked(obj.ignore_parent_mask)
+            value = round(obj.underlay_opacity * 100)
+            self.underlay.setValue(value)
+            self.underlay_value.setText(f"{value}%")
+            self.geometry_reference.setCurrentIndex(max(
+                0, self.geometry_reference.findData(obj.geometry_reference)
+            ))
+            self.placement_mode.setCurrentIndex(max(
+                0, self.placement_mode.findData(obj.placement_mode)
+            ))
+            self.fit_mode.setCurrentIndex(max(
+                0, self.fit_mode.findData(obj.fit_mode)
+            ))
+            self.fit_mode.setEnabled(obj.placement_mode == "fit_parent")
+            self.filename.setText(obj.source_filename)
+            self.dimensions.setText(f"{obj.pixel_width} × {obj.pixel_height} px")
+        self._updating = False
+
+    def _apply(self, *args) -> None:
+        del args
+        obj = self._selected()
+        if self._updating or obj is None:
+            return
+        before = self.canvas.chapter.to_dict()
+        old_placement = obj.placement_mode
+        obj.name = self.name.text().strip() or obj.name
+        obj.opacity_locked = self.opacity_lock.isChecked()
+        obj.ignore_parent_mask = self.ignore_parent_mask.isChecked()
+        reference = self.geometry_reference.currentData()
+        obj.geometry_reference = str(reference or "direct")
+        placement = str(self.placement_mode.currentData() or "free")
+        if old_placement == "fit_parent" and placement == "free":
+            obj.transform_quad = self.canvas._image_fit_quad(obj)
+            obj.transform_frame = (
+                0.0, 0.0, float(obj.pixel_width), float(obj.pixel_height)
+            )
+        obj.placement_mode = placement
+        obj.fit_mode = str(self.fit_mode.currentData() or "auto_height")
+        self._push(before, "Edit image object")
+
+    def _begin_underlay(self) -> None:
+        if not self._updating and self._selected() is not None:
+            self._underlay_before = self.canvas.chapter.to_dict()
+
+    def _underlay_changed(self, value: int) -> None:
+        self.underlay_value.setText(f"{value}%")
+        obj = self._selected()
+        if self._updating or obj is None:
+            return
+        before = None if self._underlay_before is not None else self.canvas.chapter.to_dict()
+        obj.underlay_opacity = value / 100.0
+        self.canvas.documentChanged.emit(None)
+        self.canvas.update()
+        if before is not None:
+            self._push(before, "Change image underlay")
+
+    def _finish_underlay(self) -> None:
+        before, self._underlay_before = self._underlay_before, None
+        if before is not None:
+            self._push(before, "Change image underlay")
+
+    def _push(self, before: dict, label: str) -> None:
+        after = self.canvas.chapter.to_dict()
+        if before != after:
+            self.canvas.push_model_change(before, after, label)
+            self.canvas.hierarchyChanged.emit()
+            self.canvas.documentChanged.emit(None)
+            self.changed.emit()
+        self.canvas.update()
+        self.refresh()
+
+
 class SelectionSettingsPanel(QWidget):
     """Stacked layer/raster/vector property pages for the outliner."""
 
@@ -325,9 +469,17 @@ class SelectionSettingsPanel(QWidget):
         vector_layout.addStretch(1)
         self.stack.addWidget(self.vector_page)
 
+        self.image_page = QGroupBox("Image Object Settings", self)
+        image_layout = QVBoxLayout(self.image_page)
+        self.image_controls = ImageObjectSettings(canvas, self.image_page)
+        image_layout.addWidget(self.image_controls)
+        image_layout.addStretch(1)
+        self.stack.addWidget(self.image_page)
+
         self.raster_controls.objectChanged.connect(self.changed)
         self.raster_controls.settingsChanged.connect(self.settingsChanged)
         self.vector_controls.changed.connect(self.changed)
+        self.image_controls.changed.connect(self.changed)
         self.refresh()
 
     def refresh(self) -> None:
@@ -341,6 +493,9 @@ class SelectionSettingsPanel(QWidget):
         if isinstance(target, RasterObject):
             self.raster_controls.refresh()
             self.stack.setCurrentWidget(self.raster_page)
+        elif isinstance(target, ImageObject):
+            self.image_controls.refresh()
+            self.stack.setCurrentWidget(self.image_page)
         elif isinstance(target, (VectorDrawingObject, VectorFillObject)):
             self.vector_controls.refresh()
             self.stack.setCurrentWidget(self.vector_page)

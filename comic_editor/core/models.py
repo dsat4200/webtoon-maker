@@ -7,7 +7,7 @@ from dataclasses import dataclass, field
 from typing import Any, Iterable, Iterator, Literal
 
 
-SCHEMA_VERSION = 14
+SCHEMA_VERSION = 15
 CHAPTER_WIDTH = 1080
 DEFAULT_CHAPTER_HEIGHT = 3240
 GROWTH_MARGIN = 1080
@@ -775,11 +775,55 @@ class RasterObject(DocumentObject):
     name: str = "Raster"
     tile_size: int = 256
     interaction_rect: tuple[float, float, float, float] = (0.0, 0.0, 120.0, 120.0)
+    transform_frame: tuple[float, float, float, float] | None = None
+    transform_quad: list[tuple[float, float]] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         result = self.common_dict()
         result["tile_size"] = self.tile_size
         result["interaction_rect"] = list(self.interaction_rect)
+        result["transform_frame"] = (
+            list(self.transform_frame) if self.transform_frame is not None else None
+        )
+        result["transform_quad"] = (
+            [list(point) for point in self.transform_quad]
+            if self.transform_quad is not None else None
+        )
+        return result
+
+
+@dataclass
+class ImageObject(DocumentObject):
+    object_type: str = "image"
+    name: str = "Image"
+    source_filename: str = "image"
+    source_mime_type: str = "application/octet-stream"
+    pixel_width: int = 1
+    pixel_height: int = 1
+    placement_mode: Literal["free", "fit_parent"] = "free"
+    fit_mode: Literal[
+        "auto_width", "auto_height", "stretch", "fit_inside"
+    ] = "auto_height"
+    transform_frame: tuple[float, float, float, float] | None = None
+    transform_quad: list[tuple[float, float]] | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        result = self.common_dict()
+        result.update({
+            "source_filename": self.source_filename,
+            "source_mime_type": self.source_mime_type,
+            "pixel_size": [self.pixel_width, self.pixel_height],
+            "placement_mode": self.placement_mode,
+            "fit_mode": self.fit_mode,
+            "transform_frame": (
+                list(self.transform_frame)
+                if self.transform_frame is not None else None
+            ),
+            "transform_quad": (
+                [list(point) for point in self.transform_quad]
+                if self.transform_quad is not None else None
+            ),
+        })
         return result
 
 
@@ -1504,6 +1548,8 @@ class VectorDrawingObject(DocumentObject):
     strokes: list[VectorStroke] = field(default_factory=list)
     fill_child_ids: list[str] = field(default_factory=list)
     drawing_revision: int = 0
+    transform_frame: tuple[float, float, float, float] | None = None
+    transform_quad: list[tuple[float, float]] | None = None
 
     def validate_vector(self) -> None:
         ids: set[str] = set()
@@ -1545,6 +1591,14 @@ class VectorDrawingObject(DocumentObject):
             "strokes": [stroke.to_dict() for stroke in self.strokes],
             "fill_child_ids": list(self.fill_child_ids),
             "drawing_revision": self.drawing_revision,
+            "transform_frame": (
+                list(self.transform_frame)
+                if self.transform_frame is not None else None
+            ),
+            "transform_quad": (
+                [list(point) for point in self.transform_quad]
+                if self.transform_quad is not None else None
+            ),
         })
         return result
 
@@ -1597,7 +1651,7 @@ class VectorFillObject(DocumentObject):
 
 
 ObjectEntity = (
-    RasterObject | TextObject | GradientObject
+    RasterObject | ImageObject | TextObject | GradientObject
     | VectorDrawingObject | VectorFillObject
     | SpeedLineCenterObject | DocumentObject
 )
@@ -1672,6 +1726,8 @@ def object_from_dict(data: dict[str, Any]) -> ObjectEntity:
         result.validate_center()
         return result
     if object_type == "vector_drawing":
+        raw_frame = data.get("transform_frame")
+        raw_quad = data.get("transform_quad")
         return VectorDrawingObject(
             **common,
             strokes=[
@@ -1682,6 +1738,14 @@ def object_from_dict(data: dict[str, Any]) -> ObjectEntity:
                 str(item) for item in data.get("fill_child_ids", [])
             ],
             drawing_revision=int(data.get("drawing_revision", 0)),
+            transform_frame=(
+                tuple(float(value) for value in raw_frame)
+                if raw_frame is not None else None
+            ),
+            transform_quad=(
+                [_point(point) for point in raw_quad]
+                if raw_quad is not None else None
+            ),
         )
     if object_type == "vector_fill":
         return VectorFillObject(
@@ -1702,11 +1766,44 @@ def object_from_dict(data: dict[str, Any]) -> ObjectEntity:
         )
     if object_type == "raster":
         raw_rect = data.get("interaction_rect", [0, 0, 120, 120])
+        raw_frame = data.get("transform_frame")
+        raw_quad = data.get("transform_quad")
         return RasterObject(
             **common, tile_size=int(data.get("tile_size", 256)),
             interaction_rect=(
                 float(raw_rect[0]), float(raw_rect[1]),
                 max(1.0, float(raw_rect[2])), max(1.0, float(raw_rect[3])),
+            ),
+            transform_frame=(
+                tuple(float(value) for value in raw_frame)
+                if raw_frame is not None else None
+            ),
+            transform_quad=(
+                [_point(point) for point in raw_quad]
+                if raw_quad is not None else None
+            ),
+        )
+    if object_type == "image":
+        pixel_size = data.get("pixel_size", [1, 1])
+        raw_frame = data.get("transform_frame")
+        raw_quad = data.get("transform_quad")
+        return ImageObject(
+            **common,
+            source_filename=str(data.get("source_filename", "image")),
+            source_mime_type=str(data.get(
+                "source_mime_type", "application/octet-stream"
+            )),
+            pixel_width=max(1, int(pixel_size[0])),
+            pixel_height=max(1, int(pixel_size[1])),
+            placement_mode=str(data.get("placement_mode", "free")),
+            fit_mode=str(data.get("fit_mode", "auto_height")),
+            transform_frame=(
+                tuple(float(value) for value in raw_frame)
+                if raw_frame is not None else None
+            ),
+            transform_quad=(
+                [_point(point) for point in raw_quad]
+                if raw_quad is not None else None
             ),
         )
     if object_type == "text":
@@ -1922,6 +2019,35 @@ class ChapterDocument:
                     float(left), float(top), max(1.0, float(width)),
                     max(1.0, float(height)),
                 )
+            if isinstance(obj, (RasterObject, VectorDrawingObject, ImageObject)):
+                frame = obj.transform_frame
+                quad = obj.transform_quad
+                if frame is not None:
+                    if len(frame) != 4 or not all(
+                        math.isfinite(float(value)) for value in frame
+                    ):
+                        raise ValueError("Object transform frame is invalid")
+                    obj.transform_frame = tuple(float(value) for value in frame)
+                if quad is not None:
+                    if len(quad) != 4 or not all(
+                        math.isfinite(float(value))
+                        for point in quad for value in point
+                    ):
+                        raise ValueError("Object transform quad must have four points")
+                    obj.transform_quad = [_point(point) for point in quad]
+            if isinstance(obj, ImageObject):
+                obj.source_filename = str(obj.source_filename or "image")
+                obj.source_mime_type = str(
+                    obj.source_mime_type or "application/octet-stream"
+                )
+                obj.pixel_width = max(1, int(obj.pixel_width))
+                obj.pixel_height = max(1, int(obj.pixel_height))
+                if obj.placement_mode not in {"free", "fit_parent"}:
+                    raise ValueError("Unknown image placement mode")
+                if obj.fit_mode not in {
+                    "auto_width", "auto_height", "stretch", "fit_inside",
+                }:
+                    raise ValueError("Unknown image fit mode")
             if isinstance(obj, TextObject):
                 if obj.layout_mode not in {"free", "strict"}:
                     raise ValueError("Unknown text layout mode")

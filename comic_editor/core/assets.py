@@ -14,15 +14,16 @@ from PySide6.QtGui import QImage
 
 from .models import (
     BoundGeometry, ChapterDocument, ChildRef, ColorFillGradientObject,
-    DocumentObject, GradientObject, LayerNode, RasterObject, ShapeStyle,
+    DocumentObject, GradientObject, ImageObject, LayerNode, RasterObject, ShapeStyle,
     SpeedLineCenterObject, SpeedLinesGradientObject, TextObject,
     VectorDrawingObject, VectorFillObject, new_id, object_from_dict,
 )
+from .images import ImageStore
 from .persistence import atomic_json
 from .tiles import TileStore
 
 
-ASSET_SCHEMA_VERSION = 1
+ASSET_SCHEMA_VERSION = 2
 ASSET_FILE = "asset.json"
 THUMBNAIL_FILE = "thumbnail.png"
 PENDING_FILE = ".save_pending"
@@ -62,10 +63,20 @@ def _renew_bound_ids(bound: BoundGeometry | None) -> None:
 def _translate_object(obj: DocumentObject, dx: float, dy: float,
                       document: ChapterDocument) -> None:
     """Move an object between parent coordinate spaces without changing it."""
-    obj.x += dx
-    obj.y += dy
+    moved_by_quad = False
     if isinstance(obj, TextObject) and obj.transform_quad is not None:
         obj.transform_quad = [(x + dx, y + dy) for x, y in obj.transform_quad]
+        moved_by_quad = True
+    if isinstance(obj, (RasterObject, VectorDrawingObject, ImageObject)):
+        if obj.transform_quad is not None:
+            obj.transform_quad = [(x + dx, y + dy) for x, y in obj.transform_quad]
+            moved_by_quad = True
+        elif obj.transform_frame is not None:
+            left, top, width, height = obj.transform_frame
+            obj.transform_frame = (left + dx, top + dy, width, height)
+    if not moved_by_quad:
+        obj.x += dx
+        obj.y += dy
     if isinstance(obj, GradientObject):
         _translate_bound(obj.line_field.geometry, dx, dy)
         obj.radial_field.origin_x += dx
@@ -84,11 +95,26 @@ def _translate_object(obj: DocumentObject, dx: float, dy: float,
 
 def _object_local_bounds(obj: DocumentObject, document: ChapterDocument,
                          tiles: TileStore) -> QRectF:
+    if isinstance(obj, (RasterObject, VectorDrawingObject, ImageObject)) \
+            and obj.transform_quad:
+        xs = [point[0] for point in obj.transform_quad]
+        ys = [point[1] for point in obj.transform_quad]
+        return QRectF(
+            min(xs), min(ys), max(xs) - min(xs), max(ys) - min(ys)
+        )
     if isinstance(obj, RasterObject):
         content = tiles.content_bounds(obj.object_id)
         if content is None:
             content = QRectF(*obj.interaction_rect)
         return content.translated(obj.x, obj.y)
+    if isinstance(obj, ImageObject):
+        if obj.transform_quad:
+            xs = [point[0] for point in obj.transform_quad]
+            ys = [point[1] for point in obj.transform_quad]
+            return QRectF(
+                min(xs), min(ys), max(xs) - min(xs), max(ys) - min(ys)
+            )
+        return QRectF(obj.x, obj.y, obj.pixel_width, obj.pixel_height)
     if isinstance(obj, TextObject):
         if obj.layout_mode == "free" and obj.transform_quad:
             xs = [point[0] for point in obj.transform_quad]
@@ -246,11 +272,15 @@ class AssetManifest:
             schema_version=schema,
         )
         result.validate()
+        result.schema_version = ASSET_SCHEMA_VERSION
         return result
 
 
-def extract_asset(document: ChapterDocument, tiles: TileStore, kind: str,
-                  entity_id: str, name: str) -> tuple[AssetManifest, TileStore]:
+def extract_asset(
+    document: ChapterDocument, tiles: TileStore, kind: str,
+    entity_id: str, name: str, *, source_images: ImageStore | None = None,
+    include_images: bool = False,
+) -> tuple[AssetManifest, TileStore] | tuple[AssetManifest, TileStore, ImageStore]:
     """Copy one entity subtree into a fitted, self-contained asset document."""
     if kind == "object" and isinstance(document.objects.get(entity_id), VectorFillObject):
         entity_id = document.objects[entity_id].owner_drawing_id
@@ -302,9 +332,12 @@ def extract_asset(document: ChapterDocument, tiles: TileStore, kind: str,
     container.children = [ChildRef(kind, entity_id)]
 
     asset_tiles = TileStore(tiles.tile_size)
+    asset_images = ImageStore()
     for object_id in object_ids:
         if isinstance(asset.objects[object_id], RasterObject):
             asset_tiles.replace_object_tiles(object_id, tiles.object_tiles(object_id))
+        if isinstance(asset.objects[object_id], ImageObject) and source_images is not None:
+            source_images.copy_source_to(object_id, asset_images, object_id)
 
     bounds = entity_visual_bounds(asset, asset_tiles, kind, entity_id)
     dx, dy = ASSET_PADDING - bounds.left(), ASSET_PADDING - bounds.top()
@@ -324,7 +357,11 @@ def extract_asset(document: ChapterDocument, tiles: TileStore, kind: str,
     )
     manifest.validate()
     asset_tiles.dirty.clear()
-    return manifest, asset_tiles
+    asset_images.dirty.clear()
+    return (
+        (manifest, asset_tiles, asset_images)
+        if include_images else (manifest, asset_tiles)
+    )
 
 
 def _renew_internal_ids(layer: LayerNode | None, obj: DocumentObject | None) -> None:
@@ -351,9 +388,13 @@ def _renew_internal_ids(layer: LayerNode | None, obj: DocumentObject | None) -> 
         _renew_bound_ids(obj.geometry)
 
 
-def instantiate_asset(manifest: AssetManifest, source_tiles: TileStore,
-                      target: ChapterDocument, target_tiles: TileStore,
-                      parent_id: str, world_x: float, world_y: float) -> tuple[str, str, set[str]]:
+def instantiate_asset(
+    manifest: AssetManifest, source_tiles: TileStore,
+    target: ChapterDocument, target_tiles: TileStore,
+    parent_id: str, world_x: float, world_y: float, *,
+    source_images: ImageStore | None = None,
+    target_images: ImageStore | None = None,
+) -> tuple[str, str, set[str]]:
     """Instantiate an independent asset copy centered on a world point."""
     parent = target.layers.get(parent_id)
     if parent is None or parent.layer_kind == "fill":
@@ -416,6 +457,11 @@ def instantiate_asset(manifest: AssetManifest, source_tiles: TileStore,
             target_tiles.replace_object_tiles(
                 new_object_id, source_tiles.object_tiles(old_id)
             )
+        if (
+            isinstance(source.objects[old_id], ImageObject)
+            and source_images is not None and target_images is not None
+        ):
+            source_images.copy_source_to(old_id, target_images, new_object_id)
     try:
         target.validate()
     except Exception:
@@ -425,6 +471,8 @@ def instantiate_asset(manifest: AssetManifest, source_tiles: TileStore,
         for object_id in cloned_objects:
             target.objects.pop(object_id, None)
             target_tiles.remove_object(object_id)
+            if target_images is not None:
+                target_images.remove(object_id)
         raise
     return manifest.root_kind, root_id, set(cloned_objects)
 
@@ -476,16 +524,20 @@ class AssetRepository:
             raise ValueError(f"An asset named {name!r} already exists")
         return name
 
-    def create(self, manifest: AssetManifest, tiles: TileStore,
-               thumbnail: QImage) -> AssetManifest:
+    def create(
+        self, manifest: AssetManifest, tiles: TileStore, thumbnail: QImage,
+        images: ImageStore | None = None,
+    ) -> AssetManifest:
         manifest.name = self._ensure_unique_name(manifest.name)
         if (self.asset_root(manifest.asset_id) / ASSET_FILE).exists():
             raise FileExistsError("Asset already exists")
-        self.save(manifest, tiles, thumbnail)
+        self.save(manifest, tiles, thumbnail, images=images)
         return manifest
 
-    def replace(self, asset_id: str, manifest: AssetManifest, tiles: TileStore,
-                thumbnail: QImage) -> AssetManifest:
+    def replace(
+        self, asset_id: str, manifest: AssetManifest, tiles: TileStore,
+        thumbnail: QImage, images: ImageStore | None = None,
+    ) -> AssetManifest:
         """Replace an asset's contents while preserving its stable identity."""
         existing = next(
             (asset for asset in self.list_assets() if asset.asset_id == asset_id),
@@ -495,10 +547,15 @@ class AssetRepository:
             raise FileNotFoundError(f"Asset {asset_id!r} does not exist")
         manifest.asset_id = existing.asset_id
         manifest.name = existing.name
-        self.save(manifest, tiles, thumbnail)
+        self.save(manifest, tiles, thumbnail, images=images)
         return manifest
 
-    def load(self, asset_id: str, recover: bool = False) -> tuple[AssetManifest, TileStore]:
+    def load(
+        self, asset_id: str, recover: bool = False, *,
+        include_images: bool = False,
+    ) -> tuple[AssetManifest, TileStore] | tuple[
+        AssetManifest, TileStore, ImageStore
+    ]:
         root = self.asset_root(asset_id)
         if not recover:
             self._recover_interrupted_save(root)
@@ -512,20 +569,35 @@ class AssetRepository:
             if isinstance(obj, RasterObject)
         }
         tiles.load_directory(source / "raster", raster_ids)
-        return manifest, tiles
+        images = ImageStore()
+        images.load_directory(source / "images", {
+            object_id: (obj.source_filename, obj.source_mime_type)
+            for object_id, obj in manifest.document.objects.items()
+            if isinstance(obj, ImageObject)
+        })
+        return (manifest, tiles, images) if include_images else (manifest, tiles)
 
-    def save(self, manifest: AssetManifest, tiles: TileStore,
-             thumbnail: QImage | None = None, autosave: bool = False) -> None:
+    def save(
+        self, manifest: AssetManifest, tiles: TileStore,
+        thumbnail: QImage | None = None, images: ImageStore | None = None,
+        autosave: bool = False,
+    ) -> None:
+        images = images or ImageStore()
         manifest.name = self._ensure_unique_name(manifest.name, manifest.asset_id)
         manifest.validate()
         raster_ids = {
             object_id for object_id, obj in manifest.document.objects.items()
             if isinstance(obj, RasterObject)
         }
+        image_ids = {
+            object_id for object_id, obj in manifest.document.objects.items()
+            if isinstance(obj, ImageObject)
+        }
         root = self.asset_root(manifest.asset_id)
         if autosave:
             destination = root / "autosave"
             tiles.save_directory(destination / "raster", raster_ids, complete=True)
+            images.save_directory(destination / "images", image_ids, complete=True)
             atomic_json(destination / ASSET_FILE, manifest.to_dict())
             atomic_json(destination / "recovery.json", {"saved_at": time.time()})
             return
@@ -539,11 +611,14 @@ class AssetRepository:
             shutil.copy2(manifest_path, backup / ASSET_FILE)
             if (root / "raster").is_dir():
                 shutil.copytree(root / "raster", backup / "raster")
+            if (root / "images").is_dir():
+                shutil.copytree(root / "images", backup / "images")
             if (root / THUMBNAIL_FILE).is_file():
                 shutil.copy2(root / THUMBNAIL_FILE, backup / THUMBNAIL_FILE)
         atomic_json(root / PENDING_FILE, {"started_at": time.time()})
         try:
             tiles.save_directory(root / "raster", raster_ids, complete=True)
+            images.save_directory(root / "images", image_ids, complete=True)
             if thumbnail is not None:
                 temporary = root / f".{THUMBNAIL_FILE}.tmp"
                 if not thumbnail.save(str(temporary), "PNG"):
@@ -552,6 +627,7 @@ class AssetRepository:
             atomic_json(manifest_path, manifest.to_dict())
             (root / PENDING_FILE).unlink(missing_ok=True)
             tiles.dirty.clear()
+            images.dirty.clear()
         except Exception:
             raise
         autosave_root = root / "autosave"
@@ -581,7 +657,7 @@ class AssetRepository:
         backup = root / LAST_GOOD_DIR
         if not (backup / ASSET_FILE).is_file():
             raise OSError("The first asset save was interrupted and has no recoverable revision")
-        for name in ("raster",):
+        for name in ("raster", "images"):
             target = root / name
             if target.exists():
                 shutil.rmtree(target)

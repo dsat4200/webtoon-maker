@@ -32,6 +32,7 @@ def default_hotkeys() -> dict[str, str]:
         "reset_view": "Ctrl+0",
         "toggle_grid": "Alt+G",
         "delete_selected": "Delete",
+        "paste_image": "Ctrl+V",
     }
 
 
@@ -98,7 +99,7 @@ def default_text_presets() -> list[dict]:
 
 @dataclass
 class EditorSettings:
-    settings_version: int = 13
+    settings_version: int = 14
     tablet_mode: bool = False
     brush_size: int = 12
     eraser_size: int = 28
@@ -154,7 +155,7 @@ class EditorSettings:
         self.clamp()
 
     def clamp(self) -> None:
-        self.settings_version = 13
+        self.settings_version = 14
         self.navigator_expanded = bool(self.navigator_expanded)
         self.preview_font_names = bool(self.preview_font_names)
         self.brush_size = max(1, min(200, int(self.brush_size)))
@@ -386,13 +387,17 @@ def load_settings() -> EditorSettings:
                 hotkeys.setdefault("delete_selected", "Delete")
             if int(raw.get("settings_version", 1)) < 13:
                 raw.setdefault("navigator_expanded", False)
+            if int(raw.get("settings_version", 1)) < 14:
+                raw.setdefault("hotkeys", {}).setdefault(
+                    "paste_image", "Ctrl+V"
+                )
             raw.pop("transform_snap_to_grid", None)
             stored_presets = raw.get("text_presets")
             if isinstance(stored_presets, list):
                 for preset in stored_presets:
                     if isinstance(preset, dict):
                         preset.pop("transform_snap", None)
-            raw["settings_version"] = 13
+            raw["settings_version"] = 14
             valid = {item.name for item in dataclasses.fields(EditorSettings)}
             result = EditorSettings(**{
                 key: value for key, value in raw.items() if key in valid

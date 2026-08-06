@@ -9,10 +9,13 @@ from pathlib import Path
 
 from PySide6.QtCore import (
     QCoreApplication, QEvent, QItemSelection, QItemSelectionModel, QModelIndex,
-    QPointF, QSignalBlocker, QSize, QTimer, Qt, Signal,
+    QBuffer, QByteArray, QIODevice, QPointF, QRectF, QSignalBlocker, QSize,
+    QTimer, Qt,
+    Signal,
 )
 from PySide6.QtGui import (
-    QAction, QCloseEvent, QCursor, QKeySequence, QMouseEvent, QShortcut,
+    QAction, QCloseEvent, QCursor, QImage, QImageReader, QKeySequence,
+    QMouseEvent, QShortcut,
 )
 from PySide6.QtWidgets import (
     QAbstractSpinBox, QApplication, QCheckBox, QComboBox, QDockWidget,
@@ -27,16 +30,17 @@ from comic_editor.core.models import (
     BoundGeometry, ChapterDocument, ColorFillGradientObject,
     ColorGradientRamp, ColorGradientRampPreset, ColorGradientStop,
     ColorPalette, GradientObject, PaletteSwatch, PathNode,
-    RasterObject, SpeedLineCenterObject, SpeedLinesGradientObject,
+    ImageObject, RasterObject, SpeedLineCenterObject, SpeedLinesGradientObject,
     TextObject, VectorDrawingObject, VectorFillObject, new_id,
 )
 from comic_editor.core.assets import (
     AssetManifest, AssetRepository, entity_visual_bounds, extract_asset,
 )
 from comic_editor.core.persistence import SeriesRepository
-from comic_editor.core.commands import CommandStack
+from comic_editor.core.commands import CallbackCommand, CommandStack
 from comic_editor.core.settings import load_settings, save_settings
 from comic_editor.core.tiles import TileStore
+from comic_editor.core.images import ImageStore
 from comic_editor.ui.canvas import ToolKind, create_canvas
 from comic_editor.ui.color_picker import (
     PaletteEditorWidget, PrimarySecondaryColorPanel, canonical_argb,
@@ -279,6 +283,7 @@ class MainWindow(QMainWindow):
         self.new_series_action = self.file_menu.addAction("New Series")
         self.open_series_action = self.file_menu.addAction("Open Series")
         self.open_recent_menu = self.file_menu.addMenu("Open Recent")
+        self.import_images_action = self.file_menu.addAction("Import Images…")
         self.file_menu.addSeparator()
         self.save_action = self.file_menu.addAction("Save")
         self.save_as_action = self.file_menu.addAction("Save As")
@@ -779,6 +784,7 @@ class MainWindow(QMainWindow):
         self.project_tabs.tabCloseRequested.connect(self._close_project_tab)
         self.new_series_action.triggered.connect(self._create_series)
         self.open_series_action.triggered.connect(self._open_series_dialog)
+        self.import_images_action.triggered.connect(self._import_images_dialog)
         self.save_action.triggered.connect(self.save)
         self.save_as_action.triggered.connect(self._save_as)
         self.new_chapter_action.triggered.connect(self._new_chapter)
@@ -1008,6 +1014,7 @@ class MainWindow(QMainWindow):
             "toggle_grid": self._toggle_grid,
             "select_all": self.canvas.select_all,
             "delete_selected": self._delete_selected,
+            "paste_image": self._paste_image,
         }
         self._hotkey_bindings = {
             action_id: chord_keys(value)
@@ -1062,6 +1069,8 @@ class MainWindow(QMainWindow):
     def _hotkey_is_suppressed(
         self, action_id: str, chord: frozenset[int],
     ) -> bool:
+        if action_id == "paste_image" and not self._clipboard_image_sources():
+            return True
         if action_id == "delete_selected":
             return (
                 self._hotkey_text_input_active()
@@ -1486,7 +1495,9 @@ class MainWindow(QMainWindow):
         state = self.canvas.capture_session_state()
         if state is not None:
             session.canvas_state = state
-            session.chapter, session.tiles = state.chapter, state.tiles
+            session.chapter, session.tiles, session.images = (
+                state.chapter, state.tiles, state.images
+            )
         session.dirty = self._dirty
         session.last_autosave = self._last_autosave
         session.expanded_entities = self._expanded_layer_ids()
@@ -1520,7 +1531,9 @@ class MainWindow(QMainWindow):
             self.asset_library.set_repository(session.context.assets)
             if session.canvas_state is None:
                 self.canvas.command_stack = CommandStack()
-                self.canvas.set_document(session.chapter, session.tiles)
+                self.canvas.set_document(
+                    session.chapter, session.tiles, session.images
+                )
                 initial_kind, initial_id = (
                     (session.asset_manifest.root_kind, session.asset_manifest.root_id)
                     if session.kind == "asset" and session.asset_manifest is not None
@@ -1532,7 +1545,9 @@ class MainWindow(QMainWindow):
                 self.canvas.restore_session_state(session.canvas_state)
             self.canvas.command_stack.changed_callback = self._command_stack_changed
             self.chapter = self.canvas.chapter
-            session.chapter, session.tiles = self.chapter, self.canvas.tiles
+            session.chapter, session.tiles, session.images = (
+                self.chapter, self.canvas.tiles, self.canvas.images
+            )
             self.hierarchy_model.set_chapter(self.chapter)
             for entity_id in session.expanded_entities:
                 kind = "layer" if entity_id in self.chapter.layers else "object"
@@ -1584,7 +1599,7 @@ class MainWindow(QMainWindow):
         try:
             if session.kind == "series":
                 session.context.repository.save_chapter(
-                    session.chapter, session.tiles
+                    session.chapter, session.tiles, session.images
                 )
                 for reference in session.context.series.chapters:
                     if reference.chapter_id == session.chapter.chapter_id:
@@ -1617,10 +1632,10 @@ class MainWindow(QMainWindow):
                     0, 0, session.chapter.width, session.chapter.height
                 )
                 thumbnail = self.canvas.render_asset_thumbnail(
-                    manifest, session.tiles
+                    manifest, session.tiles, images=session.images
                 )
                 session.context.assets.save(
-                    manifest, session.tiles, thumbnail
+                    manifest, session.tiles, thumbnail, images=session.images
                 )
         except (OSError, ValueError) as error:
             QMessageBox.critical(self, "Save failed", str(error))
@@ -1724,14 +1739,16 @@ class MainWindow(QMainWindow):
                 "A newer autosave exists for this chapter. Recover it?",
             ) == QMessageBox.Yes
         try:
-            chapter, tiles = repository.load_chapter(chapter_id, recover=recover)
+            chapter, tiles, images = repository.load_chapter(
+                chapter_id, recover=recover, include_images=True
+            )
         except (OSError, ValueError) as error:
             QMessageBox.critical(self, "Unable to open chapter", str(error))
             return False
         context = ProjectContext.create(repository, series)
         session = EditorSession(
             key=key, kind="series", context=context,
-            chapter=chapter, tiles=tiles, dirty=recover,
+            chapter=chapter, tiles=tiles, images=images, dirty=recover,
         )
         self._add_editor_session(session)
         return True
@@ -1816,20 +1833,26 @@ class MainWindow(QMainWindow):
                 "A newer autosave exists for this chapter. Recover it?",
             ) == QMessageBox.Yes
         try:
-            chapter, tiles = self.repository.load_chapter(chapter_id, recover=recover)
+            chapter, tiles, images = self.repository.load_chapter(
+                chapter_id, recover=recover, include_images=True
+            )
         except (OSError, ValueError) as error:
             QMessageBox.critical(self, "Unable to open chapter", str(error))
             return
-        self._set_chapter(chapter, tiles)
+        self._set_chapter(chapter, tiles, images)
         if recover:
             self._mark_dirty(None)
 
-    def _set_chapter(self, chapter, tiles) -> None:
+    def _set_chapter(
+        self, chapter, tiles, images: ImageStore | None = None,
+    ) -> None:
         self.chapter = chapter
-        self.canvas.set_document(chapter, tiles)
+        images = images or ImageStore()
+        self.canvas.set_document(chapter, tiles, images)
         if self.active_session is not None:
             self.active_session.chapter = chapter
             self.active_session.tiles = tiles
+            self.active_session.images = images
             self.active_session.canvas_state = None
         self.hierarchy_model.set_chapter(chapter)
         self._dirty = False
@@ -1840,7 +1863,7 @@ class MainWindow(QMainWindow):
         initial_object = next(
             (
                 obj for obj in chapter.objects.values()
-                if isinstance(obj, (RasterObject, VectorDrawingObject))
+                if isinstance(obj, (RasterObject, VectorDrawingObject, ImageObject))
             ),
             None,
         )
@@ -2744,12 +2767,20 @@ class MainWindow(QMainWindow):
         menu = QMenu(self)
         rename = menu.addAction("Rename")
         copy_asset = menu.addAction("Copy as Asset")
+        rasterize = (
+            menu.addAction("Rasterize Image")
+            if item.kind == "object" and isinstance(
+                self.chapter.objects.get(item.entity_id), ImageObject
+            ) else None
+        )
         copy_asset.setEnabled(self._current_project_context() is not None)
         selected = menu.exec(self.tree.viewport().mapToGlobal(point))
         if selected is rename:
             self.tree.edit(index)
         elif selected is copy_asset:
             self._copy_selected_as_asset(item.kind, item.entity_id)
+        elif rasterize is not None and selected is rasterize:
+            self._rasterize_image(item.entity_id)
 
     def _copy_selected_as_asset(self, kind: str, entity_id: str) -> None:
         context = self._current_project_context()
@@ -2761,7 +2792,11 @@ class MainWindow(QMainWindow):
         )
         if entity is None:
             return
-        default_name = getattr(entity, "name", "Asset")
+        default_name = (
+            entity.source_filename
+            if isinstance(entity, ImageObject)
+            else getattr(entity, "name", "Asset")
+        )
         name, accepted = QInputDialog.getText(
             self, "Copy as Asset", "Asset name", text=default_name
         )
@@ -2796,33 +2831,107 @@ class MainWindow(QMainWindow):
                 if answer != QMessageBox.Yes:
                     return
         try:
-            manifest, tiles = extract_asset(
-                self.chapter, self.canvas.tiles, kind, entity_id, name
+            manifest, tiles, images = extract_asset(
+                self.chapter, self.canvas.tiles, kind, entity_id, name,
+                source_images=self.canvas.images, include_images=True,
             )
-            thumbnail = self.canvas.render_asset_thumbnail(manifest, tiles)
+            thumbnail = self.canvas.render_asset_thumbnail(
+                manifest, tiles, images=images
+            )
             if existing is None:
-                context.assets.create(manifest, tiles, thumbnail)
+                context.assets.create(
+                    manifest, tiles, thumbnail, images=images
+                )
             else:
                 manifest = context.assets.replace(
-                    existing.asset_id, manifest, tiles, thumbnail
+                    existing.asset_id, manifest, tiles, thumbnail,
+                    images=images,
                 )
         except (OSError, KeyError, ValueError) as error:
             QMessageBox.warning(self, "Unable to create asset", str(error))
             return
         if existing is not None and open_session is not None:
-            self._reload_replaced_asset_session(open_session, manifest, tiles)
+            self._reload_replaced_asset_session(
+                open_session, manifest, tiles, images
+            )
         self.asset_library.refresh()
         self.ribbon.select_page("asset_library")
         action = "Replaced" if existing is not None else "Created"
         self.statusBar().showMessage(f"{action} asset {manifest.name}", 4000)
 
+    def _rasterize_image(self, object_id: str) -> None:
+        if self.chapter is None:
+            return
+        obj = self.chapter.objects.get(object_id)
+        if not isinstance(obj, ImageObject):
+            return
+        image = self.canvas.images.image(object_id)
+        if image.isNull():
+            QMessageBox.warning(
+                self, "Rasterize Image", "The embedded image cannot be decoded."
+            )
+            return
+        before_model = self.chapter.to_dict()
+        before_images = self.canvas.images.snapshot()
+        before_tiles = self.canvas.tiles.object_tiles(object_id)
+        quad = self.canvas._image_local_quad(obj)
+        raster = RasterObject(
+            object_id=obj.object_id, name=obj.name,
+            custom_name=obj.custom_name,
+            parent_layer_id=obj.parent_layer_id,
+            visible=obj.visible, opacity=obj.opacity,
+            opacity_locked=obj.opacity_locked,
+            geometry_reference=obj.geometry_reference,
+            ignore_parent_mask=obj.ignore_parent_mask,
+            underlay_opacity=obj.underlay_opacity,
+            interaction_rect=(0.0, 0.0, image.width(), image.height()),
+            transform_frame=(0.0, 0.0, image.width(), image.height()),
+            transform_quad=list(quad),
+        )
+        self.chapter.objects[object_id] = raster
+        self.canvas.images.remove(object_id)
+        self.canvas.tiles.remove_object(object_id)
+        size = self.canvas.tiles.tile_size
+        for tile_y in range(math.ceil(image.height() / size)):
+            for tile_x in range(math.ceil(image.width() / size)):
+                tile = image.copy(
+                    tile_x * size, tile_y * size,
+                    min(size, image.width() - tile_x * size),
+                    min(size, image.height() - tile_y * size),
+                )
+                self.canvas.tiles.set_tile(object_id, (tile_x, tile_y), tile)
+        after_model = self.chapter.to_dict()
+        after_images = self.canvas.images.snapshot()
+        after_tiles = self.canvas.tiles.object_tiles(object_id)
+
+        def restore(model: dict, resources: dict, tiles: dict) -> None:
+            self.canvas.replace_chapter(model)
+            self.canvas.images.restore(resources)
+            self.canvas.tiles.replace_object_tiles(object_id, tiles)
+            self.canvas.set_selection("object", object_id)
+            self.canvas.hierarchyChanged.emit()
+            self.canvas.documentChanged.emit(None)
+            self.canvas.update()
+
+        self.canvas.command_stack.push(CallbackCommand(
+            "Rasterize image",
+            lambda: restore(after_model, after_images, after_tiles),
+            lambda: restore(before_model, before_images, before_tiles),
+        ), already_done=True)
+        self.canvas.set_selection("object", object_id)
+        self.canvas.hierarchyChanged.emit()
+        self.canvas.documentChanged.emit(None)
+        self._sync_contextual_ribbon()
+
     def _reload_replaced_asset_session(
         self, session: EditorSession, manifest: AssetManifest, tiles: TileStore,
+        images: ImageStore | None = None,
     ) -> None:
         """Reload an open asset tab after its repository entry is replaced."""
         session.asset_manifest = manifest
         session.chapter = manifest.document
         session.tiles = tiles
+        session.images = images or ImageStore()
         session.canvas_state = None
         session.dirty = False
         session.last_autosave = 0.0
@@ -2836,7 +2945,7 @@ class MainWindow(QMainWindow):
         self._last_autosave = 0.0
         self.autosave_timer.stop()
         self.canvas.command_stack = CommandStack()
-        self.canvas.set_document(manifest.document, tiles)
+        self.canvas.set_document(manifest.document, tiles, session.images)
         self.canvas.command_stack.changed_callback = self._command_stack_changed
         self.canvas.set_selection(manifest.root_kind, manifest.root_id)
         self.chapter_combo.setItemText(0, f"Asset: {manifest.name}")
@@ -2867,13 +2976,15 @@ class MainWindow(QMainWindow):
                 "A newer autosave exists for this asset. Recover it?",
             ) == QMessageBox.Yes
         try:
-            manifest, tiles = context.assets.load(asset_id, recover=recover)
+            manifest, tiles, images = context.assets.load(
+                asset_id, recover=recover, include_images=True
+            )
         except (OSError, ValueError, KeyError) as error:
             QMessageBox.critical(self, "Unable to open asset", str(error))
             return
         self._add_editor_session(EditorSession(
             key=key, kind="asset", context=context,
-            chapter=manifest.document, tiles=tiles,
+            chapter=manifest.document, tiles=tiles, images=images,
             asset_manifest=manifest, dirty=recover,
         ))
 
@@ -2915,6 +3026,113 @@ class MainWindow(QMainWindow):
             self.setWindowTitle(f"{renamed.name} — Vertical Comic Editor")
         self.asset_library.refresh()
         self._refresh_project_tabs()
+
+    @staticmethod
+    def _image_file_filter() -> str:
+        extensions = sorted({
+            f"*.{bytes(value).decode('ascii', 'ignore').lower()}"
+            for value in QImageReader.supportedImageFormats()
+            if bytes(value)
+        })
+        return f"Images ({' '.join(extensions)})" if extensions else "Images (*)"
+
+    def _selected_parent_center(self, parent_id: str) -> QPointF:
+        layer = self.chapter.layers[parent_id]
+        bounds = (
+            self.canvas.layer_effective_path(parent_id).boundingRect()
+            if layer.bound is not None else QRectF(0, 0, 1, 1)
+        )
+        world_x, world_y = self.chapter.layer_world_translation(parent_id)
+        return QPointF(
+            bounds.center().x() + world_x,
+            bounds.center().y() + world_y,
+        )
+
+    def _place_import_sources(
+        self, sources: list[tuple[str, str, bytes]], label: str,
+    ) -> list[str]:
+        parent = self._selected_parent_layer(allow_page=True)
+        if (
+            parent is None and self.chapter is not None
+            and self.chapter.document_kind != "asset"
+            and self.canvas.active_page_id in self.chapter.layers
+        ):
+            parent = self.chapter.layers[self.canvas.active_page_id]
+        if parent is None or self.chapter is None:
+            self.statusBar().showMessage(
+                "Select a page or container before importing images", 5000
+            )
+            return []
+        created = self.canvas.place_image_sources(
+            sources, parent.layer_id,
+            self._selected_parent_center(parent.layer_id),
+            insertion_index=self._new_object_insertion_index(parent.layer_id),
+            fit_parent=False, label=label,
+        )
+        if len(created) != len(sources):
+            self.statusBar().showMessage(
+                f"Imported {len(created)} of {len(sources)} images", 5000
+            )
+        elif created:
+            self.statusBar().showMessage(
+                f"Imported {len(created)} image{'s' if len(created) != 1 else ''}",
+                3500,
+            )
+        return created
+
+    def _import_images_dialog(self) -> None:
+        paths, _selected_filter = QFileDialog.getOpenFileNames(
+            self, "Import Images", "", self._image_file_filter()
+        )
+        sources: list[tuple[str, str, bytes]] = []
+        for raw in paths:
+            path = Path(raw)
+            try:
+                sources.append((path.name, "", path.read_bytes()))
+            except OSError:
+                continue
+        if sources:
+            self._place_import_sources(sources, "Import images")
+
+    def _clipboard_image_sources(self) -> list[tuple[str, str, bytes]]:
+        mime = QApplication.clipboard().mimeData()
+        sources: list[tuple[str, str, bytes]] = []
+        for url in mime.urls() if mime.hasUrls() else []:
+            if not url.isLocalFile():
+                continue
+            path = Path(url.toLocalFile())
+            try:
+                data = path.read_bytes()
+            except OSError:
+                continue
+            probe = ImageStore()
+            try:
+                probe.put("clipboard", path.name, data)
+            except ValueError:
+                continue
+            sources.append((path.name, "", data))
+        if sources:
+            return sources
+        if not mime.hasImage():
+            return []
+        value = mime.imageData()
+        image = value.toImage() if hasattr(value, "toImage") else QImage(value)
+        if image.isNull():
+            return []
+        payload = QByteArray()
+        buffer = QBuffer(payload)
+        buffer.open(QIODevice.OpenModeFlag.WriteOnly)
+        saved = image.save(buffer, "PNG")
+        buffer.close()
+        return [(
+            "Clipboard Image.png", "image/png", bytes(payload)
+        )] if saved else []
+
+    def _paste_image(self) -> bool:
+        sources = self._clipboard_image_sources()
+        return bool(
+            sources and self._place_import_sources(sources, "Paste image")
+        )
 
     # ---- selection and model synchronization --------------------------
     def _tree_selection_changed(self, selected: QItemSelection, deselected) -> None:
@@ -3043,6 +3261,7 @@ class MainWindow(QMainWindow):
         if self.active_session is not None:
             self.active_session.chapter = chapter
             self.active_session.tiles = self.canvas.tiles
+            self.active_session.images = self.canvas.images
             if self.active_session.asset_manifest is not None:
                 self.active_session.asset_manifest.document = chapter
         self._refresh_hierarchy()
@@ -3531,7 +3750,9 @@ class MainWindow(QMainWindow):
         if self.repository is None or self.chapter is None:
             return False
         try:
-            self.repository.save_chapter(self.chapter, self.canvas.tiles)
+            self.repository.save_chapter(
+                self.chapter, self.canvas.tiles, self.canvas.images
+            )
             for reference in self.series.chapters:
                 if reference.chapter_id == self.chapter.chapter_id:
                     reference.name = self.chapter.name
@@ -3564,8 +3785,12 @@ class MainWindow(QMainWindow):
         """Write one session through detached models and tiles."""
         chapter = copy.deepcopy(session.chapter)
         tiles = self._copy_session_tiles(chapter, session.tiles)
+        images = session.images.clone({
+            object_id for object_id, obj in chapter.objects.items()
+            if isinstance(obj, ImageObject)
+        })
         if session.kind == "series":
-            repository.save_chapter(chapter, tiles)
+            repository.save_chapter(chapter, tiles, images)
             for reference in series.chapters:
                 if reference.chapter_id == chapter.chapter_id:
                     reference.name = chapter.name
@@ -3587,8 +3812,12 @@ class MainWindow(QMainWindow):
         container.bound = BoundGeometry.rectangle(
             0, 0, chapter.width, chapter.height
         )
-        thumbnail = self.canvas.render_asset_thumbnail(manifest, tiles)
-        AssetRepository(repository.root).save(manifest, tiles, thumbnail)
+        thumbnail = self.canvas.render_asset_thumbnail(
+            manifest, tiles, images=images
+        )
+        AssetRepository(repository.root).save(
+            manifest, tiles, thumbnail, images=images
+        )
 
     def _rebind_sessions_to_clone(
         self,
@@ -3613,6 +3842,7 @@ class MainWindow(QMainWindow):
             session.dirty = False
             session.last_autosave = 0.0
             session.tiles.dirty.clear()
+            session.images.dirty.clear()
 
         rebound: dict[str, EditorSession] = {}
         for old_key, session in self.sessions.items():
@@ -3724,11 +3954,13 @@ class MainWindow(QMainWindow):
                         session.asset_manifest.document = session.chapter
                         session.context.assets.save(
                             session.asset_manifest, session.tiles,
+                            images=session.images,
                             autosave=True,
                         )
                     else:
                         session.context.repository.save_chapter(
-                            session.chapter, session.tiles, autosave=True
+                            session.chapter, session.tiles, session.images,
+                            autosave=True,
                         )
                     session.last_autosave = now
                     saved = True
@@ -3760,11 +3992,13 @@ class MainWindow(QMainWindow):
                 self.active_session.asset_manifest.document = self.chapter
                 self.active_session.context.assets.save(
                     self.active_session.asset_manifest,
-                    self.canvas.tiles, autosave=True,
+                    self.canvas.tiles, images=self.canvas.images,
+                    autosave=True,
                 )
             else:
                 self.repository.save_chapter(
-                    self.chapter, self.canvas.tiles, autosave=True
+                    self.chapter, self.canvas.tiles, self.canvas.images,
+                    autosave=True,
                 )
             self._last_autosave = time.monotonic()
             if self.active_session is not None:

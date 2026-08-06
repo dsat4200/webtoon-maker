@@ -8,6 +8,30 @@ select support for raster mode
 smoothing support
 asset library folders.
 
+
+complex hair brushes. how do they do it?
+clipping masks
+- how do i want to handle them?
+
+Object features
+- outline support
+	- has a color, thickness.
+	- no anti-aliasing, global anti aliasing toggle?
+
+## Image mode tweaks
+- bounds should live update while dragging, intsead of doing it after release
+- increase transform hover/drag area to include inside of image while it's selected
+- if in pencil mode, click dragging 8-handle gizmos shouldn't draw.
+- any transform that has 8-handle bounds should have a text gizmo with text label that lets you toggle between uniform and free transform. (be it vector, raster, free transform text, rects, circle/ellipse, or image)
+	- in those 8-handles, any area that would let you translate an object should turn the cursor into an open palm. any drag operation should be a closed hand while dragging. 
+	- make the rotation pivot a circle with a crosshair in the center. if you double click it, it should snap back to whatever center it should be in, and return to following that center until it's manually moved again.
+	- hovering over circle-shaped handles (such as the main 8, or points in a shape) should turn the pointer into a crosshair.
+	- if there's a corresponding free/uniform toggle in a menu somewhere, like the ribbon or the selected object properties panel, for a transform mode gizmo toggle you add, remove the non-gizmo one to free up UI space.
+- pasting images and importing from the dialogue works, but dragging images in from file explorer or google images does not show preview and does not import (bug)
+- selecting image objects while another object is selected should work like any other object (text, shapes). currently, clicking from outside like that (with the image under the cursor) is selecting the page when it should be selecting the image.
+
+## New feature - repeating texture editor
+## New Feature - Image Imports
 image import support
  makes a new object under the currently selected object in the same parent. images are a new "image object" type. they have by default a free transformable (or uniform) 8 handle box around, behaves the same as it would in a raster layer.
  - image objects show image object properties in the selected object properties panel (what i'm calling the raster/vector object / layer properties panel now)
@@ -19,18 +43,7 @@ image import support
 - dragging operations support dragging into shapes to preview what they would look like in that shape, when released get put into the correct shape based on that (same behavior that asset library uses)
 - right clicking an image and adding it to the asset library defaults the name to the original filename (but still in the same "name asset" popup window, so the user still has a chance to change the name before saving it)
 
-complex hair brushes. how do they do it?
-clipping masks
-- how do i want to handle them?
-
-Object features
-- outline support
-	- 
-	- has a color, thickness.
-	- no anti-aliasing
-
-
-bugs
+## Bugs
 - trying to free transform a raster layer crashed the program
 	- also, changes made to the 8-handle cage around the transformed raster/vector object should stay so you know how you transformed it, until you deselect the object (instead of resetting the transform bounds position)
 	- also, vector objects should be able to free/uniform with 8 handles just like raster objects do.

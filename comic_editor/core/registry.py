@@ -56,6 +56,7 @@ class BoundTypeRegistry:
 
 OBJECT_TYPES = ObjectTypeRegistry()
 OBJECT_TYPES.register(ObjectTypeSpec("raster", object_from_dict, True, ("pencil", "eraser")))
+OBJECT_TYPES.register(ObjectTypeSpec("image", object_from_dict, False, ("transform",)))
 OBJECT_TYPES.register(ObjectTypeSpec("text", object_from_dict, False, ("text", "transform")))
 OBJECT_TYPES.register(ObjectTypeSpec(
     "vector_drawing", object_from_dict, False,

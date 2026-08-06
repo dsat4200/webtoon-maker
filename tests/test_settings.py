@@ -72,7 +72,7 @@ def test_settings_v8_migration_removes_transform_snap_and_disables_hold(
     }), encoding="utf-8")
     _use_settings_file(monkeypatch, path)
     loaded = load_settings()
-    assert loaded.settings_version == 13
+    assert loaded.settings_version == 14
     assert loaded.page_scope_select is False
     assert loaded.transform_mode == "uniform"
     assert loaded.snap_to_grid is False
@@ -95,7 +95,7 @@ def test_vector_and_fill_settings_are_normalized(monkeypatch, tmp_path):
         "fill_mode": "other",
     }), encoding="utf-8")
     loaded = load_settings()
-    assert loaded.settings_version == 13
+    assert loaded.settings_version == 14
     assert loaded.vector_eraser_mode == "stroke"
     assert loaded.vector_simplify_amount == 100
     assert loaded.vector_redraw_opacity_max == 0
@@ -119,7 +119,7 @@ def test_settings_v9_normalizes_splitter_sizes(monkeypatch, tmp_path):
 
     loaded = load_settings()
 
-    assert loaded.settings_version == 13
+    assert loaded.settings_version == 14
     assert loaded.ui_splitter_sizes == {
         "sidebar_workspace": [260, 1100],
         "tools_colors": [0, 440],
@@ -175,10 +175,11 @@ def test_settings_v12_adds_font_preview_delete_and_integer_text_sizes(
 
     loaded = load_settings()
 
-    assert loaded.settings_version == 13
+    assert loaded.settings_version == 14
     assert loaded.navigator_expanded is False
     assert loaded.preview_font_names is False
     assert loaded.hotkeys["delete_selected"] == "Delete"
+    assert loaded.hotkeys["paste_image"] == "Ctrl+V"
     assert [item["font_size"] for item in loaded.text_presets] == [33, 250]
 
     loaded.preview_font_names = True

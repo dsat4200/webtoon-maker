@@ -10,8 +10,9 @@ from pathlib import Path
 from typing import Callable
 
 from .models import (
-    ChapterDocument, ChapterReference, RasterObject, SeriesDocument,
+    ChapterDocument, ChapterReference, ImageObject, RasterObject, SeriesDocument,
 )
+from .images import ImageStore
 from .tiles import TileStore
 
 
@@ -163,23 +164,32 @@ class SeriesRepository:
         return chapter, tiles
 
     def save_chapter(
-        self, chapter: ChapterDocument, tiles: TileStore, autosave: bool = False,
+        self, chapter: ChapterDocument, tiles: TileStore,
+        images: ImageStore | None = None, autosave: bool = False,
     ) -> None:
+        images = images or ImageStore()
         chapter.validate()
         raster_object_ids = {
             object_id for object_id, obj in chapter.objects.items()
             if isinstance(obj, RasterObject)
         }
+        image_object_ids = {
+            object_id for object_id, obj in chapter.objects.items()
+            if isinstance(obj, ImageObject)
+        }
         chapter_root = self.chapter_root(chapter.chapter_id)
         if autosave:
             destination = chapter_root / "autosave"
             tile_root = destination / "raster"
+            image_root = destination / "images"
             tiles.save_directory(tile_root, raster_object_ids, complete=True)
+            images.save_directory(image_root, image_object_ids, complete=True)
             atomic_json(destination / CHAPTER_FILE, chapter.to_dict())
             atomic_json(destination / "recovery.json", {"saved_at": time.time()})
             return
         destination = chapter_root
         tile_root = destination / "raster"
+        image_root = destination / "images"
         destination.mkdir(parents=True, exist_ok=True)
         manifest = destination / CHAPTER_FILE
         pending = destination / PENDING_FILE
@@ -191,15 +201,19 @@ class SeriesRepository:
             shutil.copy2(manifest, backup / CHAPTER_FILE)
             if tile_root.is_dir():
                 shutil.copytree(tile_root, backup / "raster")
+            if image_root.is_dir():
+                shutil.copytree(image_root, backup / "images")
         atomic_json(pending, {"started_at": time.time()})
         try:
             # Tile files are published before the manifest. If the process is
             # interrupted, PENDING_FILE causes the previous complete revision
             # to be restored on the next open.
             tiles.save_directory(tile_root, raster_object_ids, complete=True)
+            images.save_directory(image_root, image_object_ids, complete=True)
             atomic_json(manifest, chapter.to_dict())
             pending.unlink(missing_ok=True)
             tiles.dirty.clear()
+            images.dirty.clear()
         except Exception:
             # Leave the pending marker and last-good data intact for recovery.
             raise
@@ -209,7 +223,10 @@ class SeriesRepository:
 
     def load_chapter(
         self, chapter_id: str, recover: bool = False,
-    ) -> tuple[ChapterDocument, TileStore]:
+        *, include_images: bool = False,
+    ) -> tuple[ChapterDocument, TileStore] | tuple[
+        ChapterDocument, TileStore, ImageStore
+    ]:
         root = self.chapter_root(chapter_id)
         if not recover:
             self._recover_interrupted_save(root)
@@ -222,7 +239,13 @@ class SeriesRepository:
             if isinstance(obj, RasterObject)
         }
         tiles.load_directory(source / "raster", object_ids)
-        return chapter, tiles
+        images = ImageStore()
+        images.load_directory(source / "images", {
+            object_id: (obj.source_filename, obj.source_mime_type)
+            for object_id, obj in chapter.objects.items()
+            if isinstance(obj, ImageObject)
+        })
+        return (chapter, tiles, images) if include_images else (chapter, tiles)
 
     def has_recovery(self, chapter_id: str) -> bool:
         root = self.chapter_root(chapter_id)
@@ -247,5 +270,11 @@ class SeriesRepository:
         backup_raster = backup / "raster"
         if backup_raster.is_dir():
             shutil.copytree(backup_raster, raster)
+        images = root / "images"
+        if images.exists():
+            shutil.rmtree(images)
+        backup_images = backup / "images"
+        if backup_images.is_dir():
+            shutil.copytree(backup_images, images)
         shutil.copy2(backup_manifest, root / CHAPTER_FILE)
         pending.unlink(missing_ok=True)
