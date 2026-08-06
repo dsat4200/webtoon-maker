@@ -191,16 +191,6 @@ class ContextInspector(QFrame):
         self.align_menu.addAction(alignment_action)
         outer.addWidget(self.text_panel)
 
-        self.transform_panel = QWidget()
-        transform_row = QHBoxLayout(self.transform_panel)
-        transform_row.setContentsMargins(0, 0, 0, 0)
-        transform_row.addWidget(QLabel("Transform"))
-        self.transform_mode = QComboBox()
-        self.transform_mode.addItem("Free Projective", "free")
-        self.transform_mode.addItem("Uniform", "uniform")
-        transform_row.addWidget(self.transform_mode)
-        outer.addWidget(self.transform_panel)
-
         self.raster_tool_panel = QWidget()
         raster_layout = QVBoxLayout(self.raster_tool_panel)
         raster_layout.setContentsMargins(0, 4, 0, 0)
@@ -259,7 +249,6 @@ class ContextInspector(QFrame):
         self.underlay.sliderPressed.connect(self._begin_underlay_drag)
         self.underlay.valueChanged.connect(self._underlay_changed)
         self.underlay.sliderReleased.connect(self._finish_underlay_drag)
-        self.transform_mode.currentIndexChanged.connect(self._transform_settings_changed)
         self.pencil_preset_combo.currentTextChanged.connect(
             self.pencilPresetSelected.emit
         )
@@ -365,13 +354,6 @@ class ContextInspector(QFrame):
         self.text_panel.setVisible(isinstance(entity, TextObject))
         self.preset_controls.setVisible(isinstance(entity, TextObject))
         self.name_row.setVisible(not isinstance(entity, TextObject))
-        self.transform_panel.setVisible(
-            isinstance(entity, RasterObject)
-            or (
-                isinstance(entity, TextObject)
-                and entity.layout_mode == "free"
-            )
-        )
         compound_parent = self.canvas.chapter.closest_compound_ancestor(
             entity.parent_layer_id, include_self=True
         )
@@ -431,9 +413,6 @@ class ContextInspector(QFrame):
             float(getattr(entity, "underlay_opacity", 0.0)) * 100
         ))
         self.underlay_value.setText(f"{self.underlay.value()}%")
-        self.transform_mode.setCurrentIndex(
-            max(0, self.transform_mode.findData(self.settings.transform_mode))
-        )
         self._updating = False
         self.adjustSize()
         self.reposition()
@@ -516,13 +495,6 @@ class ContextInspector(QFrame):
             self.changed.emit()
             self.canvas.update()
         self.refresh()
-
-    def _transform_settings_changed(self, *args) -> None:
-        if self._updating:
-            return
-        self.settings.transform_mode = self.transform_mode.currentData()
-        self._save_settings(self.settings)
-        self.canvas.update()
 
     def _current_preset(self) -> TextPreset | None:
         entity = self._text_entity()

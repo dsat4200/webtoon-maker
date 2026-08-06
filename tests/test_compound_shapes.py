@@ -262,7 +262,8 @@ def test_compound_selection_and_creation_placement(qapp):
     canvas.set_selection("layer", root.layer_id)
     canvas.set_tool(ToolKind.SHAPE_EDIT)
     canvas._tool_press(
-        canvas.document_to_widget(QPointF(200, 200)), 1
+        # Stay clear of the selected compound's explicit center pivot.
+        canvas.document_to_widget(QPointF(300, 220)), 1
     )
     assert canvas.selected_id == child.layer_id
 

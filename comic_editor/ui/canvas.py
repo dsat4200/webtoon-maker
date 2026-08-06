@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import gc
+import base64
+import html as html_lib
 import math
 import time
 import zlib
@@ -9,16 +11,16 @@ import json
 import mimetypes
 import re
 import urllib.parse
-import urllib.request
 from collections import deque
 from dataclasses import dataclass
 from enum import Enum
+from pathlib import Path
 
 import numpy as np
 
 from PySide6.QtCore import (
     QBuffer, QByteArray, QEvent, QIODevice, QPoint, QPointF, QRect, QRectF, Qt,
-    QTimer, Signal,
+    QTimer, QUrl, Signal,
 )
 from PySide6.QtGui import (
     QAbstractTextDocumentLayout, QBrush, QColor, QFont, QFontMetricsF,
@@ -31,6 +33,7 @@ from PySide6.QtGui import (
     QTextCursor, QTextDocument, QTransform, QValidator,
 )
 from PySide6.QtOpenGLWidgets import QOpenGLWidget
+from PySide6.QtNetwork import QNetworkAccessManager, QNetworkReply, QNetworkRequest
 from PySide6.QtWidgets import (
     QAbstractSpinBox, QApplication, QHBoxLayout, QSpinBox, QToolButton, QWidget,
 )
@@ -291,6 +294,8 @@ class _CanvasLogic:
     pageCreationFinished = Signal(object, object, str)
     pageCreationInvalid = Signal(str)
     pageGapConfirmationChanged = Signal(bool)
+    transformModeChanged = Signal(str)
+    importStatusMessage = Signal(str)
 
     def __init__(self, settings: EditorSettings, parent=None):
         super().__init__(parent)
@@ -546,6 +551,12 @@ class _CanvasLogic:
         self._asset_drag_tiles: TileStore | None = None
         self._asset_drag_images: ImageStore | None = None
         self._external_drag_sources: list[tuple[str, str, bytes]] = []
+        self._external_drag_entries: list[dict] = []
+        self._external_drag_generation = 0
+        self._external_drag_replies: dict[QNetworkReply, tuple[int, dict]] = {}
+        self._pending_external_drop: dict | None = None
+        self._external_drag_widget = QPointF()
+        self._network_manager = QNetworkAccessManager(self)
         self._asset_drag_image = QImage()
         self._asset_drag_world = QPointF()
         self._asset_drag_parent_id = ""
@@ -2430,8 +2441,19 @@ class _CanvasLogic:
             painter.drawPath(self.layer_effective_path(layer.layer_id))
         painter.restore()
 
-    def _clear_asset_drag_preview(self) -> None:
+    def _cancel_external_drag_downloads(self) -> None:
+        self._external_drag_generation += 1
+        for reply in list(self._external_drag_replies):
+            reply.abort()
+            reply.deleteLater()
+        self._external_drag_replies.clear()
+        self._external_drag_entries.clear()
+        self._pending_external_drop = None
+
+    def _clear_asset_drag_preview(self, *, cancel_downloads: bool = True) -> None:
         changed = self._asset_drag_manifest is not None
+        if cancel_downloads:
+            self._cancel_external_drag_downloads()
         self._asset_drag_manifest = None
         self._asset_drag_tiles = None
         self._asset_drag_images = None
@@ -2725,75 +2747,202 @@ class _CanvasLogic:
         ) if saved else None
 
     @staticmethod
-    def _download_drag_url(url: str) -> tuple[str, str, bytes] | None:
-        parsed = urllib.parse.urlparse(url)
-        if parsed.scheme not in {"http", "https"}:
-            return None
-        request = urllib.request.Request(
-            url, headers={"User-Agent": "WebtoonMaker/1.0"}
+    def _data_uri_source(value: str) -> tuple[str, str, bytes] | None:
+        match = re.fullmatch(
+            r"data:(image/[-+.\w]+)(?:;charset=[^;,]+)?(;base64)?,(.*)",
+            value.strip(), re.I | re.S,
         )
-        try:
-            with urllib.request.urlopen(request, timeout=15) as response:
-                data = response.read(256 * 1024 * 1024 + 1)
-                if len(data) > 256 * 1024 * 1024:
-                    return None
-                content_type = response.headers.get_content_type()
-                disposition = response.headers.get_filename()
-                filename = disposition or Path(
-                    urllib.parse.unquote(
-                        urllib.parse.urlparse(response.geturl()).path
-                    )
-                ).name or "Web Image"
-                return filename, content_type, data
-        except (OSError, ValueError):
+        if not match:
             return None
-
-    def _external_image_sources(self, mime) -> list[tuple[str, str, bytes]]:
-        sources: list[tuple[str, str, bytes]] = []
-        remote_urls: list[str] = []
-        if mime.hasHtml():
-            match = re.search(
-                r'<img[^>]+src=["\']([^"\']+)', mime.html(), re.I
+        mime_type = match.group(1).lower()
+        try:
+            data = (
+                base64.b64decode(match.group(3), validate=True)
+                if match.group(2)
+                else urllib.parse.unquote_to_bytes(match.group(3))
             )
-            if match:
-                remote_urls.append(match.group(1))
-        for url in mime.urls() if mime.hasUrls() else []:
+        except (ValueError, TypeError):
+            return None
+        suffix = mimetypes.guess_extension(mime_type) or ".img"
+        return f"Dragged Image{suffix}", mime_type, data
+
+    @staticmethod
+    def _validated_image_source(
+        filename: str, mime_type: str, data: bytes,
+    ) -> tuple[str, str, bytes] | None:
+        if not data or len(data) > 256 * 1024 * 1024:
+            return None
+        probe = ImageStore()
+        try:
+            source = probe.put("probe", filename, data, mime_type)
+        except ValueError:
+            return None
+        return source.filename, source.mime_type, bytes(source.data)
+
+    def _external_image_entries(self, mime) -> list[dict]:
+        """Normalize Explorer, browser, and direct-image drag payloads."""
+        entries: list[dict] = []
+        candidates: list[tuple[str, str]] = []
+        download_format = next((
+            name for name in mime.formats()
+            if str(name).casefold() == "downloadurl"
+        ), "")
+        if download_format:
+            raw = bytes(mime.data(download_format)).decode(
+                "utf-8", "replace"
+            ).strip().strip("\x00")
+            parts = raw.split(":", 2)
+            if len(parts) == 3:
+                candidates.append((parts[2], parts[1]))
+        if mime.hasHtml():
+            for source in re.findall(
+                r'<img[^>]+src=["\']([^"\']+)', mime.html(), re.I
+            ):
+                candidates.append((html_lib.unescape(source), ""))
+        if mime.hasUrls():
+            candidates.extend((url.toString(), "") for url in mime.urls())
+        if mime.hasText():
+            text_value = mime.text().strip()
+            if re.match(r"^(?:https?://|data:image/|file:)", text_value, re.I):
+                candidates.append((text_value, ""))
+
+        seen: set[str] = set()
+        for raw_value, suggested_name in candidates:
+            value = raw_value.strip()
+            if not value or value in seen:
+                continue
+            seen.add(value)
+            data_source = self._data_uri_source(value)
+            if data_source is not None:
+                validated = self._validated_image_source(*data_source)
+                if validated is not None:
+                    entries.append({
+                        "filename": validated[0], "mime_type": validated[1],
+                        "data": validated[2], "url": "", "pending": False,
+                        "failed": False,
+                    })
+                continue
+            url = QUrl(value)
             if url.isLocalFile():
                 path = Path(url.toLocalFile())
                 try:
-                    sources.append((
-                        path.name, mimetypes.guess_type(path.name)[0] or "",
+                    validated = self._validated_image_source(
+                        path.name,
+                        mimetypes.guess_type(path.name)[0] or "",
                         path.read_bytes(),
-                    ))
+                    )
                 except OSError:
-                    continue
+                    validated = None
+                if validated is not None:
+                    entries.append({
+                        "filename": validated[0], "mime_type": validated[1],
+                        "data": validated[2], "url": "", "pending": False,
+                        "failed": False,
+                    })
             elif url.scheme().lower() in {"http", "https"}:
-                remote_urls.append(url.toString())
-        for url in dict.fromkeys(remote_urls):
-            downloaded = self._download_drag_url(url)
-            if downloaded is not None:
-                sources.append(downloaded)
-        valid: list[tuple[str, str, bytes]] = []
-        for source in sources:
-            probe = ImageStore()
-            try:
-                probe.put("probe", source[0], source[2], source[1])
-            except ValueError:
-                continue
-            valid.append(source)
-        if not valid:
-            fallback = self._mime_image_bytes(mime)
-            if fallback is not None:
-                valid.append(fallback)
-        return valid
+                filename = ImageStore.safe_filename(
+                    suggested_name or Path(
+                        urllib.parse.unquote(url.path())
+                    ).name or "Web Image"
+                )
+                entries.append({
+                    "filename": filename,
+                    "mime_type": mimetypes.guess_type(filename)[0] or "",
+                    "data": b"", "url": url.toString(), "pending": True,
+                    "failed": False,
+                })
 
-    def _begin_external_image_drag(self, event) -> bool:
-        sources = self._external_image_sources(event.mimeData())
-        if not sources:
+        fallback = self._mime_image_bytes(mime)
+        if fallback is not None:
+            validated = self._validated_image_source(*fallback)
+            if validated is not None:
+                remote = next((entry for entry in entries if entry["url"]), None)
+                if remote is not None and not remote["data"]:
+                    remote["data"] = validated[2]
+                    remote["mime_type"] = validated[1]
+                    if remote["filename"] == "Web Image":
+                        remote["filename"] = validated[0]
+                elif not entries:
+                    entries.append({
+                        "filename": validated[0], "mime_type": validated[1],
+                        "data": validated[2], "url": "", "pending": False,
+                        "failed": False,
+                    })
+        return entries
+
+    def _external_image_sources(self, mime) -> list[tuple[str, str, bytes]]:
+        """Compatibility helper returning sources immediately present in MIME data."""
+        return [
+            (entry["filename"], entry["mime_type"], entry["data"])
+            for entry in self._external_image_entries(mime)
+            if entry["data"] and not entry["failed"]
+        ]
+
+    def _start_external_drag_download(self, generation: int, entry: dict) -> None:
+        request = QNetworkRequest(QUrl(entry["url"]))
+        request.setRawHeader(b"User-Agent", b"WebtoonMaker/1.0")
+        request.setAttribute(
+            QNetworkRequest.Attribute.RedirectPolicyAttribute,
+            QNetworkRequest.RedirectPolicy.NoLessSafeRedirectPolicy,
+        )
+        reply = self._network_manager.get(request)
+        self._external_drag_replies[reply] = (generation, entry)
+        reply.finished.connect(lambda current=reply: self._finish_external_drag_download(current))
+        QTimer.singleShot(
+            15000,
+            lambda current=reply: (
+                current.abort()
+                if current in self._external_drag_replies else None
+            ),
+        )
+
+    def _finish_external_drag_download(self, reply: QNetworkReply) -> None:
+        payload = self._external_drag_replies.pop(reply, None)
+        if payload is None:
+            reply.deleteLater()
+            return
+        generation, entry = payload
+        entry["pending"] = False
+        if generation != self._external_drag_generation:
+            reply.deleteLater()
+            return
+        status = reply.attribute(
+            QNetworkRequest.Attribute.HttpStatusCodeAttribute
+        )
+        data = bytes(reply.readAll())
+        final_url = reply.url()
+        filename = Path(urllib.parse.unquote(final_url.path())).name or entry["filename"]
+        validated = None
+        if (
+            reply.error() == QNetworkReply.NetworkError.NoError
+            and (status is None or 200 <= int(status) < 300)
+        ):
+            validated = self._validated_image_source(
+                filename, entry["mime_type"], data
+            )
+        if validated is not None:
+            entry.update({
+                "filename": validated[0], "mime_type": validated[1],
+                "data": validated[2], "failed": False,
+            })
+            if self._pending_external_drop is None:
+                if self._install_external_drag_preview(entry):
+                    self._update_asset_drag(self._external_drag_widget)
+        elif not entry["data"]:
+            entry["failed"] = True
+        reply.deleteLater()
+        self._finish_pending_external_drop_if_ready()
+
+    def _install_external_drag_preview(self, entry: dict) -> bool:
+        if not entry.get("data"):
             return False
         preview_store = ImageStore()
-        first = sources[0]
-        preview_store.put("preview", first[0], first[2], first[1])
+        try:
+            preview_store.put(
+                "preview", entry["filename"], entry["data"], entry["mime_type"]
+            )
+        except ValueError:
+            return False
         image = preview_store.image("preview")
         document = ChapterDocument(
             name="Image Drag", width=max(1, image.width()),
@@ -2806,27 +2955,95 @@ class _CanvasLogic:
             )
         )
         obj = ImageObject(
-            name=first[0], source_filename=first[0],
-            source_mime_type=first[1], pixel_width=image.width(),
+            name=entry["filename"], source_filename=entry["filename"],
+            source_mime_type=entry["mime_type"], pixel_width=image.width(),
             pixel_height=image.height(),
             transform_frame=(0, 0, image.width(), image.height()),
-            transform_quad=self._rect_quad(QRectF(
-                0, 0, image.width(), image.height()
-            )),
+            transform_quad=self._rect_quad(QRectF(0, 0, image.width(), image.height())),
         )
         document.add_object(page.layer_id, obj)
         self._asset_drag_manifest = AssetManifest(
-            name=first[0], root_kind="object", root_id=obj.object_id,
-            document=document,
-            visual_bounds=(0, 0, image.width(), image.height()),
+            name=entry["filename"], root_kind="object", root_id=obj.object_id,
+            document=document, visual_bounds=(0, 0, image.width(), image.height()),
         )
         self._asset_drag_tiles = TileStore()
         self._asset_drag_images = preview_store
         self._asset_drag_image = image
-        self._external_drag_sources = sources
         self._asset_drag_clip_cache.clear()
+        self.update()
+        return True
+
+    @staticmethod
+    def _external_drag_placeholder(filename: str) -> dict:
+        image = QImage(96, 96, QImage.Format_ARGB32_Premultiplied)
+        image.fill(QColor(53, 45, 37, 230))
+        painter = QPainter(image)
+        painter.setPen(QPen(QColor("#f2a23a"), 5))
+        painter.drawRect(QRectF(12, 12, 72, 72))
+        painter.drawLine(QPointF(25, 68), QPointF(47, 43))
+        painter.drawLine(QPointF(47, 43), QPointF(73, 70))
+        painter.end()
+        payload = QByteArray()
+        buffer = QBuffer(payload)
+        buffer.open(QIODevice.OpenModeFlag.WriteOnly)
+        image.save(buffer, "PNG")
+        buffer.close()
+        return {
+            "filename": filename or "Web Image", "mime_type": "image/png",
+            "data": bytes(payload), "url": "", "pending": False,
+            "failed": False,
+        }
+
+    def _finish_pending_external_drop_if_ready(self) -> None:
+        pending = self._pending_external_drop
+        if pending is None or any(
+            entry["pending"] for entry in pending["entries"]
+        ):
+            return
+        self._pending_external_drop = None
+        sources = [
+            (entry["filename"], entry["mime_type"], entry["data"])
+            for entry in pending["entries"]
+            if entry["data"] and not entry["failed"]
+        ]
+        if not sources:
+            self.importStatusMessage.emit("No dropped images could be decoded")
+            self._clear_asset_drag_preview()
+            return
+        created = self.place_image_sources(
+            sources, pending["parent_id"], pending["world"],
+            insertion_index=pending["insertion_index"],
+            fit_parent=pending["fit_parent"], label="Drop images",
+        )
+        skipped = len(pending["entries"]) - len(sources)
+        if skipped:
+            self.importStatusMessage.emit(
+                f"Imported {len(created)} image(s); skipped {skipped} invalid item(s)"
+            )
+        self._clear_asset_drag_preview()
+
+    def _begin_external_image_drag(self, event) -> bool:
+        self._cancel_external_drag_downloads()
+        generation = self._external_drag_generation
+        entries = self._external_image_entries(event.mimeData())
+        if not entries:
+            return False
+        self._external_drag_entries = entries
+        self._external_drag_sources = [
+            (entry["filename"], entry["mime_type"], entry["data"])
+            for entry in entries if entry["data"]
+        ]
+        preview = next((entry for entry in entries if entry["data"]), None)
+        self._install_external_drag_preview(
+            preview or self._external_drag_placeholder(entries[0]["filename"])
+        )
+        for entry in entries:
+            if entry["pending"]:
+                self._start_external_drag_download(generation, entry)
+        self._external_drag_widget = QPointF(event.position())
         self._update_asset_drag(event.position())
-        event.acceptProposedAction()
+        event.setDropAction(Qt.DropAction.CopyAction)
+        event.accept()
         return True
 
     def dragEnterEvent(self, event) -> None:  # noqa: N802
@@ -2878,9 +3095,14 @@ class _CanvasLogic:
         if self._asset_drag_manifest is None:
             event.ignore()
             return
+        self._external_drag_widget = QPointF(event.position())
         self._update_asset_drag(event.position())
         if self._asset_drag_valid:
-            event.acceptProposedAction()
+            if self._external_drag_entries:
+                event.setDropAction(Qt.DropAction.CopyAction)
+                event.accept()
+            else:
+                event.acceptProposedAction()
         else:
             event.ignore()
 
@@ -2897,7 +3119,7 @@ class _CanvasLogic:
             self._clear_asset_drag_preview()
             event.ignore()
             return
-        if self._external_drag_sources:
+        if self._external_drag_entries:
             parent_id = self._asset_drag_parent_id
             parent = self.chapter.layers.get(parent_id)
             insertion_index = None
@@ -2908,18 +3130,39 @@ class _CanvasLogic:
                     if child.kind == "object"
                     and child.entity_id == selected.object_id
                 ), None)
-            created = self.place_image_sources(
-                list(self._external_drag_sources), parent_id,
-                QPointF(self._asset_drag_world),
-                insertion_index=insertion_index,
-                fit_parent=bool(parent is not None and not parent.is_page),
-                label="Drop images",
-            )
-            self._clear_asset_drag_preview()
-            if created:
-                event.acceptProposedAction()
+            if any(entry["pending"] for entry in self._external_drag_entries):
+                self._pending_external_drop = {
+                    "entries": list(self._external_drag_entries),
+                    "parent_id": parent_id,
+                    "world": QPointF(self._asset_drag_world),
+                    "insertion_index": insertion_index,
+                    "fit_parent": bool(parent is not None and not parent.is_page),
+                }
+                self._asset_drag_manifest = None
+                self._asset_drag_tiles = None
+                self._asset_drag_images = None
+                self._asset_drag_image = QImage()
+                self._asset_drag_parent_id = ""
+                self._asset_drag_valid = False
+                self.update()
             else:
-                event.ignore()
+                sources = [
+                    (entry["filename"], entry["mime_type"], entry["data"])
+                    for entry in self._external_drag_entries
+                    if entry["data"] and not entry["failed"]
+                ]
+                created = self.place_image_sources(
+                    sources, parent_id, QPointF(self._asset_drag_world),
+                    insertion_index=insertion_index,
+                    fit_parent=bool(parent is not None and not parent.is_page),
+                    label="Drop images",
+                )
+                self._clear_asset_drag_preview()
+                if not created:
+                    event.ignore()
+                    return
+            event.setDropAction(Qt.DropAction.CopyAction)
+            event.accept()
             return
         manifest = self._asset_drag_manifest
         source_tiles = self._asset_drag_tiles
@@ -6076,6 +6319,14 @@ class _CanvasLogic:
                         ))
                     self._draw_transform_controls(
                         painter, control_quad,
+                        (
+                            QPointF(
+                                self._transform_pivot.x() - world_x,
+                                self._transform_pivot.y() - world_y,
+                            )
+                            if self._transform_pivot is not None else None
+                        ),
+                        use_global_pivot=False,
                     )
                 if self.tool == ToolKind.BOUND_EDIT and layer.bound is not None:
                     self._draw_shape_edit_handles(
@@ -6092,7 +6343,7 @@ class _CanvasLogic:
                         and selected_object.placement_mode == "fit_parent"
                     )
                     and (
-                        self._is_transformable_object(selected_object)
+                        self._object_transform_cage_visible(selected_object)
                         or self.tool == ToolKind.TRANSFORM
                         or (
                             self.tool == ToolKind.SHAPE_EDIT
@@ -6170,6 +6421,7 @@ class _CanvasLogic:
                 if isinstance(selected_object, TextObject):
                     self._draw_text_property_handles(painter)
         painter.restore()
+        self._draw_transform_mode_gizmo(painter)
 
     def _draw_text_property_handles(self, painter: QPainter) -> None:
         positions = self._text_property_handle_positions()
@@ -6870,6 +7122,195 @@ class _CanvasLogic:
         )
         return True
 
+    def _active_transform_cage(
+        self,
+    ) -> tuple[list[tuple[float, float]], str] | None:
+        """Return the visible eight-handle cage in world coordinates."""
+        if self.chapter is None:
+            return None
+        if self.tool in {
+            ToolKind.DRAW_SELECT_RECT,
+            ToolKind.DRAW_SELECT_LASSO,
+            ToolKind.DRAW_SELECT_STROKE,
+        } and self._selection_transform_quad:
+            return list(self._selection_transform_quad), "selection"
+        if self.selected_kind == "layer" and self.tool == ToolKind.SHAPE_EDIT:
+            layer = self.chapter.layers.get(self.selected_id)
+            if layer is None or layer.bound is None:
+                return None
+            wx, wy = self.chapter.layer_world_translation(layer.layer_id)
+            if (
+                self._geometry_transform_target == ("layer", layer.layer_id)
+                and self._transform_preview_quad is not None
+            ):
+                local_quad = self._transform_preview_quad
+            else:
+                left, top, width, height = layer.bound.bbox()
+                local_quad = self._rect_quad(QRectF(
+                    left, top, max(1.0, width), max(1.0, height)
+                ))
+            return [(x + wx, y + wy) for x, y in local_quad], "object"
+        if self.selected_kind != "object" or not self.selected_object_id:
+            return None
+        obj = self.chapter.objects.get(self.selected_object_id)
+        if isinstance(obj, ImageObject) and obj.placement_mode == "fit_parent":
+            return None
+        visible = (
+            self._object_transform_cage_visible(obj)
+            or self.tool == ToolKind.TRANSFORM
+            or (
+                self.tool == ToolKind.TEXT_EDIT
+                and isinstance(obj, TextObject)
+                and obj.layout_mode == "free"
+            )
+            or (
+                self.tool == ToolKind.SHAPE_EDIT
+                and isinstance(obj, GradientObject)
+                and obj.field_type in {"line", "radial"}
+            )
+        )
+        quad = self._selected_world_quad() if visible else None
+        return (list(quad), "object") if quad else None
+
+    def _transform_mode_gizmo_rect(self) -> QRectF:
+        cage = self._active_transform_cage()
+        if cage is None:
+            return QRectF()
+        quad, pivot_kind = cage
+        widget_quad = self.camera_transform().map(QPolygonF([
+            QPointF(*point) for point in quad
+        ]))
+        bounds = widget_quad.boundingRect()
+        width, height, gap = 86.0, 30.0, 8.0
+        candidates = [
+            QRectF(bounds.left(), bounds.top() - height - gap, width, height),
+            QRectF(bounds.right() - width, bounds.top() - height - gap, width, height),
+            QRectF(bounds.left(), bounds.bottom() + gap, width, height),
+            QRectF(bounds.right() - width, bounds.bottom() + gap, width, height),
+        ]
+        pivot = (
+            self._selection_pivot if pivot_kind == "selection"
+            else self._transform_pivot
+        )
+        handles, rotate, pivot = self._transform_control_points(quad, pivot)
+        control_points = [
+            self.camera_transform().map(QPointF(*point)) for point in handles
+        ] + [
+            self.camera_transform().map(rotate),
+            self.camera_transform().map(pivot),
+        ]
+        viewport = QRectF(self.rect()).adjusted(6, 6, -6, -6)
+
+        def clamped(rect: QRectF) -> QRectF:
+            x = min(max(rect.x(), viewport.left()), viewport.right() - width)
+            y = min(max(rect.y(), viewport.top()), viewport.bottom() - height)
+            return QRectF(x, y, width, height)
+
+        candidates = [clamped(candidate) for candidate in candidates]
+        return min(candidates, key=lambda rect: sum(
+            1 for point in control_points
+            if rect.adjusted(-8, -8, 8, 8).contains(point)
+        ))
+
+    def _draw_transform_mode_gizmo(self, painter: QPainter) -> None:
+        rect = self._transform_mode_gizmo_rect()
+        if rect.isEmpty():
+            return
+        painter.save()
+        painter.setTransform(QTransform())
+        painter.setRenderHint(QPainter.Antialiasing, True)
+        painter.setPen(QPen(QColor("#ffb04a"), 1.5))
+        painter.setBrush(QColor(45, 34, 25, 238))
+        painter.drawRoundedRect(rect, 7, 7)
+        font = painter.font()
+        font.setPixelSize(13)
+        font.setBold(True)
+        painter.setFont(font)
+        painter.setPen(QColor("#ffb04a"))
+        painter.drawText(
+            rect, Qt.AlignCenter,
+            "Uniform" if self.settings.transform_mode == "uniform" else "Free",
+        )
+        painter.restore()
+
+    def _transform_mode_gizmo_hit(self, widget_point: QPointF) -> bool:
+        rect = self._transform_mode_gizmo_rect()
+        if rect.isEmpty() or not rect.contains(widget_point):
+            return False
+        cage = self._active_transform_cage()
+        if cage is None:
+            return False
+        quad, pivot_kind = cage
+        world = self.widget_to_document(widget_point)
+        pivot = (
+            self._selection_pivot if pivot_kind == "selection"
+            else self._transform_pivot
+        )
+        handles, rotate, pivot = self._transform_control_points(quad, pivot)
+        tolerance = 14 / max(self.scale, 0.05)
+        if any(
+            math.dist(world.toTuple(), point) <= tolerance
+            for point in handles
+        ) or math.dist(world.toTuple(), rotate.toTuple()) <= tolerance \
+                or math.dist(world.toTuple(), pivot.toTuple()) <= tolerance:
+            return False
+        self.settings.transform_mode = (
+            "uniform" if self.settings.transform_mode == "free" else "free"
+        )
+        self.settings.clamp()
+        self.transformModeChanged.emit(self.settings.transform_mode)
+        self.update()
+        return True
+
+    def _reset_transform_pivot_at(self, world: QPointF) -> bool:
+        cage = self._active_transform_cage()
+        if cage is None:
+            return False
+        quad, kind = cage
+        current = self._selection_pivot if kind == "selection" else self._transform_pivot
+        _handles, _rotate, pivot = self._transform_control_points(quad, current)
+        if math.dist(world.toTuple(), pivot.toTuple()) > 14 / max(self.scale, 0.05):
+            return False
+        if kind == "selection":
+            self._selection_pivot = None
+            self._selection_pivot_custom = False
+        else:
+            self._transform_pivot = None
+            self._transform_pivot_custom = False
+        self.update()
+        return True
+
+    def _active_transform_hover_kind(self, world: QPointF) -> str:
+        cage = self._active_transform_cage()
+        if cage is None:
+            return ""
+        quad, kind = cage
+        pivot = self._selection_pivot if kind == "selection" else self._transform_pivot
+        handles, rotate, pivot_point = self._transform_control_points(quad, pivot)
+        tolerance = 14 / max(self.scale, 0.05)
+        if (
+            any(math.dist(world.toTuple(), point) <= tolerance for point in handles)
+            or math.dist(world.toTuple(), rotate.toTuple()) <= tolerance
+            or math.dist(world.toTuple(), pivot_point.toTuple()) <= tolerance
+        ):
+            return "handle"
+        if kind == "selection":
+            path = QPainterPath()
+            path.addPolygon(QPolygonF([QPointF(*point) for point in quad]))
+            stroker = QPainterPathStroker()
+            stroker.setWidth(18 / max(self.scale, 0.05))
+            return (
+                "translate"
+                if path.contains(world) or stroker.createStroke(path).contains(world)
+                else ""
+            )
+        obj = self.chapter.objects.get(self.selected_object_id)
+        if isinstance(obj, (RasterObject, VectorDrawingObject, ImageObject)):
+            return self._selected_object_transform_hit(obj, quad, world)[0]
+        if isinstance(obj, TextObject):
+            return self._text_transform_control_hit(quad, world)[0]
+        return self._raster_transform_control_hit(quad, world)[0]
+
     def _transform_control_points(
         self, quad: list[tuple[float, float]],
         pivot: QPointF | None = None,
@@ -6889,9 +7330,16 @@ class _CanvasLogic:
 
     def _draw_transform_controls(
         self, painter: QPainter, quad: list[tuple[float, float]],
+        pivot_override: QPointF | None = None,
+        *, use_global_pivot: bool = True,
     ) -> None:
         handles, rotate, pivot = self._transform_control_points(
-            quad, self._transform_pivot
+            quad,
+            (
+                self._transform_pivot
+                if use_global_pivot and pivot_override is None
+                else pivot_override
+            ),
         )
         radius = 7 / max(self.scale, 0.05)
         painter.setBrush(QColor("#f5f5f5"))
@@ -6901,6 +7349,8 @@ class _CanvasLogic:
         painter.drawLine(top, rotate)
         painter.drawEllipse(rotate, radius, radius)
         cross = 8 / max(self.scale, 0.05)
+        painter.setBrush(QColor("#f5f5f5"))
+        painter.drawEllipse(pivot, radius, radius)
         painter.drawLine(
             QPointF(pivot.x() - cross, pivot.y()),
             QPointF(pivot.x() + cross, pivot.y()),
@@ -8178,8 +8628,8 @@ class _CanvasLogic:
                     for x, y in self._transform_preview_quad
                 ]
         if (
-            self.tool in {ToolKind.TRANSFORM, ToolKind.TEXT_EDIT}
-            and self._transform_preview_quad is not None
+            self._transform_preview_quad is not None
+            and self._transform_start_quad is not None
             and self.selected_object_id
         ):
             obj = self.chapter.objects[self.selected_object_id]
@@ -8194,11 +8644,26 @@ class _CanvasLogic:
         if self.chapter is None or not self.selected_id:
             return QRect()
         if self.selected_kind == "object":
-            rect = self.object_world_rect(self.selected_id)
+            quad = self._selected_world_quad()
+            rect = (
+                QPolygonF([QPointF(*point) for point in quad]).boundingRect()
+                if quad else self.object_world_rect(self.selected_id)
+            )
         else:
             layer = self.chapter.layers.get(self.selected_id)
             if not layer:
                 return QRect()
+            if (
+                self._geometry_transform_target == ("layer", layer.layer_id)
+                and self._transform_preview_quad is not None
+            ):
+                wx, wy = self.chapter.layer_world_translation(layer.layer_id)
+                rect = QPolygonF([
+                    QPointF(x + wx, y + wy)
+                    for x, y in self._transform_preview_quad
+                ]).boundingRect()
+                polygon = self.camera_transform().map(QPolygonF(rect))
+                return polygon.boundingRect().toAlignedRect()
             if layer.bound is None and layer.parent_id:
                 layer = self.chapter.layers[layer.parent_id]
             if layer.bound is None:
@@ -9114,87 +9579,29 @@ class _CanvasLogic:
                 for point in self.object_world_quad(selected_text.object_id)
             ]))
             over_selected_text = text_path.contains(world)
-        transform_quad = (
-            self._selection_transform_quad
-            if self.tool in {
-                ToolKind.DRAW_SELECT_RECT,
-                ToolKind.DRAW_SELECT_LASSO,
-                ToolKind.DRAW_SELECT_STROKE,
-            }
-            else (
-                self._selected_world_quad()
-                if (
-                    self._is_transformable_object(
-                        self.chapter.objects.get(self.selected_object_id)
-                    )
-                    and not (
-                        isinstance(
-                            self.chapter.objects.get(self.selected_object_id),
-                            ImageObject,
-                        )
-                        and self.chapter.objects[
-                            self.selected_object_id
-                        ].placement_mode == "fit_parent"
-                    )
-                    or self.tool == ToolKind.TRANSFORM
-                    or (
-                        self.tool == ToolKind.TEXT_EDIT
-                        and isinstance(
-                            self.chapter.objects.get(
-                                self.selected_object_id
-                            ), TextObject
-                        )
-                        and self.chapter.objects[
-                            self.selected_object_id
-                        ].layout_mode == "free"
-                    )
-                )
-                else None
-            )
+        transform_hover = self._active_transform_hover_kind(world)
+        cage_drag_active = bool(
+            self._transform_drag_mode
+            or self._selection_transform_mode
+            or self._geometry_transform_target
         )
-        over_transform_handle = False
-        over_transform_edge = False
-        if transform_quad:
-            tolerance = 12 / max(self.scale, 0.05)
-            pivot = (
-                self._selection_pivot
-                if self.tool in {
-                    ToolKind.DRAW_SELECT_RECT,
-                    ToolKind.DRAW_SELECT_LASSO,
-                    ToolKind.DRAW_SELECT_STROKE,
-                }
-                else self._transform_pivot
-            )
-            handles, rotate, pivot = self._transform_control_points(
-                transform_quad, pivot
-            )
-            over_transform_handle = any(
-                math.dist(world.toTuple(), candidate) <= tolerance
-                for candidate in handles
-            ) or math.dist(
-                world.toTuple(), rotate.toTuple()
-            ) <= tolerance or math.dist(
-                world.toTuple(), pivot.toTuple()
-            ) <= tolerance
-            outline = QPainterPath()
-            outline.addPolygon(QPolygonF([
-                QPointF(*point) for point in transform_quad
-            ]))
-            stroker = QPainterPathStroker()
-            stroker.setWidth(16 / max(self.scale, 0.05))
-            over_transform_edge = stroker.createStroke(
-                outline
-            ).contains(world)
-        if shape_overlay_hit in {"base_thickness", "outline_thickness"}:
+        if cage_drag_active:
+            self.setCursor(Qt.ClosedHandCursor)
+        elif self._transform_mode_gizmo_rect().contains(event.position()):
+            self.setCursor(Qt.PointingHandCursor)
+        elif shape_overlay_hit in {"base_thickness", "outline_thickness"}:
             self.setCursor(Qt.CursorShape.SizeHorCursor)
+        elif self._shape_hover_target and self._shape_hover_target.get("kind") \
+                not in {None, "interior"}:
+            self.setCursor(Qt.CrossCursor)
         elif shape_overlay_hit:
             self.setCursor(Qt.PointingHandCursor)
         elif over_text_property:
             self.setCursor(Qt.CursorShape.SizeHorCursor)
-        elif over_transform_handle:
-            self.setCursor(Qt.PointingHandCursor)
-        elif over_transform_edge:
-            self.setCursor(Qt.SizeAllCursor)
+        elif transform_hover in {"handle", "rotate", "pivot"}:
+            self.setCursor(Qt.CrossCursor)
+        elif transform_hover == "translate":
+            self.setCursor(Qt.OpenHandCursor)
         elif self.tool == ToolKind.DRAW_SELECT_STROKE:
             self.setCursor(Qt.PointingHandCursor)
         elif self.tool in {
@@ -9202,7 +9609,7 @@ class _CanvasLogic:
         }:
             self.setCursor(Qt.CrossCursor)
         elif self.tool == ToolKind.TRANSFORM:
-            self.setCursor(Qt.SizeAllCursor)
+            self.setCursor(Qt.OpenHandCursor)
         elif over_selected_text:
             self.setCursor(Qt.CursorShape.IBeamCursor)
         else:
@@ -9229,6 +9636,14 @@ class _CanvasLogic:
             self._tool_release()
 
     def mouseDoubleClickEvent(self, event: QMouseEvent) -> None:  # noqa: N802
+        if (
+            self.chapter is not None
+            and self._reset_transform_pivot_at(
+                self.widget_to_document(event.position())
+            )
+        ):
+            event.accept()
+            return
         if self.tool == ToolKind.TEXT_EDIT and self.chapter is not None:
             world = self.widget_to_document(event.position())
             if self._select_text_word_at(world):
@@ -10196,10 +10611,7 @@ class _CanvasLogic:
             quad, self._selection_pivot
         )
         pivot_distance = math.dist(world.toTuple(), pivot.toTuple())
-        if (
-            4 / max(self.scale, 0.05)
-            <= pivot_distance <= tolerance
-        ):
+        if pivot_distance <= tolerance:
             mode, handle = "pivot", None
         elif math.dist(world.toTuple(), rotate.toTuple()) <= tolerance:
             mode, handle = "rotate", None
@@ -10895,34 +11307,9 @@ class _CanvasLogic:
                 QColor("#249eff"), 1.5 / max(self.scale, 0.05)
             ))
             painter.drawPolygon(QPolygonF([QPointF(*point) for point in quad]))
-            radius = 6 / max(self.scale, 0.05)
-            painter.setBrush(QColor("#ffffff"))
-            for point in self._quad_handles(quad):
-                painter.drawRect(QRectF(
-                    point[0] - radius, point[1] - radius,
-                    radius * 2, radius * 2,
-                ))
-            top = self._edge_midpoints(quad)[0]
-            center = QPointF(
-                sum(point[0] for point in quad) / 4,
-                sum(point[1] for point in quad) / 4,
-            )
-            direction = QPointF(top[0], top[1]) - center
-            length = max(1e-6, math.hypot(direction.x(), direction.y()))
-            rotate = QPointF(top[0], top[1]) + direction / length * (
-                28 / max(self.scale, 0.05)
-            )
-            painter.drawLine(QPointF(*top), rotate)
-            painter.drawEllipse(rotate, radius, radius)
-            pivot = self._selection_pivot or center
-            cross = 8 / max(self.scale, 0.05)
-            painter.drawLine(
-                QPointF(pivot.x() - cross, pivot.y()),
-                QPointF(pivot.x() + cross, pivot.y()),
-            )
-            painter.drawLine(
-                QPointF(pivot.x(), pivot.y() - cross),
-                QPointF(pivot.x(), pivot.y() + cross),
+            self._draw_transform_controls(
+                painter, quad, self._selection_pivot,
+                use_global_pivot=False,
             )
         hover = self._pointer_hover_widget or self._tablet_hover_widget
         operation = self._selection_operation()
@@ -12908,6 +13295,8 @@ class _CanvasLogic:
             return
         if self._begin_text_property_drag(widget_point):
             return
+        if self._transform_mode_gizmo_hit(widget_point):
+            return
         if self.tool in {
             ToolKind.DRAW_SELECT_RECT,
             ToolKind.DRAW_SELECT_LASSO,
@@ -13016,6 +13405,8 @@ class _CanvasLogic:
         if self.tool == ToolKind.TEXT_EDIT and not isinstance(
             self.chapter.objects.get(self.selected_object_id), TextObject
         ):
+            if self._select_foreign_object_at(point, widget_point):
+                return
             hits = self.hit_test_objects(point, text_only=True)
             if hits:
                 self.set_selection("object", hits[0])
@@ -13044,6 +13435,8 @@ class _CanvasLogic:
             ):
                 return
             if self._begin_geometry_transform(point):
+                return
+            if self._select_foreign_object_at(point, widget_point):
                 return
             hits = [
                 hit for hit in self.hit_test_shape_edit_layers(point)
@@ -13132,6 +13525,8 @@ class _CanvasLogic:
         if self.tool == ToolKind.TEXT_EDIT and self.selected_object_id:
             if self._begin_text_pointer(point):
                 return
+            if self._select_foreign_object_at(point, widget_point):
+                return
         if self.tool == ToolKind.TRANSFORM and self.selected_object_id:
             obj = self.chapter.objects[self.selected_object_id]
             if isinstance(obj, TextObject) and obj.layout_mode != "free":
@@ -13143,6 +13538,7 @@ class _CanvasLogic:
             local_quad = [(x - layer_x, y - layer_y) for x, y in world_quad]
             mode, handle = self._transform_control_hit(world_quad, point)
             if not mode:
+                self._select_foreign_object_at(point, widget_point)
                 return
             self._transform_handle_index = handle
             self._transform_drag_mode = mode
@@ -13278,13 +13674,15 @@ class _CanvasLogic:
                     selected_raster.object_id
                 )
                 raster_hit, _handle = (
-                    self._raster_transform_control_hit(world_quad, point)
+                    self._selected_object_transform_hit(
+                        selected_raster, world_quad, point
+                    )
                     if world_quad else ("", None)
                 )
                 if raster_hit == "translate":
-                    self.setCursor(Qt.SizeAllCursor)
-                elif raster_hit is not None:
-                    self.setCursor(Qt.PointingHandCursor)
+                    self.setCursor(Qt.OpenHandCursor)
+                elif raster_hit:
+                    self.setCursor(Qt.CrossCursor)
                 else:
                     self.unsetCursor()
             elif (
@@ -14013,6 +14411,24 @@ class _CanvasLogic:
         if page_id and page_id in self.chapter.layers:
             self.set_selection("layer", page_id, activate_default_tool=False)
             self.set_tool(ToolKind.OBJECT_SELECT)
+
+    def _select_foreign_object_at(
+        self, point: QPointF, widget_point: QPointF,
+    ) -> bool:
+        """Select the frontmost other object before a tool falls back to a layer."""
+        hits = [
+            hit for hit in self.hit_test_entities(point)
+            if hit["kind"] == "object" and hit["id"] != self.selected_object_id
+        ]
+        if not hits:
+            return False
+        if len(hits) > 1 and QGuiApplication.keyboardModifiers() & Qt.ControlModifier:
+            self.selectionCandidatesRequested.emit(
+                hits, self.mapToGlobal(widget_point.toPoint())
+            )
+            return True
+        self.set_selection("object", hits[0]["id"], activate_default_tool=True)
+        return True
 
     def _selected_shape_node(self, bound: BoundGeometry) -> PathNode | None:
         return next((
@@ -15320,10 +15736,7 @@ class _CanvasLogic:
             quad, self._transform_pivot
         )
         pivot_distance = math.dist(point.toTuple(), pivot.toTuple())
-        if (
-            4 / max(self.scale, 0.05)
-            <= pivot_distance <= tolerance
-        ):
+        if pivot_distance <= tolerance:
             return "pivot", None
         if math.dist(point.toTuple(), rotate.toTuple()) <= tolerance:
             return "rotate", None
@@ -15376,7 +15789,7 @@ class _CanvasLogic:
             quad, self._transform_pivot
         )
         pivot_distance = math.dist(point.toTuple(), pivot.toTuple())
-        if 4 / max(self.scale, 0.05) <= pivot_distance <= tolerance:
+        if pivot_distance <= tolerance:
             return "pivot", None
         if math.dist(point.toTuple(), rotate.toTuple()) <= tolerance:
             return "rotate", None
@@ -15407,6 +15820,25 @@ class _CanvasLogic:
             )
         ):
             return "translate", None
+        return "", None
+
+    def _selected_object_transform_hit(
+        self,
+        obj: RasterObject | VectorDrawingObject | ImageObject,
+        quad: list[tuple[float, float]],
+        point: QPointF,
+    ) -> tuple[str, int | None]:
+        """Return only the transform affordances active in the current tool."""
+        mode, handle = self._raster_transform_control_hit(quad, point)
+        if mode:
+            return mode, handle
+        if isinstance(obj, ImageObject) and obj.placement_mode == "free":
+            path = QPainterPath()
+            path.addPolygon(QPolygonF([QPointF(*candidate) for candidate in quad]))
+            if path.contains(point):
+                return "translate", None
+        if self.tool == ToolKind.TRANSFORM:
+            return self._transform_control_hit(quad, point)
         return "", None
 
     def _begin_geometry_transform(self, point: QPointF) -> bool:
@@ -15630,6 +16062,29 @@ class _CanvasLogic:
     def _is_transformable_object(obj: DocumentObject | None) -> bool:
         return isinstance(obj, (RasterObject, VectorDrawingObject, ImageObject))
 
+    def _object_transform_cage_visible(
+        self, obj: DocumentObject | None,
+    ) -> bool:
+        if not self._is_transformable_object(obj):
+            return False
+        if isinstance(obj, ImageObject) and obj.placement_mode == "fit_parent":
+            return False
+        if self.tool in {
+            ToolKind.DRAW_SELECT_RECT,
+            ToolKind.DRAW_SELECT_LASSO,
+            ToolKind.DRAW_SELECT_STROKE,
+        }:
+            return False
+        if isinstance(obj, VectorDrawingObject) and self.tool in {
+            ToolKind.VECTOR_EDIT,
+            ToolKind.VECTOR_REDRAW,
+            ToolKind.VECTOR_CONNECT,
+            ToolKind.VECTOR_SIMPLIFY,
+            ToolKind.FILL,
+        }:
+            return False
+        return True
+
     def _object_transform_frame(
         self, obj: RasterObject | VectorDrawingObject | ImageObject,
     ) -> tuple[float, float, float, float]:
@@ -15652,7 +16107,7 @@ class _CanvasLogic:
         obj = self.chapter.objects.get(self.selected_object_id)
         if not self._is_transformable_object(obj):
             return False
-        if isinstance(obj, VectorDrawingObject) and self.tool in {
+        vector_drawing_tool = isinstance(obj, VectorDrawingObject) and self.tool in {
             ToolKind.RASTER_PENCIL,
             ToolKind.RASTER_ERASER,
             ToolKind.VECTOR_EDIT,
@@ -15660,17 +16115,23 @@ class _CanvasLogic:
             ToolKind.VECTOR_CONNECT,
             ToolKind.VECTOR_SIMPLIFY,
             ToolKind.FILL,
-        }:
+        }
+        pencil_or_eraser = self.tool in {
+            ToolKind.RASTER_PENCIL, ToolKind.RASTER_ERASER,
+        }
+        if vector_drawing_tool and not pencil_or_eraser:
             return False
         if isinstance(obj, ImageObject) and obj.placement_mode == "fit_parent":
             return False
         world_quad = self.object_world_quad(obj.object_id)
         if not world_quad:
             return False
-        mode, handle = self._raster_transform_control_hit(
-            world_quad, point
+        mode, handle = self._selected_object_transform_hit(
+            obj, world_quad, point
         )
         if not mode:
+            return False
+        if vector_drawing_tool and mode not in {"handle", "rotate", "pivot"}:
             return False
         layer_x, layer_y = self.chapter.layer_world_translation(
             obj.parent_layer_id
@@ -15707,7 +16168,13 @@ class _CanvasLogic:
         quad = self.object_world_quad(obj.object_id)
         if not quad:
             return False
-        mode, _handle = self._raster_transform_control_hit(quad, point)
+        mode, _handle = self._selected_object_transform_hit(obj, quad, point)
+        if (
+            isinstance(obj, VectorDrawingObject)
+            and self.tool in {ToolKind.RASTER_PENCIL, ToolKind.RASTER_ERASER}
+            and mode not in {"handle", "rotate", "pivot"}
+        ):
+            return False
         if mode == "translate":
             self._pending_raster_transform_press = (
                 QPointF(widget_point), QPointF(point)

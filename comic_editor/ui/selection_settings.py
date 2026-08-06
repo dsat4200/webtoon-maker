@@ -451,7 +451,6 @@ class SelectionSettingsPanel(QWidget):
         self.raster_page = QGroupBox("Raster Object Settings", self)
         raster_layout = QVBoxLayout(self.raster_page)
         raster_layout.addWidget(self.raster_controls.object_widget)
-        raster_layout.addWidget(self.raster_controls.transform_widget)
         raster_layout.addStretch(1)
         self.raster_controls.visible.hide()
         opacity_row = self.raster_controls.opacity.parentWidget()

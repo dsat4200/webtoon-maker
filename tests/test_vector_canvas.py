@@ -365,6 +365,8 @@ def test_square_vector_eraser_uses_square_hit_shape(qapp):
     canvas, _chapter, drawing = _canvas_with_drawing([line])
     canvas.settings.vector_eraser_mode = "stroke"
     canvas.settings.eraser_size_px["medium"] = 20
+    # Keep the eraser probe outside the explicit cage-handle hit radius.
+    canvas.scale = 2.0
     assert canvas.set_tool(ToolKind.RASTER_ERASER)
 
     # This is inside the 10px square half-extent but outside the circle.
@@ -489,6 +491,7 @@ def test_vector_select_all_and_selection_translate_are_undoable(qapp):
     canvas, _chapter, drawing = _canvas_with_drawing([stroke])
     assert canvas.set_tool(ToolKind.DRAW_SELECT_RECT)
     assert canvas.select_all_drawing()
+    canvas.scale = 2.0
     assert canvas.selected_vector_point_ids == {
         point.point_id for point in stroke.points
     }
@@ -497,9 +500,10 @@ def test_vector_select_all_and_selection_translate_are_undoable(qapp):
         sum(x for x, _ in quad) / 4,
         sum(y for _, y in quad) / 4,
     )
-    canvas._tool_press(canvas.document_to_widget(center), 1)
+    press = center + QPointF(20, 0)
+    canvas._tool_press(canvas.document_to_widget(press), 1)
     canvas._tool_move(
-        canvas.document_to_widget(center + QPointF(25, 10)), 1
+        canvas.document_to_widget(press + QPointF(25, 10)), 1
     )
     canvas._tool_release()
     assert drawing.strokes[0].points[0].position == pytest.approx((45, 40))
@@ -697,11 +701,15 @@ def test_rotated_vector_selection_quad_persists_and_undo_restores_it(qapp):
         sum(x for x, _ in rotated) / 4,
         sum(y for _, y in rotated) / 4,
     )
+    press = QPointF(
+        center.x() * 0.65 + rotated[0][0] * 0.35,
+        center.y() * 0.65 + rotated[0][1] * 0.35,
+    )
     canvas._begin_drawing_selection_transform(
-        canvas._drawing_selection_object(), center
+        canvas._drawing_selection_object(), press
     )
     canvas._update_drawing_selection_transform(
-        canvas._drawing_selection_object(), center + QPointF(20, 15)
+        canvas._drawing_selection_object(), press + QPointF(20, 15)
     )
     translated = list(canvas._selection_transform_quad)
     canvas._finish_drawing_selection_transform(

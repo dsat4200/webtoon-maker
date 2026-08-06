@@ -98,7 +98,7 @@ def test_text_ribbon_owns_complete_selected_object_controls(
         assert controls.kerning.minimum() == -20
         assert controls.kerning.maximum() == 100
         assert controls.margin.isHidden()
-        assert controls.transform_mode.isVisible()
+        assert not hasattr(controls, "transform_mode")
         assert controls.geometry_reference.isHidden()
 
         controls.layout_mode.setCurrentIndex(
@@ -106,7 +106,6 @@ def test_text_ribbon_owns_complete_selected_object_controls(
         )
         qapp.processEvents()
         assert controls.margin.isVisible()
-        assert controls.transform_mode.isHidden()
         controls.layout_mode.setCurrentIndex(
             controls.layout_mode.findData("free")
         )
@@ -263,7 +262,10 @@ def test_free_text_boundary_translates_while_interior_edits(qapp):
         center = QPolygonF([
             QPointF(*point) for point in canvas.object_world_quad(first.object_id)
         ]).boundingRect().center()
-        canvas._tool_press(canvas.document_to_widget(center), 1.0)
+        # Avoid the explicit pivot circle at the exact cage center.
+        canvas._tool_press(
+            canvas.document_to_widget(center + QPointF(28, 0)), 1.0
+        )
         assert canvas._text_dragging
         assert canvas._model_before is None
         canvas._tool_release()
@@ -338,7 +340,7 @@ def test_text_hover_uses_ibeam_but_boundary_keeps_translate_cursor(qapp):
             quad[0][1] * 0.75 + quad[1][1] * 0.25,
         )
         hover(boundary)
-        assert canvas.cursor().shape() == Qt.CursorShape.SizeAllCursor
+        assert canvas.cursor().shape() == Qt.CursorShape.OpenHandCursor
     finally:
         canvas.hide()
         canvas.deleteLater()

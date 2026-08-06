@@ -484,12 +484,6 @@ class MainWindow(QMainWindow):
         simplify_group.add_widget(
             self.vector_tools_controls.simplify_widget
         )
-        transform_group = self.vector_tools_page.add_group(
-            "Transform Settings", minimum_width=180
-        )
-        transform_group.add_widget(
-            self.vector_tools_controls.transform_widget
-        )
         self.canvas = create_canvas(self.settings)
         self.text_object_controls = TextObjectControls(
             self.canvas, self.settings, self.ribbon
@@ -824,6 +818,10 @@ class MainWindow(QMainWindow):
         self.canvas.pageCreationInvalid.connect(
             lambda message: self.statusBar().showMessage(message, 5000)
         )
+        if hasattr(self.canvas, "importStatusMessage"):
+            self.canvas.importStatusMessage.connect(
+                lambda message: self.statusBar().showMessage(message, 7000)
+            )
         self.canvas.pageGapConfirmationChanged.connect(
             self._set_page_gap_confirmation_visible
         )
@@ -836,6 +834,10 @@ class MainWindow(QMainWindow):
         if hasattr(self.canvas, "vectorSelectionChanged"):
             self.canvas.vectorSelectionChanged.connect(
                 lambda strokes, points: self._sync_contextual_ribbon()
+            )
+        if hasattr(self.canvas, "transformModeChanged"):
+            self.canvas.transformModeChanged.connect(
+                lambda _mode: self._ribbon_settings_changed()
             )
         self.canvas.command_stack.changed_callback = self._command_stack_changed
         self.selection_common.changed.connect(self._hierarchy_changed)

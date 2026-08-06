@@ -291,13 +291,12 @@ def test_text_settings_ribbon_layout_visibility_and_quad_restore(qapp):
         assert not window.text_object_group.isHidden()
         assert not window.text_typography_group.isHidden()
         assert not window.text_layout_group.isHidden()
-        assert controls.transform_mode.isVisibleTo(window.ribbon)
+        assert not hasattr(controls, "transform_mode")
         assert controls.margin.isHidden()
 
         controls.layout_mode.setCurrentIndex(
             controls.layout_mode.findData("strict")
         )
-        assert controls.transform_mode.isHidden()
         assert not controls.margin.isHidden()
         assert text.transform_quad == original_quad
 
@@ -309,7 +308,6 @@ def test_text_settings_ribbon_layout_visibility_and_quad_restore(qapp):
             controls.layout_mode.findData("free")
         )
         assert text.transform_quad == original_quad
-        assert not controls.transform_mode.isHidden()
         assert controls.margin.isHidden()
     finally:
         window.deleteLater()

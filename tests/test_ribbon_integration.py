@@ -212,7 +212,7 @@ def test_vendored_iconoir_assets_cover_every_tool_strip_command():
         assert not icon.pixmap(QSize(20, 20)).isNull()
 
 
-def test_drawing_selection_tool_settings_reuses_transform_mode(qapp):
+def test_transform_mode_is_not_duplicated_in_ribbon_controls(qapp):
     window = MainWindow()
     chapter, _page, _layer, drawing, _fill = _vector_chapter()
     window._set_chapter(chapter, TileStore())
@@ -224,13 +224,9 @@ def test_drawing_selection_tool_settings_reuses_transform_mode(qapp):
         window._sync_contextual_ribbon()
         controls = window.tool_settings_controls
         assert controls.stack.currentWidget() is controls.empty_page
-        vector_controls = window.vector_tools_controls
-        assert vector_controls.transform_mode.currentData() == "free"
-        vector_controls.transform_mode.setCurrentIndex(
-            vector_controls.transform_mode.findData("uniform")
-        )
-        assert window.settings.transform_mode == "uniform"
-        assert controls.selection_transform_mode.currentData() == "uniform"
+        assert not hasattr(controls, "selection_transform_mode")
+        assert not hasattr(window.vector_tools_controls, "transform_mode")
+        assert not hasattr(window.raster_object_controls, "transform_mode")
     finally:
         window.deleteLater()
 
@@ -268,7 +264,7 @@ def test_underlay_slider_coalesces_drag_and_restores_with_undo(qapp):
         window.deleteLater()
 
 
-def test_raster_object_ribbon_edits_properties_and_transform_mode(qapp):
+def test_raster_object_ribbon_edits_properties_without_transform_mode(qapp):
     window = MainWindow()
     chapter = ChapterDocument()
     page = chapter.add_page()
@@ -283,10 +279,7 @@ def test_raster_object_ribbon_edits_properties_and_transform_mode(qapp):
         assert chapter.objects[raster.object_id].name == "Pencils"
         assert window.canvas.command_stack.can_undo
 
-        controls.transform_mode.setCurrentIndex(
-            controls.transform_mode.findData("uniform")
-        )
-        assert window.settings.transform_mode == "uniform"
+        assert not hasattr(controls, "transform_mode")
         assert not window.tool_buttons[ToolKind.TRANSFORM].isVisible()
         assert not window.canvas.set_tool(ToolKind.TRANSFORM)
     finally:

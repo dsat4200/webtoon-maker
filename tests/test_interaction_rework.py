@@ -543,8 +543,10 @@ def test_raster_transform_controls_do_not_consume_interior_pencil(qapp):
     )
     canvas.set_selection("object", raster.object_id)
     canvas.set_tool(ToolKind.RASTER_PENCIL)
-    center = _widget(canvas, 180, 180)
-    canvas._tool_press(center, 1)
+    # The exact center is the explicit pivot handle. A normal interior point
+    # must continue to paint through the cage.
+    interior = _widget(canvas, 145, 145)
+    canvas._tool_press(interior, 1)
     assert canvas._drawing
     assert canvas._transform_drag_mode is None
     canvas._tool_release()

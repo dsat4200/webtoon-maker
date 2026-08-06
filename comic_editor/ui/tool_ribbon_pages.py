@@ -93,8 +93,6 @@ class ToolSettingsControls(QWidget):
         self.stack.addWidget(self.eraser_page)
         self.fill_page = self._build_fill_page()
         self.stack.addWidget(self.fill_page)
-        self.selection_page = self._build_selection_page()
-        self.stack.addWidget(self.selection_page)
         self.refresh()
         self.set_context(None, False)
 
@@ -212,26 +210,6 @@ class ToolSettingsControls(QWidget):
             signal.connect(self._fill_changed)
         return page
 
-    def _build_selection_page(self) -> QWidget:
-        page = QWidget(self)
-        row = QHBoxLayout(page)
-        row.setContentsMargins(0, 0, 0, 0)
-        row.setSpacing(7)
-        row.addWidget(QLabel("Transform", page))
-        self.selection_transform_mode = QComboBox(page)
-        self.selection_transform_mode.addItem("Free", "free")
-        self.selection_transform_mode.addItem("Uniform", "uniform")
-        self.selection_transform_mode.setToolTip(
-            "Free moves corners independently and edges in connected pairs; "
-            "Uniform scales the complete selection."
-        )
-        row.addWidget(self.selection_transform_mode)
-        row.addStretch(1)
-        self.selection_transform_mode.currentIndexChanged.connect(
-            self._selection_transform_mode_changed
-        )
-        return page
-
     def set_context(self, tool: object, vector_active: bool) -> None:
         value = _tool_value(tool)
         if value == "raster_pencil":
@@ -251,7 +229,7 @@ class ToolSettingsControls(QWidget):
             "draw_select_rect", "draw_select_lasso", "draw_select_stroke",
         } and not vector_active:
             self.context_label.setText("Drawing Selection")
-            self.stack.setCurrentWidget(self.selection_page)
+            self.stack.setCurrentWidget(self.empty_page)
         else:
             self.context_label.setText("No settings for the current tool")
             self.stack.setCurrentWidget(self.empty_page)
@@ -300,25 +278,10 @@ class ToolSettingsControls(QWidget):
         self.fill_mode.setCurrentIndex(
             max(0, self.fill_mode.findData(self.settings.fill_mode))
         )
-        self.selection_transform_mode.setCurrentIndex(max(
-            0, self.selection_transform_mode.findData(
-                self.settings.transform_mode
-            ),
-        ))
         self.fill_gap_threshold.setEnabled(self.settings.fill_close_gaps)
         self.fill_area_amount.setEnabled(self.settings.fill_area_scaling)
         self.fill_area_mode.setEnabled(self.settings.fill_area_scaling)
         self._loading = False
-
-    def _selection_transform_mode_changed(self) -> None:
-        if self._loading:
-            return
-        mode = str(self.selection_transform_mode.currentData())
-        if mode not in {"free", "uniform"}:
-            return
-        self.settings.transform_mode = mode
-        self.settings.clamp()
-        self.settingsChanged.emit()
 
     def _pencil_preset_changed(self, name: str) -> None:
         if not self._loading and name:
@@ -551,12 +514,6 @@ class TextObjectControls(QObject):
         self.geometry_reference.addItem("Closest compound", "compound")
         second.addWidget(self.geometry_reference_label)
         second.addWidget(self.geometry_reference)
-        self.transform_label = QLabel("Transform", widget)
-        self.transform_mode = QComboBox(widget)
-        self.transform_mode.addItem("Free Projective", "free")
-        self.transform_mode.addItem("Uniform", "uniform")
-        second.addWidget(self.transform_label)
-        second.addWidget(self.transform_mode)
         layout.addLayout(second)
 
         self.layout_mode.currentIndexChanged.connect(self._layout_mode_changed)
@@ -567,9 +524,6 @@ class TextObjectControls(QObject):
             lambda: self._apply_field(
                 "geometry_reference", str(self.geometry_reference.currentData())
             )
-        )
-        self.transform_mode.currentIndexChanged.connect(
-            self._transform_mode_changed
         )
         return widget
 
@@ -602,15 +556,12 @@ class TextObjectControls(QObject):
             self.preset_combo, self.opacity_lock,
             self.font_family, self.preview_fonts, self.font_size, self.bold,
             self.italic, self.kerning, self.layout_mode, self.margin,
-            self.geometry_reference, self.transform_mode,
+            self.geometry_reference,
         )
         blockers = [QSignalBlocker(control) for control in controls]
         self._refresh_presets()
         self.preview_fonts.setChecked(bool(self.settings.preview_font_names))
         self._set_font_preview_roles()
-        self.transform_mode.setCurrentIndex(max(
-            0, self.transform_mode.findData(self.settings.transform_mode)
-        ))
         if entity is not None:
             self.opacity_lock.setChecked(entity.opacity_locked)
             self.font_family.setCurrentText(entity.font_family)
@@ -632,8 +583,6 @@ class TextObjectControls(QObject):
             strict = entity.layout_mode == "strict"
             self.margin_label.setVisible(strict)
             self.margin.setVisible(strict)
-            self.transform_label.setVisible(not strict)
-            self.transform_mode.setVisible(not strict)
             compound = self.canvas.chapter.closest_compound_ancestor(
                 entity.parent_layer_id, include_self=True
             )
@@ -712,19 +661,6 @@ class TextObjectControls(QObject):
         self.settings.preview_font_names = bool(checked)
         self._set_font_preview_roles()
         self.settingsChanged.emit()
-
-    def _transform_mode_changed(self, *args) -> None:
-        del args
-        if self._loading:
-            return
-        mode = str(self.transform_mode.currentData())
-        if mode not in {"free", "uniform"}:
-            return
-        self._commit_text_session()
-        self.settings.transform_mode = mode
-        self.settings.clamp()
-        self.settingsChanged.emit()
-        self.canvas.update()
 
     def _opacity_lock_changed(self, checked: bool) -> None:
         entity = self._selected()
@@ -873,29 +809,7 @@ class VectorToolsControls(QObject):
         self.redraw_widget = self._build_redraw_widget()
         self.connect_widget = self._build_connect_widget()
         self.simplify_widget = self._build_simplify_widget()
-        self.transform_widget = self._build_transform_widget()
         self.refresh()
-
-    def _build_transform_widget(self) -> QWidget:
-        widget = QWidget()
-        layout = QVBoxLayout(widget)
-        layout.setContentsMargins(0, 0, 0, 0)
-        row = QHBoxLayout()
-        row.addWidget(QLabel("Mode", widget))
-        self.transform_mode = QComboBox(widget)
-        self.transform_mode.addItem("Free", "free")
-        self.transform_mode.addItem("Uniform", "uniform")
-        self.transform_mode.setToolTip(
-            "Free moves corners independently and edges in connected pairs; "
-            "Uniform scales the complete selection."
-        )
-        row.addWidget(self.transform_mode)
-        layout.addLayout(row)
-        layout.addStretch(1)
-        self.transform_mode.currentIndexChanged.connect(
-            self._transform_mode_changed
-        )
-        return widget
 
     def _build_redraw_widget(self) -> QWidget:
         widget = QWidget()
@@ -1048,20 +962,7 @@ class VectorToolsControls(QObject):
             else self.settings.vector_redraw_opacity_max
         )
         self.simplify_amount.setValue(self.settings.vector_simplify_amount)
-        self.transform_mode.setCurrentIndex(max(
-            0, self.transform_mode.findData(self.settings.transform_mode)
-        ))
         self._loading = False
-
-    def _transform_mode_changed(self) -> None:
-        if self._loading:
-            return
-        mode = str(self.transform_mode.currentData())
-        if mode not in {"free", "uniform"}:
-            return
-        self.settings.transform_mode = mode
-        self.settings.clamp()
-        self.settingsChanged.emit()
 
     def set_selection_summary(
         self, selected_points: int, selected_strokes: int, total_strokes: int
@@ -1211,7 +1112,6 @@ class RasterObjectControls(QObject):
         self._loading = False
         self._slider_before: dict[str, dict] = {}
         self.object_widget = self._build_object_widget()
-        self.transform_widget = self._build_transform_widget()
         self.refresh()
 
     def _build_object_widget(self) -> QWidget:
@@ -1284,25 +1184,6 @@ class RasterObjectControls(QObject):
             lambda current=key: self._finish_slider(current)
         )
 
-    def _build_transform_widget(self) -> QWidget:
-        widget = QWidget()
-        layout = QHBoxLayout(widget)
-        layout.setContentsMargins(0, 0, 0, 0)
-        layout.addWidget(QLabel("Mode", widget))
-        self.transform_mode = QComboBox(widget)
-        self.transform_mode.addItem("Free", "free")
-        self.transform_mode.addItem("Uniform", "uniform")
-        self.transform_mode.setToolTip(
-            "Free moves corners independently and edges in connected pairs; "
-            "Uniform scales the complete raster."
-        )
-        layout.addWidget(self.transform_mode)
-        layout.addStretch(1)
-        self.transform_mode.currentIndexChanged.connect(
-            self._transform_changed
-        )
-        return widget
-
     def _selected(self) -> RasterObject | None:
         if (
             self.canvas.chapter is None
@@ -1336,9 +1217,6 @@ class RasterObjectControls(QObject):
                     entity.geometry_reference
                 )
             ))
-        self.transform_mode.setCurrentIndex(max(
-            0, self.transform_mode.findData(self.settings.transform_mode)
-        ))
         self._loading = False
 
     def _write_controls(self, entity: RasterObject) -> None:
@@ -1416,13 +1294,3 @@ class RasterObjectControls(QObject):
             )
             self.objectChanged.emit()
         self.canvas.interactionFinished.emit()
-
-    def _transform_changed(self) -> None:
-        if self._loading:
-            return
-        mode = str(self.transform_mode.currentData())
-        if mode not in {"free", "uniform"}:
-            return
-        self.settings.transform_mode = mode
-        self.settings.clamp()
-        self.settingsChanged.emit()
