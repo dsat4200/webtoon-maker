@@ -97,12 +97,12 @@
             "state": {
               "type": "markdown",
               "state": {
-                "file": "Not Implemented.md",
+                "file": "prompt to start the 3d merge.md",
                 "mode": "source",
                 "source": false
               },
               "icon": "lucide-file",
-              "title": "Not Implemented"
+              "title": "prompt to start the 3d merge"
             }
           },
           {
@@ -300,8 +300,10 @@
   },
   "active": "77bf8cab7e289028",
   "lastOpenFiles": [
-    "implemented.md",
+    "Basic 3D - blender pipeline.md",
     "Not Implemented.md",
+    "Pasted image 20260728213053.png",
+    "implemented.md",
     "Pasted image 20260806082328.png",
     "Asset Ideas.md",
     "tooltips.md",
@@ -313,14 +315,12 @@
     "resources.md",
     "planning.md",
     "Ideal Process notes.md",
-    "Pasted image 20260728213053.png",
     "prompt to start the 3d merge.md",
     "the current process, for now.md",
     "Chapters/Chapter 1-5.md",
     "Chapters/Chapter 2.md",
     "Pasted image 20260730190248.png",
     "art notes.md",
-    "Basic 3D - blender pipeline.md",
     "Pasted image 20260730092616.png",
     "Pasted image 20260729230030.png",
     "Pasted image 20260729230012.png",

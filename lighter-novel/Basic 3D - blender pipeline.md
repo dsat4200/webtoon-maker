@@ -1,5 +1,5 @@
-i've done some thinking
-I'd want it to be mostly unidirectional - changes from blender go to the drawing program, but not vice versa (except for say, character pose data, camera, light, and object positions, camera and light parameters)
+a blender pipeline that allows for realtime scene visualization and drawovers in the webcomic program
+ changes from blender go to the drawing program, but not vice versa (except for say, character pose data, camera, light, and object positions, camera and light parameters)
 material assignments are preserved, but mappings occur to the drawing program's 3d model viewer which has its own material creation workflow.
 textures, geometry, vertex color data, visibility, transforms, etc sync over
 basic modifiers' resulting geometry should still be visible in the drawing program - mirror, armature, solidify, array, subdivision for instance (no geo nodes)

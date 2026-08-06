@@ -32,21 +32,23 @@ Object features
 - outline support
 	- has a color, thickness.
 	- no anti-aliasing, global anti aliasing toggle?
-## more tweaks (next)
-- visibility and opacity sliders should be pinned to the top of the outliner, but below the selected object properties row.
-- text opacity is currently locking and wont let me change it (bug)
-	- same with gradients, images, speed lines, etc
-- remove speed lines feature. i didn't think it out very well
-- asset library shouldn't have a column - just put all the assets there in a grid (items wide -  however many fit, vertical with scroll bar.) and let the user scroll vertically instead of horizontally to traverse them. also include folders. let the user click an "add folder" button at the bottom of the assets window to add a folder (plus folder icon), with a delete folder button next to it (trash icon), and the name of the folder (editable text field) between the two in that row (these operations only apply to the selected folder, only one folder selectable at a time)
-	- folder icon should be, well, a folder icon, fitting the square icons of the rest of the items in the asset browser but with a visible 2x2 grid of the icons of the first 4 items in the folder, with a 8px margin between them. (and the name of the folder below the folder icon as well)
-	- right clicking any asset or folder should let you rename or delete them as well.
+
 
 
 ## more tweaks
 - dragging assets into folders isn't working (bug)
 
 
+
+
 ## New feature - repeating texture editor
+- add an "asset settings" ribbon menu that only exposes when an asset is open.
+- this lets you change the name of the asset
+- in this asset settings menu, include a button that lets you toggle to enable repeating texture mode. this creates a root object called the repeating texture object.
+	- now, instead of dragging 
+	- while in repeating mode, 2 vertical tabs should appear (below the scroll window popout) that say "tile edit mode" and "source asset mode".
+- https://repper.notion.site/Repper-Help-Centre-044964e7366843bcaa1ac04cdef96b59
+- 
 ## New Feature - Image Imports
 image import support
  makes a new object under the currently selected object in the same parent. images are a new "image object" type. they have by default a free transformable (or uniform) 8 handle box around, behaves the same as it would in a raster layer.

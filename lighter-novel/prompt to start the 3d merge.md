@@ -1,9 +1,3 @@
-## first
-implement speed lines
-implement asset browser, assets
-do a code review, architecture pass
-plan for futureproofing should a 3d engine be implemented later
-
 
 @Document 3D renderer codebase
 @Document webcomic codebase
@@ -30,6 +24,7 @@ do not import
 
 the blender sync requirements:
 - would include a blender plugin to aid in syncing
+- uses blender 4.5.5 LTS as its blender, and therefore uses its version of the scripting syntax.
 - blender owns the source data - espeically geometry, armatures, and collections. the drawing application owns the per-comic-frame presentation overrides (lighting, pose data, camera views or metadata, which perspective type (since blender only has 2), etc). the drawing program side has limited control - implementing controls on a case by case basis as i see fit, updating the comic frame data.
 - blender mesh edits and transformations would sync to the program
 - each "blender object" in the comic is associated with a specific blender "comic frame" - choosable in the blender addon.
@@ -76,3 +71,5 @@ the 3d blender object (webcomic project)
 			- also, support shift to add, control to remove from selection, both with cursor icon changes. this disables the pantiltzoom controls
 				- only enable this feature if "enable multi select" is enabled (off by default) in ribbon menu tool settings
 	- selecting a non-3d layer reverts back to 2d mode.
+
+architecturally, the program should be extensible (easy to add new features) and adhere to best practices 
