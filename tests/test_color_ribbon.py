@@ -3,6 +3,7 @@ from __future__ import annotations
 from PySide6.QtCore import QPoint, Qt
 from PySide6.QtGui import QColor
 from PySide6.QtTest import QTest
+from PySide6.QtWidgets import QSizePolicy
 
 from comic_editor.ui.color_picker import (
     ColorSwatchButton,
@@ -52,13 +53,27 @@ def test_primary_secondary_panel_hex_edit_copy_and_paste(qapp):
 def test_ribbon_context_pages_keep_stable_order(qapp):
     ribbon = RibbonWidget()
     color = ribbon.add_page("color", "Color")
-    color.add_group("Palette", minimum_width=220)
+    palette = color.add_group("Palette", minimum_width=220)
     ribbon.add_page("settings", "Tool Settings")
     ribbon.add_page("vector", "Vector Tools", visible=False)
 
     assert ribbon.page_keys() == ["color", "settings", "vector"]
     assert ribbon.page_keys(visible_only=True) == ["color", "settings"]
     assert ribbon.current_key() == "color"
+    assert ribbon.orientation == Qt.Orientation.Horizontal
+    assert color.horizontalScrollBarPolicy() == (
+        Qt.ScrollBarPolicy.ScrollBarAsNeeded
+    )
+    assert color.verticalScrollBarPolicy() == (
+        Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+    )
+    assert palette.minimumWidth() == 220
+    assert palette.sizePolicy().horizontalPolicy() == (
+        QSizePolicy.Policy.Minimum
+    )
+    assert palette.sizePolicy().verticalPolicy() == (
+        QSizePolicy.Policy.Expanding
+    )
     assert ribbon.select_page("settings")
     ribbon.set_page_visible("vector", True)
     assert ribbon.current_key() == "settings"

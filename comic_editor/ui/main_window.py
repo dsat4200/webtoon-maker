@@ -9,7 +9,7 @@ from pathlib import Path
 
 from PySide6.QtCore import (
     QCoreApplication, QEvent, QItemSelection, QItemSelectionModel, QModelIndex,
-    QPointF, QSignalBlocker, QTimer, Qt, Signal,
+    QPointF, QSignalBlocker, QSize, QTimer, Qt, Signal,
 )
 from PySide6.QtGui import (
     QAction, QCloseEvent, QCursor, QKeySequence, QMouseEvent, QShortcut,
@@ -38,11 +38,13 @@ from comic_editor.core.commands import CommandStack
 from comic_editor.core.settings import load_settings, save_settings
 from comic_editor.core.tiles import TileStore
 from comic_editor.ui.canvas import ToolKind, create_canvas
-from comic_editor.ui.inspector import ContextInspector
 from comic_editor.ui.color_picker import (
     PaletteEditorWidget, PrimarySecondaryColorPanel, canonical_argb,
 )
-from comic_editor.ui.layer_settings import LayerSettingsPanel
+from comic_editor.ui.selection_settings import (
+    SelectionCommonControls, SelectionSettingsPanel,
+)
+from comic_editor.ui.icons import iconoir
 from comic_editor.ui.hotkeys_dialog import HotkeysDialog
 from comic_editor.ui.hotkeys import (
     MODIFIER_LABELS, chord_keys, chord_text,
@@ -54,13 +56,46 @@ from comic_editor.ui.pencil_settings_dialog import PencilSettingsDialog
 from comic_editor.ui.preview import ChapterPreview
 from comic_editor.ui.ribbon import RibbonWidget
 from comic_editor.ui.tool_ribbon_pages import (
-    RasterObjectControls, TextObjectControls, ToolSettingsControls,
-    VectorToolsControls,
+    TextObjectControls, ToolSettingsControls, VectorToolsControls,
 )
 from comic_editor.ui.tree_model import HierarchyModel
 from comic_editor.ui.asset_library import AssetLibraryWidget
 from comic_editor.ui.sessions import EditorSession, ProjectContext
 from comic_editor.ui.windows_input import tablet_multitouch_native_result
+
+
+class ResponsiveToolButton(QToolButton):
+    """Fixed-height command button that reveals its label when it fits."""
+
+    def __init__(
+        self, label: str, icon_name: str, parent: QWidget | None = None,
+    ):
+        super().__init__(parent)
+        self.command_label = label
+        self.setText(label)
+        self.setIcon(iconoir(icon_name))
+        self.setIconSize(QSize(20, 20))
+        self.setToolTip(label)
+        self.setMinimumWidth(36)
+        self.setFixedHeight(36)
+        self.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed
+        )
+        self._sync_style()
+
+    def resizeEvent(self, event) -> None:  # noqa: N802
+        super().resizeEvent(event)
+        self._sync_style()
+
+    def _sync_style(self) -> None:
+        required = 20 + 7 + self.fontMetrics().horizontalAdvance(
+            self.command_label
+        ) + 18
+        self.setToolButtonStyle(
+            Qt.ToolButtonStyle.ToolButtonTextBesideIcon
+            if self.width() >= required
+            else Qt.ToolButtonStyle.ToolButtonIconOnly
+        )
 
 
 class CollapsibleToolCategory(QWidget):
@@ -73,13 +108,13 @@ class CollapsibleToolCategory(QWidget):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(2)
-        self.header = QToolButton(self)
+        self.header = ResponsiveToolButton(
+            title, "nav-arrow-right", self
+        )
         self.header.setObjectName("shapeCategoryHeader")
         self.header.setText(title)
         self.header.setCheckable(False)
         self.header.setAutoRaise(True)
-        self.header.setArrowType(Qt.RightArrow)
-        self.header.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
         layout.addWidget(self.header)
         self.contents = QWidget(self)
         self.contents_layout = QVBoxLayout(self.contents)
@@ -92,10 +127,8 @@ class CollapsibleToolCategory(QWidget):
             lambda checked=False: self.setExpanded(not self._expanded)
         )
 
-    def addTool(self, text: str) -> QToolButton:
-        button = QToolButton(self.contents)
-        button.setText(text)
-        button.setToolButtonStyle(Qt.ToolButtonTextOnly)
+    def addTool(self, text: str, icon_name: str) -> QToolButton:
+        button = ResponsiveToolButton(text, icon_name, self.contents)
         self.contents_layout.addWidget(button)
         return button
 
@@ -108,7 +141,9 @@ class CollapsibleToolCategory(QWidget):
             return
         self._expanded = expanded
         self.contents.setVisible(expanded)
-        self.header.setArrowType(Qt.DownArrow if expanded else Qt.RightArrow)
+        self.header.setIcon(iconoir(
+            "nav-arrow-down" if expanded else "nav-arrow-right"
+        ))
         self.updateGeometry()
         self.expandedChanged.emit(expanded)
 
@@ -119,6 +154,8 @@ class ScrollableToolPanel(QWidget):
     def __init__(self, parent: QWidget | None = None):
         super().__init__(parent)
         self.setObjectName("toolPanel")
+        self.setMinimumWidth(36)
+        self.setMaximumWidth(260)
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
         self.scroll_area = QScrollArea(self)
@@ -127,11 +164,14 @@ class ScrollableToolPanel(QWidget):
         self.scroll_area.setHorizontalScrollBarPolicy(
             Qt.ScrollBarPolicy.ScrollBarAlwaysOff
         )
+        self.scroll_area.setVerticalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+        )
         self.contents = QWidget(self.scroll_area)
         self.contents.setObjectName("toolPanelContents")
         self.contents_layout = QVBoxLayout(self.contents)
-        self.contents_layout.setContentsMargins(6, 6, 6, 6)
-        self.contents_layout.setSpacing(4)
+        self.contents_layout.setContentsMargins(0, 2, 0, 2)
+        self.contents_layout.setSpacing(2)
         self.contents_layout.addStretch(1)
         self.scroll_area.setWidget(self.contents)
         outer.addWidget(self.scroll_area)
@@ -149,6 +189,50 @@ class ScrollableToolPanel(QWidget):
         separator.setFrameShadow(QFrame.Shadow.Plain)
         self.addWidget(separator)
         return separator
+
+
+class NavigatorPanel(QWidget):
+    """A slim persistent rail with an optional chapter preview."""
+
+    expandedChanged = Signal(bool)
+
+    def __init__(
+        self, canvas, expanded: bool = False, parent: QWidget | None = None,
+    ):
+        super().__init__(parent)
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+        rail = QWidget(self)
+        rail.setFixedWidth(24)
+        rail_layout = QVBoxLayout(rail)
+        rail_layout.setContentsMargins(0, 2, 0, 0)
+        self.toggle = QToolButton(rail)
+        self.toggle.setFixedSize(24, 32)
+        rail_layout.addWidget(self.toggle)
+        rail_layout.addStretch(1)
+        self.preview = ChapterPreview(canvas, self)
+        layout.addWidget(rail)
+        layout.addWidget(self.preview)
+        self.toggle.clicked.connect(
+            lambda checked=False: self.setExpanded(not self.isExpanded())
+        )
+        self.setExpanded(expanded, emit=False)
+
+    def isExpanded(self) -> bool:
+        return not self.preview.isHidden()
+
+    def setExpanded(self, expanded: bool, *, emit: bool = True) -> None:
+        expanded = bool(expanded)
+        self.preview.setVisible(expanded)
+        self.toggle.setText("›" if expanded else "‹")
+        self.toggle.setToolTip(
+            "Collapse page navigator" if expanded
+            else "Expand page navigator"
+        )
+        self.setFixedWidth(116 if expanded else 24)
+        if emit:
+            self.expandedChanged.emit(expanded)
 
 
 class MainWindow(QMainWindow):
@@ -212,6 +296,20 @@ class MainWindow(QMainWindow):
         self.undo_action = self.file_toolbar.addAction("Undo")
         self.redo_action = self.file_toolbar.addAction("Redo")
         self.file_toolbar.addSeparator()
+        self.hotkeys_action = self.file_toolbar.addAction("Hotkeys…")
+        self.tablet_mode = QCheckBox("Tablet Navigation", self.file_toolbar)
+        self.tablet_mode.setChecked(self.settings.tablet_mode)
+        self.reset_view_button = QToolButton(self.file_toolbar)
+        self.reset_view_button.setText("Reset View")
+        self.reset_view_button.setToolButtonStyle(
+            Qt.ToolButtonStyle.ToolButtonTextOnly
+        )
+        self.snap_grid = QCheckBox("Snap to grid", self.file_toolbar)
+        self.snap_grid.setChecked(self.settings.snap_to_grid)
+        self.file_toolbar.addWidget(self.tablet_mode)
+        self.file_toolbar.addWidget(self.reset_view_button)
+        self.file_toolbar.addWidget(self.snap_grid)
+        self.file_toolbar.addSeparator()
         self.chapter_combo = QComboBox()
         self.chapter_combo.setMinimumWidth(190)
         self.file_toolbar.addWidget(QLabel("Chapter"))
@@ -219,30 +317,29 @@ class MainWindow(QMainWindow):
         self.new_chapter_action = self.file_toolbar.addAction("New Chapter")
         self.trim_action = self.file_toolbar.addAction("Trim Height")
         self.fullscreen_action = self.file_toolbar.addAction("Fullscreen")
-        self.hotkeys_action = self.file_toolbar.addAction("Hotkeys…")
 
         self.tool_toolbar = ScrollableToolPanel(self)
-        self.tool_toolbar.setMinimumHeight(120)
         self.tool_buttons: dict[ToolKind, QToolButton] = {}
         labels = [
-            (ToolKind.OBJECT_SELECT, "Object Select"),
-            (ToolKind.RASTER_PENCIL, "Pencil"),
-            (ToolKind.RASTER_ERASER, "Eraser"),
+            (ToolKind.OBJECT_SELECT, "Object Select", "cursor-pointer"),
+            (ToolKind.RASTER_PENCIL, "Pencil", "design-pencil"),
+            (ToolKind.RASTER_ERASER, "Eraser", "erase"),
         ]
         fill_tool = getattr(ToolKind, "FILL", None)
         if fill_tool is not None:
-            labels.append((fill_tool, "Fill"))
+            labels.append((fill_tool, "Fill", "fill-color"))
         labels.extend([
-            (ToolKind.TEXT_EDIT, "Text Edit"),
-            (ToolKind.TRANSFORM, "Transform"),
-            (ToolKind.SHAPE_EDIT, "Shape Edit"),
-            (ToolKind.INSERT_PAGE_GAP, "Insert Page Gap"),
+            (ToolKind.TEXT_EDIT, "Text Edit", "text"),
+            (ToolKind.TRANSFORM, "Transform", "frame-tool"),
+            (ToolKind.SHAPE_EDIT, "Shape Edit", "edit-pencil"),
+            (
+                ToolKind.INSERT_PAGE_GAP, "Insert Page Gap",
+                "split-square-dashed",
+            ),
         ])
-        for tool, label in labels:
-            button = QToolButton()
-            button.setText(label)
+        for tool, label, icon_name in labels:
+            button = ResponsiveToolButton(label, icon_name)
             button.setCheckable(True)
-            button.setToolButtonStyle(Qt.ToolButtonTextOnly)
             button.clicked.connect(lambda checked=False, selected=tool: self._activate_tool(selected))
             self.tool_toolbar.addWidget(button)
             self.tool_buttons[tool] = button
@@ -251,8 +348,9 @@ class MainWindow(QMainWindow):
         else:
             # Keeps the UI importable while a renderer without vector/fill
             # support is being upgraded in-place.
-            self.fill_tool_button = QToolButton()
-            self.fill_tool_button.setText("Fill")
+            self.fill_tool_button = ResponsiveToolButton(
+                "Fill", "fill-color"
+            )
             self.fill_tool_button.setCheckable(True)
             self.fill_tool_button.clicked.connect(
                 lambda checked=False: self._activate_named_tool("FILL")
@@ -261,12 +359,12 @@ class MainWindow(QMainWindow):
         self.shapes_category = CollapsibleToolCategory("Shapes")
         self.tool_toolbar.addWidget(self.shapes_category)
         self.shape_tool_buttons: dict[ToolKind, QToolButton] = {}
-        for label, tool in (
-            ("Add Rectangle", ToolKind.BOX_BOUND),
-            ("Add Circle", ToolKind.CIRCLE_BOUND),
-            ("Add Shape", ToolKind.SHAPE_CREATE),
+        for label, icon_name, tool in (
+            ("Rectangle", "plus-square-dashed", ToolKind.BOX_BOUND),
+            ("Circle", "circle", ToolKind.CIRCLE_BOUND),
+            ("Free Shape", "path-arrow", ToolKind.SHAPE_CREATE),
         ):
-            option = self.shapes_category.addTool(label)
+            option = self.shapes_category.addTool(label, icon_name)
             option.clicked.connect(
                 lambda checked=False, selected=tool:
                 self._activate_tool(selected)
@@ -277,12 +375,12 @@ class MainWindow(QMainWindow):
         )
         self.tool_toolbar.addWidget(self.drawing_selection_category)
         self.drawing_selection_buttons: dict[ToolKind, QToolButton] = {}
-        for label, tool in (
-            ("Rectangle Select", ToolKind.DRAW_SELECT_RECT),
-            ("Lasso Select", ToolKind.DRAW_SELECT_LASSO),
-            ("Stroke Select", ToolKind.DRAW_SELECT_STROKE),
+        for label, icon_name, tool in (
+            ("Rectangle Select", "select-window", ToolKind.DRAW_SELECT_RECT),
+            ("Lasso Select", "selective-tool", ToolKind.DRAW_SELECT_LASSO),
+            ("Stroke Select", "frame-select", ToolKind.DRAW_SELECT_STROKE),
         ):
-            option = self.drawing_selection_category.addTool(label)
+            option = self.drawing_selection_category.addTool(label, icon_name)
             option.setCheckable(True)
             option.clicked.connect(
                 lambda checked=False, selected=tool:
@@ -290,36 +388,25 @@ class MainWindow(QMainWindow):
             )
             self.drawing_selection_buttons[tool] = option
         self.tool_toolbar.addSeparator()
-        self.add_text_button = QToolButton()
-        self.add_text_button.setText("Add Text")
-        self.add_raster_button = QToolButton()
-        self.add_raster_button.setText("Add Raster")
-        self.add_vector_button = QToolButton()
-        self.add_vector_button.setText("Add Vector Drawing")
-        self.add_fill_button = QToolButton()
-        self.add_fill_button.setText("Add Fill")
+        self.add_page_button = ResponsiveToolButton("Add Page", "page-plus")
+        self.add_text_button = ResponsiveToolButton("Add Text", "text-square")
+        self.add_raster_button = ResponsiveToolButton(
+            "Add Raster", "media-image-plus"
+        )
+        self.add_vector_button = ResponsiveToolButton(
+            "Add Vector Drawing", "curve-array"
+        )
+        self.add_fill_button = ResponsiveToolButton("Add Fill", "fill-color")
+        self.tool_toolbar.addWidget(self.add_page_button)
         self.tool_toolbar.addWidget(self.add_fill_button)
         self.tool_toolbar.addWidget(self.add_text_button)
         self.tool_toolbar.addWidget(self.add_raster_button)
         self.tool_toolbar.addWidget(self.add_vector_button)
-        self.tool_toolbar.addSeparator()
-        self.reset_view_button = QToolButton()
-        self.reset_view_button.setText("Reset View")
-        self.tool_toolbar.addWidget(self.reset_view_button)
-        self.tablet_mode = QCheckBox("Tablet navigation")
-        self.tablet_mode.setChecked(self.settings.tablet_mode)
-        self.tool_toolbar.addWidget(self.tablet_mode)
         self.page_scope = QCheckBox("Select in page")
         self.page_scope.setChecked(self.settings.page_scope_select)
         # Kept as an attribute for compatibility with older integrations;
         # entity selection now always searches the complete chapter.
         self.page_scope.hide()
-        self.snap_grid = QCheckBox("Snap to grid")
-        self.snap_grid.setChecked(self.settings.snap_to_grid)
-        self.tool_toolbar.addWidget(self.snap_grid)
-
-        self.tool_toolbar.addSeparator()
-
         self.color_tabs = QTabWidget(self)
         self.color_tabs.setObjectName("colorTabs")
         self.color_tabs.setMinimumHeight(225)
@@ -346,8 +433,10 @@ class MainWindow(QMainWindow):
         palette_layout.addWidget(self.palette_editor)
         self.color_tabs.addTab(palette_page, "Palette")
 
-        self.ribbon = RibbonWidget(self)
-        self.ribbon.setMinimumHeight(105)
+        self.ribbon = RibbonWidget(
+            self, orientation=Qt.Orientation.Vertical
+        )
+        self.ribbon.setMinimumWidth(220)
 
         self.tool_settings_page = self.ribbon.add_page(
             "tool_settings", "Tool Settings"
@@ -396,14 +485,6 @@ class MainWindow(QMainWindow):
         transform_group.add_widget(
             self.vector_tools_controls.transform_widget
         )
-        self.raster_object_page = self.ribbon.add_page(
-            "raster_object_settings", "Raster Object Settings",
-            visible=False,
-        )
-        canvas_row = QWidget(self)
-        canvas_layout = QHBoxLayout(canvas_row)
-        canvas_layout.setContentsMargins(0, 0, 0, 0)
-        canvas_layout.setSpacing(0)
         self.canvas = create_canvas(self.settings)
         self.text_object_controls = TextObjectControls(
             self.canvas, self.settings, self.ribbon
@@ -432,21 +513,6 @@ class MainWindow(QMainWindow):
             self.text_layout_group,
         ):
             group.hide()
-        self.raster_object_controls = RasterObjectControls(
-            self.canvas, self.settings, self.ribbon
-        )
-        raster_object_group = self.raster_object_page.add_group(
-            "Object Settings", minimum_width=310
-        )
-        raster_object_group.add_widget(
-            self.raster_object_controls.object_widget
-        )
-        raster_transform_group = self.raster_object_page.add_group(
-            "Transform Settings", minimum_width=190
-        )
-        raster_transform_group.add_widget(
-            self.raster_object_controls.transform_widget
-        )
         self.gradient_tools_page = self.ribbon.add_page(
             "gradient_tools", "Gradient Tools", visible=False
         )
@@ -487,30 +553,37 @@ class MainWindow(QMainWindow):
             self._update_gradient_group_visibility
         )
         self._update_gradient_group_visibility("create")
-        self.preview = ChapterPreview(self.canvas)
-        canvas_layout.addWidget(self.preview)
+        canvas_shell = QWidget(self)
+        canvas_layout = QHBoxLayout(canvas_shell)
+        canvas_layout.setContentsMargins(0, 0, 0, 0)
+        canvas_layout.setSpacing(0)
         canvas_layout.addWidget(self.canvas, 1)
+        self.navigator_panel = NavigatorPanel(
+            self.canvas, self.settings.navigator_expanded, canvas_shell
+        )
+        self.preview = self.navigator_panel.preview
+        canvas_layout.addWidget(self.navigator_panel)
 
         self.sidebar_splitter = QSplitter(Qt.Orientation.Vertical, self)
         self.sidebar_splitter.setObjectName("sidebarSplitter")
         self.sidebar_splitter.setChildrenCollapsible(False)
         self.sidebar_splitter.setHandleWidth(6)
-        self.sidebar_splitter.setMinimumWidth(190)
-        self.sidebar_splitter.addWidget(self.tool_toolbar)
+        self.sidebar_splitter.setMinimumWidth(220)
+        self.sidebar_splitter.addWidget(self.ribbon)
         self.sidebar_splitter.addWidget(self.color_tabs)
         self.sidebar_splitter.setStretchFactor(0, 1)
         self.sidebar_splitter.setStretchFactor(1, 1)
 
-        self.ribbon_canvas_splitter = QSplitter(
-            Qt.Orientation.Vertical, self
+        self.tool_canvas_splitter = QSplitter(
+            Qt.Orientation.Horizontal, self
         )
-        self.ribbon_canvas_splitter.setObjectName("ribbonCanvasSplitter")
-        self.ribbon_canvas_splitter.setChildrenCollapsible(False)
-        self.ribbon_canvas_splitter.setHandleWidth(6)
-        self.ribbon_canvas_splitter.addWidget(self.ribbon)
-        self.ribbon_canvas_splitter.addWidget(canvas_row)
-        self.ribbon_canvas_splitter.setStretchFactor(0, 0)
-        self.ribbon_canvas_splitter.setStretchFactor(1, 1)
+        self.tool_canvas_splitter.setObjectName("toolCanvasSplitter")
+        self.tool_canvas_splitter.setChildrenCollapsible(False)
+        self.tool_canvas_splitter.setHandleWidth(5)
+        self.tool_canvas_splitter.addWidget(self.tool_toolbar)
+        self.tool_canvas_splitter.addWidget(canvas_shell)
+        self.tool_canvas_splitter.setStretchFactor(0, 0)
+        self.tool_canvas_splitter.setStretchFactor(1, 1)
 
         self.workspace_splitter = QSplitter(
             Qt.Orientation.Horizontal, self
@@ -519,7 +592,7 @@ class MainWindow(QMainWindow):
         self.workspace_splitter.setChildrenCollapsible(False)
         self.workspace_splitter.setHandleWidth(6)
         self.workspace_splitter.addWidget(self.sidebar_splitter)
-        self.workspace_splitter.addWidget(self.ribbon_canvas_splitter)
+        self.workspace_splitter.addWidget(self.tool_canvas_splitter)
         self.workspace_splitter.setStretchFactor(0, 0)
         self.workspace_splitter.setStretchFactor(1, 1)
         central = QWidget(self)
@@ -535,17 +608,39 @@ class MainWindow(QMainWindow):
         central_layout.addWidget(self.project_tabs)
         central_layout.addWidget(self.workspace_splitter, 1)
         self.setCentralWidget(central)
-        self._restore_workspace_layout()
 
         self.hierarchy_dock = QDockWidget("Layers and Objects", self)
         self.hierarchy_dock.setAllowedAreas(Qt.RightDockWidgetArea)
+        self.hierarchy_dock.setFeatures(QDockWidget.DockWidgetFeature.NoDockWidgetFeatures)
+        dock_title = QWidget(self.hierarchy_dock)
+        dock_title.setFixedHeight(0)
+        self.hierarchy_dock.setTitleBarWidget(dock_title)
         hierarchy_panel = QWidget()
         hierarchy_layout = QVBoxLayout(hierarchy_panel)
-        hierarchy_layout.setContentsMargins(6, 6, 6, 6)
-        self.layer_settings = LayerSettingsPanel(
+        hierarchy_layout.setContentsMargins(4, 4, 4, 4)
+        hierarchy_layout.setSpacing(3)
+        self.selection_common = SelectionCommonControls(
+            self.canvas, hierarchy_panel
+        )
+        hierarchy_layout.addWidget(self.selection_common)
+        self.selection_settings = SelectionSettingsPanel(
             self.canvas, self.settings, save_settings, hierarchy_panel
         )
-        hierarchy_layout.addWidget(self.layer_settings)
+        # Keep the established layer/raster attributes available to internal
+        # integrations while the visible host is now selection-driven.
+        self.layer_settings = self.selection_settings.layer_page
+        self.raster_object_controls = self.selection_settings.raster_controls
+        self.settings_scroll = QScrollArea(hierarchy_panel)
+        self.settings_scroll.setObjectName("selectionSettingsScroll")
+        self.settings_scroll.setWidgetResizable(True)
+        self.settings_scroll.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+        )
+        self.settings_scroll.setVerticalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAsNeeded
+        )
+        self.settings_scroll.setMinimumHeight(56)
+        self.settings_scroll.setWidget(self.selection_settings)
         self.tree = QTreeView()
         self.tree.setSelectionMode(QTreeView.SingleSelection)
         self.tree.setDragDropMode(QTreeView.InternalMove)
@@ -569,27 +664,21 @@ class MainWindow(QMainWindow):
         )
         self.tree.header().setStretchLastSection(False)
         self.tree.header().setSectionResizeMode(0, QHeaderView.Stretch)
-        hierarchy_layout.addWidget(self.tree, 1)
-
-        add_row = QHBoxLayout()
-        self.add_page_button = QPushButton("+ Page")
-        self.add_layer_button = QPushButton("+ Layer")
-        for button in (self.add_page_button, self.add_layer_button):
-            add_row.addWidget(button)
-        hierarchy_layout.addLayout(add_row)
-        self.delete_button = QPushButton("Delete Selected")
-        hierarchy_layout.addWidget(self.delete_button)
+        self.outliner_splitter = QSplitter(
+            Qt.Orientation.Vertical, hierarchy_panel
+        )
+        self.outliner_splitter.setObjectName("outlinerSettingsSplitter")
+        self.outliner_splitter.setChildrenCollapsible(False)
+        self.outliner_splitter.setHandleWidth(5)
+        self.outliner_splitter.addWidget(self.settings_scroll)
+        self.outliner_splitter.addWidget(self.tree)
+        self.outliner_splitter.setStretchFactor(0, 0)
+        self.outliner_splitter.setStretchFactor(1, 1)
+        hierarchy_layout.addWidget(self.outliner_splitter, 1)
 
         self.hierarchy_dock.setWidget(hierarchy_panel)
         self.addDockWidget(Qt.RightDockWidgetArea, self.hierarchy_dock)
-
-        self.inspector = ContextInspector(
-            self.canvas, self.settings, save_settings, self.canvas
-        )
-        # Tool controls now live in the ribbon; retain the inspector object
-        # panel itself while collapsing its legacy embedded tool row.
-        self.inspector.raster_tool_panel.setMaximumHeight(0)
-        self.inspector.raster_tool_panel.setMinimumHeight(0)
+        self._restore_workspace_layout()
         self.page_gap_confirmation = QFrame(self.canvas)
         self.page_gap_confirmation.setObjectName("pageGapConfirmation")
         self.page_gap_confirmation.setStyleSheet(
@@ -611,7 +700,6 @@ class MainWindow(QMainWindow):
         self.layout_settings_timer = QTimer(self)
         self.layout_settings_timer.setSingleShot(True)
         self._vector_ribbon_context = False
-        self._raster_ribbon_context = False
         self._text_ribbon_context = False
         self._gradient_ribbon_context = False
         self._selected_gradient_ribbon_id = ""
@@ -624,8 +712,8 @@ class MainWindow(QMainWindow):
         width = max(600, self.width())
         height = max(600, self.height())
         sidebar = stored.get("sidebar_workspace", [230, width - 230])
-        sidebar_width = max(190, min(
-            int(sidebar[0]), max(190, width - 480)
+        sidebar_width = max(220, min(
+            int(sidebar[0]), max(220, width - 480)
         ))
         self.workspace_splitter.setSizes(
             [sidebar_width, max(480, width - sidebar_width)]
@@ -638,42 +726,43 @@ class MainWindow(QMainWindow):
         color_minimum = max(
             225, self.color_tabs.minimumSizeHint().height()
         )
-        tools_minimum = max(
-            90, self.tool_toolbar.minimumSizeHint().height()
-        )
+        ribbon_minimum = 90
         available = max(
-            tools_minimum + color_minimum,
+            ribbon_minimum + color_minimum,
             int(tools_colors[0]) + int(tools_colors[1]),
-        )
-        tools_size = max(
-            tools_minimum,
-            min(int(tools_colors[0]), available - color_minimum),
-        )
-        self.sidebar_splitter.setSizes(
-            [tools_size, available - tools_size]
-        )
-
-        ribbon_canvas = stored.get("ribbon_canvas", [180, height - 180])
-        ribbon_minimum = max(105, self.ribbon.minimumSizeHint().height())
-        canvas_minimum = max(300, self.canvas.minimumSizeHint().height())
-        vertical_available = max(
-            ribbon_minimum + canvas_minimum,
-            int(ribbon_canvas[0]) + int(ribbon_canvas[1]),
         )
         ribbon_size = max(
             ribbon_minimum,
-            min(int(ribbon_canvas[0]), vertical_available - canvas_minimum),
+            min(int(tools_colors[0]), available - color_minimum),
         )
-        self.ribbon_canvas_splitter.setSizes(
-            [ribbon_size, vertical_available - ribbon_size]
+        self.sidebar_splitter.setSizes(
+            [ribbon_size, available - ribbon_size]
+        )
+
+        tool_canvas = stored.get("tool_canvas", [44, width - 44])
+        tool_width = max(36, min(260, int(tool_canvas[0])))
+        self.tool_canvas_splitter.setSizes(
+            [tool_width, max(320, int(tool_canvas[1]))]
+        )
+        outliner = stored.get(
+            "outliner_settings",
+            [round(height * 0.42), round(height * 0.58)],
+        )
+        self.outliner_splitter.setSizes(
+            [max(56, int(outliner[0])), max(120, int(outliner[1]))]
+        )
+        self.navigator_panel.setExpanded(
+            self.settings.navigator_expanded, emit=False
         )
 
     def _capture_workspace_layout(self) -> None:
         self.settings.ui_splitter_sizes = {
             "sidebar_workspace": self.workspace_splitter.sizes(),
             "tools_colors": self.sidebar_splitter.sizes(),
-            "ribbon_canvas": self.ribbon_canvas_splitter.sizes(),
+            "tool_canvas": self.tool_canvas_splitter.sizes(),
+            "outliner_settings": self.outliner_splitter.sizes(),
         }
+        self.settings.navigator_expanded = self.navigator_panel.isExpanded()
         self.settings.clamp()
 
     def _schedule_workspace_layout_save(self, *args) -> None:
@@ -708,10 +797,9 @@ class MainWindow(QMainWindow):
         self.canvas.hierarchyChanged.connect(self._hierarchy_changed)
         self.canvas.selectionChanged.connect(self._canvas_selection_changed)
         self.canvas.chapterReplaced.connect(self._chapter_replaced)
-        self.canvas.cameraChanged.connect(self.inspector.reposition)
         self.canvas.toolChanged.connect(self._canvas_tool_changed)
-        self.canvas.interactionFinished.connect(self.inspector.refresh)
-        self.canvas.interactionFinished.connect(self.layer_settings.refresh)
+        self.canvas.interactionFinished.connect(self.selection_common.refresh)
+        self.canvas.interactionFinished.connect(self.selection_settings.refresh)
         self.canvas.interactionFinished.connect(
             self.text_object_controls.refresh
         )
@@ -744,19 +832,10 @@ class MainWindow(QMainWindow):
                 lambda strokes, points: self._sync_contextual_ribbon()
             )
         self.canvas.command_stack.changed_callback = self._command_stack_changed
-        self.inspector.changed.connect(self._hierarchy_changed)
-        self.inspector.pencilPresetSelected.connect(
-            self._pencil_preset_selected
-        )
-        self.inspector.pencilSettingsRequested.connect(
-            self._edit_pencil_settings
-        )
-        self.inspector.brushSizeSelected.connect(
-            self._brush_size_selected
-        )
-        self.inspector.brushSizesRequested.connect(self._edit_brush_sizes)
-        self.inspector.eraserShapeChanged.connect(
-            self._eraser_shape_selected
+        self.selection_common.changed.connect(self._hierarchy_changed)
+        self.selection_settings.changed.connect(self._hierarchy_changed)
+        self.selection_settings.settingsChanged.connect(
+            self._ribbon_settings_changed
         )
         self.hierarchy_model.mutationCommitted.connect(self._tree_mutated)
         self.tree.selectionModel().selectionChanged.connect(self._tree_selection_changed)
@@ -775,19 +854,21 @@ class MainWindow(QMainWindow):
         for splitter in (
             self.workspace_splitter,
             self.sidebar_splitter,
-            self.ribbon_canvas_splitter,
+            self.tool_canvas_splitter,
+            self.outliner_splitter,
         ):
             splitter.splitterMoved.connect(
                 self._schedule_workspace_layout_save
             )
+        self.navigator_panel.expandedChanged.connect(
+            self._schedule_workspace_layout_save
+        )
 
         self.add_page_button.clicked.connect(self._add_page)
-        self.add_layer_button.clicked.connect(self._add_layer)
         self.add_raster_button.clicked.connect(self._add_raster)
         self.add_vector_button.clicked.connect(self._add_vector_drawing)
         self.add_text_button.clicked.connect(self._add_text)
         self.add_fill_button.clicked.connect(self._add_fill)
-        self.delete_button.clicked.connect(self._delete_selected)
 
         self.tool_settings_controls.pencilPresetSelected.connect(
             self._pencil_preset_selected
@@ -815,12 +896,6 @@ class MainWindow(QMainWindow):
         )
         self.vector_tools_controls.settingsChanged.connect(
             self._ribbon_settings_changed
-        )
-        self.raster_object_controls.settingsChanged.connect(
-            self._ribbon_settings_changed
-        )
-        self.raster_object_controls.objectChanged.connect(
-            self._hierarchy_changed
         )
         self.gradient_tools_controls.createRequested.connect(
             self._create_gradient
@@ -1475,8 +1550,8 @@ class MainWindow(QMainWindow):
                 self._sync_chapter_combo()
             self.setWindowTitle(f"{session.name} — Vertical Comic Editor")
             self.preview.invalidate_all()
-            self.inspector.refresh()
-            self.layer_settings.refresh()
+            self.selection_common.refresh()
+            self.selection_settings.refresh()
             self._sync_contextual_ribbon()
             self._refresh_actions()
             self._refresh_project_tabs()
@@ -1777,8 +1852,6 @@ class MainWindow(QMainWindow):
         # Pencil/Eraser activations are routed to Tool Settings.
         if isinstance(initial_object, VectorDrawingObject):
             initial_ribbon_page = "vector_tools"
-        elif isinstance(initial_object, RasterObject):
-            initial_ribbon_page = "raster_object_settings"
         else:
             initial_ribbon_page = ""
         self._refresh_actions()
@@ -2035,24 +2108,6 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(
             f"Created {page.name}", 3000
         )
-
-    def _add_layer(self) -> None:
-        placement = self.canvas._target_placement_for_new_bound()
-        if placement is None:
-            self.statusBar().showMessage("Select a page or layer first", 4000)
-            return
-        parent_id, insertion_index = placement
-        parent = self.chapter.layers[parent_id]
-        before = self.chapter.to_dict()
-        x, y, width, height = parent.bound.bbox()
-        layer = self.chapter.add_layer(
-            parent.layer_id, self._next_layer_name(),
-            BoundGeometry.rectangle(x, y, max(64, width), max(64, height)),
-            index=insertion_index,
-        )
-        after = self.chapter.to_dict()
-        self.canvas.push_model_change(before, after, "Add layer")
-        self._after_structure(layer.layer_id, "layer")
 
     def _add_raster(self) -> None:
         parent = self._selected_parent_layer(allow_page=True)
@@ -2575,16 +2630,12 @@ class MainWindow(QMainWindow):
         vector_tool_context = isinstance(
             selected_object, (VectorDrawingObject, VectorFillObject)
         )
-        raster_active = isinstance(selected_object, RasterObject)
         text_active = isinstance(selected_object, TextObject)
         selected_gradient = self.gradient_tools_controls.selected_gradient()
         gradient_selected = selected_gradient is not None
         gradient_parent_id = self._gradient_context_parent_id()
         gradient_active = bool(gradient_parent_id)
         entering = active and not self._vector_ribbon_context
-        entering_raster = (
-            raster_active and not self._raster_ribbon_context
-        )
         entering_text = text_active and not self._text_ribbon_context
         selected_gradient_id = (
             selected_gradient.object_id if gradient_selected else ""
@@ -2594,14 +2645,10 @@ class MainWindow(QMainWindow):
             and selected_gradient_id != self._selected_gradient_ribbon_id
         )
         self._vector_ribbon_context = active
-        self._raster_ribbon_context = raster_active
         self._text_ribbon_context = text_active
         self._gradient_ribbon_context = gradient_active
         self._selected_gradient_ribbon_id = selected_gradient_id
         self.ribbon.set_page_visible("vector_tools", active)
-        self.ribbon.set_page_visible(
-            "raster_object_settings", raster_active
-        )
         self.ribbon.set_page_visible("gradient_tools", gradient_active)
         self.tool_settings_group.setVisible(not text_active)
         for group in (
@@ -2619,8 +2666,6 @@ class MainWindow(QMainWindow):
             self._select_ribbon_page("tool_settings")
         elif entering:
             self._select_ribbon_page("vector_tools")
-        elif entering_raster:
-            self._select_ribbon_page("raster_object_settings")
         elif entering_gradient:
             self._select_ribbon_page("gradient_tools")
         elif self._manual_ribbon_page:
@@ -2646,8 +2691,6 @@ class MainWindow(QMainWindow):
             self.vector_tools_controls.set_selection_summary(
                 selected_points, selected_strokes, len(drawing.strokes)
             )
-        if raster_active:
-            self.raster_object_controls.refresh()
         if gradient_active:
             self.gradient_tools_controls.refresh()
             self._sync_gradient_presets()
@@ -2799,8 +2842,8 @@ class MainWindow(QMainWindow):
         self.chapter_combo.setItemText(0, f"Asset: {manifest.name}")
         self.setWindowTitle(f"{manifest.name} — Vertical Comic Editor")
         self.preview.invalidate_all()
-        self.inspector.refresh()
-        self.layer_settings.refresh()
+        self.selection_common.refresh()
+        self.selection_settings.refresh()
         self._sync_contextual_ribbon()
         session.dirty = False
         self._dirty = False
@@ -2956,8 +2999,8 @@ class MainWindow(QMainWindow):
             if vector_index.isValid():
                 self.tree.setExpanded(vector_index, True)
         self._expanded_selected_vector_id = new_vector_id
-        self.inspector.refresh()
-        self.layer_settings.refresh()
+        self.selection_common.refresh()
+        self.selection_settings.refresh()
         self._sync_tool_buttons()
         selected_object = (
             self.chapter.objects.get(entity_id)
@@ -2978,10 +3021,7 @@ class MainWindow(QMainWindow):
         self._refresh_actions()
 
     def _canvas_tool_changed(self, tool: ToolKind) -> None:
-        if tool == ToolKind.OBJECT_SELECT:
-            self.inspector.hide()
-        else:
-            self.inspector.refresh()
+        self.selection_settings.refresh()
         self._sync_tool_buttons()
         if tool in {
             ToolKind.RASTER_PENCIL, ToolKind.RASTER_ERASER, ToolKind.TEXT_EDIT,
@@ -3006,8 +3046,8 @@ class MainWindow(QMainWindow):
             if self.active_session.asset_manifest is not None:
                 self.active_session.asset_manifest.document = chapter
         self._refresh_hierarchy()
-        self.inspector.refresh()
-        self.layer_settings.refresh()
+        self.selection_common.refresh()
+        self.selection_settings.refresh()
         self.preview.invalidate_all()
         self._sync_tool_buttons()
         self._mark_dirty(None)
@@ -3016,8 +3056,8 @@ class MainWindow(QMainWindow):
         if self.chapter is not self.canvas.chapter:
             self.chapter = self.canvas.chapter
         self._refresh_hierarchy()
-        self.inspector.refresh()
-        self.layer_settings.refresh()
+        self.selection_common.refresh()
+        self.selection_settings.refresh()
         self.preview.invalidate_all()
         self._sync_tool_buttons()
 
@@ -3480,7 +3520,6 @@ class MainWindow(QMainWindow):
         self.autosave_timer.start(2000)
         self._refresh_project_tabs()
         self._refresh_actions()
-        self.inspector.reposition()
 
     def _command_stack_changed(self) -> None:
         self._mark_dirty(None)
@@ -3792,7 +3831,6 @@ class MainWindow(QMainWindow):
         self.settings.active_pencil_preset = active_name
         self.settings.clamp()
         save_settings(self.settings)
-        self.inspector.refresh_brush_controls()
         self.tool_settings_controls.refresh()
         self.canvas.refresh_brush_settings()
 
@@ -3854,7 +3892,6 @@ class MainWindow(QMainWindow):
         self.settings.eraser_size = self.settings.eraser_size_px["medium"]
         save_settings(self.settings)
         self.canvas.refresh_brush_settings()
-        self.inspector.refresh_brush_controls()
         self.tool_settings_controls.refresh()
 
     def _set_text_shortcut_suppression(self, editing: bool) -> None:
@@ -3949,8 +3986,6 @@ class MainWindow(QMainWindow):
         self.add_page_button.setEnabled(series_active)
         self.undo_action.setEnabled(self.canvas.command_stack.can_undo)
         self.redo_action.setEnabled(self.canvas.command_stack.can_redo)
-        self.delete_button.setEnabled(active and bool(self.canvas.selected_id))
-        self.add_layer_button.setEnabled(active)
         self.add_raster_button.setEnabled(active)
         self.add_vector_button.setEnabled(active)
         self.add_text_button.setEnabled(active)

@@ -98,7 +98,7 @@ def default_text_presets() -> list[dict]:
 
 @dataclass
 class EditorSettings:
-    settings_version: int = 12
+    settings_version: int = 13
     tablet_mode: bool = False
     brush_size: int = 12
     eraser_size: int = 28
@@ -144,6 +144,7 @@ class EditorSettings:
     fill_area_mode: str = "round"
     fill_mode: str = "normal"
     ui_splitter_sizes: dict[str, list[int]] = field(default_factory=dict)
+    navigator_expanded: bool = False
     recent_series: list[str] = field(default_factory=list)
 
     def __post_init__(self) -> None:
@@ -153,7 +154,8 @@ class EditorSettings:
         self.clamp()
 
     def clamp(self) -> None:
-        self.settings_version = 12
+        self.settings_version = 13
+        self.navigator_expanded = bool(self.navigator_expanded)
         self.preview_font_names = bool(self.preview_font_names)
         self.brush_size = max(1, min(200, int(self.brush_size)))
         self.eraser_size = max(2, min(400, int(self.eraser_size)))
@@ -185,7 +187,10 @@ class EditorSettings:
             if isinstance(self.ui_splitter_sizes, dict) else {}
         )
         self.ui_splitter_sizes = {}
-        for key in ("sidebar_workspace", "tools_colors", "ribbon_canvas"):
+        for key in (
+            "sidebar_workspace", "tools_colors", "ribbon_canvas",
+            "tool_canvas", "outliner_settings",
+        ):
             values = splitter_sizes.get(key)
             if not isinstance(values, (list, tuple)) or len(values) != 2:
                 continue
@@ -379,13 +384,15 @@ def load_settings() -> EditorSettings:
                 raw.setdefault("preview_font_names", False)
                 hotkeys = raw.setdefault("hotkeys", {})
                 hotkeys.setdefault("delete_selected", "Delete")
+            if int(raw.get("settings_version", 1)) < 13:
+                raw.setdefault("navigator_expanded", False)
             raw.pop("transform_snap_to_grid", None)
             stored_presets = raw.get("text_presets")
             if isinstance(stored_presets, list):
                 for preset in stored_presets:
                     if isinstance(preset, dict):
                         preset.pop("transform_snap", None)
-            raw["settings_version"] = 12
+            raw["settings_version"] = 13
             valid = {item.name for item in dataclasses.fields(EditorSettings)}
             result = EditorSettings(**{
                 key: value for key, value in raw.items() if key in valid

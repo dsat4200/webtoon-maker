@@ -63,6 +63,10 @@ QToolButton#shapeCategoryHeader {
 }
 QToolButton#shapeCategoryHeader:hover { background: #29292f; }
 QToolButton#shapeCategoryHeader:pressed { background: #303038; }
+QScrollArea#selectionSettingsScroll {
+    background: #1c1c20;
+    border: none;
+}
 QTreeView, QLineEdit, QComboBox, QSpinBox, QDoubleSpinBox {
     background: #25252a;
     border: 1px solid #3a3a42;
@@ -94,6 +98,10 @@ QWidget#ribbon {
     background: #202026;
     border-bottom: 1px solid #3a3a42;
 }
+QWidget#ribbon[orientation="vertical"] {
+    border-bottom: none;
+    border-right: 1px solid #3a3a42;
+}
 QTabBar#ribbonTabs::tab {
     background: transparent;
     border: none;
@@ -105,6 +113,15 @@ QTabBar#ribbonTabs::tab:hover { background: #2a2a31; color: #ffffff; }
 QTabBar#ribbonTabs::tab:selected {
     color: #ffffff;
     border-bottom-color: #80c8ff;
+}
+QWidget#ribbon[orientation="vertical"] QTabBar#ribbonTabs::tab {
+    border-bottom: none;
+    border-left: 2px solid transparent;
+    padding: 10px 5px;
+}
+QWidget#ribbon[orientation="vertical"] QTabBar#ribbonTabs::tab:selected {
+    border-bottom: none;
+    border-left-color: #80c8ff;
 }
 QTabBar#projectTabs {
     background: #18181c;

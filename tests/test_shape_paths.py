@@ -1604,6 +1604,104 @@ def test_shift_selected_nodes_drag_together(qapp):
     assert canvas._active_shape_control is None
 
 
+@pytest.mark.parametrize("rectangle_mode", ["normal", "free"])
+def test_ctrl_rectangle_roundness_drag_links_all_corners_and_undoes_once(
+    qapp, rectangle_mode,
+):
+    canvas, chapter, _page, layer = _canvas()
+    canvas.settings.rectangle_edit_mode = rectangle_mode
+    canvas.set_tool(ToolKind.SHAPE_EDIT)
+    canvas.show()
+    canvas.setFocus()
+    qapp.processEvents()
+    try:
+        # Keep the rectangle primitive while making its four local maxima
+        # deliberately uneven, so the linked radius must use the smallest.
+        layer.bound.nodes[0].position = (40, 40)
+        layer.bound.nodes[1].position = (520, 40)
+        layer.bound.nodes[2].position = (360, 240)
+        layer.bound.nodes[3].position = (40, 300)
+        original = layer.bound.to_dict()
+        expected_maximum = min(
+            min(
+                math.dist(node.position, layer.bound.nodes[index - 1].position),
+                math.dist(
+                    node.position,
+                    layer.bound.nodes[(index + 1) % 4].position,
+                ),
+            ) / 2
+            for index, node in enumerate(layer.bound.nodes)
+        )
+        layer_x, layer_y = chapter.layer_world_translation(layer.layer_id)
+        corner = QPointF(layer.bound.nodes[0].x, layer.bound.nodes[0].y)
+        handle = canvas._rectangle_radius_positions(layer.bound)[0]
+        direction = handle - corner
+        direction /= math.hypot(direction.x(), direction.y())
+
+        assert canvas._begin_shape_edit(
+            QPointF(handle.x() + layer_x, handle.y() + layer_y),
+            modifiers=Qt.KeyboardModifier.ControlModifier,
+        )
+        assert canvas._rectangle_roundness_linked
+        canvas._update_shape_edit(QPointF(
+            corner.x() + direction.x() * 2000 + layer_x,
+            corner.y() + direction.y() * 2000 + layer_y,
+        ))
+
+        radii = [node.roundness for node in layer.bound.nodes]
+        assert radii == pytest.approx([expected_maximum] * 4)
+        assert all(node.roundness_enabled for node in layer.bound.nodes)
+        canvas._tool_release()
+        assert len(canvas.command_stack._undo) == 1
+
+        canvas.command_stack.undo()
+        restored = canvas.chapter.layers[layer.layer_id]
+        assert restored.bound.to_dict() == original
+        canvas.command_stack.redo()
+        redone = canvas.chapter.layers[layer.layer_id]
+        assert [node.roundness for node in redone.bound.nodes] == (
+            pytest.approx([expected_maximum] * 4)
+        )
+    finally:
+        canvas.hide()
+        canvas.deleteLater()
+
+
+def test_rectangle_roundness_without_ctrl_changes_one_corner_and_escape_restores(
+    qapp,
+):
+    canvas, chapter, _page, layer = _canvas()
+    canvas.set_tool(ToolKind.SHAPE_EDIT)
+    canvas.show()
+    canvas.setFocus()
+    qapp.processEvents()
+    try:
+        layer_x, layer_y = chapter.layer_world_translation(layer.layer_id)
+        corner = QPointF(layer.bound.nodes[0].x, layer.bound.nodes[0].y)
+        handle = canvas._rectangle_radius_positions(layer.bound)[0]
+        direction = handle - corner
+        direction /= math.hypot(direction.x(), direction.y())
+        assert canvas._begin_shape_edit(
+            QPointF(handle.x() + layer_x, handle.y() + layer_y)
+        )
+        assert not canvas._rectangle_roundness_linked
+        canvas._update_shape_edit(QPointF(
+            corner.x() + direction.x() * 120 + layer_x,
+            corner.y() + direction.y() * 120 + layer_y,
+        ))
+        assert layer.bound.nodes[0].roundness > 0
+        assert [node.roundness for node in layer.bound.nodes[1:]] == [0, 0, 0]
+
+        QTest.keyClick(canvas, Qt.Key.Key_Escape)
+        restored = canvas.chapter.layers[layer.layer_id]
+        assert [node.roundness for node in restored.bound.nodes] == [0, 0, 0, 0]
+        assert not any(node.roundness_enabled for node in restored.bound.nodes)
+        assert len(canvas.command_stack._undo) == 0
+    finally:
+        canvas.hide()
+        canvas.deleteLater()
+
+
 def test_shapes_category_stays_open_after_tool_choice(qapp):
     window = MainWindow()
     try:
@@ -1631,6 +1729,6 @@ def test_bound_edit_hotkey_migrates_to_shape_edit(monkeypatch, tmp_path):
     }), encoding="utf-8")
     monkeypatch.setattr(settings_module, "settings_path", lambda: path)
     loaded = load_settings()
-    assert loaded.settings_version == 12
+    assert loaded.settings_version == 13
     assert loaded.hotkeys["shape_edit"] == "Ctrl+B"
     assert "bound_edit" not in loaded.hotkeys

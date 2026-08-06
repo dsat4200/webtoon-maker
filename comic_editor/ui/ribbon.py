@@ -1,4 +1,4 @@
-"""Reusable, horizontally scrolling ribbon controls.
+"""Reusable horizontal or vertical ribbon controls.
 
 The editor intentionally keeps the ribbon independent from any document model.
 Callers own the page contents and decide when contextual pages are visible.
@@ -25,12 +25,19 @@ from PySide6.QtWidgets import (
 class RibbonGroup(QFrame):
     """A titled column of related ribbon controls."""
 
-    def __init__(self, title: str, parent: QWidget | None = None):
+    def __init__(
+        self, title: str, parent: QWidget | None = None,
+        *, orientation: Qt.Orientation = Qt.Orientation.Horizontal,
+    ):
         super().__init__(parent)
         self.setObjectName("ribbonGroup")
         self.setFrameShape(QFrame.Shape.StyledPanel)
+        vertical = orientation == Qt.Orientation.Vertical
         self.setSizePolicy(
-            QSizePolicy.Policy.Minimum, QSizePolicy.Policy.Expanding
+            QSizePolicy.Policy.Expanding
+            if vertical else QSizePolicy.Policy.Minimum,
+            QSizePolicy.Policy.Minimum
+            if vertical else QSizePolicy.Policy.Expanding,
         )
 
         outer = QVBoxLayout(self)
@@ -71,19 +78,28 @@ class RibbonGroup(QFrame):
 
 
 class RibbonPage(QScrollArea):
-    """A ribbon page whose groups overflow into a horizontal scrollbar."""
+    """A ribbon page whose groups scroll along the ribbon orientation."""
 
-    def __init__(self, key: str, title: str, parent: QWidget | None = None):
+    def __init__(
+        self, key: str, title: str, parent: QWidget | None = None,
+        *, orientation: Qt.Orientation = Qt.Orientation.Horizontal,
+    ):
         super().__init__(parent)
         self.key = key
         self.title = title
+        self.orientation = orientation
         self.setObjectName("ribbonPage")
         self.setFrameShape(QFrame.Shape.NoFrame)
         self.setWidgetResizable(True)
+        vertical = orientation == Qt.Orientation.Vertical
         self.setHorizontalScrollBarPolicy(
-            Qt.ScrollBarPolicy.ScrollBarAsNeeded
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+            if vertical else Qt.ScrollBarPolicy.ScrollBarAsNeeded
         )
-        self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.setVerticalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAsNeeded
+            if vertical else Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+        )
         self.setSizePolicy(
             QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred
         )
@@ -91,9 +107,13 @@ class RibbonPage(QScrollArea):
         self.groups_container = QWidget(self)
         self.groups_container.setObjectName("ribbonPageGroups")
         self.groups_container.setSizePolicy(
-            QSizePolicy.Policy.Minimum, QSizePolicy.Policy.Expanding
+            QSizePolicy.Policy.Expanding
+            if vertical else QSizePolicy.Policy.Minimum,
+            QSizePolicy.Policy.Minimum
+            if vertical else QSizePolicy.Policy.Expanding,
         )
-        self.groups_layout = QHBoxLayout(self.groups_container)
+        layout_type = QVBoxLayout if vertical else QHBoxLayout
+        self.groups_layout = layout_type(self.groups_container)
         self.groups_layout.setContentsMargins(4, 3, 4, 3)
         self.groups_layout.setSpacing(4)
         self.groups_layout.setSizeConstraint(
@@ -105,8 +125,13 @@ class RibbonPage(QScrollArea):
     def add_group(
         self, title: str, *, minimum_width: int | None = None
     ) -> RibbonGroup:
-        group = RibbonGroup(title, self.groups_container)
-        if minimum_width is not None:
+        group = RibbonGroup(
+            title, self.groups_container, orientation=self.orientation
+        )
+        if (
+            minimum_width is not None
+            and self.orientation == Qt.Orientation.Horizontal
+        ):
             group.setMinimumWidth(minimum_width)
         self.groups_layout.insertWidget(self.groups_layout.count() - 1, group)
         return group
@@ -114,8 +139,13 @@ class RibbonPage(QScrollArea):
     def insert_group(
         self, index: int, title: str, *, minimum_width: int | None = None
     ) -> RibbonGroup:
-        group = RibbonGroup(title, self.groups_container)
-        if minimum_width is not None:
+        group = RibbonGroup(
+            title, self.groups_container, orientation=self.orientation
+        )
+        if (
+            minimum_width is not None
+            and self.orientation == Qt.Orientation.Horizontal
+        ):
             group.setMinimumWidth(minimum_width)
         maximum = max(0, self.groups_layout.count() - 1)
         self.groups_layout.insertWidget(max(0, min(index, maximum)), group)
@@ -137,14 +167,25 @@ class RibbonWidget(QWidget):
     pageChanged = Signal(str)
     pageVisibilityChanged = Signal(str, bool)
 
-    def __init__(self, parent: QWidget | None = None):
+    def __init__(
+        self, parent: QWidget | None = None,
+        *, orientation: Qt.Orientation = Qt.Orientation.Horizontal,
+    ):
         super().__init__(parent)
         self.setObjectName("ribbon")
+        self.orientation = orientation
+        self.setProperty(
+            "orientation",
+            "vertical"
+            if orientation == Qt.Orientation.Vertical else "horizontal",
+        )
         self._pages: list[RibbonPage] = []
         self._visible: dict[str, bool] = {}
         self._tab_keys: list[str] = []
 
-        layout = QVBoxLayout(self)
+        vertical = orientation == Qt.Orientation.Vertical
+        layout_type = QHBoxLayout if vertical else QVBoxLayout
+        layout = layout_type(self)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
 
@@ -153,19 +194,27 @@ class RibbonWidget(QWidget):
         self.tab_bar.setDrawBase(False)
         self.tab_bar.setExpanding(False)
         self.tab_bar.setUsesScrollButtons(True)
+        if vertical:
+            self.tab_bar.setShape(QTabBar.Shape.RoundedEast)
         self.tab_bar.currentChanged.connect(self._tab_changed)
-        layout.addWidget(self.tab_bar)
 
         self.pages_stack = QStackedWidget(self)
         self.pages_stack.setObjectName("ribbonPageStack")
-        layout.addWidget(self.pages_stack, 1)
+        if vertical:
+            layout.addWidget(self.pages_stack, 1)
+            layout.addWidget(self.tab_bar)
+        else:
+            layout.addWidget(self.tab_bar)
+            layout.addWidget(self.pages_stack, 1)
 
     def add_page(
         self, key: str, title: str, *, visible: bool = True
     ) -> RibbonPage:
         if not key or self.page(key) is not None:
             raise ValueError(f"Ribbon page key must be unique: {key!r}")
-        page = RibbonPage(key, title, self.pages_stack)
+        page = RibbonPage(
+            key, title, self.pages_stack, orientation=self.orientation
+        )
         self._pages.append(page)
         self._visible[key] = bool(visible)
         self.pages_stack.addWidget(page)

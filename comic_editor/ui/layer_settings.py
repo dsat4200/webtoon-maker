@@ -15,7 +15,10 @@ from comic_editor.core.models import GridSettings
 class LayerSettingsPanel(QGroupBox):
     changed = Signal()
 
-    def __init__(self, canvas, settings, save_settings_callback, parent=None):
+    def __init__(
+        self, canvas, settings, save_settings_callback, parent=None,
+        *, show_common: bool = True,
+    ):
         super().__init__("Layer Settings", parent)
         self.canvas = canvas
         self.settings = settings
@@ -32,8 +35,8 @@ class LayerSettingsPanel(QGroupBox):
 
         self.name = QLineEdit()
         self.form.addRow("Name", self.name)
-        common = QWidget()
-        common_layout = QHBoxLayout(common)
+        self.common_row = QWidget()
+        common_layout = QHBoxLayout(self.common_row)
         common_layout.setContentsMargins(0, 0, 0, 0)
         self.visible = QCheckBox("Visible")
         self.opacity = QSlider(Qt.Horizontal)
@@ -41,7 +44,8 @@ class LayerSettingsPanel(QGroupBox):
         common_layout.addWidget(self.visible)
         common_layout.addWidget(QLabel("Opacity"))
         common_layout.addWidget(self.opacity, 1)
-        self.form.addRow(common)
+        self.form.addRow(self.common_row)
+        self.common_row.setVisible(show_common)
         self.ignore_parent_mask = QCheckBox("Ignore direct parent mask")
         self.ignore_parent_mask.setToolTip(
             "Allow this layer and its descendants outside its direct parent "

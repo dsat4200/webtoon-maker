@@ -1,5 +1,11 @@
 from __future__ import annotations
 
+from pathlib import Path
+
+from PySide6.QtCore import QSize, Qt
+from PySide6.QtGui import QIcon
+from PySide6.QtWidgets import QDockWidget, QTabBar
+
 from comic_editor.core.models import (
     BoundGeometry,
     ChapterDocument,
@@ -10,7 +16,8 @@ from comic_editor.core.models import (
 from comic_editor.core.persistence import SeriesRepository
 from comic_editor.core.tiles import TileStore
 from comic_editor.ui.canvas import ToolKind
-from comic_editor.ui.main_window import MainWindow
+from comic_editor.ui import icons as icons_module
+from comic_editor.ui.main_window import MainWindow, ResponsiveToolButton
 
 
 def _vector_chapter():
@@ -42,9 +49,10 @@ def test_main_window_ribbon_is_contextual_and_tools_are_renamed(qapp):
         assert window.tool_buttons[ToolKind.RASTER_PENCIL].text() == "Pencil"
         assert window.tool_buttons[ToolKind.RASTER_ERASER].text() == "Eraser"
         assert window.ribbon.page_keys() == [
-            "tool_settings", "asset_library", "vector_tools", "raster_object_settings",
-            "gradient_tools",
+            "tool_settings", "asset_library", "vector_tools", "gradient_tools",
         ]
+        assert window.ribbon.orientation == Qt.Orientation.Vertical
+        assert window.ribbon.tab_bar.shape() == QTabBar.Shape.RoundedEast
         assert window.color_tabs.count() == 2
         assert [
             window.color_tabs.tabText(index) for index in range(2)
@@ -62,32 +70,41 @@ def test_main_window_ribbon_is_contextual_and_tools_are_renamed(qapp):
         window.deleteLater()
 
 
-def test_workspace_splitters_resize_and_keep_navigator_fixed(qapp):
+def test_workspace_splitters_resize_and_persist_collapsed_navigator(qapp):
     window = MainWindow()
+    window.resize(1700, 900)
     window.show()
     qapp.processEvents()
     try:
         assert window.workspace_splitter.handleWidth() == 6
         assert window.sidebar_splitter.handleWidth() == 6
-        assert window.ribbon_canvas_splitter.handleWidth() == 6
+        assert window.tool_canvas_splitter.handleWidth() == 5
+        assert window.outliner_splitter.handleWidth() == 5
+        assert not window.navigator_panel.isExpanded()
+        assert window.navigator_panel.width() == 24
         assert window.preview.width() == 92
 
         window.workspace_splitter.setSizes([320, 1100])
         window.sidebar_splitter.setSizes([360, 300])
-        window.ribbon_canvas_splitter.setSizes([230, 600])
+        window.tool_canvas_splitter.setSizes([160, 940])
+        window.outliner_splitter.setSizes([180, 420])
+        window.navigator_panel.setExpanded(True)
         qapp.processEvents()
 
         assert window.workspace_splitter.sizes()[0] >= 300
         assert all(size > 0 for size in window.sidebar_splitter.sizes())
-        assert window.ribbon_canvas_splitter.sizes()[0] >= 200
+        assert window.tool_canvas_splitter.sizes()[0] >= 150
+        assert window.navigator_panel.width() == 116
         assert window.preview.width() == 92
 
         window._capture_workspace_layout()
         assert window.settings.ui_splitter_sizes == {
             "sidebar_workspace": window.workspace_splitter.sizes(),
             "tools_colors": window.sidebar_splitter.sizes(),
-            "ribbon_canvas": window.ribbon_canvas_splitter.sizes(),
+            "tool_canvas": window.tool_canvas_splitter.sizes(),
+            "outliner_settings": window.outliner_splitter.sizes(),
         }
+        assert window.settings.navigator_expanded is True
     finally:
         window.deleteLater()
 
@@ -111,6 +128,88 @@ def test_bottom_left_color_picker_is_visible_and_responsive(qapp):
         assert window.palette_editor.isVisibleTo(window)
     finally:
         window.deleteLater()
+
+
+def test_project_view_controls_and_icon_tool_strip(qapp):
+    window = MainWindow()
+    window.resize(1800, 900)
+    window.show()
+    qapp.processEvents()
+    try:
+        hotkeys = window.file_toolbar.widgetForAction(window.hotkeys_action)
+        assert hotkeys.x() < window.tablet_mode.x()
+        assert window.tablet_mode.x() < window.reset_view_button.x()
+        assert window.reset_view_button.x() < window.snap_grid.x()
+        assert window.tablet_mode.text() == "Tablet Navigation"
+        assert window.reset_view_button.text() == "Reset View"
+        assert window.snap_grid.text() == "Snap to grid"
+
+        expected = {
+            ToolKind.OBJECT_SELECT: "Object Select",
+            ToolKind.RASTER_PENCIL: "Pencil",
+            ToolKind.RASTER_ERASER: "Eraser",
+            ToolKind.TEXT_EDIT: "Text Edit",
+            ToolKind.TRANSFORM: "Transform",
+            ToolKind.SHAPE_EDIT: "Shape Edit",
+            ToolKind.INSERT_PAGE_GAP: "Insert Page Gap",
+        }
+        for tool, label in expected.items():
+            button = window.tool_buttons[tool]
+            assert isinstance(button, ResponsiveToolButton)
+            assert button.command_label == label
+            assert button.toolTip() == label
+            assert button.height() == 36
+            assert button.minimumWidth() == 36
+            assert button.iconSize() == QSize(20, 20)
+            assert not button.icon().isNull()
+            assert not button.icon().pixmap(
+                QSize(20, 20), QIcon.Mode.Disabled, QIcon.State.Off
+            ).isNull()
+
+        narrow = window.tool_buttons[ToolKind.OBJECT_SELECT]
+        narrow.resize(36, 36)
+        assert narrow.toolButtonStyle() == Qt.ToolButtonStyle.ToolButtonIconOnly
+        narrow.resize(220, 36)
+        assert narrow.toolButtonStyle() == (
+            Qt.ToolButtonStyle.ToolButtonTextBesideIcon
+        )
+        assert window.shape_tool_buttons[ToolKind.BOX_BOUND].toolTip() == (
+            "Rectangle"
+        )
+        assert window.shape_tool_buttons[ToolKind.CIRCLE_BOUND].toolTip() == (
+            "Circle"
+        )
+        assert window.shape_tool_buttons[ToolKind.SHAPE_CREATE].toolTip() == (
+            "Free Shape"
+        )
+        assert window.add_page_button.toolTip() == "Add Page"
+        assert not hasattr(window, "add_layer_button")
+        assert not hasattr(window, "delete_button")
+        assert window.hierarchy_dock.features() == (
+            QDockWidget.DockWidgetFeature.NoDockWidgetFeatures
+        )
+        assert window.hierarchy_dock.titleBarWidget().height() == 0
+        assert window.file_menu.menuAction() not in window.menuBar().actions()
+    finally:
+        window.deleteLater()
+
+
+def test_vendored_iconoir_assets_cover_every_tool_strip_command():
+    required = {
+        "circle", "cursor-pointer", "curve-array", "design-pencil",
+        "edit-pencil", "erase", "fill-color", "frame-select",
+        "frame-tool", "media-image-plus", "nav-arrow-down",
+        "nav-arrow-right", "page-plus", "path-arrow",
+        "plus-square-dashed", "select-window", "selective-tool",
+        "split-square-dashed", "text-square", "text",
+    }
+    root = Path(icons_module.__file__).with_name("icons") / "iconoir"
+    assert {path.stem for path in root.glob("*.svg")} == required
+    assert "MIT License" in (root / "LICENSE").read_text(encoding="utf-8")
+    for name in required:
+        icon = icons_module.iconoir(name)
+        assert not icon.isNull()
+        assert not icon.pixmap(QSize(20, 20)).isNull()
 
 
 def test_drawing_selection_tool_settings_reuses_transform_mode(qapp):
@@ -144,9 +243,10 @@ def test_underlay_slider_coalesces_drag_and_restores_with_undo(qapp):
     window._set_chapter(chapter, TileStore())
     try:
         window.canvas.set_selection("object", raster.object_id)
-        window.inspector.refresh()
-        assert window.inspector.isHidden()
-        assert window.ribbon.is_page_visible("raster_object_settings")
+        window.selection_settings.refresh()
+        assert window.selection_settings.stack.currentWidget() is (
+            window.selection_settings.raster_page
+        )
         assert window.ribbon.current_key() == "tool_settings"
         controls = window.raster_object_controls
         controls.underlay.sliderPressed.emit()

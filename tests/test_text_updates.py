@@ -80,7 +80,13 @@ def test_text_ribbon_owns_complete_selected_object_controls(
         controls = window.text_object_controls
 
         assert window.ribbon.current_key() == "tool_settings"
-        assert window.inspector.isHidden()
+        assert not hasattr(window, "inspector")
+        assert window.selection_settings.stack.currentWidget() is (
+            window.selection_settings.layer_page
+        )
+        assert window.selection_settings.layer_page.title() == (
+            "Parent Layer Settings"
+        )
         assert window.tool_settings_group.isHidden()
         assert window.text_object_group.isVisible()
         assert window.text_typography_group.isVisible()

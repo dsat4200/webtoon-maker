@@ -220,6 +220,10 @@ class GradientToolsControls(QWidget):
         self.type_parameters_widget = QWidget(self)
         type_parameters = QVBoxLayout(self.type_parameters_widget)
         type_parameters.setContentsMargins(0, 0, 0, 0)
+        self.opacity_lock = QCheckBox(
+            "Lock opacity", self.type_parameters_widget
+        )
+        type_parameters.addWidget(self.opacity_lock)
         self.direction_row = QWidget(self.type_parameters_widget)
         direction_layout = QHBoxLayout(self.direction_row)
         direction_layout.setContentsMargins(0, 0, 0, 0)
@@ -397,6 +401,7 @@ class GradientToolsControls(QWidget):
         )
         self.field_type.currentIndexChanged.connect(self._field_changed)
         self.select_gradient.clicked.connect(self._select_matching_gradient)
+        self.opacity_lock.toggled.connect(self._opacity_lock_changed)
         self.direction_mode.currentIndexChanged.connect(
             self._type_parameter_changed
         )
@@ -513,6 +518,7 @@ class GradientToolsControls(QWidget):
         self.presets_widget.setEnabled(enabled)
         self.type_parameters_widget.setEnabled(enabled)
         if obj is not None:
+            self.opacity_lock.setChecked(obj.opacity_locked)
             self.field_type.setCurrentIndex(max(
                 0, self.field_type.findData(obj.field_type)
             ))
@@ -736,6 +742,21 @@ class GradientToolsControls(QWidget):
         obj.field_type = str(field_type)
         obj.touch_revision()
         self._commit_change(before, "Change gradient field")
+        self.refresh()
+
+    def _opacity_lock_changed(self, checked: bool) -> None:
+        if self._loading:
+            return
+        obj = self.selected_gradient()
+        if obj is None:
+            return
+        before = self.canvas.chapter.to_dict()
+        obj.opacity_locked = bool(checked)
+        if obj.opacity_locked:
+            obj.opacity = self.canvas.chapter.layers[
+                obj.parent_layer_id
+            ].opacity
+        self._commit_change(before, "Change gradient opacity lock")
         self.refresh()
 
     def _select_matching_gradient(self) -> None:

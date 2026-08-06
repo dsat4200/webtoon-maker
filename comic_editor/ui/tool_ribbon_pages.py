@@ -380,7 +380,6 @@ class TextObjectControls(QObject):
         self.canvas = canvas
         self.settings = settings
         self._loading = False
-        self._opacity_before: dict | None = None
         self._preview_roles_enabled: bool | None = None
         self._alignment_buttons: dict[tuple[str, str], QToolButton] = {}
         self.object_widget = self._build_object_widget()
@@ -426,18 +425,9 @@ class TextObjectControls(QObject):
         layout.addLayout(preset_row)
 
         flags = QHBoxLayout()
-        self.visible = QCheckBox("Visible", widget)
         self.opacity_lock = QCheckBox("Lock opacity", widget)
-        flags.addWidget(self.visible)
         flags.addWidget(self.opacity_lock)
-        flags.addWidget(QLabel("Opacity", widget))
-        self.opacity = QSlider(Qt.Orientation.Horizontal, widget)
-        self.opacity.setRange(0, 100)
-        self.opacity.setMinimumWidth(90)
-        flags.addWidget(self.opacity, 1)
-        self.opacity_value = QLabel("100%", widget)
-        self.opacity_value.setMinimumWidth(36)
-        flags.addWidget(self.opacity_value)
+        flags.addStretch(1)
         layout.addLayout(flags)
 
         self.preset_combo.activated.connect(self._apply_preset)
@@ -445,13 +435,7 @@ class TextObjectControls(QObject):
         self.preset_rename.clicked.connect(self._rename_preset)
         self.preset_remove.clicked.connect(self._remove_preset)
         self.preset_add.clicked.connect(self._add_preset)
-        self.visible.toggled.connect(
-            lambda checked: self._apply_field("visible", bool(checked))
-        )
         self.opacity_lock.toggled.connect(self._opacity_lock_changed)
-        self.opacity.sliderPressed.connect(self._begin_opacity_drag)
-        self.opacity.valueChanged.connect(self._opacity_changed)
-        self.opacity.sliderReleased.connect(self._finish_opacity_drag)
         return widget
 
     def _build_typography_widget(self) -> QWidget:
@@ -615,7 +599,7 @@ class TextObjectControls(QObject):
         entity = self._selected()
         self._loading = True
         controls = (
-            self.preset_combo, self.visible, self.opacity_lock, self.opacity,
+            self.preset_combo, self.opacity_lock,
             self.font_family, self.preview_fonts, self.font_size, self.bold,
             self.italic, self.kerning, self.layout_mode, self.margin,
             self.geometry_reference, self.transform_mode,
@@ -628,11 +612,7 @@ class TextObjectControls(QObject):
             0, self.transform_mode.findData(self.settings.transform_mode)
         ))
         if entity is not None:
-            self.visible.setChecked(entity.visible)
             self.opacity_lock.setChecked(entity.opacity_locked)
-            self.opacity.setValue(round(entity.opacity * 100))
-            self.opacity_value.setText(f"{self.opacity.value()}%")
-            self.opacity.setEnabled(not entity.opacity_locked)
             self.font_family.setCurrentText(entity.font_family)
             self.font_size.setValue(max(6, min(250, round(entity.font_size))))
             self.bold.setChecked(entity.bold)
@@ -761,30 +741,6 @@ class TextObjectControls(QObject):
                 entity.parent_layer_id
             ].opacity
         self._push_change(before, "Change text opacity lock")
-        self.refresh()
-
-    def _begin_opacity_drag(self) -> None:
-        if self._loading or self._selected() is None:
-            return
-        self._commit_text_session()
-        self._opacity_before = self.canvas.chapter.to_dict()
-
-    def _opacity_changed(self, value: int) -> None:
-        self.opacity_value.setText(f"{int(value)}%")
-        entity = self._selected()
-        if self._loading or entity is None or entity.opacity_locked:
-            return
-        before = None if self._opacity_before is not None else self.canvas.chapter.to_dict()
-        entity.opacity = value / 100.0
-        self.canvas.documentChanged.emit(None)
-        self.canvas.update()
-        if before is not None:
-            self._push_change(before, "Change text opacity")
-
-    def _finish_opacity_drag(self) -> None:
-        before, self._opacity_before = self._opacity_before, None
-        if before is not None:
-            self._push_change(before, "Change text opacity")
         self.refresh()
 
     def _current_preset(self) -> TextPreset | None:

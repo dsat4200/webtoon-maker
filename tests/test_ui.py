@@ -286,7 +286,7 @@ def test_text_settings_ribbon_layout_visibility_and_quad_restore(qapp):
     try:
         window.canvas.set_selection("object", text.object_id)
         controls = window.text_object_controls
-        assert window.inspector.isHidden()
+        assert not hasattr(window, "inspector")
         assert window.ribbon.current_key() == "tool_settings"
         assert not window.text_object_group.isHidden()
         assert not window.text_typography_group.isHidden()

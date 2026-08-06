@@ -1,3 +1,19 @@
+## shape tweaks
+- for shape creation, add a "finish" button gizmo that confirms the shape.
+- adding a shape to a compound shape should be additive compound by default. it should affect the shape creation preview stage too.
+	- assume the shape is an open shape during free shape creation unless closed (for preview purposes)
+- these gizmos should be added to shape edit / shape creation:
+	- if the shape is a compound shape: show a gizmo button with text that shows the type of compounding going on (add, subtract, ignore). clicking or tapping this button cycles between them. also, these set compound types should be previewable during shape creation pre-confirmation.
+	- also, include a gizmo (similar to the text size or kerning text gizmos in appearance and behavior) that alters the thickness of the stroke, and another for the thickness of the outline, of the preview shape
+		- (0px to 150px total for stroke thickness)
+		- (0px to 100 px for outline thickness)
+- closing the shape or double clicking the last point still also confirms the shape.
+- confirming the shape also sets the preview parameters as the params of the new shape of course
+- clicking and dragging the translate boundary in text free transform mode isn't letting me translate the shape. the 8 handle corners and edges let me transform, but not the dotted line to translate the whole text object.
+- move the file dropdown to the same row as the undo/redo/etc
+- the text selection should let me double click a word to select it, triple click to select all text in that box. hovering over text in a currently selected text box should change the cursor to a text insertion icon, and clicking and dragging should select from the click point to the release point (select characters) live, like any normal text input field in any program.
+- make the text gizmos a little smaller (maybe 30 percent smaller), except the kerning/font size drag handles 
+
 ## Gradient tool / objects:
 - [x] add a gradient object type with its own creation tool
 	- dropdown that lets the user create a shape fill gradient, a linear/curve gradient, or a circle/ellipsoid gradient. these are parameterized objects that are the child of a shape
@@ -158,78 +174,6 @@ more text tweaks
 - [x] undo doesn't let me undo a shape creation (bug)
 - [x] bug during shape editing, now the canvas is just grey and i can't change or open anything
 
-## Raster/Vector object / pencil features
-psd brush support?
-- add brushes to tool settings ribbon (raster/vector pencil) (with preview of a small, curved stroke segment in a square live preview icon, from zero pressure to 100, swoop curve )
-
-smoothing support
-
-
-Object features
-- outline support
-	- has a color, thickness.
-	- no anti-aliasing
-
-
-bugs
-- trying to free transform a raster layer crashed the program
-	- also, changes made to the 8-handle cage around the transformed raster/vector object should stay so you know how you transformed it, until you deselect the object (instead of resetting the transform bounds position)
-	- also, vector objects should be able to free/uniform with 8 handles just like raster objects do.
-
-
-general tweaks
-- holding control while click-dragging a corner smoothness handle in a rect object should force all 4 corners to copy smoothness of the handle being manipulated.
-- move the opacity slider to a row at the top of, inside of, the object/layer outliner.
-	- put the "visible" toggle there too
-- the space between the top row window and layer/object outliner should be able to move up to cover up elements, but introduce a scroll bar if this happens
-- move tablet navigation, reset view, and snap to grid to the top row, to the right of the hotkeys button
-- use iconoir icons to replace the toolbar buttons with buttons that show an icon, and show the name of the command upon hover.
-	- https://iconoir.com/
-	- that includes all of the tools and options that are normally on the tool bar (except the ones I just moved)
-		- add an "add page" button
-- remove the "delete selected" , add page, and add layer buttons from the outliner.
-- make the full page preview/scrollbar ui element instead a collapsable to the right of the drawing canvas element, that is collapsed by default.
-- where the scrollbar is currently (but thinner) is where the new, smaller, tool buttons will live, in a verical column that can be click-dragged at the right side to grow it horizontally right. if large enough, it should show both the icon and tool name simultaneously. if too narrow, the buttons should stay the same height but auto width, hiding the text when not all of it can fit, and minimal width is the width that would make the icons square.
-- where the tool settings vertical menu currently is, instead put the ribbon menu there but make it vertical. all the ribbon menu switching buttons should now be vertical on the right side of the new ribbon location. text should be right to left but rotated 90 degrees on this menu. of course, instead of scrolling horizontally, it should now scroll vertically.
-	- this will give the canvas more room.
-- remove the "layers and objects" header with the popout and x button.
-- instead of having "raster object settings" and "vector object settings" be in a separate window from layer settings, just have the layer settings window switch to showing raster object or vector object settings, depending on the selected object type. 
-	- this way, when eraser or raster are selected, the ribbon can default to tool settings instead of raster/vector object settings
-	- remove raster/layer object settings from the ribbon, but all of their settings should instead be where layer settings are now, when a raster or vector object is selected.
-
-
-## New feature - repeating texture mode
-
-
-## shape tweaks
-- for shape creation, add a "finish" button gizmo that confirms the shape.
-- adding a shape to a compound shape should be additive compound by default. it should affect the shape creation preview stage too.
-	- assume the shape is an open shape during free shape creation unless closed (for preview purposes)
-- these gizmos should be added to shape edit / shape creation:
-	- if the shape is a compound shape: show a gizmo button with text that shows the type of compounding going on (add, subtract, ignore). clicking or tapping this button cycles between them. also, these set compound types should be previewable during shape creation pre-confirmation.
-	- also, include a gizmo (similar to the text size or kerning text gizmos in appearance and behavior) that alters the thickness of the stroke, and another for the thickness of the outline, of the preview shape
-		- (0px to 150px total for stroke thickness)
-		- (0px to 100 px for outline thickness)
-- closing the shape or double clicking the last point still also confirms the shape.
-- confirming the shape also sets the preview parameters as the params of the new shape of course
-- clicking and dragging the translate boundary in text free transform mode isn't letting me translate the shape. the 8 handle corners and edges let me transform, but not the dotted line to translate the whole text object.
-- move the file dropdown to the same row as the undo/redo/etc
-- the text selection should let me double click a word to select it, triple click to select all text in that box. hovering over text in a currently selected text box should change the cursor to a text insertion icon, and clicking and dragging should select from the click point to the release point (select characters) live, like any normal text input field in any program.
-- make the text gizmos a little smaller (maybe 30 percent smaller), except the kerning/font size drag handles 
-
-
-## Dont forget
-- object/layer outer outline
-	- in drawing object:
-		- appears in object settings
-		- draws an integer px thickness outline around all pixels that have a drawn-on value
-		- lets you set the color of the outline too. since it has an alpha channel that can control the opacity for us
-test the fill tool dumbass (vector and raster drawing)
-(can you free transform 8 handle a shape?)
-- asset library
-
-
-
 ## more tweaks (done)
 - [x] stylus should be able to click popup tool menu options (currently not working)
 - [x] sweep simplify should also show a circle outline around the radius so you know which points you select. drawing with sweep simplify should show as if you're drawing with a circular brush, as a transparent orange overlay. the points under this selection are what is simplified when you release the pen from the canvas. (which then also turns off sweep simplify.) it shouldn't simplify the whole stroke, just those points underneath.
@@ -285,19 +229,6 @@ test the fill tool dumbass (vector and raster drawing)
 
 
 
-
-## Bugs:
-- [ ] now the raster pencil doesn't work. instead it just draws a dot. if the issue is that the interaction would translate, instead make the translation handle for the raster 8 handle system happen only when hovering/clickdragging around the outside of the width/height with a 20px outside margin.
-- [ ] where did pencil settings go? I had a pencil settings dialogue somewhere. it had some pretty precise adjustments. is it supposed to be under tool settings? i can't select tool settings while in raster or vector pencil (this must be a bug)
-
-
-## Performance issues
-- pinch zoom is laggy
-- improve performance for vector drawin
-- sweep simplify is super laggy
-- transforming in stroke select mode is slow
-- shape gradient in reverse direction is very slow to update
-
 ## OG prompt
 - add a drawing selection tools dropdown that has rect select, lasso select, and stroke select. for now, just make it work on only raster drawings or vector drawings - only allowing you to either select pixels or points. if in stroke select (which only appers on a vector drawing), hovering over should show a blue outline around the stroke you're over. clicking it selects all points on that stroke.
 	- drawing selections should let you hold shift to add, control to remove, or nothing to replace. doing so should show either a plus, minus, or nothing next to the respective cursor you're on (rect, lasso, or pointer finger hand) clicking an empty spot on the canvas should deselect. when things are selected, show the 8 handles for transforming the selection, free and uniform. if the user hovers near enough to one of the 4 edges of this transform boundary, change the cursor to a move icon, clicking or dragging this should let the user translate their selection. add a rotate handle in the top middle above the top middle transform handle. add a pivot handle that defaults to the center of the selection. however, if the user modified the position of this pivot anchor (dragged it), then keep it the same even if they modify their selection. however, reset this pivot anchor the next time they deselect everything and make a new selection.
@@ -313,24 +244,3 @@ test the fill tool dumbass (vector and raster drawing)
 - in text edit, if mode is free transform, show 8 handles to change the text bounds manually.
 	- if a text object is a child of the main shape in a compound shape, and strict is on, there should be an option to strict fit to the main shape, or to strict fit to the full compound shape. the default should be to the main shape (currently its only doing it to the full compound shape)
 - in text edit, trying to transform both with line handles and point handles sometimes only lets me do one or the other, this is a bug.
-
-
-## Fill types - textures
-what supports fill types?
-- shape fills
-- gradient colors
-
-
-what are the fill types / textures
-- repeating pattern
-- brick texture
-- different noise types
-- screentones
-	- tone size, dynamic, texture-able?
-	- parameters - if it has a value from 0 to 1, it can be set to a "texture"
-- support having a mask
-- dynamic mask - glow around, inside an object?
-	- gradient ramp support
-- glow object with a child that represents the fill (but what about scale / parameter support?)
-
-![[Pasted image 20260730190248.png]]

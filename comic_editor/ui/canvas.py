@@ -405,6 +405,8 @@ class _CanvasLogic:
         self._selected_shape_node_ids: set[str] = set()
         self._shape_drag_nodes: dict[str, dict] = {}
         self._active_shape_control: str | None = None
+        self._rectangle_roundness_linked = False
+        self._input_press_modifiers = None
         self._active_gradient_control: tuple[str, str] | None = None
         self._geometry_transform_target: tuple[str, str] | None = None
         self._shape_control_dragged = False
@@ -8565,7 +8567,9 @@ class _CanvasLogic:
         if self._select_all_text_from_triple_click(QPointF(event.position())):
             event.accept()
             return
-        self._tool_press(event.position(), 1.0)
+        self._dispatch_tool_press(
+            event.position(), 1.0, event.modifiers()
+        )
 
     def mouseMoveEvent(self, event: QMouseEvent) -> None:  # noqa: N802
         if self.chapter is None:
@@ -8758,6 +8762,22 @@ class _CanvasLogic:
             event.accept()
             return
         if event.key() == Qt.Key_Escape and self._cancel_text_property_drag():
+            event.accept()
+            return
+        if (
+            event.key() == Qt.Key_Escape
+            and self._model_before is not None
+            and self._active_shape_control is not None
+        ):
+            before, self._model_before = self._model_before, None
+            self._active_handle = None
+            self._active_shape_control = None
+            self._rectangle_roundness_linked = False
+            self._shape_control_dragged = False
+            self._bound_drag_mode = None
+            self._bound_start_points = []
+            self.replace_chapter(before)
+            self.interactionFinished.emit()
             event.accept()
             return
         if event.key() == Qt.Key_Escape and self._asset_drag_manifest is not None:
@@ -8968,7 +8988,9 @@ class _CanvasLogic:
                     self._last_gradient_tablet_tap = None
                 self._pen_contact_active = True
                 self._tablet_tool_active = True
-                self._tool_press(event.position(), event.pressure())
+                self._dispatch_tool_press(
+                    event.position(), event.pressure(), event.modifiers()
+                )
         elif event.type() == QEvent.TabletMove:
             if self._nav_mode:
                 self._update_navigation(event.position())
@@ -12294,10 +12316,23 @@ class _CanvasLogic:
             self._finish_vector_fill(drawing)
 
     # ---- tool actions --------------------------------------------------
+    def _dispatch_tool_press(
+        self, widget_point: QPointF, pressure: float, modifiers,
+    ) -> None:
+        """Preserve press modifiers without changing the tool-hook API."""
+        self._input_press_modifiers = modifiers
+        try:
+            self._tool_press(widget_point, pressure)
+        finally:
+            self._input_press_modifiers = None
+
     def _tool_press(self, widget_point: QPointF, pressure: float) -> None:
         if self.chapter is None:
             self._clear_detached_input_state()
             return
+        modifiers = self._input_press_modifiers
+        if modifiers is None:
+            modifiers = QGuiApplication.keyboardModifiers()
         point = self.widget_to_document(widget_point)
         self._press_widget_point = QPointF(widget_point)
         self._press_document_point = QPointF(point)
@@ -12434,12 +12469,16 @@ class _CanvasLogic:
                 return
             if (
                 isinstance(selected_gradient, SpeedLineCenterObject)
-                and self._begin_shape_edit(point, allow_interior=False)
+                and self._begin_shape_edit(
+                    point, allow_interior=False, modifiers=modifiers
+                )
             ):
                 return
             if (
                 self.selected_kind == "layer"
-                and self._begin_shape_edit(point, allow_interior=False)
+                and self._begin_shape_edit(
+                    point, allow_interior=False, modifiers=modifiers
+                )
             ):
                 return
             if self._begin_geometry_transform(point):
@@ -12461,12 +12500,12 @@ class _CanvasLogic:
                 return
             if (
                 self.selected_kind == "layer"
-                and self._begin_shape_edit(point)
+                and self._begin_shape_edit(point, modifiers=modifiers)
             ):
                 return
             if (
                 isinstance(selected_gradient, SpeedLineCenterObject)
-                and self._begin_shape_edit(point)
+                and self._begin_shape_edit(point, modifiers=modifiers)
             ):
                 return
         if self.tool == ToolKind.OBJECT_SELECT:
@@ -13069,6 +13108,7 @@ class _CanvasLogic:
                     )
             self._active_handle = None
             self._active_shape_control = None
+            self._rectangle_roundness_linked = False
             self._shape_control_dragged = False
             self._bound_drag_mode = None
             self._bound_start_points = []
@@ -13525,6 +13565,7 @@ class _CanvasLogic:
 
     def _begin_shape_edit(
         self, world_point: QPointF, allow_interior: bool = True,
+        modifiers=None,
     ) -> bool:
         target = self._shape_edit_target()
         if target is None:
@@ -13577,6 +13618,12 @@ class _CanvasLogic:
             self._model_before = self.chapter.to_dict()
             self._active_shape_control = f"primitive_roundness:{index}"
             self._drag_start_value = bound.to_dict()
+            self._rectangle_roundness_linked = bool(
+                (
+                    QGuiApplication.keyboardModifiers()
+                    if modifiers is None else modifiers
+                ) & Qt.ControlModifier
+            )
             return True
         if kind == "control":
             self._selected_shape_node_id = hit["node_id"]
@@ -13837,13 +13884,33 @@ class _CanvasLogic:
                 math.dist(node.position, previous.position),
                 math.dist(node.position, following.position),
             ) / 2
-            bound.nodes[index].roundness = min(
+            radius = min(
                 maximum,
                 projected / math.sqrt(2),
             )
-            bound.nodes[index].roundness_enabled = (
-                bound.nodes[index].roundness > 0
-            )
+            if self._rectangle_roundness_linked:
+                shared_maximum = min(
+                    min(
+                        math.dist(
+                            candidate.position,
+                            original.nodes[i - 1].position,
+                        ),
+                        math.dist(
+                            candidate.position,
+                            original.nodes[
+                                (i + 1) % len(original.nodes)
+                            ].position,
+                        ),
+                    ) / 2
+                    for i, candidate in enumerate(original.nodes)
+                )
+                radius = min(radius, shared_maximum)
+                for candidate in bound.nodes:
+                    candidate.roundness = radius
+                    candidate.roundness_enabled = radius > 0
+            else:
+                bound.nodes[index].roundness = radius
+                bound.nodes[index].roundness_enabled = radius > 0
         elif control == "node" and selected is not None:
             snapped = self._snap(world_point, layer_id)
             target = QPointF(snapped.x() - wx, snapped.y() - wy)

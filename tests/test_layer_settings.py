@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 from PySide6.QtCore import QObject, Signal
-from PySide6.QtWidgets import QSlider, QSpinBox
+from PySide6.QtTest import QTest
+from PySide6.QtWidgets import QScrollArea, QSlider, QSpinBox
 
 from comic_editor.core.models import (
-    BoundGeometry, ChapterDocument, PathNode, RasterObject, ShapeStyle,
-    VectorDrawingObject,
+    BoundGeometry, ChapterDocument, ColorFillGradientObject, PathNode,
+    RasterObject, ShapeStyle, TextObject, VectorDrawingObject,
+    VectorFillObject,
 )
 from comic_editor.core.tiles import TileStore
 from comic_editor.ui.canvas import ToolKind
@@ -42,23 +44,24 @@ def test_layer_settings_follows_layer_page_and_object_parent(
         window.layer_settings.refresh()
         assert window.layer_settings.type_label.text() == "Rectangle Layer"
         assert window.layer_settings.name.text() == "Panel"
-        assert window.inspector.isHidden()
+        assert window.selection_settings.stack.currentWidget() is (
+            window.selection_settings.layer_page
+        )
 
         window.canvas.set_selection("object", raster.object_id)
         qapp.processEvents()
         assert window.canvas.active_layer_id == layer.layer_id
-        assert window.layer_settings.name.text() == "Panel"
-        assert window.inspector.isHidden()
-        assert window.ribbon.is_page_visible(
-            "raster_object_settings"
+        assert window.selection_settings.stack.currentWidget() is (
+            window.selection_settings.raster_page
         )
+        assert window.raster_object_controls.name.text() == "Ink"
+        assert "raster_object_settings" not in window.ribbon.page_keys()
 
         window.canvas.set_selection("layer", page.layer_id, False)
         qapp.processEvents()
         assert window.layer_settings.type_label.text() == "Page"
         assert window.layer_settings.border_width.maximum() == 40
         assert window.layer_settings.border_width_slider.maximum() == 40
-        assert window.inspector.isHidden()
 
         window.canvas.set_selection("layer", layer.layer_id, False)
         qapp.processEvents()
@@ -84,7 +87,13 @@ def test_layer_settings_kind_rows_and_position_above_tree(qapp, monkeypatch):
     )
     window._refresh_hierarchy()
     layout = window.hierarchy_dock.widget().layout()
-    assert layout.indexOf(window.layer_settings) < layout.indexOf(window.tree)
+    assert layout.indexOf(window.selection_common) < layout.indexOf(
+        window.outliner_splitter
+    )
+    assert window.outliner_splitter.widget(0) is window.settings_scroll
+    assert isinstance(window.settings_scroll, QScrollArea)
+    assert window.settings_scroll.widget() is window.selection_settings
+    assert window.outliner_splitter.widget(1) is window.tree
     try:
         window.canvas.set_selection("layer", fill.layer_id, False)
         window.layer_settings.refresh()
@@ -210,10 +219,10 @@ def test_raster_tool_controls_live_in_tool_settings_ribbon(qapp, monkeypatch):
     before = chapter.to_dict()
     try:
         assert window.canvas.tool == ToolKind.RASTER_PENCIL
-        assert window.inspector.isHidden()
-        assert window.ribbon.is_page_visible(
-            "raster_object_settings"
+        assert window.selection_settings.stack.currentWidget() is (
+            window.selection_settings.raster_page
         )
+        assert "raster_object_settings" not in window.ribbon.page_keys()
         controls = window.tool_settings_controls
         assert controls.stack.currentWidget() is controls.pencil_page
 
@@ -225,7 +234,6 @@ def test_raster_tool_controls_live_in_tool_settings_ribbon(qapp, monkeypatch):
 
         window._activate_tool(ToolKind.RASTER_ERASER)
         qapp.processEvents()
-        assert window.inspector.isHidden()
         assert controls.stack.currentWidget() is controls.eraser_page
         square = controls.eraser_shape.findData(True)
         controls.eraser_shape.setCurrentIndex(square)
@@ -235,7 +243,6 @@ def test_raster_tool_controls_live_in_tool_settings_ribbon(qapp, monkeypatch):
 
         window._activate_tool(ToolKind.TRANSFORM)
         qapp.processEvents()
-        assert window.inspector.isHidden()
         assert window.canvas.tool == ToolKind.RASTER_ERASER
         assert window.ribbon.current_key() == "tool_settings"
     finally:
@@ -266,13 +273,13 @@ def test_pencil_tool_settings_remains_selected_across_context_refreshes(
         assert controls.pencil_presets_button.isVisible()
         assert controls.pencil_presets_button.isEnabled()
 
-        # A user-selected contextual tab survives ordinary ribbon refreshes.
-        window.ribbon.tab_bar.setCurrentIndex(
-            window.ribbon._tab_keys.index("raster_object_settings")
+        # Raster properties now stay in the selection-settings pane.
+        assert "raster_object_settings" not in window.ribbon.page_keys()
+        assert window.selection_settings.stack.currentWidget() is (
+            window.selection_settings.raster_page
         )
-        assert window.ribbon.current_key() == "raster_object_settings"
         window._sync_contextual_ribbon()
-        assert window.ribbon.current_key() == "raster_object_settings"
+        assert window.ribbon.current_key() == "tool_settings"
 
         # Vector Pencil uses the same Tool Settings page and must not be
         # replaced by Vector Tools after its default tool is selected.
@@ -328,5 +335,129 @@ def test_pressure_presets_button_opens_for_raster_and_vector_pencil(
         assert len(opened) == 2
         assert all(active_name == window.settings.active_pencil_preset
                    for _presets, active_name, _parent in opened)
+    finally:
+        window.deleteLater()
+
+
+def test_common_selection_row_targets_exact_entity_and_coalesces_opacity(
+    qapp, monkeypatch,
+):
+    monkeypatch.setattr(main_window_module, "save_settings", lambda _value: None)
+    window = MainWindow()
+    chapter, _page, layer, raster = _window_document(window)
+    window._set_chapter(chapter, TileStore())
+    window.show()
+    qapp.processEvents()
+    try:
+        window.canvas.set_selection("layer", layer.layer_id, False)
+        common = window.selection_common
+        assert common.visible.isEnabled()
+        assert common.opacity.isEnabled()
+        assert common.opacity_value.text() == "100%"
+
+        window.canvas.command_stack.clear()
+        common.opacity.sliderPressed.emit()
+        common.opacity.setValue(82)
+        common.opacity.setValue(47)
+        common.opacity.sliderReleased.emit()
+        assert chapter.layers[layer.layer_id].opacity == 0.47
+        assert common.opacity_value.text() == "47%"
+        assert len(window.canvas.command_stack._undo) == 1
+        window.canvas.command_stack.undo()
+        assert window.canvas.chapter.layers[layer.layer_id].opacity == 1.0
+        window.canvas.command_stack.redo()
+        assert window.canvas.chapter.layers[layer.layer_id].opacity == 0.47
+
+        raster = window.canvas.chapter.objects[raster.object_id]
+        raster.opacity_locked = True
+        window.canvas.set_selection("object", raster.object_id)
+        common.refresh()
+        assert not common.opacity.isEnabled()
+        controls = window.raster_object_controls
+        controls.refresh()
+        controls.opacity_lock.setChecked(False)
+        qapp.processEvents()
+        assert common.opacity.isEnabled()
+
+        window.canvas.clear_selection()
+        common.refresh()
+        assert not common.visible.isEnabled()
+        assert not common.opacity.isEnabled()
+    finally:
+        window.deleteLater()
+
+
+def test_selection_settings_switches_object_pages_and_uses_parent_for_contextual(
+    qapp, monkeypatch,
+):
+    monkeypatch.setattr(main_window_module, "save_settings", lambda _value: None)
+    window = MainWindow()
+    chapter, _page, layer, raster = _window_document(window)
+    drawing = chapter.add_object(
+        layer.layer_id, VectorDrawingObject(name="Vector")
+    )
+    fill = chapter.add_vector_fill(
+        drawing.object_id, VectorFillObject(name="Fill")
+    )
+    text = chapter.add_object(layer.layer_id, TextObject(text="Text"))
+    gradient = chapter.add_object(
+        layer.layer_id, ColorFillGradientObject()
+    )
+    window._set_chapter(chapter, TileStore())
+    panel = window.selection_settings
+    try:
+        window.canvas.set_selection("object", raster.object_id)
+        assert panel.stack.currentWidget() is panel.raster_page
+        window.canvas.set_selection("object", drawing.object_id)
+        assert panel.stack.currentWidget() is panel.vector_page
+        assert panel.vector_controls.ignore_parent_mask.isVisibleTo(panel)
+        window.canvas.set_selection("object", fill.object_id)
+        assert panel.stack.currentWidget() is panel.vector_page
+        assert panel.vector_controls.type_label.text() == "Vector Fill"
+        assert panel.vector_controls.ignore_parent_mask.isHidden()
+        assert panel.vector_controls.underlay_row.isHidden()
+
+        for object_id in (text.object_id, gradient.object_id):
+            window.canvas.set_selection("object", object_id)
+            assert panel.stack.currentWidget() is panel.layer_page
+            assert panel.layer_page.title() == "Parent Layer Settings"
+            assert panel.layer_page.name.text() == "Panel"
+        assert window.gradient_tools_controls.opacity_lock.isChecked()
+        assert not window.selection_common.opacity.isEnabled()
+        window.gradient_tools_controls.opacity_lock.setChecked(False)
+        qapp.processEvents()
+        assert window.selection_common.opacity.isEnabled()
+    finally:
+        window.deleteLater()
+
+
+def test_common_text_visibility_commits_typing_before_property_undo(
+    qapp, monkeypatch,
+):
+    monkeypatch.setattr(main_window_module, "save_settings", lambda _value: None)
+    window = MainWindow()
+    chapter = ChapterDocument()
+    page = chapter.add_page()
+    text = chapter.add_object(page.layer_id, TextObject(text="abc"))
+    window._set_chapter(chapter, TileStore())
+    window.show()
+    try:
+        window.canvas.set_selection("object", text.object_id)
+        window.canvas._begin_text_session(text)
+        window.canvas._text_cursor_position = len(text.text)
+        window.canvas._text_selection_anchor = len(text.text)
+        window.canvas.setFocus()
+        QTest.keyClicks(window.canvas, "x")
+        assert text.text == "abcx"
+        assert len(window.canvas.command_stack._undo) == 0
+
+        window.selection_common.visible.click()
+        assert len(window.canvas.command_stack._undo) == 2
+        assert not window.canvas.chapter.objects[text.object_id].visible
+        window.canvas.command_stack.undo()
+        assert window.canvas.chapter.objects[text.object_id].visible
+        assert window.canvas.chapter.objects[text.object_id].text == "abcx"
+        window.canvas.command_stack.undo()
+        assert window.canvas.chapter.objects[text.object_id].text == "abc"
     finally:
         window.deleteLater()
