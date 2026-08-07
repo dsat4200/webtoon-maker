@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import copy
+import json
 import re
 import time
 import math
@@ -10,26 +11,29 @@ from pathlib import Path
 from PySide6.QtCore import (
     QCoreApplication, QEvent, QItemSelection, QItemSelectionModel, QModelIndex,
     QBuffer, QByteArray, QIODevice, QPointF, QRectF, QSignalBlocker, QSize,
-    QTimer, Qt,
+    QSaveFile, QTimer, Qt,
     Signal,
 )
 from PySide6.QtGui import (
-    QAction, QCloseEvent, QCursor, QImage, QImageReader, QKeySequence,
+    QAction, QCloseEvent, QColor, QCursor, QImage, QImageReader, QKeySequence,
     QMouseEvent, QShortcut,
 )
 from PySide6.QtWidgets import (
-    QAbstractSpinBox, QApplication, QCheckBox, QComboBox, QDockWidget,
+    QAbstractItemView, QAbstractSpinBox, QApplication, QCheckBox, QComboBox,
+    QDockWidget,
     QFileDialog, QHBoxLayout,
     QDialog, QDialogButtonBox, QFormLayout, QHeaderView, QInputDialog, QLabel,
-    QLineEdit, QMainWindow, QMenu, QMessageBox, QPlainTextEdit, QPushButton,
+    QDoubleSpinBox, QLineEdit, QListWidget, QMainWindow, QMenu, QMessageBox,
+    QPlainTextEdit, QPushButton,
     QScrollArea, QSizePolicy, QSpinBox, QSplitter, QTabBar, QTabWidget, QTextEdit,
-    QToolBar, QToolButton, QToolTip, QTreeView, QVBoxLayout, QWidget, QFrame,
+    QTableWidget, QTableWidgetItem, QToolBar, QToolButton, QToolTip, QTreeView,
+    QVBoxLayout, QWidget, QFrame,
 )
 
 from comic_editor.core.models import (
     BoundGeometry, ChapterDocument, ColorFillGradientObject,
     ColorGradientRamp, ColorGradientRampPreset, ColorGradientStop,
-    ColorPalette, GradientObject, PaletteSwatch, PathNode,
+    ColorPalette, GradientObject, LayerNode, PaletteSwatch, PathNode,
     ImageObject, RasterObject, SpeedLineCenterObject, SpeedLinesGradientObject,
     TextObject, VectorDrawingObject, VectorFillObject, new_id,
 )
@@ -66,6 +70,15 @@ from comic_editor.ui.tree_model import HierarchyModel
 from comic_editor.ui.asset_library import AssetLibraryWidget
 from comic_editor.ui.sessions import EditorSession, ProjectContext
 from comic_editor.ui.windows_input import tablet_multitouch_native_result
+from comic_editor.ui.three_d import ThreeDToolKind, ThreeDViewportController
+from comic_editor.ui.three_d_sync import ThreeDSyncCoordinator
+from comic_editor.three_d.documents import (
+    BlenderChapterDocument, ComicFrameDocument, DrawingMaterial3D,
+)
+from comic_editor.three_d.repository import BlenderSidecarData
+from comic_editor.three_d.protocol import (
+    ConflictResolution, grouped_conflicts,
+)
 
 
 class ResponsiveToolButton(QToolButton):
@@ -256,7 +269,9 @@ class MainWindow(QMainWindow):
         self._dirty = False
         self._last_autosave = 0.0
         self._loading_chapter = False
+        self._three_d_scene_cache: dict[str, object] = {}
         self._build_ui()
+        self.three_d_sync_manager = ThreeDSyncCoordinator(self)
         self._connect()
         self._install_shortcuts()
         self._refresh_actions()
@@ -375,6 +390,24 @@ class MainWindow(QMainWindow):
                 self._activate_tool(selected)
             )
             self.shape_tool_buttons[tool] = option
+        self.add_blender_layer_button = self.shapes_category.addTool(
+            "3D Layer", "plus-square-dashed"
+        )
+        blender_shape_menu = QMenu(self.add_blender_layer_button)
+        for label, kind in (
+            ("Rectangle 3D Layer", "rectangle"),
+            ("Ellipse 3D Layer", "circle"),
+            ("Free Closed 3D Layer", "custom"),
+        ):
+            action = blender_shape_menu.addAction(label)
+            action.triggered.connect(
+                lambda checked=False, selected=kind:
+                self._begin_blender_layer_creation(selected)
+            )
+        self.add_blender_layer_button.setMenu(blender_shape_menu)
+        self.add_blender_layer_button.setPopupMode(
+            QToolButton.ToolButtonPopupMode.InstantPopup
+        )
         self.drawing_selection_category = CollapsibleToolCategory(
             "Drawing Selection"
         )
@@ -407,6 +440,38 @@ class MainWindow(QMainWindow):
         self.tool_toolbar.addWidget(self.add_text_button)
         self.tool_toolbar.addWidget(self.add_raster_button)
         self.tool_toolbar.addWidget(self.add_vector_button)
+        self.three_d_tool_buttons: dict[ThreeDToolKind, QToolButton] = {}
+        for tool, label, icon_name in (
+            (ThreeDToolKind.TRANSFORM, "Transform Object", "frame-tool"),
+            (ThreeDToolKind.ADD_LIGHT, "Add Light", "circle"),
+            (ThreeDToolKind.DRAW_CUBE, "Draw Cube", "plus-square-dashed"),
+            (ThreeDToolKind.DRAW_CYLINDER, "Draw Cylinder", "plus-square-dashed"),
+            (ThreeDToolKind.SELECT_RECT, "Rectangle Select", "select-window"),
+            (ThreeDToolKind.SELECT_LASSO, "Lasso Select", "selective-tool"),
+        ):
+            button = ResponsiveToolButton(label, icon_name)
+            button.setCheckable(True)
+            button.clicked.connect(
+                lambda checked=False, selected=tool:
+                self._activate_three_d_tool(selected)
+            )
+            button.hide()
+            self.tool_toolbar.addWidget(button)
+            self.three_d_tool_buttons[tool] = button
+        light_menu = QMenu(self)
+        for label, light_type in (
+            ("Sun", "sun"), ("Point", "point"),
+            ("Rectangle", "rectangle"), ("Spot", "spot"),
+        ):
+            action = light_menu.addAction(label)
+            action.triggered.connect(
+                lambda checked=False, selected=light_type:
+                self._select_three_d_light_type(selected)
+            )
+        self.three_d_tool_buttons[ThreeDToolKind.ADD_LIGHT].setMenu(light_menu)
+        self.three_d_tool_buttons[ThreeDToolKind.ADD_LIGHT].setPopupMode(
+            QToolButton.ToolButtonPopupMode.MenuButtonPopup
+        )
         self.page_scope = QCheckBox("Select in page")
         self.page_scope.setChecked(self.settings.page_scope_select)
         # Kept as an attribute for compatibility with older integrations;
@@ -500,6 +565,11 @@ class MainWindow(QMainWindow):
             self.vector_tools_controls.simplify_widget
         )
         self.canvas = create_canvas(self.settings)
+        self.three_d_controller = ThreeDViewportController(
+            self, scene_provider=self._three_d_scene_for_frame
+        )
+        self.canvas.set_three_d_controller(self.three_d_controller)
+        self._build_three_d_ribbon()
         self.text_object_controls = TextObjectControls(
             self.canvas, self.settings, self.ribbon
         )
@@ -728,6 +798,483 @@ class MainWindow(QMainWindow):
         self._programmatic_ribbon_selection = 0
         self._expanded_selected_vector_id = ""
 
+    def _build_three_d_ribbon(self) -> None:
+        """Create the six contextual pages used while a 3D layer is active."""
+        self.three_d_view_page = self.ribbon.add_page(
+            "three_d_view", "View", visible=False
+        )
+        view_group = self.three_d_view_page.add_group("Overlays")
+        view_widget = QWidget(self.ribbon)
+        view_layout = QVBoxLayout(view_widget)
+        view_layout.setContentsMargins(0, 0, 0, 0)
+        self.three_d_grid = QCheckBox("Grid", view_widget)
+        self.three_d_volume_grid = QCheckBox("Volume grid", view_widget)
+        self.three_d_axes = QCheckBox("Colored axes", view_widget)
+        self.three_d_floor = QCheckBox("Neutral floor", view_widget)
+        self.three_d_overlays = QCheckBox("Overlays", view_widget)
+        for control, checked in (
+            (self.three_d_grid, True), (self.three_d_volume_grid, False),
+            (self.three_d_axes, True),
+            (self.three_d_floor, True), (self.three_d_overlays, True),
+        ):
+            control.setChecked(checked)
+            view_layout.addWidget(control)
+        view_group.add_widget(view_widget)
+        source_group = self.three_d_view_page.add_group("Blender source")
+        source_widget = QWidget(self.ribbon)
+        source_layout = QVBoxLayout(source_widget)
+        source_layout.setContentsMargins(0, 0, 0, 0)
+        self.three_d_source_status = QLabel("No Blender file linked", source_widget)
+        self.three_d_source_status.setWordWrap(True)
+        self.three_d_connection_status = QLabel(
+            "Blender sync is inactive", source_widget
+        )
+        self.three_d_connection_status.setWordWrap(True)
+        self.three_d_copy_sync = QPushButton(
+            "Copy Add-on Connection Settings", source_widget
+        )
+        self.three_d_replace_source = QPushButton(
+            "Link / Replace Blender File", source_widget
+        )
+        self.three_d_edit_boundary = QPushButton("Edit Boundary", source_widget)
+        source_layout.addWidget(self.three_d_source_status)
+        source_layout.addWidget(self.three_d_connection_status)
+        source_layout.addWidget(self.three_d_copy_sync)
+        source_layout.addWidget(self.three_d_replace_source)
+        source_layout.addWidget(self.three_d_edit_boundary)
+        source_group.add_widget(source_widget)
+
+        self.three_d_rendering_page = self.ribbon.add_page(
+            "three_d_rendering", "Rendering", visible=False
+        )
+        camera_group = self.three_d_rendering_page.add_group("Camera")
+        camera_widget = QWidget(self.ribbon)
+        camera_form = QFormLayout(camera_widget)
+        camera_form.setContentsMargins(0, 0, 0, 0)
+        self.three_d_projection = QComboBox(camera_widget)
+        for label, value in (
+            ("Perspective", "perspective"),
+            ("Orthographic", "orthographic"),
+            ("Fisheye - Equidistant", "fisheye_equidistant"),
+            ("Fisheye - Equisolid", "fisheye_equisolid"),
+            ("Fisheye - Stereographic", "fisheye_stereographic"),
+            ("Fisheye - Orthographic", "fisheye_orthographic"),
+        ):
+            self.three_d_projection.addItem(label, value)
+        self.three_d_fov = QDoubleSpinBox(camera_widget)
+        self.three_d_fov.setRange(1.0, 179.0)
+        self.three_d_fov.setValue(50.0)
+        self.three_d_fov.setSuffix(" deg")
+        self.three_d_ortho_height = QDoubleSpinBox(camera_widget)
+        self.three_d_ortho_height.setRange(0.001, 100000.0)
+        self.three_d_ortho_height.setValue(10.0)
+        camera_form.addRow("Projection", self.three_d_projection)
+        camera_form.addRow("FOV", self.three_d_fov)
+        camera_form.addRow("Ortho height", self.three_d_ortho_height)
+        camera_group.add_widget(camera_widget)
+        quality_group = self.three_d_rendering_page.add_group("Quality")
+        quality_widget = QWidget(self.ribbon)
+        quality_layout = QVBoxLayout(quality_widget)
+        quality_layout.setContentsMargins(0, 0, 0, 0)
+        self.three_d_shadows = QCheckBox("Shadows", quality_widget)
+        self.three_d_shadows.setChecked(True)
+        self.three_d_shadow_quality = QComboBox(quality_widget)
+        self.three_d_shadow_quality.addItem("Low shadows", "low")
+        self.three_d_shadow_quality.addItem("Medium shadows", "medium")
+        self.three_d_shadow_quality.addItem("High shadows", "high")
+        self.three_d_fidelity = QComboBox(quality_widget)
+        self.three_d_fidelity.addItem("Interactive", "interactive")
+        self.three_d_fidelity.addItem("Full", "full")
+        self.three_d_antialiasing = QCheckBox("4x MSAA", quality_widget)
+        self.three_d_antialiasing.setChecked(False)
+        for control in (
+            self.three_d_shadows, self.three_d_shadow_quality,
+            self.three_d_fidelity, self.three_d_antialiasing,
+        ):
+            quality_layout.addWidget(control)
+        quality_group.add_widget(quality_widget)
+
+        # Intentionally contains no controls in v1.  Freestyle marks remain
+        # in sidecar metadata for the later Freestyle-like implementation.
+        self.three_d_outline_page = self.ribbon.add_page(
+            "three_d_outline", "Outline Settings", visible=False
+        )
+
+        self.three_d_materials_page = self.ribbon.add_page(
+            "three_d_materials", "Materials", visible=False
+        )
+        materials_group = self.three_d_materials_page.add_group(
+            "Drawing materials"
+        )
+        materials_widget = QWidget(self.ribbon)
+        materials_layout = QVBoxLayout(materials_widget)
+        materials_layout.setContentsMargins(0, 0, 0, 0)
+        self.three_d_material_list = QListWidget(materials_widget)
+        material_buttons = QHBoxLayout()
+        self.three_d_material_add = QPushButton("Create", materials_widget)
+        self.three_d_material_rename = QPushButton("Rename", materials_widget)
+        self.three_d_material_delete = QPushButton("Delete", materials_widget)
+        for button in (
+            self.three_d_material_add, self.three_d_material_rename,
+            self.three_d_material_delete,
+        ):
+            material_buttons.addWidget(button)
+        self.three_d_material_shader = QComboBox(materials_widget)
+        self.three_d_material_shader.addItem("Diffuse", "diffuse")
+        self.three_d_material_shader.addItem("Toon", "toon")
+        self.three_d_material_shader.addItem("Unshaded", "unshaded")
+        self.three_d_material_texture = QCheckBox("Use texture", materials_widget)
+        self.three_d_material_vertex = QCheckBox(
+            "Use vertex color", materials_widget
+        )
+        material_properties = QFormLayout()
+        material_properties.setContentsMargins(0, 0, 0, 0)
+        self.three_d_material_tint = QLineEdit(materials_widget)
+        self.three_d_material_tint.setPlaceholderText("#AARRGGBB")
+        self.three_d_material_tint.setToolTip(
+            "Drawing-side tint in #AARRGGBB format"
+        )
+        self.three_d_material_toon_ramp = QLineEdit(materials_widget)
+        self.three_d_material_toon_ramp.setPlaceholderText(
+            "0:#FF333333, 0.5:#FFAAAAAA, 1:#FFFFFFFF"
+        )
+        self.three_d_material_toon_ramp.setToolTip(
+            "Comma-separated Toon stops in position:#AARRGGBB format"
+        )
+        self.three_d_material_outline = QCheckBox(
+            "Enable material outline", materials_widget
+        )
+        self.three_d_material_outline_color = QLineEdit(materials_widget)
+        self.three_d_material_outline_color.setPlaceholderText("#AARRGGBB")
+        self.three_d_material_outline_width = QDoubleSpinBox(materials_widget)
+        self.three_d_material_outline_width.setRange(0.0, 1000.0)
+        self.three_d_material_outline_width.setDecimals(2)
+        self.three_d_material_outline_width.setSingleStep(0.25)
+        self.three_d_material_outline_width.setSuffix(" px")
+        material_properties.addRow("Tint", self.three_d_material_tint)
+        material_properties.addRow(
+            "Toon ramp", self.three_d_material_toon_ramp
+        )
+        material_properties.addRow(
+            "Outline color", self.three_d_material_outline_color
+        )
+        material_properties.addRow(
+            "Outline width", self.three_d_material_outline_width
+        )
+        materials_layout.addWidget(self.three_d_material_list, 1)
+        materials_layout.addLayout(material_buttons)
+        materials_layout.addWidget(self.three_d_material_shader)
+        materials_layout.addWidget(self.three_d_material_texture)
+        materials_layout.addWidget(self.three_d_material_vertex)
+        materials_layout.addLayout(material_properties)
+        materials_layout.addWidget(self.three_d_material_outline)
+        materials_group.add_widget(materials_widget)
+
+        assignments_group = self.three_d_materials_page.add_group(
+            "Source assignments"
+        )
+        assignments_widget = QWidget(self.ribbon)
+        assignments_layout = QVBoxLayout(assignments_widget)
+        assignments_layout.setContentsMargins(0, 0, 0, 0)
+        self.three_d_material_mapping_table = QTableWidget(
+            0, 3, assignments_widget
+        )
+        self.three_d_material_mapping_table.setHorizontalHeaderLabels((
+            "Blender material", "Assigned objects / slots", "Drawing material",
+        ))
+        self.three_d_material_mapping_table.setEditTriggers(
+            QAbstractItemView.EditTrigger.NoEditTriggers
+        )
+        self.three_d_material_mapping_table.setSelectionBehavior(
+            QAbstractItemView.SelectionBehavior.SelectRows
+        )
+        header = self.three_d_material_mapping_table.horizontalHeader()
+        header.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
+        assignments_layout.addWidget(self.three_d_material_mapping_table)
+        assignments_group.add_widget(assignments_widget)
+
+        self.three_d_object_page = self.ribbon.add_page(
+            "three_d_object", "Object Properties", visible=False
+        )
+        transform_group = self.three_d_object_page.add_group("Transform")
+        transform_widget = QWidget(self.ribbon)
+        transform_form = QFormLayout(transform_widget)
+        transform_form.setContentsMargins(0, 0, 0, 0)
+        self.three_d_transform_space = QComboBox(transform_widget)
+        self.three_d_transform_space.addItem("Global", "global")
+        self.three_d_transform_space.addItem("Local", "local")
+        self.three_d_gizmo_mode = QComboBox(transform_widget)
+        for label, value in (
+            ("Move", "move"), ("Rotate", "rotate"),
+            ("Scale", "scale"), ("Trackball Rotate", "trackball"),
+        ):
+            self.three_d_gizmo_mode.addItem(label, value)
+        transform_form.addRow("Space", self.three_d_transform_space)
+        transform_form.addRow("Gizmo", self.three_d_gizmo_mode)
+        self.three_d_transform_fields: list[QDoubleSpinBox] = []
+        for label, minimum, maximum, initial in (
+            ("Position X", -1_000_000.0, 1_000_000.0, 0.0),
+            ("Position Y", -1_000_000.0, 1_000_000.0, 0.0),
+            ("Position Z", -1_000_000.0, 1_000_000.0, 0.0),
+            ("Rotation X", -360_000.0, 360_000.0, 0.0),
+            ("Rotation Y", -360_000.0, 360_000.0, 0.0),
+            ("Rotation Z", -360_000.0, 360_000.0, 0.0),
+            ("Scale X", -10_000.0, 10_000.0, 1.0),
+            ("Scale Y", -10_000.0, 10_000.0, 1.0),
+            ("Scale Z", -10_000.0, 10_000.0, 1.0),
+        ):
+            field = QDoubleSpinBox(transform_widget)
+            field.setDecimals(4)
+            field.setRange(minimum, maximum)
+            field.setValue(initial)
+            field.setSingleStep(0.1 if "Rotation" not in label else 1.0)
+            field.setEnabled(False)
+            field.editingFinished.connect(self._edit_three_d_transform)
+            transform_form.addRow(label, field)
+            self.three_d_transform_fields.append(field)
+        self.three_d_reset_object = QPushButton(
+            "Reset to Blender", transform_widget
+        )
+        transform_form.addRow(self.three_d_reset_object)
+        transform_group.add_widget(transform_widget)
+
+        properties_group = self.three_d_object_page.add_group("Parameters")
+        self.three_d_entity_properties_widget = QWidget(self.ribbon)
+        properties_form = QFormLayout(self.three_d_entity_properties_widget)
+        properties_form.setContentsMargins(0, 0, 0, 0)
+        self.three_d_entity_kind = QLabel("No editable parameters", self.ribbon)
+        properties_form.addRow("Entity", self.three_d_entity_kind)
+        self.three_d_entity_property_rows: dict[str, tuple[QWidget, QWidget]] = {}
+        self.three_d_entity_property_controls: list[QWidget] = []
+
+        def add_property_row(name: str, label: str, control: QWidget) -> None:
+            properties_form.addRow(label, control)
+            row_label = properties_form.labelForField(control)
+            self.three_d_entity_property_rows[name] = (row_label, control)
+            self.three_d_entity_property_controls.append(control)
+
+        def numeric_property(
+            name: str, label: str, minimum: float, maximum: float,
+            value: float, step: float = 0.1,
+        ) -> QDoubleSpinBox:
+            control = QDoubleSpinBox(self.three_d_entity_properties_widget)
+            control.setDecimals(4)
+            control.setRange(minimum, maximum)
+            control.setValue(value)
+            control.setSingleStep(step)
+            control.editingFinished.connect(
+                self._edit_three_d_entity_properties
+            )
+            add_property_row(name, label, control)
+            return control
+
+        self.three_d_cube_size_x = numeric_property(
+            "size_x", "Size X", 0.001, 1_000_000.0, 1.0
+        )
+        self.three_d_cube_size_y = numeric_property(
+            "size_y", "Size Y", 0.001, 1_000_000.0, 1.0
+        )
+        self.three_d_cube_size_z = numeric_property(
+            "size_z", "Size Z", 0.001, 1_000_000.0, 1.0
+        )
+        self.three_d_cylinder_radius = numeric_property(
+            "radius", "Radius", 0.001, 1_000_000.0, 0.5
+        )
+        self.three_d_cylinder_depth = numeric_property(
+            "depth", "Depth", 0.001, 1_000_000.0, 1.0
+        )
+        self.three_d_cylinder_segments = QSpinBox(
+            self.three_d_entity_properties_widget
+        )
+        self.three_d_cylinder_segments.setRange(3, 512)
+        self.three_d_cylinder_segments.setValue(32)
+        self.three_d_cylinder_segments.editingFinished.connect(
+            self._edit_three_d_entity_properties
+        )
+        add_property_row(
+            "segments", "Segments", self.three_d_cylinder_segments
+        )
+
+        self.three_d_light_type = QComboBox(
+            self.three_d_entity_properties_widget
+        )
+        for label, value in (
+            ("Sun", "sun"), ("Point", "point"),
+            ("Rectangle", "rectangle"), ("Spot", "spot"),
+        ):
+            self.three_d_light_type.addItem(label, value)
+        self.three_d_light_type.currentIndexChanged.connect(
+            self._edit_three_d_entity_properties
+        )
+        add_property_row("light_type", "Type", self.three_d_light_type)
+        self.three_d_light_color = QLineEdit(
+            "#FFFFFFFF", self.three_d_entity_properties_widget
+        )
+        self.three_d_light_color.setPlaceholderText("#AARRGGBB")
+        self.three_d_light_color.editingFinished.connect(
+            self._edit_three_d_entity_properties
+        )
+        add_property_row("color", "Color", self.three_d_light_color)
+        self.three_d_light_energy = numeric_property(
+            "energy", "Energy", 0.0, 1_000_000_000.0, 1.0, 1.0
+        )
+        self.three_d_light_range = numeric_property(
+            "range", "Range", 0.0, 1_000_000.0, 0.0
+        )
+        self.three_d_light_area_width = numeric_property(
+            "area_width", "Area width", 0.001, 1_000_000.0, 1.0
+        )
+        self.three_d_light_area_height = numeric_property(
+            "area_height", "Area height", 0.001, 1_000_000.0, 1.0
+        )
+        self.three_d_light_spot_angle = numeric_property(
+            "spot_angle", "Spot angle (deg)", 0.001, 179.999, 45.0, 1.0
+        )
+        self.three_d_light_shadow = QCheckBox(
+            "Cast shadows", self.three_d_entity_properties_widget
+        )
+        self.three_d_light_shadow.toggled.connect(
+            self._edit_three_d_entity_properties
+        )
+        add_property_row("casts_shadow", "Shadow", self.three_d_light_shadow)
+
+        self.three_d_camera_type = QComboBox(
+            self.three_d_entity_properties_widget
+        )
+        self.three_d_camera_type.addItem("Perspective", "perspective")
+        self.three_d_camera_type.addItem("Orthographic", "orthographic")
+        self.three_d_camera_type.currentIndexChanged.connect(
+            self._edit_three_d_entity_properties
+        )
+        add_property_row("camera_type", "Projection", self.three_d_camera_type)
+        self.three_d_camera_fov = numeric_property(
+            "fov", "Field of view", 0.001, 179.999, 50.0, 1.0
+        )
+        self.three_d_camera_ortho_scale = numeric_property(
+            "ortho_scale", "Ortho scale", 0.001, 1_000_000.0, 10.0
+        )
+        self.three_d_camera_clip_start = numeric_property(
+            "clip_start", "Clip start", 0.000001, 1_000_000.0, 0.01
+        )
+        self.three_d_camera_clip_end = numeric_property(
+            "clip_end", "Clip end", 0.000002, 1_000_000_000.0, 1000.0
+        )
+        properties_group.add_widget(self.three_d_entity_properties_widget)
+        self.three_d_entity_properties_widget.setVisible(False)
+
+        metadata_group = self.three_d_object_page.add_group("Blender metadata")
+        self.three_d_object_metadata = QLabel(
+            "Select an object in the Blender subtree.", self.ribbon
+        )
+        self.three_d_object_metadata.setWordWrap(True)
+        metadata_group.add_widget(self.three_d_object_metadata)
+
+        self.three_d_tool_settings_page = self.ribbon.add_page(
+            "three_d_tool_settings", "Tool Settings", visible=False
+        )
+        select_group = self.three_d_tool_settings_page.add_group("Selection")
+        self.three_d_multi_select = QCheckBox("Enable Multi Select", self.ribbon)
+        self.three_d_multi_select.setChecked(False)
+        select_group.add_widget(self.three_d_multi_select)
+
+        for control, key in (
+            (self.three_d_grid, "grid_visible"),
+            (self.three_d_volume_grid, "volume_grid_visible"),
+            (self.three_d_axes, "axes_visible"),
+            (self.three_d_floor, "floor_visible"),
+            (self.three_d_overlays, "overlays_visible"),
+            (self.three_d_shadows, "shadows_enabled"),
+            (self.three_d_antialiasing, "antialiasing"),
+        ):
+            control.toggled.connect(
+                lambda enabled, setting=key:
+                self._set_three_d_renderer_setting(setting, enabled)
+            )
+        self.three_d_projection.currentIndexChanged.connect(
+            lambda _index: self._set_three_d_renderer_setting(
+                "projection", self.three_d_projection.currentData()
+            )
+        )
+        self.three_d_fov.valueChanged.connect(
+            lambda value: self._set_three_d_renderer_setting("fov", value)
+        )
+        self.three_d_ortho_height.valueChanged.connect(
+            lambda value: self._set_three_d_renderer_setting(
+                "ortho_height", value
+            )
+        )
+        self.three_d_shadow_quality.currentIndexChanged.connect(
+            lambda _index: self._set_three_d_renderer_setting(
+                "shadow_quality", self.three_d_shadow_quality.currentData()
+            )
+        )
+        self.three_d_fidelity.currentIndexChanged.connect(
+            lambda _index: self._set_three_d_renderer_setting(
+                "quality", self.three_d_fidelity.currentData()
+            )
+        )
+        self.three_d_multi_select.toggled.connect(
+            self._three_d_multi_select_changed
+        )
+        self.three_d_transform_space.currentIndexChanged.connect(
+            lambda _index: self.three_d_controller.set_transform_settings(
+                space=self.three_d_transform_space.currentData()
+            ) if not getattr(self, "_syncing_three_d_controls", False) else None
+        )
+        self.three_d_gizmo_mode.currentIndexChanged.connect(
+            lambda _index: self.three_d_controller.set_transform_settings(
+                mode=self.three_d_gizmo_mode.currentData()
+            ) if not getattr(self, "_syncing_three_d_controls", False) else None
+        )
+        self.three_d_reset_object.clicked.connect(
+            self._reset_three_d_object_overrides
+        )
+        self.three_d_edit_boundary.clicked.connect(
+            self.canvas.begin_blender_boundary_edit
+        )
+        self.three_d_replace_source.clicked.connect(
+            self._replace_blender_association
+        )
+        self.three_d_copy_sync.clicked.connect(
+            self._copy_three_d_sync_registration
+        )
+        self.three_d_material_add.clicked.connect(self._add_three_d_material)
+        self.three_d_material_rename.clicked.connect(
+            self._rename_three_d_material
+        )
+        self.three_d_material_delete.clicked.connect(
+            self._delete_three_d_material
+        )
+        self.three_d_material_list.currentRowChanged.connect(
+            self._three_d_material_selected
+        )
+        self.three_d_material_shader.currentIndexChanged.connect(
+            self._edit_three_d_material
+        )
+        self.three_d_material_texture.toggled.connect(
+            self._edit_three_d_material
+        )
+        self.three_d_material_vertex.toggled.connect(
+            self._edit_three_d_material
+        )
+        self.three_d_material_tint.editingFinished.connect(
+            self._edit_three_d_material
+        )
+        self.three_d_material_toon_ramp.editingFinished.connect(
+            self._edit_three_d_material
+        )
+        self.three_d_material_outline.toggled.connect(
+            self._edit_three_d_material
+        )
+        self.three_d_material_outline_color.editingFinished.connect(
+            self._edit_three_d_material
+        )
+        self.three_d_material_outline_width.editingFinished.connect(
+            self._edit_three_d_material
+        )
+
     def _restore_workspace_layout(self) -> None:
         stored = self.settings.ui_splitter_sizes
         width = max(600, self.width())
@@ -818,10 +1365,15 @@ class MainWindow(QMainWindow):
         self.ribbon.pageChanged.connect(self._ribbon_page_changed)
         self.canvas.hierarchyChanged.connect(self._hierarchy_changed)
         self.canvas.selectionChanged.connect(self._canvas_selection_changed)
+        self.canvas.threeDModeChanged.connect(self._three_d_mode_changed)
+        self.canvas.blenderLayerCreated.connect(self._blender_layer_created)
         self.canvas.chapterReplaced.connect(self._chapter_replaced)
         self.canvas.toolChanged.connect(self._canvas_tool_changed)
         self.canvas.interactionFinished.connect(self.selection_common.refresh)
         self.canvas.interactionFinished.connect(self.selection_settings.refresh)
+        self.canvas.interactionFinished.connect(
+            self.canvas.finish_blender_boundary_edit
+        )
         self.canvas.interactionFinished.connect(
             self.text_object_controls.refresh
         )
@@ -868,6 +1420,42 @@ class MainWindow(QMainWindow):
             self._ribbon_settings_changed
         )
         self.hierarchy_model.mutationCommitted.connect(self._tree_mutated)
+        self.hierarchy_model.virtualVisibilityChanged.connect(
+            self.three_d_controller.set_virtual_visibility
+        )
+        self.three_d_controller.hierarchyChanged.connect(
+            self._refresh_three_d_hierarchy
+        )
+        self.three_d_controller.statusMessage.connect(
+            lambda message: self.statusBar().showMessage(message, 7000)
+        )
+        self.three_d_controller.toolChanged.connect(
+            lambda _tool: self._sync_three_d_tool_buttons()
+        )
+        self.three_d_controller.selectionChanged.connect(
+            self._three_d_selection_changed
+        )
+        self.three_d_controller.imageChanged.connect(
+            self._persist_three_d_preview
+        )
+        self.three_d_controller.editingAvailabilityChanged.connect(
+            self._three_d_editing_availability_changed
+        )
+        self.three_d_sync_manager.statusMessage.connect(
+            lambda message: self.statusBar().showMessage(message, 9000)
+        )
+        self.three_d_sync_manager.registrationChanged.connect(
+            self._three_d_sync_registration_changed
+        )
+        self.three_d_sync_manager.accepted.connect(
+            lambda _receipt: self._three_d_sync_accepted()
+        )
+        self.three_d_sync_manager.conflicts.connect(
+            self._resolve_three_d_sync_conflicts
+        )
+        self.three_d_sync_manager.rejected.connect(
+            self._three_d_sync_rejected
+        )
         self.tree.selectionModel().selectionChanged.connect(self._tree_selection_changed)
         self.tree.customContextMenuRequested.connect(
             self._show_tree_context_menu
@@ -1551,6 +2139,12 @@ class MainWindow(QMainWindow):
             self._last_autosave = session.last_autosave
             self.canvas.asset_repository = session.context.assets
             self.asset_library.set_repository(session.context.assets)
+            self.three_d_controller.set_documents(
+                session.chapter,
+                session.blender_sidecar if session.kind == "series" else None,
+            )
+            if session.kind == "series":
+                self._load_three_d_previews(session)
             if session.canvas_state is None:
                 self.canvas.command_stack = CommandStack()
                 self.canvas.set_document(
@@ -1571,6 +2165,9 @@ class MainWindow(QMainWindow):
                 self.chapter, self.canvas.tiles, self.canvas.images
             )
             self.hierarchy_model.set_chapter(self.chapter)
+            self.hierarchy_model.set_blender_hierarchy(
+                self.three_d_controller.virtual_hierarchy()
+            )
             for entity_id in session.expanded_entities:
                 kind = "layer" if entity_id in self.chapter.layers else "object"
                 index = self.hierarchy_model.index_for_entity(kind, entity_id)
@@ -1592,6 +2189,7 @@ class MainWindow(QMainWindow):
             self._sync_contextual_ribbon()
             self._refresh_actions()
             self._refresh_project_tabs()
+            self._refresh_three_d_sync_binding()
             self.statusBar().showMessage(
                 f"{session.name} — {self.chapter.width} × {self.chapter.height}px"
             )
@@ -1602,11 +2200,13 @@ class MainWindow(QMainWindow):
         if self.project_tabs.count() > 0:
             return
         self.active_session = None
+        self.three_d_sync_manager.stop()
         self.repository = None
         self.series = None
         self.chapter = None
         self._dirty = False
         self.canvas.asset_repository = None
+        self.three_d_controller.set_documents(None, None)
         self.canvas.clear_document()
         self.hierarchy_model.set_chapter(None)
         self.asset_library.set_repository(None)
@@ -1621,7 +2221,11 @@ class MainWindow(QMainWindow):
         try:
             if session.kind == "series":
                 session.context.repository.save_chapter(
-                    session.chapter, session.tiles, session.images
+                    session.chapter, session.tiles, session.images,
+                    blender_sidecar=session.blender_sidecar,
+                    protected_blender_hashes=(
+                        self._protected_blender_hashes(session)
+                    ),
                 )
                 for reference in session.context.series.chapters:
                     if reference.chapter_id == session.chapter.chapter_id:
@@ -1668,7 +2272,16 @@ class MainWindow(QMainWindow):
             self.autosave_timer.stop()
         self.asset_library.refresh()
         self._refresh_project_tabs()
-        self.statusBar().showMessage("Saved", 3000)
+        warnings = (
+            session.context.repository.last_save_warnings
+            if session.kind == "series" else []
+        )
+        if warnings:
+            self.statusBar().showMessage(
+                f"Saved with warning: {warnings[0]}", 7000
+            )
+        else:
+            self.statusBar().showMessage("Saved", 3000)
         self._refresh_actions()
         return True
 
@@ -1761,8 +2374,9 @@ class MainWindow(QMainWindow):
                 "A newer autosave exists for this chapter. Recover it?",
             ) == QMessageBox.Yes
         try:
-            chapter, tiles, images = repository.load_chapter(
-                chapter_id, recover=recover, include_images=True
+            chapter, tiles, images, blender_sidecar = repository.load_chapter(
+                chapter_id, recover=recover, include_images=True,
+                include_blender=True,
             )
         except (OSError, ValueError) as error:
             QMessageBox.critical(self, "Unable to open chapter", str(error))
@@ -1777,6 +2391,7 @@ class MainWindow(QMainWindow):
         session = EditorSession(
             key=key, kind="series", context=context,
             chapter=chapter, tiles=tiles, images=images,
+            blender_sidecar=blender_sidecar,
             dirty=recover or bool(load_warnings),
         )
         self._add_editor_session(session)
@@ -1862,8 +2477,9 @@ class MainWindow(QMainWindow):
                 "A newer autosave exists for this chapter. Recover it?",
             ) == QMessageBox.Yes
         try:
-            chapter, tiles, images = self.repository.load_chapter(
-                chapter_id, recover=recover, include_images=True
+            chapter, tiles, images, blender_sidecar = self.repository.load_chapter(
+                chapter_id, recover=recover, include_images=True,
+                include_blender=True,
             )
         except (OSError, ValueError) as error:
             QMessageBox.critical(self, "Unable to open chapter", str(error))
@@ -1874,22 +2490,30 @@ class MainWindow(QMainWindow):
                 self, "Unsupported content omitted",
                 "\n".join(load_warnings),
             )
-        self._set_chapter(chapter, tiles, images)
+        self._set_chapter(chapter, tiles, images, blender_sidecar)
         if recover or load_warnings:
             self._mark_dirty(None)
 
     def _set_chapter(
         self, chapter, tiles, images: ImageStore | None = None,
+        blender_sidecar: BlenderSidecarData | None = None,
     ) -> None:
         self.chapter = chapter
         images = images or ImageStore()
         self.canvas.set_document(chapter, tiles, images)
+        self.three_d_controller.set_documents(chapter, blender_sidecar)
         if self.active_session is not None:
             self.active_session.chapter = chapter
             self.active_session.tiles = tiles
             self.active_session.images = images
+            self.active_session.blender_sidecar = blender_sidecar
             self.active_session.canvas_state = None
+            if self.active_session.kind == "series":
+                self._load_three_d_previews(self.active_session)
         self.hierarchy_model.set_chapter(chapter)
+        self.hierarchy_model.set_blender_hierarchy(
+            self.three_d_controller.virtual_hierarchy()
+        )
         self._dirty = False
         if self.active_session is not None:
             self.active_session.dirty = False
@@ -1905,6 +2529,7 @@ class MainWindow(QMainWindow):
         if initial_object:
             self.canvas.set_selection("object", initial_object.object_id)
         self._sync_contextual_ribbon()
+        self._refresh_three_d_sync_binding()
         # The first selection establishes the object context.  Keep the
         # contextual page as the initial landing page; subsequent explicit
         # Pencil/Eraser activations are routed to Tool Settings.
@@ -2397,8 +3022,61 @@ class MainWindow(QMainWindow):
                 numbers.append(int(match.group(1)))
         return f"Layer {max(numbers, default=0) + 1}"
 
+    def _duplicate_blender_layer(self, layer_id: str) -> None:
+        sidecar = self._ensure_blender_sidecar()
+        if (
+            self.chapter is None or sidecar is None
+            or layer_id not in self.chapter.layers
+        ):
+            return
+        before = self.chapter.to_dict()
+        sidecar_before = copy.deepcopy(sidecar)
+        source = self.chapter.layers[layer_id]
+        duplicate = self.chapter.duplicate_blender_layer(layer_id)
+        if source.comic_frame_id in sidecar.frames:
+            sidecar.duplicate_frame(
+                source.comic_frame_id, duplicate.comic_frame_id
+            )
+        else:
+            if source.comic_frame_id not in sidecar.document.frame_ids:
+                sidecar.document.frame_ids.append(source.comic_frame_id)
+            sidecar.unavailable_frame_ids.add(source.comic_frame_id)
+            sidecar.create_frame(
+                frame_id=duplicate.comic_frame_id,
+                warnings=[
+                    "Duplicated from a layer whose comic-frame sidecar was "
+                    "missing; this independent frame has no cached source state."
+                ],
+            )
+        after = self.chapter.to_dict()
+        sidecar_after = copy.deepcopy(sidecar)
+        controller = self.three_d_controller
+
+        def apply(chapter_state: dict, sidecar_state) -> None:
+            self.canvas.replace_chapter(chapter_state)
+            controller.replace_sidecar(sidecar_state, monotonic=True)
+            self._refresh_three_d_hierarchy()
+
+        command = CallbackCommand(
+            "Duplicate Blender 3D layer",
+            lambda: apply(after, sidecar_after),
+            lambda: apply(before, sidecar_before),
+        )
+        self.canvas.command_stack.push(
+            self._tag_three_d_command(
+                command, sidecar_before, sidecar_after
+            ),
+            already_done=True,
+        )
+        self._after_structure(duplicate.layer_id, "layer")
+
     def _delete_selected(self) -> None:
         if self.chapter is None or not self.canvas.selected_id:
+            return
+        if self.canvas.selected_kind == "blender_entity":
+            self.statusBar().showMessage(
+                "Blender hierarchy rows are read-only", 4000
+            )
             return
         if (
             self.active_session is not None
@@ -2411,10 +3089,55 @@ class MainWindow(QMainWindow):
         if QMessageBox.question(
             self, "Delete selection",
             "Delete the selected entity and all of its descendants?",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
         ) != QMessageBox.Yes:
             return
         before = self.chapter.to_dict()
-        deleted = self.chapter.delete_entity(
+        selected_layer = (
+            self.chapter.layers.get(self.canvas.selected_id)
+            if self.canvas.selected_kind == "layer" else None
+        )
+        if selected_layer is not None and selected_layer.layer_kind == "blender":
+            sidecar = self._active_blender_sidecar()
+            if sidecar is None:
+                self.chapter.delete_blender_layer(selected_layer.layer_id)
+                after = self.chapter.to_dict()
+                self.canvas.clear_selection()
+                self.canvas.push_model_change(
+                    before, after, "Delete unavailable Blender 3D layer"
+                )
+                self._after_structure("", "")
+                return
+            sidecar_before = copy.deepcopy(sidecar)
+            frame_id = self.chapter.delete_blender_layer(
+                selected_layer.layer_id
+            )
+            sidecar.delete_frame(frame_id)
+            after = self.chapter.to_dict()
+            sidecar_after = copy.deepcopy(sidecar)
+            self.canvas.clear_selection()
+
+            def apply(chapter_state: dict, sidecar_state) -> None:
+                self.canvas.replace_chapter(chapter_state)
+                self.three_d_controller.replace_sidecar(
+                    sidecar_state, monotonic=True
+                )
+                self._refresh_three_d_hierarchy()
+
+            command = CallbackCommand(
+                "Delete Blender 3D layer",
+                lambda: apply(after, sidecar_after),
+                lambda: apply(before, sidecar_before),
+            )
+            self.canvas.command_stack.push(
+                self._tag_three_d_command(
+                    command, sidecar_before, sidecar_after
+                ),
+                already_done=True,
+            )
+            self._after_structure("", "")
+            return
+        self.chapter.delete_entity(
             self.canvas.selected_kind, self.canvas.selected_id
         )
         # Keep detached tiles in memory until the undo stack is discarded.
@@ -2510,6 +3233,1605 @@ class MainWindow(QMainWindow):
         self._sync_tool_buttons()
         return True
 
+    def _active_blender_sidecar(self) -> BlenderSidecarData | None:
+        return (
+            self.active_session.blender_sidecar
+            if self.active_session is not None
+            and self.active_session.kind == "series" else None
+        )
+
+    @staticmethod
+    def _blender_hashes(sidecar: BlenderSidecarData | None) -> set[str]:
+        if sidecar is None:
+            return set()
+        result: set[str] = set()
+        if sidecar.cache_manifest is not None:
+            result.update(sidecar.cache_manifest.referenced_hashes())
+        for frame in sidecar.frames.values():
+            result.update(frame.baked_variant_hashes.values())
+        return result
+
+    def _tag_three_d_command(self, command, *sidecars) -> object:
+        protected: set[str] = set()
+        for sidecar in sidecars:
+            protected.update(self._blender_hashes(sidecar))
+        command.protected_blender_hashes = protected
+        return command
+
+    def _protected_blender_hashes(self, session: EditorSession | None) -> set[str]:
+        if session is None:
+            return set()
+        result = self._blender_hashes(session.blender_sidecar)
+        stack = (
+            self.canvas.command_stack if session is self.active_session
+            else getattr(session.canvas_state, "command_stack", None)
+        )
+        if stack is None:
+            return result
+        for command in (*stack._undo, *stack._redo):
+            result.update(getattr(command, "protected_blender_hashes", ()))
+        return result
+
+    @staticmethod
+    def _three_d_preview_root(session: EditorSession) -> Path:
+        return (
+            session.context.repository.chapter_root(session.chapter.chapter_id)
+            / "blender" / "cache" / "previews"
+        )
+
+    def _load_three_d_previews(self, session: EditorSession) -> None:
+        sidecar = session.blender_sidecar
+        if sidecar is None:
+            return
+        root = self._three_d_preview_root(session)
+        for layer in session.chapter.layers.values():
+            if layer.layer_kind != "blender" or not layer.comic_frame_id:
+                continue
+            path = root / f"{layer.comic_frame_id}.png"
+            if path.is_file() and not path.is_symlink():
+                image = QImage(str(path))
+                if not image.isNull():
+                    self.three_d_controller.set_cached_image(
+                        layer.layer_id, image.convertToFormat(
+                            QImage.Format.Format_RGBA8888_Premultiplied
+                        )
+                    )
+
+    def _persist_three_d_preview(self, layer_id: str) -> None:
+        session = self.active_session
+        if (
+            session is None or session.kind != "series"
+            or session.blender_sidecar is None
+            or layer_id not in session.chapter.layers
+        ):
+            return
+        layer = session.chapter.layers[layer_id]
+        if layer.layer_kind != "blender" or not layer.comic_frame_id:
+            return
+        service = getattr(self.three_d_controller, "_render_service", None)
+        latest = service.latest_result() if service is not None and hasattr(
+            service, "latest_result"
+        ) else None
+        if (
+            latest is None or not getattr(latest, "available", False)
+            or latest.request.chapter_id != session.chapter.chapter_id
+            or latest.request.frame_id != layer.comic_frame_id
+        ):
+            return
+        image = self.three_d_controller.image_for_layer(layer_id)
+        if image is None or image.isNull():
+            return
+        destination = self._three_d_preview_root(session)
+        try:
+            destination.mkdir(parents=True, exist_ok=True)
+            target = destination / f"{layer.comic_frame_id}.png"
+            output = QSaveFile(str(target))
+            if not output.open(QIODevice.OpenModeFlag.WriteOnly):
+                raise OSError(output.errorString())
+            if not image.save(output, "PNG") or not output.commit():
+                raise OSError(output.errorString())
+        except OSError as error:
+            self.statusBar().showMessage(
+                f"Could not cache the latest 3D frame preview: {error}", 7000
+            )
+
+    def _refresh_three_d_sync_binding(self) -> None:
+        manager = self.three_d_sync_manager
+        session = self.active_session
+        if (
+            session is None or session.kind != "series"
+            or session.blender_sidecar is None
+        ):
+            manager.stop()
+            return
+        root = session.context.repository.chapter_root(
+            session.chapter.chapter_id
+        ).resolve()
+        binding = manager.binding
+        if (
+            binding is not None
+            and binding.chapter_root == root
+            and binding.series_id == session.context.series.series_id
+            and binding.chapter_id == session.chapter.chapter_id
+        ):
+            self._three_d_sync_registration_changed(
+                manager.registration_payload(
+                    self.three_d_controller.active_frame_id
+                )
+            )
+            return
+        try:
+            manager.activate_editor_session(
+                session, self._commit_three_d_sync_update,
+                process_offline=True,
+            )
+        except (OSError, ValueError, RuntimeError) as error:
+            manager.stop()
+            self.statusBar().showMessage(
+                f"Blender sync could not start: {error}", 9000
+            )
+
+    def _commit_three_d_sync_update(
+        self, before: BlenderSidecarData, after: BlenderSidecarData,
+        label: str,
+    ) -> None:
+        session = self.active_session
+        if (
+            session is None or session.kind != "series"
+            or session.blender_sidecar is None
+            or session.chapter.chapter_id != after.document.chapter_id
+        ):
+            raise RuntimeError("The synced chapter is no longer active")
+        controller = self.three_d_controller
+
+        def apply(snapshot: BlenderSidecarData, *, monotonic: bool) -> None:
+            controller.replace_sidecar(snapshot, monotonic=monotonic)
+            session.blender_sidecar = controller.sidecar
+            self._three_d_scene_cache.clear()
+            self._refresh_three_d_hierarchy()
+            self._refresh_three_d_materials()
+            self._three_d_sync_registration_changed(
+                self.three_d_sync_manager.registration_payload(
+                    controller.active_frame_id
+                )
+            )
+            self.canvas.documentChanged.emit(QRectF())
+            self.canvas.update()
+
+        apply(after, monotonic=False)
+        command = CallbackCommand(
+            label,
+            lambda: apply(after, monotonic=True),
+            lambda: apply(before, monotonic=True),
+        )
+        self.canvas.command_stack.push(
+            self._tag_three_d_command(command, before, after),
+            already_done=True,
+        )
+        self._mark_dirty(None)
+
+    def _three_d_sync_registration_changed(self, payload) -> None:
+        if not isinstance(payload, dict) or not payload:
+            self.three_d_connection_status.setText("Blender sync is inactive")
+            self.three_d_copy_sync.setEnabled(False)
+            return
+        endpoint = str(payload.get("endpoint", ""))
+        chapter_id = str(payload.get("chapter_id", ""))
+        frames = len(payload.get("comic_frame_ids", ()))
+        self.three_d_connection_status.setText(
+            f"Listening: {endpoint}\nChapter: {chapter_id}\n"
+            f"{frames} comic frame(s); bearer token ready"
+        )
+        self.three_d_copy_sync.setEnabled(True)
+
+    def _copy_three_d_sync_registration(self) -> None:
+        payload = self.three_d_sync_manager.registration_payload(
+            self.three_d_controller.active_frame_id
+        )
+        if not payload:
+            self.statusBar().showMessage("Blender sync is not active", 5000)
+            return
+        QApplication.clipboard().setText(json.dumps(payload, indent=2))
+        self.statusBar().showMessage(
+            "Copied the add-on endpoint, token, chapter, inbox, and frame IDs",
+            6000,
+        )
+
+    def _three_d_sync_accepted(self) -> None:
+        self._three_d_scene_cache.clear()
+        self._refresh_three_d_hierarchy()
+        self._sync_three_d_controls()
+        if self.three_d_controller.active:
+            self.three_d_controller.request_render()
+
+    def _three_d_sync_rejected(self, receipt) -> None:
+        message = (
+            receipt.errors[0]
+            if getattr(receipt, "errors", ()) else "Blender sync was rejected."
+        )
+        self.three_d_connection_status.setText(f"Last sync rejected: {message}")
+        if self.isVisible():
+            QMessageBox.warning(self, "Blender sync rejected", message)
+
+    def _resolve_three_d_sync_conflicts(self, receipt) -> None:
+        conflicts = tuple(getattr(receipt, "conflicts", ()))
+        if not conflicts:
+            return
+        conflicts = tuple(
+            conflict
+            for category_conflicts in grouped_conflicts(conflicts).values()
+            for conflict in category_conflicts
+        )
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Resolve Blender Sync Conflicts")
+        dialog.resize(980, 520)
+        layout = QVBoxLayout(dialog)
+        explanation = QLabel(
+            "Blender and Webtoon changed the same presentation fields. "
+            "Keep Webtoon Override is the default; Use Blender Value removes "
+            "the conflicting override.", dialog
+        )
+        explanation.setWordWrap(True)
+        layout.addWidget(explanation)
+        table = QTableWidget(len(conflicts), 6, dialog)
+        table.setHorizontalHeaderLabels((
+            "Category", "Property", "Webtoon", "Blender", "Resolution",
+            "Category",
+        ))
+        table.verticalHeader().setVisible(False)
+        combos: dict[str, QComboBox] = {}
+        rows_by_category: dict[str, list[int]] = {}
+        for row, conflict in enumerate(conflicts):
+            rows_by_category.setdefault(conflict.category, []).append(row)
+            for column, value in enumerate((
+                conflict.category, conflict.path,
+                json.dumps(conflict.webtoon_value, ensure_ascii=False),
+                json.dumps(conflict.blender_value, ensure_ascii=False),
+            )):
+                item = QTableWidgetItem(str(value))
+                item.setFlags(item.flags() & ~Qt.ItemIsEditable)
+                table.setItem(row, column, item)
+            combo = QComboBox(table)
+            combo.addItem(
+                "Keep Webtoon Override",
+                ConflictResolution.KEEP_WEBTOON_OVERRIDE.value,
+            )
+            combo.addItem(
+                "Use Blender Value",
+                ConflictResolution.USE_BLENDER_VALUE.value,
+            )
+            table.setCellWidget(row, 4, combo)
+            combos[conflict.path] = combo
+            apply_category = QPushButton("Apply to category", table)
+
+            def apply_to_category(
+                checked=False, category=conflict.category, source=combo,
+            ) -> None:
+                del checked
+                for target_row in rows_by_category.get(category, ()):
+                    target = table.cellWidget(target_row, 4)
+                    if isinstance(target, QComboBox):
+                        target.setCurrentIndex(source.currentIndex())
+
+            apply_category.clicked.connect(apply_to_category)
+            table.setCellWidget(row, 5, apply_category)
+        table.horizontalHeader().setStretchLastSection(False)
+        table.horizontalHeader().setSectionResizeMode(
+            1, QHeaderView.ResizeMode.Stretch
+        )
+        layout.addWidget(table, 1)
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.Apply | QDialogButtonBox.Cancel,
+            parent=dialog,
+        )
+        buttons.button(QDialogButtonBox.Apply).setDefault(True)
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        layout.addWidget(buttons)
+        if dialog.exec() != QDialog.Accepted:
+            self.statusBar().showMessage(
+                "Blender sync remains paused with unresolved conflicts", 8000
+            )
+            return
+        choices = {
+            path: combo.currentData() for path, combo in combos.items()
+        }
+        resolver = getattr(
+            self.three_d_sync_manager, "resolve_conflicts", None
+        )
+        if not callable(resolver):
+            QMessageBox.warning(
+                self, "Conflict resolution unavailable",
+                "The validated bundle remains queued; retry after restarting "
+                "Webtoon Maker.",
+            )
+            return
+        result = resolver(receipt, choices)
+        if getattr(result, "errors", ()):
+            QMessageBox.warning(
+                self, "Blender sync not accepted", result.errors[0]
+            )
+
+    def _three_d_scene_for_frame(self, layer_id: str, frame, sidecar):
+        """Materialize a neutral render scene from the active hashed GLB."""
+        del layer_id
+        session = self.active_session
+        if session is None or session.kind != "series" or sidecar is None:
+            return None
+        cache = sidecar.cache_manifest
+        digest = str(cache.base_glb_hash or "") if cache is not None else ""
+
+        def load_cached_scene(resource_digest: str):
+            blob = (
+                session.context.repository.chapter_root(frame.chapter_id)
+                / "blender" / "cache" / "blobs"
+                / f"{resource_digest}.glb"
+            )
+            if not blob.is_file():
+                raise FileNotFoundError(
+                    f"3D cache blob {resource_digest[:12]} is unavailable"
+                )
+            base = self._three_d_scene_cache.get(resource_digest)
+            if base is None:
+                from comic_editor.three_d.renderer.gltf import load_gltf
+                base = load_gltf(blob).scene
+                self._three_d_scene_cache[resource_digest] = base
+            return copy.deepcopy(base)
+
+        if digest:
+            scene = load_cached_scene(digest)
+        else:
+            from comic_editor.three_d.renderer.scene import SceneData
+            scene = SceneData(scene_id=frame.frame_id)
+
+        if cache is not None and digest:
+            from comic_editor.three_d.renderer.resources import (
+                replace_object_resource,
+            )
+            resources = dict(cache.object_resources)
+            resources.update({
+                str(object_id): str(resource_hash)
+                for object_id, resource_hash
+                in frame.baked_variant_hashes.items()
+                if str(object_id) != "scene"
+            })
+            for object_id, resource_hash in sorted(resources.items()):
+                resource_scene = load_cached_scene(resource_hash)
+                scene = replace_object_resource(
+                    scene, resource_scene, object_id
+                )
+
+        import numpy as np
+        from comic_editor.three_d.renderer.camera import (
+            quaternion_from_axis_angle, quaternion_multiply,
+        )
+        from comic_editor.three_d.renderer.materials import (
+            DrawingMaterial, SurfaceMaterial, ToonRamp, ToonRampStop,
+        )
+        from comic_editor.three_d.renderer.mesh import SourceMaterial
+        from comic_editor.three_d.renderer.primitives import (
+            cube_mesh, cylinder_mesh,
+        )
+        from comic_editor.three_d.renderer.projection import (
+            FisheyeMapping, ProjectionMode,
+        )
+        from comic_editor.three_d.renderer.scene import (
+            LightType, SceneLight, SceneNode,
+        )
+
+        source_transforms = frame.source_state.get("transforms", {})
+        override_transforms = frame.presentation_overrides.get(
+            "transforms", {}
+        )
+        source_visibility = frame.source_state.get("visibility", {})
+        override_visibility = frame.presentation_overrides.get(
+            "visibility", {}
+        )
+        for node_id, node in scene.nodes.items():
+            transform = override_transforms.get(
+                node_id, source_transforms.get(node_id, {})
+            )
+            matrix_local = (
+                transform.get("matrix_local")
+                if isinstance(transform, dict) else None
+            )
+            if isinstance(matrix_local, (list, tuple)) and len(matrix_local) == 16:
+                node.local_matrix = np.asarray(
+                    matrix_local, dtype=np.float64
+                ).reshape((4, 4), order="F")
+            visible = source_visibility.get(node_id, True)
+            if isinstance(visible, dict):
+                visible = visible.get("visible", not visible.get("hide_render", False))
+            override = override_visibility.get(node_id, visible)
+            if isinstance(override, dict):
+                override = override.get("visible", not override.get("hide_render", False))
+            node.visible = bool(override)
+            catalog = sidecar.document.object_catalog.get(node_id, {})
+            collection_ids = catalog.get("collection_ids", ())
+            if collection_ids:
+                node.visible = node.visible and any(
+                    frame.collection_visible(str(collection_id))
+                    for collection_id in collection_ids
+                )
+        scene.recompute_world_matrices()
+        from comic_editor.three_d.frame_scene import (
+            apply_pose_and_shape_state,
+        )
+        apply_pose_and_shape_state(scene, frame)
+
+        source_lights = frame.source_state.get("lights", {})
+        override_lights = frame.presentation_overrides.get("lights", {})
+        for node_id, node in scene.nodes.items():
+            if node.light_index is None or not 0 <= node.light_index < len(scene.lights):
+                continue
+            base_light = (
+                source_lights.get(node_id, {})
+                if isinstance(source_lights, dict) else {}
+            )
+            changed_light = (
+                override_lights.get(node_id, {})
+                if isinstance(override_lights, dict) else {}
+            )
+            values = {
+                **(base_light if isinstance(base_light, dict) else {}),
+                **(changed_light if isinstance(changed_light, dict) else {}),
+            }
+            light = scene.lights[node.light_index]
+            raw_type = str(values.get("type", light.light_type.value)).lower()
+            mapped_type = {
+                "area": "rectangle", "rect": "rectangle",
+            }.get(raw_type, raw_type)
+            light.light_type = LightType(mapped_type) if mapped_type in {
+                "sun", "point", "rectangle", "spot"
+            } else light.light_type
+            raw_color = values.get("color")
+            if isinstance(raw_color, (list, tuple)) and len(raw_color) >= 3:
+                light.color = tuple(float(item) for item in raw_color[:3])
+            light.energy = max(0.0, float(values.get("energy", light.energy)))
+            raw_range = values.get("range")
+            if raw_range is None:
+                raw_range = (
+                    values.get("cutoff_distance", light.range)
+                    if bool(values.get("use_custom_distance", False))
+                    else 0.0
+                )
+            light.range = max(0.0, float(raw_range))
+            area_width = max(0.001, float(values.get(
+                "size", light.area_size[0]
+            )))
+            area_height = max(0.001, float(values.get(
+                "size_y", area_width
+            )))
+            if str(values.get("shape", "")).upper() in {"SQUARE", "DISK"}:
+                area_height = area_width
+            light.area_size = (area_width, area_height)
+            outer = max(1.0e-6, min(
+                math.pi - 1.0e-6,
+                float(values.get("spot_size", light.spot_outer_angle)),
+            ))
+            blend = max(0.0, min(1.0, float(values.get("spot_blend", 0.0))))
+            light.spot_outer_angle = outer
+            light.spot_inner_angle = outer * (1.0 - blend)
+            light.casts_shadow = bool(values.get(
+                "casts_shadow", values.get("use_shadow", light.casts_shadow)
+            ))
+            light.visible = node.visible
+            light.raw_source = copy.deepcopy(values)
+
+        settings = frame.presentation_overrides.get("renderer_settings", {})
+        projection = str(settings.get("projection", "perspective"))
+        if projection == "orthographic":
+            scene.projection.mode = ProjectionMode.ORTHOGRAPHIC
+        elif projection.startswith("fisheye_"):
+            scene.projection.mode = ProjectionMode.FISHEYE
+            scene.projection.fisheye_mapping = {
+                "fisheye_equidistant": FisheyeMapping.EQUIDISTANT,
+                "fisheye_equisolid": FisheyeMapping.EQUISOLID_ANGLE,
+                "fisheye_stereographic": FisheyeMapping.STEREOGRAPHIC,
+                "fisheye_orthographic": FisheyeMapping.ORTHOGRAPHIC,
+            }.get(projection, FisheyeMapping.EQUIDISTANT)
+        else:
+            scene.projection.mode = ProjectionMode.PERSPECTIVE
+        scene.projection.vertical_fov_deg = float(settings.get("fov", 50.0))
+        scene.projection.ortho_height = max(
+            0.001, float(settings.get("ortho_height", 10.0))
+        )
+        overlays_visible = bool(settings.get("overlays_visible", True))
+        scene.overlays.grid_visible = overlays_visible and bool(
+            settings.get("grid_visible", True)
+        )
+        scene.overlays.volume_grid_visible = overlays_visible and bool(
+            settings.get("volume_grid_visible", False)
+        )
+        scene.overlays.axes_visible = overlays_visible and bool(
+            settings.get("axes_visible", True)
+        )
+        scene.overlays.floor_visible = bool(settings.get("floor_visible", True))
+        scene.shadows.enabled = bool(settings.get("shadows_enabled", True))
+        scene.shadows.resolution = {
+            "low": 512, "medium": 1024, "high": 2048,
+        }.get(str(settings.get("shadow_quality", "medium")), 1024)
+
+        from comic_editor.three_d.frame_scene import (
+            apply_blender_camera_state,
+        )
+        has_blender_camera = apply_blender_camera_state(
+            scene, frame, settings
+        )
+        navigation = frame.presentation_overrides.get(
+            "camera_navigation", {}
+        )
+        if navigation or not has_blender_camera:
+            target = navigation.get("target", [0.0, 0.0, 0.0])
+            pan = navigation.get("pan", [0.0, 0.0])
+            scene.active_camera.target = np.asarray([
+                float(target[0]),
+                float(target[1]),
+                float(target[2]),
+            ], dtype=np.float64)
+            scene.active_camera.distance = max(
+                0.01, float(navigation.get("distance", 8.0))
+            )
+            exact_orientation = navigation.get("orientation")
+            if (
+                isinstance(exact_orientation, (list, tuple))
+                and len(exact_orientation) == 4
+            ):
+                candidate = np.asarray(exact_orientation, dtype=np.float64)
+                length = float(np.linalg.norm(candidate))
+                if np.all(np.isfinite(candidate)) and length > 1.0e-12:
+                    scene.active_camera.orientation = candidate / length
+                else:
+                    exact_orientation = None
+            if exact_orientation is None:
+                yaw = quaternion_from_axis_angle(
+                    np.array([0.0, 1.0, 0.0]),
+                    math.radians(float(navigation.get("yaw", 35.0))),
+                )
+                pitch = quaternion_from_axis_angle(
+                    np.array([1.0, 0.0, 0.0]),
+                    math.radians(float(navigation.get("pitch", 20.0))),
+                )
+                scene.active_camera.orientation = quaternion_multiply(
+                    yaw, pitch
+                )
+            # Pan is stored as a camera-plane offset, so rolled and pitched
+            # source cameras continue to pan horizontally/vertically on screen.
+            scene.active_camera.target += (
+                scene.active_camera.right * float(pan[0])
+                + scene.active_camera.up * float(pan[1])
+            )
+
+        def color_tuple(value: str) -> tuple[float, float, float, float]:
+            color = QColor(value)
+            return color.redF(), color.greenF(), color.blueF(), color.alphaF()
+
+        scene.drawing_materials = {}
+        for material in sidecar.document.drawing_materials:
+            ramp = tuple(
+                ToonRampStop(position, color_tuple(color)[:3])
+                for position, color in material.toon_ramp
+            )
+            scene.drawing_materials[material.material_id] = DrawingMaterial(
+                material_id=material.material_id, name=material.name,
+                surface=SurfaceMaterial(material.shader.title()),
+                base_color=color_tuple(material.tint),
+                use_base_color_texture=material.use_texture,
+                use_vertex_color=material.use_vertex_color,
+                toon_ramp=ToonRamp(ramp),
+                outline_enabled=material.outline_enabled,
+                outline_color=color_tuple(material.outline_color),
+                outline_thickness_px=material.outline_width,
+            )
+        scene.material_mappings = dict(sidecar.document.material_mappings)
+
+        def local_matrix(record: dict) -> object:
+            transform = record.get("transform", {})
+            raw = transform.get("matrix") if isinstance(transform, dict) else None
+            if isinstance(raw, (list, tuple)) and len(raw) == 16:
+                return np.asarray(raw, dtype=np.float64).reshape((4, 4), order="F")
+            value = np.identity(4, dtype=np.float64)
+            translation = transform.get("translation", (0.0, 0.0, 0.0))
+            rotation = transform.get("rotation", (0.0, 0.0, 0.0))
+            scale = transform.get("scale", (1.0, 1.0, 1.0))
+            value[:3, 3] = np.asarray(translation[:3], dtype=np.float64)
+            rx, ry, rz = (
+                math.radians(float(item)) for item in rotation[:3]
+            )
+            cx, sx = math.cos(rx), math.sin(rx)
+            cy, sy = math.cos(ry), math.sin(ry)
+            cz, sz = math.cos(rz), math.sin(rz)
+            rotate_x = np.array([
+                [1.0, 0.0, 0.0], [0.0, cx, -sx], [0.0, sx, cx],
+            ])
+            rotate_y = np.array([
+                [cy, 0.0, sy], [0.0, 1.0, 0.0], [-sy, 0.0, cy],
+            ])
+            rotate_z = np.array([
+                [cz, -sz, 0.0], [sz, cz, 0.0], [0.0, 0.0, 1.0],
+            ])
+            value[:3, :3] = (
+                rotate_z @ rotate_y @ rotate_x
+                @ np.diag(np.asarray(scale[:3], dtype=np.float64))
+            )
+            return value
+
+        for record in frame.local_entities:
+            if not isinstance(record, dict):
+                continue
+            entity_id = str(record.get("id", ""))
+            kind = str(record.get("type", ""))
+            parameters = record.get("parameters", {})
+            matrix = local_matrix(record)
+            if kind in {"cube", "cylinder"}:
+                mesh = (
+                    cube_mesh(
+                        entity_id + ":mesh",
+                        tuple(parameters.get("size", (1.0, 1.0, 1.0))),
+                    )
+                    if kind == "cube" else cylinder_mesh(
+                        entity_id + ":mesh",
+                        float(parameters.get("radius", 0.5)),
+                        float(parameters.get("depth", 1.0)),
+                        int(parameters.get("vertices", 32)),
+                    )
+                )
+                # Local primitives get an explicit app-owned source material;
+                # they must never inherit Blender material slot zero merely
+                # because their generated primitive defaults to index zero.
+                from dataclasses import replace
+
+                local_material_id = f"webtoon:local-material:{entity_id}"
+                material_index = len(scene.source_materials)
+                scene.source_materials = (*scene.source_materials, SourceMaterial(
+                    local_material_id,
+                    str(record.get("name", kind.title())) + " Material",
+                ))
+                mesh = replace(mesh, primitives=tuple(
+                    replace(primitive, material_index=material_index)
+                    for primitive in mesh.primitives
+                ))
+                drawing_material_id = str(
+                    parameters.get("drawing_material_id", "")
+                )
+                if drawing_material_id in scene.drawing_materials:
+                    scene.material_mappings[local_material_id] = (
+                        drawing_material_id
+                    )
+                mesh_index = len(scene.meshes)
+                scene.meshes = (*scene.meshes, mesh)
+                scene.nodes[entity_id] = SceneNode(
+                    entity_id, str(record.get("name", kind.title())),
+                    local_matrix=matrix, mesh_index=mesh_index,
+                    visible=bool(record.get("visible", True)),
+                )
+                scene.root_node_ids = (*scene.root_node_ids, entity_id)
+            elif kind in {"sun", "point", "rectangle", "spot"}:
+                light_index = len(scene.lights)
+                color = color_tuple(str(parameters.get("color", "#FFFFFFFF")))
+                size = parameters.get("size", (1.0, 1.0))
+                if not isinstance(size, (list, tuple)):
+                    size = (float(size), float(size))
+                scene.lights = (*scene.lights, SceneLight(
+                    light_id=entity_id,
+                    name=str(record.get("name", kind.title())),
+                    light_type=LightType(kind), color=color[:3],
+                    energy=max(0.0, float(parameters.get("energy", 1.0))),
+                    range=max(0.0, float(parameters.get("range", 0.0))),
+                    area_size=(float(size[0]), float(size[1])),
+                    spot_outer_angle=math.radians(float(
+                        parameters.get("spot_size", 45.0)
+                    )),
+                    casts_shadow=bool(parameters.get("casts_shadow", True)),
+                    visible=bool(record.get("visible", True)),
+                    raw_source=copy.deepcopy(parameters),
+                ))
+                scene.nodes[entity_id] = SceneNode(
+                    entity_id, str(record.get("name", kind.title())),
+                    local_matrix=matrix, light_index=light_index,
+                    visible=bool(record.get("visible", True)),
+                )
+                scene.root_node_ids = (*scene.root_node_ids, entity_id)
+        requested_lights = settings.get("active_light_ids")
+        if isinstance(requested_lights, (list, tuple)):
+            requested = {str(item) for item in requested_lights}
+            for node in scene.nodes.values():
+                if node.light_index is not None:
+                    scene.lights[node.light_index].visible = (
+                        scene.lights[node.light_index].visible
+                        and node.node_id in requested
+                    )
+        enabled_lights = [
+            (node, scene.lights[node.light_index])
+            for node in scene.nodes.values()
+            if node.visible and node.light_index is not None
+            and scene.lights[node.light_index].visible
+        ]
+        warnings = list(scene.warnings)
+        if len(enabled_lights) > 8:
+            warnings.append(
+                f"{len(enabled_lights)} lights are enabled; only the first 8 render."
+            )
+        shadow_count = sum(
+            1 for _node, light in enabled_lights[:8] if light.casts_shadow
+        )
+        if shadow_count > 4:
+            warnings.append(
+                f"{shadow_count} shadow-casting lights are enabled; only the first 4 cast shadows."
+            )
+        scene.warnings = tuple(dict.fromkeys(warnings))
+        scene.validate()
+        scene.recompute_world_matrices()
+        return scene
+
+    def _ensure_blender_sidecar(self) -> BlenderSidecarData | None:
+        if (
+            self.chapter is None or self.active_session is None
+            or self.active_session.kind != "series"
+        ):
+            return None
+        sidecar = self.active_session.blender_sidecar
+        if sidecar is None:
+            sidecar = BlenderSidecarData(BlenderChapterDocument(
+                chapter_id=self.chapter.chapter_id,
+                series_id=(self.series.series_id if self.series else ""),
+            ))
+            self.active_session.blender_sidecar = sidecar
+        self.three_d_controller.set_documents(self.chapter, sidecar)
+        self._refresh_three_d_sync_binding()
+        return sidecar
+
+    def _begin_blender_layer_creation(self, kind: str) -> None:
+        sidecar = self._ensure_blender_sidecar()
+        if sidecar is None:
+            self.statusBar().showMessage(
+                "3D layers are available only in comic chapters", 5000
+            )
+            return
+        document = sidecar.document
+        if not document.file_uuid and not document.blend_path_hint:
+            path, _filter = QFileDialog.getOpenFileName(
+                self, "Link this chapter to a Blender file", "",
+                "Blender files (*.blend)",
+            )
+            if not path:
+                return
+            document.blend_path_hint = str(Path(path).resolve())
+            document.revision += 1
+            self._mark_dirty(None)
+        if not self.canvas.begin_blender_layer_creation(kind):
+            self.statusBar().showMessage(
+                "Select a page or container before drawing a 3D layer", 5000
+            )
+
+    def _replace_blender_association(self) -> None:
+        sidecar = self._active_blender_sidecar()
+        if sidecar is None:
+            return
+        path, _filter = QFileDialog.getOpenFileName(
+            self, "Choose replacement Blender file", "",
+            "Blender files (*.blend)",
+        )
+        if not path:
+            return
+        path = str(Path(path).resolve())
+        document = sidecar.document
+        if path == document.blend_path_hint:
+            return
+        if document.file_uuid or document.blend_path_hint:
+            message = (
+                "Replace this chapter's Blender association? The next add-on "
+                "sync must establish the new file UUID. Existing frame "
+                "presentation overrides are retained."
+            )
+            if self._dirty:
+                message += (
+                    "\n\nThis chapter also has unsaved changes; they will not "
+                    "be discarded."
+                )
+            if QMessageBox.question(
+                self, "Replace Blender Association", message,
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
+            ) != QMessageBox.Yes:
+                return
+        before = copy.deepcopy(sidecar)
+        document.file_uuid = ""
+        document.blend_path_hint = path
+        document.source_revision = 0
+        document.revision += 1
+        document.warnings.append(
+            "Blender association is pending validation by the next sync."
+        )
+        self._push_sidecar_change(before, "Replace Blender association")
+        self._sync_three_d_controls()
+
+    def _blender_layer_created(self, layer_id: str, frame_id: str) -> None:
+        sidecar = self._ensure_blender_sidecar()
+        if sidecar is None or not frame_id:
+            return
+        if frame_id not in sidecar.frames:
+            sidecar.create_frame(frame_id=frame_id)
+        self.three_d_controller.set_documents(self.chapter, sidecar)
+        self._refresh_three_d_hierarchy()
+        self._refresh_three_d_sync_binding()
+
+    def _activate_three_d_tool(self, tool: ThreeDToolKind) -> bool:
+        if (
+            not self.canvas.in_three_d_mode
+            or not self.three_d_controller.editing_available
+        ):
+            return False
+        self.three_d_controller.set_tool(tool)
+        self._sync_three_d_tool_buttons()
+        self._select_ribbon_page(
+            "three_d_tool_settings"
+            if tool in {ThreeDToolKind.SELECT_RECT, ThreeDToolKind.SELECT_LASSO}
+            else "three_d_object"
+        )
+        return True
+
+    def _select_three_d_light_type(self, light_type: str) -> None:
+        if not self.canvas.in_three_d_mode:
+            return
+        self.three_d_controller.set_pending_light_type(light_type)
+        button = self.three_d_tool_buttons[ThreeDToolKind.ADD_LIGHT]
+        button.setToolTip(f"Add {light_type.title()} Light")
+        self._sync_three_d_tool_buttons()
+        self._select_ribbon_page("three_d_object")
+
+    def _sync_three_d_tool_buttons(self) -> None:
+        active = self.canvas.in_three_d_mode
+        editable = active and self.three_d_controller.editing_available
+        for tool, button in self.three_d_tool_buttons.items():
+            button.setVisible(active)
+            button.setEnabled(editable)
+            button.blockSignals(True)
+            button.setChecked(active and tool == self.three_d_controller.tool)
+            button.blockSignals(False)
+
+    def _three_d_editing_availability_changed(
+        self, available: bool, reason: str,
+    ) -> None:
+        self._sync_three_d_tool_buttons()
+        if self.canvas.in_three_d_mode:
+            self._sync_three_d_controls()
+            if not available and reason:
+                self.statusBar().showMessage(
+                    f"3D editing unavailable: {reason}", 9000
+                )
+
+    def _three_d_mode_changed(self, active: bool, layer_id: str) -> None:
+        del layer_id
+        self.tree.setSelectionMode(
+            QTreeView.ExtendedSelection
+            if active and self.three_d_controller.multi_select
+            else QTreeView.SingleSelection
+        )
+        for button in self.tool_buttons.values():
+            button.setVisible(not active)
+        for button in self.shape_tool_buttons.values():
+            button.setVisible(not active)
+        for button in self.drawing_selection_buttons.values():
+            button.setVisible(not active)
+        for widget in (
+            self.shapes_category, self.drawing_selection_category,
+            self.add_page_button, self.add_fill_button, self.add_text_button,
+            self.add_raster_button, self.add_vector_button,
+        ):
+            widget.setVisible(not active)
+        self.color_tabs.setVisible(not active)
+        self._sync_three_d_tool_buttons()
+        three_d_pages = (
+            "three_d_view", "three_d_rendering", "three_d_outline",
+            "three_d_materials", "three_d_object",
+            "three_d_tool_settings",
+        )
+        for key in three_d_pages:
+            self.ribbon.set_page_visible(key, active)
+        for key in ("tool_settings", "asset_library", "vector_tools", "gradient_tools"):
+            self.ribbon.set_page_visible(key, not active and (
+                key in {"tool_settings", "asset_library"}
+            ))
+        if active:
+            self._sync_three_d_controls()
+            self._select_ribbon_page("three_d_view")
+        else:
+            self._sync_contextual_ribbon()
+            self._select_ribbon_page("tool_settings")
+            self._sync_tool_buttons()
+        self._refresh_actions()
+
+    def _set_three_d_renderer_setting(self, key: str, value) -> None:
+        if (
+            getattr(self, "_syncing_three_d_controls", False)
+            or not self.canvas.in_three_d_mode
+        ):
+            return
+        self.three_d_controller.set_renderer_setting(key, value)
+
+    def _three_d_multi_select_changed(self, enabled: bool) -> None:
+        if getattr(self, "_syncing_three_d_controls", False):
+            return
+        self.three_d_controller.set_multi_select(enabled)
+        self.tree.setSelectionMode(
+            QTreeView.ExtendedSelection if enabled
+            else QTreeView.SingleSelection
+        )
+
+    def _sync_three_d_controls(self) -> None:
+        self._syncing_three_d_controls = True
+        controls = (
+            self.three_d_grid, self.three_d_volume_grid,
+            self.three_d_axes, self.three_d_floor,
+            self.three_d_overlays, self.three_d_shadows,
+            self.three_d_antialiasing, self.three_d_projection,
+            self.three_d_fov, self.three_d_ortho_height,
+            self.three_d_shadow_quality, self.three_d_fidelity,
+            self.three_d_multi_select, self.three_d_transform_space,
+            self.three_d_gizmo_mode, *self.three_d_transform_fields,
+            *self.three_d_entity_property_controls,
+        )
+        for control in controls:
+            control.blockSignals(True)
+        try:
+            editing_available = self.three_d_controller.editing_available
+            for page in (
+                self.three_d_rendering_page, self.three_d_materials_page,
+                self.three_d_object_page, self.three_d_tool_settings_page,
+            ):
+                page.setEnabled(editing_available)
+            for control in (
+                self.three_d_grid, self.three_d_volume_grid,
+                self.three_d_axes, self.three_d_floor,
+                self.three_d_overlays,
+            ):
+                control.setEnabled(editing_available)
+            for control, key, default in (
+                (self.three_d_grid, "grid_visible", True),
+                (self.three_d_volume_grid, "volume_grid_visible", False),
+                (self.three_d_axes, "axes_visible", True),
+                (self.three_d_floor, "floor_visible", True),
+                (self.three_d_overlays, "overlays_visible", True),
+                (self.three_d_shadows, "shadows_enabled", True),
+                (self.three_d_antialiasing, "antialiasing", False),
+            ):
+                control.setChecked(bool(
+                    self.three_d_controller.renderer_setting(key, default)
+                ))
+            for combo, key, default in (
+                (self.three_d_projection, "projection", "perspective"),
+                (self.three_d_shadow_quality, "shadow_quality", "medium"),
+                (self.three_d_fidelity, "quality", "full"),
+            ):
+                index = combo.findData(
+                    self.three_d_controller.renderer_setting(key, default)
+                )
+                combo.setCurrentIndex(max(0, index))
+            self.three_d_fov.setValue(float(
+                self.three_d_controller.renderer_setting("fov", 50.0)
+            ))
+            self.three_d_ortho_height.setValue(float(
+                self.three_d_controller.renderer_setting(
+                    "ortho_height", 10.0
+                )
+            ))
+            self.three_d_multi_select.setChecked(
+                self.three_d_controller.multi_select
+            )
+            frame = self.three_d_controller._frame()
+            tool_settings = (
+                frame.presentation_overrides.get("tool_settings", {})
+                if frame is not None else {}
+            )
+            self.three_d_transform_space.setCurrentIndex(max(
+                0, self.three_d_transform_space.findData(
+                    tool_settings.get("transform_space", "global")
+                )
+            ))
+            self.three_d_gizmo_mode.setCurrentIndex(max(
+                0, self.three_d_gizmo_mode.findData(
+                    tool_settings.get("gizmo_mode", "move")
+                )
+            ))
+            components = self.three_d_controller.selected_transform_components()
+            editable = editing_available and components is not None
+            for index, field in enumerate(self.three_d_transform_fields):
+                field.setEnabled(editable)
+                if editable:
+                    field.setValue(float(components[index]))
+            descriptor = self.three_d_controller.selected_entity_properties()
+            kind = str(descriptor.get("kind", "")) if descriptor else ""
+            properties = (
+                descriptor.get("properties", {}) if descriptor else {}
+            )
+            visible_fields = {
+                "cube": {"size_x", "size_y", "size_z"},
+                "cylinder": {"radius", "depth", "segments"},
+                "light": {
+                    "light_type", "color", "energy", "range",
+                    "area_width", "area_height", "spot_angle",
+                    "casts_shadow",
+                },
+                "camera": {
+                    "camera_type", "fov", "ortho_scale",
+                    "clip_start", "clip_end",
+                },
+            }.get(kind, set())
+            self.three_d_entity_properties_widget.setVisible(bool(
+                visible_fields
+            ))
+            self.three_d_entity_kind.setText(
+                f"{descriptor.get('name', '')} ({kind.title()})"
+                if descriptor else "No editable parameters"
+            )
+            for name, (label, control) in (
+                self.three_d_entity_property_rows.items()
+            ):
+                shown = name in visible_fields
+                if label is not None:
+                    label.setVisible(shown)
+                control.setVisible(shown)
+                control.setEnabled(shown and editing_available)
+            if descriptor:
+                for name, control in (
+                    ("size_x", self.three_d_cube_size_x),
+                    ("size_y", self.three_d_cube_size_y),
+                    ("size_z", self.three_d_cube_size_z),
+                    ("radius", self.three_d_cylinder_radius),
+                    ("depth", self.three_d_cylinder_depth),
+                    ("energy", self.three_d_light_energy),
+                    ("range", self.three_d_light_range),
+                    ("area_width", self.three_d_light_area_width),
+                    ("area_height", self.three_d_light_area_height),
+                    ("spot_angle", self.three_d_light_spot_angle),
+                    ("fov", self.three_d_camera_fov),
+                    ("ortho_scale", self.three_d_camera_ortho_scale),
+                    ("clip_start", self.three_d_camera_clip_start),
+                    ("clip_end", self.three_d_camera_clip_end),
+                ):
+                    if name in properties:
+                        control.setValue(float(properties[name]))
+                if "segments" in properties:
+                    self.three_d_cylinder_segments.setValue(
+                        int(properties["segments"])
+                    )
+                if "color" in properties:
+                    self.three_d_light_color.setText(str(properties["color"]))
+                if "casts_shadow" in properties:
+                    self.three_d_light_shadow.setChecked(
+                        bool(properties["casts_shadow"])
+                    )
+                for name, combo in (
+                    ("light_type", self.three_d_light_type),
+                    ("camera_type", self.three_d_camera_type),
+                ):
+                    if name in properties:
+                        combo.setCurrentIndex(max(
+                            0, combo.findData(properties[name])
+                        ))
+            self.three_d_reset_object.setEnabled(
+                editing_available
+                and len(self.three_d_controller.selected_entity_ids) == 1
+            )
+        finally:
+            for control in controls:
+                control.blockSignals(False)
+            self._syncing_three_d_controls = False
+        sidecar = self._active_blender_sidecar()
+        if sidecar is None:
+            self.three_d_source_status.setText("No Blender file linked")
+        else:
+            document = sidecar.document
+            self.three_d_source_status.setText(
+                f"File UUID: {document.file_uuid or 'pending first sync'}\n"
+                f"{document.blend_path_hint or 'No local path hint'}"
+            )
+        self._refresh_three_d_materials()
+        if hasattr(self, "three_d_sync_manager"):
+            self._three_d_sync_registration_changed(
+                self.three_d_sync_manager.registration_payload(
+                    self.three_d_controller.active_frame_id
+                )
+            )
+
+    def _refresh_three_d_hierarchy(self) -> None:
+        if not hasattr(self, "hierarchy_model"):
+            return
+        self.hierarchy_model.set_blender_hierarchy(
+            self.three_d_controller.virtual_hierarchy()
+        )
+
+    def _three_d_metadata_text(
+        self, source_id: str, type_label: str,
+    ) -> str:
+        metadata = self.three_d_controller.selected_entity_metadata(source_id)
+        if not metadata:
+            return f"Source ID: {source_id}\nType: {type_label}"
+        serialized = json.dumps(
+            metadata, indent=2, sort_keys=True, ensure_ascii=False,
+            default=str,
+        )
+        if len(serialized) > 6000:
+            serialized = serialized[:5997] + "..."
+        return (
+            f"Source ID: {source_id}\nType: {type_label}\n\n{serialized}"
+        )
+
+    def _three_d_selection_changed(self, entity_ids: set[str]) -> None:
+        if not self.canvas.in_three_d_mode:
+            return
+        self.tree.setSelectionMode(
+            QTreeView.ExtendedSelection
+            if self.three_d_controller.multi_select
+            else QTreeView.SingleSelection
+        )
+        if not entity_ids:
+            self.three_d_object_metadata.setText(
+                "Select an object in the Blender subtree."
+            )
+            self._sync_three_d_controls()
+            return
+        first = sorted(entity_ids)[0]
+        index = self.hierarchy_model.index_for_blender_source(
+            self.three_d_controller.active_layer_id, first
+        )
+        if not index.isValid():
+            return
+        item = self.hierarchy_model.item_for_index(index)
+        blocker = QSignalBlocker(self.tree.selectionModel())
+        self.tree.selectionModel().select(
+            index,
+            QItemSelectionModel.ClearAndSelect | QItemSelectionModel.Rows,
+        )
+        self.tree.setCurrentIndex(index)
+        self.tree.scrollTo(index)
+        del blocker
+        self.canvas.selected_kind = "blender_entity"
+        self.canvas.selected_id = item.entity_id
+        self.canvas.selectionChanged.emit("blender_entity", item.entity_id)
+        self.three_d_object_metadata.setText(
+            self._three_d_metadata_text(item.source_id, item.type_label)
+        )
+        self._sync_three_d_controls()
+
+    def _edit_three_d_transform(self) -> None:
+        if (
+            getattr(self, "_syncing_three_d_controls", False)
+            or not self.canvas.in_three_d_mode
+        ):
+            return
+        values = tuple(field.value() for field in self.three_d_transform_fields)
+        if self.three_d_controller.set_selected_transform_components(values):
+            self._sync_three_d_controls()
+
+    def _edit_three_d_entity_properties(self, *args) -> None:
+        del args
+        if (
+            getattr(self, "_syncing_three_d_controls", False)
+            or not self.canvas.in_three_d_mode
+        ):
+            return
+        descriptor = self.three_d_controller.selected_entity_properties()
+        if descriptor is None:
+            return
+        values = {
+            "size_x": self.three_d_cube_size_x.value(),
+            "size_y": self.three_d_cube_size_y.value(),
+            "size_z": self.three_d_cube_size_z.value(),
+            "radius": self.three_d_cylinder_radius.value(),
+            "depth": self.three_d_cylinder_depth.value(),
+            "segments": self.three_d_cylinder_segments.value(),
+            "light_type": self.three_d_light_type.currentData(),
+            "color": self.three_d_light_color.text(),
+            "energy": self.three_d_light_energy.value(),
+            "range": self.three_d_light_range.value(),
+            "area_width": self.three_d_light_area_width.value(),
+            "area_height": self.three_d_light_area_height.value(),
+            "spot_angle": self.three_d_light_spot_angle.value(),
+            "casts_shadow": self.three_d_light_shadow.isChecked(),
+            "camera_type": self.three_d_camera_type.currentData(),
+            "fov": self.three_d_camera_fov.value(),
+            "ortho_scale": self.three_d_camera_ortho_scale.value(),
+            "clip_start": self.three_d_camera_clip_start.value(),
+            "clip_end": self.three_d_camera_clip_end.value(),
+        }
+        try:
+            changed = self.three_d_controller.set_selected_entity_properties(
+                values
+            )
+        except (TypeError, ValueError) as exc:
+            self.statusBar().showMessage(str(exc), 7000)
+            changed = False
+        if changed:
+            self._sync_three_d_controls()
+
+    def _push_sidecar_change(
+        self, before: BlenderSidecarData, label: str,
+    ) -> None:
+        sidecar = self._active_blender_sidecar()
+        if sidecar is None:
+            return
+        after = copy.deepcopy(sidecar)
+        controller = self.three_d_controller
+
+        def apply(snapshot) -> None:
+            controller.replace_sidecar(snapshot, monotonic=True)
+            self._refresh_three_d_hierarchy()
+            self._refresh_three_d_materials()
+            self.canvas.documentChanged.emit(QRectF())
+            self.canvas.update()
+
+        command = CallbackCommand(
+            label, lambda: apply(after), lambda: apply(before)
+        )
+        self.canvas.command_stack.push(
+            self._tag_three_d_command(command, before, after),
+            already_done=True,
+        )
+        self._mark_dirty(None)
+
+    def _refresh_three_d_materials(self) -> None:
+        if not hasattr(self, "three_d_material_list"):
+            return
+        sidecar = self._active_blender_sidecar()
+        current = self.three_d_material_list.currentRow()
+        self.three_d_material_list.blockSignals(True)
+        self.three_d_material_list.clear()
+        if sidecar is not None:
+            for material in sidecar.document.drawing_materials:
+                self.three_d_material_list.addItem(material.name)
+        if self.three_d_material_list.count():
+            self.three_d_material_list.setCurrentRow(
+                max(0, min(current, self.three_d_material_list.count() - 1))
+            )
+        self.three_d_material_list.blockSignals(False)
+        self._three_d_material_selected(
+            self.three_d_material_list.currentRow()
+        )
+        self._refresh_three_d_material_mappings()
+
+    def _refresh_three_d_material_mappings(self) -> None:
+        """Show Blender slot assignments and their drawing-side mappings."""
+        if not hasattr(self, "three_d_material_mapping_table"):
+            return
+        table = self.three_d_material_mapping_table
+        sidecar = self._active_blender_sidecar()
+        self._refreshing_three_d_material_mappings = True
+        try:
+            table.setRowCount(0)
+            if sidecar is None:
+                return
+            document = sidecar.document
+            raw_assignments = document.extensions.get(
+                "source_material_assignments", {}
+            )
+            if not isinstance(raw_assignments, dict):
+                raw_assignments = {}
+            assigned_to: dict[str, list[str]] = {}
+            for object_id, raw_slots in raw_assignments.items():
+                object_id = str(object_id)
+                object_data = document.object_catalog.get(object_id, {})
+                object_name = str(object_data.get("name") or object_id)
+                if isinstance(raw_slots, dict):
+                    slots = tuple(raw_slots.items())
+                elif isinstance(raw_slots, (list, tuple)):
+                    slots = tuple(enumerate(raw_slots))
+                else:
+                    slots = ((0, raw_slots),)
+                for slot, source_id in slots:
+                    if source_id is None or not str(source_id):
+                        continue
+                    source_id = str(source_id)
+                    try:
+                        slot_label = str(int(slot) + 1)
+                    except (TypeError, ValueError):
+                        slot_label = str(slot)
+                    assigned_to.setdefault(source_id, []).append(
+                        f"{object_name} [slot {slot_label}]"
+                    )
+
+            source_ids = (
+                set(document.material_catalog)
+                | set(document.material_mappings)
+                | set(assigned_to)
+            )
+            ordered_sources = sorted(
+                source_ids,
+                key=lambda source_id: (
+                    str(document.material_catalog.get(source_id, {}).get(
+                        "name", source_id
+                    )).casefold(),
+                    source_id,
+                ),
+            )
+            drawing_materials = tuple(document.drawing_materials)
+            table.setRowCount(len(ordered_sources))
+            for row, source_id in enumerate(ordered_sources):
+                source_data = document.material_catalog.get(source_id, {})
+                source_name = str(source_data.get("name") or source_id)
+                source_item = QTableWidgetItem(source_name)
+                source_item.setData(Qt.ItemDataRole.UserRole, source_id)
+                source_item.setToolTip(f"Blender material ID: {source_id}")
+                table.setItem(row, 0, source_item)
+
+                assignment_labels = assigned_to.get(source_id, [])
+                assignment_item = QTableWidgetItem(
+                    ", ".join(assignment_labels) if assignment_labels
+                    else "Not assigned in participating collections"
+                )
+                assignment_item.setToolTip("\n".join(assignment_labels))
+                table.setItem(row, 1, assignment_item)
+
+                mapping = QComboBox(table)
+                mapping.addItem("Use Blender material", "")
+                for material in drawing_materials:
+                    mapping.addItem(material.name, material.material_id)
+                target_id = document.material_mappings.get(source_id, "")
+                target_index = mapping.findData(target_id)
+                mapping.setCurrentIndex(max(0, target_index))
+                mapping.setToolTip(
+                    "Choose a drawing-side renderer material, or leave the "
+                    "original Blender material unmapped"
+                )
+                mapping.currentIndexChanged.connect(
+                    lambda _index, source_id=source_id, control=mapping:
+                    self._set_three_d_material_mapping(
+                        source_id, control.currentData()
+                    )
+                )
+                table.setCellWidget(row, 2, mapping)
+        finally:
+            self._refreshing_three_d_material_mappings = False
+
+    def _set_three_d_material_mapping(
+        self, source_id: str, target_id: str | None,
+    ) -> None:
+        if getattr(self, "_refreshing_three_d_material_mappings", False):
+            return
+        sidecar = self._active_blender_sidecar()
+        if sidecar is None:
+            return
+        source_id = str(source_id)
+        target_id = str(target_id or "")
+        drawing_by_id = {
+            material.material_id: material
+            for material in sidecar.document.drawing_materials
+        }
+        if target_id and target_id not in drawing_by_id:
+            self.statusBar().showMessage(
+                "The selected drawing material no longer exists", 4000
+            )
+            self._refresh_three_d_material_mappings()
+            return
+        current_target = sidecar.document.material_mappings.get(source_id, "")
+        if current_target == target_id:
+            return
+        before = copy.deepcopy(sidecar)
+        if target_id:
+            sidecar.document.material_mappings[source_id] = target_id
+        else:
+            sidecar.document.material_mappings.pop(source_id, None)
+        for material in sidecar.document.drawing_materials:
+            material.source_material_ids = [
+                item for item in material.source_material_ids
+                if item != source_id
+            ]
+        if target_id:
+            drawing_by_id[target_id].source_material_ids.append(source_id)
+        sidecar.document.revision += 1
+        self._push_sidecar_change(before, "Map Blender material")
+        self.three_d_controller.request_render()
+
+    def _add_three_d_material(self) -> None:
+        sidecar = self._active_blender_sidecar()
+        if sidecar is None:
+            return
+        name, accepted = QInputDialog.getText(
+            self, "Create 3D material", "Material name", text="Material"
+        )
+        if not accepted or not name.strip():
+            return
+        before = copy.deepcopy(sidecar)
+        sidecar.document.drawing_materials.append(
+            DrawingMaterial3D(name=name.strip())
+        )
+        sidecar.document.revision += 1
+        self._push_sidecar_change(before, "Create 3D material")
+        self.three_d_material_list.setCurrentRow(
+            len(sidecar.document.drawing_materials) - 1
+        )
+
+    def _rename_three_d_material(self) -> None:
+        sidecar = self._active_blender_sidecar()
+        row = self.three_d_material_list.currentRow()
+        if sidecar is None or not 0 <= row < len(sidecar.document.drawing_materials):
+            return
+        material = sidecar.document.drawing_materials[row]
+        name, accepted = QInputDialog.getText(
+            self, "Rename 3D material", "Material name", text=material.name
+        )
+        if not accepted or not name.strip() or name.strip() == material.name:
+            return
+        before = copy.deepcopy(sidecar)
+        material.name = name.strip()
+        sidecar.document.revision += 1
+        self._push_sidecar_change(before, "Rename 3D material")
+
+    def _delete_three_d_material(self) -> None:
+        sidecar = self._active_blender_sidecar()
+        row = self.three_d_material_list.currentRow()
+        if sidecar is None or not 0 <= row < len(sidecar.document.drawing_materials):
+            return
+        material = sidecar.document.drawing_materials[row]
+        if QMessageBox.question(
+            self, "Delete 3D material?",
+            f'Delete drawing material "{material.name}" and clear its mappings?',
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
+        ) != QMessageBox.Yes:
+            return
+        before = copy.deepcopy(sidecar)
+        sidecar.document.drawing_materials.pop(row)
+        sidecar.document.material_mappings = {
+            source: target
+            for source, target in sidecar.document.material_mappings.items()
+            if target != material.material_id
+        }
+        sidecar.document.revision += 1
+        self._push_sidecar_change(before, "Delete 3D material")
+
+    def _three_d_material_selected(self, row: int) -> None:
+        sidecar = self._active_blender_sidecar()
+        enabled = bool(
+            sidecar is not None
+            and 0 <= row < len(sidecar.document.drawing_materials)
+        )
+        for control in (
+            self.three_d_material_shader, self.three_d_material_texture,
+            self.three_d_material_vertex, self.three_d_material_rename,
+            self.three_d_material_delete, self.three_d_material_tint,
+            self.three_d_material_toon_ramp,
+            self.three_d_material_outline,
+            self.three_d_material_outline_color,
+            self.three_d_material_outline_width,
+        ):
+            control.setEnabled(enabled)
+        if not enabled:
+            return
+        material = sidecar.document.drawing_materials[row]
+        for control in (
+            self.three_d_material_shader, self.three_d_material_texture,
+            self.three_d_material_vertex, self.three_d_material_tint,
+            self.three_d_material_toon_ramp,
+            self.three_d_material_outline,
+            self.three_d_material_outline_color,
+            self.three_d_material_outline_width,
+        ):
+            control.blockSignals(True)
+        self.three_d_material_shader.setCurrentIndex(max(
+            0, self.three_d_material_shader.findData(material.shader)
+        ))
+        self.three_d_material_texture.setChecked(material.use_texture)
+        self.three_d_material_vertex.setChecked(material.use_vertex_color)
+        self.three_d_material_tint.setText(material.tint)
+        self.three_d_material_toon_ramp.setText(
+            self._format_three_d_toon_ramp(material.toon_ramp)
+        )
+        self.three_d_material_outline.setChecked(material.outline_enabled)
+        self.three_d_material_outline_color.setText(material.outline_color)
+        self.three_d_material_outline_width.setValue(material.outline_width)
+        for control in (
+            self.three_d_material_shader, self.three_d_material_texture,
+            self.three_d_material_vertex, self.three_d_material_tint,
+            self.three_d_material_toon_ramp,
+            self.three_d_material_outline,
+            self.three_d_material_outline_color,
+            self.three_d_material_outline_width,
+        ):
+            control.blockSignals(False)
+        self.three_d_material_toon_ramp.setEnabled(material.shader == "toon")
+        self.three_d_material_outline_color.setEnabled(
+            material.outline_enabled
+        )
+        self.three_d_material_outline_width.setEnabled(
+            material.outline_enabled
+        )
+
+    @staticmethod
+    def _format_three_d_toon_ramp(
+        ramp: list[tuple[float, str]],
+    ) -> str:
+        return ", ".join(
+            f"{float(position):g}:{color}" for position, color in ramp
+        )
+
+    @staticmethod
+    def _parse_three_d_color(value: str, label: str) -> str:
+        text = str(value).strip()
+        digits = text[1:] if text.startswith("#") else text
+        if (
+            len(digits) not in {3, 4, 6, 8}
+            or re.fullmatch(r"[0-9A-Fa-f]+", digits) is None
+        ):
+            raise ValueError(f"{label} must be a hexadecimal color")
+        color = QColor(f"#{digits}")
+        if not color.isValid():
+            raise ValueError(f"{label} is not a valid color")
+        return canonical_argb(color)
+
+    @classmethod
+    def _parse_three_d_toon_ramp(
+        cls, value: str,
+    ) -> list[tuple[float, str]]:
+        stops: list[tuple[float, str]] = []
+        for raw_stop in re.split(r"\s*[,;]\s*", str(value).strip()):
+            if not raw_stop:
+                continue
+            if ":" not in raw_stop:
+                raise ValueError(
+                    "Each Toon stop must use position:#AARRGGBB"
+                )
+            raw_position, raw_color = raw_stop.split(":", 1)
+            position = float(raw_position.strip())
+            if not math.isfinite(position) or not 0.0 <= position <= 1.0:
+                raise ValueError(
+                    "Toon ramp positions must be between zero and one"
+                )
+            stops.append((
+                position,
+                cls._parse_three_d_color(raw_color, "Toon ramp color"),
+            ))
+        if not stops:
+            raise ValueError("The Toon ramp needs at least one stop")
+        return sorted(stops, key=lambda item: item[0])
+
+    def _edit_three_d_material(self, *args) -> None:
+        del args
+        sidecar = self._active_blender_sidecar()
+        row = self.three_d_material_list.currentRow()
+        if (
+            getattr(self, "_syncing_three_d_controls", False)
+            or sidecar is None
+            or not 0 <= row < len(sidecar.document.drawing_materials)
+        ):
+            return
+        material = sidecar.document.drawing_materials[row]
+        updated = copy.deepcopy(material)
+        try:
+            updated.shader = self.three_d_material_shader.currentData()
+            updated.use_texture = self.three_d_material_texture.isChecked()
+            updated.use_vertex_color = self.three_d_material_vertex.isChecked()
+            updated.tint = self._parse_three_d_color(
+                self.three_d_material_tint.text(), "Tint"
+            )
+            updated.toon_ramp = self._parse_three_d_toon_ramp(
+                self.three_d_material_toon_ramp.text()
+            )
+            updated.outline_enabled = self.three_d_material_outline.isChecked()
+            updated.outline_color = self._parse_three_d_color(
+                self.three_d_material_outline_color.text(), "Outline color"
+            )
+            updated.outline_width = (
+                self.three_d_material_outline_width.value()
+            )
+            updated.validate()
+        except (TypeError, ValueError) as error:
+            self.statusBar().showMessage(str(error), 5000)
+            self._three_d_material_selected(row)
+            return
+        if updated == material:
+            return
+        before = copy.deepcopy(sidecar)
+        sidecar.document.drawing_materials[row] = updated
+        sidecar.document.revision += 1
+        self._push_sidecar_change(before, "Edit 3D material")
+        self.three_d_controller.request_render()
+
+    def _reset_three_d_object_overrides(self) -> None:
+        if not self.three_d_controller.reset_selected_to_blender():
+            self.statusBar().showMessage(
+                "Select a Blender object or local entity first", 4000
+            )
+
     def _activate_named_tool(self, enum_name: str) -> bool:
         tool = getattr(ToolKind, enum_name, None)
         if tool is None:
@@ -2537,6 +4859,14 @@ class MainWindow(QMainWindow):
         )
 
     def _sync_tool_buttons(self) -> None:
+        if getattr(self.canvas, "in_three_d_mode", False):
+            for button in self.tool_buttons.values():
+                button.setVisible(False)
+            self.shapes_category.setVisible(False)
+            self.drawing_selection_category.setVisible(False)
+            self._sync_three_d_tool_buttons()
+            self._sync_contextual_ribbon()
+            return
         vector_edit = getattr(ToolKind, "VECTOR_EDIT", None)
         for tool, button in self.tool_buttons.items():
             button.blockSignals(True)
@@ -2674,6 +5004,14 @@ class MainWindow(QMainWindow):
     def _sync_contextual_ribbon(self) -> None:
         if not hasattr(self, "ribbon"):
             return
+        if getattr(self.canvas, "in_three_d_mode", False):
+            for key in (
+                "three_d_view", "three_d_rendering", "three_d_outline",
+                "three_d_materials", "three_d_object",
+                "three_d_tool_settings",
+            ):
+                self.ribbon.set_page_visible(key, True)
+            return
         drawing = self._active_vector_drawing()
         active = drawing is not None
         selected_object = (
@@ -2797,6 +5135,11 @@ class MainWindow(QMainWindow):
         index = index.siblingAtColumn(0)
         self.tree.setCurrentIndex(index)
         item = self.hierarchy_model.item_for_index(index)
+        if item.kind in {"blender_root", "blender_entity"}:
+            self.canvas.set_blender_virtual_selection(
+                item.owner_layer_id, item.entity_id, item.source_id
+            )
+            return
         self.canvas.set_selection(item.kind, item.entity_id, activate_default_tool=True)
         menu = QMenu(self)
         rename = menu.addAction("Rename")
@@ -2807,12 +5150,29 @@ class MainWindow(QMainWindow):
                 self.chapter.objects.get(item.entity_id), ImageObject
             ) else None
         )
-        copy_asset.setEnabled(self._current_project_context() is not None)
+        selected_layer = (
+            self.chapter.layers.get(item.entity_id)
+            if item.kind == "layer" else None
+        )
+        duplicate_blender = (
+            menu.addAction("Duplicate 3D Layer")
+            if selected_layer is not None
+            and selected_layer.layer_kind == "blender" else None
+        )
+        copy_asset.setEnabled(
+            self._current_project_context() is not None
+            and not (
+                selected_layer is not None
+                and selected_layer.layer_kind == "blender"
+            )
+        )
         selected = menu.exec(self.tree.viewport().mapToGlobal(point))
         if selected is rename:
             self.tree.edit(index)
         elif selected is copy_asset:
             self._copy_selected_as_asset(item.kind, item.entity_id)
+        elif duplicate_blender is not None and selected is duplicate_blender:
+            self._duplicate_blender_layer(item.entity_id)
         elif rasterize is not None and selected is rasterize:
             self._rasterize_image(item.entity_id)
 
@@ -2825,6 +5185,12 @@ class MainWindow(QMainWindow):
             if kind == "layer" else self.chapter.objects.get(entity_id)
         )
         if entity is None:
+            return
+        if isinstance(entity, LayerNode) and entity.layer_kind == "blender":
+            self.statusBar().showMessage(
+                "Blender-linked layers cannot be copied to the Asset Library",
+                5000,
+            )
             return
         default_name = (
             entity.source_filename
@@ -3287,6 +5653,17 @@ class MainWindow(QMainWindow):
         if not index.isValid():
             return
         item = self.hierarchy_model.item_for_index(index)
+        if item.kind in {"blender_root", "blender_entity"}:
+            self.canvas.set_blender_virtual_selection(
+                item.owner_layer_id, item.entity_id, item.source_id
+            )
+            if item.kind == "blender_entity":
+                self.three_d_object_metadata.setText(
+                    self._three_d_metadata_text(
+                        item.source_id, item.type_label
+                    )
+                )
+            return
         self.canvas.set_selection(
             item.kind, item.entity_id, activate_default_tool=True
         )
@@ -3897,7 +6274,8 @@ class MainWindow(QMainWindow):
             return False
         try:
             self.repository.save_chapter(
-                self.chapter, self.canvas.tiles, self.canvas.images
+                self.chapter, self.canvas.tiles, self.canvas.images,
+                blender_sidecar=self._active_blender_sidecar(),
             )
             for reference in self.series.chapters:
                 if reference.chapter_id == self.chapter.chapter_id:
@@ -3908,7 +6286,13 @@ class MainWindow(QMainWindow):
             return False
         self._dirty = False
         self.autosave_timer.stop()
-        self.statusBar().showMessage("Saved", 3000)
+        if self.repository.last_save_warnings:
+            self.statusBar().showMessage(
+                f"Saved with warning: {self.repository.last_save_warnings[0]}",
+                7000,
+            )
+        else:
+            self.statusBar().showMessage("Saved", 3000)
         self._refresh_actions()
         return True
 
@@ -3936,7 +6320,14 @@ class MainWindow(QMainWindow):
             if isinstance(obj, ImageObject)
         })
         if session.kind == "series":
-            repository.save_chapter(chapter, tiles, images)
+            blender_sidecar = copy.deepcopy(session.blender_sidecar)
+            if blender_sidecar is not None:
+                blender_sidecar.document.series_id = series.series_id
+                blender_sidecar.document.revision += 1
+            repository.save_chapter(
+                chapter, tiles, images,
+                blender_sidecar=blender_sidecar,
+            )
             for reference in series.chapters:
                 if reference.chapter_id == chapter.chapter_id:
                     reference.name = chapter.name
@@ -3987,6 +6378,9 @@ class MainWindow(QMainWindow):
             replacements[old_key] = session.key
             session.dirty = False
             session.last_autosave = 0.0
+            if session.blender_sidecar is not None:
+                session.blender_sidecar.document.series_id = series.series_id
+                session.blender_sidecar.document.revision += 1
             session.tiles.dirty.clear()
             session.images.dirty.clear()
 
@@ -4008,6 +6402,10 @@ class MainWindow(QMainWindow):
             self.autosave_timer.stop()
             self.canvas.asset_repository = clone_context.assets
             self.asset_library.set_repository(clone_context.assets)
+            self.three_d_controller.set_documents(
+                self.active_session.chapter,
+                self.active_session.blender_sidecar,
+            )
             self.setWindowTitle(
                 f"{self.active_session.name} — Vertical Comic Editor"
             )
@@ -4107,6 +6505,7 @@ class MainWindow(QMainWindow):
                         session.context.repository.save_chapter(
                             session.chapter, session.tiles, session.images,
                             autosave=True,
+                            blender_sidecar=session.blender_sidecar,
                         )
                     session.last_autosave = now
                     saved = True
@@ -4145,6 +6544,7 @@ class MainWindow(QMainWindow):
                 self.repository.save_chapter(
                     self.chapter, self.canvas.tiles, self.canvas.images,
                     autosave=True,
+                    blender_sidecar=self._active_blender_sidecar(),
                 )
             self._last_autosave = time.monotonic()
             if self.active_session is not None:
@@ -4404,4 +6804,8 @@ class MainWindow(QMainWindow):
             if application is not None:
                 application.removeEventFilter(self)
             self._application_event_filter_installed = False
+        sync_manager = getattr(self, "three_d_sync_manager", None)
+        if sync_manager is not None:
+            sync_manager.stop()
+        self.three_d_controller.shutdown()
         event.accept()

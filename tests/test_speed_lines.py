@@ -39,7 +39,7 @@ def test_legacy_speed_lines_are_omitted_with_warning_and_references_repaired():
     warnings: list[str] = []
     restored = ChapterDocument.from_dict(payload, warnings=warnings)
 
-    assert restored.schema_version == 15
+    assert restored.schema_version == 16
     assert warnings == ["Omitted 2 unsupported Speed Lines objects."]
     assert legacy_id not in restored.objects
     assert "legacy-center" not in restored.objects

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import gc
+import copy
 import base64
 import html as html_lib
 import math
@@ -69,6 +70,7 @@ from comic_editor.core.vector_geometry import (
     stroke_cubics, tangent_bridge, trace_cubic_faces,
 )
 from comic_editor.ui.windows_input import configure_simultaneous_pen_touch
+from comic_editor.ui.three_d import ThreeDToolKind, ThreeDViewportController
 
 
 class ToolKind(Enum):
@@ -246,6 +248,8 @@ class CanvasSessionState:
     gradient_geometry_cache: dict
     gradient_scalar_cache: dict
     gradient_render_cache: dict
+    three_d_layer_id: str = ""
+    saved_two_d_camera: tuple[float, float, float, float] | None = None
 
 
 class CanvasPerformanceMonitor:
@@ -296,6 +300,8 @@ class _CanvasLogic:
     pageGapConfirmationChanged = Signal(bool)
     transformModeChanged = Signal(str)
     importStatusMessage = Signal(str)
+    threeDModeChanged = Signal(bool, str)
+    blenderLayerCreated = Signal(str, str)
 
     def __init__(self, settings: EditorSettings, parent=None):
         super().__init__(parent)
@@ -319,6 +325,12 @@ class _CanvasLogic:
         self._nav_anchor_center = QPointF()
         self._nav_anchor_scale = 1.0
         self._nav_anchor_rotation = 0.0
+        self.three_d_controller: ThreeDViewportController | None = None
+        self._three_d_mode_layer_id = ""
+        self._saved_two_d_camera: tuple[float, float, float, float] | None = None
+        self._three_d_boundary_edit = False
+        self._pending_blender_creation = False
+        self._three_d_touch_distance = 0.0
         self._drawing = False
         self._last_draw_point = QPointF()
         self._last_pressure = 1.0
@@ -619,6 +631,7 @@ class _CanvasLogic:
         self._pending_primitive_insert = None
         self._shape_hover_target = None
         self._shape_hover_insert = None
+        self._pending_blender_creation = False
         self.setToolTip("")
 
     def performance_snapshot(self) -> dict:
@@ -844,12 +857,251 @@ class _CanvasLogic:
         self._gradient_creation_type = ""
         self._gradient_creation_family = "color_fill"
         self._gradient_creation_before = None
+        self._pending_blender_creation = False
         self.unsetCursor()
+
+    @property
+    def in_three_d_mode(self) -> bool:
+        return bool(self._three_d_mode_layer_id and not self._three_d_boundary_edit)
+
+    def set_three_d_controller(
+        self, controller: ThreeDViewportController | None,
+    ) -> None:
+        if controller is self.three_d_controller:
+            return
+        if self.three_d_controller is not None:
+            try:
+                self.three_d_controller.deactivate()
+            except RuntimeError:
+                pass
+        self.three_d_controller = controller
+        if controller is None:
+            self._exit_three_d_mode(restore=True)
+            return
+        controller.imageChanged.connect(self._three_d_image_changed)
+        controller.frameEditCommitted.connect(self._three_d_frame_edited)
+
+    def _three_d_image_changed(self, layer_id: str) -> None:
+        if self.chapter is None or layer_id not in self.chapter.layers:
+            return
+        self._invalidate_scene_cache()
+        self.visualChanged.emit(QRectF())
+        self.update()
+
+    def _three_d_frame_edited(
+        self, frame_id: str, before: dict, after: dict, label: str,
+    ) -> None:
+        controller = self.three_d_controller
+        if controller is None or before == after:
+            return
+
+        def apply(payload: dict) -> None:
+            controller.apply_frame_payload(frame_id, payload, monotonic=True)
+            self._invalidate_scene_cache()
+            self.hierarchyChanged.emit()
+            self.documentChanged.emit(QRectF())
+            self.update()
+
+        self.command_stack.push(CallbackCommand(
+            label, lambda: apply(after), lambda: apply(before)
+        ), already_done=True)
+        self.documentChanged.emit(QRectF())
+
+    def _three_d_world_rect(self, layer_id: str) -> QRectF:
+        if self.chapter is None or layer_id not in self.chapter.layers:
+            return QRectF()
+        layer = self.chapter.layers[layer_id]
+        if layer.bound is None:
+            return QRectF()
+        left, top, width, height = layer.bound.bbox()
+        world_x, world_y = self.chapter.layer_world_translation(layer_id)
+        return QRectF(world_x + left, world_y + top, width, height)
+
+    def _three_d_render_position(self, widget_point: QPointF) -> QPointF:
+        controller = self.three_d_controller
+        if controller is None or not self._three_d_mode_layer_id:
+            return QPointF(widget_point)
+        widget_rect = self.camera_transform().mapRect(
+            self._three_d_world_rect(self._three_d_mode_layer_id)
+        )
+        if widget_rect.isEmpty():
+            return QPointF(widget_point)
+        width, height = controller.target_size
+        return QPointF(
+            (widget_point.x() - widget_rect.left())
+            * width / widget_rect.width(),
+            (widget_point.y() - widget_rect.top())
+            * height / widget_rect.height(),
+        )
+
+    def _enter_three_d_mode(self, layer_id: str) -> bool:
+        if self.chapter is None or layer_id not in self.chapter.layers:
+            return False
+        layer = self.chapter.layers[layer_id]
+        if layer.layer_kind != "blender":
+            return False
+        already_active = self._three_d_mode_layer_id == layer_id
+        if not self._three_d_mode_layer_id:
+            self._saved_two_d_camera = (
+                self.center_x, self.center_y, self.scale, self.rotation
+            )
+        self._commit_text_edit()
+        if self._page_creation_anchor_id:
+            self._cancel_page_creation()
+        if self._gradient_creation_parent_id:
+            self._cancel_gradient_creation()
+        if self._page_gap_state is not None:
+            if self._page_gap_transaction is not None:
+                self.cancel_page_gap_transaction()
+            else:
+                self._clear_page_gap_editor()
+        if self._asset_drag_manifest is not None:
+            self._clear_asset_drag_preview()
+        if self._vector_gesture_mode is not None:
+            self._cancel_vector_gesture(restore=True)
+        self._cancel_touch_navigation(emit_finished=False)
+        self._nav_mode = None
+        self._drawing = False
+        self._clear_creation_gesture()
+        self._clear_transform_preview()
+        self._three_d_mode_layer_id = layer_id
+        self._three_d_boundary_edit = False
+        target = self._three_d_world_rect(layer_id)
+        if not already_active and not target.isEmpty():
+            self.rotation = 0.0
+            self.center_x = target.center().x()
+            self.center_y = target.center().y()
+            available_width = max(1.0, self.width() - 80.0)
+            available_height = max(1.0, self.height() - 80.0)
+            self.scale = max(0.05, min(
+                8.0, available_width / max(1.0, target.width()),
+                available_height / max(1.0, target.height()),
+            ))
+        controller = self.three_d_controller
+        if controller is not None and not already_active:
+            ratio = max(1.0, float(self.devicePixelRatioF()))
+            target_size = (
+                max(1, round(target.width() * self.scale * ratio)),
+                max(1, round(target.height() * self.scale * ratio)),
+            )
+            controller.activate(layer_id, target_size)
+        self._invalidate_scene_cache()
+        self.threeDModeChanged.emit(True, layer_id)
+        self.cameraChanged.emit()
+        self.update()
+        return True
+
+    def _refresh_three_d_render_size(self) -> None:
+        controller = self.three_d_controller
+        if controller is None or not self.in_three_d_mode:
+            return
+        target = self.camera_transform().mapRect(
+            self._three_d_world_rect(self._three_d_mode_layer_id)
+        )
+        ratio = max(1.0, float(self.devicePixelRatioF()))
+        controller.request_render((
+            max(1, round(abs(target.width()) * ratio)),
+            max(1, round(abs(target.height()) * ratio)),
+        ))
+
+    def resizeEvent(self, event) -> None:  # noqa: N802
+        super().resizeEvent(event)
+        self._refresh_three_d_render_size()
+
+    def _exit_three_d_mode(self, *, restore: bool) -> None:
+        if not self._three_d_mode_layer_id:
+            return
+        previous = self._three_d_mode_layer_id
+        controller = self.three_d_controller
+        if controller is not None:
+            controller.deactivate()
+        if restore and self._saved_two_d_camera is not None:
+            self.center_x, self.center_y, self.scale, self.rotation = (
+                self._saved_two_d_camera
+            )
+        self._three_d_mode_layer_id = ""
+        self._saved_two_d_camera = None
+        self._three_d_boundary_edit = False
+        self.unsetCursor()
+        self._invalidate_scene_cache()
+        self.threeDModeChanged.emit(False, previous)
+        self.cameraChanged.emit()
+        self.update()
+
+    def set_blender_virtual_selection(
+        self, owner_layer_id: str, virtual_id: str, source_id: str = "",
+    ) -> bool:
+        if (
+            self.chapter is None or owner_layer_id not in self.chapter.layers
+            or self.chapter.layers[owner_layer_id].layer_kind != "blender"
+        ):
+            return False
+        self._enter_three_d_mode(owner_layer_id)
+        self.selected_kind = "blender_entity"
+        self.selected_id = virtual_id
+        self.selected_object_id = ""
+        self.active_layer_id = owner_layer_id
+        self.active_page_id = self.chapter.page_for_layer(
+            owner_layer_id
+        ).layer_id
+        if self.three_d_controller is not None:
+            self.three_d_controller.selected_entity_ids = (
+                {source_id} if source_id else set()
+            )
+            self.three_d_controller.selectionChanged.emit(
+                set(self.three_d_controller.selected_entity_ids)
+            )
+            self.three_d_controller.request_render()
+        self.selectionChanged.emit("blender_entity", virtual_id)
+        self.update()
+        return True
+
+    def begin_blender_layer_creation(self, kind: str) -> bool:
+        if (
+            self.chapter is None or self.chapter.document_kind == "asset"
+            or kind not in {"rectangle", "circle", "custom"}
+            or self._target_placement_for_new_bound() is None
+        ):
+            return False
+        self._exit_three_d_mode(restore=True)
+        self._clear_creation_gesture()
+        self._pending_blender_creation = True
+        return self.set_tool({
+            "rectangle": ToolKind.BOX_BOUND,
+            "circle": ToolKind.CIRCLE_BOUND,
+            "custom": ToolKind.SHAPE_CREATE,
+        }[kind])
+
+    def begin_blender_boundary_edit(self) -> bool:
+        if not self._three_d_mode_layer_id:
+            return False
+        layer_id = self._three_d_mode_layer_id
+        self._three_d_boundary_edit = True
+        # Virtual descendants are not real document entities. Shape Edit must
+        # target the owning Blender layer's actual closed boundary.
+        self.selected_kind = "layer"
+        self.selected_id = layer_id
+        self.selected_object_id = ""
+        self.active_layer_id = layer_id
+        self.selectionChanged.emit("layer", layer_id)
+        self.tool = ToolKind.SHAPE_EDIT
+        self.toolChanged.emit(self.tool)
+        self.update()
+        return True
+
+    def finish_blender_boundary_edit(self) -> None:
+        if not self._three_d_boundary_edit:
+            return
+        self._three_d_boundary_edit = False
+        layer_id = self._three_d_mode_layer_id
+        if layer_id:
+            self._enter_three_d_mode(layer_id)
 
     def set_document(
         self, chapter: ChapterDocument, tiles: TileStore,
         images: ImageStore | None = None, reset_view: bool = True,
     ) -> None:
+        self._exit_three_d_mode(restore=False)
         self._clear_detached_input_state()
         self.chapter = chapter
         self.tiles = tiles
@@ -919,6 +1171,8 @@ class _CanvasLogic:
             gradient_geometry_cache=self._gradient_geometry_cache,
             gradient_scalar_cache=self._gradient_scalar_cache,
             gradient_render_cache=self._gradient_render_cache,
+            three_d_layer_id=self._three_d_mode_layer_id,
+            saved_two_d_camera=self._saved_two_d_camera,
         )
 
     def restore_session_state(self, state: CanvasSessionState) -> None:
@@ -936,6 +1190,8 @@ class _CanvasLogic:
         self.selected_object_id = state.selected_object_id
         self.center_x, self.center_y = state.center_x, state.center_y
         self.scale, self.rotation = state.scale, state.rotation
+        self._three_d_mode_layer_id = ""
+        self._saved_two_d_camera = state.saved_two_d_camera
         self._compound_path_cache = state.compound_cache
         self._vector_render_cache = state.vector_cache
         self._gradient_geometry_cache = state.gradient_geometry_cache
@@ -946,12 +1202,21 @@ class _CanvasLogic:
         self._touch_frame_timer.stop()
         self._touch_pending_points = None
         self._clear_asset_drag_preview()
+        if (
+            state.three_d_layer_id
+            and state.three_d_layer_id in self.chapter.layers
+        ):
+            saved_camera = state.saved_two_d_camera
+            self._enter_three_d_mode(state.three_d_layer_id)
+            if saved_camera is not None:
+                self._saved_two_d_camera = saved_camera
         self.update()
         self.hierarchyChanged.emit()
         self.selectionChanged.emit(self.selected_kind, self.selected_id)
         self.toolChanged.emit(self.tool)
 
     def clear_document(self) -> None:
+        self._exit_three_d_mode(restore=False)
         if self.chapter is not None and self._page_creation_anchor_id:
             self._cancel_page_creation()
         if self._gradient_creation_parent_id:
@@ -988,16 +1253,26 @@ class _CanvasLogic:
         self._clear_page_gap_editor()
         self.pageGapConfirmationChanged.emit(False)
         self.chapter = ChapterDocument.from_dict(state)
+        if self.three_d_controller is not None:
+            self.three_d_controller.chapter = self.chapter
+        if (
+            self._three_d_mode_layer_id
+            and self._three_d_mode_layer_id not in self.chapter.layers
+        ):
+            self._exit_three_d_mode(restore=True)
         self._compound_path_cache.clear()
         self._gradient_geometry_cache.clear()
         self._gradient_scalar_cache.clear()
         self._gradient_render_cache.clear()
         self._promoted_vector_preview = None
         self._invalidate_scene_cache()
-        valid = (
-            self.selected_id in self.chapter.layers
-            if self.selected_kind == "layer"
-            else self.selected_id in self.chapter.objects
+        valid = bool(
+            self.selected_kind == "layer"
+            and self.selected_id in self.chapter.layers
+            or self.selected_kind == "object"
+            and self.selected_id in self.chapter.objects
+            or self.selected_kind == "blender_entity"
+            and self._three_d_mode_layer_id in self.chapter.layers
         )
         if not valid:
             self.selected_kind = ""
@@ -1310,6 +1585,12 @@ class _CanvasLogic:
             return
         if kind == "object" and entity_id not in self.chapter.objects:
             return
+        target_is_blender = bool(
+            kind == "layer"
+            and self.chapter.layers[entity_id].layer_kind == "blender"
+        )
+        if not target_is_blender:
+            self._exit_three_d_mode(restore=True)
         if self._text_editing and not (
             kind == "object" and entity_id == self.selected_object_id
         ):
@@ -1342,10 +1623,12 @@ class _CanvasLogic:
             layer = self.chapter.layers[entity_id]
             if (
                 activate_default_tool
-                and layer.layer_kind != "fill"
+                and layer.layer_kind not in {"fill", "blender"}
                 and layer.bound is not None
             ):
                 self.tool = ToolKind.SHAPE_EDIT
+            if layer.layer_kind == "blender":
+                self._enter_three_d_mode(entity_id)
         if self.tool != previous_tool:
             self.toolChanged.emit(self.tool)
         self.selectionChanged.emit(kind, entity_id)
@@ -1356,6 +1639,7 @@ class _CanvasLogic:
         """Clear the current entity and notify every selection consumer."""
         if self.chapter is None:
             return
+        self._exit_three_d_mode(restore=True)
         if (
             self._page_gap_state is not None
             and self._page_gap_transaction is None
@@ -1381,6 +1665,11 @@ class _CanvasLogic:
         self.update()
 
     def set_tool(self, tool: ToolKind) -> bool:
+        if self._three_d_boundary_edit and tool != ToolKind.SHAPE_EDIT:
+            self.finish_blender_boundary_edit()
+            return False
+        if self.in_three_d_mode:
+            return False
         selected_object = (
             self.chapter.objects.get(self.selected_object_id)
             if self.chapter is not None else None
@@ -1396,6 +1685,8 @@ class _CanvasLogic:
             ToolKind.BOX_BOUND, ToolKind.CIRCLE_BOUND,
             ToolKind.SHAPE_CREATE,
         }
+        if self._pending_blender_creation and tool not in creation_tools:
+            self._pending_blender_creation = False
         if (
             self._page_creation_anchor_id
             and tool not in creation_tools
@@ -3511,6 +3802,34 @@ class _CanvasLogic:
             return
         layer_path = self.bound_path(layer.bound, layer.vertex_radius)
         opacity = parent_opacity * layer.opacity
+        if layer.layer_kind == "blender":
+            painter.save()
+            painter.setOpacity(opacity)
+            painter.setClipPath(layer_path, Qt.IntersectClip)
+            image = (
+                self.three_d_controller.image_for_layer(layer.layer_id)
+                if self.three_d_controller is not None else None
+            )
+            target_rect = layer_path.boundingRect()
+            if image is not None and not image.isNull():
+                painter.setRenderHint(QPainter.SmoothPixmapTransform, True)
+                painter.drawImage(target_rect, image, QRectF(image.rect()))
+            else:
+                painter.fillPath(layer_path, QColor(28, 30, 35, 190))
+                painter.setPen(QPen(QColor("#aeb4bf"), 1.0 / max(self.scale, 0.05)))
+                reason = (
+                    self.three_d_controller.render_unavailable_reason
+                    if self.three_d_controller is not None else ""
+                )
+                label = "3D frame unavailable"
+                if reason:
+                    label += f"\n{reason[:160]}"
+                painter.drawText(
+                    target_rect.adjusted(12, 12, -12, -12),
+                    Qt.AlignmentFlag.AlignCenter | Qt.TextFlag.TextWordWrap,
+                    label,
+                )
+            painter.restore()
         if layer.fill_color:
             painter.save()
             painter.setOpacity(opacity)
@@ -6244,6 +6563,9 @@ class _CanvasLogic:
         painter.restore()
 
     def _draw_selection(self, painter: QPainter) -> None:
+        if self.in_three_d_mode:
+            self._draw_three_d_selection(painter)
+            return
         if self.tool in {
             ToolKind.DRAW_SELECT_RECT,
             ToolKind.DRAW_SELECT_LASSO,
@@ -6291,6 +6613,7 @@ class _CanvasLogic:
             if active.bound is not None:
                 painter.drawPath(self.layer_effective_path(active.layer_id))
             painter.restore()
+
         pen = QPen(QColor("#36b7ff"), 2 / max(self.scale, 0.05), Qt.DashLine)
         painter.setPen(pen)
         selected_object = self.chapter.objects.get(self.selected_id)
@@ -6424,6 +6747,95 @@ class _CanvasLogic:
                     self._draw_text_property_handles(painter)
         painter.restore()
         self._draw_transform_mode_gizmo(painter)
+
+    def _draw_three_d_selection(self, painter: QPainter) -> None:
+        controller = self.three_d_controller
+        if controller is None or not self._three_d_mode_layer_id:
+            return
+        world = self._three_d_world_rect(self._three_d_mode_layer_id)
+        if world.isEmpty():
+            return
+        painter.save()
+        painter.setBrush(Qt.NoBrush)
+        painter.setPen(QPen(
+            QColor("#36b7ff"), 2 / max(self.scale, 0.05), Qt.DashLine
+        ))
+        painter.drawRect(world)
+        target_width, target_height = controller.target_size
+
+        def to_world(point: QPointF) -> QPointF:
+            return QPointF(
+                world.left()
+                + point.x() * world.width() / max(1, target_width),
+                world.top()
+                + point.y() * world.height() / max(1, target_height),
+            )
+
+        path = list(getattr(controller, "_selection_path", ()))
+        if path:
+            painter.setPen(QPen(
+                QColor("#f2a23a"),
+                1.5 / max(self.scale, 0.05), Qt.DashLine,
+            ))
+            if (
+                controller.tool == ThreeDToolKind.SELECT_RECT
+                and len(path) >= 2
+            ):
+                painter.drawRect(QRectF(
+                    to_world(path[0]), to_world(path[-1])
+                ).normalized())
+            elif (
+                controller.tool == ThreeDToolKind.SELECT_LASSO
+                and len(path) >= 2
+            ):
+                painter.drawPolyline(QPolygonF([
+                    to_world(point) for point in path
+                ]))
+        if (
+            controller.tool == ThreeDToolKind.TRANSFORM
+            and controller.selected_entity_ids
+        ):
+            geometry = controller.gizmo_geometry()
+            if geometry is not None:
+                center = to_world(geometry["center"])
+                mode = geometry["mode"]
+                radius_x = (
+                    geometry["radius"] * world.width()
+                    / max(1, target_width)
+                )
+                radius_y = (
+                    geometry["radius"] * world.height()
+                    / max(1, target_height)
+                )
+            else:
+                center = None
+                mode = ""
+                radius_x = radius_y = 0.0
+            if center is not None and mode in {"rotate", "trackball"}:
+                painter.setPen(QPen(
+                    QColor("#f2a23a"), 2 / max(self.scale, 0.05)
+                ))
+                painter.drawEllipse(center, radius_x, radius_y)
+                if mode == "trackball":
+                    painter.drawEllipse(center, radius_x * 0.58, radius_y)
+            if center is not None and mode != "trackball":
+                for name, color in (
+                    ("x", QColor("#ff5b5b")),
+                    ("y", QColor("#62d879")),
+                    ("z", QColor("#5d8cff")),
+                ):
+                    endpoint = to_world(geometry["axes"][name])
+                    painter.setPen(QPen(
+                        color, 3 / max(self.scale, 0.05), Qt.SolidLine
+                    ))
+                    painter.drawLine(center, endpoint)
+                    if mode == "scale":
+                        size = 5 / max(self.scale, 0.05)
+                        painter.drawRect(QRectF(
+                            endpoint.x() - size, endpoint.y() - size,
+                            size * 2, size * 2,
+                        ))
+        painter.restore()
 
     def _draw_text_property_handles(self, painter: QPainter) -> None:
         positions = self._text_property_handle_positions()
@@ -9598,6 +10010,14 @@ class _CanvasLogic:
         if self._is_touch_mouse(event) or self._tablet_tool_active:
             event.accept()
             return
+        if self.in_three_d_mode:
+            if self.three_d_controller is not None:
+                self.three_d_controller.pointer_press(
+                    self._three_d_render_position(event.position()),
+                    event.button(), event.modifiers()
+                )
+            event.accept()
+            return
         if event.button() != Qt.LeftButton:
             return
         nav = self._navigation_mode()
@@ -9617,6 +10037,22 @@ class _CanvasLogic:
             event.accept()
             return
         if self._is_touch_mouse(event) or self._tablet_tool_active:
+            event.accept()
+            return
+        if self.in_three_d_mode:
+            controller = self.three_d_controller
+            if controller is not None:
+                controller.pointer_move(
+                    self._three_d_render_position(event.position()),
+                    event.modifiers(),
+                )
+                cursor_mode = controller.cursor_mode(event.modifiers())
+                self.setCursor({
+                    "add": Qt.CursorShape.DragCopyCursor,
+                    "remove": Qt.CursorShape.ForbiddenCursor,
+                    "replace": Qt.CursorShape.CrossCursor,
+                    "select": Qt.CursorShape.CrossCursor,
+                }.get(cursor_mode, Qt.CursorShape.ArrowCursor))
             event.accept()
             return
         if self._nav_mode:
@@ -9694,6 +10130,14 @@ class _CanvasLogic:
         if self._is_touch_mouse(event) or self._tablet_tool_active:
             event.accept()
             return
+        if self.in_three_d_mode:
+            if self.three_d_controller is not None:
+                self.three_d_controller.pointer_release(
+                    self._three_d_render_position(event.position()),
+                    event.button(), event.modifiers()
+                )
+            event.accept()
+            return
         if self._nav_mode:
             self._end_navigation()
             return
@@ -9701,6 +10145,9 @@ class _CanvasLogic:
             self._tool_release()
 
     def mouseDoubleClickEvent(self, event: QMouseEvent) -> None:  # noqa: N802
+        if self.in_three_d_mode:
+            event.accept()
+            return
         if (
             self.chapter is not None
             and self._reset_transform_pivot_at(
@@ -9765,6 +10212,16 @@ class _CanvasLogic:
         super().mouseDoubleClickEvent(event)
 
     def keyPressEvent(self, event) -> None:  # noqa: N802
+        if self.in_three_d_mode:
+            controller = self.three_d_controller
+            if event.key() in {Qt.Key_Shift, Qt.Key_Control}:
+                self.update()
+            elif event.key() == Qt.Key_Escape and controller is not None:
+                controller.selected_entity_ids.clear()
+                controller.selectionChanged.emit(set())
+                controller.request_render()
+            event.accept()
+            return
         if event.key() in {Qt.Key_Shift, Qt.Key_Control}:
             self.update()
         if event.key() == Qt.Key_Escape and self._cancel_shape_property_drag():
@@ -9891,6 +10348,10 @@ class _CanvasLogic:
         super().keyPressEvent(event)
 
     def keyReleaseEvent(self, event) -> None:  # noqa: N802
+        if self.in_three_d_mode:
+            self.update()
+            event.accept()
+            return
         if event.key() in {Qt.Key_Shift, Qt.Key_Control}:
             self.update()
         super().keyReleaseEvent(event)
@@ -9928,6 +10389,13 @@ class _CanvasLogic:
     def wheelEvent(self, event) -> None:  # noqa: N802
         if self.chapter is None:
             return
+        if self.in_three_d_mode:
+            if self.three_d_controller is not None:
+                self.three_d_controller.wheel(
+                    event.angleDelta().y(), event.modifiers()
+                )
+            event.accept()
+            return
         if event.modifiers() & Qt.ControlModifier:
             factor = math.pow(1.0015, event.angleDelta().y())
             self._set_centered_scale(self.scale * factor)
@@ -9946,6 +10414,33 @@ class _CanvasLogic:
             )
         if self.chapter is None:
             self._clear_detached_input_state()
+            event.accept()
+            return
+        if self.in_three_d_mode:
+            controller = self.three_d_controller
+            if controller is not None:
+                if event.type() == QEvent.TabletPress:
+                    self._pen_contact_active = True
+                    self._tablet_tool_active = True
+                    controller.pointer_press(
+                        self._three_d_render_position(event.position()),
+                        Qt.LeftButton, event.modifiers()
+                    )
+                elif (
+                    event.type() == QEvent.TabletMove
+                    and self._pen_contact_active
+                ):
+                    controller.pointer_move(
+                        self._three_d_render_position(event.position()),
+                        event.modifiers()
+                    )
+                elif event.type() == QEvent.TabletRelease:
+                    controller.pointer_release(
+                        self._three_d_render_position(event.position()),
+                        Qt.LeftButton, event.modifiers()
+                    )
+                    self._pen_contact_active = False
+                    self._tablet_tool_active = False
             event.accept()
             return
         self._tablet_hover_widget = QPointF(event.position())
@@ -10033,11 +10528,50 @@ class _CanvasLogic:
         if event.type() == QEvent.Type.Leave:
             self._tablet_hover_widget = None
             self.update()
+        if self.in_three_d_mode and event.type() in {
+            QEvent.TouchBegin, QEvent.TouchUpdate, QEvent.TouchEnd,
+            QEvent.TouchCancel,
+        }:
+            return self._three_d_touch_event(event)
         if self.settings.tablet_mode and event.type() in {
             QEvent.TouchBegin, QEvent.TouchUpdate, QEvent.TouchEnd, QEvent.TouchCancel
         }:
             return self._touch_event(event)
         return super().event(event)
+
+    def _three_d_touch_event(self, event) -> bool:
+        controller = self.three_d_controller
+        points = [item.position() for item in event.points()]
+        if controller is None:
+            event.accept()
+            return True
+        center = self._touch_centroid(points) if points else QPointF()
+        render_center = self._three_d_render_position(center)
+        distance = 0.0
+        if len(points) >= 2:
+            vector = points[1] - points[0]
+            distance = math.hypot(vector.x(), vector.y())
+        if event.type() == QEvent.TouchBegin:
+            controller.pointer_press(
+                render_center, Qt.MiddleButton, Qt.NoModifier
+            )
+            self._three_d_touch_distance = distance
+        elif event.type() == QEvent.TouchUpdate and points:
+            controller.pointer_move(render_center, Qt.NoModifier)
+            if distance and self._three_d_touch_distance:
+                controller.wheel(
+                    round((distance - self._three_d_touch_distance) * 8),
+                    Qt.NoModifier,
+                    commit=False,
+                )
+            self._three_d_touch_distance = distance
+        else:
+            controller.pointer_release(
+                render_center, Qt.MiddleButton, Qt.NoModifier
+            )
+            self._three_d_touch_distance = 0.0
+        event.accept()
+        return True
 
     @staticmethod
     def _is_touch_mouse(event: QMouseEvent) -> bool:
@@ -14149,6 +14683,8 @@ class _CanvasLogic:
                 self.push_model_change(before, after, "Edit geometry")
                 self.hierarchyChanged.emit()
             self.interactionFinished.emit()
+            if self._three_d_boundary_edit:
+                self.finish_blender_boundary_edit()
             return
         if self.tool in {
             ToolKind.BOX_BOUND, ToolKind.CIRCLE_BOUND, ToolKind.RASTER_CREATE
@@ -15196,6 +15732,8 @@ class _CanvasLogic:
             if not self._finish_pending_page_bound(bound):
                 return
             return
+        if self._pending_blender_creation:
+            closed = True
         minimum = 3 if closed else 2
         if len(self._creation_nodes) < minimum:
             return
@@ -15232,7 +15770,7 @@ class _CanvasLogic:
             bound, style=style, placement=placement,
             compound_operation=compound_operation,
         )
-        if created is not None:
+        if created is not None and created.layer_kind != "blender":
             self.set_tool(ToolKind.SHAPE_EDIT)
 
     def _create_layer_from_world_bound(
@@ -15245,6 +15783,13 @@ class _CanvasLogic:
             return None
         parent_id, insertion_index = placement
         before = self.chapter.to_dict()
+        sidecar_before = (
+            copy.deepcopy(self.three_d_controller.sidecar)
+            if self._pending_blender_creation
+            and self.three_d_controller is not None
+            and self.three_d_controller.sidecar is not None
+            else None
+        )
         parent_x, parent_y = self.chapter.layer_world_translation(parent_id)
         local = BoundGeometry.from_dict(bound.to_dict())
         for contour in local.iter_contours():
@@ -15268,20 +15813,44 @@ class _CanvasLogic:
                     numbered.append(int(candidate.name[6:]))
                 except ValueError:
                     pass
-        layer = self.chapter.add_layer(
-            parent_id, f"Layer {max(numbered, default=0) + 1}", local,
-            index=insertion_index,
-            layer_kind="bounded" if local.closed else "open_shape",
-            style=style,
-        )
-        layer.compound_operation = (
-            compound_operation
-            if compound_operation in {"add", "subtract", "ignore"}
-            else "add"
-        )
+        blender_layer = self._pending_blender_creation
+        if blender_layer:
+            layer = self.chapter.add_blender_layer(
+                parent_id, "3D Layer", local, index=insertion_index,
+            )
+            self._pending_blender_creation = False
+            self.blenderLayerCreated.emit(
+                layer.layer_id, layer.comic_frame_id or ""
+            )
+        else:
+            layer = self.chapter.add_layer(
+                parent_id, f"Layer {max(numbered, default=0) + 1}", local,
+                index=insertion_index,
+                layer_kind="bounded" if local.closed else "open_shape",
+                style=style,
+            )
+            layer.compound_operation = (
+                compound_operation
+                if compound_operation in {"add", "subtract", "ignore"}
+                else "add"
+            )
         after = self.chapter.to_dict()
         self.set_selection("layer", layer.layer_id)
-        self.push_model_change(before, after, "Create bounded layer")
+        if blender_layer and self.three_d_controller is not None:
+            controller = self.three_d_controller
+            sidecar_after = copy.deepcopy(controller.sidecar)
+
+            def apply(chapter_state: dict, sidecar_state) -> None:
+                self.replace_chapter(chapter_state)
+                controller.replace_sidecar(sidecar_state, monotonic=True)
+
+            self.command_stack.push(CallbackCommand(
+                "Create Blender 3D layer",
+                lambda: apply(after, sidecar_after),
+                lambda: apply(before, sidecar_before),
+            ), already_done=True)
+        else:
+            self.push_model_change(before, after, "Create bounded layer")
         self.hierarchyChanged.emit()
         self.documentChanged.emit(QRectF())
         self.update()
