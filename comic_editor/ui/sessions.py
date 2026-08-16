@@ -10,7 +10,6 @@ from comic_editor.core.persistence import SeriesRepository
 from comic_editor.core.tiles import TileStore
 from comic_editor.core.images import ImageStore
 from comic_editor.ui.canvas import CanvasSessionState
-from comic_editor.three_d.repository import BlenderSidecarData
 
 
 @dataclass
@@ -33,7 +32,6 @@ class EditorSession:
     chapter: ChapterDocument
     tiles: TileStore
     images: ImageStore = field(default_factory=ImageStore)
-    blender_sidecar: BlenderSidecarData | None = None
     asset_manifest: AssetManifest | None = None
     canvas_state: CanvasSessionState | None = None
     dirty: bool = False

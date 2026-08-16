@@ -19,17 +19,10 @@ class TreeItem:
     entity_id: str
     parent: "TreeItem | None" = None
     children: list["TreeItem"] = field(default_factory=list)
-    label: str = ""
-    type_label: str = ""
-    visible: bool = True
-    owner_layer_id: str = ""
-    source_id: str = ""
-    checkable: bool = False
 
 
 class HierarchyModel(QAbstractItemModel):
     mutationCommitted = Signal(object, object, str)
-    virtualVisibilityChanged = Signal(str, str, bool)
 
     MIME = "application/x-vertical-comic-entity"
 
@@ -38,7 +31,6 @@ class HierarchyModel(QAbstractItemModel):
         self.chapter = chapter
         self.root = TreeItem("root", "")
         self._items: dict[tuple[str, str], TreeItem] = {}
-        self._blender_hierarchy: dict[str, list[dict]] = {}
         self.rebuild()
 
     def set_chapter(self, chapter: ChapterDocument | None) -> None:
@@ -49,21 +41,6 @@ class HierarchyModel(QAbstractItemModel):
 
     def rebuild(self) -> None:
         self.beginResetModel()
-        self._build()
-        self.endResetModel()
-
-    def set_blender_hierarchy(
-        self, hierarchy: dict[str, list[dict]] | None,
-    ) -> None:
-        """Install read-only virtual Blender rows keyed by 3D layer id.
-
-        Each entry is a small transport-neutral mapping with ``id``, ``name``,
-        ``type``, ``visible`` and optional recursive ``children`` fields.  The
-        hierarchy intentionally does not become part of ``LayerNode.children``;
-        Blender remains authoritative for it.
-        """
-        self.beginResetModel()
-        self._blender_hierarchy = hierarchy or {}
         self._build()
         self.endResetModel()
 
@@ -90,37 +67,6 @@ class HierarchyModel(QAbstractItemModel):
             self._items[("layer", layer_id)] = item
             parent.children.append(item)
             layer = self.chapter.layers[layer_id]
-            if layer.layer_kind == "blender":
-                root_id = f"{layer_id}:blender"
-                blender_root = TreeItem(
-                    "blender_root", root_id, item, label="Blender",
-                    type_label="Linked Scene", owner_layer_id=layer_id,
-                )
-                item.children.append(blender_root)
-                self._items[("blender_root", root_id)] = blender_root
-
-                def build_virtual(entry: dict, virtual_parent: TreeItem) -> None:
-                    source_id = str(entry.get("id", ""))
-                    entry_kind = str(entry.get("kind", entry.get("type", "object")))
-                    virtual_id = f"{layer_id}:{entry_kind}:{source_id}"
-                    virtual = TreeItem(
-                        "blender_entity", virtual_id, virtual_parent,
-                        label=str(entry.get("name", source_id or "Unnamed")),
-                        type_label=str(entry.get("type_label", entry_kind.title())),
-                        visible=bool(entry.get("visible", True)),
-                        owner_layer_id=layer_id, source_id=source_id,
-                        checkable=bool(entry.get("checkable", True)),
-                    )
-                    virtual_parent.children.append(virtual)
-                    self._items[("blender_entity", virtual_id)] = virtual
-                    for child_entry in entry.get("children", ()):
-                        if isinstance(child_entry, dict):
-                            build_virtual(child_entry, virtual)
-
-                for entry in self._blender_hierarchy.get(layer_id, ()):
-                    if isinstance(entry, dict):
-                        build_virtual(entry, blender_root)
-                return item
             for child in layer.children:
                 if child.kind == "layer":
                     build_layer(child.entity_id, item)
@@ -148,19 +94,6 @@ class HierarchyModel(QAbstractItemModel):
             return QModelIndex()
         row = item.parent.children.index(item)
         return self.createIndex(row, 0, item)
-
-    def index_for_blender_source(
-        self, owner_layer_id: str, source_id: str,
-    ) -> QModelIndex:
-        item = next((
-            candidate for candidate in self._items.values()
-            if candidate.kind == "blender_entity"
-            and candidate.owner_layer_id == owner_layer_id
-            and candidate.source_id == source_id
-        ), None)
-        if item is None or item.parent is None:
-            return QModelIndex()
-        return self.createIndex(item.parent.children.index(item), 0, item)
 
     def index(self, row: int, column: int, parent=QModelIndex()) -> QModelIndex:
         parent_item = self.item_for_index(parent)
@@ -195,29 +128,6 @@ class HierarchyModel(QAbstractItemModel):
         if not index.isValid() or self.chapter is None:
             return None
         item = self.item_for_index(index)
-        if item.kind in {"blender_root", "blender_entity"}:
-            if role in (Qt.DisplayRole, Qt.EditRole):
-                if index.column() == 0:
-                    return item.label
-                if index.column() == 1:
-                    return item.type_label
-                if index.column() == 2:
-                    return ""
-            if (
-                role == Qt.CheckStateRole and index.column() == 0
-                and item.checkable
-            ):
-                return Qt.Checked if item.visible else Qt.Unchecked
-            if role == Qt.ToolTipRole:
-                return (
-                    "Virtual Blender hierarchy. Select or toggle visibility; "
-                    "rename, drag, nesting, and asset conversion are disabled."
-                )
-            if role == Qt.BackgroundRole:
-                return QColor("#17191d")
-            if role == Qt.ForegroundRole:
-                return QColor("#cfd3da")
-            return None
         if (
             item.kind == "layer"
             and item.entity_id not in self.chapter.layers
@@ -243,8 +153,6 @@ class HierarchyModel(QAbstractItemModel):
                         return "Fill Layer"
                     if entity.layer_kind == "open_shape":
                         return "Open Shape"
-                    if entity.layer_kind == "blender":
-                        return "Blender 3D Layer"
                     primitive = {
                         "rectangle": "Rectangle",
                         "ellipse": "Circle",
@@ -285,24 +193,6 @@ class HierarchyModel(QAbstractItemModel):
         if not index.isValid() or self.chapter is None:
             return False
         item = self.item_for_index(index)
-        if item.kind in {"blender_root", "blender_entity"}:
-            if not (
-                item.kind == "blender_entity"
-                and item.checkable
-                and role == Qt.CheckStateRole
-                and index.column() == 0
-            ):
-                return False
-            try:
-                check_state = Qt.CheckState(value)
-            except (TypeError, ValueError):
-                return False
-            item.visible = check_state == Qt.Checked
-            self.dataChanged.emit(index, index, [role, Qt.DisplayRole])
-            self.virtualVisibilityChanged.emit(
-                item.owner_layer_id, item.source_id, item.visible
-            )
-            return True
         if (
             item.kind == "layer"
             and item.entity_id not in self.chapter.layers
@@ -342,11 +232,6 @@ class HierarchyModel(QAbstractItemModel):
         if not index.isValid():
             return Qt.ItemIsDropEnabled
         item = self.item_for_index(index)
-        if item.kind in {"blender_root", "blender_entity"}:
-            flags = Qt.ItemIsEnabled | Qt.ItemIsSelectable
-            if item.kind == "blender_entity" and item.checkable:
-                flags |= Qt.ItemIsUserCheckable
-            return flags
         if self.chapter is None or (
             item.kind == "layer"
             and item.entity_id not in self.chapter.layers
@@ -370,7 +255,7 @@ class HierarchyModel(QAbstractItemModel):
             item.kind == "layer"
             and self.chapter.layers.get(item.entity_id) is not None
             and self.chapter.layers[item.entity_id].layer_kind
-            not in {"fill", "blender"}
+            != "fill"
         ):
             flags |= Qt.ItemIsDropEnabled
         if isinstance(entity, VectorDrawingObject):
@@ -388,8 +273,6 @@ class HierarchyModel(QAbstractItemModel):
         data = QMimeData()
         if index.isValid():
             item = self.item_for_index(index)
-            if item.kind in {"blender_root", "blender_entity"}:
-                return data
             data.setData(self.MIME, json.dumps({
                 "kind": item.kind, "id": item.entity_id
             }).encode("utf-8"))
@@ -400,18 +283,6 @@ class HierarchyModel(QAbstractItemModel):
             return False
         payload = json.loads(bytes(data.data(self.MIME)).decode("utf-8"))
         item = self.item_for_index(parent)
-        if item.kind in {"blender_root", "blender_entity"}:
-            return False
-        if payload.get("kind") not in {"layer", "object"}:
-            return False
-        if (
-            payload["kind"] == "layer"
-            and self.chapter.layers.get(payload.get("id")) is not None
-            and self.chapter.layers[payload["id"]].layer_kind == "blender"
-            and item.kind == "layer"
-            and self.chapter.layers[item.entity_id].layer_kind == "blender"
-        ):
-            return False
         if item.kind == "object":
             parent_object = self.chapter.objects.get(item.entity_id)
             moving_object = self.chapter.objects.get(payload["id"])
@@ -430,7 +301,7 @@ class HierarchyModel(QAbstractItemModel):
         if (
             item.kind == "layer"
             and self.chapter.layers[item.entity_id].layer_kind
-            in {"fill", "blender"}
+            == "fill"
         ):
             return False
         if payload["kind"] == "layer" and self.chapter.layers[payload["id"]].is_page:

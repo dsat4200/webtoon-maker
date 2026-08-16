@@ -228,8 +228,6 @@ class LayerSettingsPanel(QGroupBox):
             return "Fill Layer"
         if layer.layer_kind == "open_shape":
             return "Open Shape"
-        if layer.layer_kind == "blender":
-            return "3D Layer"
         return {
             "rectangle": "Rectangle Layer",
             "ellipse": "Circle Layer",
@@ -270,16 +268,14 @@ class LayerSettingsPanel(QGroupBox):
         self.name.setText(layer.name)
         self.visible.setChecked(layer.visible)
         self.opacity.setValue(round(layer.opacity * 100))
-        is_blender = layer.layer_kind == "blender"
         self.ignore_parent_mask.setVisible(
-            not layer.is_page
-            and layer.layer_kind != "fill" and not is_blender
+            not layer.is_page and layer.layer_kind != "fill"
         )
         self.ignore_parent_mask.setChecked(layer.ignore_parent_mask)
 
         is_fill = layer.layer_kind == "fill"
         is_open = layer.layer_kind == "open_shape"
-        compound_capable = not layer.is_page and not is_fill and not is_blender
+        compound_capable = not layer.is_page and not is_fill
         self.compound_enabled.setVisible(compound_capable)
         self.compound_enabled.setChecked(layer.compound_enabled)
         compound_parent = (
@@ -311,7 +307,6 @@ class LayerSettingsPanel(QGroupBox):
         ))
 
         self.fill_enabled.setText("Stroke" if is_open else "Fill")
-        self.fill_row.setVisible(not is_blender)
         self.fill_enabled.setChecked(bool(layer.fill_color))
         self.fill_enabled.setEnabled(not is_fill and not is_open)
         self._set_color_button(
@@ -357,13 +352,12 @@ class LayerSettingsPanel(QGroupBox):
             self.point_roundness.setValue(selected_node.roundness)
 
         effective_grid = chapter.effective_grid(layer.layer_id)
-        self.grid_override.setVisible(not is_fill and not is_blender)
+        self.grid_override.setVisible(not is_fill)
         self._set_pair_visible(
-            self.grid_size_label, self.grid_size, not is_fill and not is_blender
+            self.grid_size_label, self.grid_size, not is_fill
         )
         self._set_pair_visible(
-            self.grid_divisions_label, self.grid_divisions,
-            not is_fill and not is_blender,
+            self.grid_divisions_label, self.grid_divisions, not is_fill
         )
         self.grid_override.setChecked(layer.grid_override is not None)
         self.grid_size.setValue(effective_grid.size)
@@ -428,34 +422,24 @@ class LayerSettingsPanel(QGroupBox):
         before = chapter.to_dict()
         layer.name = self.name.text().strip() or layer.name
         layer.visible = self.visible.isChecked()
-        is_blender = layer.layer_kind == "blender"
-        if not layer.is_page and layer.layer_kind not in {"fill", "blender"}:
+        if not layer.is_page and layer.layer_kind != "fill":
             layer.ignore_parent_mask = self.ignore_parent_mask.isChecked()
         chapter.set_layer_opacity(layer.layer_id, self.opacity.value() / 100)
-        if not is_blender:
-            layer.fill_color = (
-                str(self.fill_color.property("color"))
-                if layer.layer_kind in {"fill", "open_shape"}
-                or self.fill_enabled.isChecked()
-                else None
-            )
+        layer.fill_color = (
+            str(self.fill_color.property("color"))
+            if layer.layer_kind in {"fill", "open_shape"}
+            or self.fill_enabled.isChecked()
+            else None
+        )
         if layer.layer_kind != "fill":
             layer.shape_style.base_thickness = self.base_thickness.value()
             layer.border_width = self.border_width.value()
             layer.border_color = str(self.border_color.property("color"))
-            layer.compound_enabled = (
-                False if is_blender else self.compound_enabled.isChecked()
-            )
-            if is_blender:
-                layer.compound_operation = "add"
-            else:
-                operation = self.compound_operation.currentData()
-                if operation in {"add", "subtract", "ignore"}:
-                    layer.compound_operation = operation
-        if (
-            layer.layer_kind not in {"fill", "blender"}
-            and self.grid_override.isChecked()
-        ):
+            layer.compound_enabled = self.compound_enabled.isChecked()
+            operation = self.compound_operation.currentData()
+            if operation in {"add", "subtract", "ignore"}:
+                layer.compound_operation = operation
+        if layer.layer_kind != "fill" and self.grid_override.isChecked():
             if layer.grid_override is None:
                 inherited = (
                     chapter.effective_grid(layer.parent_id)

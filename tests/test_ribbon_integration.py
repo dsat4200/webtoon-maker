@@ -49,10 +49,7 @@ def test_main_window_ribbon_is_contextual_and_tools_are_renamed(qapp):
         assert window.tool_buttons[ToolKind.RASTER_PENCIL].text() == "Pencil"
         assert window.tool_buttons[ToolKind.RASTER_ERASER].text() == "Eraser"
         assert window.ribbon.page_keys() == [
-            "tool_settings", "asset_library", "vector_tools",
-            "three_d_view", "three_d_rendering", "three_d_outline",
-            "three_d_materials", "three_d_object", "three_d_tool_settings",
-            "gradient_tools",
+            "tool_settings", "asset_library", "vector_tools", "gradient_tools",
         ]
         assert window.ribbon.orientation == Qt.Orientation.Vertical
         assert window.ribbon.tab_bar.shape() == QTabBar.Shape.RoundedEast

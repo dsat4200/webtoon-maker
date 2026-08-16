@@ -173,45 +173,6 @@ def test_layer_settings_preserves_all_bounded_layer_fields(
         window.deleteLater()
 
 
-def test_blender_layer_settings_expose_only_valid_boundary_controls(
-    qapp, monkeypatch,
-):
-    monkeypatch.setattr(main_window_module, "save_settings", lambda _value: None)
-    window = MainWindow()
-    chapter, page, _layer, _raster = _window_document(window)
-    blender = chapter.add_blender_layer(
-        page.layer_id, "3D Shot",
-        BoundGeometry.rectangle(20, 20, 320, 180),
-    )
-    window._refresh_hierarchy()
-    window.canvas.set_selection("layer", blender.layer_id, False)
-    panel = window.layer_settings
-    panel.refresh()
-    try:
-        assert panel.type_label.text() == "3D Layer"
-        assert panel.fill_row.isHidden()
-        assert panel.compound_enabled.isHidden()
-        assert panel.ignore_parent_mask.isHidden()
-        assert panel.grid_override.isHidden()
-        assert not panel.border_width.isHidden()
-
-        panel._updating = True
-        panel.fill_enabled.setChecked(True)
-        panel.compound_enabled.setChecked(True)
-        panel.ignore_parent_mask.setChecked(True)
-        panel.grid_override.setChecked(True)
-        panel._updating = False
-        panel._apply()
-        assert blender.fill_color is None
-        assert not blender.compound_enabled
-        assert blender.compound_operation == "add"
-        assert not blender.ignore_parent_mask
-        assert blender.grid_override is None
-        chapter.validate()
-    finally:
-        window.deleteLater()
-
-
 def test_thickness_sliders_use_integers_sync_and_coalesce_undo(
     qapp, monkeypatch,
 ):

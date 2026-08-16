@@ -242,7 +242,7 @@ def test_path_node_shape_style_round_trip_and_open_leaf_invariants():
     )
     loaded = ChapterDocument.from_dict(chapter.to_dict())
     result = loaded.layers[line.layer_id]
-    assert loaded.schema_version == 16
+    assert loaded.schema_version == 15
     assert result.layer_kind == "open_shape"
     assert result.bound.closed is False
     assert result.bound.nodes[1].incoming == (70, 30)

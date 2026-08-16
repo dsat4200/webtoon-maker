@@ -1,19 +1,10 @@
 - establishing shot, home depot bass pro shops
-	- "do you ever get the feeling"
-- lance talking to a coworker 
-	- "you're being watched?" *re-arranging *
 - low angle of lance, shelves and stuff visible in bg
-	- girl vaping at work: dude, chill out 
 - bunch of shots of him scanning stuff, customer order
-	- "easy for you to say." (she's just watering plants)
-- he thinks he sees something out of the corner of his eye, glances over paranoid, vignette
 - fast pace interrupted by him putting something back on the shelf again and again to align it
-- picking orders, "orders" ui on company phone, time ticking down
-- places order in pickup box right on time 
-- clocks out
-- hops on skateboard on his way out
+- says bye to somone, runs out door, hops on skateboard on his way out
 - cool shot of him skating past cars and stuff down sidewalk
-	- more glancing back and forth, but this time looking at cars?
+
 - gets home to his dinky apartment establishing shot
 - his food is just a protein shake and a vitamin gummy.
 - chug chug chug
@@ -38,7 +29,6 @@
 - title card
 - leaves the audience guessing on a cliff hanger
 
-idea: lance is soul bonded to this eroge otome game character from the future
 
 chapter 2 takes place from phoebe's perspective.
 - phoebe opens mouth, pulling out lance

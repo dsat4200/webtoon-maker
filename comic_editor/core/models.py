@@ -7,7 +7,7 @@ from dataclasses import dataclass, field
 from typing import Any, Iterable, Iterator, Literal
 
 
-SCHEMA_VERSION = 16
+SCHEMA_VERSION = 15
 CHAPTER_WIDTH = 1080
 DEFAULT_CHAPTER_HEIGHT = 3240
 GROWTH_MARGIN = 1080
@@ -626,8 +626,7 @@ class LayerNode:
     layer_id: str = field(default_factory=new_id)
     name: str = "Layer"
     is_page: bool = False
-    layer_kind: Literal["bounded", "open_shape", "fill", "blender"] = "bounded"
-    comic_frame_id: str | None = None
+    layer_kind: Literal["bounded", "open_shape", "fill"] = "bounded"
     parent_id: str | None = None
     children: list[ChildRef] = field(default_factory=list)
     visible: bool = True
@@ -646,7 +645,6 @@ class LayerNode:
         return {
             "id": self.layer_id, "name": self.name, "is_page": self.is_page,
             "layer_kind": self.layer_kind,
-            "comic_frame_id": self.comic_frame_id,
             "parent_id": self.parent_id,
             "children": [item.to_dict() for item in self.children],
             "visible": self.visible, "opacity": self.opacity,
@@ -667,10 +665,6 @@ class LayerNode:
             layer_id=str(data["id"]), name=str(data.get("name", "Layer")),
             is_page=bool(data.get("is_page", False)), parent_id=data.get("parent_id"),
             layer_kind=str(data.get("layer_kind", "bounded")),
-            comic_frame_id=(
-                str(data["comic_frame_id"])
-                if data.get("comic_frame_id") is not None else None
-            ),
             children=[ChildRef.from_dict(item) for item in data.get("children", [])],
             visible=bool(data.get("visible", True)),
             opacity=float(data.get("opacity", 1.0)),
@@ -1867,7 +1861,6 @@ class ChapterDocument:
         if len(set(self.root_page_ids)) != len(self.root_page_ids):
             raise ValueError("Duplicate root page")
         referenced: set[tuple[str, str]] = set()
-        comic_frame_ids: set[str] = set()
         for page_id in self.root_page_ids:
             page = self.layers.get(page_id)
             if page is None or not page.is_page or page.parent_id is not None:
@@ -1875,15 +1868,11 @@ class ChapterDocument:
             referenced.add(("layer", page_id))
         for layer in self.layers.values():
             layer.ignore_parent_mask = bool(layer.ignore_parent_mask)
-            if layer.layer_kind not in {
-                "bounded", "open_shape", "fill", "blender",
-            }:
+            if layer.layer_kind not in {"bounded", "open_shape", "fill"}:
                 raise ValueError("Unknown layer kind")
             if layer.compound_operation not in {"add", "subtract", "ignore"}:
                 raise ValueError("Unknown compound operation")
             if layer.layer_kind == "fill":
-                if layer.comic_frame_id is not None:
-                    raise ValueError("Only Blender layers may reference comic frames")
                 if layer.is_page or layer.parent_id is None:
                     raise ValueError("Fill layers require a parent")
                 if layer.bound is not None or layer.children:
@@ -1895,35 +1884,9 @@ class ChapterDocument:
                 layer.vertex_radius = 0.0
                 layer.compound_enabled = False
                 layer.ignore_parent_mask = False
-            elif layer.layer_kind == "blender":
-                if self.document_kind != "chapter":
-                    raise ValueError("Blender layers cannot be stored as assets")
-                if layer.is_page or layer.parent_id is None:
-                    raise ValueError("Blender layers require a parent shape")
-                if layer.bound is None or not layer.bound.closed:
-                    raise ValueError("Blender layers require a closed boundary")
-                if layer.children:
-                    raise ValueError("Blender layers cannot contain ordinary children")
-                if layer.compound_enabled or layer.compound_operation != "add":
-                    raise ValueError("Blender layers cannot use compound shapes")
-                if layer.fill_color is not None:
-                    raise ValueError("Blender layer boundaries cannot have a fill")
-                layer.grid_override = None
-                layer.ignore_parent_mask = False
-                layer.last_raster_id = None
-                frame_id = str(layer.comic_frame_id or "").strip()
-                if not frame_id:
-                    raise ValueError("Blender layers require a comic frame ID")
-                if frame_id in comic_frame_ids:
-                    raise ValueError("Comic frame IDs must be unique per 3D layer")
-                comic_frame_ids.add(frame_id)
-                layer.comic_frame_id = frame_id
-                layer.bound.validate()
             elif layer.bound is None:
                 raise ValueError("Bounded layers require geometry")
             else:
-                if layer.comic_frame_id is not None:
-                    raise ValueError("Only Blender layers may reference comic frames")
                 layer.bound.validate()
                 if layer.layer_kind == "open_shape":
                     if layer.is_page or layer.bound.closed:
@@ -1945,7 +1908,7 @@ class ChapterDocument:
                 raise ValueError(f"Layer {layer.layer_id} has no valid parent")
             if (
                 layer.parent_id
-                and self.layers[layer.parent_id].layer_kind in {"fill", "blender"}
+                and self.layers[layer.parent_id].layer_kind == "fill"
             ):
                 raise ValueError("Leaf layers cannot contain entities")
             if layer.parent_id and self.layers[layer.parent_id].is_page is False:
@@ -2041,7 +2004,7 @@ class ChapterDocument:
                 parent = self.layers.get(obj.parent_layer_id)
             if (
                 parent is None
-                or parent.layer_kind in {"fill", "blender"}
+                or parent.layer_kind == "fill"
             ):
                 raise ValueError(f"Object {object_id} requires a container layer")
             obj.opacity = max(0.0, min(1.0, float(obj.opacity)))
@@ -2164,10 +2127,8 @@ class ChapterDocument:
         style: ShapeStyle | None = None,
     ) -> LayerNode:
         parent = self.layers[parent_id]
-        if parent.layer_kind in {"fill", "blender"}:
+        if parent.layer_kind == "fill":
             raise ValueError("Leaf layers cannot contain entities")
-        if layer_kind == "blender":
-            raise ValueError("Use add_blender_layer to create 3D layers")
         layer = LayerNode(
             name=name, parent_id=parent_id, layer_kind=layer_kind,
             bound=bound or BoundGeometry.rectangle(0, 0, 720, 720),
@@ -2183,97 +2144,11 @@ class ChapterDocument:
             )
         return layer
 
-    def add_blender_layer(
-        self, parent_id: str, name: str = "3D Layer",
-        bound: BoundGeometry | None = None, index: int | None = None,
-        comic_frame_id: str | None = None,
-    ) -> LayerNode:
-        """Create a closed, leaf-like 3D viewport with an independent frame."""
-        if self.document_kind != "chapter":
-            raise ValueError("Blender layers cannot be stored as assets")
-        parent = self.layers[parent_id]
-        if parent.layer_kind in {"fill", "blender"}:
-            raise ValueError("Leaf layers cannot contain entities")
-        geometry = bound or BoundGeometry.rectangle(0, 0, 720, 720)
-        if not geometry.closed:
-            raise ValueError("Blender layers require a closed boundary")
-        frame_id = str(comic_frame_id or new_id()).strip()
-        if not frame_id:
-            raise ValueError("Blender layers require a comic frame ID")
-        if any(
-            item.layer_kind == "blender"
-            and item.comic_frame_id == frame_id
-            for item in self.layers.values()
-        ):
-            raise ValueError("Comic frame IDs must be unique per 3D layer")
-        layer = LayerNode(
-            name=name, parent_id=parent_id, layer_kind="blender",
-            comic_frame_id=frame_id, bound=geometry,
-            shape_style=ShapeStyle(
-                primary_color=None,
-                outline_color="#FF000000",
-                outline_thickness=4.0,
-            ),
-            compound_enabled=False,
-        )
-        self.layers[layer.layer_id] = layer
-        reference = ChildRef("layer", layer.layer_id)
-        if index is None:
-            parent.children.append(reference)
-        else:
-            parent.children.insert(
-                max(0, min(int(index), len(parent.children))), reference,
-            )
-        return layer
-
-    def duplicate_blender_layer(
-        self, layer_id: str, parent_id: str | None = None,
-        index: int | None = None, name: str | None = None,
-    ) -> LayerNode:
-        """Duplicate a 3D boundary while always minting a new comic frame."""
-        source = self.layers[layer_id]
-        if source.layer_kind != "blender":
-            raise ValueError("Only Blender layers can be duplicated this way")
-        destination_parent_id = parent_id or source.parent_id
-        if destination_parent_id is None:
-            raise ValueError("Blender layers require a parent")
-        if index is None and destination_parent_id == source.parent_id:
-            siblings = self.layers[destination_parent_id].children
-            source_index = next(
-                position for position, reference in enumerate(siblings)
-                if reference.kind == "layer" and reference.entity_id == layer_id
-            )
-            index = source_index + 1
-        duplicate = self.add_blender_layer(
-            destination_parent_id,
-            name=name or f"{source.name} Copy",
-            bound=BoundGeometry.from_dict(source.bound.to_dict()),
-            index=index,
-        )
-        duplicate.visible = source.visible
-        duplicate.opacity = source.opacity
-        duplicate.translate_x = source.translate_x
-        duplicate.translate_y = source.translate_y
-        duplicate.shape_style = ShapeStyle.from_dict(
-            source.shape_style.to_dict()
-        )
-        duplicate.ignore_parent_mask = source.ignore_parent_mask
-        return duplicate
-
-    def delete_blender_layer(self, layer_id: str) -> str:
-        """Delete a 3D layer and return the sidecar frame ID to tombstone."""
-        layer = self.layers[layer_id]
-        if layer.layer_kind != "blender" or not layer.comic_frame_id:
-            raise ValueError("Only Blender layers own comic frames")
-        frame_id = layer.comic_frame_id
-        self.delete_entity("layer", layer_id)
-        return frame_id
-
     def add_fill_layer(
         self, parent_id: str, name: str = "Fill", color: str = "#111111",
     ) -> LayerNode:
         parent = self.layers[parent_id]
-        if parent.layer_kind in {"fill", "blender"}:
+        if parent.layer_kind == "fill":
             raise ValueError("Leaf layers cannot contain entities")
         layer = LayerNode(
             name=name, parent_id=parent_id, layer_kind="fill",
@@ -2293,7 +2168,7 @@ class ChapterDocument:
         if isinstance(obj, SpeedLineCenterObject):
             return self.add_speed_center(parent_id, obj)
         parent = self.layers[parent_id]
-        if parent.layer_kind in {"fill", "blender"}:
+        if parent.layer_kind == "fill":
             raise ValueError("Objects require a container layer")
         if isinstance(obj, GradientObject):
             family = (
@@ -2488,7 +2363,7 @@ class ChapterDocument:
         if new_parent_id is None:
             raise ValueError("Only page layers can be roots")
         new_parent = self.layers[new_parent_id]
-        if new_parent.layer_kind in {"fill", "blender"}:
+        if new_parent.layer_kind == "fill":
             raise ValueError("Leaf layers cannot contain entities")
         if kind == "layer":
             cursor: str | None = new_parent_id
