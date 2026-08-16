@@ -1,0 +1,342 @@
+{
+  "schema_version": 15,
+  "id": "26f5d698727842d39eea3275ae1df22d",
+  "name": "Chapter 1",
+  "size": [
+    1080,
+    3240
+  ],
+  "document_kind": "chapter",
+  "background": "#ffffff",
+  "grid": {
+    "enabled": true,
+    "size": 120,
+    "divisions": 4,
+    "origin": [
+      0.0,
+      0.0
+    ],
+    "color": "#5d7d9c",
+    "opacity": 0.25
+  },
+  "root_page_ids": [
+    "4b64d13de1e44211a2ac9d878622f324"
+  ],
+  "layers": [
+    {
+      "id": "4b64d13de1e44211a2ac9d878622f324",
+      "name": "Page 1",
+      "is_page": true,
+      "layer_kind": "bounded",
+      "parent_id": null,
+      "children": [
+        {
+          "kind": "layer",
+          "id": "87c91e9d4cae4a5c85ddb51c38f0ed3a"
+        },
+        {
+          "kind": "layer",
+          "id": "adf5a1d5aa384360a65719a12198d461"
+        }
+      ],
+      "visible": true,
+      "opacity": 1.0,
+      "translation": [
+        0,
+        0
+      ],
+      "bound": {
+        "type": "path",
+        "closed": true,
+        "primitive": "rectangle",
+        "nodes": [
+          {
+            "id": "cfe3b8864e1641d7835b51d0c2c29e46",
+            "position": [
+              0.0,
+              0.0
+            ],
+            "point_type": "vector",
+            "incoming": null,
+            "outgoing": null,
+            "handles_locked": true,
+            "roundness": 0.0,
+            "roundness_enabled": false,
+            "width_multiplier": 1.0
+          },
+          {
+            "id": "6b4ea60e5a074f678c5ee24c7ecbf182",
+            "position": [
+              1080.0,
+              0.0
+            ],
+            "point_type": "vector",
+            "incoming": null,
+            "outgoing": null,
+            "handles_locked": true,
+            "roundness": 0.0,
+            "roundness_enabled": false,
+            "width_multiplier": 1.0
+          },
+          {
+            "id": "888f1c80d5ed46429a66fd705cd14853",
+            "position": [
+              1080.0,
+              1080.0
+            ],
+            "point_type": "vector",
+            "incoming": null,
+            "outgoing": null,
+            "handles_locked": true,
+            "roundness": 0.0,
+            "roundness_enabled": false,
+            "width_multiplier": 1.0
+          },
+          {
+            "id": "446625f4df7c47a3a9504f660992e25f",
+            "position": [
+              0.0,
+              1080.0
+            ],
+            "point_type": "vector",
+            "incoming": null,
+            "outgoing": null,
+            "handles_locked": true,
+            "roundness": 0.0,
+            "roundness_enabled": false,
+            "width_multiplier": 1.0
+          }
+        ],
+        "additional_contours": []
+      },
+      "shape_style": {
+        "primary_color": null,
+        "base_thickness": 8,
+        "outline_color": "#111111",
+        "outline_thickness": 4,
+        "start_cap": "round",
+        "end_cap": "round"
+      },
+      "grid_override": null,
+      "last_raster_id": null,
+      "compound_enabled": false,
+      "compound_operation": "add",
+      "ignore_parent_mask": false
+    },
+    {
+      "id": "adf5a1d5aa384360a65719a12198d461",
+      "name": "Drawing Layer",
+      "is_page": false,
+      "layer_kind": "bounded",
+      "parent_id": "4b64d13de1e44211a2ac9d878622f324",
+      "children": [
+        {
+          "kind": "object",
+          "id": "e19a254f3d424907b3e511971ae01440"
+        }
+      ],
+      "visible": true,
+      "opacity": 1.0,
+      "translation": [
+        0.0,
+        0.0
+      ],
+      "bound": {
+        "type": "path",
+        "closed": true,
+        "primitive": "rectangle",
+        "nodes": [
+          {
+            "id": "cfe3b8864e1641d7835b51d0c2c29e46",
+            "position": [
+              0.0,
+              0.0
+            ],
+            "point_type": "vector",
+            "incoming": null,
+            "outgoing": null,
+            "handles_locked": true,
+            "roundness": 0.0,
+            "roundness_enabled": false,
+            "width_multiplier": 1.0
+          },
+          {
+            "id": "6b4ea60e5a074f678c5ee24c7ecbf182",
+            "position": [
+              1080.0,
+              0.0
+            ],
+            "point_type": "vector",
+            "incoming": null,
+            "outgoing": null,
+            "handles_locked": true,
+            "roundness": 0.0,
+            "roundness_enabled": false,
+            "width_multiplier": 1.0
+          },
+          {
+            "id": "888f1c80d5ed46429a66fd705cd14853",
+            "position": [
+              1080.0,
+              1080.0
+            ],
+            "point_type": "vector",
+            "incoming": null,
+            "outgoing": null,
+            "handles_locked": true,
+            "roundness": 0.0,
+            "roundness_enabled": false,
+            "width_multiplier": 1.0
+          },
+          {
+            "id": "446625f4df7c47a3a9504f660992e25f",
+            "position": [
+              0.0,
+              1080.0
+            ],
+            "point_type": "vector",
+            "incoming": null,
+            "outgoing": null,
+            "handles_locked": true,
+            "roundness": 0.0,
+            "roundness_enabled": false,
+            "width_multiplier": 1.0
+          }
+        ],
+        "additional_contours": []
+      },
+      "shape_style": {
+        "primary_color": null,
+        "base_thickness": 8,
+        "outline_color": "#111111",
+        "outline_thickness": 0,
+        "start_cap": "round",
+        "end_cap": "round"
+      },
+      "grid_override": null,
+      "last_raster_id": "e19a254f3d424907b3e511971ae01440",
+      "compound_enabled": false,
+      "compound_operation": "add",
+      "ignore_parent_mask": false
+    },
+    {
+      "id": "87c91e9d4cae4a5c85ddb51c38f0ed3a",
+      "name": "Layer 1",
+      "is_page": false,
+      "layer_kind": "bounded",
+      "parent_id": "4b64d13de1e44211a2ac9d878622f324",
+      "children": [],
+      "visible": true,
+      "opacity": 1.0,
+      "translation": [
+        0.0,
+        0.0
+      ],
+      "bound": {
+        "type": "path",
+        "closed": true,
+        "primitive": "rectangle",
+        "nodes": [
+          {
+            "id": "42e73a40995a45ecb466c5792a75425d",
+            "position": [
+              90.0,
+              120.0
+            ],
+            "point_type": "vector",
+            "incoming": null,
+            "outgoing": null,
+            "handles_locked": true,
+            "roundness": 0.0,
+            "roundness_enabled": false,
+            "width_multiplier": 1.0
+          },
+          {
+            "id": "50401a709ffd458a82d28ab08670adcc",
+            "position": [
+              900.0,
+              120.0
+            ],
+            "point_type": "vector",
+            "incoming": null,
+            "outgoing": null,
+            "handles_locked": true,
+            "roundness": 0.0,
+            "roundness_enabled": false,
+            "width_multiplier": 1.0
+          },
+          {
+            "id": "662d5e912eb54205b6841f444f979022",
+            "position": [
+              900.0,
+              330.0
+            ],
+            "point_type": "vector",
+            "incoming": null,
+            "outgoing": null,
+            "handles_locked": true,
+            "roundness": 0.0,
+            "roundness_enabled": false,
+            "width_multiplier": 1.0
+          },
+          {
+            "id": "d80eb7587f58469e851f28712d14e7bc",
+            "position": [
+              90.0,
+              330.0
+            ],
+            "point_type": "vector",
+            "incoming": null,
+            "outgoing": null,
+            "handles_locked": true,
+            "roundness": 0.0,
+            "roundness_enabled": false,
+            "width_multiplier": 1.0
+          }
+        ],
+        "additional_contours": []
+      },
+      "shape_style": {
+        "primary_color": "#FFFFFFFF",
+        "base_thickness": 8,
+        "outline_color": "#FF000000",
+        "outline_thickness": 4,
+        "start_cap": "round",
+        "end_cap": "round"
+      },
+      "grid_override": null,
+      "last_raster_id": null,
+      "compound_enabled": false,
+      "compound_operation": "add",
+      "ignore_parent_mask": false
+    }
+  ],
+  "objects": [
+    {
+      "id": "e19a254f3d424907b3e511971ae01440",
+      "type": "raster",
+      "name": "Raster 1",
+      "custom_name": false,
+      "parent_layer_id": "adf5a1d5aa384360a65719a12198d461",
+      "position": [
+        0.0,
+        0.0
+      ],
+      "visible": true,
+      "opacity": 1.0,
+      "opacity_locked": true,
+      "geometry_reference": "direct",
+      "ignore_parent_mask": false,
+      "underlay_opacity": 0.0,
+      "tile_size": 256,
+      "interaction_rect": [
+        0.0,
+        0.0,
+        120.0,
+        120.0
+      ],
+      "transform_frame": null,
+      "transform_quad": null
+    }
+  ]
+}

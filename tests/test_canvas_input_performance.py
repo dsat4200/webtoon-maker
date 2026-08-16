@@ -6,6 +6,8 @@ import pytest
 from PySide6.QtCore import QPointF, QRectF, Qt
 from PySide6.QtGui import QColor, QImage, QPainter
 
+import comic_editor.ui.canvas as canvas_module
+
 from comic_editor.core.models import (
     BoundGeometry, ChapterDocument, RasterObject, VectorDrawingObject,
     VectorStroke, VectorStrokePoint,
@@ -142,6 +144,18 @@ def test_cached_bounds_prune_erased_tile_and_visible_lookup_is_direct():
     assert store.tile("ink", (2, 0)) is not None
 
 
+def test_sparse_tile_lookup_filters_existing_tiles_for_extreme_bounds():
+    store = TileStore()
+    store.paint_dab("ink", QPointF(20, 20), 20, QColor("#111111"))
+    store.paint_dab("ink", QPointF(600, 20), 20, QColor("#111111"))
+
+    visible = list(store.iter_tiles(
+        "ink", QRectF(-1.0e12, -1.0e12, 2.0e12, 2.0e12)
+    ))
+
+    assert {key for key, _image in visible} == {(0, 0), (2, 0)}
+
+
 def test_raster_stroke_coalesces_visual_updates_and_commits_once(qapp):
     canvas, chapter, layer = _document_canvas()
     raster = chapter.add_object(
@@ -240,6 +254,33 @@ def test_vector_preview_error_restores_gc_and_transient_state(
     finally:
         if not was_enabled:
             gc.disable()
+
+
+def test_vector_eraser_error_clears_live_background(qapp, monkeypatch):
+    settings = EditorSettings(
+        snap_to_grid=False, vector_eraser_mode="stroke",
+    )
+    canvas, chapter, layer = _document_canvas(settings)
+    drawing = chapter.add_object(
+        layer.layer_id,
+        VectorDrawingObject(strokes=[VectorStroke(points=[
+            VectorStrokePoint(x=50, y=100, width=10),
+            VectorStrokePoint(x=350, y=100, width=10),
+        ])]),
+    )
+    canvas.set_selection("object", drawing.object_id)
+    canvas.set_tool(ToolKind.RASTER_ERASER)
+    monkeypatch.setattr(
+        canvas, "_vector_stroke_touched",
+        lambda *_args: (_ for _ in ()).throw(RuntimeError("eraser failure")),
+    )
+
+    with pytest.raises(RuntimeError, match="eraser failure"):
+        canvas._begin_vector_gesture(drawing, QPointF(200, 100), 1.0)
+
+    assert canvas._vector_gesture_mode is None
+    assert canvas._vector_eraser_background_cache.isNull()
+    assert canvas._vector_eraser_preview_versions == {}
 
 
 def test_freehand_pressure_knots_preserve_peak_without_centerline_change():
@@ -370,6 +411,166 @@ def test_vector_eraser_previews_without_mutating_and_commits_once(
     assert restored.to_dict() == before
 
 
+@pytest.mark.parametrize("mode", ["stroke", "point", "intersection"])
+def test_vector_eraser_first_press_paints_complete_live_result(
+    qapp, mode,
+):
+    settings = EditorSettings(
+        snap_to_grid=False, vector_eraser_mode=mode,
+    )
+    canvas, chapter, layer = _document_canvas(settings)
+    target = VectorStroke(color="#FF111111", points=[
+        VectorStrokePoint(x=50, y=150, width=18),
+        VectorStrokePoint(x=350, y=150, width=18),
+    ])
+    drawing = chapter.add_object(
+        layer.layer_id, VectorDrawingObject(strokes=[target])
+    )
+    canvas.set_selection("object", drawing.object_id)
+    canvas.set_tool(ToolKind.RASTER_ERASER)
+    before_model = drawing.to_dict()
+
+    before = QImage(800, 600, QImage.Format_ARGB32_Premultiplied)
+    before.fill(Qt.transparent)
+    canvas.render(before)
+    # Sample inside the ink but off its degenerate centerline selection cage.
+    probe = canvas.document_to_widget(QPointF(200, 154)).toPoint()
+    assert before.pixelColor(probe).red() < 100
+
+    canvas._begin_vector_gesture(drawing, QPointF(200, 150), 1.0)
+    assert drawing.to_dict() == before_model
+    assert target.stroke_id in canvas._vector_eraser_preview
+    assert not canvas._vector_eraser_background_cache.isNull()
+
+    live = QImage(800, 600, QImage.Format_ARGB32_Premultiplied)
+    live.fill(Qt.transparent)
+    canvas.render(live)
+    before_color = before.pixelColor(probe)
+    live_color = live.pixelColor(probe)
+    assert live_color.red() > 220, (
+        before_color.getRgb(), live_color.getRgb()
+    )
+
+    canvas._cancel_vector_gesture(restore=True)
+    assert canvas._vector_eraser_background_cache.isNull()
+    assert canvas._vector_eraser_preview_versions == {}
+
+
+def test_transformed_vector_eraser_requests_mapped_live_dirty_region(
+    qapp, monkeypatch,
+):
+    settings = EditorSettings(
+        snap_to_grid=False, vector_eraser_mode="stroke",
+    )
+    canvas, chapter, layer = _document_canvas(settings)
+    stroke = VectorStroke(points=[
+        VectorStrokePoint(x=0, y=50, width=12),
+        VectorStrokePoint(x=100, y=50, width=12),
+    ])
+    drawing = chapter.add_object(
+        layer.layer_id,
+        VectorDrawingObject(
+            strokes=[stroke],
+            transform_frame=(0, 0, 100, 100),
+            transform_quad=[
+                (300, 200), (500, 180), (530, 390), (280, 410),
+            ],
+        ),
+    )
+    canvas.set_selection("object", drawing.object_id)
+    canvas.set_tool(ToolKind.RASTER_ERASER)
+    local_probe = QPointF(50, 50)
+    world_probe = canvas._drawing_object_transform(drawing).map(local_probe)
+    updates = []
+    monkeypatch.setattr(canvas, "update", lambda *args: updates.append(args))
+
+    canvas._begin_vector_gesture(drawing, world_probe, 1.0)
+
+    widget_probe = canvas.document_to_widget(world_probe).toPoint()
+    assert any(
+        args and args[0].contains(widget_probe)
+        for args in updates
+    )
+
+
+def test_vector_eraser_reuses_unchanged_replacement_images(qapp):
+    settings = EditorSettings(
+        snap_to_grid=False, vector_eraser_mode="point",
+    )
+    canvas, chapter, layer = _document_canvas(settings)
+    first = VectorStroke(points=[
+        VectorStrokePoint(x=50, y=100, width=10),
+        VectorStrokePoint(x=350, y=100, width=10),
+    ])
+    second = VectorStroke(points=[
+        VectorStrokePoint(x=50, y=300, width=10),
+        VectorStrokePoint(x=350, y=300, width=10),
+    ])
+    drawing = chapter.add_object(
+        layer.layer_id, VectorDrawingObject(strokes=[first, second])
+    )
+    canvas.set_selection("object", drawing.object_id)
+    canvas.set_tool(ToolKind.RASTER_ERASER)
+    image = QImage(800, 600, QImage.Format_ARGB32_Premultiplied)
+
+    canvas._begin_vector_gesture(drawing, QPointF(200, 100), 1.0)
+    canvas._continue_vector_gesture(QPointF(200, 200), 1.0)
+    painter = QPainter(image)
+    canvas._render_vector_drawing(
+        painter, drawing, QRectF(0, 0, 800, 600)
+    )
+    painter.end()
+    first_version = canvas._vector_eraser_preview_versions[first.stroke_id]
+    first_keys = {
+        key for key in canvas._vector_render_cache
+        if len(key) >= 3
+        and key[1] == first.stroke_id
+        and isinstance(key[2], tuple)
+        and key[2][0] == "eraser-preview"
+    }
+    assert first_keys
+
+    canvas._continue_vector_gesture(QPointF(200, 300), 1.0)
+    painter = QPainter(image)
+    canvas._render_vector_drawing(
+        painter, drawing, QRectF(0, 0, 800, 600)
+    )
+    painter.end()
+    assert canvas._vector_eraser_preview_versions[first.stroke_id] == (
+        first_version
+    )
+    assert first_keys <= set(canvas._vector_render_cache)
+
+
+def test_vector_eraser_background_cache_is_device_pixel_aware(qapp):
+    class TestCanvas(CanvasWidget):
+        def devicePixelRatioF(self):  # noqa: N802
+            return 2.0
+
+    source, chapter, layer = _document_canvas()
+    drawing = chapter.add_object(
+        layer.layer_id,
+        VectorDrawingObject(strokes=[VectorStroke(points=[
+            VectorStrokePoint(x=50, y=100, width=10),
+            VectorStrokePoint(x=350, y=100, width=10),
+        ])]),
+    )
+    canvas = TestCanvas(EditorSettings(
+        snap_to_grid=False, vector_eraser_mode="stroke",
+    ))
+    canvas.resize(source.size())
+    canvas.set_document(chapter, TileStore())
+    canvas.center_x, canvas.center_y, canvas.scale = 400, 300, 1.0
+    canvas.set_selection("object", drawing.object_id)
+    canvas.set_tool(ToolKind.RASTER_ERASER)
+
+    canvas._begin_vector_gesture(drawing, QPointF(200, 100), 1.0)
+
+    assert canvas._vector_eraser_background_cache.width() == 1600
+    assert canvas._vector_eraser_background_cache.height() == 1200
+    assert canvas._vector_eraser_background_cache.devicePixelRatio() == 2.0
+
+
 @pytest.mark.parametrize("canvas_type", [RasterCanvasWidget, GpuCanvasWidget])
 @pytest.mark.parametrize("ratio", [1.0, 2.0])
 def test_scene_cache_is_device_pixel_aware_and_updates_partial_region(
@@ -404,6 +605,137 @@ def test_scene_cache_is_device_pixel_aware_and_updates_partial_region(
     assert canvas._scene_dirty_widget.isEmpty()
 
 
+def test_vector_cache_is_byte_budgeted_and_keeps_dense_warm_frames(
+    qapp,
+):
+    canvas, chapter, layer = _document_canvas()
+    strokes = [
+        VectorStroke(points=[
+            VectorStrokePoint(x=20, y=20 + index, width=2),
+            VectorStrokePoint(x=40, y=20 + index, width=2),
+        ])
+        for index in range(500)
+    ]
+    drawing = chapter.add_object(
+        layer.layer_id, VectorDrawingObject(strokes=strokes)
+    )
+    canvas.set_selection("object", drawing.object_id)
+    image = QImage(800, 600, QImage.Format_ARGB32_Premultiplied)
+
+    painter = QPainter(image)
+    canvas._render_vector_drawing(
+        painter, drawing, QRectF(0, 0, 800, 600)
+    )
+    painter.end()
+    warm_keys = set(canvas._vector_render_cache)
+    assert len(warm_keys) > 384
+    assert canvas._vector_render_cache_bytes <= (
+        canvas_module.VECTOR_RENDER_CACHE_BUDGET
+    )
+
+    canvas._begin_navigation("zoom", QPointF(300, 240))
+    start_scale = canvas._vector_render_scale_override
+    canvas._update_navigation(QPointF(390, 240))
+    assert canvas._vector_render_scale_override == start_scale
+    painter = QPainter(image)
+    canvas._render_vector_drawing(
+        painter, drawing, QRectF(0, 0, 800, 600)
+    )
+    painter.end()
+    assert set(canvas._vector_render_cache) == warm_keys
+
+    canvas._end_navigation()
+    assert canvas._vector_render_scale_override is None
+    painter = QPainter(image)
+    canvas._render_vector_drawing(
+        painter, drawing, QRectF(0, 0, 800, 600)
+    )
+    painter.end()
+    assert len(canvas._vector_render_cache) > 384
+    assert canvas._vector_render_cache_bytes <= (
+        canvas_module.VECTOR_RENDER_CACHE_BUDGET
+    )
+
+
+def test_vector_cache_byte_accounting_oversize_invalidation_and_session(
+    qapp, monkeypatch,
+):
+    canvas, chapter, layer = _document_canvas()
+    monkeypatch.setattr(canvas_module, "VECTOR_RENDER_CACHE_BUDGET", 64)
+    small = QImage(3, 3, QImage.Format_ARGB32_Premultiplied)
+    small.fill(Qt.transparent)
+    oversized = QImage(5, 5, QImage.Format_ARGB32_Premultiplied)
+    oversized.fill(Qt.transparent)
+    canvas._store_vector_render_cache(("drawing", "first"), (
+        small, QRectF(0, 0, 3, 3),
+    ))
+    canvas._store_vector_render_cache(("drawing", "oversized"), (
+        oversized, QRectF(0, 0, 5, 5),
+    ))
+    assert ("drawing", "oversized") not in canvas._vector_render_cache
+    assert canvas._vector_render_cache_bytes == small.sizeInBytes()
+
+    canvas._store_vector_render_cache(("drawing", "second"), (
+        small, QRectF(0, 0, 3, 3),
+    ))
+    assert ("drawing", "first") not in canvas._vector_render_cache
+    assert canvas._vector_render_cache_bytes <= 64
+    canvas._invalidate_vector_cache_strokes({"second"})
+    assert canvas._vector_render_cache == {}
+    assert canvas._vector_render_cache_bytes == 0
+
+    monkeypatch.setattr(
+        canvas_module, "VECTOR_RENDER_CACHE_BUDGET", 64 * 1024 * 1024
+    )
+    stroke = VectorStroke(points=[VectorStrokePoint(x=20, y=20, width=2)])
+    drawing = chapter.add_object(
+        layer.layer_id, VectorDrawingObject(strokes=[stroke])
+    )
+    canvas._vector_stroke_image(drawing, stroke)
+    state = canvas.capture_session_state()
+    assert state is not None
+    expected_cache = state.vector_cache
+    expected_bytes = state.vector_cache_bytes
+    canvas.restore_session_state(state)
+    assert canvas._vector_render_cache is expected_cache
+    assert canvas._vector_render_cache_bytes == expected_bytes
+
+    cache_identity = canvas._vector_render_cache
+    canvas._render_entity_crop(
+        chapter, canvas.tiles, "object", drawing.object_id, maximum=64
+    )
+    assert canvas._vector_render_cache is cache_identity
+    assert canvas._vector_render_cache_bytes == expected_bytes
+
+
+def test_vector_spatial_index_preserves_order_and_rebuilds_on_revision(qapp):
+    canvas, chapter, layer = _document_canvas()
+    near_first = VectorStroke(points=[
+        VectorStrokePoint(x=20, y=20, width=4),
+        VectorStrokePoint(x=80, y=20, width=4),
+    ])
+    far = VectorStroke(points=[
+        VectorStrokePoint(x=900, y=20, width=4),
+        VectorStrokePoint(x=980, y=20, width=4),
+    ])
+    near_last = VectorStroke(points=[
+        VectorStrokePoint(x=30, y=70, width=4),
+        VectorStrokePoint(x=90, y=70, width=4),
+    ])
+    drawing = chapter.add_object(
+        layer.layer_id,
+        VectorDrawingObject(strokes=[near_first, far, near_last]),
+    )
+    visible = QRectF(0, 0, 200, 200)
+    assert canvas._vector_stroke_indexes(drawing, visible) == [0, 2]
+
+    for point in far.points:
+        point.x -= 880
+    far.touch_render_revision()
+    drawing.touch_revision()
+    assert canvas._vector_stroke_indexes(drawing, visible) == [0, 1, 2]
+
+
 @pytest.mark.parametrize("ratio", [1.0, 2.0])
 @pytest.mark.parametrize("rotation", [0.0, 37.0])
 def test_ctrl_wheel_zoom_is_centered_and_pointer_independent(
@@ -436,6 +768,11 @@ def test_ctrl_wheel_zoom_is_centered_and_pointer_independent(
         previous_key = canvas._scene_cache_key
         event = _WheelEvent(position, 120)
         canvas.wheelEvent(event)
+        start_render_scale = canvas._vector_render_scale_override
+        canvas.wheelEvent(_WheelEvent(position, 120))
+        assert canvas._vector_render_scale_override == start_render_scale
+        canvas._settle_wheel_zoom()
+        assert canvas._vector_render_scale_override is None
         canvas._ensure_scene_cache()
         states.append((canvas.center_x, canvas.center_y, canvas.scale))
         assert event.accepted
@@ -463,26 +800,92 @@ def test_centered_wheel_zoom_clamps_and_zero_delta_does_not_move_camera(qapp):
     assert (canvas.center_x, canvas.center_y) == center_before
 
 
-def test_drag_zoom_is_centered_and_start_position_independent(qapp):
-    canvases = [_document_canvas()[0], _document_canvas()[0]]
-    starts = [QPointF(40, 80), QPointF(620, 410)]
-    states = []
-    for canvas, start in zip(canvases, starts):
-        canvas.center_x = 431.125
-        canvas.center_y = 517.875
-        canvas.scale = 0.75
-        canvas.rotation = 31.0
-        viewport_center = QPointF(canvas.width() / 2, canvas.height() / 2)
-        centered_document = canvas.widget_to_document(viewport_center)
-        canvas._begin_navigation("zoom", start)
-        canvas._update_navigation(start + QPointF(80, 25))
-        assert canvas.widget_to_document(viewport_center) == centered_document
-        before_release = (canvas.center_x, canvas.center_y, canvas.scale)
-        canvas._end_navigation()
-        assert (canvas.center_x, canvas.center_y, canvas.scale) == before_release
-        assert canvas.widget_to_document(viewport_center) == centered_document
-        states.append(before_release)
-    assert states[0] == states[1]
+@pytest.mark.parametrize("rotation", [0.0, 31.0])
+@pytest.mark.parametrize("start", [QPointF(40, 80), QPointF(620, 410)])
+@pytest.mark.parametrize("drag_x", [-80.0, 80.0])
+def test_drag_zoom_preserves_initial_screen_anchor(
+    qapp, rotation, start, drag_x,
+):
+    canvas, _chapter, _layer = _document_canvas()
+    canvas.center_x = 431.125
+    canvas.center_y = 517.875
+    canvas.scale = 0.75
+    canvas.rotation = rotation
+    anchor_document = canvas.widget_to_document(start)
+    original_scale = canvas.scale
+
+    canvas._begin_navigation("zoom", start)
+    start_render_scale = canvas._vector_render_scale_override
+    canvas._update_navigation(start + QPointF(drag_x, 25))
+    assert canvas._vector_render_scale_override == start_render_scale
+
+    anchored_widget = canvas.document_to_widget(anchor_document)
+    assert anchored_widget.x() == pytest.approx(start.x())
+    assert anchored_widget.y() == pytest.approx(start.y())
+    if drag_x > 0:
+        assert canvas.scale > original_scale
+    else:
+        assert canvas.scale < original_scale
+    before_release = (
+        canvas.center_x, canvas.center_y, canvas.scale, canvas.rotation
+    )
+    canvas._end_navigation()
+    assert canvas._vector_render_scale_override is None
+    assert (
+        canvas.center_x, canvas.center_y, canvas.scale, canvas.rotation
+    ) == before_release
+
+
+def test_modifier_navigation_coalesces_to_latest_pointer_packet(qapp):
+    canvas, _chapter, _layer = _document_canvas()
+    reference, _chapter, _layer = _document_canvas()
+    start = QPointF(120, 90)
+    latest = QPointF(650, 430)
+    changes = []
+    canvas.cameraChanged.connect(lambda: changes.append(canvas.rotation))
+
+    canvas._begin_navigation("rotate", start)
+    reference._begin_navigation("rotate", start)
+    for point in (
+        QPointF(180, 120), QPointF(300, 200), latest,
+    ):
+        canvas._queue_navigation_update(point)
+    assert canvas.rotation == 0.0
+
+    reference._update_navigation(latest)
+    qapp.processEvents()
+
+    assert canvas.rotation == pytest.approx(reference.rotation)
+    assert canvas.center_x == pytest.approx(reference.center_x)
+    assert canvas.center_y == pytest.approx(reference.center_y)
+    assert len(changes) == 1
+
+    final = QPointF(700, 450)
+    canvas._queue_navigation_update(QPointF(680, 440))
+    canvas._end_navigation(final)
+    reference._update_navigation(final)
+    assert canvas.rotation == pytest.approx(reference.rotation)
+    assert canvas.center_x == pytest.approx(reference.center_x)
+    assert canvas.center_y == pytest.approx(reference.center_y)
+    assert len(changes) == 2
+    assert canvas._nav_mode is None
+    assert canvas._nav_pending_point is None
+
+
+def test_touch_pinch_reuses_starting_vector_scale_until_completion(qapp):
+    canvas, _chapter, _layer = _document_canvas()
+    start = [QPointF(250, 300), QPointF(550, 300)]
+    canvas._rebase_touch_navigation(start)
+    render_scale = canvas._vector_render_scale_override
+
+    canvas._apply_touch_navigation([
+        QPointF(150, 300), QPointF(650, 300),
+    ])
+
+    assert canvas.scale > 1.0
+    assert canvas._vector_render_scale_override == render_scale
+    canvas._cancel_touch_navigation()
+    assert canvas._vector_render_scale_override is None
 
 
 def test_non_zoom_wheel_scrolling_retains_camera_snapping(qapp):

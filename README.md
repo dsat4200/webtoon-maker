@@ -60,7 +60,7 @@ Navigation defaults:
 
 - `Alt` + drag: pan
 - `Shift` + drag: rotate
-- `Alt+Shift` + drag: zoom
+- `Alt+Shift` + drag: zoom toward the initial click (right in, left out)
 - Mouse wheel: vertical scroll
 - `Ctrl` + mouse wheel: zoom
 - `P`, `E`, `F`, `S`, `T`, `B`: Pencil, Eraser, Fill, Object Select,
@@ -160,8 +160,10 @@ and vector strokes on a Vector Drawing. Vector pencil input is fitted to
 editable cubic anchors while retaining absolute point width and opacity.
 Shape Edit becomes Vector Edit for the selected drawing, showing only anchor
 circles for the selected stroke; Ctrl-click extends the stroke selection.
-Vector Pencil and Eraser update on the canvas during the gesture instead of
-waiting for release. Stylus hover shows a pressure-tool circle and center
+Vector Pencil and Eraser update on the canvas from the initial press instead
+of waiting for release. The vector stroke cache and visibility index keep
+warmed pan/rotation responsive; live zoom reuses its starting vector detail
+and performs one crisp redraw when the gesture ends. Stylus hover shows a pressure-tool circle and center
 crosshair at the active S/M/L size, and stylus taps work in popup menus.
 
 The vector Eraser supports Stroke (whole touched line), Point (only the swept

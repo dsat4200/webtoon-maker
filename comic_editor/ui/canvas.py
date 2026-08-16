@@ -98,6 +98,9 @@ class ToolKind(Enum):
 RASTER_FRAME_MARGIN = 24.0
 SHAPE_CONTROL_SCALE = 1.5
 ASSET_MIME = "application/x-webtoon-asset"
+VECTOR_RENDER_CACHE_BUDGET = 64 * 1024 * 1024
+VECTOR_RENDER_INDEX_CELL = 256.0
+WHEEL_ZOOM_SETTLE_MS = 120
 
 
 class _TextSizeSpinBox(QSpinBox):
@@ -243,6 +246,8 @@ class CanvasSessionState:
     rotation: float
     compound_cache: dict
     vector_cache: dict
+    vector_cache_bytes: int
+    vector_spatial_indexes: dict
     gradient_geometry_cache: dict
     gradient_scalar_cache: dict
     gradient_render_cache: dict
@@ -319,6 +324,17 @@ class _CanvasLogic:
         self._nav_anchor_center = QPointF()
         self._nav_anchor_scale = 1.0
         self._nav_anchor_rotation = 0.0
+        self._nav_anchor_document = QPointF()
+        self._nav_pending_point: QPointF | None = None
+        self._nav_frame_timer = QTimer(self)
+        self._nav_frame_timer.setSingleShot(True)
+        self._nav_frame_timer.timeout.connect(
+            self._flush_navigation_update
+        )
+        self._wheel_zoom_timer = QTimer(self)
+        self._wheel_zoom_timer.setSingleShot(True)
+        self._wheel_zoom_timer.setInterval(WHEEL_ZOOM_SETTLE_MS)
+        self._wheel_zoom_timer.timeout.connect(self._settle_wheel_zoom)
         self._drawing = False
         self._last_draw_point = QPointF()
         self._last_pressure = 1.0
@@ -351,6 +367,8 @@ class _CanvasLogic:
         self._transform_pivot: QPointF | None = None
         self._transform_pivot_custom = False
         self._transform_rotate_start = 0.0
+        self._transform_gizmo_key: tuple | None = None
+        self._transform_gizmo_slot: int | None = None
         self._render_excluded_object_id = ""
         self._rendering_compound_references = False
         self._rendering_outward_gradient = False
@@ -470,6 +488,10 @@ class _CanvasLogic:
         self._vector_render_cache: dict[
             tuple, tuple[QImage, QRectF]
         ] = {}
+        self._vector_render_cache_bytes = 0
+        self._vector_spatial_indexes: dict[str, dict] = {}
+        self._vector_render_scale_override: float | None = None
+        self._vector_render_scale_owner: str | None = None
         self._gradient_geometry_cache: dict[tuple, object] = {}
         self._gradient_scalar_cache: dict[tuple, tuple[np.ndarray, np.ndarray, QRectF]] = {}
         self._gradient_render_cache: dict[
@@ -491,6 +513,8 @@ class _CanvasLogic:
         self._vector_eraser_grid_revision: tuple[str, int] | None = None
         self._vector_eraser_preview: dict[str, list[VectorStroke]] = {}
         self._vector_eraser_preview_revision = 0
+        self._vector_eraser_preview_versions: dict[str, int] = {}
+        self._vector_eraser_background_cache = QImage()
         self._vector_simplify_point_ids: set[str] = set()
         self._vector_simplify_anchor_grid: dict[
             tuple[int, int], list[tuple[str, str, tuple[float, float]]]
@@ -817,6 +841,13 @@ class _CanvasLogic:
         self._tablet_tool_active = False
         self._pen_contact_active = False
         self._nav_mode = None
+        self._nav_frame_timer.stop()
+        self._nav_pending_point = None
+        self._wheel_zoom_timer.stop()
+        self._vector_render_scale_override = None
+        self._vector_render_scale_owner = None
+        self._transform_gizmo_key = None
+        self._transform_gizmo_slot = None
         self._pointer_hover_widget = None
         self._tablet_hover_widget = None
         self._touch_frame_timer.stop()
@@ -832,6 +863,8 @@ class _CanvasLogic:
         self._vector_eraser_grid.clear()
         self._vector_eraser_bounds.clear()
         self._vector_eraser_preview.clear()
+        self._vector_eraser_preview_versions.clear()
+        self._vector_eraser_background_cache = QImage()
         self._restore_gc_after_stroke()
         self._page_creation_anchor_id = ""
         self._page_creation_before = None
@@ -869,7 +902,8 @@ class _CanvasLogic:
         self.selected_object_id = ""
         self._selected_vector_stroke_ids.clear()
         self._selected_vector_point_ids.clear()
-        self._vector_render_cache.clear()
+        self._clear_vector_render_cache()
+        self._vector_spatial_indexes.clear()
         self._pending_raster_transform_press = None
         self._gradient_render_cache.clear()
         self._gradient_preview_active = False
@@ -916,6 +950,8 @@ class _CanvasLogic:
             scale=self.scale, rotation=self.rotation,
             compound_cache=self._compound_path_cache,
             vector_cache=self._vector_render_cache,
+            vector_cache_bytes=self._vector_render_cache_bytes,
+            vector_spatial_indexes=self._vector_spatial_indexes,
             gradient_geometry_cache=self._gradient_geometry_cache,
             gradient_scalar_cache=self._gradient_scalar_cache,
             gradient_render_cache=self._gradient_render_cache,
@@ -938,6 +974,8 @@ class _CanvasLogic:
         self.scale, self.rotation = state.scale, state.rotation
         self._compound_path_cache = state.compound_cache
         self._vector_render_cache = state.vector_cache
+        self._vector_render_cache_bytes = state.vector_cache_bytes
+        self._vector_spatial_indexes = state.vector_spatial_indexes
         self._gradient_geometry_cache = state.gradient_geometry_cache
         self._gradient_scalar_cache = state.gradient_scalar_cache
         self._gradient_render_cache = state.gradient_render_cache
@@ -965,7 +1003,8 @@ class _CanvasLogic:
         self.active_page_id = self.active_layer_id = ""
         self.selected_object_id = ""
         self._compound_path_cache.clear()
-        self._vector_render_cache.clear()
+        self._clear_vector_render_cache()
+        self._vector_spatial_indexes.clear()
         self._gradient_geometry_cache.clear()
         self._gradient_scalar_cache.clear()
         self._gradient_render_cache.clear()
@@ -1030,6 +1069,57 @@ class _CanvasLogic:
             return owner if isinstance(owner, VectorDrawingObject) else None
         return None
 
+    def _drawing_object_transform(
+        self,
+        obj: RasterObject | VectorDrawingObject,
+        destination: list[tuple[float, float]] | None = None,
+    ) -> QTransform:
+        target = obj.transform_quad if destination is None else destination
+        if target is None:
+            return QTransform()
+        return self._quad_transform(
+            QRectF(*self._object_transform_frame(obj)), list(target)
+        )
+
+    def _drawing_local_visible_rect(
+        self,
+        obj: RasterObject | VectorDrawingObject,
+        parent_visible: QRectF,
+        destination: list[tuple[float, float]] | None = None,
+    ) -> QRectF | None:
+        target = obj.transform_quad if destination is None else destination
+        visible = QRectF(parent_visible)
+        if target is not None:
+            inverse, valid = self._drawing_object_transform(
+                obj, target
+            ).inverted()
+            if not valid:
+                return None
+            visible = inverse.mapRect(visible)
+        return visible.translated(-obj.x, -obj.y)
+
+    def _drawing_local_rect_to_world(
+        self,
+        obj: RasterObject | VectorDrawingObject,
+        local_rect: QRectF,
+    ) -> QRectF:
+        if local_rect.isEmpty():
+            return QRectF()
+        parent_polygon = QPolygonF([
+            local_rect.topLeft() + QPointF(obj.x, obj.y),
+            local_rect.topRight() + QPointF(obj.x, obj.y),
+            local_rect.bottomRight() + QPointF(obj.x, obj.y),
+            local_rect.bottomLeft() + QPointF(obj.x, obj.y),
+        ])
+        if obj.transform_quad is not None:
+            parent_polygon = self._drawing_object_transform(obj).map(
+                parent_polygon
+            )
+        layer_x, layer_y = self.chapter.layer_world_translation(
+            obj.parent_layer_id
+        )
+        return parent_polygon.translated(layer_x, layer_y).boundingRect()
+
     def _vector_local_point(
         self, drawing: VectorDrawingObject, world: QPointF,
     ) -> QPointF:
@@ -1038,14 +1128,8 @@ class _CanvasLogic:
         )
         parent_local = QPointF(world.x() - layer_x, world.y() - layer_y)
         if drawing.transform_quad is not None:
-            left, top, width, height = drawing.derived_bounds()
-            source = QRectF(*(
-                drawing.transform_frame
-                or (drawing.x + left, drawing.y + top,
-                    max(1.0, width), max(1.0, height))
-            ))
-            inverse, valid = self._quad_transform(
-                source, drawing.transform_quad
+            inverse, valid = self._drawing_object_transform(
+                drawing
             ).inverted()
             if valid:
                 parent_local = inverse.map(parent_local)
@@ -1062,14 +1146,7 @@ class _CanvasLogic:
         )
         parent_local = QPointF(world.x() - layer_x, world.y() - layer_y)
         if obj.transform_quad is not None:
-            source = QRectF(*(
-                obj.transform_frame
-                or QRectF(*obj.interaction_rect).translated(obj.x, obj.y)
-                .getRect()
-            ))
-            inverse, valid = self._quad_transform(
-                source, obj.transform_quad
-            ).inverted()
+            inverse, valid = self._drawing_object_transform(obj).inverted()
             if valid:
                 parent_local = inverse.map(parent_local)
         return QPointF(parent_local.x() - obj.x, parent_local.y() - obj.y)
@@ -1079,14 +1156,9 @@ class _CanvasLogic:
     ) -> QPointF:
         parent_local = QPointF(local.x() + obj.x, local.y() + obj.y)
         if obj.transform_quad is not None:
-            source = QRectF(*(
-                obj.transform_frame
-                or QRectF(*obj.interaction_rect).translated(obj.x, obj.y)
-                .getRect()
-            ))
-            parent_local = self._quad_transform(
-                source, obj.transform_quad
-            ).map(parent_local)
+            parent_local = self._drawing_object_transform(obj).map(
+                parent_local
+            )
         layer_x, layer_y = self.chapter.layer_world_translation(
             obj.parent_layer_id
         )
@@ -1117,12 +1189,13 @@ class _CanvasLogic:
         updates cheap for large drawings.
         """
         if changed_stroke_ids is None:
-            self._vector_render_cache.clear()
+            self._clear_vector_render_cache()
+            self._vector_spatial_indexes.clear()
         elif changed_stroke_ids:
-            self._vector_render_cache = {
-                key: value for key, value in self._vector_render_cache.items()
-                if len(key) < 2 or key[1] not in changed_stroke_ids
-            }
+            self._invalidate_vector_cache_strokes(changed_stroke_ids)
+            drawing = self._active_vector_drawing()
+            if drawing is not None:
+                self._vector_spatial_indexes.pop(drawing.object_id, None)
         drawing = self._active_vector_drawing()
         if drawing is not None:
             live_strokes = {stroke.stroke_id for stroke in drawing.strokes}
@@ -1263,6 +1336,7 @@ class _CanvasLogic:
         self._vector_eraser_bounds.clear()
         self._vector_eraser_grid_revision = None
         self._vector_eraser_preview.clear()
+        self._clear_vector_eraser_live_cache()
         self._vector_simplify_point_ids.clear()
         self._vector_simplify_anchor_grid.clear()
         self._vector_simplify_last_sample = None
@@ -1291,6 +1365,8 @@ class _CanvasLogic:
         ):
             self._clear_page_gap_editor()
         if entity_id != self.selected_object_id:
+            if self._vector_gesture_mode is not None:
+                self._cancel_vector_gesture(restore=True)
             self._cancel_text_property_drag()
             self._clear_transform_preview()
             self._transform_pivot = None
@@ -1356,6 +1432,8 @@ class _CanvasLogic:
         """Clear the current entity and notify every selection consumer."""
         if self.chapter is None:
             return
+        if self._vector_gesture_mode is not None:
+            self._cancel_vector_gesture(restore=True)
         if (
             self._page_gap_state is not None
             and self._page_gap_transaction is None
@@ -1385,6 +1463,8 @@ class _CanvasLogic:
             self.chapter.objects.get(self.selected_object_id)
             if self.chapter is not None else None
         )
+        if tool != self.tool and self._vector_gesture_mode is not None:
+            self._cancel_vector_gesture(restore=True)
         if tool != ToolKind.TEXT_EDIT:
             self._cancel_text_property_drag()
         if (
@@ -1552,6 +1632,34 @@ class _CanvasLogic:
     def _set_centered_scale(self, scale: float) -> None:
         """Scale around the visible viewport center without moving the camera."""
         self.scale = max(0.05, min(8.0, float(scale)))
+
+    def _center_camera_on_widget_anchor(
+        self,
+        document_anchor: QPointF,
+        widget_anchor: QPointF,
+        *,
+        scale: float | None = None,
+        rotation: float | None = None,
+    ) -> None:
+        target_scale = self.scale if scale is None else float(scale)
+        target_rotation = self.rotation if rotation is None else float(rotation)
+        viewport_delta = widget_anchor - QPointF(
+            self.width() / 2, self.height() / 2
+        )
+        angle = math.radians(target_rotation)
+        cos_a, sin_a = math.cos(angle), math.sin(angle)
+        document_delta = QPointF(
+            (
+                viewport_delta.x() * cos_a
+                + viewport_delta.y() * sin_a
+            ) / target_scale,
+            (
+                -viewport_delta.x() * sin_a
+                + viewport_delta.y() * cos_a
+            ) / target_scale,
+        )
+        self.center_x = document_anchor.x() - document_delta.x()
+        self.center_y = document_anchor.y() - document_delta.y()
 
     def visible_document_rect(self) -> QRectF:
         inverse, valid = self.camera_transform().inverted()
@@ -2362,21 +2470,49 @@ class _CanvasLogic:
                 (time.perf_counter_ns() - frame_started) / 1_000_000
             )
             return
-        self._ensure_scene_cache()
-        painter.setTransform(QTransform())
-        painter.drawImage(0, 0, self._scene_cache)
-        painter.setTransform(self.camera_transform())
-        painter.save()
-        painter.setClipRect(QRectF(0, 0, self.chapter.width, self.chapter.height))
-        self._draw_predictive_ink(painter)
-        self._draw_live_vector_gesture(painter)
-        selected_live = self.chapter.objects.get(self.selected_object_id)
-        if self._text_editing and isinstance(selected_live, TextObject):
-            self._render_selected_raster_preview(
-                painter, self.visible_document_rect()
+        live_vector_eraser = (
+            self._vector_gesture_mode == "eraser"
+            and isinstance(
+                self.chapter.objects.get(self.selected_object_id),
+                VectorDrawingObject,
             )
-        self._draw_page_gap_overlay(painter)
-        painter.restore()
+            and not self._vector_eraser_background_cache.isNull()
+        )
+        if live_vector_eraser:
+            painter.setTransform(QTransform())
+            painter.drawImage(0, 0, self._vector_eraser_background_cache)
+            painter.setTransform(self.camera_transform())
+            painter.save()
+            painter.setClipRect(
+                QRectF(0, 0, self.chapter.width, self.chapter.height)
+            )
+            visible = self.visible_document_rect()
+            self._set_live_underlay_context()
+            self._render_selected_raster_preview(painter, visible)
+            self._render_selected_drawing_underlay(painter, visible)
+            self._clear_live_underlay_context()
+            self._draw_page_gap_overlay(painter)
+            painter.restore()
+        else:
+            self._ensure_scene_cache()
+            painter.setTransform(QTransform())
+            painter.drawImage(0, 0, self._scene_cache)
+            painter.setTransform(self.camera_transform())
+            painter.save()
+            painter.setClipRect(
+                QRectF(0, 0, self.chapter.width, self.chapter.height)
+            )
+            self._draw_predictive_ink(painter)
+            self._draw_live_vector_gesture(painter)
+            selected_live = self.chapter.objects.get(
+                self.selected_object_id
+            )
+            if self._text_editing and isinstance(selected_live, TextObject):
+                self._render_selected_raster_preview(
+                    painter, self.visible_document_rect()
+                )
+            self._draw_page_gap_overlay(painter)
+            painter.restore()
         painter.save()
         self._draw_selection(painter)
         self._draw_creation_preview(painter)
@@ -3332,6 +3468,9 @@ class _CanvasLogic:
         previous = (
             self.chapter, self.tiles, self.images,
             self._compound_path_cache, self._vector_render_cache,
+            self._vector_render_cache_bytes, self._vector_spatial_indexes,
+            self._vector_render_scale_override,
+            self._vector_render_scale_owner,
             self._gradient_geometry_cache, self._gradient_scalar_cache,
             self._gradient_render_cache,
         )
@@ -3341,6 +3480,10 @@ class _CanvasLogic:
             )
             self._compound_path_cache = {}
             self._vector_render_cache = {}
+            self._vector_render_cache_bytes = 0
+            self._vector_spatial_indexes = {}
+            self._vector_render_scale_override = None
+            self._vector_render_scale_owner = None
             self._gradient_geometry_cache = {}
             self._gradient_scalar_cache = {}
             self._gradient_render_cache = {}
@@ -3372,6 +3515,10 @@ class _CanvasLogic:
             (
                 self.chapter, self.tiles, self.images,
                 self._compound_path_cache, self._vector_render_cache,
+                self._vector_render_cache_bytes,
+                self._vector_spatial_indexes,
+                self._vector_render_scale_override,
+                self._vector_render_scale_owner,
                 self._gradient_geometry_cache, self._gradient_scalar_cache,
                 self._gradient_render_cache,
             ) = previous
@@ -3791,6 +3938,167 @@ class _CanvasLogic:
             )
         return path
 
+    @staticmethod
+    def _vector_cache_entry_bytes(
+        value: tuple[QImage, QRectF],
+    ) -> int:
+        image = value[0]
+        return max(0, int(image.sizeInBytes()))
+
+    def _clear_vector_render_cache(self) -> None:
+        self._vector_render_cache.clear()
+        self._vector_render_cache_bytes = 0
+
+    def _recount_vector_render_cache_bytes(self) -> None:
+        self._vector_render_cache_bytes = sum(
+            self._vector_cache_entry_bytes(value)
+            for value in self._vector_render_cache.values()
+        )
+
+    def _invalidate_vector_cache_strokes(
+        self, stroke_ids: set[str],
+    ) -> None:
+        if not stroke_ids:
+            return
+        for key in list(self._vector_render_cache):
+            if len(key) >= 2 and key[1] in stroke_ids:
+                value = self._vector_render_cache.pop(key)
+                self._vector_render_cache_bytes -= (
+                    self._vector_cache_entry_bytes(value)
+                )
+        self._vector_render_cache_bytes = max(
+            0, self._vector_render_cache_bytes
+        )
+
+    def _clear_vector_eraser_live_cache(self) -> None:
+        for key in list(self._vector_render_cache):
+            token = key[2] if len(key) >= 3 else None
+            if (
+                isinstance(token, tuple)
+                and token
+                and token[0] == "eraser-preview"
+            ):
+                value = self._vector_render_cache.pop(key)
+                self._vector_render_cache_bytes -= (
+                    self._vector_cache_entry_bytes(value)
+                )
+        self._vector_render_cache_bytes = max(
+            0, self._vector_render_cache_bytes
+        )
+        self._vector_eraser_preview_versions.clear()
+        self._vector_eraser_background_cache = QImage()
+
+    def _store_vector_render_cache(
+        self, key: tuple, value: tuple[QImage, QRectF],
+    ) -> None:
+        entry_bytes = self._vector_cache_entry_bytes(value)
+        previous = self._vector_render_cache.pop(key, None)
+        if previous is not None:
+            self._vector_render_cache_bytes -= (
+                self._vector_cache_entry_bytes(previous)
+            )
+        if entry_bytes > VECTOR_RENDER_CACHE_BUDGET:
+            self._vector_render_cache_bytes = max(
+                0, self._vector_render_cache_bytes
+            )
+            return
+        self._vector_render_cache[key] = value
+        self._vector_render_cache_bytes += entry_bytes
+        while (
+            self._vector_render_cache
+            and self._vector_render_cache_bytes
+            > VECTOR_RENDER_CACHE_BUDGET
+        ):
+            oldest = next(iter(self._vector_render_cache))
+            removed = self._vector_render_cache.pop(oldest)
+            self._vector_render_cache_bytes -= (
+                self._vector_cache_entry_bytes(removed)
+            )
+        self._vector_render_cache_bytes = max(
+            0, self._vector_render_cache_bytes
+        )
+
+    def _requested_vector_render_scale(self) -> float:
+        if self._vector_render_scale_override is not None:
+            return self._vector_render_scale_override
+        return max(
+            0.1,
+            min(8.0, self.scale * max(1.0, self.devicePixelRatioF())),
+        )
+
+    def _vector_stroke_indexes(
+        self, drawing: VectorDrawingObject, visible: QRectF | None,
+    ) -> list[int]:
+        """Return visible stroke indexes in their original paint order."""
+        if visible is None:
+            return list(range(len(drawing.strokes)))
+        # Point/handle previews can move geometry without touching the model
+        # revision.  Do not consult stale cells while such an edit is live.
+        if (
+            drawing.object_id == self.selected_object_id
+            and (
+                self._selection_vector_preview
+                or self._vector_gesture_mode in {
+                    "edit_drag", "redraw", "simplify", "connect",
+                }
+            )
+        ):
+            return list(range(len(drawing.strokes)))
+        revision = (drawing.drawing_revision, len(drawing.strokes))
+        index = self._vector_spatial_indexes.get(drawing.object_id)
+        if index is None or index["revision"] != revision:
+            cell = VECTOR_RENDER_INDEX_CELL
+            cells: dict[tuple[int, int], list[int]] = {}
+            global_strokes: list[int] = []
+            for stroke_index, stroke in enumerate(drawing.strokes):
+                if not stroke.points:
+                    continue
+                bounds = QRectF(*stroke.derived_bounds())
+                if not all(math.isfinite(value) for value in (
+                    bounds.left(), bounds.right(),
+                    bounds.top(), bounds.bottom(),
+                )):
+                    global_strokes.append(stroke_index)
+                    continue
+                left = math.floor(bounds.left() / cell)
+                right = math.floor(bounds.right() / cell)
+                top = math.floor(bounds.top() / cell)
+                bottom = math.floor(bounds.bottom() / cell)
+                cell_count = (right - left + 1) * (bottom - top + 1)
+                if cell_count > 4096:
+                    global_strokes.append(stroke_index)
+                    continue
+                for y in range(top, bottom + 1):
+                    for x in range(left, right + 1):
+                        cells.setdefault((x, y), []).append(stroke_index)
+            index = {
+                "revision": revision,
+                "cells": cells,
+                "global": global_strokes,
+            }
+            self._vector_spatial_indexes[drawing.object_id] = index
+        cell = VECTOR_RENDER_INDEX_CELL
+        if not all(math.isfinite(value) for value in (
+            visible.left(), visible.right(),
+            visible.top(), visible.bottom(),
+        )):
+            return list(range(len(drawing.strokes)))
+        left = math.floor(visible.left() / cell)
+        right = math.floor(visible.right() / cell)
+        top = math.floor(visible.top() / cell)
+        bottom = math.floor(visible.bottom() / cell)
+        candidates = set(index["global"])
+        query_cells = (right - left + 1) * (bottom - top + 1)
+        if query_cells > max(4096, len(index["cells"]) * 4):
+            for (x, y), stroke_indexes in index["cells"].items():
+                if left <= x <= right and top <= y <= bottom:
+                    candidates.update(stroke_indexes)
+        else:
+            for y in range(top, bottom + 1):
+                for x in range(left, right + 1):
+                    candidates.update(index["cells"].get((x, y), ()))
+        return sorted(candidates)
+
     def _vector_stroke_image(
         self, drawing: VectorDrawingObject, stroke: VectorStroke,
         *, cache_token: object | None = None,
@@ -3799,7 +4107,7 @@ class _CanvasLogic:
         if not stroke.points:
             return None
         device_ratio = max(1.0, float(self.devicePixelRatioF()))
-        requested_scale = max(0.1, min(8.0, self.scale * device_ratio))
+        requested_scale = self._requested_vector_render_scale()
         key = (
             drawing.object_id,
             stroke.stroke_id,
@@ -3972,11 +4280,7 @@ class _CanvasLogic:
         image_painter.drawImage(0, 0, mask)
         image_painter.end()
         result = image, target
-        self._vector_render_cache[key] = result
-        # Keep a bounded insertion-ordered cache without pulling a dependency
-        # into the hot rendering path.  Re-inserting a hit makes it recent.
-        while len(self._vector_render_cache) > 384:
-            self._vector_render_cache.pop(next(iter(self._vector_render_cache)))
+        self._store_vector_render_cache(key, result)
         return result
 
     def _render_vector_fill(
@@ -4006,18 +4310,14 @@ class _CanvasLogic:
             if drawing.transform_quad is not None else None
         )
         if destination is not None:
-            left, top, width, height = drawing.derived_bounds()
-            source = QRectF(*(
-                drawing.transform_frame
-                or (drawing.x + left, drawing.y + top,
-                    max(1.0, width), max(1.0, height))
-            ))
             painter.setTransform(
-                self._quad_transform(source, destination), True
+                self._drawing_object_transform(drawing, destination), True
             )
         painter.translate(drawing.x, drawing.y)
         drawing_visible = (
-            local_visible.translated(-drawing.x, -drawing.y)
+            self._drawing_local_visible_rect(
+                drawing, local_visible, destination
+            )
             if local_visible is not None else None
         )
         # Fill IDs are frontmost-first, so paint them back-to-front.
@@ -4025,7 +4325,10 @@ class _CanvasLogic:
             fill = self.chapter.objects.get(fill_id)
             if isinstance(fill, VectorFillObject):
                 self._render_vector_fill(painter, fill)
-        for stroke in drawing.strokes:
+        for stroke_index in self._vector_stroke_indexes(
+            drawing, drawing_visible
+        ):
+            stroke = drawing.strokes[stroke_index]
             if (
                 drawing_visible is not None
                 and not QRectF(*stroke.derived_bounds()).intersects(
@@ -4045,7 +4348,9 @@ class _CanvasLogic:
                         drawing, replacement,
                         cache_token=(
                             "eraser-preview",
-                            self._vector_eraser_preview_revision,
+                            self._vector_eraser_preview_versions.get(
+                                stroke.stroke_id, 0
+                            ),
                             replacement.stroke_id,
                         ),
                     )
@@ -4054,10 +4359,7 @@ class _CanvasLogic:
                         painter.drawImage(target, image)
                 continue
             promoted = self._promoted_vector_preview
-            requested_scale = max(
-                0.1,
-                min(8.0, self.scale * max(1.0, self.devicePixelRatioF())),
-            )
+            requested_scale = self._requested_vector_render_scale()
             if (
                 promoted is not None
                 and promoted["drawing_id"] == drawing.object_id
@@ -5818,20 +6120,17 @@ class _CanvasLogic:
             else None
         )
         if destination is not None:
-            source = QRectF(*(
-                obj.transform_frame
-                or QRectF(*obj.interaction_rect).translated(obj.x, obj.y)
-                .getRect()
-            ))
-            transform = self._quad_transform(source, destination)
+            transform = self._drawing_object_transform(obj, destination)
             painter.save()
             painter.setRenderHint(QPainter.SmoothPixmapTransform, True)
             painter.setTransform(transform, True)
-            inverse, invertible = transform.inverted()
-            object_visible = (
-                inverse.mapRect(local_visible).translated(-obj.x, -obj.y)
-                if invertible else None
+            object_visible = self._drawing_local_visible_rect(
+                obj, local_visible, destination
             )
+            if object_visible is not None:
+                object_visible = object_visible.intersected(
+                    QRectF(*obj.interaction_rect)
+                )
             for (tile_x, tile_y), image in self.tiles.iter_tiles(
                 obj.object_id, object_visible
             ):
@@ -6127,9 +6426,15 @@ class _CanvasLogic:
             drawing.parent_layer_id
         )
         painter.save()
-        painter.translate(layer_x + drawing.x, layer_y + drawing.y)
-        local_visible = self.visible_document_rect().translated(
-            -layer_x - drawing.x, -layer_y - drawing.y
+        painter.translate(layer_x, layer_y)
+        if drawing.transform_quad is not None:
+            painter.setTransform(
+                self._drawing_object_transform(drawing), True
+            )
+        painter.translate(drawing.x, drawing.y)
+        local_visible = self._drawing_local_visible_rect(
+            drawing,
+            self.visible_document_rect().translated(-layer_x, -layer_y),
         )
         tile_size = self._vector_preview_tiles.tile_size
         for (tile_x, tile_y), image in self._vector_preview_tiles.iter_tiles(
@@ -6338,9 +6643,18 @@ class _CanvasLogic:
             quad = self._selected_world_quad()
             if quad:
                 polygon = QPolygonF([QPointF(*point) for point in quad])
-                painter.drawPolygon(polygon)
+                live_vector_eraser = (
+                    self._vector_gesture_mode == "eraser"
+                    and isinstance(selected_object, VectorDrawingObject)
+                )
+                # A zero-height vector bounds cage can lie directly over the
+                # ink.  During erasing it would redraw the committed stroke in
+                # blue and conceal the otherwise-correct live cutout.
+                if not live_vector_eraser:
+                    painter.drawPolygon(polygon)
                 if (
-                    not (
+                    not live_vector_eraser
+                    and not (
                         isinstance(selected_object, ImageObject)
                         and selected_object.placement_mode == "fit_parent"
                     )
@@ -7177,8 +7491,17 @@ class _CanvasLogic:
     def _transform_mode_gizmo_rect(self) -> QRectF:
         cage = self._active_transform_cage()
         if cage is None:
+            self._transform_gizmo_key = None
+            self._transform_gizmo_slot = None
             return QRectF()
         quad, pivot_kind = cage
+        context_key = (
+            id(self.chapter), self.selected_kind, self.selected_id,
+            self.tool.value, pivot_kind,
+        )
+        if context_key != self._transform_gizmo_key:
+            self._transform_gizmo_key = context_key
+            self._transform_gizmo_slot = None
         widget_quad = self.camera_transform().map(QPolygonF([
             QPointF(*point) for point in quad
         ]))
@@ -7275,7 +7598,14 @@ class _CanvasLogic:
             )
             return collisions, area, distance
 
-        return min(candidates, key=score)
+        if (
+            self._transform_gizmo_slot is None
+            or self._transform_gizmo_slot >= len(candidates)
+        ):
+            self._transform_gizmo_slot = min(
+                range(len(candidates)), key=lambda index: score(candidates[index])
+            )
+        return candidates[self._transform_gizmo_slot]
 
     def _draw_transform_mode_gizmo(self, painter: QPainter) -> None:
         rect = self._transform_mode_gizmo_rect()
@@ -9620,7 +9950,7 @@ class _CanvasLogic:
             event.accept()
             return
         if self._nav_mode:
-            self._update_navigation(event.position())
+            self._queue_navigation_update(event.position())
             return
         self._pointer_hover_widget = QPointF(event.position())
         world = self.widget_to_document(event.position())
@@ -9695,7 +10025,7 @@ class _CanvasLogic:
             event.accept()
             return
         if self._nav_mode:
-            self._end_navigation()
+            self._end_navigation(event.position())
             return
         if event.button() == Qt.LeftButton:
             self._tool_release()
@@ -9929,8 +10259,10 @@ class _CanvasLogic:
         if self.chapter is None:
             return
         if event.modifiers() & Qt.ControlModifier:
+            self._begin_vector_scale_reuse("wheel")
             factor = math.pow(1.0015, event.angleDelta().y())
             self._set_centered_scale(self.scale * factor)
+            self._wheel_zoom_timer.start()
         else:
             self.center_y -= event.angleDelta().y() / max(0.05, self.scale)
             self._snap_camera()
@@ -9954,7 +10286,9 @@ class _CanvasLogic:
             # A real pen-down wins over any finger gesture already in flight.
             # Hover-only TabletMove events deliberately leave touch navigation
             # intact so fingers can pan, pinch, and rotate with the pen nearby.
-            self._cancel_touch_navigation(emit_finished=True)
+            self._cancel_touch_navigation(
+                emit_finished=True, flush_pending=False
+            )
             if nav:
                 self._begin_navigation(nav, event.position())
             elif event.button() == Qt.LeftButton or event.pressure() > 0:
@@ -9997,7 +10331,7 @@ class _CanvasLogic:
                 )
         elif event.type() == QEvent.TabletMove:
             if self._nav_mode:
-                self._update_navigation(event.position())
+                self._queue_navigation_update(event.position())
             elif self._pen_contact_active:
                 input_started = time.perf_counter_ns()
                 self._tool_move(event.position(), event.pressure())
@@ -10017,7 +10351,7 @@ class _CanvasLogic:
                 )
         elif event.type() == QEvent.TabletRelease:
             if self._nav_mode:
-                self._end_navigation()
+                self._end_navigation(event.position())
             elif self._pen_contact_active:
                 self._pen_contact_active = False
                 self._tablet_tool_active = False
@@ -10048,11 +10382,32 @@ class _CanvasLogic:
         )
 
     def _begin_navigation(self, mode: str, point: QPointF) -> None:
+        if self._vector_render_scale_owner == "wheel":
+            self._wheel_zoom_timer.stop()
+            self._finish_vector_scale_reuse("wheel", redraw=False)
+        if mode == "zoom":
+            self._begin_vector_scale_reuse("drag")
+        self._nav_frame_timer.stop()
+        self._nav_pending_point = None
         self._nav_mode = mode
-        self._nav_anchor = point
+        self._nav_anchor = QPointF(point)
         self._nav_anchor_center = QPointF(self.center_x, self.center_y)
         self._nav_anchor_scale = self.scale
         self._nav_anchor_rotation = self.rotation
+        self._nav_anchor_document = self.widget_to_document(point)
+
+    def _queue_navigation_update(self, point: QPointF) -> None:
+        if self._nav_mode is None:
+            return
+        self._nav_pending_point = QPointF(point)
+        if not self._nav_frame_timer.isActive():
+            self._nav_frame_timer.start(0)
+
+    def _flush_navigation_update(self) -> None:
+        point = self._nav_pending_point
+        self._nav_pending_point = None
+        if point is not None and self._nav_mode is not None:
+            self._update_navigation(point)
 
     def _update_navigation(self, point: QPointF) -> None:
         delta = point - self._nav_anchor
@@ -10066,6 +10421,9 @@ class _CanvasLogic:
             self._set_centered_scale(
                 self._nav_anchor_scale * (1 + delta.x() * 0.005)
             )
+            self._center_camera_on_widget_anchor(
+                self._nav_anchor_document, self._nav_anchor
+            )
         elif self._nav_mode == "rotate":
             center = QPointF(self.rect().center())
             start_angle = math.atan2(self._nav_anchor.y() - center.y(), self._nav_anchor.x() - center.x())
@@ -10076,16 +10434,49 @@ class _CanvasLogic:
         self.update()
         self.cameraChanged.emit()
 
-    def _end_navigation(self) -> None:
+    def _end_navigation(self, final_point: QPointF | None = None) -> None:
+        self._nav_frame_timer.stop()
+        if final_point is not None:
+            self._nav_pending_point = QPointF(final_point)
+        self._flush_navigation_update()
         mode = self._nav_mode
         self._nav_mode = None
+        if mode == "zoom":
+            self._finish_vector_scale_reuse("drag")
         if mode != "zoom":
             self._snap_camera()
         self.interactionFinished.emit()
 
+    def _begin_vector_scale_reuse(self, owner: str) -> None:
+        if self._vector_render_scale_owner == owner:
+            return
+        if self._vector_render_scale_owner is not None:
+            self._vector_render_scale_override = None
+        self._vector_render_scale_override = max(
+            0.1,
+            min(8.0, self.scale * max(1.0, self.devicePixelRatioF())),
+        )
+        self._vector_render_scale_owner = owner
+
+    def _finish_vector_scale_reuse(
+        self, owner: str, *, redraw: bool = True,
+    ) -> None:
+        if self._vector_render_scale_owner != owner:
+            return
+        self._vector_render_scale_owner = None
+        self._vector_render_scale_override = None
+        if redraw and self.chapter is not None:
+            self._invalidate_scene_cache()
+            self.update()
+
+    def _settle_wheel_zoom(self) -> None:
+        self._finish_vector_scale_reuse("wheel")
+
     def _touch_event(self, event) -> bool:
         if self._pen_contact_active or self._nav_mode:
-            self._cancel_touch_navigation(emit_finished=True)
+            self._cancel_touch_navigation(
+                emit_finished=True, flush_pending=False
+            )
             event.accept()
             return True
         points = [item.position() for item in event.points()]
@@ -10115,7 +10506,10 @@ class _CanvasLogic:
         event.accept()
         return True
 
-    def _cancel_touch_navigation(self, *, emit_finished: bool = False) -> None:
+    def _cancel_touch_navigation(
+        self, *, emit_finished: bool = False,
+        flush_pending: bool = True,
+    ) -> None:
         active = bool(
             self._touch_frame_timer.isActive()
             or self._touch_pending_points
@@ -10123,9 +10517,12 @@ class _CanvasLogic:
             or self._touch_anchor_points
         )
         self._touch_frame_timer.stop()
+        if flush_pending and self._touch_pending_points:
+            self._flush_touch_navigation()
         self._touch_pending_points = None
         self._touch_points.clear()
         self._touch_anchor_points.clear()
+        self._finish_vector_scale_reuse("touch")
         if emit_finished and active:
             self.interactionFinished.emit()
 
@@ -10143,6 +10540,8 @@ class _CanvasLogic:
         )
 
     def _rebase_touch_navigation(self, points: list[QPointF]) -> None:
+        if points:
+            self._begin_vector_scale_reuse("touch")
         self._touch_points = [QPointF(point) for point in points]
         self._touch_anchor_points = [QPointF(point) for point in points]
         self._touch_anchor_center = QPointF(self.center_x, self.center_y)
@@ -10193,25 +10592,12 @@ class _CanvasLogic:
                 self._touch_anchor_rotation + math.degrees(angle_delta)
             )
 
-        viewport_delta = current_center - QPointF(
-            self.width() / 2, self.height() / 2
-        )
-        angle = math.radians(new_rotation)
-        cos_a, sin_a = math.cos(angle), math.sin(angle)
-        document_delta = QPointF(
-            (
-                viewport_delta.x() * cos_a
-                + viewport_delta.y() * sin_a
-            ) / new_scale,
-            (
-                -viewport_delta.x() * sin_a
-                + viewport_delta.y() * cos_a
-            ) / new_scale,
-        )
-        self.center_x = self._touch_anchor_document.x() - document_delta.x()
-        self.center_y = self._touch_anchor_document.y() - document_delta.y()
         self.scale = new_scale
         self.rotation = new_rotation
+        self._center_camera_on_widget_anchor(
+            self._touch_anchor_document, current_center,
+            scale=new_scale, rotation=new_rotation,
+        )
         self._touch_points = [QPointF(point) for point in points]
         self.update()
         self.cameraChanged.emit()
@@ -10560,6 +10946,8 @@ class _CanvasLogic:
     def _clear_drawing_selection(self, *, reset_pivot: bool = True) -> None:
         self._drawing_selection_path = QPainterPath()
         self._drawing_selection_gesture.clear()
+        self._transform_gizmo_key = None
+        self._transform_gizmo_slot = None
         self._selection_transform_quad = None
         self._selection_transform_start_quad = None
         self._selection_transform_mode = None
@@ -11735,11 +12123,8 @@ class _CanvasLogic:
         drawing = self._active_vector_drawing()
         if drawing is None:
             return
-        layer_x, layer_y = self.chapter.layer_world_translation(
-            drawing.parent_layer_id
-        )
         self._queue_visual_dirty(
-            dirty.translated(layer_x + drawing.x, layer_y + drawing.y),
+            self._drawing_local_rect_to_world(drawing, dirty),
             scene=False, notify_preview=False,
         )
 
@@ -12063,6 +12448,9 @@ class _CanvasLogic:
                         if replacement is not None:
                             replacements.append(replacement)
             self._vector_eraser_preview[stroke_id] = replacements
+            self._vector_eraser_preview_versions[stroke_id] = (
+                self._vector_eraser_preview_versions.get(stroke_id, 0) + 1
+            )
             if mode == "point":
                 xs = [point[0] for point in segment]
                 ys = [point[1] for point in segment]
@@ -12084,13 +12472,15 @@ class _CanvasLogic:
         if not changed:
             return
         self._vector_eraser_preview_revision += 1
-        layer_x, layer_y = self.chapter.layer_world_translation(
-            drawing.parent_layer_id
+        world_dirty = self._drawing_local_rect_to_world(
+            drawing, changed_bounds
         )
-        self._queue_visual_dirty(
-            changed_bounds.translated(layer_x + drawing.x, layer_y + drawing.y),
-            scene=True, notify_preview=False,
-        )
+        widget_dirty = self._world_dirty_to_widget(world_dirty)
+        if not widget_dirty.isEmpty():
+            # The eraser owns a separate background, so repaint it directly;
+            # marking the main scene dirty would make it show the committed
+            # (pre-gesture) vector again until release.
+            self.update(widget_dirty)
 
     def _vector_stroke_touched(
         self, stroke: VectorStroke, sweep: list[tuple[float, float]],
@@ -12281,6 +12671,7 @@ class _CanvasLogic:
             drawing.strokes = rebuilt
             drawing.touch_revision()
         self._vector_eraser_preview.clear()
+        self._clear_vector_eraser_live_cache()
         self._vector_eraser_grid.clear()
         self._vector_eraser_bounds.clear()
         self._vector_eraser_grid_revision = None
@@ -12288,17 +12679,9 @@ class _CanvasLogic:
         self._vector_gesture_mode = None
         self._vector_sweep = []
         self._vector_before = None
-        if (
-            changed_strokes
-            and not self._scene_cache.isNull()
-            and not self._scene_dirty_full
-            and self._scene_dirty_widget.isEmpty()
-            and not self._visual_frame_timer.isActive()
-        ):
-            self._preserve_scene_cache_once = True
         pushed = self._push_vector_change(before, "Vector eraser")
         if not pushed:
-            self._preserve_scene_cache_once = False
+            self.update()
         self.interactionFinished.emit()
 
     def _apply_vector_eraser_sweep(
@@ -13188,10 +13571,16 @@ class _CanvasLogic:
         if self.tool == ToolKind.RASTER_ERASER:
             self._vector_before = {drawing.object_id: drawing.to_dict()}
             self._vector_gesture_mode = "eraser"
+            self._clear_vector_eraser_live_cache()
             self._vector_eraser_preview.clear()
             self._vector_eraser_preview_revision += 1
             self._vector_eraser_grid_revision = None
-            self._build_vector_eraser_index(drawing)
+            try:
+                self._build_vector_eraser_index(drawing)
+                self._build_vector_eraser_background_cache()
+            except Exception:
+                self._cancel_vector_gesture(restore=True)
+                raise
         elif self.tool == ToolKind.VECTOR_REDRAW:
             if self.settings.vector_redraw_interaction == "point":
                 self._begin_vector_point_select(drawing, local)
@@ -13212,7 +13601,11 @@ class _CanvasLogic:
             FreehandSample(local.x(), local.y(), pressure)
         ]
         if self._vector_gesture_mode == "eraser":
-            self._update_vector_eraser_preview(drawing)
+            try:
+                self._update_vector_eraser_preview(drawing)
+            except Exception:
+                self._cancel_vector_gesture(restore=True)
+                raise
         if self._vector_gesture_mode == "simplify":
             self._build_simplify_anchor_index(drawing)
             self._update_simplify_point_sweep(drawing)
@@ -13268,7 +13661,11 @@ class _CanvasLogic:
             self._collect_vector_endpoint(drawing, local)
         elif self._vector_gesture_mode == "eraser":
             if len(self._vector_sweep) != sweep_count:
-                self._update_vector_eraser_preview(drawing)
+                try:
+                    self._update_vector_eraser_preview(drawing)
+                except Exception:
+                    self._cancel_vector_gesture(restore=True)
+                    raise
             return
         self.update()
 
@@ -13409,7 +13806,6 @@ class _CanvasLogic:
         if self.tool in {ToolKind.RASTER_PENCIL, ToolKind.RASTER_ERASER}:
             obj = self.chapter.objects.get(self.selected_object_id)
             if isinstance(obj, VectorDrawingObject):
-                path = QPainterPath()
                 bounds = QRectF(*obj.derived_bounds())
                 if obj.strokes and not bounds.isEmpty():
                     radius = (
@@ -13418,12 +13814,8 @@ class _CanvasLogic:
                         if self.tool == ToolKind.RASTER_ERASER else 0.0
                     )
                     bounds.adjust(-radius, -radius, radius, radius)
-                    layer_x, layer_y = self.chapter.layer_world_translation(
-                        obj.parent_layer_id
-                    )
-                    bounds.translate(layer_x + obj.x, layer_y + obj.y)
-                    path.addRect(bounds)
-                if not obj.strokes or path.contains(point):
+                local = self._vector_local_point(obj, point)
+                if not obj.strokes or bounds.contains(local):
                     self._begin_vector_gesture(obj, point, pressure)
                 else:
                     self._pending_vector_press = (
@@ -15715,14 +16107,7 @@ class _CanvasLogic:
             max(1.0, frame.height()),
         )
         if obj.transform_quad is not None:
-            corners = [
-                self._raster_world_point(obj, point)
-                for point in (
-                    local.topLeft(), local.topRight(),
-                    local.bottomRight(), local.bottomLeft(),
-                )
-            ]
-            world = QPolygonF(corners).boundingRect()
+            world = self._drawing_local_rect_to_world(obj, local)
         else:
             layer_x, layer_y = self.chapter.layer_world_translation(
                 obj.parent_layer_id
@@ -16409,17 +16794,32 @@ class _CanvasLogic:
         self._render_excluded_object_id = ""
 
     def _build_raster_transform_cache(self) -> None:
+        image = self._build_excluded_object_scene_cache(
+            self.selected_object_id
+        )
+        self._transform_static_cache = image
+        if image.isNull():
+            self._text_transform_cache = QImage()
+
+    def _build_excluded_object_scene_cache(
+        self, object_id: str,
+    ) -> QImage:
         if (
-            self.chapter is None or not self.selected_object_id
+            self.chapter is None or not object_id
             or self.width() <= 0 or self.height() <= 0
         ):
-            return
+            return QImage()
+        ratio = max(1.0, float(self.devicePixelRatioF()))
         image = QImage(
-            self.width(), self.height(), QImage.Format_ARGB32_Premultiplied
+            max(1, round(self.width() * ratio)),
+            max(1, round(self.height() * ratio)),
+            QImage.Format_ARGB32_Premultiplied,
         )
+        image.setDevicePixelRatio(ratio)
         image.fill(QColor("#242428"))
         painter = QPainter(image)
         succeeded = False
+        previous_excluded = self._render_excluded_object_id
         try:
             painter.setRenderHint(QPainter.Antialiasing, True)
             painter.setTransform(self.camera_transform())
@@ -16432,7 +16832,7 @@ class _CanvasLogic:
                 painter.setClipRect(
                     QRectF(0, 0, self.chapter.width, self.chapter.height)
                 )
-                self._render_excluded_object_id = self.selected_object_id
+                self._render_excluded_object_id = object_id
                 visible = self.visible_document_rect()
                 for page_id in reversed(self.chapter.root_page_ids):
                     self._render_layer(
@@ -16443,14 +16843,17 @@ class _CanvasLogic:
                 painter.restore()
             succeeded = True
         finally:
-            self._render_excluded_object_id = ""
+            self._render_excluded_object_id = previous_excluded
             if painter.isActive():
                 painter.end()
-            if not succeeded:
-                self._transform_static_cache = QImage()
-                self._text_transform_cache = QImage()
-        if succeeded:
-            self._transform_static_cache = image
+        return image if succeeded else QImage()
+
+    def _build_vector_eraser_background_cache(self) -> None:
+        self._vector_eraser_background_cache = (
+            self._build_excluded_object_scene_cache(
+                self.selected_object_id
+            )
+        )
 
     def _render_selected_raster_preview(
         self, painter: QPainter, visible: QRectF,

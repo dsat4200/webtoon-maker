@@ -1,3 +1,7 @@
+## Chapter 1
+ - split panels?
+ - [[how should the story start]]
+#### kind of boring chapter 1 plot
 - establishing shot, home depot bass pro shops
 - low angle of lance, shelves and stuff visible in bg
 - bunch of shots of him scanning stuff, customer order
@@ -29,6 +33,8 @@
 - title card
 - leaves the audience guessing on a cliff hanger
 
+
+## chapter 2
 
 chapter 2 takes place from phoebe's perspective.
 - phoebe opens mouth, pulling out lance

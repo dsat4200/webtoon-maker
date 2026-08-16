@@ -1,0 +1,52 @@
+{
+  "schema_version": 15,
+  "id": "187f27954c864450b8b4d5a383c4df90",
+  "name": "arst",
+  "chapters": [
+    {
+      "id": "26f5d698727842d39eea3275ae1df22d",
+      "name": "Chapter 1"
+    }
+  ],
+  "primary_color": "#FF000000",
+  "secondary_color": "#FFFFFFFF",
+  "active_palette_id": "ad8d9804946b45e2af52eb995c29ab23",
+  "palettes": [
+    {
+      "id": "ad8d9804946b45e2af52eb995c29ab23",
+      "name": "Default",
+      "swatches": [
+        {
+          "id": "ba83253b29e64ac49b5895959dabe6a0",
+          "color": "#FF000000"
+        },
+        {
+          "id": "1b04eedeb1064203b2dde5c91b3b89c8",
+          "color": "#FFFFFFFF"
+        }
+      ]
+    }
+  ],
+  "gradient_ramp_presets": [
+    {
+      "id": "16ef5117022e42f5a229b0aea9507ac0",
+      "name": "Default",
+      "ramp": {
+        "value_type": "color",
+        "interpolation": "linear",
+        "stops": [
+          {
+            "id": "9b4e1238bac14da2ad761eaac537d4af",
+            "position": 0.0,
+            "color": "#FF000000"
+          },
+          {
+            "id": "bbb768a8063e4282928583843b228505",
+            "position": 1.0,
+            "color": "#FFFFFFFF"
+          }
+        ]
+      }
+    }
+  ]
+}

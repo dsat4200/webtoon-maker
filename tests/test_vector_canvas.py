@@ -3,7 +3,7 @@ from __future__ import annotations
 import math
 
 from PySide6.QtCore import QPointF, QRectF, Qt
-from PySide6.QtGui import QGuiApplication, QImage, QPainterPath
+from PySide6.QtGui import QGuiApplication, QImage, QPainter, QPainterPath
 import pytest
 
 from comic_editor.core.models import (
@@ -63,6 +63,55 @@ def test_vector_pencil_creates_pressure_stroke_and_undoes(qapp):
     assert not drawing.strokes
     canvas.command_stack.redo()
     assert len(drawing.strokes) == 1
+
+
+def test_vector_pencil_preview_and_commit_follow_persistent_transform(qapp):
+    original = _stroke((0, 0, 6, 1), (100, 80, 6, 1))
+    canvas, _chapter, drawing = _canvas_with_drawing([original])
+    drawing.transform_frame = (0, 0, 100, 80)
+    drawing.transform_quad = [
+        (140, 120), (310, 105), (325, 255), (125, 235),
+    ]
+    canvas.center_x = 450
+    canvas.center_y = 350
+    canvas.scale = 1.0
+    canvas.rotation = 0.0
+    canvas.set_tool(ToolKind.RASTER_PENCIL)
+    object_transform = canvas._drawing_object_transform(drawing)
+    first_local = QPointF(25, 25)
+    second_local = QPointF(45, 45)
+    first_world = object_transform.map(first_local)
+    second_world = object_transform.map(second_local)
+
+    canvas._tool_press(canvas.document_to_widget(first_world), 1.0)
+    assert canvas._vector_gesture_mode == "pencil"
+    assert canvas._pending_vector_press is None
+    canvas._tool_move(canvas.document_to_widget(second_world), 1.0)
+
+    image = QImage(900, 700, QImage.Format_ARGB32_Premultiplied)
+    image.fill(Qt.transparent)
+    painter = QPainter(image)
+    painter.setTransform(canvas.camera_transform())
+    canvas._draw_live_vector_gesture(painter)
+    painter.end()
+    expected = canvas.document_to_widget(second_world).toPoint()
+    assert any(
+        image.pixelColor(expected.x() + dx, expected.y() + dy).alpha() > 0
+        for dx in range(-3, 4) for dy in range(-3, 4)
+    )
+
+    canvas._tool_release()
+    created = drawing.strokes[-1]
+    assert created.points[0].position == pytest.approx(first_local.toTuple())
+    assert created.points[-1].position == pytest.approx(second_local.toTuple())
+    assert drawing.transform_frame == (0, 0, 100, 80)
+    assert drawing.transform_quad == [
+        (140, 120), (310, 105), (325, 255), (125, 235),
+    ]
+    canvas.command_stack.undo()
+    assert len(drawing.strokes) == 1
+    canvas.command_stack.redo()
+    assert len(drawing.strokes) == 2
 
 
 def test_vector_pencil_preserves_zero_pressure_from_capable_pen(qapp):

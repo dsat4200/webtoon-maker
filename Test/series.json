@@ -1,0 +1,52 @@
+{
+  "schema_version": 15,
+  "id": "eb0ba5d637f942308935a94af9b572cb",
+  "name": "Test",
+  "chapters": [
+    {
+      "id": "2a9f55d8898c4d968c06336933bff773",
+      "name": "Chapter 1"
+    }
+  ],
+  "primary_color": "#FF000000",
+  "secondary_color": "#FFFFFFFF",
+  "active_palette_id": "f2bff450e4cb4554b1a90bcebce206aa",
+  "palettes": [
+    {
+      "id": "f2bff450e4cb4554b1a90bcebce206aa",
+      "name": "Default",
+      "swatches": [
+        {
+          "id": "7dfd80b826e54aebb6d649d629a9a8cf",
+          "color": "#FF000000"
+        },
+        {
+          "id": "bcadfa30c0444b4ebe89c66ef0e728ba",
+          "color": "#FFFFFFFF"
+        }
+      ]
+    }
+  ],
+  "gradient_ramp_presets": [
+    {
+      "id": "ce58e2254681420a911ac9bee55224ae",
+      "name": "Default",
+      "ramp": {
+        "value_type": "color",
+        "interpolation": "linear",
+        "stops": [
+          {
+            "id": "ffc3097486bc471699041186caeb6d7f",
+            "position": 0.0,
+            "color": "#FF000000"
+          },
+          {
+            "id": "5ee4c70d4ef04109a2cd435781528e3f",
+            "position": 1.0,
+            "color": "#FFFFFFFF"
+          }
+        ]
+      }
+    }
+  ]
+}

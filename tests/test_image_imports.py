@@ -3,9 +3,10 @@ from __future__ import annotations
 import base64
 
 from PySide6.QtCore import (
-    QBuffer, QByteArray, QEvent, QIODevice, QMimeData, QPointF, Qt, QUrl,
+    QBuffer, QByteArray, QEvent, QIODevice, QMimeData, QPointF, QRectF, Qt,
+    QUrl,
 )
-from PySide6.QtGui import QColor, QImage, QMouseEvent
+from PySide6.QtGui import QColor, QImage, QMouseEvent, QPainter
 from PySide6.QtNetwork import QNetworkReply
 import pytest
 
@@ -334,6 +335,122 @@ def test_image_translation_cage_updates_live_and_mode_gizmo_is_global(qapp):
     assert clamped.bottom() <= canvas.height() - 6
     obj.placement_mode = "fit_parent"
     assert canvas._transform_mode_gizmo_rect().isEmpty()
+
+
+@pytest.mark.parametrize("object_kind", ["raster", "vector"])
+def test_transform_mode_gizmo_keeps_one_slot_during_camera_changes(
+    qapp, object_kind,
+):
+    chapter, _page, shape = _document()
+    if object_kind == "raster":
+        obj = chapter.add_object(shape.layer_id, RasterObject(
+            interaction_rect=(0, 0, 120, 80),
+            transform_frame=(0, 0, 120, 80),
+            transform_quad=[
+                (150, 130), (290, 115), (300, 230), (135, 215),
+            ],
+        ))
+    else:
+        obj = chapter.add_object(shape.layer_id, VectorDrawingObject(
+            strokes=[VectorStroke(points=[
+                VectorStrokePoint(x=0, y=0),
+                VectorStrokePoint(x=120, y=80),
+            ])],
+            transform_frame=(0, 0, 120, 80),
+            transform_quad=[
+                (150, 130), (290, 115), (300, 230), (135, 215),
+            ],
+        ))
+    canvas = CanvasWidget(EditorSettings(snap_to_grid=False))
+    canvas.resize(900, 700)
+    canvas.set_document(chapter, TileStore(), ImageStore())
+    canvas.set_selection("object", obj.object_id)
+    canvas.center_x = 250
+    canvas.center_y = 190
+    canvas.scale = 1.0
+
+    assert not canvas._transform_mode_gizmo_rect().isEmpty()
+    initial_slot = canvas._transform_gizmo_slot
+    assert initial_slot is not None
+    for scale, rotation in (
+        (0.35, 0.0), (2.2, 0.0), (2.2, 48.0), (0.7, -31.0),
+    ):
+        canvas.scale = scale
+        canvas.rotation = rotation
+        assert not canvas._transform_mode_gizmo_rect().isEmpty()
+        assert canvas._transform_gizmo_slot == initial_slot
+
+
+def test_projective_raster_remains_renderable_and_drawable(qapp):
+    chapter, _page, shape = _document()
+    raster = chapter.add_object(shape.layer_id, RasterObject(
+        interaction_rect=(0, 0, 120, 120),
+        transform_frame=(0, 0, 120, 120),
+        transform_quad=[
+            (60, 70), (220, 100), (220, 220), (100, 220),
+        ],
+    ))
+    tiles = TileStore()
+    tiles.paint_dab(
+        raster.object_id, QPointF(20, 20), 16, QColor("#111111")
+    )
+    canvas = CanvasWidget(EditorSettings(snap_to_grid=False))
+    canvas.resize(900, 700)
+    canvas.set_document(chapter, tiles, ImageStore())
+    canvas.set_selection("object", raster.object_id)
+    canvas.center_x = 450
+    canvas.center_y = 350
+    canvas.scale = 1.0
+    original_quad = list(raster.transform_quad)
+    original_frame = tuple(raster.transform_frame)
+
+    image = QImage(900, 700, QImage.Format_ARGB32_Premultiplied)
+    image.fill(Qt.transparent)
+    painter = QPainter(image)
+    canvas._render_raster_content(
+        painter, raster, QRectF(0, 0, 1080, 1080),
+        use_transform_preview=False,
+    )
+    painter.end()
+
+    first_local = QPointF(35, 45)
+    second_local = QPointF(55, 65)
+    canvas._tool_press(
+        canvas.document_to_widget(
+            canvas._raster_world_point(raster, first_local)
+        ),
+        1.0,
+    )
+    assert canvas._drawing
+    canvas._tool_move(
+        canvas.document_to_widget(
+            canvas._raster_world_point(raster, second_local)
+        ),
+        1.0,
+    )
+    canvas._tool_release()
+
+    assert raster.transform_quad == original_quad
+    assert raster.transform_frame == original_frame
+    assert tiles.content_bounds(raster.object_id).contains(second_local)
+    canvas.command_stack.undo()
+    assert raster.transform_quad == original_quad
+    canvas.command_stack.redo()
+    assert raster.transform_quad == original_quad
+
+    canvas.set_tool(ToolKind.RASTER_ERASER)
+    canvas._tool_press(
+        canvas.document_to_widget(
+            canvas._raster_world_point(raster, second_local)
+        ),
+        1.0,
+    )
+    assert canvas._drawing
+    canvas._tool_release()
+    assert raster.transform_quad == original_quad
+    assert raster.transform_frame == original_frame
+    canvas.command_stack.undo()
+    assert raster.transform_quad == original_quad
 
 
 def test_transform_pivot_double_click_resets_to_follow_live_center(qapp):

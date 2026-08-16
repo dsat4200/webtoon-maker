@@ -164,7 +164,11 @@ Each vector stroke is rasterized independently by `_vector_stroke_image()`:
 6. Fill an ARGB image with the stroke color and apply the mask through `DestinationIn`.
 7. Draw the colored image into the stroke's document-space target rectangle.
 
-The cache key includes drawing ID, stroke ID, stroke render revision, color, closure/caps, rounded render scale, and device ratio. Live selection previews use a transient token. Cache hits are reinserted to approximate recency, and the cache is capped at 384 stroke images.
+The cache key includes drawing ID, stroke ID, stroke render revision, color, closure/caps, rounded render scale, and device ratio. Live selection and eraser previews use transient per-stroke tokens. Cache hits are reinserted for LRU recency. Each canvas session has a 64 MiB byte budget; selective invalidation updates byte accounting, and a single image larger than the budget is rendered but not retained.
+
+Each drawing also builds a lazy 256-document-unit spatial index keyed by its drawing revision. Visible queries union only intersecting cells, sort their stroke indexes to retain paint order, and fall back to live geometry during edits that have not yet committed a new revision. Very large queries filter occupied cells instead of enumerating an unbounded grid.
+
+The vector eraser keeps the committed model unchanged until release. Its live pass uses a device-pixel-aware scene image rendered without the active drawing, then composites unchanged strokes and the newest replacement strokes over that background. Dirty bounds are mapped through the drawing's persistent transform, affected strokes receive independent preview revisions, and the background/preview images are cleared on commit, cancel, selection/document changes, and errors.
 
 Vector fills paint first, in reverse owner order, and strokes paint afterward. A fill is a closed `BoundGeometry` drawn with `fillPath()`.
 
@@ -249,7 +253,9 @@ All mouse, tablet, wheel, touch, key, double-click, and IME events enter the can
 
 ## Navigation performance
 
-Touch hardware may report more events than a full recursive render can sustain. The canvas therefore keeps only the newest touch packet and applies it with a zero-delay single-shot timer. Each applied packet updates the camera and live-renders the document, avoiding transformed viewport-screenshot boundaries during pan, zoom, and rotation.
+Touch hardware and high-frequency desktop pen input may report more events than a full recursive render can sustain. Touch navigation and modifier-drag mouse/pen navigation therefore keep only their newest pending packet and apply it with a zero-delay single-shot timer. Release synchronously applies the final pointer position. Each packet updates camera layout, clipping, transforms, overlays, and newly revealed content live; no viewport screenshot is stretched.
+
+Vector stroke bitmaps are reused at unchanged scale for pan and rotation. Alt+Shift drag zoom, touch pinch, and Ctrl+wheel bursts temporarily reuse vector bitmaps from the gesture's starting scale while the rest of the scene stays live. Release/touch completion, or 120 ms without another Ctrl+wheel event, clears that override and performs one crisp final-scale redraw. Alt+Shift drag zoom also preserves the initial click's document point at its original widget-space position while scale changes.
 
 ## Rendering invariants and limitations
 

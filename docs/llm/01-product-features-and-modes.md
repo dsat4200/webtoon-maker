@@ -94,6 +94,7 @@ The application intentionally does not implement scheduling, reference libraries
   - **Point** subtracts the swept corridor and keeps surviving cubic spans.
   - **Intersection** removes from the touched portion to the nearest centerline intersections.
 - The eraser hit metric follows the circular/square eraser shape and accounts for variable stroke width.
+- Vector erasing previews the complete cut from the initial press while keeping the drawing model unchanged until release, so the gesture still creates one undoable command.
 - **Vector Redraw** changes point thickness or opacity. Manual Redraw maps pressure directly up to a configured maximum. Point Select mode applies Increase, Decrease, or Uniform operations to selected points first, then selected strokes, then all strokes.
 - **Vector Connect** sweeps across two endpoints and joins them with a tangent bridge while retaining the first stroke's visual style.
 - **Sweep Simplify** uses a screen-stable orange circular preview and a spatial anchor grid. It simplifies only covered anchors and incident cubic spans. **Apply** uses selected points, then strokes, then the whole drawing.
@@ -161,9 +162,16 @@ The application intentionally does not implement scheduling, reference libraries
 
 ## Navigation and input
 
-- Alt-drag pans, Shift-drag rotates, and Alt+Shift-drag zooms.
-- Mouse wheel scrolls vertically; Ctrl+wheel zooms.
+- Alt-drag pans, Shift-drag rotates, and Alt+Shift-drag zooms. Drag zoom keeps
+  the document point beneath the initial click fixed at that screen position;
+  dragging right zooms in and dragging left zooms out.
+- Mouse wheel scrolls vertically; Ctrl+wheel zooms around the viewport center.
 - The camera transform is centered, rotated, uniformly scaled, then translated to the document center. Camera centers are snapped in device space to reduce blur.
+- High-frequency mouse and pen navigation packets are coalesced to the newest
+  position per event-loop frame, with the final release position always applied.
+- During drag zoom, touch pinch, and Ctrl+wheel bursts, vector strokes reuse their
+  starting-scale images while layout and newly revealed content remain live. A
+  crisp vector redraw follows release/touch completion or a short wheel pause.
 - **Tablet navigation** enables touch navigation. One finger pans with the finger; two fingers pan, pinch, and twist around a stable centroid.
 - Touch input is coalesced to one application per event-loop turn and live-renders the document under the updated camera transform.
 - Stylus events are handled separately from synthesized mouse events. Popup and outliner forwarding allow buttonless stylus taps.

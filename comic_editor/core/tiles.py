@@ -228,10 +228,33 @@ class TileStore:
         if local_rect is None:
             yield from object_tiles.items()
             return
-        for key in self.keys_for_rect(local_rect):
-            image = object_tiles.get(key)
-            if image is not None:
-                yield key, image
+        if local_rect.isEmpty() or not object_tiles:
+            return
+        edges = (
+            local_rect.left(), local_rect.right(),
+            local_rect.top(), local_rect.bottom(),
+        )
+        if not all(math.isfinite(value) for value in edges):
+            yield from object_tiles.items()
+            return
+        left = math.floor(local_rect.left() / self.tile_size)
+        right = math.floor(local_rect.right() / self.tile_size)
+        top = math.floor(local_rect.top() / self.tile_size)
+        bottom = math.floor(local_rect.bottom() / self.tile_size)
+        if right < left or bottom < top:
+            return
+        candidate_count = (right - left + 1) * (bottom - top + 1)
+        if candidate_count <= max(64, len(object_tiles) * 2):
+            for tile_y in range(top, bottom + 1):
+                for tile_x in range(left, right + 1):
+                    key = (tile_x, tile_y)
+                    image = object_tiles.get(key)
+                    if image is not None:
+                        yield key, image
+            return
+        for (tile_x, tile_y), image in object_tiles.items():
+            if left <= tile_x <= right and top <= tile_y <= bottom:
+                yield (tile_x, tile_y), image
 
     def remove_object(self, object_id: str) -> None:
         self._tiles.pop(object_id, None)

@@ -320,7 +320,7 @@ The application-wide dark Qt stylesheet. It styles toolbars, scroll areas, split
 
 ### `tests/smoke_canvas_latency.py`
 
-An opt-in offscreen performance gate for 800-move raster/vector pencil and eraser gestures plus cached free-text transforms. It reports median-run input/frame P95, commit latency, and long-gesture growth; the input and frame limits are 8 ms and 16.7 ms respectively.
+An opt-in offscreen performance gate for 800-move raster/vector pencil and eraser gestures, cached free-text transforms, and warmed navigation over 550 vector strokes. It reports median-run input/frame P95, commit latency, and long-gesture growth; the input and frame limits are 8 ms and 16.7 ms respectively.
 
 ### `tests/conftest.py`
 

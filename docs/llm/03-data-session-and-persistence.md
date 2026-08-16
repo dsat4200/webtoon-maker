@@ -299,7 +299,8 @@ The canvas holds:
 - vector samples, sweep paths, selections, preview payloads, connect endpoints, and pre-gesture object graph;
 - drawing-selection geometry, transform quad, pivot, and raster/vector before state;
 - page-creation and page-gap staged transaction state; and
-- compound/vector/gradient/navigation/transform render caches.
+- compound/vector/gradient/navigation/transform render caches, including the
+  vector cache's byte count and lazy per-drawing spatial indexes.
 
 Selection, camera position, command history, active tool, gesture state, local text undo, and render caches are not written into project JSON or recovery autosaves. Switching project tabs retains the committed state in memory; switching chapters inside a series still binds a new chapter/tile store and resets chapter-local transient state.
 

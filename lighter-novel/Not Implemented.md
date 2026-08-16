@@ -1,3 +1,19 @@
+## synced image support
+- use an image that streams itself from blender, actively reloading when refreshed every second?
+- use a literal actual blender window, displaying it below our window somehow.
+
+bugs:
+- [x] when zooming in and out, sometimes the transform type button flashes between each corner of a raster object, or starts flipping around in a vector object
+- [x] drawing in a vector after transforming it causes the pencil to draw in an offset position. 
+- [x] drawing in a raster object after transforming it causes the program to crash.
+- [ ] vector edit point preview in a scaled object shows the non-transformed points.
+![[Pasted image 20260816003707.png]]
+
+non-tablet mode navigation changes:
+- when scaling using modifier keys + pen click and drag, zooming in should act like clip studio paint, where the first place you clicked before dragging on the canvas (in screen space, mind you) should be where the zooming in happens towards (where dragging right zooms in, left out.)
+- the pivot for rotating the canvas should act the same way
+
+
 ## Raster/Vector object / pencil features
 psd brush support?
 - add brushes to tool settings ribbon (raster/vector pencil) (with preview of a small, curved stroke segment in a square live preview icon, from zero pressure to 100, swoop curve )

@@ -239,6 +239,77 @@ def run_text_transform() -> dict[str, float]:
     return result
 
 
+def run_dense_vector_navigation() -> dict[str, float]:
+    """Exercise warmed pan and balanced-live zoom above the old 384 cap."""
+    chapter = ChapterDocument()
+    page = chapter.add_page(
+        "Page", BoundGeometry.rectangle(0, 0, 1800, 1800)
+    )
+    layer = chapter.add_layer(
+        page.layer_id, "Dense vectors",
+        BoundGeometry.rectangle(0, 0, 1800, 1800),
+    )
+    strokes = [
+        VectorStroke(points=[
+            VectorStrokePoint(
+                x=100 + (index % 20) * 70,
+                y=100 + (index // 20) * 32,
+                width=4,
+            ),
+            VectorStrokePoint(
+                x=145 + (index % 20) * 70,
+                y=110 + (index // 20) * 32,
+                width=4,
+            ),
+        ])
+        for index in range(550)
+    ]
+    drawing = chapter.add_object(
+        layer.layer_id, VectorDrawingObject(strokes=strokes)
+    )
+    canvas = CanvasWidget(EditorSettings(
+        snap_to_grid=False, predictive_ink=False,
+        canvas_renderer="raster",
+    ))
+    canvas.resize(1000, 800)
+    canvas.set_document(chapter, TileStore())
+    canvas.center_x, canvas.center_y, canvas.scale = 800, 700, 0.75
+    canvas.set_selection("object", drawing.object_id)
+    canvas.show()
+    QApplication.processEvents()
+    QApplication.processEvents()
+
+    frames: list[float] = []
+    start = QPointF(500, 400)
+    canvas._begin_navigation("pan", start)
+    for index in range(60):
+        started = time.perf_counter_ns()
+        canvas._update_navigation(start + QPointF(index % 24, index % 11))
+        QApplication.processEvents()
+        frames.append((time.perf_counter_ns() - started) / 1_000_000)
+    canvas._end_navigation()
+
+    canvas._begin_navigation("zoom", start)
+    for index in range(60):
+        started = time.perf_counter_ns()
+        canvas._update_navigation(start + QPointF((index % 20) - 10, 0))
+        QApplication.processEvents()
+        frames.append((time.perf_counter_ns() - started) / 1_000_000)
+    started = time.perf_counter_ns()
+    canvas._end_navigation()
+    QApplication.processEvents()
+    commit = (time.perf_counter_ns() - started) / 1_000_000
+    result = {
+        "input_p95_ms": percentile(frames, 0.95),
+        "frame_p95_ms": canvas.performance_snapshot()["frame_p95_ms"],
+        "commit_ms": commit,
+        "growth": 1.0,
+    }
+    canvas.close()
+    QApplication.processEvents()
+    return result
+
+
 def median_runs(function) -> dict[str, float]:
     function()  # warm Qt, painters, caches, and imports
     runs = [function() for _ in range(3)]
@@ -256,6 +327,9 @@ def main() -> int:
         "vector_pencil": median_runs(lambda: run_pencil("vector")),
         "vector_eraser": median_runs(lambda: run_eraser("vector")),
         "text_transform": median_runs(run_text_transform),
+        "dense_vector_navigation": median_runs(
+            run_dense_vector_navigation
+        ),
     }
     print(json.dumps(results, indent=2, sort_keys=True))
     failures: list[str] = []
