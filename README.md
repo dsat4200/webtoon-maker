@@ -42,6 +42,7 @@ workflow.
 - Per-layer inherited or overridden grids
 - Pixel-snapped pan, zoom, rotation, and aspect-preserving chapter preview navigation
 - Touch navigation controlled only by Tablet Navigation mode
+- Shape-bound 3D Frame objects backed by one shared live Blender scene on Windows
 - Command-based undo/redo and atomic autosave recovery
 
 ## Run
@@ -151,6 +152,27 @@ Page-gap edits and page insertion are undoable, and the chapter grows with a
 With Tablet navigation enabled, one finger pans in the finger's direction.
 Two fingers pan, pinch-zoom, and twist-rotate around their centroid without
 snapping or resetting the existing zoom.
+
+## Blender 3D frames (Windows prototype)
+
+Use **Add 3D Frame** while a closed, non-page shape is selected. The resulting
+object always stays behind that shape's other children and uses the shape's
+effective silhouette, compound holes, ancestor masks, and on-screen bounds; it
+has no independent 2D transform. A shape can own one 3D Frame.
+
+All 3D Frames share one lazily launched Blender process and the complete scene
+currently open there. The frame belonging to the nearest selected shape context
+is live, while other frames show labeled placeholders. Switching contexts saves
+and restores each frame's orientation, focal point, distance, projection, lens,
+and camera-view offset/zoom. The `.blend` file remains owned and saved by
+Blender; the comic stores only viewport compositions.
+
+The executable can be selected with `BLENDER_EXECUTABLE`; otherwise the newest
+installed Blender is used. The current diagnostic overlay draws magenta corner
+and center marks above Blender and is permanently click-through. Existing comic
+art is not rendered into that overlay yet. Live 3D content is opaque, and a live
+frame becomes a placeholder while the 2D canvas is rotated because an external
+native window cannot rotate its framebuffer with the canvas.
 
 ## Vector drawings, fills, and colors
 

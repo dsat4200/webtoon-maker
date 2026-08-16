@@ -69,6 +69,10 @@ OBJECT_TYPES.register(ObjectTypeSpec(
     "gradient", object_from_dict, False,
     ("shape_edit", "gradient_tools"),
 ))
+OBJECT_TYPES.register(ObjectTypeSpec(
+    "blender_view", object_from_dict, False, ("object_select",),
+    asset_ready=False,
+))
 
 BOUND_TYPES = BoundTypeRegistry()
 BOUND_TYPES.register(BoundTypeSpec("path", BoundGeometry.from_dict, 2))

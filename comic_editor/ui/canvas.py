@@ -45,7 +45,7 @@ from comic_editor.core.assets import (
     AssetManifest, AssetRepository, entity_visual_bounds, instantiate_asset,
 )
 from comic_editor.core.models import (
-    BoundGeometry, ChapterDocument, ChildRef, ColorFillGradientObject,
+    BlenderViewObject, BoundGeometry, ChapterDocument, ChildRef, ColorFillGradientObject,
     ColorGradientRamp, ColorGradientStop, DocumentObject, GradientObject,
     LineGradientField, LayerNode, RadialGradientField,
     ImageObject, PathContour, PathNode, RasterObject, ShapeStyle, TextObject,
@@ -301,6 +301,7 @@ class _CanvasLogic:
     pageGapConfirmationChanged = Signal(bool)
     transformModeChanged = Signal(str)
     importStatusMessage = Signal(str)
+    blenderRestartRequested = Signal(str)
 
     def __init__(self, settings: EditorSettings, parent=None):
         super().__init__(parent)
@@ -315,6 +316,8 @@ class _CanvasLogic:
         self.active_page_id = ""
         self.active_layer_id = ""
         self.selected_object_id = ""
+        self._active_blender_view_id = ""
+        self._blender_view_status: dict[str, tuple[str, str]] = {}
         self.center_x = 540.0
         self.center_y = 540.0
         self.scale = 0.6
@@ -900,6 +903,8 @@ class _CanvasLogic:
         self.active_page_id = ""
         self.active_layer_id = ""
         self.selected_object_id = ""
+        self._active_blender_view_id = ""
+        self._blender_view_status.clear()
         self._selected_vector_stroke_ids.clear()
         self._selected_vector_point_ids.clear()
         self._clear_vector_render_cache()
@@ -1002,6 +1007,8 @@ class _CanvasLogic:
         self.selected_kind = self.selected_id = ""
         self.active_page_id = self.active_layer_id = ""
         self.selected_object_id = ""
+        self._active_blender_view_id = ""
+        self._blender_view_status.clear()
         self._compound_path_cache.clear()
         self._clear_vector_render_cache()
         self._vector_spatial_indexes.clear()
@@ -1027,6 +1034,8 @@ class _CanvasLogic:
         self._clear_page_gap_editor()
         self.pageGapConfirmationChanged.emit(False)
         self.chapter = ChapterDocument.from_dict(state)
+        self._active_blender_view_id = ""
+        self._blender_view_status.clear()
         self._compound_path_cache.clear()
         self._gradient_geometry_cache.clear()
         self._gradient_scalar_cache.clear()
@@ -1411,6 +1420,8 @@ class _CanvasLogic:
                 self.tool = ToolKind.TEXT_EDIT
             elif activate_default_tool and isinstance(obj, ImageObject):
                 self.tool = ToolKind.OBJECT_SELECT
+            elif activate_default_tool and isinstance(obj, BlenderViewObject):
+                self.tool = ToolKind.OBJECT_SELECT
         else:
             self.selected_object_id = ""
             self.active_layer_id = entity_id
@@ -1628,6 +1639,30 @@ class _CanvasLogic:
 
     def document_to_widget(self, point: QPointF) -> QPointF:
         return self.camera_transform().map(point)
+
+    def set_blender_view_status(
+        self, object_id: str, status: str, message: str = "",
+    ) -> None:
+        """Update transient native-viewport state without touching the model."""
+        next_active = object_id if status == "ready" else ""
+        next_status = (str(status), str(message))
+        if (
+            object_id
+            and self._blender_view_status.get(object_id) == next_status
+            and self._active_blender_view_id == next_active
+        ):
+            return
+        if object_id:
+            self._blender_view_status[object_id] = next_status
+        self._active_blender_view_id = next_active
+        self._invalidate_scene_cache()
+        self.update()
+
+    def clear_blender_view_statuses(self) -> None:
+        self._active_blender_view_id = ""
+        self._blender_view_status.clear()
+        self._invalidate_scene_cache()
+        self.update()
 
     def _set_centered_scale(self, scale: float) -> None:
         """Scale around the visible viewport center without moving the camera."""
@@ -6091,7 +6126,14 @@ class _CanvasLogic:
         if obj.object_id == self._live_underlay_object_id:
             opacity *= 1.0 - self._live_underlay_amount
         painter.setOpacity(opacity)
-        if isinstance(obj, VectorDrawingObject):
+        if isinstance(obj, BlenderViewObject):
+            if not (
+                obj.object_id == self._active_blender_view_id
+                and self._blender_view_status.get(obj.object_id, ("", ""))[0]
+                == "ready"
+            ):
+                self._draw_blender_placeholder(painter, obj)
+        elif isinstance(obj, VectorDrawingObject):
             self._render_vector_drawing(painter, obj, local_visible)
         elif isinstance(obj, GradientObject):
             self._render_gradient(painter, obj, local_visible)
@@ -6103,6 +6145,58 @@ class _CanvasLogic:
             self._render_image_object(painter, obj)
         elif isinstance(obj, TextObject):
             self._draw_text_object(painter, obj)
+        painter.restore()
+
+    def _draw_blender_placeholder(
+        self, painter: QPainter, obj: BlenderViewObject,
+    ) -> None:
+        parent = self.chapter.layers.get(obj.parent_layer_id)
+        if parent is None or parent.bound is None:
+            return
+        path = self.layer_effective_path(parent.layer_id)
+        bounds = path.boundingRect()
+        if bounds.isEmpty():
+            return
+        status, detail = self._blender_view_status.get(
+            obj.object_id, ("inactive", "")
+        )
+        colors = {
+            "loading": ("#252932", "#81A9D6"),
+            "failed": ("#35262A", "#F08B8B"),
+            "rotation": ("#312C24", "#E8B66C"),
+        }
+        background, foreground = colors.get(status, ("#25272C", "#AAB0BB"))
+        painter.save()
+        painter.setClipPath(path, Qt.IntersectClip)
+        painter.fillPath(path, QColor(background))
+        spacing = max(24.0, 48.0 / max(self.scale, 0.05))
+        painter.setPen(QPen(QColor("#343841"), 1.0 / max(self.scale, 0.05)))
+        x = math.floor(bounds.left() / spacing) * spacing
+        while x <= bounds.right():
+            painter.drawLine(QPointF(x, bounds.top()), QPointF(x, bounds.bottom()))
+            x += spacing
+        y = math.floor(bounds.top() / spacing) * spacing
+        while y <= bounds.bottom():
+            painter.drawLine(QPointF(bounds.left(), y), QPointF(bounds.right(), y))
+            y += spacing
+        font = painter.font()
+        font.setPixelSize(max(8, round(15 / max(self.scale, 0.05))))
+        font.setBold(True)
+        painter.setFont(font)
+        painter.setPen(QColor(foreground))
+        label = {
+            "loading": "Starting Blender…",
+            "failed": "Blender disconnected — double-click to restart",
+            "rotation": "3D Frame hidden while canvas is rotated",
+            "inactive": "3D Frame — select this shape to activate",
+        }.get(status, "3D Frame")
+        if detail and status == "failed":
+            label = f"{label}\n{detail}"
+        painter.drawText(
+            bounds.adjusted(12, 12, -12, -12),
+            Qt.AlignCenter | Qt.TextWordWrap,
+            label,
+        )
         painter.restore()
 
     def _render_raster_content(
@@ -8907,6 +9001,15 @@ class _CanvasLogic:
         if obj is None:
             return None
         layer_x, layer_y = self.chapter.layer_world_translation(obj.parent_layer_id)
+        if isinstance(obj, BlenderViewObject):
+            parent = self.chapter.layers.get(obj.parent_layer_id)
+            if parent is None or parent.bound is None:
+                return None
+            bounds = self.layer_effective_path(parent.layer_id).boundingRect()
+            return [
+                (x + layer_x, y + layer_y)
+                for x, y in self._rect_quad(bounds)
+            ]
         if isinstance(obj, TextObject):
             local_quad = (
                 self._rect_quad(self._strict_text_rect(obj))
@@ -9160,6 +9263,12 @@ class _CanvasLogic:
     ) -> bool:
         if not obj.visible:
             return False
+        if isinstance(obj, BlenderViewObject):
+            layer_x, layer_y = self.chapter.layer_world_translation(
+                obj.parent_layer_id
+            )
+            local = QPointF(point.x() - layer_x, point.y() - layer_y)
+            return self.layer_effective_path(obj.parent_layer_id).contains(local)
         if isinstance(obj, SpeedLineCenterObject):
             return False
         if isinstance(obj, VectorDrawingObject):
@@ -10031,6 +10140,22 @@ class _CanvasLogic:
             self._tool_release()
 
     def mouseDoubleClickEvent(self, event: QMouseEvent) -> None:  # noqa: N802
+        if self.chapter is not None:
+            world = self.widget_to_document(event.position())
+            frame_id = next((
+                object_id for object_id in self.hit_test_objects(world)
+                if isinstance(
+                    self.chapter.objects.get(object_id), BlenderViewObject
+                )
+            ), "")
+            if frame_id:
+                status = self._blender_view_status.get(
+                    frame_id, ("inactive", "")
+                )[0]
+                if status in {"failed", "loading"}:
+                    self.blenderRestartRequested.emit(frame_id)
+                    event.accept()
+                    return
         if (
             self.chapter is not None
             and self._reset_transform_pivot_at(
@@ -15750,6 +15875,28 @@ class _CanvasLogic:
         ):
             return False
         layer = self.chapter.layers[layer_id]
+
+        flattened_blender_ids: list[str] = []
+
+        def collect_flattened_blender_frames(candidate: LayerNode) -> None:
+            for reference in candidate.children:
+                if reference.kind == "object":
+                    if isinstance(
+                        self.chapter.objects.get(reference.entity_id),
+                        BlenderViewObject,
+                    ):
+                        flattened_blender_ids.append(reference.entity_id)
+                    continue
+                child = self.chapter.layers[reference.entity_id]
+                if (
+                    child.compound_operation != "ignore" and child.visible
+                    and child.layer_kind != "fill"
+                ):
+                    collect_flattened_blender_frames(child)
+
+        collect_flattened_blender_frames(layer)
+        if len(flattened_blender_ids) > 1:
+            return False
         calculated = self.layer_effective_path(layer_id)
         geometry = self._geometry_from_painter_path(calculated)
         if geometry is None:
@@ -15768,6 +15915,10 @@ class _CanvasLogic:
             return factor
 
         def reparent_object(obj: DocumentObject) -> ChildRef:
+            if isinstance(obj, BlenderViewObject):
+                obj.parent_layer_id = layer_id
+                obj.validate_blender_view()
+                return ChildRef("object", obj.object_id)
             old_x, old_y = self.chapter.layer_world_translation(
                 obj.parent_layer_id
             )
@@ -15884,7 +16035,23 @@ class _CanvasLogic:
                 removed_layers.add(child.layer_id)
         for removed_id in removed_layers:
             self.chapter.layers.pop(removed_id, None)
-        layer.children = rebuilt
+        layer.children = [
+            reference for reference in rebuilt
+            if not (
+                reference.kind == "object"
+                and isinstance(
+                    self.chapter.objects.get(reference.entity_id),
+                    BlenderViewObject,
+                )
+            )
+        ] + [
+            reference for reference in rebuilt
+            if reference.kind == "object"
+            and isinstance(
+                self.chapter.objects.get(reference.entity_id),
+                BlenderViewObject,
+            )
+        ]
         layer.bound = geometry
         layer.layer_kind = "bounded"
         layer.compound_enabled = False

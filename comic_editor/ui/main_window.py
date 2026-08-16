@@ -27,7 +27,7 @@ from PySide6.QtWidgets import (
 )
 
 from comic_editor.core.models import (
-    BoundGeometry, ChapterDocument, ColorFillGradientObject,
+    BlenderViewObject, BoundGeometry, ChapterDocument, ColorFillGradientObject,
     ColorGradientRamp, ColorGradientRampPreset, ColorGradientStop,
     ColorPalette, GradientObject, PaletteSwatch, PathNode,
     ImageObject, RasterObject, SpeedLineCenterObject, SpeedLinesGradientObject,
@@ -66,6 +66,7 @@ from comic_editor.ui.tree_model import HierarchyModel
 from comic_editor.ui.asset_library import AssetLibraryWidget
 from comic_editor.ui.sessions import EditorSession, ProjectContext
 from comic_editor.ui.windows_input import tablet_multitouch_native_result
+from comic_editor.ui.blender_viewport import BlenderViewportController
 
 
 class ResponsiveToolButton(QToolButton):
@@ -258,6 +259,13 @@ class MainWindow(QMainWindow):
         self._loading_chapter = False
         self._build_ui()
         self._connect()
+        self.blender_viewport = BlenderViewportController(self, self.canvas)
+        self.blender_viewport.viewStateUpdated.connect(
+            lambda _object_id: self._mark_dirty(None)
+        )
+        self.blender_viewport.errorOccurred.connect(
+            lambda message: self.statusBar().showMessage(message, 7000)
+        )
         self._install_shortcuts()
         self._refresh_actions()
         self.statusBar().showMessage("Create or open a series")
@@ -401,12 +409,16 @@ class MainWindow(QMainWindow):
         self.add_vector_button = ResponsiveToolButton(
             "Add Vector Drawing", "curve-array"
         )
+        self.add_blender_button = ResponsiveToolButton(
+            "Add 3D Frame", "frame-tool"
+        )
         self.add_fill_button = ResponsiveToolButton("Add Fill", "fill-color")
         self.tool_toolbar.addWidget(self.add_page_button)
         self.tool_toolbar.addWidget(self.add_fill_button)
         self.tool_toolbar.addWidget(self.add_text_button)
         self.tool_toolbar.addWidget(self.add_raster_button)
         self.tool_toolbar.addWidget(self.add_vector_button)
+        self.tool_toolbar.addWidget(self.add_blender_button)
         self.page_scope = QCheckBox("Select in page")
         self.page_scope.setChecked(self.settings.page_scope_select)
         # Kept as an attribute for compatibility with older integrations;
@@ -903,6 +915,7 @@ class MainWindow(QMainWindow):
         self.add_page_button.clicked.connect(self._add_page)
         self.add_raster_button.clicked.connect(self._add_raster)
         self.add_vector_button.clicked.connect(self._add_vector_drawing)
+        self.add_blender_button.clicked.connect(self._add_blender_view)
         self.add_text_button.clicked.connect(self._add_text)
         self.add_fill_button.clicked.connect(self._add_fill)
 
@@ -1514,6 +1527,8 @@ class MainWindow(QMainWindow):
         session = self.active_session
         if session is None or self.chapter is None:
             return
+        if hasattr(self, "blender_viewport"):
+            self.blender_viewport.flush_active_view_state()
         state = self.canvas.capture_session_state()
         if state is not None:
             session.canvas_state = state
@@ -2211,6 +2226,38 @@ class MainWindow(QMainWindow):
         )
         self._after_structure(drawing.object_id, "object")
         self._activate_tool(ToolKind.RASTER_PENCIL)
+
+    def _eligible_blender_parent(self):
+        parent = self._selected_parent_layer(allow_page=False)
+        if (
+            parent is None or self.chapter is None
+            or self.chapter.document_kind != "chapter"
+            or parent.layer_kind != "bounded" or parent.bound is None
+            or not parent.bound.closed
+            or self.chapter.blender_view_for_layer(parent.layer_id) is not None
+        ):
+            return None
+        return parent
+
+    def _add_blender_view(self) -> None:
+        parent = self._eligible_blender_parent()
+        if parent is None or self.chapter is None:
+            self.statusBar().showMessage(
+                "Select a closed non-page shape without a 3D Frame first",
+                5000,
+            )
+            return
+        before = self.chapter.to_dict()
+        count = sum(
+            isinstance(item, BlenderViewObject)
+            for item in self.chapter.objects.values()
+        ) + 1
+        frame = BlenderViewObject(name=f"3D Frame {count}")
+        self.chapter.add_object(parent.layer_id, frame)
+        after = self.chapter.to_dict()
+        self.canvas.push_model_change(before, after, "Add 3D Frame")
+        self._after_structure(frame.object_id, "object")
+        self.canvas.set_tool(ToolKind.OBJECT_SELECT)
 
     def _add_fill(self) -> None:
         parent = self._selected_parent_layer()
@@ -3895,6 +3942,8 @@ class MainWindow(QMainWindow):
             return self._save_editor_session(self.active_session)
         if self.repository is None or self.chapter is None:
             return False
+        if hasattr(self, "blender_viewport"):
+            self.blender_viewport.flush_active_view_state()
         try:
             self.repository.save_chapter(
                 self.chapter, self.canvas.tiles, self.canvas.images
@@ -4368,6 +4417,9 @@ class MainWindow(QMainWindow):
         self.redo_action.setEnabled(self.canvas.command_stack.can_redo)
         self.add_raster_button.setEnabled(active)
         self.add_vector_button.setEnabled(active)
+        self.add_blender_button.setEnabled(
+            active and self._eligible_blender_parent() is not None
+        )
         self.add_text_button.setEnabled(active)
         self.add_fill_button.setEnabled(active)
         self._sync_tool_buttons()
@@ -4404,4 +4456,6 @@ class MainWindow(QMainWindow):
             if application is not None:
                 application.removeEventFilter(self)
             self._application_event_filter_installed = False
+        if hasattr(self, "blender_viewport"):
+            self.blender_viewport.shutdown()
         event.accept()

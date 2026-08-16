@@ -8,7 +8,7 @@ from PySide6.QtCore import QAbstractItemModel, QMimeData, QModelIndex, Qt, Signa
 from PySide6.QtGui import QColor
 
 from comic_editor.core.models import (
-    ChapterDocument, GradientObject, LayerNode, SpeedLinesGradientObject,
+    BlenderViewObject, ChapterDocument, GradientObject, LayerNode, SpeedLinesGradientObject,
     TextObject, VectorDrawingObject, VectorFillObject,
 )
 
@@ -167,6 +167,8 @@ class HierarchyModel(QAbstractItemModel):
                     if isinstance(entity, SpeedLinesGradientObject):
                         return "Speed Lines"
                     return "Gradient"
+                if isinstance(entity, BlenderViewObject):
+                    return "3D Frame"
                 return entity.object_type.title()
             if index.column() == 2:
                 return f"{round(entity.opacity * 100)}%"
@@ -181,6 +183,11 @@ class HierarchyModel(QAbstractItemModel):
                 return (
                     "Editable vector strokes. Its Vector Fill objects are "
                     "ordered beneath it."
+                )
+            if isinstance(entity, BlenderViewObject):
+                return (
+                    "Shared Blender scene view. It always uses its parent "
+                    "shape and remains behind that shape's other content."
                 )
             return "Drag objects between page or container layers."
         if role == Qt.BackgroundRole:
@@ -296,6 +303,20 @@ class HierarchyModel(QAbstractItemModel):
             self.chapter.objects.get(payload["id"])
             if payload["kind"] == "object" else None
         )
+        if isinstance(moving_object, BlenderViewObject):
+            if item.kind != "layer":
+                return False
+            parent = self.chapter.layers[item.entity_id]
+            existing = self.chapter.blender_view_for_layer(parent.layer_id)
+            return bool(
+                self.chapter.document_kind == "chapter"
+                and not parent.is_page and parent.layer_kind == "bounded"
+                and parent.bound is not None and parent.bound.closed
+                and (
+                    existing is None
+                    or existing.object_id == moving_object.object_id
+                )
+            )
         if isinstance(moving_object, VectorFillObject):
             return False
         if (

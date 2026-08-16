@@ -13,7 +13,7 @@ from PySide6.QtCore import QRectF, Qt
 from PySide6.QtGui import QImage
 
 from .models import (
-    BoundGeometry, ChapterDocument, ChildRef, ColorFillGradientObject,
+    BlenderViewObject, BoundGeometry, ChapterDocument, ChildRef, ColorFillGradientObject,
     DocumentObject, GradientObject, ImageObject, LayerNode, RasterObject, ShapeStyle,
     SpeedLineCenterObject, SpeedLinesGradientObject, TextObject,
     VectorDrawingObject, VectorFillObject, new_id, object_from_dict,
@@ -97,6 +97,10 @@ def _translate_object(obj: DocumentObject, dx: float, dy: float,
 
 def _object_local_bounds(obj: DocumentObject, document: ChapterDocument,
                          tiles: TileStore) -> QRectF:
+    if isinstance(obj, BlenderViewObject):
+        parent = document.layers.get(obj.parent_layer_id)
+        if parent is not None and parent.bound is not None:
+            return QRectF(*parent.bound.bbox())
     if isinstance(obj, (RasterObject, VectorDrawingObject, ImageObject)) \
             and obj.transform_quad:
         xs = [point[0] for point in obj.transform_quad]
@@ -332,6 +336,11 @@ def extract_asset(
         raise KeyError(entity_id)
 
     layer_ids, object_ids = _collect_subtree(document, kind, entity_id)
+    if any(
+        isinstance(document.objects[object_id], BlenderViewObject)
+        for object_id in object_ids
+    ):
+        raise ValueError("Blender frames cannot be stored as reusable assets")
     asset = ChapterDocument(
         name=name.strip() or "Asset", width=512, height=512,
         background="#00000000", document_kind="asset",

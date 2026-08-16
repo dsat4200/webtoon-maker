@@ -7,7 +7,7 @@ from dataclasses import dataclass, field
 from typing import Any, Iterable, Iterator, Literal
 
 
-SCHEMA_VERSION = 15
+SCHEMA_VERSION = 16
 CHAPTER_WIDTH = 1080
 DEFAULT_CHAPTER_HEIGHT = 3240
 GROWTH_MARGIN = 1080
@@ -767,6 +767,100 @@ class DocumentObject:
 
     def to_dict(self) -> dict[str, Any]:
         return self.common_dict()
+
+
+@dataclass
+class BlenderViewportState:
+    """Serializable composition for one comic frame's shared Blender view."""
+
+    rotation: tuple[float, float, float, float] = (1.0, 0.0, 0.0, 0.0)
+    location: tuple[float, float, float] = (0.0, 0.0, 0.0)
+    distance: float = 10.0
+    perspective: Literal["PERSP", "ORTHO", "CAMERA"] = "PERSP"
+    lens: float = 50.0
+    camera_zoom: float = 0.0
+    camera_offset: tuple[float, float] = (0.0, 0.0)
+
+    def validate(self) -> None:
+        values = (
+            *self.rotation, *self.location, self.distance, self.lens,
+            self.camera_zoom, *self.camera_offset,
+        )
+        if not all(math.isfinite(float(value)) for value in values):
+            raise ValueError("Blender viewport state requires finite values")
+        magnitude = math.sqrt(sum(float(value) ** 2 for value in self.rotation))
+        if magnitude <= 1e-12:
+            self.rotation = (1.0, 0.0, 0.0, 0.0)
+        else:
+            self.rotation = tuple(
+                float(value) / magnitude for value in self.rotation
+            )
+        self.location = tuple(float(value) for value in self.location)
+        self.distance = max(0.0, float(self.distance))
+        if self.perspective not in {"PERSP", "ORTHO", "CAMERA"}:
+            raise ValueError("Unknown Blender viewport projection")
+        self.lens = max(1.0, min(250.0, float(self.lens)))
+        self.camera_zoom = max(-30.0, min(600.0, float(self.camera_zoom)))
+        self.camera_offset = tuple(float(value) for value in self.camera_offset)
+
+    def to_dict(self) -> dict[str, Any]:
+        self.validate()
+        return {
+            "rotation": list(self.rotation),
+            "location": list(self.location),
+            "distance": self.distance,
+            "perspective": self.perspective,
+            "lens": self.lens,
+            "camera_zoom": self.camera_zoom,
+            "camera_offset": list(self.camera_offset),
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any] | None) -> "BlenderViewportState | None":
+        if data is None:
+            return None
+        rotation = data.get("rotation", [1.0, 0.0, 0.0, 0.0])
+        location = data.get("location", [0.0, 0.0, 0.0])
+        camera_offset = data.get("camera_offset", [0.0, 0.0])
+        if len(rotation) != 4 or len(location) != 3 or len(camera_offset) != 2:
+            raise ValueError("Invalid Blender viewport state dimensions")
+        result = cls(
+            rotation=tuple(float(value) for value in rotation),
+            location=tuple(float(value) for value in location),
+            distance=float(data.get("distance", 10.0)),
+            perspective=str(data.get("perspective", "PERSP")),
+            lens=float(data.get("lens", 50.0)),
+            camera_zoom=float(data.get("camera_zoom", 0.0)),
+            camera_offset=tuple(float(value) for value in camera_offset),
+        )
+        result.validate()
+        return result
+
+
+@dataclass
+class BlenderViewObject(DocumentObject):
+    object_type: str = "blender_view"
+    name: str = "3D Frame"
+    view_state: BlenderViewportState | None = None
+
+    def validate_blender_view(self) -> None:
+        self.x = 0.0
+        self.y = 0.0
+        self.opacity = 1.0
+        self.opacity_locked = True
+        self.geometry_reference = "direct"
+        self.ignore_parent_mask = False
+        self.underlay_opacity = 0.0
+        if self.view_state is not None:
+            self.view_state.validate()
+
+    def to_dict(self) -> dict[str, Any]:
+        self.validate_blender_view()
+        result = self.common_dict()
+        result["view_state"] = (
+            self.view_state.to_dict() if self.view_state is not None else None
+        )
+        return result
 
 
 @dataclass
@@ -1651,7 +1745,7 @@ class VectorFillObject(DocumentObject):
 
 
 ObjectEntity = (
-    RasterObject | ImageObject | TextObject | GradientObject
+    RasterObject | ImageObject | TextObject | GradientObject | BlenderViewObject
     | VectorDrawingObject | VectorFillObject
     | SpeedLineCenterObject | DocumentObject
 )
@@ -1671,6 +1765,13 @@ def object_from_dict(data: dict[str, Any]) -> ObjectEntity:
         underlay_opacity=float(data.get("underlay_opacity", 0.0)),
     )
     object_type = str(data.get("type", "object"))
+    if object_type == "blender_view":
+        result = BlenderViewObject(
+            **common,
+            view_state=BlenderViewportState.from_dict(data.get("view_state")),
+        )
+        result.validate_blender_view()
+        return result
     if object_type == "gradient":
         gradient_type = str(data.get("gradient_type", "color_fill"))
         gradient_common = dict(
@@ -1935,6 +2036,26 @@ class ChapterDocument:
                         raise ValueError("Invalid child object")
                 else:
                     raise ValueError(f"Unknown child kind: {child.kind}")
+            blender_children = [
+                child for child in layer.children
+                if child.kind == "object"
+                and isinstance(
+                    self.objects.get(child.entity_id), BlenderViewObject
+                )
+            ]
+            if len(blender_children) > 1:
+                raise ValueError("A shape can contain only one Blender frame")
+            if blender_children:
+                if (
+                    self.document_kind != "chapter" or layer.is_page
+                    or layer.layer_kind != "bounded" or layer.bound is None
+                    or not layer.bound.closed
+                ):
+                    raise ValueError(
+                        "Blender frames require a closed non-page bounded shape"
+                    )
+                if layer.children[-1] != blender_children[0]:
+                    raise ValueError("Blender frames must remain background-most")
         owned_fill_ids: set[str] = set()
         for obj in self.objects.values():
             try:
@@ -2011,6 +2132,8 @@ class ChapterDocument:
             obj.ignore_parent_mask = bool(obj.ignore_parent_mask)
             if isinstance(obj, VectorFillObject):
                 obj.ignore_parent_mask = bool(owner.ignore_parent_mask)
+            if isinstance(obj, BlenderViewObject):
+                obj.validate_blender_view()
             if obj.geometry_reference not in {"direct", "compound"}:
                 obj.geometry_reference = "direct"
             if isinstance(obj, RasterObject):
@@ -2136,12 +2259,7 @@ class ChapterDocument:
         )
         self.layers[layer.layer_id] = layer
         reference = ChildRef("layer", layer.layer_id)
-        if index is None:
-            parent.children.append(reference)
-        else:
-            parent.children.insert(
-                max(0, min(int(index), len(parent.children))), reference
-            )
+        self._insert_foreground_child(parent, reference, index)
         return layer
 
     def add_fill_layer(
@@ -2170,6 +2288,18 @@ class ChapterDocument:
         parent = self.layers[parent_id]
         if parent.layer_kind == "fill":
             raise ValueError("Objects require a container layer")
+        if isinstance(obj, BlenderViewObject):
+            if (
+                self.document_kind != "chapter" or parent.is_page
+                or parent.layer_kind != "bounded" or parent.bound is None
+                or not parent.bound.closed
+            ):
+                raise ValueError(
+                    "Blender frames require a closed non-page bounded shape"
+                )
+            if self.blender_view_for_layer(parent_id) is not None:
+                raise ValueError("This shape already has a Blender frame")
+            obj.validate_blender_view()
         if isinstance(obj, GradientObject):
             family = (
                 "speed_lines"
@@ -2185,15 +2315,41 @@ class ChapterDocument:
         obj.parent_layer_id = parent_id
         self.objects[obj.object_id] = obj
         reference = ChildRef("object", obj.object_id)
-        if index is None:
+        if isinstance(obj, BlenderViewObject):
             parent.children.append(reference)
         else:
-            parent.children.insert(
-                max(0, min(int(index), len(parent.children))), reference
-            )
+            self._insert_foreground_child(parent, reference, index)
         if isinstance(obj, RasterObject):
             parent.last_raster_id = obj.object_id
         return obj
+
+    def blender_view_for_layer(self, parent_id: str) -> BlenderViewObject | None:
+        parent = self.layers.get(parent_id)
+        if parent is None:
+            return None
+        for child in parent.children:
+            if child.kind != "object":
+                continue
+            candidate = self.objects.get(child.entity_id)
+            if isinstance(candidate, BlenderViewObject):
+                return candidate
+        return None
+
+    def _insert_foreground_child(
+        self, parent: LayerNode, reference: ChildRef, index: int | None,
+    ) -> None:
+        limit = len(parent.children)
+        if (
+            parent.children
+            and parent.children[-1].kind == "object"
+            and isinstance(
+                self.objects.get(parent.children[-1].entity_id),
+                BlenderViewObject,
+            )
+        ):
+            limit -= 1
+        target = limit if index is None else max(0, min(int(index), limit))
+        parent.children.insert(target, reference)
 
     def gradient_children(
         self, parent_id: str, field_type: str | None = None,
@@ -2365,6 +2521,22 @@ class ChapterDocument:
         new_parent = self.layers[new_parent_id]
         if new_parent.layer_kind == "fill":
             raise ValueError("Leaf layers cannot contain entities")
+        moving_blender = (
+            kind == "object"
+            and isinstance(self.objects.get(entity_id), BlenderViewObject)
+        )
+        if moving_blender:
+            if (
+                self.document_kind != "chapter" or new_parent.is_page
+                or new_parent.layer_kind != "bounded"
+                or new_parent.bound is None or not new_parent.bound.closed
+            ):
+                raise ValueError(
+                    "Blender frames require a closed non-page bounded shape"
+                )
+            existing = self.blender_view_for_layer(new_parent_id)
+            if existing is not None and existing.object_id != entity_id:
+                raise ValueError("This shape already has a Blender frame")
         if kind == "layer":
             cursor: str | None = new_parent_id
             while cursor:
@@ -2401,9 +2573,22 @@ class ChapterDocument:
         old_ref = next(item for item in old_parent.children if item.kind == kind and item.entity_id == entity_id)
         old_index = old_parent.children.index(old_ref)
         old_parent.children.remove(old_ref)
-        if old_parent is new_parent and old_index < index:
-            index -= 1
-        new_parent.children.insert(max(0, min(index, len(new_parent.children))), old_ref)
+        if moving_blender:
+            new_parent.children.append(old_ref)
+        else:
+            if old_parent is new_parent and old_index < index:
+                index -= 1
+            limit = len(new_parent.children)
+            if (
+                new_parent.children
+                and new_parent.children[-1].kind == "object"
+                and isinstance(
+                    self.objects.get(new_parent.children[-1].entity_id),
+                    BlenderViewObject,
+                )
+            ):
+                limit -= 1
+            new_parent.children.insert(max(0, min(index, limit)), old_ref)
         if kind == "layer":
             entity.parent_id = new_parent_id
         else:

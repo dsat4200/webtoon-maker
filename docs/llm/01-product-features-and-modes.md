@@ -152,6 +152,7 @@ The application intentionally does not implement scheduling, reference libraries
 ## Hierarchy, selection, and editing infrastructure
 
 - The outliner mixes layers and objects in one frontmost-first tree. The first child row is visually frontmost; rendering walks lists in reverse to paint back-to-front.
+- A closed non-page shape may own one background-most 3D Frame. On Windows, the nearest selected framed shape receives the single live Blender viewport; other frames are placeholders and retain independent saved viewport compositions for the shared Blender scene.
 - Vector fills appear nested beneath their owner and may only reorder within that owner.
 - Drag/drop validates page-root rules, prevents layer cycles, prevents dropping into fill leaves, preserves object world placement where required, and restores the old graph if validation fails.
 - Tree rebuilds preserve expanded entities and selection by stable ID.

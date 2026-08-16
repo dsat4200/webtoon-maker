@@ -8,7 +8,8 @@ from PySide6.QtWidgets import (
 )
 
 from comic_editor.core.models import (
-    ImageObject, RasterObject, TextObject, VectorDrawingObject, VectorFillObject,
+    BlenderViewObject, ImageObject, RasterObject, TextObject,
+    VectorDrawingObject, VectorFillObject,
 )
 from comic_editor.ui.layer_settings import LayerSettingsPanel
 from comic_editor.ui.tool_ribbon_pages import RasterObjectControls
@@ -81,13 +82,14 @@ class SelectionCommonControls(QWidget):
             enabled
             and self.canvas.selected_kind == "object"
             and hasattr(target, "opacity_locked")
+            and not isinstance(target, BlenderViewObject)
         )
         self.opacity_lock.setVisible(object_target)
         self.opacity_lock.setEnabled(object_target)
         # Opacity locking controls inheritance during rendering.  It does
         # not disable the common edit path: the first real value change
         # snapshots the effective value and unlocks the object atomically.
-        self.opacity.setEnabled(enabled)
+        self.opacity.setEnabled(enabled and not isinstance(target, BlenderViewObject))
         if target is not None:
             self.visible.setChecked(bool(target.visible))
             self._update_visibility_button(bool(target.visible))

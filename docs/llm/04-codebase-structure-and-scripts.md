@@ -118,11 +118,12 @@ Marks the UI package with a PySide6 interface docstring. It has no runtime logic
 
 The canonical saved-data model and invariant layer.
 
-- Declares schema version 14, chapter width 1080, default height 3240, growth margin 1080, and chapter/asset document kinds.
+- Declares schema version 16, chapter width 1080, default height 3240, growth margin 1080, and chapter/asset document kinds.
 - Normalizes colors to canonical ARGB and generates stable UUID IDs.
 - Defines grids, path nodes/contours, shape style, and unified rectangle/ellipse/custom `BoundGeometry`.
 - Defines mixed layer/object child references and `LayerNode` with shape, fill, page, mask, grid, and compound fields.
 - Defines the object hierarchy: base object, Raster, Text, Gradient, color gradient, Vector Drawing, and Vector Fill.
+- Defines the serialized Blender View object and its per-frame viewport composition; the external Blender scene itself is not part of the document.
 - Defines vector stroke points/strokes and gradient field/ramp/preset value objects.
 - Defines `ChapterDocument`, including validation, add/move/reorder/delete operations, vector-fill ownership, gradient uniqueness, inherited grid/opacity queries, compound-ancestor queries, automatic height growth, trimming, render-order iteration, serialization, and legacy migration.
 - Defines `SeriesDocument`, chapter references, color palettes/swatches, gradient presets, and series serialization/migration.
@@ -232,6 +233,17 @@ The largest and most central runtime script.
 - Provides software and OpenGL-backed widget classes plus the OpenGL probe/factory.
 
 See the dedicated canvas document for the rendering pipeline.
+
+### Blender viewport integration
+
+`ui/blender_viewport.py` owns active shape-context selection, effective-mask to
+native-region conversion, HWND geometry/z-order, the opaque external viewport,
+rotation/visibility fallback, and the click-through diagnostic overlay.
+`integrations/blender_process.py` owns executable discovery, `QProcess`, the
+authenticated loopback connection, and view-state requests. The standalone
+`integrations/blender_bootstrap.py` runs inside Blender and touches only
+Blender's `VIEW_3D` state. The canvas knows only the serialized frame object and
+transient placeholder status; drawing tools never import or call Blender.
 
 ### `comic_editor/ui/color_picker.py`
 
