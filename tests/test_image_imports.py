@@ -193,6 +193,7 @@ def test_persistent_raster_transform_keeps_tiles_and_quad(qapp):
     canvas.resize(900, 700)
     canvas.set_document(chapter, tiles, ImageStore())
     canvas.set_selection("object", raster.object_id)
+    canvas.set_tool(ToolKind.TRANSFORM)
     assert canvas._begin_selected_raster_transform(QPointF(120, 120))
     canvas._update_transform_preview(QPointF(80, 90))
     canvas._commit_object_transform()
@@ -255,7 +256,10 @@ def test_vector_pencil_cage_handle_intercepts_without_drawing(qapp):
             VectorStrokePoint(x=230, y=190),
         ])],
     ))
-    canvas = CanvasWidget(EditorSettings(snap_to_grid=False))
+    canvas = CanvasWidget(EditorSettings(
+        snap_to_grid=False,
+        pencil_transform_handles_visible=True,
+    ))
     canvas.resize(900, 700)
     canvas.set_document(chapter, TileStore(), ImageStore())
     canvas.set_selection("object", vector.object_id)
@@ -361,10 +365,13 @@ def test_transform_mode_gizmo_keeps_one_slot_during_camera_changes(
                 (150, 130), (290, 115), (300, 230), (135, 215),
             ],
         ))
-    canvas = CanvasWidget(EditorSettings(snap_to_grid=False))
+    canvas = CanvasWidget(EditorSettings(
+        snap_to_grid=False, pencil_transform_handles_visible=True,
+    ))
     canvas.resize(900, 700)
     canvas.set_document(chapter, TileStore(), ImageStore())
     canvas.set_selection("object", obj.object_id)
+    canvas.set_tool(ToolKind.TRANSFORM)
     canvas.center_x = 250
     canvas.center_y = 190
     canvas.scale = 1.0
@@ -394,7 +401,9 @@ def test_projective_raster_remains_renderable_and_drawable(qapp):
     tiles.paint_dab(
         raster.object_id, QPointF(20, 20), 16, QColor("#111111")
     )
-    canvas = CanvasWidget(EditorSettings(snap_to_grid=False))
+    canvas = CanvasWidget(EditorSettings(
+        snap_to_grid=False, pencil_transform_handles_visible=True,
+    ))
     canvas.resize(900, 700)
     canvas.set_document(chapter, tiles, ImageStore())
     canvas.set_selection("object", raster.object_id)

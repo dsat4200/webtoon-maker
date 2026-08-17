@@ -17,6 +17,7 @@ def default_hotkeys() -> dict[str, str]:
         "fill": "F",
         "object_select": "S",
         "transform": "T",
+        "eyedropper": "I",
         "shape_edit": "B",
         "vector_redraw": "",
         "vector_connect": "",
@@ -30,6 +31,7 @@ def default_hotkeys() -> dict[str, str]:
         "undo": "Ctrl+Z",
         "redo": "Ctrl+Shift+Z",
         "reset_view": "Ctrl+0",
+        "reset_rotation": "Ctrl+Shift+0",
         "toggle_grid": "Alt+G",
         "delete_selected": "Delete",
         "paste_image": "Ctrl+V",
@@ -43,6 +45,7 @@ def default_hotkey_hold() -> dict[str, bool]:
         "fill": False,
         "object_select": False,
         "transform": False,
+        "eyedropper": True,
         "shape_edit": False,
         "vector_redraw": False,
         "vector_connect": False,
@@ -99,7 +102,7 @@ def default_text_presets() -> list[dict]:
 
 @dataclass
 class EditorSettings:
-    settings_version: int = 15
+    settings_version: int = 16
     tablet_mode: bool = False
     brush_size: int = 12
     eraser_size: int = 28
@@ -110,6 +113,11 @@ class EditorSettings:
     canvas_renderer: str = "auto"
     predictive_ink: bool = True
     transform_mode: str = "free"
+    pencil_transform_handles_visible: bool = False
+    eraser_transform_handles_visible: bool = False
+    vector_point_icons_visible: bool = False
+    vector_point_icon_size: int = 80
+    vector_point_icon_opacity: int = 100
     rectangle_edit_mode: str = "normal"
     text_presets: list[dict] = field(default_factory=default_text_presets)
     active_text_preset: str = "Default"
@@ -158,7 +166,7 @@ class EditorSettings:
         self.clamp()
 
     def clamp(self) -> None:
-        self.settings_version = 15
+        self.settings_version = 16
         self.blender_bridge_host = str(
             self.blender_bridge_host or "127.0.0.1"
         ).strip()
@@ -242,6 +250,19 @@ class EditorSettings:
             self.canvas_renderer = "auto"
         if self.transform_mode not in {"free", "uniform"}:
             self.transform_mode = "free"
+        self.pencil_transform_handles_visible = bool(
+            self.pencil_transform_handles_visible
+        )
+        self.eraser_transform_handles_visible = bool(
+            self.eraser_transform_handles_visible
+        )
+        self.vector_point_icons_visible = bool(self.vector_point_icons_visible)
+        self.vector_point_icon_size = max(
+            25, min(200, int(self.vector_point_icon_size))
+        )
+        self.vector_point_icon_opacity = max(
+            0, min(100, int(self.vector_point_icon_opacity))
+        )
         if self.rectangle_edit_mode not in {"normal", "free"}:
             self.rectangle_edit_mode = "normal"
         presets: list[dict] = []
@@ -407,13 +428,24 @@ def load_settings() -> EditorSettings:
                 raw.setdefault("blender_bridge_host", "127.0.0.1")
                 raw.setdefault("blender_bridge_port", 47837)
                 raw.setdefault("blender_bridge_token", "")
+            if int(raw.get("settings_version", 1)) < 16:
+                raw.setdefault("pencil_transform_handles_visible", False)
+                raw.setdefault("eraser_transform_handles_visible", False)
+                raw.setdefault("vector_point_icons_visible", False)
+                raw.setdefault("vector_point_icon_size", 80)
+                raw.setdefault("vector_point_icon_opacity", 100)
+                hotkeys = raw.setdefault("hotkeys", {})
+                holds = raw.setdefault("hotkey_hold", {})
+                hotkeys.setdefault("eyedropper", "I")
+                hotkeys.setdefault("reset_rotation", "Ctrl+Shift+0")
+                holds.setdefault("eyedropper", True)
             raw.pop("transform_snap_to_grid", None)
             stored_presets = raw.get("text_presets")
             if isinstance(stored_presets, list):
                 for preset in stored_presets:
                     if isinstance(preset, dict):
                         preset.pop("transform_snap", None)
-            raw["settings_version"] = 15
+            raw["settings_version"] = 16
             valid = {item.name for item in dataclasses.fields(EditorSettings)}
             result = EditorSettings(**{
                 key: value for key, value in raw.items() if key in valid

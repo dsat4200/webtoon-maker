@@ -2,10 +2,49 @@
 - [x] use an image that streams itself from blender, actively reloading when refreshed every second?
 - [x] use a literal actual blender window, displaying it below our window somehow.
 
+## prompt
+- i still cant drag layers to move them between layers with the stylus
+    
+- dragging the eyedropper should show a circle icon above where you're clicking/dragging that displays the selected color
+    
+- tool options shouln't extend further right, they should wrap to another row beneath if they're too long.
+    
+- allow for selecting multiple objects. doing so lets you drag them to move multiple up and down layers. it also changes the visible tools to only ones that work with multiple objects. for now, that should only be a transform tool (doesn't appear if objects other than raster, vector are selected)
+    
+- for now, multi select should only let you select rasters and vectors
+    
+- add a new tab to the vertical list of options on the left. this tab is for "modifiers"
+    
+- modifiers act like a shader or like a modifier in blender, or an adjustment layer. they aren't visible in the outliner - being attatched to an object. modifier settings should show an "add modifier" button that exposes a list of addable modifiers. for now, the only modifier should be hue/saturation/lightness, and blur)
+    
+    - hsl should have those 3 parameters
+        
+    - blur should have a strength, and 2 modes - full and focal point. full does the whole object/objects. focal point has gui handles (orange)
+        
+        - handle for center, handle for end, and handle for ramp between the two) these 3 handles should appear on a line, with a circle dotted outline around the full radius. translating the center moves all the handles with it.
+            
+- because modifiers are non destructive, drawing, erasing, updating blender objects, etc works like normal, and the modifier will reflect any changes correctly (non destructive and parameterized)
+    
+- modifiers should have their own row/ui element like they do in blender. they appear in a stack that applies from top to bottom, like blender. they can be click dragged from their title to reorder (each modifier should have a title on top, like in blender)
+    
+- modifiers should all have an "intensity" value that appears first on the list. this a horizontal slider from 0 to 100 percent that adjusts how much a modifier is applied.
+    
+- the only modifiers that should appear are ones that exist in the selected object (or in all selected objects if multiple are selected)
+    
+- all modifiers should also have a square chain (link) icon in the top right. when in link select mode, highlight in orange in the outliner which object or objects this modifier is attached to. selecting/deselecting objects or shapes in the outliner adds/removes those from the link state of that modifier. clicking the link button again in this mode toggles things back to normal.
+    
+- when you click add modifier, it should add it to all the currently selected objects, linked. linked modifiers means that the same modifier data/parameters persist between its duplicates in other objects/shapes.
+    
+- transform tool should also appear if a shape is selected. this should move the shape and everything in it (unlike manipulating the handles normally, which just edits the shape bounds and doesn't modify the objects within.
+    
+- click dragging slightly outside the 8 handles of a shape should let you translate it. currently, this isn't working./
 
+
+## more
+- fill tool in a raster object should let you fill only what's inside the active selection.
+- fill tool in a raster object should act like it does in clip studio paint.
 ## image sync tweaks
 - render region box on screen
-- link transforms to layer above? or mabyee
 - adjustment layer - allows transforms and modifiers simultaneously
 - includes uniform, free, etc
 
@@ -23,7 +62,7 @@ bugs:
 
 
 tools
-- eyedropper icon in the color picker (with hotkey setting). for now, samples from the whole image.
+- add an eyedropper icon in the color picker (with hotkey setting). for now, samples from the whole image.
 - new item in the color window besides picker and pallette - color history
 - add the option to hide transform handles while drawing to pencil and eraser tool in tool settings. 
 - add a transform tool for vector/raster that exposes the handles, and click-dragging or pen tap dragging in the bounds translates instead of drawing while in transform mode.
@@ -32,11 +71,10 @@ tools
 - while having point selected in point select mode, pressing delete should delete the points you have selected.
 - the click and drag handle outside a shape to translate it doesn't seem to work.
 - add an export to png button that exports the current chapter to a full size png image. (add a folder where assets and chapters are called exports. the image name should 
+- translating a vector by the handle on the bounds is drawing instead of translating
+	- translating should also be visible live (like raster does)
 
 bugs:
-- [x] when zooming in and out, sometimes the transform type button flashes between each corner of a raster object, or starts flipping around in a vector object
-- [x] drawing in a vector after transforming it causes the pencil to draw in an offset position. 
-- [x] drawing in a raster object after transforming it causes the program to crash.
 - [ ] text move handles 
 - [ ] vector edit point preview in a scaled object shows the non-transformed points. also, make the actual point icons about 20 percent smaller, and make their size and transparency settable in tool settings with sliders. also include a toggle to show or hide them, and they should be hidden by default.
 ![[Pasted image 20260816003707.png]]
@@ -57,6 +95,11 @@ later
 - multi object select support
 - lasso fill support
 - MODIFIER STACK?
+	- for instance, smudge tool could have parameters and strokes. the strokes could be manipulated?
+	- params:
+		- insensity
+	- modifers can be moved between objects
+	- a modifier can apply to multiple objects and act as a modifier to any object type (acting as an overlay, perhaps like a shader almost?)
 
 cage transform support
 select support for raster mode

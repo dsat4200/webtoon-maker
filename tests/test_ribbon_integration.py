@@ -54,7 +54,7 @@ def test_main_window_ribbon_is_contextual_and_tools_are_renamed(qapp):
         ]
         assert window.ribbon.orientation == Qt.Orientation.Vertical
         assert window.ribbon.tab_bar.shape() == QTabBar.Shape.RoundedEast
-        assert window.color_tabs.count() == 2
+        assert window.color_tabs.count() == 3
         assert [
             window.color_tabs.tabText(index) for index in range(2)
         ] == ["Picker", "Palette"]
@@ -284,7 +284,7 @@ def test_raster_object_ribbon_edits_properties_without_transform_mode(qapp):
 
         assert not hasattr(controls, "transform_mode")
         assert not window.tool_buttons[ToolKind.TRANSFORM].isVisible()
-        assert not window.canvas.set_tool(ToolKind.TRANSFORM)
+        assert window.canvas.set_tool(ToolKind.TRANSFORM)
     finally:
         window.deleteLater()
 

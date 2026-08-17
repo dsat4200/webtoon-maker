@@ -244,7 +244,7 @@ def test_raster_tool_controls_live_in_tool_settings_ribbon(qapp, monkeypatch):
 
         window._activate_tool(ToolKind.TRANSFORM)
         qapp.processEvents()
-        assert window.canvas.tool == ToolKind.RASTER_ERASER
+        assert window.canvas.tool == ToolKind.TRANSFORM
         assert window.ribbon.current_key() == "tool_settings"
     finally:
         window.hide()

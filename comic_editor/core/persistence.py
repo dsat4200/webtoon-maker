@@ -47,6 +47,8 @@ class SeriesRepository:
             raise FileExistsError("Series folder must be empty")
         self.root.mkdir(parents=True, exist_ok=True)
         (self.root / "chapters").mkdir(exist_ok=True)
+        (self.root / "assets").mkdir(exist_ok=True)
+        (self.root / "exports").mkdir(exist_ok=True)
         series = SeriesDocument(name=name.strip() or "Untitled Series")
         self.save_series(series)
         return series

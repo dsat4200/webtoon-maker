@@ -4,7 +4,7 @@ import pytest
 
 from comic_editor.core.models import (
     BoundGeometry, ChapterDocument, GridSettings, PathNode, RasterObject,
-    TextObject, VectorDrawingObject,
+    SeriesDocument, TextObject, VectorDrawingObject,
 )
 
 
@@ -14,6 +14,21 @@ def populated_chapter():
     layer = chapter.add_layer(page.layer_id, "Layer")
     raster = chapter.add_object(layer.layer_id, RasterObject())
     return chapter, page, layer, raster
+
+
+def test_series_color_history_migrates_deduplicates_and_caps():
+    data = SeriesDocument(name="Colors").to_dict()
+    data["schema_version"] = 16
+    data["color_history"] = [
+        "#112233", "#FF112233", *(
+            f"#FF{index:06X}" for index in range(30)
+        ),
+    ]
+    loaded = SeriesDocument.from_dict(data)
+    assert loaded.schema_version == 17
+    assert loaded.color_history[0] == "#FF112233"
+    assert len(loaded.color_history) == 24
+    assert len(set(loaded.color_history)) == 24
 
 
 def test_shape_style_thickness_values_are_integer_pixels():

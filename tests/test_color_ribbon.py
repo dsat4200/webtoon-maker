@@ -1,12 +1,15 @@
 from __future__ import annotations
 
+import math
+
 from PySide6.QtCore import QPoint, Qt
-from PySide6.QtGui import QColor
+from PySide6.QtGui import QColor, QImage
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QSizePolicy
 
 from comic_editor.ui.color_picker import (
     ColorSwatchButton,
+    ColorHistoryWidget,
     HsvAlphaPicker,
     PaletteEditorWidget,
     PrimarySecondaryColorPanel,
@@ -22,6 +25,42 @@ def test_canonical_argb_accepts_rgb_argb_and_qcolor():
     assert canonical_argb(QColor(1, 2, 3, 4)) == "#04010203"
     assert canonical_argb("not a color", "#80AABBCC") == "#80AABBCC"
     assert qcolor_from_argb("#40010203").alpha() == 64
+
+
+def test_color_history_grid_deduplicates_caps_and_emits(qapp):
+    history = ColorHistoryWidget()
+    history.set_colors([
+        "#112233", "#FF112233", *(
+            f"#FF{index:06X}" for index in range(30)
+        ),
+    ])
+    assert history.colors()[0] == "#FF112233"
+    assert len(history.colors()) == 24
+    activated: list[str] = []
+    history.colorActivated.connect(activated.append)
+    history._buttons[0].click()
+    assert activated == ["#FF112233"]
+
+
+def test_hue_ring_pixels_follow_marker_angle_convention(qapp):
+    picker = HsvAlphaPicker()
+    picker.resize(260, 260)
+    image = QImage(picker.size(), QImage.Format_ARGB32)
+    image.fill(Qt.GlobalColor.transparent)
+    picker.render(image)
+    outer, inner = picker.hue_ring_bounds()
+    center = outer.center()
+    radius = (outer.width() + inner.width()) / 4
+    for hue in (0, 1 / 6, 1 / 3, 1 / 2, 2 / 3, 5 / 6):
+        point = QPoint(
+            round(center.x() + math.cos(hue * math.tau) * radius),
+            round(center.y() - math.sin(hue * math.tau) * radius),
+        )
+        actual = image.pixelColor(point)
+        expected = QColor.fromHsvF(hue, 1, 1)
+        assert abs(actual.red() - expected.red()) <= 4
+        assert abs(actual.green() - expected.green()) <= 4
+        assert abs(actual.blue() - expected.blue()) <= 4
 
 
 def test_primary_secondary_panel_hex_edit_copy_and_paste(qapp):

@@ -177,7 +177,7 @@ def test_series_colors_and_palettes_migrate_and_persist_atomically(tmp_path):
     repository.root.mkdir()
     repository.save_series(legacy)
     restored = repository.load_series()
-    assert restored.schema_version == 16
+    assert restored.schema_version == 17
     assert restored.to_dict() == legacy.to_dict()
     on_disk = json.loads(repository.series_path.read_text(encoding="utf-8"))
     assert on_disk["primary_color"] == "#FF123456"

@@ -114,6 +114,10 @@ class ToolSettingsControls(QWidget):
         row.addWidget(self.pencil_presets_button)
         self.pencil_sizes_button = QPushButton("Configure sizes…", page)
         row.addWidget(self.pencil_sizes_button)
+        self.pencil_transform_handles = QCheckBox(
+            "Show transform handles", page
+        )
+        row.addWidget(self.pencil_transform_handles)
         row.addStretch(1)
 
         self.pencil_preset.currentTextChanged.connect(
@@ -126,6 +130,9 @@ class ToolSettingsControls(QWidget):
             self.pencilSettingsRequested
         )
         self.pencil_sizes_button.clicked.connect(self.brushSizesRequested)
+        self.pencil_transform_handles.toggled.connect(
+            self._drawing_handles_changed
+        )
         return page
 
     def _build_eraser_page(self) -> QWidget:
@@ -152,6 +159,10 @@ class ToolSettingsControls(QWidget):
         row.addWidget(self.vector_eraser_mode)
         self.eraser_sizes_button = QPushButton("Configure sizes…", page)
         row.addWidget(self.eraser_sizes_button)
+        self.eraser_transform_handles = QCheckBox(
+            "Show transform handles", page
+        )
+        row.addWidget(self.eraser_transform_handles)
         row.addStretch(1)
 
         self.eraser_size.currentIndexChanged.connect(
@@ -164,6 +175,9 @@ class ToolSettingsControls(QWidget):
             self._vector_eraser_mode_changed
         )
         self.eraser_sizes_button.clicked.connect(self.brushSizesRequested)
+        self.eraser_transform_handles.toggled.connect(
+            self._drawing_handles_changed
+        )
         return page
 
     def _build_fill_page(self) -> QWidget:
@@ -265,6 +279,12 @@ class ToolSettingsControls(QWidget):
                 self.settings.vector_eraser_mode
             ))
         )
+        self.pencil_transform_handles.setChecked(
+            self.settings.pencil_transform_handles_visible
+        )
+        self.eraser_transform_handles.setChecked(
+            self.settings.eraser_transform_handles_visible
+        )
         self.fill_close_gaps.setChecked(self.settings.fill_close_gaps)
         self.fill_gap_threshold.setValue(self.settings.fill_gap_threshold)
         self.fill_narrow_areas.setChecked(self.settings.fill_narrow_areas)
@@ -282,6 +302,19 @@ class ToolSettingsControls(QWidget):
         self.fill_area_amount.setEnabled(self.settings.fill_area_scaling)
         self.fill_area_mode.setEnabled(self.settings.fill_area_scaling)
         self._loading = False
+
+    def _drawing_handles_changed(self, *args) -> None:
+        del args
+        if self._loading:
+            return
+        self.settings.pencil_transform_handles_visible = (
+            self.pencil_transform_handles.isChecked()
+        )
+        self.settings.eraser_transform_handles_visible = (
+            self.eraser_transform_handles.isChecked()
+        )
+        self.settings.clamp()
+        self.settingsChanged.emit()
 
     def _pencil_preset_changed(self, name: str) -> None:
         if not self._loading and name:
@@ -829,6 +862,37 @@ class VectorToolsControls(QObject):
         self.redraw_interaction.addItem("Manual Redraw", "manual")
         self.redraw_interaction.addItem("Point Select", "point")
         form.addRow("Interaction", self.redraw_interaction)
+        self.show_point_icons = QCheckBox("Show point icons", widget)
+        self.show_point_icons.setToolTip(
+            "When off, only selected and hovered points are shown"
+        )
+        form.addRow(self.show_point_icons)
+        self.point_icon_size_row = QWidget(widget)
+        point_size_layout = QHBoxLayout(self.point_icon_size_row)
+        point_size_layout.setContentsMargins(0, 0, 0, 0)
+        self.point_icon_size = QSlider(
+            Qt.Orientation.Horizontal, self.point_icon_size_row
+        )
+        self.point_icon_size.setRange(25, 200)
+        self.point_icon_size_value = QSpinBox(self.point_icon_size_row)
+        self.point_icon_size_value.setRange(25, 200)
+        self.point_icon_size_value.setSuffix("%")
+        point_size_layout.addWidget(self.point_icon_size, 1)
+        point_size_layout.addWidget(self.point_icon_size_value)
+        form.addRow("Point size", self.point_icon_size_row)
+        self.point_icon_opacity_row = QWidget(widget)
+        point_opacity_layout = QHBoxLayout(self.point_icon_opacity_row)
+        point_opacity_layout.setContentsMargins(0, 0, 0, 0)
+        self.point_icon_opacity = QSlider(
+            Qt.Orientation.Horizontal, self.point_icon_opacity_row
+        )
+        self.point_icon_opacity.setRange(0, 100)
+        self.point_icon_opacity_value = QSpinBox(self.point_icon_opacity_row)
+        self.point_icon_opacity_value.setRange(0, 100)
+        self.point_icon_opacity_value.setSuffix("%")
+        point_opacity_layout.addWidget(self.point_icon_opacity, 1)
+        point_opacity_layout.addWidget(self.point_icon_opacity_value)
+        form.addRow("Point opacity", self.point_icon_opacity_row)
         self.redraw_operation = QComboBox(widget)
         self.redraw_operation.addItem("Increase", "increase")
         self.redraw_operation.addItem("Decrease", "decrease")
@@ -872,6 +936,25 @@ class VectorToolsControls(QObject):
             self.redraw_operation,
         ):
             combo.currentIndexChanged.connect(self._redraw_changed)
+        self.show_point_icons.toggled.connect(self._point_display_changed)
+        self.point_icon_size.valueChanged.connect(
+            self.point_icon_size_value.setValue
+        )
+        self.point_icon_size_value.valueChanged.connect(
+            self.point_icon_size.setValue
+        )
+        self.point_icon_opacity.valueChanged.connect(
+            self.point_icon_opacity_value.setValue
+        )
+        self.point_icon_opacity_value.valueChanged.connect(
+            self.point_icon_opacity.setValue
+        )
+        self.point_icon_size_value.valueChanged.connect(
+            self._point_display_changed
+        )
+        self.point_icon_opacity_value.valueChanged.connect(
+            self._point_display_changed
+        )
         self.redraw_amount.valueChanged.connect(
             self._redraw_amount_edited
         )
@@ -949,6 +1032,19 @@ class VectorToolsControls(QObject):
                 self.settings.vector_redraw_interaction
             ))
         )
+        self.show_point_icons.setChecked(
+            self.settings.vector_point_icons_visible
+        )
+        self.point_icon_size.setValue(self.settings.vector_point_icon_size)
+        self.point_icon_size_value.setValue(
+            self.settings.vector_point_icon_size
+        )
+        self.point_icon_opacity.setValue(
+            self.settings.vector_point_icon_opacity
+        )
+        self.point_icon_opacity_value.setValue(
+            self.settings.vector_point_icon_opacity
+        )
         self.redraw_operation.setCurrentIndex(
             max(0, self.redraw_operation.findData(
                 self.settings.vector_redraw_operation
@@ -988,6 +1084,13 @@ class VectorToolsControls(QObject):
 
     def _sync_redraw_controls(self) -> None:
         manual = self.redraw_interaction.currentData() == "manual"
+        point_select = not manual
+        for control in (
+            self.show_point_icons,
+            self.point_icon_size_row,
+            self.point_icon_opacity_row,
+        ):
+            self.redraw_form.setRowVisible(control, point_select)
         for control in (
             self.redraw_operation,
             self.redraw_amount_row,
@@ -1092,6 +1195,20 @@ class VectorToolsControls(QObject):
             )
         self.settings.clamp()
         self._sync_redraw_controls()
+        self.settingsChanged.emit()
+
+    def _point_display_changed(self, *args) -> None:
+        del args
+        if self._loading:
+            return
+        self.settings.vector_point_icons_visible = (
+            self.show_point_icons.isChecked()
+        )
+        self.settings.vector_point_icon_size = self.point_icon_size_value.value()
+        self.settings.vector_point_icon_opacity = (
+            self.point_icon_opacity_value.value()
+        )
+        self.settings.clamp()
         self.settingsChanged.emit()
 
     def _simplify_changed(self, value: int) -> None:

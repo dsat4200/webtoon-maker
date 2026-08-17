@@ -38,6 +38,8 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from comic_editor.ui.icons import iconoir
+
 
 def qcolor_from_argb(
     value: str | QColor | int | None,
@@ -178,7 +180,7 @@ class HsvAlphaPicker(QWidget):
         for step in range(13):
             fraction = step / 12
             hue_gradient.setColorAt(
-                fraction, QColor.fromHsvF((1.0 - fraction) % 1.0, 1, 1)
+                fraction, QColor.fromHsvF(fraction % 1.0, 1, 1)
             )
         ring = QPainterPath()
         ring.setFillRule(Qt.FillRule.OddEvenFill)
@@ -437,6 +439,8 @@ class PrimarySecondaryColorPanel(QWidget):
     primaryColorChanged = Signal(str)
     secondaryColorChanged = Signal(str)
     colorsSwapped = Signal(str, str)
+    colorCommitted = Signal(str)
+    eyedropperRequested = Signal()
 
     def __init__(
         self,
@@ -498,6 +502,11 @@ class PrimarySecondaryColorPanel(QWidget):
         self.hex_field.setPlaceholderText("#AARRGGBB")
         self.hex_copy = QPushButton("Copy", self.footer)
         self.hex_paste = QPushButton("Paste", self.footer)
+        self.eyedropper = QToolButton(self.footer)
+        self.eyedropper.setCheckable(True)
+        self.eyedropper.setIcon(iconoir("eyedropper"))
+        self.eyedropper.setToolTip("Sample the composited chapter (I)")
+        self.eyedropper.setFixedSize(28, 28)
         self.hex_copy.setFixedWidth(44)
         self.hex_paste.setFixedWidth(44)
         self.hex_copy.setToolTip("Copy the active color hex code")
@@ -505,6 +514,7 @@ class PrimarySecondaryColorPanel(QWidget):
         hex_row.addWidget(self.hex_field, 1)
         hex_row.addWidget(self.hex_copy)
         hex_row.addWidget(self.hex_paste)
+        hex_row.addWidget(self.eyedropper)
         footer_layout.addLayout(hex_row)
         footer_layout.addLayout(wells)
         layout.addWidget(self.footer, 0)
@@ -517,11 +527,13 @@ class PrimarySecondaryColorPanel(QWidget):
         )
         self.swap_colors.clicked.connect(self._swap_colors)
         self.picker.colorChanged.connect(self._picker_changed)
+        self.picker.interactionFinished.connect(self.colorCommitted)
         self.hex_field.editingFinished.connect(self._hex_edited)
         self.hex_copy.clicked.connect(
             lambda: QApplication.clipboard().setText(self.active_color())
         )
         self.hex_paste.clicked.connect(self._paste_hex)
+        self.eyedropper.clicked.connect(self.eyedropperRequested)
 
     def active_slot(self) -> str:
         return self._active_slot
@@ -601,6 +613,7 @@ class PrimarySecondaryColorPanel(QWidget):
             self.hex_field.setText(self.active_color())
             return
         self.apply_color(value)
+        self.colorCommitted.emit(value)
 
     def _paste_hex(self) -> None:
         value = self._valid_hex(QApplication.clipboard().text())
@@ -608,6 +621,7 @@ class PrimarySecondaryColorPanel(QWidget):
             self.hex_field.setText(self.active_color())
             return
         self.apply_color(value)
+        self.colorCommitted.emit(value)
 
     def _set_slot_color(
         self,
@@ -743,6 +757,49 @@ class ColorSwatchButton(QAbstractButton):
         self.swatchActivated.emit(
             self.swatch_id, canonical_argb(self._color)
         )
+
+
+class ColorHistoryWidget(QWidget):
+    """Compact newest-first swatch grid for committed series colors."""
+
+    colorActivated = Signal(str)
+
+    def __init__(self, parent: QWidget | None = None):
+        super().__init__(parent)
+        self._colors: list[str] = []
+        self._buttons: list[ColorWellButton] = []
+        self.grid = QGridLayout(self)
+        self.grid.setContentsMargins(0, 0, 0, 0)
+        self.grid.setHorizontalSpacing(4)
+        self.grid.setVerticalSpacing(4)
+
+    def colors(self) -> list[str]:
+        return list(self._colors)
+
+    def set_colors(self, colors: Any) -> None:
+        normalized: list[str] = []
+        for value in colors or []:
+            color = canonical_argb(value)
+            if color not in normalized:
+                normalized.append(color)
+            if len(normalized) >= 24:
+                break
+        self._colors = normalized
+        for button in self._buttons:
+            self.grid.removeWidget(button)
+            button.deleteLater()
+        self._buttons.clear()
+        for index, color in enumerate(self._colors):
+            button = ColorWellButton(color, self)
+            button.setCheckable(False)
+            button.setFixedSize(32, 32)
+            button.setToolTip(color)
+            button.clicked.connect(
+                lambda checked=False, value=color: self.colorActivated.emit(value)
+            )
+            self._buttons.append(button)
+            self.grid.addWidget(button, index // 6, index % 6)
+        self.grid.setRowStretch(4, 1)
 
 
 class ColorPickerPopup(QDialog):

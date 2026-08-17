@@ -76,6 +76,7 @@ class ToolKind(Enum):
     OBJECT_SELECT = "object_select"
     RASTER_PENCIL = "raster_pencil"
     RASTER_ERASER = "raster_eraser"
+    EYEDROPPER = "eyedropper"
     FILL = "fill"
     TEXT_EDIT = "text_edit"
     TRANSFORM = "transform"
@@ -302,6 +303,9 @@ class _CanvasLogic:
     pageGapConfirmationChanged = Signal(bool)
     transformModeChanged = Signal(str)
     importStatusMessage = Signal(str)
+    colorSampled = Signal(str)
+    colorSampleCommitted = Signal(str)
+    eyedropperGestureChanged = Signal(bool)
 
     def __init__(self, settings: EditorSettings, parent=None):
         super().__init__(parent)
@@ -340,6 +344,8 @@ class _CanvasLogic:
         self._wheel_zoom_timer.setInterval(WHEEL_ZOOM_SETTLE_MS)
         self._wheel_zoom_timer.timeout.connect(self._settle_wheel_zoom)
         self._drawing = False
+        self._eyedropper_sampling = False
+        self._eyedropper_last_color = ""
         self._last_draw_point = QPointF()
         self._last_pressure = 1.0
         self._stroke_before: dict[tuple[int, int], QImage | None] = {}
@@ -534,6 +540,7 @@ class _CanvasLogic:
         ] = {}
         self._vector_connect_endpoints: list[tuple[str, str]] = []
         self._hover_vector_stroke_id = ""
+        self._hover_vector_point_id = ""
         self._drawing_selection_path = QPainterPath()
         self._drawing_selection_gesture: list[QPointF] = []
         self._drawing_selection_operation = "replace"
@@ -1172,6 +1179,17 @@ class _CanvasLogic:
         )
         return QPointF(parent_local.x() + layer_x, parent_local.y() + layer_y)
 
+    def _vector_world_point(
+        self, obj: VectorDrawingObject, local: QPointF,
+    ) -> QPointF:
+        parent_local = QPointF(local.x() + obj.x, local.y() + obj.y)
+        if obj.transform_quad is not None:
+            parent_local = self._drawing_object_transform(obj).map(parent_local)
+        layer_x, layer_y = self.chapter.layer_world_translation(
+            obj.parent_layer_id
+        )
+        return parent_local + QPointF(layer_x, layer_y)
+
     def _capture_vector_graph(
         self, drawing: VectorDrawingObject,
     ) -> dict[str, dict | None]:
@@ -1494,11 +1512,12 @@ class _CanvasLogic:
             and isinstance(selected_object, VectorDrawingObject)
         ):
             tool = ToolKind.VECTOR_EDIT
-        if (
-            tool == ToolKind.TRANSFORM
-            and isinstance(selected_object, RasterObject)
-        ):
-            return False
+        if tool != ToolKind.EYEDROPPER and self._eyedropper_sampling:
+            self._eyedropper_sampling = False
+            self._eyedropper_last_color = ""
+            self.eyedropperGestureChanged.emit(False)
+        if tool != ToolKind.VECTOR_EDIT:
+            self._hover_vector_point_id = ""
         if self.tool == ToolKind.TRANSFORM and tool != ToolKind.TRANSFORM:
             self._clear_transform_preview()
         if self.tool == ToolKind.SHAPE_CREATE and tool != ToolKind.SHAPE_CREATE:
@@ -1685,6 +1704,53 @@ class _CanvasLogic:
         self._snap_camera()
         self.update()
         self.cameraChanged.emit()
+
+    def reset_rotation(self) -> None:
+        """Reset only canvas rotation, preserving scale and document center."""
+        if abs(self.rotation) <= 1e-9:
+            return
+        self.rotation = 0.0
+        self._invalidate_scene_cache()
+        self.update()
+        self.cameraChanged.emit()
+        self.interactionFinished.emit()
+
+    def sample_composited_color(self, world: QPointF) -> str | None:
+        """Sample one full-resolution chapter pixel without UI overlays."""
+        if self.chapter is None:
+            return None
+        sample_x, sample_y = math.floor(world.x()), math.floor(world.y())
+        if not (
+            0 <= sample_x < self.chapter.width
+            and 0 <= sample_y < self.chapter.height
+        ):
+            return None
+        image = QImage(3, 3, QImage.Format_ARGB32_Premultiplied)
+        image.fill(QColor(self.chapter.background))
+        painter = QPainter(image)
+        try:
+            painter.setRenderHint(QPainter.Antialiasing, True)
+            transform = QTransform()
+            transform.translate(1 - sample_x, 1 - sample_y)
+            painter.setTransform(transform)
+            visible = QRectF(sample_x - 1, sample_y - 1, 3, 3)
+            for page_id in reversed(self.chapter.root_page_ids):
+                self._render_layer(
+                    painter, self.chapter.layers[page_id], 1.0, visible
+                )
+        finally:
+            painter.end()
+        return image.pixelColor(1, 1).name(
+            QColor.NameFormat.HexArgb
+        ).upper()
+
+    def _sample_eyedropper(self, world: QPointF) -> bool:
+        color = self.sample_composited_color(world)
+        if color is None:
+            return False
+        self._eyedropper_last_color = color
+        self.colorSampled.emit(color)
+        return True
 
     def scroll_to_fraction(self, fraction: float) -> None:
         if not self.chapter:
@@ -6722,6 +6788,7 @@ class _CanvasLogic:
                     painter.drawPolygon(polygon)
                 if (
                     not live_vector_eraser
+                    and not self._is_two_point_line_gradient(selected_object)
                     and not (
                         isinstance(selected_object, ImageObject)
                         and selected_object.placement_mode == "fit_parent"
@@ -7539,6 +7606,8 @@ class _CanvasLogic:
         obj = self.chapter.objects.get(self.selected_object_id)
         if isinstance(obj, ImageObject) and obj.placement_mode == "fit_parent":
             return None
+        if self._is_two_point_line_gradient(obj):
+            return None
         visible = (
             self._object_transform_cage_visible(obj)
             or self.tool == ToolKind.TRANSFORM
@@ -7826,14 +7895,13 @@ class _CanvasLogic:
     def _draw_vector_edit_handles(
         self, painter: QPainter, drawing: VectorDrawingObject,
     ) -> None:
-        layer_x, layer_y = self.chapter.layer_world_translation(
-            drawing.parent_layer_id
-        )
         scale = max(self.scale, 0.05)
+        icon_scale = self.settings.vector_point_icon_size / 100.0
+        icon_opacity = self.settings.vector_point_icon_opacity / 100.0
         painter.save()
-        painter.translate(layer_x + drawing.x, layer_y + drawing.y)
         show_all = (
-            (
+            self.settings.vector_point_icons_visible
+            or (
                 self.tool == ToolKind.VECTOR_REDRAW
                 and self.settings.vector_redraw_interaction == "manual"
             )
@@ -7848,6 +7916,10 @@ class _CanvasLogic:
             if (
                 not show_all
                 and stroke.stroke_id not in self._selected_vector_stroke_ids
+                and not any(
+                    point.point_id == self._hover_vector_point_id
+                    for point in stroke.points
+                )
             ):
                 continue
             if (
@@ -7861,7 +7933,14 @@ class _CanvasLogic:
                     Qt.RoundCap, Qt.RoundJoin,
                 ))
                 painter.setBrush(Qt.NoBrush)
-                painter.drawPath(self._vector_centerline_path(stroke))
+                local_path = self._vector_centerline_path(stroke)
+                mapped_path = QPainterPath()
+                for polygon in local_path.toSubpathPolygons():
+                    mapped_path.addPolygon(QPolygonF([
+                        self._vector_world_point(drawing, point)
+                        for point in polygon
+                    ]))
+                painter.drawPath(mapped_path)
             for point in stroke.points:
                 preview = self._selection_vector_preview.get(point.point_id)
                 position = (
@@ -7872,14 +7951,21 @@ class _CanvasLogic:
                     point.point_id in self._selected_vector_point_ids
                     or point.point_id in self._vector_simplify_point_ids
                 )
+                hovered = point.point_id == self._hover_vector_point_id
+                if not show_all and not selected and not hovered:
+                    continue
+                edge = QColor("#ff7417" if selected else "#079bd3")
+                fill = QColor("#aeeaff")
+                edge.setAlphaF(icon_opacity)
+                fill.setAlphaF(icon_opacity)
                 painter.setPen(QPen(
-                    QColor("#ff7417" if selected else "#079bd3"),
-                    (3 if selected else 2) / scale,
+                    edge, (3 if selected else 2) / scale,
                 ))
-                painter.setBrush(QColor("#aeeaff"))
-                radius = (7 if selected else 5.5) / scale
+                painter.setBrush(fill)
+                radius = (7 if selected else 5.5) * icon_scale / scale
                 painter.drawEllipse(
-                    QPointF(*position), radius, radius
+                    self._vector_world_point(drawing, QPointF(*position)),
+                    radius, radius
                 )
         painter.restore()
 
@@ -10252,6 +10338,9 @@ class _CanvasLogic:
             self._raster_creation_index = None
             self.set_tool(ToolKind.OBJECT_SELECT)
             return
+        if event.key() == Qt.Key_Delete and self._delete_selected_vector_points():
+            event.accept()
+            return
         if event.key() == Qt.Key_Escape:
             self.set_tool(ToolKind.OBJECT_SELECT)
         if (
@@ -11932,15 +12021,19 @@ class _CanvasLogic:
     def _hit_vector_point(
         self, drawing: VectorDrawingObject, local: QPointF,
     ) -> tuple[str, str] | None:
-        tolerance = 11.0 / max(self.scale, 0.05)
+        query = self.camera_transform().map(
+            self._vector_world_point(drawing, local)
+        )
+        tolerance = 11.0
         candidates: list[tuple[float, str, str]] = []
         for stroke in reversed(drawing.strokes):
             if stroke.stroke_id not in self._selected_vector_stroke_ids:
                 continue
             for point in stroke.points:
-                separation = math.dist(
-                    (local.x(), local.y()), point.position
+                candidate = self.camera_transform().map(
+                    self._vector_world_point(drawing, QPointF(*point.position))
                 )
+                separation = math.dist(query.toTuple(), candidate.toTuple())
                 if separation <= tolerance:
                     candidates.append(
                         (separation, stroke.stroke_id, point.point_id)
@@ -13797,6 +13890,11 @@ class _CanvasLogic:
         point = self.widget_to_document(widget_point)
         self._press_widget_point = QPointF(widget_point)
         self._press_document_point = QPointF(point)
+        if self.tool == ToolKind.EYEDROPPER:
+            if self._sample_eyedropper(point):
+                self._eyedropper_sampling = True
+                self.eyedropperGestureChanged.emit(True)
+            return
         if self._begin_page_gap_interaction(point):
             return
         if self.tool == ToolKind.INSERT_PAGE_GAP:
@@ -13824,6 +13922,8 @@ class _CanvasLogic:
         if self._begin_shape_overlay_interaction(widget_point):
             return
         if self._begin_text_property_drag(widget_point):
+            return
+        if self._begin_selected_text_transform(point):
             return
         if self._transform_mode_gizmo_hit(widget_point):
             return
@@ -14162,6 +14262,20 @@ class _CanvasLogic:
             self._clear_detached_input_state()
             return
         point = self.widget_to_document(widget_point)
+        if self.tool == ToolKind.EYEDROPPER and self._eyedropper_sampling:
+            self._sample_eyedropper(point)
+            return
+        if self.tool == ToolKind.VECTOR_EDIT and self._vector_before is None:
+            drawing = self._selected_vector_drawing()
+            hovered = ""
+            if drawing is not None:
+                hit = self._hit_vector_point(
+                    drawing, self._vector_local_point(drawing, point)
+                )
+                hovered = hit[1] if hit else ""
+            if hovered != self._hover_vector_point_id:
+                self._hover_vector_point_id = hovered
+                self.update()
         if self._shape_property_drag is not None:
             self._update_shape_property_drag(widget_point)
             return
@@ -14402,6 +14516,15 @@ class _CanvasLogic:
             self._update_shape_hover(point)
 
     def _tool_release(self) -> None:
+        if self._eyedropper_sampling:
+            color = self._eyedropper_last_color
+            self._eyedropper_sampling = False
+            self._eyedropper_last_color = ""
+            if color:
+                self.colorSampleCommitted.emit(color)
+            self.eyedropperGestureChanged.emit(False)
+            self.interactionFinished.emit()
+            return
         if self._finish_shape_property_drag():
             return
         if self._finish_text_property_drag():
@@ -16354,6 +16477,7 @@ class _CanvasLogic:
             if (
                 not isinstance(obj, GradientObject)
                 or obj.field_type == "parent_shape"
+                or self._is_two_point_line_gradient(obj)
             ):
                 return False
             parent_id = obj.parent_layer_id
@@ -16555,6 +16679,14 @@ class _CanvasLogic:
     def _is_transformable_object(obj: DocumentObject | None) -> bool:
         return isinstance(obj, (RasterObject, VectorDrawingObject, ImageObject))
 
+    @staticmethod
+    def _is_two_point_line_gradient(obj: DocumentObject | None) -> bool:
+        return bool(
+            isinstance(obj, GradientObject)
+            and obj.field_type == "line"
+            and len(obj.line_field.geometry.nodes) == 2
+        )
+
     def _object_transform_cage_visible(
         self, obj: DocumentObject | None,
     ) -> bool:
@@ -16562,6 +16694,10 @@ class _CanvasLogic:
             return False
         if isinstance(obj, ImageObject) and obj.placement_mode == "fit_parent":
             return False
+        if self.tool == ToolKind.RASTER_PENCIL:
+            return bool(self.settings.pencil_transform_handles_visible)
+        if self.tool == ToolKind.RASTER_ERASER:
+            return bool(self.settings.eraser_transform_handles_visible)
         if self.tool in {
             ToolKind.DRAW_SELECT_RECT,
             ToolKind.DRAW_SELECT_LASSO,
@@ -16600,6 +16736,9 @@ class _CanvasLogic:
         obj = self.chapter.objects.get(self.selected_object_id)
         if not self._is_transformable_object(obj):
             return False
+        if not self._object_transform_cage_visible(obj) \
+                and self.tool != ToolKind.TRANSFORM:
+            return False
         vector_drawing_tool = isinstance(obj, VectorDrawingObject) and self.tool in {
             ToolKind.RASTER_PENCIL,
             ToolKind.RASTER_ERASER,
@@ -16623,8 +16762,6 @@ class _CanvasLogic:
             obj, world_quad, point
         )
         if not mode:
-            return False
-        if vector_drawing_tool and mode not in {"handle", "rotate", "pivot"}:
             return False
         layer_x, layer_y = self.chapter.layer_world_translation(
             obj.parent_layer_id
@@ -16656,18 +16793,15 @@ class _CanvasLogic:
         obj = self.chapter.objects.get(self.selected_object_id)
         if not self._is_transformable_object(obj):
             return False
+        if not self._object_transform_cage_visible(obj) \
+                and self.tool != ToolKind.TRANSFORM:
+            return False
         if isinstance(obj, ImageObject) and obj.placement_mode == "fit_parent":
             return False
         quad = self.object_world_quad(obj.object_id)
         if not quad:
             return False
         mode, _handle = self._selected_object_transform_hit(obj, quad, point)
-        if (
-            isinstance(obj, VectorDrawingObject)
-            and self.tool in {ToolKind.RASTER_PENCIL, ToolKind.RASTER_ERASER}
-            and mode not in {"handle", "rotate", "pivot"}
-        ):
-            return False
         if mode == "translate":
             self._pending_raster_transform_press = (
                 QPointF(widget_point), QPointF(point)
@@ -17040,10 +17174,51 @@ class _CanvasLogic:
         return bool(
             self._text_editing
             or (
+                self._selected_vector_point_ids
+                and self.tool in {ToolKind.VECTOR_EDIT, ToolKind.VECTOR_REDRAW}
+            )
+            or (
                 self._selected_shape_node_id
                 and self.tool in {ToolKind.SHAPE_EDIT, ToolKind.BOUND_EDIT}
             )
         )
+
+    def _delete_selected_vector_points(self) -> bool:
+        if (
+            self.chapter is None
+            or not self._selected_vector_point_ids
+            or self.tool not in {ToolKind.VECTOR_EDIT, ToolKind.VECTOR_REDRAW}
+        ):
+            return False
+        drawing = self._selected_vector_drawing()
+        if drawing is None:
+            return False
+        before = self._capture_vector_graph(drawing)
+        selected = set(self._selected_vector_point_ids)
+        changed_strokes: set[str] = set()
+        remaining: list[VectorStroke] = []
+        for stroke in drawing.strokes:
+            points = [
+                point for point in stroke.points
+                if point.point_id not in selected
+            ]
+            if len(points) != len(stroke.points):
+                stroke.points = points
+                stroke.closed = stroke.closed and len(points) > 1
+                stroke.touch_render_revision()
+                changed_strokes.add(stroke.stroke_id)
+            if stroke.points:
+                remaining.append(stroke)
+        if not changed_strokes:
+            return False
+        drawing.strokes = remaining
+        drawing.touch_revision()
+        self._selected_vector_point_ids.clear()
+        self._selected_vector_stroke_ids.clear()
+        self._hover_vector_point_id = ""
+        self._hover_vector_stroke_id = ""
+        self._push_vector_change(before, "Delete vector points")
+        return True
 
     def _selected_text_for_gizmos(self) -> TextObject | None:
         if (
@@ -17054,6 +17229,45 @@ class _CanvasLogic:
             return None
         obj = self.chapter.objects.get(self.selected_object_id)
         return obj if isinstance(obj, TextObject) else None
+
+    def _begin_selected_text_transform(self, point: QPointF) -> bool:
+        if (
+            self.chapter is None
+            or self.tool not in {ToolKind.TEXT_EDIT, ToolKind.TRANSFORM}
+            or not self.selected_object_id
+        ):
+            return False
+        obj = self.chapter.objects.get(self.selected_object_id)
+        if not isinstance(obj, TextObject) or obj.layout_mode != "free":
+            return False
+        world_quad = self.object_world_quad(obj.object_id)
+        mode, handle = self._text_transform_control_hit(world_quad, point)
+        if not mode:
+            return False
+        self.commit_active_text_edit()
+        obj = self.chapter.objects[self.selected_object_id]
+        world_quad = self.object_world_quad(obj.object_id)
+        layer_x, layer_y = self.chapter.layer_world_translation(
+            obj.parent_layer_id
+        )
+        self._transform_handle_index = handle
+        self._transform_drag_mode = mode
+        self._model_before = self.chapter.to_dict()
+        self._drag_start_doc = QPointF(point)
+        self._transform_start_quad = [
+            (x - layer_x, y - layer_y) for x, y in world_quad
+        ]
+        self._transform_preview_quad = list(self._transform_start_quad)
+        pivot = self._transform_pivot or QPointF(
+            sum(x for x, _ in world_quad) / 4,
+            sum(y for _, y in world_quad) / 4,
+        )
+        self._transform_rotate_start = math.atan2(
+            point.y() - pivot.y(), point.x() - pivot.x()
+        )
+        self._build_raster_transform_cache()
+        self._build_text_transform_cache(obj)
+        return True
 
     def _update_text_gizmo_overlay(self) -> None:
         overlay = self._text_gizmo_overlay

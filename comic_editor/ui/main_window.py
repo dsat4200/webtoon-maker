@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import copy
+from datetime import datetime
 import re
 import time
 import math
@@ -44,7 +45,8 @@ from comic_editor.core.tiles import TileStore
 from comic_editor.core.images import ImageStore
 from comic_editor.ui.canvas import ToolKind, create_canvas
 from comic_editor.ui.color_picker import (
-    PaletteEditorWidget, PrimarySecondaryColorPanel, canonical_argb,
+    ColorHistoryWidget, PaletteEditorWidget, PrimarySecondaryColorPanel,
+    canonical_argb,
 )
 from comic_editor.ui.selection_settings import (
     SelectionCommonControls, SelectionSettingsPanel,
@@ -308,6 +310,7 @@ class MainWindow(QMainWindow):
         self.file_menu.addSeparator()
         self.save_action = self.file_menu.addAction("Save")
         self.save_as_action = self.file_menu.addAction("Save As")
+        self.export_png_action = self.file_menu.addAction("Export PNG")
         self._rebuild_recent_menu()
 
         self.file_toolbar = QToolBar("Project", self)
@@ -342,6 +345,7 @@ class MainWindow(QMainWindow):
         self.file_toolbar.addWidget(self.chapter_combo)
         self.new_chapter_action = self.file_toolbar.addAction("New Chapter")
         self.trim_action = self.file_toolbar.addAction("Trim Height")
+        self.export_png_toolbar_action = self.file_toolbar.addAction("Export PNG")
         self.fullscreen_action = self.file_toolbar.addAction("Fullscreen")
 
         self.tool_toolbar = ScrollableToolPanel(self)
@@ -458,6 +462,13 @@ class MainWindow(QMainWindow):
         self.palette_editor.setMinimumWidth(0)
         palette_layout.addWidget(self.palette_editor)
         self.color_tabs.addTab(palette_page, "Palette")
+
+        history_page = QWidget(self.color_tabs)
+        history_layout = QVBoxLayout(history_page)
+        history_layout.setContentsMargins(4, 4, 4, 4)
+        self.color_history = ColorHistoryWidget(history_page)
+        history_layout.addWidget(self.color_history)
+        self.color_tabs.addTab(history_page, "History")
 
         self.ribbon = RibbonWidget(
             self, orientation=Qt.Orientation.Vertical
@@ -850,6 +861,8 @@ class MainWindow(QMainWindow):
         self.import_images_action.triggered.connect(self._import_images_dialog)
         self.save_action.triggered.connect(self.save)
         self.save_as_action.triggered.connect(self._save_as)
+        self.export_png_action.triggered.connect(self._export_png)
+        self.export_png_toolbar_action.triggered.connect(self._export_png)
         self.new_chapter_action.triggered.connect(self._new_chapter)
         self.trim_action.triggered.connect(self._trim_height)
         self.fullscreen_action.triggered.connect(self._toggle_fullscreen)
@@ -867,6 +880,11 @@ class MainWindow(QMainWindow):
         self.canvas.selectionChanged.connect(self._canvas_selection_changed)
         self.canvas.chapterReplaced.connect(self._chapter_replaced)
         self.canvas.toolChanged.connect(self._canvas_tool_changed)
+        self.canvas.colorSampled.connect(self._eyedropper_preview)
+        self.canvas.colorSampleCommitted.connect(self._eyedropper_commit)
+        self.canvas.eyedropperGestureChanged.connect(
+            self._eyedropper_gesture_changed
+        )
         self.canvas.interactionFinished.connect(self.selection_common.refresh)
         self.canvas.interactionFinished.connect(self.selection_settings.refresh)
         self.canvas.interactionFinished.connect(
@@ -1074,8 +1092,12 @@ class MainWindow(QMainWindow):
                 self.color_panel.active_color()
             )
         )
-        self.color_panel.picker.interactionFinished.connect(
-            lambda color: self._flush_series_preferences()
+        self.color_panel.colorCommitted.connect(self._record_color_history)
+        self.color_panel.eyedropperRequested.connect(
+            lambda: self._activate_tool(ToolKind.EYEDROPPER)
+        )
+        self.color_history.colorActivated.connect(
+            self._history_color_activated
         )
         self.palette_editor.paletteSelectionChanged.connect(
             self._palette_selected
@@ -1109,6 +1131,7 @@ class MainWindow(QMainWindow):
             "object_select": ToolKind.OBJECT_SELECT,
             "transform": ToolKind.TRANSFORM,
             "shape_edit": ToolKind.SHAPE_EDIT,
+            "eyedropper": ToolKind.EYEDROPPER,
         }
         for action_id, enum_name in (
             ("fill", "FILL"),
@@ -1128,6 +1151,7 @@ class MainWindow(QMainWindow):
             "undo": self._undo,
             "redo": self._redo,
             "reset_view": self.canvas.reset_view,
+            "reset_rotation": self.canvas.reset_rotation,
             "toggle_grid": self._toggle_grid,
             "select_all": self.canvas.select_all,
             "delete_selected": self._delete_selected,
@@ -1250,6 +1274,13 @@ class MainWindow(QMainWindow):
             callback()
 
     def _restore_active_hotkey_tool(self) -> None:
+        if (
+            getattr(self, "_eyedropper_pointer_active", False)
+            and self._hotkey_active_hold is not None
+            and self._hotkey_active_hold["target"] == ToolKind.EYEDROPPER
+        ):
+            self._eyedropper_restore_pending = True
+            return
         active, self._hotkey_active_hold = self._hotkey_active_hold, None
         if active is None or self.canvas.tool != active["target"]:
             return
@@ -1468,9 +1499,14 @@ class MainWindow(QMainWindow):
         if event.type() == QEvent.TabletPress:
             if not inside:
                 return False
+            self._send_outliner_mouse(
+                QEvent.MouseButtonPress, global_position,
+                Qt.LeftButton, Qt.LeftButton,
+                event.modifiers(), event.pointingDevice(),
+            )
             self._tablet_outliner_press = {
                 "global": QPointF(global_position),
-                "forwarded": False,
+                "forwarded": True,
                 "device": event.pointingDevice(),
                 "modifiers": event.modifiers(),
             }
@@ -1487,44 +1523,18 @@ class MainWindow(QMainWindow):
                 return True
             return False
         if event.type() == QEvent.TabletMove:
-            distance = (
-                global_position - state["global"]
-            ).manhattanLength()
-            if (
-                not state["forwarded"]
-                and distance >= QApplication.startDragDistance()
-            ):
-                self._send_outliner_mouse(
-                    QEvent.MouseButtonPress, state["global"],
-                    Qt.LeftButton, Qt.LeftButton,
-                    state["modifiers"], state["device"],
-                )
-                state["forwarded"] = True
-            if state["forwarded"]:
-                self._send_outliner_mouse(
-                    QEvent.MouseMove, global_position,
-                    Qt.NoButton, Qt.LeftButton,
-                    event.modifiers(), state["device"],
-                )
+            self._send_outliner_mouse(
+                QEvent.MouseMove, global_position,
+                Qt.NoButton, Qt.LeftButton,
+                event.modifiers(), state["device"],
+            )
             event.accept()
             return True
-        if state["forwarded"]:
-            self._send_outliner_mouse(
-                QEvent.MouseButtonRelease, global_position,
-                Qt.LeftButton, Qt.NoButton,
-                event.modifiers(), state["device"],
-            )
-        else:
-            self._send_outliner_mouse(
-                QEvent.MouseButtonPress, state["global"],
-                Qt.LeftButton, Qt.LeftButton,
-                state["modifiers"], state["device"],
-            )
-            self._send_outliner_mouse(
-                QEvent.MouseButtonRelease, state["global"],
-                Qt.LeftButton, Qt.NoButton,
-                event.modifiers(), state["device"],
-            )
+        self._send_outliner_mouse(
+            QEvent.MouseButtonRelease, global_position,
+            Qt.LeftButton, Qt.NoButton,
+            event.modifiers(), state["device"],
+        )
         self._tablet_outliner_press = None
         event.accept()
         return True
@@ -2714,8 +2724,15 @@ class MainWindow(QMainWindow):
         text_selected = isinstance(selected_object, TextObject)
         self.tool_buttons[ToolKind.TEXT_EDIT].setVisible(self.chapter is not None)
         transform_available = (
-            text_selected
-            and self.chapter.objects[self.canvas.selected_id].layout_mode == "free"
+            isinstance(
+                selected_object,
+                (RasterObject, VectorDrawingObject, ImageObject),
+            )
+            or (
+                text_selected
+                and self.chapter.objects[self.canvas.selected_id].layout_mode
+                == "free"
+            )
         )
         self.tool_buttons[ToolKind.TRANSFORM].setVisible(transform_available)
         self._sync_contextual_ribbon()
@@ -3716,6 +3733,11 @@ class MainWindow(QMainWindow):
         self._refresh_actions()
 
     def _canvas_tool_changed(self, tool: ToolKind) -> None:
+        self.color_panel.eyedropper.blockSignals(True)
+        self.color_panel.eyedropper.setChecked(
+            tool == ToolKind.EYEDROPPER
+        )
+        self.color_panel.eyedropper.blockSignals(False)
         self.selection_settings.refresh()
         self._sync_tool_buttons()
         if tool in {
@@ -3999,6 +4021,7 @@ class MainWindow(QMainWindow):
         if self.series is None:
             primary, secondary = "#FF000000", "#FFFFFFFF"
             palettes, active_palette = [], None
+            history = []
         else:
             self.series.validate()
             primary = canonical_argb(self.series.primary_color)
@@ -4007,6 +4030,7 @@ class MainWindow(QMainWindow):
             )
             palettes = self.series.palettes
             active_palette = self.series.active_palette_id
+            history = list(self.series.color_history)
         self.color_panel.set_colors(primary, secondary, emit=False)
         self.palette_editor.set_palettes(
             palettes, active_palette, emit=False
@@ -4014,6 +4038,7 @@ class MainWindow(QMainWindow):
         self.palette_editor.set_new_swatch_color(
             self.color_panel.active_color()
         )
+        self.color_history.set_colors(history)
         self._apply_series_colors_to_canvas(primary, secondary)
         self._sync_gradient_presets()
 
@@ -4134,6 +4159,38 @@ class MainWindow(QMainWindow):
     ) -> None:
         del palette_id, swatch_id
         self.color_panel.apply_color(color, emit=True)
+        self._record_color_history(color)
+
+    def _record_color_history(self, color: str) -> None:
+        if self.series is None:
+            return
+        color = canonical_argb(color)
+        self.series.color_history = [
+            color,
+            *(
+                item for item in self.series.color_history
+                if canonical_argb(item) != color
+            ),
+        ][:24]
+        self.color_history.set_colors(self.series.color_history)
+        self._schedule_series_preferences_save()
+
+    def _history_color_activated(self, color: str) -> None:
+        self.color_panel.apply_color(color, emit=True)
+        self._record_color_history(color)
+
+    def _eyedropper_preview(self, color: str) -> None:
+        self.color_panel.apply_color(color, emit=True)
+
+    def _eyedropper_commit(self, color: str) -> None:
+        self.color_panel.apply_color(color, emit=True)
+        self._record_color_history(color)
+
+    def _eyedropper_gesture_changed(self, active: bool) -> None:
+        self._eyedropper_pointer_active = bool(active)
+        if not active and getattr(self, "_eyedropper_restore_pending", False):
+            self._eyedropper_restore_pending = False
+            self._restore_active_hotkey_tool()
 
     def _change_palette_swatch(
         self, palette_id: str, swatch_id: str, color: str
@@ -4687,6 +4744,49 @@ class MainWindow(QMainWindow):
             return False
         return self.save() if answer == QMessageBox.Save else True
 
+    def _export_png(self) -> None:
+        if (
+            self.chapter is None or self.repository is None
+            or self.series is None
+            or (self.active_session is not None
+                and self.active_session.kind != "series")
+        ):
+            return
+        exports = self.repository.root / "exports"
+        raw_name = self.chapter_combo.currentText().strip() or "Chapter"
+        safe_name = re.sub(r'[<>:"/\\|?*\x00-\x1f]+', "-", raw_name)
+        safe_name = safe_name.strip(" .-") or "Chapter"
+        stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        base = f"{safe_name}-{stamp}"
+        try:
+            exports.mkdir(parents=True, exist_ok=True)
+            destination = exports / f"{base}.png"
+            suffix = 2
+            while destination.exists():
+                destination = exports / f"{base}-{suffix}.png"
+                suffix += 1
+            image = QImage(
+                int(self.chapter.width), int(self.chapter.height),
+                QImage.Format.Format_ARGB32_Premultiplied,
+            )
+            if image.isNull():
+                raise MemoryError("could not allocate the chapter image")
+            self.canvas.render_preview(image)
+            temporary = destination.with_name(f".{destination.name}.tmp.png")
+            try:
+                if not image.save(str(temporary), "PNG"):
+                    raise OSError("Qt could not encode the PNG")
+                temporary.replace(destination)
+            finally:
+                if temporary.exists():
+                    temporary.unlink(missing_ok=True)
+        except (MemoryError, OSError, ValueError) as error:
+            QMessageBox.critical(
+                self, "Export PNG", f"Unable to export the chapter:\n{error}"
+            )
+            return
+        self.statusBar().showMessage(f"Exported {destination.name}", 7000)
+
     def _refresh_actions(self) -> None:
         active = self.chapter is not None
         series_active = active and (
@@ -4696,6 +4796,8 @@ class MainWindow(QMainWindow):
         self.save_as_action.setEnabled(self._current_project_context() is not None)
         self.new_chapter_action.setEnabled(series_active and self.series is not None)
         self.trim_action.setEnabled(series_active)
+        self.export_png_action.setEnabled(series_active)
+        self.export_png_toolbar_action.setEnabled(series_active)
         self.add_page_button.setEnabled(series_active)
         self.undo_action.setEnabled(self.canvas.command_stack.can_undo)
         self.redo_action.setEnabled(self.canvas.command_stack.can_redo)

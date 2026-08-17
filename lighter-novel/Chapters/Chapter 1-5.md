@@ -1,3 +1,5 @@
+
+oh also phoebe and lance have telepathic speech
 ## Chapter 1
  - split panels?
  - [[how should the story start]]

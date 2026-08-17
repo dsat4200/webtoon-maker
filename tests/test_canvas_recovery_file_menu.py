@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from datetime import datetime
 from pathlib import Path
 
 from PySide6.QtCore import QPointF, Qt
@@ -51,7 +52,7 @@ def test_file_menu_replaces_project_file_controls_and_handles_stale_recent(
     try:
         actions = window.file_menu.actions()
         assert [action.text() for action in actions] == [
-            "New Series", "Open Series", "Open Recent", "Import Images…", "", "Save", "Save As",
+            "New Series", "Open Series", "Open Recent", "Import Images…", "", "Save", "Save As", "Export PNG",
         ]
         toolbar_labels = [
             action.text() for action in window.file_toolbar.actions()
@@ -86,6 +87,38 @@ def test_file_menu_replaces_project_file_controls_and_handles_stale_recent(
         assert warnings and str(stale) in warnings[-1]
         assert window.settings.recent_series == []
         assert window.open_recent_menu.actions()[0].text() == "No Recent Series"
+    finally:
+        _dispose(window)
+
+
+def test_export_png_uses_full_chapter_size_and_collision_suffix(
+    qapp, tmp_path, monkeypatch,
+):
+    monkeypatch.setattr(main_window_module, "save_settings", lambda _value: None)
+    repository = SeriesRepository(tmp_path / "Series")
+    series = repository.create("Export")
+    chapter, _tiles = repository.create_chapter(series, "Bad:/Name")
+
+    class FixedDateTime:
+        @classmethod
+        def now(cls):
+            return datetime(2026, 8, 16, 12, 34, 56)
+
+    monkeypatch.setattr(main_window_module, "datetime", FixedDateTime)
+    window = MainWindow()
+    assert window.open_series(repository.root)
+    try:
+        window._export_png()
+        window._export_png()
+        exports = sorted((repository.root / "exports").glob("*.png"))
+        assert [path.name for path in exports] == [
+            "Bad-Name-20260816-123456-2.png",
+            "Bad-Name-20260816-123456.png",
+        ]
+        image = QImage(str(exports[0]))
+        assert image.size().width() == chapter.width
+        assert image.size().height() == chapter.height
+        assert not list((repository.root / "exports").glob("*.tmp.png"))
     finally:
         _dispose(window)
 

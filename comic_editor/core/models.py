@@ -8,6 +8,7 @@ from typing import Any, Iterable, Iterator, Literal
 
 
 SCHEMA_VERSION = 16
+SERIES_SCHEMA_VERSION = 17
 CHAPTER_WIDTH = 1080
 DEFAULT_CHAPTER_HEIGHT = 3240
 GROWTH_MARGIN = 1080
@@ -3002,16 +3003,25 @@ class SeriesDocument:
         default_factory=lambda: [default_color_palette()]
     )
     active_palette_id: str = ""
+    color_history: list[str] = field(default_factory=list)
     gradient_ramp_presets: list[ColorGradientRampPreset] = field(
         default_factory=lambda: [default_gradient_ramp_preset()]
     )
-    schema_version: int = SCHEMA_VERSION
+    schema_version: int = SERIES_SCHEMA_VERSION
 
     def validate(self) -> None:
         self.primary_color = canonical_argb(self.primary_color)
         self.secondary_color = canonical_argb(
             self.secondary_color, "#FFFFFFFF"
         )
+        history: list[str] = []
+        for value in self.color_history or []:
+            color = canonical_argb(value)
+            if color not in history:
+                history.append(color)
+            if len(history) >= 24:
+                break
+        self.color_history = history
         if not self.palettes:
             self.palettes = [default_color_palette()]
         palette_ids: set[str] = set()
@@ -3042,6 +3052,7 @@ class SeriesDocument:
             "name": self.name, "chapters": [item.to_dict() for item in self.chapters],
             "primary_color": self.primary_color,
             "secondary_color": self.secondary_color,
+            "color_history": list(self.color_history),
             "active_palette_id": self.active_palette_id,
             "palettes": [palette.to_dict() for palette in self.palettes],
             "gradient_ramp_presets": [
@@ -3052,7 +3063,7 @@ class SeriesDocument:
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "SeriesDocument":
         schema = int(data.get("schema_version", 1))
-        if schema > SCHEMA_VERSION:
+        if schema > SERIES_SCHEMA_VERSION:
             raise ValueError(f"Unsupported future series schema: {schema}")
         palettes = [
             ColorPalette.from_dict(item)
@@ -3076,13 +3087,14 @@ class SeriesDocument:
             ],
             primary_color=primary,
             secondary_color=secondary,
+            color_history=list(data.get("color_history", [])),
             palettes=palettes or [default_color_palette()],
             active_palette_id=str(data.get("active_palette_id", "")),
             gradient_ramp_presets=(
                 gradient_presets
                 or [default_gradient_ramp_preset(primary, secondary)]
             ),
-            schema_version=SCHEMA_VERSION,
+            schema_version=SERIES_SCHEMA_VERSION,
         )
         result.validate()
         return result

@@ -767,3 +767,21 @@ def test_rotated_vector_selection_quad_persists_and_undo_restores_it(qapp):
     assert translated == pytest.approx([
         (x + 20, y + 15) for x, y in rotated
     ])
+
+
+def test_delete_selected_vector_points_is_one_undoable_edit(qapp):
+    stroke = _stroke((40, 40, 5, 1), (80, 60, 5, 1), (120, 40, 5, 1))
+    canvas, _chapter, drawing = _canvas_with_drawing([stroke])
+    canvas.set_tool(ToolKind.VECTOR_EDIT)
+    removed = stroke.points[1].point_id
+    canvas._set_vector_selection(drawing, {stroke.stroke_id}, {removed})
+
+    assert canvas._delete_selected_vector_points()
+    assert len(drawing.strokes[0].points) == 2
+    assert removed not in {
+        point.point_id for point in drawing.strokes[0].points
+    }
+
+    canvas.command_stack.undo()
+    restored = canvas.chapter.objects[drawing.object_id]
+    assert len(restored.strokes[0].points) == 3

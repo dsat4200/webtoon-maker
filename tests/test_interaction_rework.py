@@ -414,6 +414,7 @@ def test_sparse_raster_translation_preserves_tiles_and_uses_standard_undo(
     )
     canvas.set_selection("object", raster.object_id)
     assert canvas.tool == ToolKind.RASTER_PENCIL
+    canvas.settings.pencil_transform_handles_visible = True
     rect = canvas.object_world_rect(raster.object_id)
     edge = QPointF(rect.left() + rect.width() * 0.25, rect.top())
     canvas._tool_press(canvas.document_to_widget(edge), 1)
@@ -519,7 +520,7 @@ def test_raster_handle_transform_still_bakes_and_undoes(qapp):
     original_bounds = canvas.tiles.content_bounds(raster.object_id)
     canvas.set_selection("object", raster.object_id)
     assert canvas.tool == ToolKind.RASTER_PENCIL
-    assert not canvas.set_tool(ToolKind.TRANSFORM)
+    assert canvas.set_tool(ToolKind.TRANSFORM)
     canvas._tool_press(_widget(canvas, 100, 100), 1)
     canvas._tool_move(_widget(canvas, 80, 80), 1)
     canvas._tool_release()
@@ -656,3 +657,28 @@ def test_outliner_colors_collapsed_add_and_dynamic_tools(qapp):
     assert not hasattr(window, "inspector")
     window.hide()
     window.deleteLater()
+
+
+def test_reset_rotation_preserves_navigation_center_and_scale(qapp):
+    canvas, _chapter, _page, _layer = _canvas_document()
+    canvas.center_x = 321.25
+    canvas.center_y = 654.75
+    canvas.scale = 1.75
+    canvas.rotation = 37.0
+    canvas.reset_rotation()
+    assert canvas.rotation == 0.0
+    assert canvas.scale == pytest.approx(1.75)
+    assert (canvas.center_x, canvas.center_y) == pytest.approx(
+        (321.25, 654.75)
+    )
+
+
+def test_eyedropper_samples_normal_compositor_without_overlays(qapp):
+    canvas, chapter, page, _layer = _canvas_document()
+    raster = chapter.add_object(
+        page.layer_id, RasterObject(x=100, y=100)
+    )
+    canvas.tiles.paint_dab(
+        raster.object_id, QPointF(20, 20), 30, QColor("#FF336699")
+    )
+    assert canvas.sample_composited_color(QPointF(120, 120)) == "#FF336699"

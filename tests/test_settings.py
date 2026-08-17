@@ -35,7 +35,7 @@ def test_blender_bridge_endpoint_is_clamped_and_persisted(monkeypatch, tmp_path)
 
     loaded = load_settings()
 
-    assert loaded.settings_version == 15
+    assert loaded.settings_version == 16
     assert loaded.blender_bridge_host == "localhost"
     assert loaded.blender_bridge_port == 65535
     assert loaded.blender_bridge_token == "panel-token"
@@ -98,7 +98,7 @@ def test_settings_v8_migration_removes_transform_snap_and_disables_hold(
     }), encoding="utf-8")
     _use_settings_file(monkeypatch, path)
     loaded = load_settings()
-    assert loaded.settings_version == 15
+    assert loaded.settings_version == 16
     assert loaded.page_scope_select is False
     assert loaded.transform_mode == "uniform"
     assert loaded.snap_to_grid is False
@@ -121,7 +121,7 @@ def test_vector_and_fill_settings_are_normalized(monkeypatch, tmp_path):
         "fill_mode": "other",
     }), encoding="utf-8")
     loaded = load_settings()
-    assert loaded.settings_version == 15
+    assert loaded.settings_version == 16
     assert loaded.vector_eraser_mode == "stroke"
     assert loaded.vector_simplify_amount == 100
     assert loaded.vector_redraw_opacity_max == 0
@@ -145,7 +145,7 @@ def test_settings_v9_normalizes_splitter_sizes(monkeypatch, tmp_path):
 
     loaded = load_settings()
 
-    assert loaded.settings_version == 15
+    assert loaded.settings_version == 16
     assert loaded.ui_splitter_sizes == {
         "sidebar_workspace": [260, 1100],
         "tools_colors": [0, 440],
@@ -185,6 +185,24 @@ def test_default_text_preset_is_protected_and_formatting_only():
     assert "text" not in loaded.text_presets[0]
 
 
+def test_settings_v16_adds_sampling_transform_and_point_defaults(
+    monkeypatch, tmp_path,
+):
+    path = tmp_path / "settings.json"
+    _use_settings_file(monkeypatch, path)
+    path.write_text(json.dumps({"settings_version": 15}), encoding="utf-8")
+    loaded = load_settings()
+    assert loaded.settings_version == 16
+    assert loaded.hotkeys["eyedropper"] == "I"
+    assert loaded.hotkeys["reset_rotation"] == "Ctrl+Shift+0"
+    assert loaded.hotkey_hold["eyedropper"] is True
+    assert loaded.pencil_transform_handles_visible is False
+    assert loaded.eraser_transform_handles_visible is False
+    assert loaded.vector_point_icons_visible is False
+    assert loaded.vector_point_icon_size == 80
+    assert loaded.vector_point_icon_opacity == 100
+
+
 def test_settings_v12_adds_font_preview_delete_and_integer_text_sizes(
     monkeypatch, tmp_path,
 ):
@@ -201,7 +219,7 @@ def test_settings_v12_adds_font_preview_delete_and_integer_text_sizes(
 
     loaded = load_settings()
 
-    assert loaded.settings_version == 15
+    assert loaded.settings_version == 16
     assert loaded.navigator_expanded is False
     assert loaded.preview_font_names is False
     assert loaded.hotkeys["delete_selected"] == "Delete"

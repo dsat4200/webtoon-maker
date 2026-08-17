@@ -122,7 +122,7 @@
         "additional_contours": []
       },
       "shape_style": {
-        "primary_color": "#101010",
+        "primary_color": "#000000",
         "base_thickness": 8,
         "outline_color": "#111111",
         "outline_thickness": 4,
@@ -151,7 +151,7 @@
           "id": "44074fda6d3b42b5aa9bc9ffef66f901"
         }
       ],
-      "visible": true,
+      "visible": false,
       "opacity": 1.0,
       "translation": [
         0.0,
@@ -265,7 +265,7 @@
           "id": "c9efdff5e1c744378c98411add87fd75"
         }
       ],
-      "visible": true,
+      "visible": false,
       "opacity": 1.0,
       "translation": [
         0.0,
@@ -479,7 +479,7 @@
           {
             "id": "03c67186784c4ea28dd8ad0c6049aebb",
             "position": [
-              37.0,
+              -25.0,
               746.0
             ],
             "point_type": "vector",
@@ -493,7 +493,7 @@
           {
             "id": "dcf89befec484f03977c5ed0310c8114",
             "position": [
-              1052.0,
+              1097.0,
               746.0
             ],
             "point_type": "vector",
@@ -507,8 +507,8 @@
           {
             "id": "adc737925f03421ab55e15bf8681618f",
             "position": [
-              1052.0,
-              2859.0
+              1097.0,
+              3121.0
             ],
             "point_type": "vector",
             "incoming": null,
@@ -521,8 +521,8 @@
           {
             "id": "9bbbb1a49fb2463089a8e150abe814b5",
             "position": [
-              37.0,
-              2859.0
+              -25.0,
+              3121.0
             ],
             "point_type": "vector",
             "incoming": null,
@@ -734,7 +734,7 @@
           "id": "26f36ceadf594672be180cb452052844"
         }
       ],
-      "visible": true,
+      "visible": false,
       "opacity": 1.0,
       "translation": [
         -608.0976744157647,
@@ -23435,7 +23435,7 @@
         "project_uuid": "bdf1aec65cf84149a0a07569c8c3341e",
         "view_uuid": "bb6339a045144df4b60fe894eee5b6c2",
         "display_name": "Comic View 1",
-        "last_revision": 13
+        "last_revision": 14
       },
       "source_filename": "last-frame.png",
       "source_mime_type": "image/png",
@@ -53118,20 +53118,20 @@
       "margin": 24.0,
       "transform_quad": [
         [
-          723.2201467821346,
-          1240.4919299290204
+          729.5940722367866,
+          1236.2426462925857
         ],
         [
-          1048.4144853217363,
-          1322.7719400463454
+          1054.7884107763882,
+          1318.5226564099107
         ],
         [
-          1008.6160263211341,
-          1443.616657866339
+          1014.9899517757859,
+          1439.3673742299043
         ],
         [
-          683.4216877815325,
-          1361.336647749014
+          689.7956132361844,
+          1357.0873641125793
         ]
       ]
     },
