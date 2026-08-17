@@ -16,11 +16,11 @@ This folder is a source-verified guide to the current `webtoon-maker` codebase. 
 - `lighter-novel/` contains story/planning material and Obsidian workspace files. It is not imported by the editor.
 - `paint/handles.png` is an unreferenced image asset in the current source.
 - `program-map.txt` is a useful historical generated map, but it is not authoritative. Some names and counts in it lag the current source. These documents follow the current code.
-- The current document schema is version 14, editor settings are version 12, and the package reports version `0.1.0`.
+- The current document schema is version 16, editor settings are version 15, and the package reports version `0.1.0`.
 
 ## One-paragraph architecture
 
-Webtoon Maker is a native PySide6 desktop editor for fixed-width, vertically growing comics. `MainWindow` owns application workflow and contextual controls; `_CanvasLogic` owns rendering and nearly all pointer/stylus/touch interaction; `ChapterDocument` owns the validated layer/object graph; `TileStore` owns sparse raster pixels; the vector geometry module supplies cubic fitting, projection, erasing, simplification, connection, intersection, and face tracing; and `SeriesRepository` publishes portable JSON/PNG series folders with autosave and interrupted-save recovery. Rendering is QPainter-based in both software and OpenGL-backed widgets.
+Webtoon Maker is a native PySide6 desktop editor for fixed-width, vertically growing comics. `MainWindow` owns application workflow and contextual controls; `_CanvasLogic` owns rendering and nearly all pointer/stylus/touch interaction; `ChapterDocument` owns the validated layer/object graph; `TileStore` owns sparse raster pixels; `ImageStore` owns embedded image bytes plus transient live overrides; the vector geometry module supplies cubic fitting, projection, erasing, simplification, connection, intersection, and face tracing; and `SeriesRepository` publishes portable JSON/PNG series folders with autosave and interrupted-save recovery. The optional Blender 4.5 extension exposes geometry-free Comic View snapshots and transparent RGBA frames through an authenticated loopback protocol and shared memory; the editor consumes them through the generic Image Object path.
 
 ## Important terminology
 
@@ -28,7 +28,9 @@ Webtoon Maker is a native PySide6 desktop editor for fixed-width, vertically gro
 - **Chapter**: one 1080-pixel-wide, vertically growing canvas and its complete object graph.
 - **Page**: a root shape layer positioned within a chapter. Pages need not tile the chapter and may overlap.
 - **Layer**: a shape/mask container, open stroked shape, or boundless fill leaf.
-- **Object**: raster, text, vector drawing, vector fill, or gradient data attached to a container layer.
+- **Object**: raster, image, text, vector drawing, vector fill, or gradient data attached to a container layer.
+- **Comic View**: a geometry-free Blender scene-state snapshot identified by project and view UUIDs.
+- **Linked Image**: an Image Object whose replaceable source is a Comic View and whose last accepted frame is persisted as an offline PNG.
 - **Direct parent mask**: the immediate shape used to clip a child.
 - **Compound mask**: the Boolean result of a compound layer and contributing descendants.
 - **Interaction frame**: a raster object's editable rectangle; it does not crop or clip stored pixels.

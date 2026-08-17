@@ -1,5 +1,5 @@
 {
-  "schema_version": 15,
+  "schema_version": 16,
   "id": "eb0ba5d637f942308935a94af9b572cb",
   "name": "Test",
   "chapters": [
@@ -8,7 +8,7 @@
       "name": "Chapter 1"
     }
   ],
-  "primary_color": "#FF000000",
+  "primary_color": "#89000000",
   "secondary_color": "#FFFFFFFF",
   "active_palette_id": "f2bff450e4cb4554b1a90bcebce206aa",
   "palettes": [

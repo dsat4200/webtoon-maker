@@ -1,0 +1,732 @@
+"""Webtoon Comic Views Blender 4.5 extension."""
+from __future__ import annotations
+
+import time
+import uuid
+
+import bpy
+from bpy.app.handlers import persistent
+from bpy.props import (
+    BoolProperty, CollectionProperty, EnumProperty, FloatProperty, IntProperty,
+    PointerProperty, StringProperty,
+)
+from bpy.types import AddonPreferences, Operator, Panel, PropertyGroup, UIList
+
+from . import bridge, renderer, viewport
+from .state import (
+    apply_state, capture_state, ensure_uuid, parse_state, state_digest, state_json,
+    view_layer_for_state,
+)
+
+
+def _resolution_changed(item: object, _context: object) -> None:
+    width, height = viewport.update_working_resolution(item)
+    if item.state_json:
+        item.updated_at = time.time()
+        bridge.RUNTIME.mark_scene_dirty()
+        viewport.tag_redraw()
+
+
+def _view_name_changed(item: object, _context: object) -> None:
+    if item.state_json:
+        item.updated_at = time.time()
+        bridge.RUNTIME.send_views(bpy.context.scene)
+
+
+class WebtoonComicView(PropertyGroup):
+    view_uuid: StringProperty(name="UUID")
+    name: StringProperty(
+        name="Name", default="Comic View", update=_view_name_changed,
+    )
+    revision: IntProperty(name="Revision", min=0, default=0)
+    width: IntProperty(
+        name="Width", min=64, max=4096, default=1920,
+        update=_resolution_changed,
+    )
+    height: IntProperty(
+        name="Height", min=64, max=4096, default=1080,
+    )
+    published_width: IntProperty(name="Published Width", min=0, max=4096, default=0)
+    published_height: IntProperty(name="Published Height", min=0, max=4096, default=0)
+    frame_min_x: FloatProperty(default=0.1, min=0.0, max=1.0)
+    frame_min_y: FloatProperty(default=0.1, min=0.0, max=1.0)
+    frame_max_x: FloatProperty(default=0.9, min=0.0, max=1.0)
+    frame_max_y: FloatProperty(default=0.9, min=0.0, max=1.0)
+    state_json: StringProperty(name="State")
+    state_hash: StringProperty(name="State Hash")
+    thumbnail_image: StringProperty(name="Thumbnail Image")
+    thumbnail_png: StringProperty(name="Thumbnail PNG")
+    is_dirty: BoolProperty(name="Dirty", default=False)
+    created_at: FloatProperty(name="Created", default=0.0)
+    updated_at: FloatProperty(name="Updated", default=0.0)
+
+
+class WebtoonRegisteredProperty(PropertyGroup):
+    owner_uuid: StringProperty()
+    owner_type: StringProperty()
+    owner_name: StringProperty()
+    rna_path: StringProperty()
+    property_id: StringProperty()
+    label: StringProperty()
+
+
+class WebtoonComicSettings(PropertyGroup):
+    project_uuid: StringProperty(name="Project UUID")
+    active_index: IntProperty(name="Active Comic View", default=-1)
+    registered_index: IntProperty(name="Registered Property", default=-1)
+
+
+class WebtoonComicPreferences(AddonPreferences):
+    bl_idname = __package__
+
+    port: IntProperty(name="Port", min=1024, max=65535, default=47837)
+    token: StringProperty(name="Token", subtype="PASSWORD")
+    # Retained so existing extension preferences continue to deserialize.
+    # Automatic publishing is disabled; only Update and Render Once render.
+    max_fps: IntProperty(
+        name="Maximum FPS", min=1, max=30, default=15, options={"HIDDEN"}
+    )
+
+    def draw(self, _context: object) -> None:
+        layout = self.layout
+        layout.label(text="Loopback bridge")
+        layout.label(text="Host: 127.0.0.1")
+        layout.prop(self, "port")
+        layout.prop(self, "token")
+        layout.label(text="Publishing: Update (Render Once previews)")
+
+
+def _scene() -> bpy.types.Scene:
+    return bpy.context.scene
+
+
+def _settings(scene: bpy.types.Scene | None = None) -> WebtoonComicSettings:
+    return (scene or _scene()).webtoon_comic_settings
+
+
+def _views(scene: bpy.types.Scene | None = None) -> object:
+    return (scene or _scene()).webtoon_comic_views
+
+
+def _active_view(scene: bpy.types.Scene | None = None) -> object | None:
+    scene = scene or _scene()
+    index = int(_settings(scene).active_index)
+    views = _views(scene)
+    return views[index] if 0 <= index < len(views) else None
+
+
+def _ensure_project_uuid(scene: bpy.types.Scene) -> None:
+    settings = _settings(scene)
+    try:
+        settings.project_uuid = uuid.UUID(settings.project_uuid).hex
+    except (ValueError, AttributeError):
+        settings.project_uuid = uuid.uuid4().hex
+
+
+def _report_warnings(operator: Operator, warnings: list[str]) -> None:
+    if warnings:
+        operator.report({"WARNING"}, f"Applied with {len(warnings)} warning(s)")
+
+
+def _restore_view_presentation(view: object, stored_state: dict) -> None:
+    viewport.set_frame_bounds(
+        view, stored_state.get("stream_frame", viewport.DEFAULT_FRAME)
+    )
+    resolution = stored_state.get("output_resolution", [1920, 1080])
+    if isinstance(resolution, list) and len(resolution) == 2:
+        try:
+            view.width, view.height = int(resolution[0]), int(resolution[1])
+        except (TypeError, ValueError):
+            pass
+    viewport.update_working_resolution(view)
+    viewport.tag_redraw()
+
+
+class WEBTOON_OT_new_comic_view(Operator):
+    bl_idname = "webtoon.new_comic_view"
+    bl_label = "New Comic View"
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context: bpy.types.Context) -> set[str]:
+        scene = context.scene
+        _ensure_project_uuid(scene)
+        views = _views(scene)
+        view = views.add()
+        view.view_uuid = uuid.uuid4().hex
+        view.name = f"Comic View {len(views)}"
+        width = max(64, int(scene.render.resolution_x))
+        height = max(64, int(scene.render.resolution_y))
+        if width * height > renderer.MAX_PIXELS:
+            ratio = (renderer.MAX_PIXELS / (width * height)) ** 0.5
+            width, height = int(width * ratio), int(height * ratio)
+        view.width, view.height = min(4096, width), min(4096, height)
+        view.created_at = time.time()
+        view.updated_at = view.created_at
+        _settings(scene).active_index = len(views) - 1
+        viewport.set_frame_bounds(view, viewport.default_frame(scene))
+        viewport.update_working_resolution(view)
+        try:
+            warnings = bridge.RUNTIME.capture_into_view(scene, view)
+        except Exception as error:
+            views.remove(len(views) - 1)
+            self.report({"ERROR"}, str(error))
+            return {"CANCELLED"}
+        _report_warnings(self, warnings)
+        return {"FINISHED"}
+
+
+class WEBTOON_OT_duplicate_comic_view(Operator):
+    bl_idname = "webtoon.duplicate_comic_view"
+    bl_label = "Duplicate Comic View"
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context: bpy.types.Context) -> set[str]:
+        source = _active_view(context.scene)
+        if source is None:
+            return {"CANCELLED"}
+        target = _views(context.scene).add()
+        target.view_uuid = uuid.uuid4().hex
+        target.name = f"{source.name} Copy"
+        target.revision = 1
+        target.width, target.height = source.width, source.height
+        target.published_width = source.published_width
+        target.published_height = source.published_height
+        viewport.set_frame_bounds(target, viewport.frame_bounds(source))
+        target.state_json, target.state_hash = source.state_json, source.state_hash
+        target.thumbnail_image = source.thumbnail_image
+        target.thumbnail_png = source.thumbnail_png
+        target.created_at = target.updated_at = time.time()
+        target.is_dirty = False
+        _settings(context.scene).active_index = len(_views(context.scene)) - 1
+        bridge.RUNTIME.send_views(context.scene)
+        return {"FINISHED"}
+
+
+class WEBTOON_OT_update_comic_view(Operator):
+    bl_idname = "webtoon.update_comic_view"
+    bl_label = "Update Comic View"
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context: bpy.types.Context) -> set[str]:
+        view = _active_view(context.scene)
+        if view is None:
+            return {"CANCELLED"}
+        try:
+            warnings = bridge.RUNTIME.capture_into_view(context.scene, view)
+        except Exception as error:
+            self.report({"ERROR"}, str(error))
+            return {"CANCELLED"}
+        _report_warnings(self, warnings)
+        return {"FINISHED"}
+
+
+class WEBTOON_OT_delete_comic_view(Operator):
+    bl_idname = "webtoon.delete_comic_view"
+    bl_label = "Delete Comic View"
+    bl_options = {"REGISTER", "UNDO"}
+
+    @classmethod
+    def poll(cls, context: bpy.types.Context) -> bool:
+        return _active_view(context.scene) is not None
+
+    def execute(self, context: bpy.types.Context) -> set[str]:
+        scene = context.scene
+        index = int(_settings(scene).active_index)
+        view = _active_view(scene)
+        if view is None:
+            return {"CANCELLED"}
+        if bridge.RUNTIME.active_stream_uuid == view.view_uuid:
+            bridge.RUNTIME.stop_stream()
+        thumbnail = view.thumbnail_image
+        _views(scene).remove(index)
+        _settings(scene).active_index = min(index, len(_views(scene)) - 1)
+        if thumbnail and not any(item.thumbnail_image == thumbnail for item in _views(scene)):
+            image = bpy.data.images.get(thumbnail)
+            if image is not None:
+                bpy.data.images.remove(image)
+        bridge.RUNTIME.send_views(scene)
+        return {"FINISHED"}
+
+
+class WEBTOON_OT_revert_comic_view(Operator):
+    bl_idname = "webtoon.revert_comic_view"
+    bl_label = "Revert Comic View"
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context: bpy.types.Context) -> set[str]:
+        view = _active_view(context.scene)
+        if view is None:
+            return {"CANCELLED"}
+        try:
+            bridge.RUNTIME.ignore_updates_until = time.monotonic() + 0.3
+            stored_state = parse_state(view.state_json)
+            warnings = apply_state(
+                context.scene, stored_state,
+                view_layer_for_state(context.scene, stored_state, context.view_layer),
+            )
+            _restore_view_presentation(view, stored_state)
+            view.is_dirty = False
+            bridge.RUNTIME.scene_matches_snapshot = True
+            bridge.RUNTIME.request_committed_frame(context.scene, view)
+        except Exception as error:
+            self.report({"ERROR"}, str(error))
+            return {"CANCELLED"}
+        _report_warnings(self, warnings)
+        return {"FINISHED"}
+
+
+class WEBTOON_OT_set_stream_frame(Operator):
+    bl_idname = "webtoon.set_stream_frame"
+    bl_label = "Set Stream Frame"
+    bl_options = {"BLOCKING"}
+
+    def invoke(self, context: bpy.types.Context, _event: object) -> set[str]:
+        view = _active_view(context.scene)
+        if view is None or context.area is None or context.area.type != "VIEW_3D":
+            return {"CANCELLED"}
+        viewport.bind(context)
+        self._view_uuid = view.view_uuid
+        self._original = viewport.frame_bounds(view)
+        self._start = None
+        context.window.cursor_modal_set("CROSSHAIR")
+        context.window_manager.modal_handler_add(self)
+        return {"RUNNING_MODAL"}
+
+    def _window_point(self, context: bpy.types.Context, event: object):
+        _window, _area, _space, region = viewport.find_view3d()
+        if region is None:
+            return None
+        x = max(0.0, min(float(region.width), float(event.mouse_x - region.x)))
+        y = max(0.0, min(float(region.height), float(event.mouse_y - region.y)))
+        return x, y, region
+
+    def _finish(self, context: bpy.types.Context) -> None:
+        context.window.cursor_modal_restore()
+        viewport.tag_redraw()
+
+    def modal(self, context: bpy.types.Context, event: object) -> set[str]:
+        view = bridge.RUNTIME._view(context.scene, self._view_uuid)
+        if view is None:
+            self._finish(context)
+            return {"CANCELLED"}
+        if event.type in {"ESC", "RIGHTMOUSE"}:
+            viewport.set_frame_bounds(view, self._original)
+            viewport.update_working_resolution(view)
+            self._finish(context)
+            return {"CANCELLED"}
+        point = self._window_point(context, event)
+        if point is None:
+            self._finish(context)
+            return {"CANCELLED"}
+        x, y, region = point
+        if event.type == "LEFTMOUSE" and event.value == "PRESS":
+            self._start = (x, y)
+            return {"RUNNING_MODAL"}
+        if self._start is not None and event.type == "MOUSEMOVE":
+            sx, sy = self._start
+            if abs(x - sx) >= viewport.MIN_FRAME_PIXELS and abs(y - sy) >= viewport.MIN_FRAME_PIXELS:
+                viewport.set_frame_bounds(view, (
+                    min(sx, x) / region.width, min(sy, y) / region.height,
+                    max(sx, x) / region.width, max(sy, y) / region.height,
+                ))
+                viewport.update_working_resolution(view)
+                viewport.tag_redraw()
+            return {"RUNNING_MODAL"}
+        if event.type == "LEFTMOUSE" and event.value == "RELEASE" and self._start is not None:
+            sx, sy = self._start
+            if abs(x - sx) < viewport.MIN_FRAME_PIXELS or abs(y - sy) < viewport.MIN_FRAME_PIXELS:
+                viewport.set_frame_bounds(view, self._original)
+                self._finish(context)
+                return {"CANCELLED"}
+            viewport.set_frame_bounds(view, (
+                min(sx, x) / region.width, min(sy, y) / region.height,
+                max(sx, x) / region.width, max(sy, y) / region.height,
+            ))
+            viewport.update_working_resolution(view)
+            view.updated_at = time.time()
+            bridge.RUNTIME.mark_scene_dirty()
+            self._finish(context)
+            return {"FINISHED"}
+        return {"RUNNING_MODAL"}
+
+
+class WEBTOON_OT_activate_comic_view(Operator):
+    bl_idname = "webtoon.activate_comic_view"
+    bl_label = "Activate Comic View"
+    bl_options = {"REGISTER", "UNDO"}
+
+    view_uuid: StringProperty()
+    resolution: EnumProperty(items=(
+        ("UPDATE", "Update", "Save the current changes before switching"),
+        ("REVERT", "Revert", "Discard current changes and switch"),
+        ("CANCEL", "Cancel", "Keep the current view"),
+    ), default="UPDATE")
+
+    def invoke(self, context: bpy.types.Context, _event: object) -> set[str]:
+        current = _active_view(context.scene)
+        destination = bridge.RUNTIME._view(context.scene, self.view_uuid)
+        if current is not None and destination != current and current.is_dirty:
+            return context.window_manager.invoke_props_dialog(self)
+        return self.execute(context)
+
+    def execute(self, context: bpy.types.Context) -> set[str]:
+        current = _active_view(context.scene)
+        destination = bridge.RUNTIME._view(context.scene, self.view_uuid)
+        if destination is None:
+            self.report({"ERROR"}, "Comic View not found")
+            return {"CANCELLED"}
+        if current == destination:
+            viewport.bind(context)
+            viewport.tag_redraw()
+            return {"FINISHED"}
+        if current is not None and current != destination and current.is_dirty:
+            if self.resolution == "CANCEL":
+                return {"CANCELLED"}
+            if self.resolution == "UPDATE":
+                try:
+                    bridge.RUNTIME.capture_into_view(context.scene, current)
+                except Exception as error:
+                    self.report({"ERROR"}, str(error))
+                    return {"CANCELLED"}
+                if (
+                    bridge.RUNTIME.streaming
+                    and bridge.RUNTIME.active_stream_uuid == current.view_uuid
+                ):
+                    bridge.RUNTIME._switch_after_publish = {
+                        "request_id": None,
+                        "destination_uuid": destination.view_uuid,
+                        "sequence": None,
+                        "deadline": time.monotonic() + 5.0,
+                    }
+                    return {"FINISHED"}
+        try:
+            bridge.RUNTIME._activate(context.scene, destination)
+        except Exception as error:
+            self.report({"ERROR"}, str(error))
+            return {"CANCELLED"}
+        return {"FINISHED"}
+
+
+class WEBTOON_OT_start_bridge(Operator):
+    bl_idname = "webtoon.start_bridge"
+    bl_label = "Start Comic View Bridge"
+
+    def execute(self, _context: bpy.types.Context) -> set[str]:
+        preferences = bridge.addon_preferences()
+        if preferences is None:
+            return {"CANCELLED"}
+        if not preferences.token:
+            preferences.token = uuid.uuid4().hex
+        try:
+            bridge.RUNTIME.start_server(preferences.port, preferences.token)
+        except OSError as error:
+            bridge.RUNTIME.last_error = str(error)
+            self.report({"ERROR"}, str(error))
+            return {"CANCELLED"}
+        return {"FINISHED"}
+
+
+class WEBTOON_OT_stop_bridge(Operator):
+    bl_idname = "webtoon.stop_bridge"
+    bl_label = "Stop Comic View Bridge"
+
+    def execute(self, _context: bpy.types.Context) -> set[str]:
+        bridge.RUNTIME.stop_server()
+        return {"FINISHED"}
+
+
+class WEBTOON_OT_include_property(Operator):
+    bl_idname = "webtoon.include_property"
+    bl_label = "Include in Comic Views"
+
+    @classmethod
+    def poll(cls, context: bpy.types.Context) -> bool:
+        pointer = getattr(context, "button_pointer", None)
+        prop = getattr(context, "button_prop", None)
+        return pointer is not None and prop is not None and prop.type in {
+            "BOOLEAN", "INT", "FLOAT", "ENUM", "STRING",
+        }
+
+    def execute(self, context: bpy.types.Context) -> set[str]:
+        pointer = context.button_pointer
+        prop = context.button_prop
+        owner = getattr(pointer, "id_data", None)
+        if owner is None or owner.bl_rna.identifier in {
+            "Mesh", "Curve", "Curves", "Lattice", "GreasePencil",
+        }:
+            self.report({"ERROR"}, "Geometry properties cannot be captured")
+            return {"CANCELLED"}
+        if getattr(prop, "is_array", False) and int(prop.array_length) > 32:
+            self.report({"ERROR"}, "Arrays longer than 32 values are not supported")
+            return {"CANCELLED"}
+        try:
+            value = getattr(pointer, prop.identifier)
+            if prop.type != "ENUM" and hasattr(value, "__len__") \
+                    and not isinstance(value, str) and len(value) > 32:
+                raise ValueError("The property value is too large")
+            rna_path = pointer.path_from_id()
+        except (AttributeError, TypeError, ValueError) as error:
+            self.report({"ERROR"}, str(error))
+            return {"CANCELLED"}
+        owner_uuid = ensure_uuid(owner)
+        entries = context.scene.webtoon_comic_registered
+        if any(
+            item.owner_uuid == owner_uuid and item.rna_path == rna_path
+            and item.property_id == prop.identifier
+            for item in entries
+        ):
+            self.report({"INFO"}, "This property is already included")
+            return {"CANCELLED"}
+        item = entries.add()
+        item.owner_uuid = owner_uuid
+        item.owner_type = owner.bl_rna.identifier
+        item.owner_name = getattr(owner, "name", "")
+        item.rna_path = rna_path
+        item.property_id = prop.identifier
+        item.label = prop.name
+        bridge.RUNTIME.mark_scene_dirty()
+        self.report({"INFO"}, f"Included {prop.name} in Comic Views")
+        return {"FINISHED"}
+
+
+class WEBTOON_OT_remove_registered_property(Operator):
+    bl_idname = "webtoon.remove_registered_property"
+    bl_label = "Remove Registered Comic View Property"
+
+    def execute(self, context: bpy.types.Context) -> set[str]:
+        settings = _settings(context.scene)
+        entries = context.scene.webtoon_comic_registered
+        index = int(settings.registered_index)
+        if not 0 <= index < len(entries):
+            return {"CANCELLED"}
+        entries.remove(index)
+        settings.registered_index = min(index, len(entries) - 1)
+        bridge.RUNTIME.mark_scene_dirty()
+        return {"FINISHED"}
+
+
+class WEBTOON_UL_comic_views(UIList):
+    def draw_item(
+        self, _context: object, layout: object, _data: object, item: object,
+        _icon: object, _active_data: object, _active_propname: object,
+        _index: object,
+    ) -> None:
+        row = layout.row(align=True)
+        image = bpy.data.images.get(item.thumbnail_image)
+        if image is not None:
+            image.preview_ensure()
+            row.label(text="", icon_value=image.preview.icon_id)
+        row.prop(item, "name", text="", emboss=False)
+        row.label(text=f"r{item.revision}")
+        if item.is_dirty:
+            row.label(text="", icon="ERROR")
+
+
+class WEBTOON_UL_registered_properties(UIList):
+    def draw_item(
+        self, _context: object, layout: object, _data: object, item: object,
+        _icon: object, _active_data: object, _active_propname: object,
+        _index: object,
+    ) -> None:
+        layout.label(text=f"{item.owner_name}: {item.label}")
+
+
+class WEBTOON_PT_comic_views(Panel):
+    bl_label = "Comic Views"
+    bl_idname = "WEBTOON_PT_comic_views"
+    bl_space_type = "VIEW_3D"
+    bl_region_type = "UI"
+    bl_category = "Comic Views"
+
+    def draw(self, context: bpy.types.Context) -> None:
+        scene = context.scene
+        settings = _settings(scene)
+        layout = self.layout
+        bridge_box = layout.box()
+        preferences = bridge.addon_preferences()
+        status = (
+            "Connected" if bridge.RUNTIME.connected else
+            "Listening" if bridge.RUNTIME.server.running else "Stopped"
+        )
+        bridge_box.label(text=f"Bridge: {status}")
+        bridge_box.label(text="Host: 127.0.0.1")
+        if preferences is not None:
+            bridge_box.prop(preferences, "port")
+            bridge_box.prop(preferences, "token")
+            bridge_box.label(text="Publishing: Update (Render Once previews)")
+        row = bridge_box.row(align=True)
+        row.operator("webtoon.start_bridge", text="Start / Restart")
+        row.operator("webtoon.stop_bridge", text="Stop")
+        if bridge.RUNTIME.last_error:
+            bridge_box.label(text=bridge.RUNTIME.last_error, icon="ERROR")
+
+        layout.template_list(
+            "WEBTOON_UL_comic_views", "", scene, "webtoon_comic_views",
+            settings, "active_index", rows=4,
+        )
+        row = layout.row(align=True)
+        row.operator("webtoon.new_comic_view", text="New", icon="ADD")
+        row.operator("webtoon.duplicate_comic_view", text="Duplicate")
+        row.operator("webtoon.delete_comic_view", text="Delete", icon="TRASH")
+        view = _active_view(scene)
+        if view is not None:
+            image = bpy.data.images.get(view.thumbnail_image)
+            if image is not None:
+                layout.template_preview(image, show_buttons=False)
+            layout.prop(view, "name")
+            row = layout.row(align=True)
+            row.prop(view, "width")
+            row.label(text=f"Height {view.height}")
+            layout.operator("webtoon.set_stream_frame", text="Set Stream Frame")
+            activate = layout.operator("webtoon.activate_comic_view", text="Activate")
+            activate.view_uuid = view.view_uuid
+            row = layout.row(align=True)
+            row.operator("webtoon.update_comic_view", text="Update")
+            row.operator("webtoon.revert_comic_view", text="Revert")
+            layout.label(text=f"Revision {view.revision}")
+            if view.is_dirty:
+                layout.label(text="Stored view has unsaved scene changes", icon="ERROR")
+
+        layout.separator()
+        layout.label(text="Extra captured properties")
+        layout.template_list(
+            "WEBTOON_UL_registered_properties", "", scene,
+            "webtoon_comic_registered", settings, "registered_index", rows=2,
+        )
+        layout.operator("webtoon.remove_registered_property", icon="REMOVE")
+
+
+def _draw_button_context(self: object, context: bpy.types.Context) -> None:
+    if WEBTOON_OT_include_property.poll(context):
+        self.layout.separator()
+        self.layout.operator("webtoon.include_property")
+
+
+@persistent
+def _depsgraph_updated(_scene: object, _depsgraph: object) -> None:
+    bridge.RUNTIME.mark_scene_dirty()
+
+
+@persistent
+def _load_post(_unused: object) -> None:
+    _initialize_scenes()
+    bridge.RUNTIME.stop_stream()
+    bridge.RUNTIME.frame_dirty = False
+
+
+CLASSES = (
+    WebtoonComicView,
+    WebtoonRegisteredProperty,
+    WebtoonComicSettings,
+    WebtoonComicPreferences,
+    WEBTOON_OT_new_comic_view,
+    WEBTOON_OT_duplicate_comic_view,
+    WEBTOON_OT_update_comic_view,
+    WEBTOON_OT_delete_comic_view,
+    WEBTOON_OT_revert_comic_view,
+    WEBTOON_OT_set_stream_frame,
+    WEBTOON_OT_activate_comic_view,
+    WEBTOON_OT_start_bridge,
+    WEBTOON_OT_stop_bridge,
+    WEBTOON_OT_include_property,
+    WEBTOON_OT_remove_registered_property,
+    WEBTOON_UL_comic_views,
+    WEBTOON_UL_registered_properties,
+    WEBTOON_PT_comic_views,
+)
+
+
+def _initialize_scenes() -> bool:
+    """Initialize scene data only after Blender leaves _RestrictData mode."""
+    scenes = getattr(bpy.data, "scenes", None)
+    if scenes is None:
+        return False
+    for scene in scenes:
+        _ensure_project_uuid(scene)
+        for view in scene.webtoon_comic_views:
+            if not view.published_width:
+                view.published_width = max(64, int(view.width))
+            if not view.published_height:
+                view.published_height = max(64, int(view.height))
+            if view.state_json:
+                try:
+                    stored = parse_state(
+                        view.state_json,
+                        fallback_stream_frame=viewport.default_frame(scene),
+                        fallback_resolution=(int(view.width), int(view.height)),
+                    )
+                    view.state_json = state_json(stored)
+                    view.state_hash = state_digest(stored)
+                    _restore_view_presentation(view, stored)
+                except (TypeError, ValueError):
+                    pass
+    active_scene = getattr(bpy.context, "scene", None)
+    active = _active_view(active_scene) if active_scene is not None else None
+    bridge.RUNTIME.scene_matches_snapshot = bool(
+        active is not None and active.state_json and not active.is_dirty
+    )
+    bridge.RUNTIME.ignore_updates_until = time.monotonic() + 0.3
+    return True
+
+
+def _start_after_register() -> float | None:
+    if not _initialize_scenes():
+        return 0.2
+    preferences = bridge.addon_preferences()
+    if preferences is None:
+        return 0.2
+    if not preferences.token:
+        preferences.token = uuid.uuid4().hex
+    try:
+        bridge.RUNTIME.start_server(preferences.port, preferences.token)
+    except OSError as error:
+        bridge.RUNTIME.last_error = str(error)
+    return None
+
+
+def register() -> None:
+    for cls in CLASSES:
+        bpy.utils.register_class(cls)
+    bpy.types.Scene.webtoon_comic_views = CollectionProperty(type=WebtoonComicView)
+    bpy.types.Scene.webtoon_comic_registered = CollectionProperty(
+        type=WebtoonRegisteredProperty
+    )
+    bpy.types.Scene.webtoon_comic_settings = PointerProperty(type=WebtoonComicSettings)
+    if _depsgraph_updated not in bpy.app.handlers.depsgraph_update_post:
+        bpy.app.handlers.depsgraph_update_post.append(_depsgraph_updated)
+    if _load_post not in bpy.app.handlers.load_post:
+        bpy.app.handlers.load_post.append(_load_post)
+    menu = getattr(bpy.types, "WM_MT_button_context", None)
+    if menu is not None:
+        menu.append(_draw_button_context)
+    if not bpy.app.timers.is_registered(bridge.RUNTIME.tick):
+        bpy.app.timers.register(bridge.RUNTIME.tick, first_interval=0.1, persistent=True)
+    if not bpy.app.timers.is_registered(_start_after_register):
+        bpy.app.timers.register(_start_after_register, first_interval=0.2)
+    viewport.register_overlay()
+
+
+def unregister() -> None:
+    viewport.unregister_overlay()
+    bridge.RUNTIME.stop_server()
+    if bpy.app.timers.is_registered(_start_after_register):
+        bpy.app.timers.unregister(_start_after_register)
+    if bpy.app.timers.is_registered(bridge.RUNTIME.tick):
+        bpy.app.timers.unregister(bridge.RUNTIME.tick)
+    menu = getattr(bpy.types, "WM_MT_button_context", None)
+    if menu is not None:
+        try:
+            menu.remove(_draw_button_context)
+        except RuntimeError:
+            pass
+    for handler, collection in (
+        (_depsgraph_updated, bpy.app.handlers.depsgraph_update_post),
+        (_load_post, bpy.app.handlers.load_post),
+    ):
+        if handler in collection:
+            collection.remove(handler)
+    del bpy.types.Scene.webtoon_comic_settings
+    del bpy.types.Scene.webtoon_comic_registered
+    del bpy.types.Scene.webtoon_comic_views
+    for cls in reversed(CLASSES):
+        bpy.utils.unregister_class(cls)

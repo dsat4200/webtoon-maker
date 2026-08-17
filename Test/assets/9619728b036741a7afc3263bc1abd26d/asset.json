@@ -1,0 +1,341 @@
+{
+  "asset_schema_version": 2,
+  "id": "9619728b036741a7afc3263bc1abd26d",
+  "name": "Basic Word Balloon",
+  "root": {
+    "kind": "layer",
+    "id": "63d282b9ce7c45bab56d95e63e27bcdd"
+  },
+  "visual_bounds": [
+    63.99999999999997,
+    64.0,
+    325.4,
+    287.4
+  ],
+  "document": {
+    "schema_version": 16,
+    "id": "a50ff06d213b46158d60723d5cbf1c90",
+    "name": "Basic Word Balloon",
+    "size": [
+      454,
+      416
+    ],
+    "document_kind": "asset",
+    "background": "#00000000",
+    "grid": {
+      "enabled": true,
+      "size": 120,
+      "divisions": 4,
+      "origin": [
+        0.0,
+        0.0
+      ],
+      "color": "#5d7d9c",
+      "opacity": 0.25
+    },
+    "root_page_ids": [
+      "fbb302b74bc141cb9e9481d666aa9ef8"
+    ],
+    "layers": [
+      {
+        "id": "fbb302b74bc141cb9e9481d666aa9ef8",
+        "name": "Asset Canvas",
+        "is_page": true,
+        "layer_kind": "bounded",
+        "parent_id": null,
+        "children": [
+          {
+            "kind": "layer",
+            "id": "63d282b9ce7c45bab56d95e63e27bcdd"
+          }
+        ],
+        "visible": true,
+        "opacity": 1.0,
+        "translation": [
+          0.0,
+          0.0
+        ],
+        "bound": {
+          "type": "path",
+          "closed": true,
+          "primitive": "rectangle",
+          "nodes": [
+            {
+              "id": "36d6e4a8a57045bfa7f688884e6537e4",
+              "position": [
+                0.0,
+                0.0
+              ],
+              "point_type": "vector",
+              "incoming": null,
+              "outgoing": null,
+              "handles_locked": true,
+              "roundness": 0.0,
+              "roundness_enabled": false,
+              "width_multiplier": 1.0
+            },
+            {
+              "id": "1a8048af5d544e07985212fe8a642287",
+              "position": [
+                454.0,
+                0.0
+              ],
+              "point_type": "vector",
+              "incoming": null,
+              "outgoing": null,
+              "handles_locked": true,
+              "roundness": 0.0,
+              "roundness_enabled": false,
+              "width_multiplier": 1.0
+            },
+            {
+              "id": "5110fa46ebe44c0bb69f2987046840f8",
+              "position": [
+                454.0,
+                416.0
+              ],
+              "point_type": "vector",
+              "incoming": null,
+              "outgoing": null,
+              "handles_locked": true,
+              "roundness": 0.0,
+              "roundness_enabled": false,
+              "width_multiplier": 1.0
+            },
+            {
+              "id": "ed0a9538e5d848beb76edc1eea8b766e",
+              "position": [
+                0.0,
+                416.0
+              ],
+              "point_type": "vector",
+              "incoming": null,
+              "outgoing": null,
+              "handles_locked": true,
+              "roundness": 0.0,
+              "roundness_enabled": false,
+              "width_multiplier": 1.0
+            }
+          ],
+          "additional_contours": []
+        },
+        "shape_style": {
+          "primary_color": null,
+          "base_thickness": 8,
+          "outline_color": "#111111",
+          "outline_thickness": 0,
+          "start_cap": "round",
+          "end_cap": "round"
+        },
+        "grid_override": null,
+        "last_raster_id": null,
+        "compound_enabled": false,
+        "compound_operation": "add",
+        "ignore_parent_mask": false
+      },
+      {
+        "id": "63d282b9ce7c45bab56d95e63e27bcdd",
+        "name": "Layer 4",
+        "is_page": false,
+        "layer_kind": "bounded",
+        "parent_id": "fbb302b74bc141cb9e9481d666aa9ef8",
+        "children": [
+          {
+            "kind": "layer",
+            "id": "edd392d0597a4d23af7a4534bfd082a1"
+          },
+          {
+            "kind": "object",
+            "id": "ff014054c6d94abebb4e25afd38f3c42"
+          }
+        ],
+        "visible": true,
+        "opacity": 1.0,
+        "translation": [
+          -632.6,
+          -1186.0
+        ],
+        "bound": {
+          "type": "path",
+          "closed": true,
+          "primitive": "rectangle",
+          "nodes": [
+            {
+              "id": "2170406425e347a5b3f9e596ff330234",
+              "position": [
+                729.0,
+                1254.0
+              ],
+              "point_type": "vector",
+              "incoming": null,
+              "outgoing": null,
+              "handles_locked": true,
+              "roundness": 89.0,
+              "roundness_enabled": true,
+              "width_multiplier": 1.0
+            },
+            {
+              "id": "51537a836643470f84cf3c52b6cfedec",
+              "position": [
+                1018.0,
+                1254.0
+              ],
+              "point_type": "vector",
+              "incoming": null,
+              "outgoing": null,
+              "handles_locked": true,
+              "roundness": 89.0,
+              "roundness_enabled": true,
+              "width_multiplier": 1.0
+            },
+            {
+              "id": "d7cd8458f1fd4fe2954a659309d82b36",
+              "position": [
+                1018.0,
+                1432.0
+              ],
+              "point_type": "vector",
+              "incoming": null,
+              "outgoing": null,
+              "handles_locked": true,
+              "roundness": 89.0,
+              "roundness_enabled": true,
+              "width_multiplier": 1.0
+            },
+            {
+              "id": "795964133a9045d4a8afc0546d046b55",
+              "position": [
+                729.0,
+                1432.0
+              ],
+              "point_type": "vector",
+              "incoming": null,
+              "outgoing": null,
+              "handles_locked": true,
+              "roundness": 89.0,
+              "roundness_enabled": true,
+              "width_multiplier": 1.0
+            }
+          ],
+          "additional_contours": []
+        },
+        "shape_style": {
+          "primary_color": "#FFFFFFFF",
+          "base_thickness": 8,
+          "outline_color": "#FF000000",
+          "outline_thickness": 4,
+          "start_cap": "round",
+          "end_cap": "round"
+        },
+        "grid_override": null,
+        "last_raster_id": null,
+        "compound_enabled": true,
+        "compound_operation": "add",
+        "ignore_parent_mask": false
+      },
+      {
+        "id": "edd392d0597a4d23af7a4534bfd082a1",
+        "name": "Layer 5",
+        "is_page": false,
+        "layer_kind": "open_shape",
+        "parent_id": "63d282b9ce7c45bab56d95e63e27bcdd",
+        "children": [],
+        "visible": true,
+        "opacity": 1.0,
+        "translation": [
+          0.0,
+          0.0
+        ],
+        "bound": {
+          "type": "path",
+          "closed": false,
+          "primitive": "custom",
+          "nodes": [
+            {
+              "id": "ac7cd47e9c2941478fc42128fb649c36",
+              "position": [
+                875.0,
+                1326.0
+              ],
+              "point_type": "bezier",
+              "incoming": null,
+              "outgoing": [
+                909.0,
+                1428.0
+              ],
+              "handles_locked": false,
+              "roundness": 0.0,
+              "roundness_enabled": false,
+              "width_multiplier": 5.9
+            },
+            {
+              "id": "996b4f7107e14427af87cf6fc5232eaf",
+              "position": [
+                736.0,
+                1498.0
+              ],
+              "point_type": "bezier",
+              "incoming": [
+                834.0,
+                1480.0
+              ],
+              "outgoing": null,
+              "handles_locked": false,
+              "roundness": 0.0,
+              "roundness_enabled": false,
+              "width_multiplier": 1.0
+            }
+          ],
+          "additional_contours": []
+        },
+        "shape_style": {
+          "primary_color": "#FFFFFFFF",
+          "base_thickness": 12,
+          "outline_color": "#FF000000",
+          "outline_thickness": 4,
+          "start_cap": "round",
+          "end_cap": "round"
+        },
+        "grid_override": null,
+        "last_raster_id": null,
+        "compound_enabled": false,
+        "compound_operation": "add",
+        "ignore_parent_mask": false
+      }
+    ],
+    "objects": [
+      {
+        "id": "ff014054c6d94abebb4e25afd38f3c42",
+        "type": "text",
+        "name": "Text 2",
+        "custom_name": false,
+        "parent_layer_id": "63d282b9ce7c45bab56d95e63e27bcdd",
+        "position": [
+          0.0,
+          0.0
+        ],
+        "visible": true,
+        "opacity": 1.0,
+        "opacity_locked": true,
+        "geometry_reference": "direct",
+        "ignore_parent_mask": false,
+        "underlay_opacity": 0.0,
+        "text": "Words.",
+        "size": [
+          360.0,
+          120.0
+        ],
+        "font_family": "Cammi Sans Superbold",
+        "font_size": 42,
+        "bold": false,
+        "italic": false,
+        "kerning": 0.0,
+        "layout_mode": "strict",
+        "horizontal_alignment": "center",
+        "vertical_alignment": "middle",
+        "margin": 24.0,
+        "transform_quad": null
+      }
+    ]
+  }
+}

@@ -8,7 +8,7 @@ from PySide6.QtCore import QAbstractItemModel, QMimeData, QModelIndex, Qt, Signa
 from PySide6.QtGui import QColor
 
 from comic_editor.core.models import (
-    ChapterDocument, GradientObject, LayerNode, SpeedLinesGradientObject,
+    ChapterDocument, GradientObject, ImageObject, LayerNode, SpeedLinesGradientObject,
     TextObject, VectorDrawingObject, VectorFillObject,
 )
 
@@ -167,6 +167,8 @@ class HierarchyModel(QAbstractItemModel):
                     if isinstance(entity, SpeedLinesGradientObject):
                         return "Speed Lines"
                     return "Gradient"
+                if isinstance(entity, ImageObject) and entity.is_blender_linked:
+                    return "Blender Comic View"
                 return entity.object_type.title()
             if index.column() == 2:
                 return f"{round(entity.opacity * 100)}%"

@@ -7,7 +7,7 @@ from dataclasses import dataclass, field
 from typing import Any, Iterable, Iterator, Literal
 
 
-SCHEMA_VERSION = 15
+SCHEMA_VERSION = 16
 CHAPTER_WIDTH = 1080
 DEFAULT_CHAPTER_HEIGHT = 3240
 GROWTH_MARGIN = 1080
@@ -770,6 +770,92 @@ class DocumentObject:
 
 
 @dataclass
+class EmbeddedImageSourceDescriptor:
+    """Persistent descriptor for an image embedded in the comic project."""
+
+    source_type: str = "embedded"
+    filename: str = "image"
+    mime_type: str = "application/octet-stream"
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "type": "embedded",
+            "filename": str(self.filename or "image"),
+            "mime_type": str(self.mime_type or "application/octet-stream"),
+        }
+
+
+@dataclass
+class BlenderComicViewSourceDescriptor:
+    """Stable reference to one Comic View provided by a Blender project."""
+
+    source_type: str = "blender_comic_view"
+    project_uuid: str = ""
+    view_uuid: str = ""
+    display_name: str = "Comic View"
+    last_revision: int = 0
+
+    @staticmethod
+    def _uuid(value: object, label: str) -> str:
+        try:
+            return uuid.UUID(str(value)).hex
+        except (ValueError, AttributeError, TypeError) as error:
+            raise ValueError(f"{label} must be a valid UUID") from error
+
+    def validate(self) -> None:
+        self.project_uuid = self._uuid(self.project_uuid, "Blender project UUID")
+        self.view_uuid = self._uuid(self.view_uuid, "Comic View UUID")
+        self.display_name = str(self.display_name or "Comic View")
+        self.last_revision = max(0, int(self.last_revision))
+
+    def to_dict(self) -> dict[str, Any]:
+        self.validate()
+        return {
+            "type": "blender_comic_view",
+            "project_uuid": self.project_uuid,
+            "view_uuid": self.view_uuid,
+            "display_name": self.display_name,
+            "last_revision": self.last_revision,
+        }
+
+
+ImageSourceDescriptor = (
+    EmbeddedImageSourceDescriptor | BlenderComicViewSourceDescriptor
+)
+
+
+def image_source_from_dict(
+    data: object, *, legacy_filename: object = "image",
+    legacy_mime_type: object = "application/octet-stream",
+) -> ImageSourceDescriptor:
+    """Load schema-16 source data, or migrate a legacy embedded image."""
+    if not isinstance(data, dict):
+        return EmbeddedImageSourceDescriptor(
+            filename=str(legacy_filename or "image"),
+            mime_type=str(legacy_mime_type or "application/octet-stream"),
+        )
+    source_type = str(data.get("type", "embedded"))
+    if source_type == "embedded":
+        return EmbeddedImageSourceDescriptor(
+            filename=str(data.get("filename", legacy_filename) or "image"),
+            mime_type=str(
+                data.get("mime_type", legacy_mime_type)
+                or "application/octet-stream"
+            ),
+        )
+    if source_type == "blender_comic_view":
+        result = BlenderComicViewSourceDescriptor(
+            project_uuid=str(data.get("project_uuid", "")),
+            view_uuid=str(data.get("view_uuid", "")),
+            display_name=str(data.get("display_name", "Comic View")),
+            last_revision=int(data.get("last_revision", 0)),
+        )
+        result.validate()
+        return result
+    raise ValueError(f"Unknown image source type: {source_type}")
+
+
+@dataclass
 class RasterObject(DocumentObject):
     object_type: str = "raster"
     name: str = "Raster"
@@ -806,10 +892,40 @@ class ImageObject(DocumentObject):
     ] = "auto_height"
     transform_frame: tuple[float, float, float, float] | None = None
     transform_quad: list[tuple[float, float]] | None = None
+    source: ImageSourceDescriptor | None = None
+
+    def __post_init__(self) -> None:
+        if self.source is None:
+            self.source = EmbeddedImageSourceDescriptor(
+                filename=self.source_filename,
+                mime_type=self.source_mime_type,
+            )
+        self.sync_source_metadata()
+
+    @property
+    def is_blender_linked(self) -> bool:
+        return isinstance(self.source, BlenderComicViewSourceDescriptor)
+
+    def sync_source_metadata(self) -> None:
+        if isinstance(self.source, EmbeddedImageSourceDescriptor):
+            self.source.filename = str(self.source.filename or "image")
+            self.source.mime_type = str(
+                self.source.mime_type or "application/octet-stream"
+            )
+            self.source_filename = self.source.filename
+            self.source_mime_type = self.source.mime_type
+        elif isinstance(self.source, BlenderComicViewSourceDescriptor):
+            self.source.validate()
+            self.source_filename = "last-frame.png"
+            self.source_mime_type = "image/png"
+        else:
+            raise ValueError("Image object requires a valid image source")
 
     def to_dict(self) -> dict[str, Any]:
+        self.sync_source_metadata()
         result = self.common_dict()
         result.update({
+            "source": self.source.to_dict(),
             "source_filename": self.source_filename,
             "source_mime_type": self.source_mime_type,
             "pixel_size": [self.pixel_width, self.pixel_height],
@@ -1787,6 +1903,13 @@ def object_from_dict(data: dict[str, Any]) -> ObjectEntity:
         pixel_size = data.get("pixel_size", [1, 1])
         raw_frame = data.get("transform_frame")
         raw_quad = data.get("transform_quad")
+        source = image_source_from_dict(
+            data.get("source"),
+            legacy_filename=data.get("source_filename", "image"),
+            legacy_mime_type=data.get(
+                "source_mime_type", "application/octet-stream"
+            ),
+        )
         return ImageObject(
             **common,
             source_filename=str(data.get("source_filename", "image")),
@@ -1805,6 +1928,7 @@ def object_from_dict(data: dict[str, Any]) -> ObjectEntity:
                 [_point(point) for point in raw_quad]
                 if raw_quad is not None else None
             ),
+            source=source,
         )
     if object_type == "text":
         size = data.get("size", [360, 120])
@@ -2036,10 +2160,7 @@ class ChapterDocument:
                         raise ValueError("Object transform quad must have four points")
                     obj.transform_quad = [_point(point) for point in quad]
             if isinstance(obj, ImageObject):
-                obj.source_filename = str(obj.source_filename or "image")
-                obj.source_mime_type = str(
-                    obj.source_mime_type or "application/octet-stream"
-                )
+                obj.sync_source_metadata()
                 obj.pixel_width = max(1, int(obj.pixel_width))
                 obj.pixel_height = max(1, int(obj.pixel_height))
                 if obj.placement_mode not in {"free", "fit_parent"}:

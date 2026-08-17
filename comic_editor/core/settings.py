@@ -99,7 +99,7 @@ def default_text_presets() -> list[dict]:
 
 @dataclass
 class EditorSettings:
-    settings_version: int = 14
+    settings_version: int = 15
     tablet_mode: bool = False
     brush_size: int = 12
     eraser_size: int = 28
@@ -147,6 +147,9 @@ class EditorSettings:
     ui_splitter_sizes: dict[str, list[int]] = field(default_factory=dict)
     navigator_expanded: bool = False
     recent_series: list[str] = field(default_factory=list)
+    blender_bridge_host: str = "127.0.0.1"
+    blender_bridge_port: int = 47837
+    blender_bridge_token: str = ""
 
     def __post_init__(self) -> None:
         # Settings are also constructed directly by tests and UI helpers, so
@@ -155,7 +158,16 @@ class EditorSettings:
         self.clamp()
 
     def clamp(self) -> None:
-        self.settings_version = 14
+        self.settings_version = 15
+        self.blender_bridge_host = str(
+            self.blender_bridge_host or "127.0.0.1"
+        ).strip()
+        if self.blender_bridge_host not in {"127.0.0.1", "localhost"}:
+            self.blender_bridge_host = "127.0.0.1"
+        self.blender_bridge_port = max(
+            1024, min(65535, int(self.blender_bridge_port))
+        )
+        self.blender_bridge_token = str(self.blender_bridge_token or "").strip()
         self.navigator_expanded = bool(self.navigator_expanded)
         self.preview_font_names = bool(self.preview_font_names)
         self.brush_size = max(1, min(200, int(self.brush_size)))
@@ -391,13 +403,17 @@ def load_settings() -> EditorSettings:
                 raw.setdefault("hotkeys", {}).setdefault(
                     "paste_image", "Ctrl+V"
                 )
+            if int(raw.get("settings_version", 1)) < 15:
+                raw.setdefault("blender_bridge_host", "127.0.0.1")
+                raw.setdefault("blender_bridge_port", 47837)
+                raw.setdefault("blender_bridge_token", "")
             raw.pop("transform_snap_to_grid", None)
             stored_presets = raw.get("text_presets")
             if isinstance(stored_presets, list):
                 for preset in stored_presets:
                     if isinstance(preset, dict):
                         preset.pop("transform_snap", None)
-            raw["settings_version"] = 14
+            raw["settings_version"] = 15
             valid = {item.name for item in dataclasses.fields(EditorSettings)}
             result = EditorSettings(**{
                 key: value for key, value in raw.items() if key in valid

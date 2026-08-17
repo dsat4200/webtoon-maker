@@ -25,6 +25,7 @@ class ImageStore:
     def __init__(self) -> None:
         self._sources: dict[str, ImageSource] = {}
         self._decoded: dict[str, QImage] = {}
+        self._runtime: dict[str, QImage] = {}
         self.dirty: set[str] = set()
 
     @staticmethod
@@ -71,6 +72,9 @@ class ImageStore:
 
     def image(self, object_id: str) -> QImage:
         object_id = str(object_id)
+        runtime = self._runtime.get(object_id)
+        if runtime is not None:
+            return QImage(runtime)
         cached = self._decoded.get(object_id)
         if cached is not None:
             return QImage(cached)
@@ -81,8 +85,68 @@ class ImageStore:
         self._decoded[object_id] = image
         return QImage(image)
 
+    def set_runtime_frame(self, object_id: str, image: QImage) -> None:
+        """Install a transient frame without changing persistent bytes."""
+        object_id = str(object_id)
+        if image.isNull():
+            self._runtime.pop(object_id, None)
+            return
+        self._runtime[object_id] = image.convertToFormat(
+            QImage.Format_ARGB32_Premultiplied
+        )
+
+    def runtime_frame(self, object_id: str) -> QImage:
+        image = self._runtime.get(str(object_id))
+        return QImage(image) if image is not None else QImage()
+
+    def clear_runtime_frame(self, object_id: str) -> None:
+        self._runtime.pop(str(object_id), None)
+
+    def clear_runtime_frames(self) -> None:
+        self._runtime.clear()
+
+    def persist_runtime_frame(
+        self, object_id: str, filename: str = "last-frame.png",
+    ) -> bool:
+        """Encode the newest transient frame as the last-good PNG cache."""
+        object_id = str(object_id)
+        image = self._runtime.get(object_id)
+        if image is None or image.isNull():
+            return False
+        payload = QByteArray()
+        buffer = QBuffer(payload)
+        buffer.open(QIODevice.OpenModeFlag.WriteOnly)
+        saved = image.save(buffer, "PNG")
+        buffer.close()
+        if not saved:
+            return False
+        raw = bytes(payload)
+        safe = self.safe_filename(filename or "last-frame.png")
+        self._sources[object_id] = ImageSource(safe, "image/png", raw)
+        self._decoded[object_id] = QImage(image)
+        self.dirty.add(object_id)
+        return True
+
+    def relabel(
+        self, object_id: str, filename: str,
+        mime_type: str | None = None,
+    ) -> bool:
+        """Change persistent resource metadata without touching its bytes."""
+        object_id = str(object_id)
+        source = self._sources.get(object_id)
+        if source is None:
+            return False
+        self._sources[object_id] = ImageSource(
+            self.safe_filename(filename),
+            str(mime_type or source.mime_type or "application/octet-stream"),
+            source.data,
+        )
+        self.dirty.add(object_id)
+        return True
+
     def remove(self, object_id: str) -> None:
         object_id = str(object_id)
+        self._runtime.pop(object_id, None)
         if object_id in self._sources:
             self._sources.pop(object_id, None)
             self._decoded.pop(object_id, None)
@@ -119,6 +183,7 @@ class ImageStore:
             for object_id, item in values.items()
         }
         self._decoded.clear()
+        self._runtime.clear()
         self.dirty.update(values)
 
     @staticmethod
@@ -160,6 +225,7 @@ class ImageStore:
     ) -> None:
         self._sources.clear()
         self._decoded.clear()
+        self._runtime.clear()
         if not root.is_dir():
             return
         for object_id, (filename, mime_type) in metadata.items():

@@ -1,5 +1,5 @@
 {
-  "schema_version": 15,
+  "schema_version": 16,
   "id": "26f5d698727842d39eea3275ae1df22d",
   "name": "Chapter 1",
   "size": [
@@ -42,8 +42,8 @@
       "visible": true,
       "opacity": 1.0,
       "translation": [
-        0,
-        0
+        0.0,
+        0.0
       ],
       "bound": {
         "type": "path",

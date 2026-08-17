@@ -18,6 +18,32 @@ def test_missing_settings_file_has_complete_hotkeys(monkeypatch, tmp_path):
     loaded = load_settings()
     assert loaded.hotkeys == default_hotkeys()
     assert loaded.recent_series == []
+    assert loaded.blender_bridge_host == "127.0.0.1"
+    assert loaded.blender_bridge_port == 47837
+    assert loaded.blender_bridge_token == ""
+
+
+def test_blender_bridge_endpoint_is_clamped_and_persisted(monkeypatch, tmp_path):
+    path = tmp_path / "settings.json"
+    _use_settings_file(monkeypatch, path)
+    path.write_text(json.dumps({
+        "settings_version": 14,
+        "blender_bridge_host": " localhost ",
+        "blender_bridge_port": 999999,
+        "blender_bridge_token": " panel-token ",
+    }), encoding="utf-8")
+
+    loaded = load_settings()
+
+    assert loaded.settings_version == 15
+    assert loaded.blender_bridge_host == "localhost"
+    assert loaded.blender_bridge_port == 65535
+    assert loaded.blender_bridge_token == "panel-token"
+    save_settings(loaded)
+    restored = load_settings()
+    assert restored.blender_bridge_host == "localhost"
+    assert restored.blender_bridge_port == 65535
+    assert restored.blender_bridge_token == "panel-token"
 
 
 def test_partial_settings_without_hotkeys_uses_defaults(monkeypatch, tmp_path):
@@ -72,7 +98,7 @@ def test_settings_v8_migration_removes_transform_snap_and_disables_hold(
     }), encoding="utf-8")
     _use_settings_file(monkeypatch, path)
     loaded = load_settings()
-    assert loaded.settings_version == 14
+    assert loaded.settings_version == 15
     assert loaded.page_scope_select is False
     assert loaded.transform_mode == "uniform"
     assert loaded.snap_to_grid is False
@@ -95,7 +121,7 @@ def test_vector_and_fill_settings_are_normalized(monkeypatch, tmp_path):
         "fill_mode": "other",
     }), encoding="utf-8")
     loaded = load_settings()
-    assert loaded.settings_version == 14
+    assert loaded.settings_version == 15
     assert loaded.vector_eraser_mode == "stroke"
     assert loaded.vector_simplify_amount == 100
     assert loaded.vector_redraw_opacity_max == 0
@@ -119,7 +145,7 @@ def test_settings_v9_normalizes_splitter_sizes(monkeypatch, tmp_path):
 
     loaded = load_settings()
 
-    assert loaded.settings_version == 14
+    assert loaded.settings_version == 15
     assert loaded.ui_splitter_sizes == {
         "sidebar_workspace": [260, 1100],
         "tools_colors": [0, 440],
@@ -175,7 +201,7 @@ def test_settings_v12_adds_font_preview_delete_and_integer_text_sizes(
 
     loaded = load_settings()
 
-    assert loaded.settings_version == 14
+    assert loaded.settings_version == 15
     assert loaded.navigator_expanded is False
     assert loaded.preview_font_names is False
     assert loaded.hotkeys["delete_selected"] == "Delete"

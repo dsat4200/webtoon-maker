@@ -4,7 +4,8 @@ from __future__ import annotations
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
     QCheckBox, QComboBox, QFormLayout, QGroupBox, QHBoxLayout, QLabel,
-    QLineEdit, QSlider, QStackedWidget, QToolButton, QVBoxLayout, QWidget,
+    QLineEdit, QPushButton, QSlider, QStackedWidget, QToolButton, QVBoxLayout,
+    QWidget,
 )
 
 from comic_editor.core.models import (
@@ -353,6 +354,10 @@ class ImageObjectSettings(QWidget):
     """Embedded-image metadata, masking, and parent-fit behavior."""
 
     changed = Signal()
+    renderOnceRequested = Signal()
+    reconnectRequested = Signal()
+    relinkRequested = Signal()
+    detachRequested = Signal()
 
     def __init__(self, canvas, parent: QWidget | None = None):
         super().__init__(parent)
@@ -400,6 +405,21 @@ class ImageObjectSettings(QWidget):
         form.addRow("Original", self.filename)
         self.dimensions = QLabel("â€”", self)
         form.addRow("Dimensions", self.dimensions)
+        self.source_status = QLabel("", self)
+        self.source_status.setWordWrap(True)
+        form.addRow("Source status", self.source_status)
+        self.source_actions = QWidget(self)
+        source_layout = QHBoxLayout(self.source_actions)
+        source_layout.setContentsMargins(0, 0, 0, 0)
+        self.render_once = QPushButton("Render Once", self.source_actions)
+        self.reconnect = QPushButton("Reconnect", self.source_actions)
+        self.relink = QPushButton("Relink", self.source_actions)
+        self.detach = QPushButton("Detach", self.source_actions)
+        source_layout.addWidget(self.render_once)
+        source_layout.addWidget(self.reconnect)
+        source_layout.addWidget(self.relink)
+        source_layout.addWidget(self.detach)
+        form.addRow(self.source_actions)
         self.name.editingFinished.connect(self._apply)
         self.ignore_parent_mask.toggled.connect(self._apply)
         self.geometry_reference.currentIndexChanged.connect(self._apply)
@@ -408,6 +428,10 @@ class ImageObjectSettings(QWidget):
         self.underlay.sliderPressed.connect(self._begin_underlay)
         self.underlay.valueChanged.connect(self._underlay_changed)
         self.underlay.sliderReleased.connect(self._finish_underlay)
+        self.render_once.clicked.connect(self.renderOnceRequested)
+        self.reconnect.clicked.connect(self.reconnectRequested)
+        self.relink.clicked.connect(self.relinkRequested)
+        self.detach.clicked.connect(self.detachRequested)
 
     def _selected(self) -> ImageObject | None:
         if self.canvas.chapter is None or self.canvas.selected_kind != "object":
@@ -435,9 +459,27 @@ class ImageObjectSettings(QWidget):
                 0, self.fit_mode.findData(obj.fit_mode)
             ))
             self.fit_mode.setEnabled(obj.placement_mode == "fit_parent")
-            self.filename.setText(obj.source_filename)
+            self.filename.setText(
+                f"Blender: {obj.source.display_name}"
+                if obj.is_blender_linked else obj.source_filename
+            )
             self.dimensions.setText(f"{obj.pixel_width} × {obj.pixel_height} px")
+            self.source_actions.setVisible(obj.is_blender_linked)
+            self.source_status.setVisible(obj.is_blender_linked)
+            self.detach.setEnabled(
+                not obj.is_blender_linked
+                or self.canvas.images.source(obj.object_id) is not None
+                or not self.canvas.images.runtime_frame(obj.object_id).isNull()
+            )
+            if obj.is_blender_linked and not self.source_status.text():
+                self.source_status.setText("Offline — showing the last cached frame")
+        else:
+            self.source_actions.hide()
+            self.source_status.hide()
         self._updating = False
+
+    def set_source_status(self, status: str) -> None:
+        self.source_status.setText(str(status))
 
     def _apply(self, *args) -> None:
         del args

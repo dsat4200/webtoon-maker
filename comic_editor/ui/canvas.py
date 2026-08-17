@@ -51,7 +51,8 @@ from comic_editor.core.models import (
     ImageObject, PathContour, PathNode, RasterObject, ShapeStyle, TextObject,
     SpeedLineCenterObject, SpeedLinesGradientObject, VectorDrawingObject,
     VectorFillObject, VectorStroke, VectorStrokePoint,
-    canonical_argb, object_from_dict,
+    ImageSourceDescriptor, canonical_argb, image_source_from_dict,
+    object_from_dict,
 )
 from comic_editor.core.pressure import BrushPreset
 from comic_editor.core.settings import EditorSettings
@@ -308,6 +309,9 @@ class _CanvasLogic:
         self.chapter: ChapterDocument | None = None
         self.tiles = TileStore()
         self.images = ImageStore()
+        # Runtime-only Blender preview dimensions/quads. These never enter the
+        # chapter model or Undo history.
+        self._image_runtime_geometry: dict[str, dict] = {}
         self.command_stack = CommandStack()
         self.tool = ToolKind.OBJECT_SELECT
         self.selected_kind = ""
@@ -887,6 +891,7 @@ class _CanvasLogic:
         self.chapter = chapter
         self.tiles = tiles
         self.images = images or ImageStore()
+        self._image_runtime_geometry.clear()
         self._compound_path_cache.clear()
         self._gradient_geometry_cache.clear()
         self._gradient_scalar_cache.clear()
@@ -963,6 +968,7 @@ class _CanvasLogic:
         self.chapter, self.tiles, self.images = (
             state.chapter, state.tiles, state.images
         )
+        self._image_runtime_geometry.clear()
         self.command_stack = state.command_stack
         self.tool = state.tool
         self.selected_kind, self.selected_id = state.selected_kind, state.selected_id
@@ -998,6 +1004,7 @@ class _CanvasLogic:
         self.chapter = None
         self.tiles = TileStore()
         self.images = ImageStore()
+        self._image_runtime_geometry.clear()
         self.command_stack = CommandStack()
         self.selected_kind = self.selected_id = ""
         self.active_page_id = self.active_layer_id = ""
@@ -1027,6 +1034,7 @@ class _CanvasLogic:
         self._clear_page_gap_editor()
         self.pageGapConfirmationChanged.emit(False)
         self.chapter = ChapterDocument.from_dict(state)
+        self._image_runtime_geometry.clear()
         self._compound_path_cache.clear()
         self._gradient_geometry_cache.clear()
         self._gradient_scalar_cache.clear()
@@ -2610,6 +2618,8 @@ class _CanvasLogic:
         insertion_index: int | None = None,
         fit_parent: bool = False,
         label: str = "Import images",
+        source_descriptors: list[ImageSourceDescriptor] | None = None,
+        logical_sizes: list[tuple[int, int]] | None = None,
     ) -> list[str]:
         """Embed decoded originals and add image objects as one command."""
         if (
@@ -2617,15 +2627,15 @@ class _CanvasLogic:
             or self.chapter.layers[parent_id].layer_kind == "fill"
         ):
             return []
-        valid: list[tuple[str, str, bytes, QImage]] = []
-        for filename, mime_type, data in sources:
+        valid: list[tuple[int, str, str, bytes, QImage]] = []
+        for source_index, (filename, mime_type, data) in enumerate(sources):
             temporary = ImageStore()
             try:
                 temporary.put("preview", filename, data, mime_type)
                 image = temporary.image("preview")
             except ValueError:
                 continue
-            valid.append((filename, mime_type, bytes(data), image))
+            valid.append((source_index, filename, mime_type, bytes(data), image))
         if not valid:
             return []
         before_model = self.chapter.to_dict()
@@ -2635,23 +2645,41 @@ class _CanvasLogic:
             world_center.x() - layer_x, world_center.y() - layer_y
         )
         created: list[str] = []
-        for offset, (filename, mime_type, data, image) in enumerate(valid):
+        for offset, (
+            source_index, filename, mime_type, data, image,
+        ) in enumerate(valid):
+            source = (
+                image_source_from_dict(
+                    source_descriptors[source_index].to_dict()
+                )
+                if source_descriptors is not None
+                and source_index < len(source_descriptors)
+                else None
+            )
+            logical_width, logical_height = (
+                logical_sizes[source_index]
+                if logical_sizes is not None and source_index < len(logical_sizes)
+                else (image.width(), image.height())
+            )
+            logical_width = max(1, int(logical_width))
+            logical_height = max(1, int(logical_height))
             obj = ImageObject(
                 name=ImageStore.safe_filename(filename),
                 source_filename=ImageStore.safe_filename(filename),
                 source_mime_type=mime_type or "application/octet-stream",
-                pixel_width=image.width(), pixel_height=image.height(),
+                pixel_width=logical_width, pixel_height=logical_height,
                 placement_mode="fit_parent" if fit_parent else "free",
                 fit_mode="auto_height",
+                source=source,
             )
             obj.transform_frame = (
-                0.0, 0.0, float(image.width()), float(image.height())
+                0.0, 0.0, float(logical_width), float(logical_height)
             )
             if not fit_parent:
                 rect = QRectF(
-                    local_center.x() - image.width() / 2,
-                    local_center.y() - image.height() / 2,
-                    image.width(), image.height(),
+                    local_center.x() - logical_width / 2,
+                    local_center.y() - logical_height / 2,
+                    logical_width, logical_height,
                 )
                 obj.transform_quad = self._rect_quad(rect)
             index = (
@@ -6474,7 +6502,7 @@ class _CanvasLogic:
         )
         return self._rect_quad(rect)
 
-    def _image_local_quad(self, obj: ImageObject) -> list[tuple[float, float]]:
+    def _image_model_local_quad(self, obj: ImageObject) -> list[tuple[float, float]]:
         if obj.placement_mode == "fit_parent":
             return self._image_fit_quad(obj)
         if obj.transform_quad is not None:
@@ -6483,11 +6511,32 @@ class _CanvasLogic:
             obj.x, obj.y, obj.pixel_width, obj.pixel_height
         ))
 
+    def _image_local_quad(self, obj: ImageObject) -> list[tuple[float, float]]:
+        override = self._image_runtime_geometry.get(obj.object_id)
+        if override is not None:
+            return list(override["quad"])
+        return self._image_model_local_quad(obj)
+
+    def set_image_runtime_geometry(
+        self, object_id: str, width: int, height: int,
+        quad: list[tuple[float, float]],
+    ) -> None:
+        self._image_runtime_geometry[object_id] = {
+            "width": max(1, int(width)), "height": max(1, int(height)),
+            "quad": [tuple(point) for point in quad],
+        }
+
+    def clear_image_runtime_geometry(self, object_id: str) -> None:
+        self._image_runtime_geometry.pop(object_id, None)
+
     def _render_image_object(self, painter: QPainter, obj: ImageObject) -> None:
         image = self.images.image(obj.object_id)
-        if image.isNull():
+        if image.isNull() and not obj.is_blender_linked:
             return
-        source = QRectF(0, 0, obj.pixel_width, obj.pixel_height)
+        geometry = self._image_runtime_geometry.get(obj.object_id)
+        source_width = geometry["width"] if geometry else obj.pixel_width
+        source_height = geometry["height"] if geometry else obj.pixel_height
+        source = QRectF(0, 0, source_width, source_height)
         destination = self._image_local_quad(obj)
         if (
             obj.object_id == self.selected_object_id
@@ -6499,7 +6548,26 @@ class _CanvasLogic:
         painter.save()
         painter.setRenderHint(QPainter.SmoothPixmapTransform, True)
         painter.setTransform(transform, True)
-        painter.drawImage(source, image)
+        if image.isNull():
+            painter.fillRect(source, QColor("#322f39"))
+            step = max(8.0, min(source.width(), source.height()) / 12.0)
+            painter.setPen(Qt.NoPen)
+            painter.setBrush(QColor("#3e3a47"))
+            rows = max(1, math.ceil(source.height() / step))
+            columns = max(1, math.ceil(source.width() / step))
+            for row in range(rows):
+                for column in range(columns):
+                    if (row + column) % 2:
+                        painter.drawRect(QRectF(
+                            column * step, row * step, step, step
+                        ))
+            painter.setPen(QColor("#d9d4e5"))
+            painter.drawText(
+                source, Qt.AlignCenter,
+                "Waiting for Blender\nComic View",
+            )
+        else:
+            painter.drawImage(source, image)
         painter.restore()
 
     def _draw_simplify_hover(self, painter: QPainter) -> None:
@@ -16643,6 +16711,11 @@ class _CanvasLogic:
 
     def _update_transform_preview(self, point: QPointF) -> None:
         obj = self.chapter.objects[self.selected_object_id]
+        old_preview = (
+            list(self._transform_preview_quad)
+            if isinstance(obj, ImageObject) and self._transform_preview_quad
+            else None
+        )
         layer_x, layer_y = self.chapter.layer_world_translation(obj.parent_layer_id)
         local_point = (point.x() - layer_x, point.y() - layer_y)
         start = list(self._transform_start_quad)
@@ -16724,6 +16797,15 @@ class _CanvasLogic:
                     )
         if self._quad_is_valid(candidate):
             self._transform_preview_quad = candidate
+            if isinstance(obj, ImageObject) and old_preview is not None:
+                polygons = []
+                for quad in (old_preview, candidate):
+                    polygons.append(QPolygonF([
+                        QPointF(x + layer_x, y + layer_y) for x, y in quad
+                    ]).boundingRect())
+                self._queue_visual_dirty(
+                    polygons[0].united(polygons[1]), notify_preview=False
+                )
 
     def _commit_object_transform(self) -> None:
         object_id = self.selected_object_id
@@ -16794,6 +16876,16 @@ class _CanvasLogic:
         self._render_excluded_object_id = ""
 
     def _build_raster_transform_cache(self) -> None:
+        selected = (
+            self.chapter.objects.get(self.selected_object_id)
+            if self.chapter is not None else None
+        )
+        if isinstance(selected, ImageObject):
+            # Image transforms must remain in normal hierarchy traversal so
+            # unchanged artwork above them stays above them during the drag.
+            self._transform_static_cache = QImage()
+            self._text_transform_cache = QImage()
+            return
         image = self._build_excluded_object_scene_cache(
             self.selected_object_id
         )

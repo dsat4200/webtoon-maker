@@ -14,7 +14,8 @@ from PySide6.QtGui import QImage
 
 from .models import (
     BoundGeometry, ChapterDocument, ChildRef, ColorFillGradientObject,
-    DocumentObject, GradientObject, ImageObject, LayerNode, RasterObject, ShapeStyle,
+    DocumentObject, EmbeddedImageSourceDescriptor, GradientObject, ImageObject,
+    LayerNode, RasterObject, ShapeStyle,
     SpeedLineCenterObject, SpeedLinesGradientObject, TextObject,
     VectorDrawingObject, VectorFillObject, new_id, object_from_dict,
 )
@@ -377,7 +378,26 @@ def extract_asset(
         if isinstance(asset.objects[object_id], RasterObject):
             asset_tiles.replace_object_tiles(object_id, tiles.object_tiles(object_id))
         if isinstance(asset.objects[object_id], ImageObject) and source_images is not None:
+            image_object = asset.objects[object_id]
+            if image_object.is_blender_linked:
+                cached = source_images.source(object_id)
+                if cached is None:
+                    raise ValueError(
+                        "A Blender Comic View needs a cached frame before it "
+                        "can be copied as an asset"
+                    )
+                display_name = image_object.source.display_name
+                image_object.source = EmbeddedImageSourceDescriptor(
+                    filename=f"{display_name}.png", mime_type="image/png"
+                )
+                image_object.sync_source_metadata()
             source_images.copy_source_to(object_id, asset_images, object_id)
+            image_object = asset.objects[object_id]
+            asset_images.relabel(
+                object_id,
+                image_object.source_filename,
+                image_object.source_mime_type,
+            )
 
     bounds = entity_visual_bounds(asset, asset_tiles, kind, entity_id)
     dx, dy = ASSET_PADDING - bounds.left(), ASSET_PADDING - bounds.top()

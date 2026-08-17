@@ -30,6 +30,7 @@ from comic_editor.core.models import (
     BoundGeometry, ChapterDocument, ColorFillGradientObject,
     ColorGradientRamp, ColorGradientRampPreset, ColorGradientStop,
     ColorPalette, GradientObject, PaletteSwatch, PathNode,
+    BlenderComicViewSourceDescriptor, EmbeddedImageSourceDescriptor,
     ImageObject, RasterObject, SpeedLineCenterObject, SpeedLinesGradientObject,
     TextObject, VectorDrawingObject, VectorFillObject, new_id,
 )
@@ -64,8 +65,12 @@ from comic_editor.ui.tool_ribbon_pages import (
 )
 from comic_editor.ui.tree_model import HierarchyModel
 from comic_editor.ui.asset_library import AssetLibraryWidget
+from comic_editor.ui.blender_views import BlenderViewsWidget
 from comic_editor.ui.sessions import EditorSession, ProjectContext
 from comic_editor.ui.windows_input import tablet_multitouch_native_result
+from comic_editor.integrations.blender_controller import (
+    BlenderImageSourceController,
+)
 
 
 class ResponsiveToolButton(QToolButton):
@@ -256,7 +261,9 @@ class MainWindow(QMainWindow):
         self._dirty = False
         self._last_autosave = 0.0
         self._loading_chapter = False
+        self._blender_relink_object_id = ""
         self._build_ui()
+        self.blender_sources = BlenderImageSourceController(self.canvas, self)
         self._connect()
         self._install_shortcuts()
         self._refresh_actions()
@@ -272,6 +279,20 @@ class MainWindow(QMainWindow):
         if result is not None:
             return True, result
         return super().nativeEvent(event_type, message)
+
+    def changeEvent(self, event) -> None:  # noqa: N802
+        super().changeEvent(event)
+        if event.type() == QEvent.Type.WindowStateChange and hasattr(
+            self, "blender_sources"
+        ):
+            was_minimized = bool(event.oldState() & Qt.WindowState.WindowMinimized)
+            is_minimized = self.isMinimized()
+            if was_minimized == is_minimized:
+                return
+            if is_minimized:
+                self.blender_sources.stop_for_context_change()
+            else:
+                self.blender_sources.resume_for_context()
 
     # ---- UI ------------------------------------------------------------
     def _build_ui(self) -> None:
@@ -414,7 +435,7 @@ class MainWindow(QMainWindow):
         self.page_scope.hide()
         self.color_tabs = QTabWidget(self)
         self.color_tabs.setObjectName("colorTabs")
-        self.color_tabs.setMinimumHeight(225)
+        self.color_tabs.setMinimumHeight(236)
         picker_page = QWidget(self.color_tabs)
         picker_layout = QVBoxLayout(picker_page)
         picker_layout.setContentsMargins(4, 4, 4, 4)
@@ -478,6 +499,32 @@ class MainWindow(QMainWindow):
             QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding
         )
         asset_group.add_widget(self.asset_library)
+
+        self.blender_views_page = self.ribbon.add_page(
+            "blender_views", "Blender Views"
+        )
+        blender_group = self.blender_views_page.add_group(
+            "", minimum_width=760
+        )
+        blender_group.title_label.hide()
+        blender_group.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding
+        )
+        self.blender_views_page.groups_layout.setStretch(0, 1)
+        self.blender_views_page.groups_layout.setStretch(
+            self.blender_views_page.groups_layout.count() - 1, 0
+        )
+        self.blender_views_widget = BlenderViewsWidget(self.ribbon)
+        self.blender_views_widget.setMinimumHeight(220)
+        self.blender_views_widget.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding
+        )
+        self.blender_views_widget.set_endpoint(
+            self.settings.blender_bridge_host,
+            self.settings.blender_bridge_port,
+            self.settings.blender_bridge_token,
+        )
+        blender_group.add_widget(self.blender_views_widget)
 
         self.vector_tools_page = self.ribbon.add_page(
             "vector_tools", "Vector Tools", visible=False
@@ -879,6 +926,54 @@ class MainWindow(QMainWindow):
         self.asset_library.folderDeleteRequested.connect(self._delete_asset_folder)
         self.asset_library.statusMessage.connect(
             lambda message: self.statusBar().showMessage(message, 5000)
+        )
+        self.blender_views_widget.connectRequested.connect(
+            self._connect_blender_bridge
+        )
+        self.blender_views_widget.disconnectRequested.connect(
+            self.blender_sources.disconnect
+        )
+        self.blender_views_widget.refreshRequested.connect(
+            self.blender_sources.client.refresh_views
+        )
+        self.blender_views_widget.addRequested.connect(
+            self._add_blender_comic_view
+        )
+        self.blender_sources.viewsChanged.connect(
+            self.blender_views_widget.set_views
+        )
+        self.blender_sources.connectionStateChanged.connect(
+            self.blender_views_widget.set_connection_state
+        )
+        self.blender_sources.connectionStateChanged.connect(
+            self._blender_connection_changed
+        )
+        self.blender_sources.streamStatusChanged.connect(
+            self._blender_stream_status_changed
+        )
+        self.blender_sources.switchDecisionRequired.connect(
+            self._resolve_blender_dirty_switch
+        )
+        self.blender_sources.cachePersisted.connect(
+            lambda: self._mark_dirty(None)
+        )
+        self.blender_sources.errorOccurred.connect(
+            self._blender_source_error
+        )
+        self.canvas.selectionChanged.connect(
+            self.blender_sources.handle_selection
+        )
+        self.selection_settings.image_controls.renderOnceRequested.connect(
+            self.blender_sources.render_once
+        )
+        self.selection_settings.image_controls.reconnectRequested.connect(
+            self._reconnect_selected_blender_source
+        )
+        self.selection_settings.image_controls.relinkRequested.connect(
+            self._begin_relink_selected_blender_source
+        )
+        self.selection_settings.image_controls.detachRequested.connect(
+            self._detach_selected_blender_source
         )
         self.autosave_timer.timeout.connect(self._autosave)
         self.series_preferences_timer.timeout.connect(
@@ -1514,6 +1609,7 @@ class MainWindow(QMainWindow):
         session = self.active_session
         if session is None or self.chapter is None:
             return
+        self.blender_sources.flush_pending_frames()
         state = self.canvas.capture_session_state()
         if state is not None:
             session.canvas_state = state
@@ -1539,6 +1635,9 @@ class MainWindow(QMainWindow):
     def _activate_editor_session(self, session: EditorSession) -> None:
         if session is self.active_session:
             return
+        self._blender_relink_object_id = ""
+        self.blender_views_widget.set_relink_mode(False)
+        self.blender_sources.stop_for_context_change()
         self._switching_session = True
         try:
             self._capture_active_session()
@@ -1597,6 +1696,7 @@ class MainWindow(QMainWindow):
             )
         finally:
             self._switching_session = False
+            self.blender_sources.resume_for_context()
 
     def _clear_active_session(self) -> None:
         if self.project_tabs.count() > 0:
@@ -1606,6 +1706,9 @@ class MainWindow(QMainWindow):
         self.series = None
         self.chapter = None
         self._dirty = False
+        self._blender_relink_object_id = ""
+        self.blender_views_widget.set_relink_mode(False)
+        self.blender_sources.stop_for_context_change()
         self.canvas.asset_repository = None
         self.canvas.clear_document()
         self.hierarchy_model.set_chapter(None)
@@ -2807,7 +2910,21 @@ class MainWindow(QMainWindow):
                 self.chapter.objects.get(item.entity_id), ImageObject
             ) else None
         )
-        copy_asset.setEnabled(self._current_project_context() is not None)
+        selected_image = (
+            self.chapter.objects.get(item.entity_id)
+            if item.kind == "object" else None
+        )
+        can_freeze = not (
+            isinstance(selected_image, ImageObject)
+            and selected_image.is_blender_linked
+            and self.canvas.images.source(selected_image.object_id) is None
+            and self.canvas.images.runtime_frame(selected_image.object_id).isNull()
+        )
+        copy_asset.setEnabled(
+            self._current_project_context() is not None and can_freeze
+        )
+        if rasterize is not None:
+            rasterize.setEnabled(can_freeze)
         selected = menu.exec(self.tree.viewport().mapToGlobal(point))
         if selected is rename:
             self.tree.edit(index)
@@ -2820,6 +2937,7 @@ class MainWindow(QMainWindow):
         context = self._current_project_context()
         if context is None or self.chapter is None:
             return
+        self.blender_sources.flush_pending_frames()
         entity = (
             self.chapter.layers.get(entity_id)
             if kind == "layer" else self.chapter.objects.get(entity_id)
@@ -2900,6 +3018,8 @@ class MainWindow(QMainWindow):
         obj = self.chapter.objects.get(object_id)
         if not isinstance(obj, ImageObject):
             return
+        if obj.is_blender_linked:
+            self.blender_sources.flush_pending_frames()
         image = self.canvas.images.image(object_id)
         if image.isNull():
             QMessageBox.warning(
@@ -3194,6 +3314,211 @@ class MainWindow(QMainWindow):
             bounds.center().y() + world_y,
         )
 
+    # ---- Blender Comic View image sources ----------------------------
+    def _connect_blender_bridge(
+        self, host: str, port: int, token: str,
+    ) -> None:
+        self.settings.blender_bridge_host = host
+        self.settings.blender_bridge_port = int(port)
+        self.settings.blender_bridge_token = token
+        self.settings.clamp()
+        save_settings(self.settings)
+        self.blender_sources.connect_to_provider(
+            self.settings.blender_bridge_host,
+            self.settings.blender_bridge_port,
+            self.settings.blender_bridge_token,
+        )
+
+    def _add_blender_comic_view(self, view) -> None:
+        if self._blender_relink_object_id:
+            object_id, self._blender_relink_object_id = (
+                self._blender_relink_object_id, ""
+            )
+            self.blender_views_widget.set_relink_mode(False)
+            obj = (
+                self.chapter.objects.get(object_id)
+                if self.chapter is not None else None
+            )
+            if not isinstance(obj, ImageObject) or not obj.is_blender_linked:
+                self.statusBar().showMessage(
+                    "The image selected for relinking is no longer available", 5000
+                )
+                return
+            before = self.chapter.to_dict()
+            obj.source = BlenderComicViewSourceDescriptor(
+                project_uuid=view.project_uuid,
+                view_uuid=view.view_uuid,
+                display_name=view.name,
+                last_revision=view.revision,
+            )
+            obj.sync_source_metadata()
+            after = self.chapter.to_dict()
+            self.canvas.push_model_change(
+                before, after, "Relink Blender Comic View"
+            )
+            self.canvas.documentChanged.emit(None)
+            self.selection_settings.refresh()
+            self.blender_sources.handle_selection()
+            self.statusBar().showMessage(
+                f"Relinked image to Blender Comic View {view.name}", 5000
+            )
+            return
+        if self.chapter is None or (
+            self.active_session is not None
+            and self.active_session.kind == "asset"
+        ):
+            self.statusBar().showMessage(
+                "Blender Comic Views can be added only to a chapter", 5000
+            )
+            return
+        parent = self._selected_parent_layer(allow_page=True)
+        if parent is None and self.canvas.active_page_id in self.chapter.layers:
+            parent = self.chapter.layers[self.canvas.active_page_id]
+        if parent is None:
+            self.statusBar().showMessage(
+                "Select a page or container before adding a Comic View", 5000
+            )
+            return
+        thumbnail = QImage(view.thumbnail)
+        if thumbnail.isNull():
+            thumbnail = QImage(256, 144, QImage.Format_ARGB32_Premultiplied)
+            thumbnail.fill(Qt.transparent)
+        payload = QByteArray()
+        buffer = QBuffer(payload)
+        buffer.open(QIODevice.OpenModeFlag.WriteOnly)
+        saved = thumbnail.save(buffer, "PNG")
+        buffer.close()
+        if not saved:
+            self.statusBar().showMessage("Unable to encode the Comic View thumbnail", 5000)
+            return
+        descriptor = BlenderComicViewSourceDescriptor(
+            project_uuid=view.project_uuid,
+            view_uuid=view.view_uuid,
+            display_name=view.name,
+            last_revision=view.revision,
+        )
+        created = self.canvas.place_image_sources(
+            [(f"{view.name}.png", "image/png", bytes(payload))],
+            parent.layer_id,
+            self._selected_parent_center(parent.layer_id),
+            insertion_index=self._new_object_insertion_index(parent.layer_id),
+            fit_parent=False,
+            label="Add Blender Comic View",
+            source_descriptors=[descriptor],
+            logical_sizes=[(view.width, view.height)],
+        )
+        if created:
+            self.statusBar().showMessage(
+                f"Added Blender Comic View {view.name}", 3500
+            )
+            self.blender_sources.handle_selection()
+
+    def _blender_connection_changed(self, state: str) -> None:
+        if state == "connected":
+            self.statusBar().showMessage("Connected to Blender Comic Views", 3000)
+        self._blender_stream_status_changed(
+            "offline" if state != "connected" else "connected"
+        )
+
+    def _blender_stream_status_changed(self, status: str) -> None:
+        labels = {
+            "live": "Ready — Update publishes; Render Once shows a temporary preview",
+            "preview": "Preview — temporary unsaved Blender scene (not cached)",
+            "activating": "Activating the selected Comic View in Blender…",
+            "connected": "Connected — select a linked image to stream it",
+            "stopped": "Frozen — showing the last cached frame",
+            "frozen": "Frozen — activation was canceled",
+            "offline": "Offline — showing the last cached frame",
+            "unavailable": "Offline — this Comic View is unavailable; use Relink to choose another",
+            "stale": "Stale — Blender has an older revision; update or relink before streaming",
+            "error": "Error — showing the last cached frame",
+        }
+        self.selection_settings.image_controls.set_source_status(
+            labels.get(status, str(status).title())
+        )
+
+    def _resolve_blender_dirty_switch(self, message: dict) -> None:
+        current = str(message.get("current_name", "the current Comic View"))
+        destination = str(message.get("destination_name", "the selected view"))
+        box = QMessageBox(self)
+        box.setWindowTitle("Comic View has unsaved changes")
+        box.setText(
+            f'"{current}" has scene changes that have not been stored. '
+            f'Switch to "{destination}"?'
+        )
+        update = box.addButton("Update and Switch", QMessageBox.AcceptRole)
+        revert = box.addButton("Revert and Switch", QMessageBox.DestructiveRole)
+        cancel = box.addButton(QMessageBox.Cancel)
+        box.setDefaultButton(update)
+        box.exec()
+        clicked = box.clickedButton()
+        resolution = (
+            "update" if clicked is update else
+            "revert" if clicked is revert else "cancel"
+        )
+        self.blender_sources.client.resolve_dirty_switch(resolution)
+        if clicked is cancel:
+            self._blender_stream_status_changed("frozen")
+
+    def _blender_source_error(self, message: str) -> None:
+        self.blender_views_widget.set_status_message(message)
+        self.statusBar().showMessage(f"Blender source: {message}", 7000)
+        self._blender_stream_status_changed("error")
+
+    def _reconnect_selected_blender_source(self) -> None:
+        if self.blender_sources.client.connected:
+            self.blender_sources.reconnect_selected()
+            return
+        self._connect_blender_bridge(
+            self.settings.blender_bridge_host,
+            self.settings.blender_bridge_port,
+            self.settings.blender_bridge_token,
+        )
+
+    def _begin_relink_selected_blender_source(self) -> None:
+        obj = self.blender_sources.selected_linked_object()
+        if obj is None:
+            return
+        self._blender_relink_object_id = obj.object_id
+        self.blender_views_widget.set_relink_mode(True, obj.name)
+        self.ribbon.select_page("blender_views")
+        self.statusBar().showMessage(
+            "Choose a Blender Comic View to relink the selected image", 5000
+        )
+
+    def _detach_selected_blender_source(self) -> None:
+        obj = self.blender_sources.selected_linked_object()
+        if obj is None or self.chapter is None:
+            return
+        self.blender_sources.flush_pending_frames()
+        if self.canvas.images.source(obj.object_id) is None:
+            QMessageBox.warning(
+                self, "Detach Blender source",
+                "This Comic View has no cached frame to preserve.",
+            )
+            return
+        before = self.chapter.to_dict()
+        display_name = obj.source.display_name
+        obj.source = EmbeddedImageSourceDescriptor(
+            filename=f"{display_name}.png", mime_type="image/png"
+        )
+        obj.sync_source_metadata()
+        self.canvas.images.relabel(
+            obj.object_id, obj.source_filename, obj.source_mime_type
+        )
+        self.canvas.images.clear_runtime_frame(obj.object_id)
+        after = self.chapter.to_dict()
+        self.canvas.push_model_change(
+            before, after, "Detach Blender image source"
+        )
+        self.canvas.documentChanged.emit(None)
+        self.selection_settings.refresh()
+        self.blender_sources.handle_selection()
+        self.statusBar().showMessage(
+            "Detached Blender source; the cached frame is now an embedded image",
+            5000,
+        )
+
     def _place_import_sources(
         self, sources: list[tuple[str, str, bytes]], label: str,
     ) -> list[str]:
@@ -3332,6 +3657,12 @@ class MainWindow(QMainWindow):
             menu.exec(global_point)
 
     def _canvas_selection_changed(self, kind: str, entity_id: str) -> None:
+        if (
+            self._blender_relink_object_id
+            and entity_id != self._blender_relink_object_id
+        ):
+            self._blender_relink_object_id = ""
+            self.blender_views_widget.set_relink_mode(False)
         if entity_id:
             index = self.hierarchy_model.index_for_entity(kind, entity_id)
             if index.isValid():
@@ -3895,6 +4226,7 @@ class MainWindow(QMainWindow):
             return self._save_editor_session(self.active_session)
         if self.repository is None or self.chapter is None:
             return False
+        self.blender_sources.flush_pending_frames()
         try:
             self.repository.save_chapter(
                 self.chapter, self.canvas.tiles, self.canvas.images
@@ -4084,6 +4416,7 @@ class MainWindow(QMainWindow):
         return True
 
     def _autosave(self) -> None:
+        self.blender_sources.flush_pending_frames()
         if self.sessions:
             now = time.monotonic()
             deferred: list[float] = []
@@ -4396,6 +4729,7 @@ class MainWindow(QMainWindow):
         elif not self._confirm_discard_or_save():
             event.ignore()
             return
+        self.blender_sources.shutdown()
         self._flush_series_preferences()
         self.layout_settings_timer.stop()
         self._save_workspace_layout()

@@ -1,0 +1,21 @@
+schema_version = "1.0.0"
+id = "webtoon_comic_views"
+version = "0.2.0"
+name = "Webtoon Comic Views"
+tagline = "Publish persistent viewport Comic Views to Webtoon Maker"
+maintainer = "Webtoon Maker"
+type = "add-on"
+tags = ["3D View", "Animation"]
+blender_version_min = "4.5.0"
+platforms = ["windows-x64"]
+license = ["SPDX:GPL-3.0-or-later"]
+
+[permissions]
+network = "Expose a token-authenticated loopback image source"
+
+[build]
+paths_exclude_pattern = [
+  "__pycache__/",
+  "*.pyc",
+  "*.zip",
+]

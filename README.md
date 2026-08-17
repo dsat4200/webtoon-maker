@@ -43,6 +43,8 @@ workflow.
 - Pixel-snapped pan, zoom, rotation, and aspect-preserving chapter preview navigation
 - Touch navigation controlled only by Tablet Navigation mode
 - Command-based undo/redo and atomic autosave recovery
+- Blender 4.5 Comic Views as live, transparent image sources with persistent
+  offline PNG caches
 
 ## Run
 
@@ -55,6 +57,47 @@ Or run the equivalent commands manually:
 python -m pip install -r requirements.txt
 python main.py
 ```
+
+## Blender Comic Views prototype
+
+The Blender integration keeps the 3D scene wholly inside Blender. A linked
+Comic View is an ordinary Image Object in the editor: translation, free or
+uniform projective transforms, masks, opacity, hierarchy, and compositing all
+remain editor-owned. Blender only replaces its source pixels. Drawing stays on
+normal raster or vector layers above the image.
+
+To install and connect it:
+
+1. Install Blender 4.5 LTS on Windows.
+2. Run `blender_extension/webtoon_comic_views/build.ps1`, or use the already
+   built `blender_extension/webtoon_comic_views-0.2.0.zip`.
+3. In Blender, choose **Edit → Preferences → Get Extensions → Install from
+   Disk**, select the ZIP, and enable **Webtoon Comic Views**.
+4. In a 3D View, open the **Comic Views** sidebar. Create or update views and
+   copy the displayed loopback port and token.
+5. In Webtoon Maker, open the **Blender Views** ribbon page, enter those values,
+   connect, select a thumbnail, and choose **Add Selected View to Canvas**.
+
+Only the linked image selected in the active chapter owns the stream. Blender
+scene edits remain working changes until **Update** publishes a committed
+revision, thumbnail, resolution, and full frame. **Render Once** shows a
+temporary preview that is never cached into the comic project. Selecting
+anything else, changing tabs, minimizing, or disconnecting freezes the last
+committed frame. That frame is encoded into the project, so the comic reopens
+with identical cached pixels when Blender is unavailable. Incoming frames
+preserve placement, transforms, masks, opacity, ordering, and Undo history.
+When a committed stream-frame aspect changes, the image keeps its displayed
+width and center while its height follows the new aspect.
+Use the Image Object inspector to Render Once, reconnect, relink by UUID, or
+detach the cache into a normal embedded image. Rasterize and Copy as Asset also
+freeze the cached image.
+
+The prototype supports one Blender instance, one editor connection, and one
+active stream. It renders the orange, screen-space Stream Frame from the saved
+3D viewport with captured shading and a transparent background; that frame may
+extend beyond the active camera and is not a Cycles/Eevee final render.
+Comic Views store panel-variable state and stable references, never mesh,
+curve, texture, or other geometry data.
 
 Navigation defaults:
 

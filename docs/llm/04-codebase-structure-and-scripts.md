@@ -22,6 +22,9 @@ webtoon-maker/
 │   │   ├── settings.py
 │   │   ├── tiles.py
 │   │   └── vector_geometry.py
+│   ├── integrations/               # live external image-source adapters
+│   │   ├── blender_source.py       # protocol/shared-memory client
+│   │   └── blender_controller.py   # selection, cache, and repaint lifecycle
 │   └── ui/                         # PySide6 window, canvas, controls, models, theme
 │       ├── __init__.py
 │       ├── main_window.py
@@ -39,6 +42,9 @@ webtoon-maker/
 │       ├── pencil_settings_dialog.py
 │       ├── pressure_curve_editor.py
 │       └── style.qss
+├── blender_extension/
+│   ├── webtoon_comic_views/        # Blender 4.5 manifest extension source
+│   └── webtoon_comic_views-0.2.0.zip # installable build artifact
 ├── tests/                           # offscreen Qt and pure-core regression suite
 ├── docs/llm/                        # this LLM-oriented documentation set
 ├── lighter-novel/                   # story/planning content, not application code
@@ -60,6 +66,9 @@ flowchart LR
     P --> M
     P --> T
     W --> S["core/settings.py"]
+    W --> BI["integrations/blender_controller.py"]
+    BI --> BS["integrations/blender_source.py"]
+    BS -. "JSON control + shared RGBA" .-> BE["Blender Comic Views extension"]
 ```
 
 `MainWindow` is the application coordinator; the canvas is the editing/rendering engine; the core package defines data and algorithms; the remaining UI files break out contextual controls and Qt view models.
@@ -118,11 +127,11 @@ Marks the UI package with a PySide6 interface docstring. It has no runtime logic
 
 The canonical saved-data model and invariant layer.
 
-- Declares schema version 14, chapter width 1080, default height 3240, growth margin 1080, and chapter/asset document kinds.
+- Declares schema version 16, chapter width 1080, default height 3240, growth margin 1080, and chapter/asset document kinds.
 - Normalizes colors to canonical ARGB and generates stable UUID IDs.
 - Defines grids, path nodes/contours, shape style, and unified rectangle/ellipse/custom `BoundGeometry`.
 - Defines mixed layer/object child references and `LayerNode` with shape, fill, page, mask, grid, and compound fields.
-- Defines the object hierarchy: base object, Raster, Text, Gradient, color gradient, Vector Drawing, and Vector Fill.
+- Defines the object hierarchy: base object, Raster, Image with typed embedded/Blender source descriptors, Text, Gradient, color gradient, Vector Drawing, and Vector Fill.
 - Defines vector stroke points/strokes and gradient field/ramp/preset value objects.
 - Defines `ChapterDocument`, including validation, add/move/reorder/delete operations, vector-fill ownership, gradient uniqueness, inherited grid/opacity queries, compound-ancestor queries, automatic height growth, trimming, render-order iteration, serialization, and legacy migration.
 - Defines `SeriesDocument`, chapter references, color palettes/swatches, gradient presets, and series serialization/migration.
@@ -168,7 +177,8 @@ Defines small extensibility registries for object and bound types. It registers 
 
 ### `comic_editor/core/settings.py`
 
-Defines per-user editor settings and their version-11 migration.
+Defines per-user editor settings and their version-15 migration, including the
+loopback Blender bridge endpoint and token.
 
 - Supplies default hotkeys and Hold flags.
 - Defines validated formatting-only `TextPreset` values.

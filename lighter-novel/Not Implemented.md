@@ -1,23 +1,62 @@
-## synced image support
-- use an image that streams itself from blender, actively reloading when refreshed every second?
-- use a literal actual blender window, displaying it below our window somehow.
+- [x] ## synced image support
+- [x] use an image that streams itself from blender, actively reloading when refreshed every second?
+- [x] use a literal actual blender window, displaying it below our window somehow.
+
+
+## image sync tweaks
+- render region box on screen
+- link transforms to layer above? or mabyee
+- adjustment layer - allows transforms and modifiers simultaneously
+- includes uniform, free, etc
+
+
+transformations
+- cage warp
+- blur
+- smear
+- hue, saturation, lightness
+
+
+
+bugs:
+- wont let me drag select to reorder objects with the stylus, only with the mouse
+
+
+tools
+- eyedropper icon in the color picker (with hotkey setting). for now, samples from the whole image.
+- new item in the color window besides picker and pallette - color history
+- add the option to hide transform handles while drawing to pencil and eraser tool in tool settings. 
+- add a transform tool for vector/raster that exposes the handles, and click-dragging or pen tap dragging in the bounds translates instead of drawing while in transform mode.
+- add a "reset rotation" tool that only works as a hotkey. it should keep the scale and position navigation the same, but reset rotation of the canvas.
+- line gradients with 2 points shouldn't have the 8 handle transform around them (its redundant)
+- while having point selected in point select mode, pressing delete should delete the points you have selected.
+- the click and drag handle outside a shape to translate it doesn't seem to work.
+- add an export to png button that exports the current chapter to a full size png image. (add a folder where assets and chapters are called exports. the image name should 
 
 bugs:
 - [x] when zooming in and out, sometimes the transform type button flashes between each corner of a raster object, or starts flipping around in a vector object
 - [x] drawing in a vector after transforming it causes the pencil to draw in an offset position. 
 - [x] drawing in a raster object after transforming it causes the program to crash.
-- [ ] vector edit point preview in a scaled object shows the non-transformed points.
+- [ ] text move handles 
+- [ ] vector edit point preview in a scaled object shows the non-transformed points. also, make the actual point icons about 20 percent smaller, and make their size and transparency settable in tool settings with sliders. also include a toggle to show or hide them, and they should be hidden by default.
 ![[Pasted image 20260816003707.png]]
+- ![[Pasted image 20260816190558.png]]
+- the color wheel shows the wrong hue.
 
-non-tablet mode navigation changes:
-- when scaling using modifier keys + pen click and drag, zooming in should act like clip studio paint, where the first place you clicked before dragging on the canvas (in screen space, mind you) should be where the zooming in happens towards (where dragging right zooms in, left out.)
-- the pivot for rotating the canvas should act the same way
 
 
 ## Raster/Vector object / pencil features
 psd brush support?
 - add brushes to tool settings ribbon (raster/vector pencil) (with preview of a small, curved stroke segment in a square live preview icon, from zero pressure to 100, swoop curve )
 - outside of shapes can be treated as a stroke that supports psd brushes?
+
+
+
+
+later
+- multi object select support
+- lasso fill support
+- MODIFIER STACK?
 
 cage transform support
 select support for raster mode
@@ -31,6 +70,10 @@ more key commands
 - same key multi tool stack toggle
 
 motion blur, smudge, gaussian blur?
+
+gaussian blur modes
+- full image
+- focal point (with handle for center, handle for end, and handle for ramp between the two) these 3 handles should appear on a line, with a circle outline around the full radius
 
 faster fill tools / layer agnostic fill
 
