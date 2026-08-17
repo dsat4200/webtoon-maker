@@ -65,6 +65,7 @@ from comic_editor.ui.ribbon import RibbonWidget
 from comic_editor.ui.tool_ribbon_pages import (
     TextObjectControls, ToolSettingsControls, VectorToolsControls,
 )
+from comic_editor.ui.modifier_controls import ModifierControls
 from comic_editor.ui.tree_model import HierarchyModel
 from comic_editor.ui.asset_library import AssetLibraryWidget
 from comic_editor.ui.blender_views import BlenderViewsWidget
@@ -439,7 +440,9 @@ class MainWindow(QMainWindow):
         self.page_scope.hide()
         self.color_tabs = QTabWidget(self)
         self.color_tabs.setObjectName("colorTabs")
-        self.color_tabs.setMinimumHeight(236)
+        # Preserve a usable wheel even when a tall contextual ribbon page is
+        # present in the sibling splitter.
+        self.color_tabs.setMinimumHeight(280)
         picker_page = QWidget(self.color_tabs)
         picker_layout = QVBoxLayout(picker_page)
         picker_layout.setContentsMargins(4, 4, 4, 4)
@@ -485,6 +488,11 @@ class MainWindow(QMainWindow):
             self.settings, self.ribbon
         )
         self.tool_settings_group.add_widget(self.tool_settings_controls)
+
+        self.modifiers_page = self.ribbon.add_page(
+            "modifiers", "Modifiers"
+        )
+        self.modifiers_group = self.modifiers_page.add_group("Modifier Stack")
 
         self.asset_library_page = self.ribbon.add_page(
             "asset_library", "Asset Library"
@@ -558,6 +566,10 @@ class MainWindow(QMainWindow):
             self.vector_tools_controls.simplify_widget
         )
         self.canvas = create_canvas(self.settings)
+        self.modifier_controls = ModifierControls(
+            self.canvas, self.modifiers_page
+        )
+        self.modifiers_group.add_widget(self.modifier_controls)
         self.text_object_controls = TextObjectControls(
             self.canvas, self.settings, self.ribbon
         )
@@ -713,7 +725,7 @@ class MainWindow(QMainWindow):
         self.settings_scroll.setMinimumHeight(56)
         self.settings_scroll.setWidget(self.selection_settings)
         self.tree = QTreeView()
-        self.tree.setSelectionMode(QTreeView.SingleSelection)
+        self.tree.setSelectionMode(QTreeView.ExtendedSelection)
         self.tree.setDragDropMode(QTreeView.InternalMove)
         self.tree.setDefaultDropAction(Qt.MoveAction)
         self.tree.setDropIndicatorShown(True)
@@ -723,8 +735,17 @@ class MainWindow(QMainWindow):
         )
         self.hierarchy_model = HierarchyModel()
         self.tree.setModel(self.hierarchy_model)
+        self.modifier_controls.linkModeChanged.connect(
+            self.hierarchy_model.set_link_highlights
+        )
         self.tree.setContextMenuPolicy(Qt.CustomContextMenu)
         self._tablet_outliner_press: dict | None = None
+        self._tablet_drop_indicator = QFrame(self.tree.viewport())
+        self._tablet_drop_indicator.setObjectName("tabletDropIndicator")
+        self._tablet_drop_indicator.setStyleSheet(
+            "#tabletDropIndicator { background: #ff7417; }"
+        )
+        self._tablet_drop_indicator.hide()
         self._hierarchy_reset_expanded: set[str] = set()
         self._hierarchy_reset_selection: tuple[str, str] = ("", "")
         self.hierarchy_model.modelAboutToBeReset.connect(
@@ -1499,57 +1520,137 @@ class MainWindow(QMainWindow):
         if event.type() == QEvent.TabletPress:
             if not inside:
                 return False
-            self._send_outliner_mouse(
-                QEvent.MouseButtonPress, global_position,
-                Qt.LeftButton, Qt.LeftButton,
-                event.modifiers(), event.pointingDevice(),
-            )
+            index = self.tree.indexAt(local).siblingAtColumn(0)
+            if self.modifier_controls.link_modifier_id and index.isValid():
+                item = self.hierarchy_model.item_for_index(index)
+                self.modifier_controls.toggle_link_target(
+                    item.kind, item.entity_id
+                )
+                event.accept()
+                return True
             self._tablet_outliner_press = {
                 "global": QPointF(global_position),
-                "forwarded": True,
+                "index": index,
+                "dragging": False,
+                "drop": None,
+                "mime": None,
                 "device": event.pointingDevice(),
                 "modifiers": event.modifiers(),
             }
             event.accept()
             return True
         if state is None:
-            if event.type() == QEvent.TabletMove and inside:
-                self._send_outliner_mouse(
-                    QEvent.MouseMove, global_position,
-                    Qt.NoButton, Qt.NoButton,
-                    event.modifiers(), event.pointingDevice(),
-                )
-                event.accept()
-                return True
             return False
         if event.type() == QEvent.TabletMove:
-            self._send_outliner_mouse(
-                QEvent.MouseMove, global_position,
-                Qt.NoButton, Qt.LeftButton,
-                event.modifiers(), state["device"],
-            )
+            if not state["dragging"]:
+                distance = (
+                    global_position - state["global"]
+                ).manhattanLength()
+                if distance >= QApplication.startDragDistance():
+                    source = state["index"]
+                    if not source.isValid():
+                        self._cancel_outliner_tablet_press()
+                        event.accept()
+                        return True
+                    if not self.tree.selectionModel().isSelected(source):
+                        self.tree.selectionModel().select(
+                            source,
+                            QItemSelectionModel.ClearAndSelect
+                            | QItemSelectionModel.Rows,
+                        )
+                    self.tree.selectionModel().setCurrentIndex(
+                        source, QItemSelectionModel.NoUpdate
+                    )
+                    state["mime"] = self.hierarchy_model.mimeData(
+                        self.tree.selectionModel().selectedRows(0)
+                    )
+                    state["dragging"] = True
+            if state["dragging"]:
+                state["drop"] = self._tablet_outliner_drop_target(
+                    local, state["mime"]
+                )
             event.accept()
             return True
-        self._send_outliner_mouse(
-            QEvent.MouseButtonRelease, global_position,
-            Qt.LeftButton, Qt.NoButton,
-            event.modifiers(), state["device"],
-        )
+        if state["dragging"]:
+            drop = state.get("drop")
+            if drop is not None:
+                parent, row = drop
+                self.hierarchy_model.dropMimeData(
+                    state["mime"], Qt.MoveAction, row, 0, parent
+                )
+        else:
+            # Preserve the tree's native checkbox, selection, and editing tap
+            # behavior without asking it to infer a drag from tablet packets.
+            self._send_outliner_mouse(
+                QEvent.MouseButtonPress, state["global"],
+                Qt.LeftButton, Qt.LeftButton,
+                state["modifiers"], state["device"],
+            )
+            self._send_outliner_mouse(
+                QEvent.MouseButtonRelease, global_position,
+                Qt.LeftButton, Qt.NoButton,
+                event.modifiers(), state["device"],
+            )
+        self._tablet_drop_indicator.hide()
         self._tablet_outliner_press = None
         event.accept()
         return True
 
-    def _cancel_outliner_tablet_press(self) -> None:
-        state = self._tablet_outliner_press
-        if state is not None and state.get("forwarded"):
-            self._send_outliner_mouse(
-                QEvent.MouseButtonRelease, state["global"],
-                Qt.LeftButton, Qt.NoButton,
-                state["modifiers"], state["device"],
+    def _tablet_outliner_drop_target(self, local, mime):
+        index = self.tree.indexAt(local).siblingAtColumn(0)
+        if not index.isValid() or mime is None:
+            self._tablet_drop_indicator.hide()
+            return None
+        rect = self.tree.visualRect(index)
+        item = self.hierarchy_model.item_for_index(index)
+        band = max(5, min(12, rect.height() // 4))
+        if local.y() < rect.top() + band:
+            parent, row, line_y = index.parent(), index.row(), rect.top()
+        elif local.y() > rect.bottom() - band:
+            parent, row, line_y = index.parent(), index.row() + 1, rect.bottom()
+        elif item.kind == "layer" or (
+            item.kind == "object" and isinstance(
+                self.chapter.objects.get(item.entity_id), VectorDrawingObject
             )
+        ):
+            parent, row, line_y = index, -1, rect.bottom()
+        else:
+            parent, row, line_y = index.parent(), index.row() + 1, rect.bottom()
+        if not self.hierarchy_model.canDropMimeData(
+            mime, Qt.MoveAction, row, 0, parent
+        ):
+            self._tablet_drop_indicator.hide()
+            return None
+        indent = max(0, rect.left())
+        self._tablet_drop_indicator.setGeometry(
+            indent, max(0, line_y - 1),
+            max(1, self.tree.viewport().width() - indent), 3,
+        )
+        self._tablet_drop_indicator.raise_()
+        self._tablet_drop_indicator.show()
+        return parent, row
+
+    def _cancel_outliner_tablet_press(self) -> None:
+        self._tablet_drop_indicator.hide()
         self._tablet_outliner_press = None
 
     def eventFilter(self, watched, event) -> bool:  # noqa: N802
+        if (
+            watched is self.tree.viewport()
+            and event.type() == QEvent.MouseButtonPress
+            and event.button() == Qt.MouseButton.LeftButton
+            and self.modifier_controls.link_modifier_id
+        ):
+            index = self.tree.indexAt(
+                event.position().toPoint()
+            ).siblingAtColumn(0)
+            if index.isValid():
+                item = self.hierarchy_model.item_for_index(index)
+                self.modifier_controls.toggle_link_target(
+                    item.kind, item.entity_id
+                )
+            event.accept()
+            return True
         if self._forward_popup_tablet_event(watched, event):
             return True
         if self._forward_outliner_tablet_event(watched, event):
@@ -1561,6 +1662,13 @@ class MainWindow(QMainWindow):
             self._hotkey_pressed.clear()
             self._restore_active_hotkey_tool()
             return super().eventFilter(watched, event)
+        if (
+            event.type() == QEvent.KeyPress
+            and event.key() == Qt.Key_Escape
+            and self.modifier_controls.cancel_link_mode()
+        ):
+            event.accept()
+            return True
         if (
             not getattr(self, "_hotkey_runtime_enabled", False)
             or event.type() not in {QEvent.KeyPress, QEvent.KeyRelease}
@@ -2580,6 +2688,16 @@ class MainWindow(QMainWindow):
             )
             else None
         )
+        if len(self.canvas.selected_entities) > 1:
+            if tool != ToolKind.TRANSFORM:
+                self.statusBar().showMessage(
+                    "Only Transform is available for multiple objects", 3000
+                )
+                self._sync_tool_buttons()
+                return False
+            changed = self.canvas.set_tool(ToolKind.TRANSFORM)
+            self._sync_tool_buttons()
+            return changed
         vector_selected = isinstance(selected_object, VectorDrawingObject)
         if tool in {ToolKind.RASTER_PENCIL, ToolKind.RASTER_ERASER}:
             if (
@@ -2669,6 +2787,21 @@ class MainWindow(QMainWindow):
             )
             else None
         )
+        if len(self.canvas.selected_entities) > 1:
+            for candidate, button in self.tool_buttons.items():
+                button.setVisible(candidate == ToolKind.TRANSFORM)
+                button.setEnabled(candidate == ToolKind.TRANSFORM)
+            self.tool_buttons[ToolKind.TRANSFORM].setChecked(
+                self.canvas.tool == ToolKind.TRANSFORM
+            )
+            self.drawing_selection_category.setVisible(False)
+            self.fill_tool_button.setVisible(False)
+            self.selection_settings.setVisible(False)
+            self._sync_contextual_ribbon()
+            return
+        self.selection_settings.setVisible(True)
+        for button in self.tool_buttons.values():
+            button.setVisible(True)
         raster_selected = isinstance(selected_object, RasterObject)
         vector_selected = isinstance(
             selected_object, VectorDrawingObject
@@ -2732,6 +2865,14 @@ class MainWindow(QMainWindow):
                 text_selected
                 and self.chapter.objects[self.canvas.selected_id].layout_mode
                 == "free"
+            )
+            or (
+                self.chapter is not None
+                and self.canvas.selected_kind == "layer"
+                and self.canvas.selected_id in self.chapter.layers
+                and not self.chapter.layers[self.canvas.selected_id].is_page
+                and self.chapter.layers[self.canvas.selected_id].layer_kind
+                != "fill"
             )
         )
         self.tool_buttons[ToolKind.TRANSFORM].setVisible(transform_available)
@@ -3624,14 +3765,58 @@ class MainWindow(QMainWindow):
 
     # ---- selection and model synchronization --------------------------
     def _tree_selection_changed(self, selected: QItemSelection, deselected) -> None:
-        indexes = selected.indexes()
-        index = next((item for item in indexes if item.column() == 0), QModelIndex())
-        if not index.isValid():
+        del selected, deselected
+        indexes = self.tree.selectionModel().selectedRows(0)
+        if not indexes:
             return
-        item = self.hierarchy_model.item_for_index(index)
-        self.canvas.set_selection(
-            item.kind, item.entity_id, activate_default_tool=True
+        entities = [
+            (item.kind, item.entity_id)
+            for item in (
+                self.hierarchy_model.item_for_index(index)
+                for index in indexes
+            )
+        ]
+        current = self.tree.currentIndex().siblingAtColumn(0)
+        primary_item = self.hierarchy_model.item_for_index(
+            current if current.isValid() else indexes[-1]
         )
+        primary = (primary_item.kind, primary_item.entity_id)
+        eligible = [
+            (kind, entity_id) for kind, entity_id in entities
+            if kind == "object" and isinstance(
+                self.chapter.objects.get(entity_id),
+                (RasterObject, VectorDrawingObject),
+            )
+        ]
+        valid_multi = len(entities) <= 1 or len(eligible) == len(entities)
+        if (
+            not valid_multi
+            and QApplication.keyboardModifiers()
+            & Qt.KeyboardModifier.ShiftModifier
+            and eligible
+        ):
+            entities = eligible
+            primary = primary if primary in eligible else eligible[-1]
+            blocker = QSignalBlocker(self.tree.selectionModel())
+            self.tree.selectionModel().clearSelection()
+            for kind, entity_id in entities:
+                index = self.hierarchy_model.index_for_entity(kind, entity_id)
+                self.tree.selectionModel().select(
+                    index,
+                    QItemSelectionModel.Select | QItemSelectionModel.Rows,
+                )
+            del blocker
+            valid_multi = True
+        if not valid_multi:
+            blocker = QSignalBlocker(self.tree.selectionModel())
+            self.tree.selectionModel().select(
+                current,
+                QItemSelectionModel.ClearAndSelect | QItemSelectionModel.Rows,
+            )
+            del blocker
+            self.canvas.set_selection(*primary, activate_default_tool=True)
+            return
+        self.canvas.set_selection_set(entities, primary)
 
     def _show_selection_candidates(self, candidates, global_point) -> None:
         if self.chapter is None:
@@ -3681,15 +3866,22 @@ class MainWindow(QMainWindow):
             self._blender_relink_object_id = ""
             self.blender_views_widget.set_relink_mode(False)
         if entity_id:
-            index = self.hierarchy_model.index_for_entity(kind, entity_id)
-            if index.isValid():
-                blocker = QSignalBlocker(self.tree.selectionModel())
-                self.tree.selectionModel().select(
-                    index, QItemSelectionModel.ClearAndSelect
-                    | QItemSelectionModel.Rows
+            blocker = QSignalBlocker(self.tree.selectionModel())
+            self.tree.selectionModel().clearSelection()
+            for selected_kind, selected_id in self.canvas.selected_entities:
+                index = self.hierarchy_model.index_for_entity(
+                    selected_kind, selected_id
                 )
-                self.tree.scrollTo(index)
-                del blocker
+                if not index.isValid():
+                    continue
+                self.tree.selectionModel().select(
+                    index,
+                    QItemSelectionModel.Select | QItemSelectionModel.Rows,
+                )
+                if (selected_kind, selected_id) == (kind, entity_id):
+                    self.tree.setCurrentIndex(index)
+                    self.tree.scrollTo(index)
+            del blocker
         new_vector_id = ""
         if self.chapter is not None and kind == "object":
             selected = self.chapter.objects.get(entity_id)
@@ -3751,6 +3943,9 @@ class MainWindow(QMainWindow):
     def _tree_mutated(self, before: dict, after: dict, label: str) -> None:
         self.canvas.push_model_change(before, after, label)
         self.chapter = self.canvas.chapter
+        self._canvas_selection_changed(
+            self.canvas.selected_kind, self.canvas.selected_id
+        )
         self.canvas.documentChanged.emit(None)
         self.canvas.update()
         self._mark_dirty(None)
@@ -3821,20 +4016,27 @@ class MainWindow(QMainWindow):
                 self.tree.setExpanded(index, True)
         kind, entity_id = self._hierarchy_reset_selection
         if entity_id:
-            index = self.hierarchy_model.index_for_entity(kind, entity_id)
-            if index.isValid():
-                blocker = QSignalBlocker(self.tree.selectionModel())
+            blocker = QSignalBlocker(self.tree.selectionModel())
+            self.tree.selectionModel().clearSelection()
+            for selected_kind, selected_id in (
+                self.canvas.selected_entities or [(kind, entity_id)]
+            ):
+                index = self.hierarchy_model.index_for_entity(
+                    selected_kind, selected_id
+                )
+                if not index.isValid():
+                    continue
                 self.tree.selectionModel().select(
                     index,
-                    QItemSelectionModel.ClearAndSelect
-                    | QItemSelectionModel.Rows,
+                    QItemSelectionModel.Select | QItemSelectionModel.Rows,
                 )
-                self.tree.setCurrentIndex(index)
-                del blocker
+                if (selected_kind, selected_id) == (kind, entity_id):
+                    self.tree.setCurrentIndex(index)
+            del blocker
 
     def _refresh_hierarchy(self) -> None:
         expanded = self._expanded_layer_ids()
-        selected = (self.canvas.selected_kind, self.canvas.selected_id)
+        selected = list(self.canvas.selected_entities)
         blocker = QSignalBlocker(self.tree.selectionModel())
         self.hierarchy_model.set_chapter(self.chapter)
         for entity_id in expanded:
@@ -3844,12 +4046,12 @@ class MainWindow(QMainWindow):
             index = self.hierarchy_model.index_for_entity(kind, entity_id)
             if index.isValid():
                 self.tree.setExpanded(index, True)
-        if selected[1]:
-            index = self.hierarchy_model.index_for_entity(*selected)
+        for kind, entity_id in selected:
+            index = self.hierarchy_model.index_for_entity(kind, entity_id)
             if index.isValid():
                 self.tree.selectionModel().select(
                     index,
-                    QItemSelectionModel.ClearAndSelect | QItemSelectionModel.Rows,
+                    QItemSelectionModel.Select | QItemSelectionModel.Rows,
                 )
         del blocker
 

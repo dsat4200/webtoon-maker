@@ -151,6 +151,153 @@ def test_outliner_tablet_tap_toggles_visibility_both_ways(qapp):
         window.deleteLater()
 
 
+def test_outliner_tablet_drag_reorders_and_undoes(qapp):
+    window = MainWindow()
+    chapter = ChapterDocument()
+    page = chapter.add_page(
+        bound=BoundGeometry.rectangle(0, 0, 300, 300)
+    )
+    layer = chapter.add_layer(
+        page.layer_id, "Drawings",
+        BoundGeometry.rectangle(0, 0, 300, 300),
+    )
+    for name in ("One", "Two", "Three"):
+        chapter.add_object(layer.layer_id, RasterObject(name=name))
+    window._set_chapter(chapter, TileStore())
+    try:
+        window.show()
+        window.tree.expandAll()
+        qapp.processEvents()
+        original = [child.entity_id for child in layer.children]
+        source_index = window.hierarchy_model.index_for_entity(
+            "object", original[0]
+        )
+        target_index = window.hierarchy_model.index_for_entity(
+            "object", original[-1]
+        )
+        source_rect = window.tree.visualRect(source_index)
+        target_rect = window.tree.visualRect(target_index)
+        source_local = QPointF(source_rect.center())
+        target_local = QPointF(
+            target_rect.center().x(), target_rect.bottom() - 1
+        )
+        source_global = QPointF(window.tree.viewport().mapToGlobal(
+            source_local.toPoint()
+        ))
+        target_global = QPointF(window.tree.viewport().mapToGlobal(
+            target_local.toPoint()
+        ))
+
+        assert window._forward_outliner_tablet_event(
+            window.tree.viewport(),
+            _tablet_event(
+                QEvent.TabletPress, source_local, source_global,
+                1.0, Qt.LeftButton,
+            ),
+        )
+        assert window._forward_outliner_tablet_event(
+            window.tree.viewport(),
+            _tablet_event(
+                QEvent.TabletMove, target_local, target_global,
+                1.0, Qt.LeftButton,
+            ),
+        )
+        assert window._tablet_outliner_press["dragging"] is True
+        assert window._forward_outliner_tablet_event(
+            window.tree.viewport(),
+            _tablet_event(
+                QEvent.TabletRelease, target_local, target_global,
+                0.0, Qt.NoButton,
+            ),
+        )
+        assert [child.entity_id for child in layer.children] == [
+            *original[1:], original[0],
+        ]
+        window.canvas.command_stack.undo()
+        assert [
+            child.entity_id
+            for child in window.canvas.chapter.layers[layer.layer_id].children
+        ] == original
+    finally:
+        window.deleteLater()
+
+
+def test_outliner_tablet_drag_moves_selected_object_block(qapp):
+    window = MainWindow()
+    chapter = ChapterDocument()
+    page = chapter.add_page(
+        bound=BoundGeometry.rectangle(0, 0, 500, 500)
+    )
+    source = chapter.add_layer(
+        page.layer_id, "Source",
+        BoundGeometry.rectangle(0, 0, 200, 200),
+    )
+    destination = chapter.add_layer(
+        page.layer_id, "Destination",
+        BoundGeometry.rectangle(250, 0, 200, 200),
+    )
+    first = chapter.add_object(source.layer_id, RasterObject(name="First"))
+    second = chapter.add_object(source.layer_id, RasterObject(name="Second"))
+    window._set_chapter(chapter, TileStore())
+    try:
+        window.show()
+        window.tree.expandAll()
+        window.canvas.set_selection_set([
+            ("object", first.object_id), ("object", second.object_id),
+        ], ("object", first.object_id))
+        qapp.processEvents()
+        source_index = window.hierarchy_model.index_for_entity(
+            "object", first.object_id
+        )
+        target_index = window.hierarchy_model.index_for_entity(
+            "layer", destination.layer_id
+        )
+        source_local = QPointF(window.tree.visualRect(source_index).center())
+        target_local = QPointF(window.tree.visualRect(target_index).center())
+        source_global = QPointF(window.tree.viewport().mapToGlobal(
+            source_local.toPoint()
+        ))
+        target_global = QPointF(window.tree.viewport().mapToGlobal(
+            target_local.toPoint()
+        ))
+
+        window._forward_outliner_tablet_event(
+            window.tree.viewport(), _tablet_event(
+                QEvent.TabletPress, source_local, source_global,
+                1.0, Qt.LeftButton,
+            )
+        )
+        window._forward_outliner_tablet_event(
+            window.tree.viewport(), _tablet_event(
+                QEvent.TabletMove, target_local, target_global,
+                1.0, Qt.LeftButton,
+            )
+        )
+        window._forward_outliner_tablet_event(
+            window.tree.viewport(), _tablet_event(
+                QEvent.TabletRelease, target_local, target_global,
+                0.0, Qt.NoButton,
+            )
+        )
+        assert {child.entity_id for child in destination.children} == {
+            first.object_id, second.object_id,
+        }
+        assert first.parent_layer_id == destination.layer_id
+        assert second.parent_layer_id == destination.layer_id
+        selected = {
+            (
+                window.hierarchy_model.item_for_index(index).kind,
+                window.hierarchy_model.item_for_index(index).entity_id,
+            )
+            for index in window.tree.selectionModel().selectedRows(0)
+        }
+        assert selected == {
+            ("object", first.object_id), ("object", second.object_id),
+        }
+    finally:
+        window.deleteLater()
+
+
 def test_redraw_sliders_keep_exact_manual_opacity_and_hide_pressure(qapp):
     settings = EditorSettings(
         vector_redraw_parameter="opacity",

@@ -43,6 +43,28 @@
 ## more
 - fill tool in a raster object should let you fill only what's inside the active selection.
 - fill tool in a raster object should act like it does in clip studio paint.
+- add "mask to layer below" or perhaps a masking modal that lets you select what is on the mask (previewing in the editor with white and black, letting you select objects in the outliner like orange)
+- fill tool has a "global" toggle that lets it fill anything by clicking. if a shape is clicked, it changes the fill's background color. if a raster is selected, it fills (with tolerance) the pixels.
+- can modifiers have a mask?
+- masks are a selected list of objects, along with an extra selection
+- outline modifier
+	- draws outlines around pixels in an object (or objects, if linked)
+	- has a thickness parameter
+		- a mask button (circle with half filled, half not filled).
+		- this button lets you add a mask to the outline. a mask is a greyscaled image, sort of like an overlay, that lets you draw on the canvas the mask (when the button is pressed). this mask affects the strength of the thickness parameter. black means 0, white means 1, everything in between is between.
+		- for instance, say you drew a "shape" by drawing some raster or vector strokes in a circle
+		- you could then add an outline modifier and change the thickness with a mask. then, altering the original drawing would still show the outline around in real time.
+	- has an opacity parameter
+		- do the same masking thing with the opacity parameter.
+	- masks are unique to the modifier by default. however, a mask can be saved (save mask button in the tool settings while in mask mode). mask has pencil and eraser support like normal, and is raster-based. saving a mask adds it to a new "masks" tab (the layer settings window should now be tab-based, with layer settings as one of the tabs). masks show as a grid with icons of each mask and their name. top row above that should be a mask new, rename, and delete option.
+	- (multi object selection support here?)
+	- masks can be dragged into the mask button of any parameter or modifier as a whole.
+	- add a mask slot to the object opacity slider (left of the slider, right of the eye icon). these mask slot buttons may exist in places all over the software, but only add them to a feature if i say so.
+		- this opacity feature will allow them to effectively act like masks do in any other program
+	- also include an anti aliasing on off toggle.
+- what if each parameter of a modifier can be mapped to a mask, where the strength of that parameter (or the strength of the whole modifier) can be mapped to a mask?
+- folders.
+	- can have modifiers that apply to the whole stack (but can select exclusions?)
 ## image sync tweaks
 - render region box on screen
 - adjustment layer - allows transforms and modifiers simultaneously

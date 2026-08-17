@@ -227,6 +227,9 @@ class BlenderImageSourceController(QObject):
             if quad:
                 bounds = QPolygonF([QPointF(*point) for point in quad]).boundingRect()
                 bounds = bounds.united(old_bounds)
+                bounds = self.canvas.modifier_expanded_dirty(
+                    obj.object_id, bounds
+                )
                 dirty = bounds if dirty.isEmpty() else dirty.united(bounds)
         if not dirty.isEmpty():
             self.canvas._queue_visual_dirty(dirty)

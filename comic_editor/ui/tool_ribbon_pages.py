@@ -1,7 +1,7 @@
 """Contextual controls hosted by the main-window ribbon."""
 from __future__ import annotations
 
-from PySide6.QtCore import QObject, QSignalBlocker, Qt, Signal
+from PySide6.QtCore import QObject, QPoint, QRect, QSize, QSignalBlocker, Qt, Signal
 from PySide6.QtGui import QFont, QFontDatabase, QValidator
 from PySide6.QtWidgets import (
     QAbstractSpinBox,
@@ -15,6 +15,7 @@ from PySide6.QtWidgets import (
     QInputDialog,
     QLabel,
     QLineEdit,
+    QLayout,
     QMenu,
     QMessageBox,
     QPushButton,
@@ -33,6 +34,87 @@ from comic_editor.core.settings import TextPreset
 
 def _tool_value(tool: object) -> str:
     return str(getattr(tool, "value", tool or ""))
+
+
+class WrappingLayout(QLayout):
+    """Compact flow layout used by narrow vertical ribbon pages."""
+
+    def __init__(self, parent=None, spacing: int = 5):
+        super().__init__(parent)
+        self._items = []
+        self.setContentsMargins(0, 0, 0, 0)
+        self.setSpacing(spacing)
+
+    def addItem(self, item) -> None:  # noqa: N802
+        self._items.append(item)
+
+    def count(self) -> int:
+        return len(self._items)
+
+    def itemAt(self, index: int):  # noqa: N802
+        return self._items[index] if 0 <= index < len(self._items) else None
+
+    def takeAt(self, index: int):  # noqa: N802
+        return self._items.pop(index) if 0 <= index < len(self._items) else None
+
+    def expandingDirections(self):  # noqa: N802
+        return Qt.Orientations()
+
+    def hasHeightForWidth(self) -> bool:  # noqa: N802
+        return True
+
+    def heightForWidth(self, width: int) -> int:  # noqa: N802
+        return self._layout(QRect(0, 0, width, 0), True)
+
+    def setGeometry(self, rect: QRect) -> None:  # noqa: N802
+        super().setGeometry(rect)
+        self._layout(rect, False)
+
+    def sizeHint(self) -> QSize:  # noqa: N802
+        return self.minimumSize()
+
+    def minimumSize(self) -> QSize:  # noqa: N802
+        size = QSize()
+        for item in self._items:
+            size = size.expandedTo(item.minimumSize())
+        margins = self.contentsMargins()
+        return size + QSize(
+            margins.left() + margins.right(),
+            margins.top() + margins.bottom(),
+        )
+
+    def _layout(self, rect: QRect, test_only: bool) -> int:
+        margins = self.contentsMargins()
+        area = rect.adjusted(
+            margins.left(), margins.top(), -margins.right(), -margins.bottom()
+        )
+        x, y, row_height = area.x(), area.y(), 0
+        spacing = self.spacing()
+        for item in self._items:
+            hint = item.sizeHint().expandedTo(item.minimumSize())
+            next_x = x + hint.width()
+            if x > area.x() and next_x > area.right() + 1:
+                x = area.x()
+                y += row_height + spacing
+                row_height = 0
+            if not test_only:
+                item.setGeometry(QRect(QPoint(x, y), hint))
+            x += hint.width() + spacing
+            row_height = max(row_height, hint.height())
+        return y + row_height - rect.y() + margins.bottom()
+
+
+def _labeled_control(
+    label: str, control: QWidget, parent: QWidget,
+) -> QWidget:
+    group = QWidget(parent)
+    row = QHBoxLayout(group)
+    row.setContentsMargins(0, 0, 0, 0)
+    row.setSpacing(4)
+    if label:
+        row.addWidget(QLabel(label, group))
+    row.addWidget(control)
+    return group
 
 
 class _FontSizeSpinBox(QSpinBox):
@@ -98,18 +180,14 @@ class ToolSettingsControls(QWidget):
 
     def _build_pencil_page(self) -> QWidget:
         page = QWidget(self)
-        row = QHBoxLayout(page)
-        row.setContentsMargins(0, 0, 0, 0)
-        row.setSpacing(5)
-        row.addWidget(QLabel("Preset", page))
+        row = WrappingLayout(page)
         self.pencil_preset = QComboBox(page)
         self.pencil_preset.setMinimumWidth(120)
-        row.addWidget(self.pencil_preset)
-        row.addWidget(QLabel("Size", page))
+        row.addWidget(_labeled_control("Preset", self.pencil_preset, page))
         self.pencil_size = QComboBox(page)
         for label, value in (("S", "small"), ("M", "medium"), ("L", "large")):
             self.pencil_size.addItem(label, value)
-        row.addWidget(self.pencil_size)
+        row.addWidget(_labeled_control("Size", self.pencil_size, page))
         self.pencil_presets_button = QPushButton("Pressure / Presets…", page)
         row.addWidget(self.pencil_presets_button)
         self.pencil_sizes_button = QPushButton("Configure sizes…", page)
@@ -118,7 +196,6 @@ class ToolSettingsControls(QWidget):
             "Show transform handles", page
         )
         row.addWidget(self.pencil_transform_handles)
-        row.addStretch(1)
 
         self.pencil_preset.currentTextChanged.connect(
             self._pencil_preset_changed
@@ -137,33 +214,30 @@ class ToolSettingsControls(QWidget):
 
     def _build_eraser_page(self) -> QWidget:
         page = QWidget(self)
-        row = QHBoxLayout(page)
-        row.setContentsMargins(0, 0, 0, 0)
-        row.setSpacing(5)
-        row.addWidget(QLabel("Size", page))
+        row = WrappingLayout(page)
         self.eraser_size = QComboBox(page)
         for label, value in (("S", "small"), ("M", "medium"), ("L", "large")):
             self.eraser_size.addItem(label, value)
-        row.addWidget(self.eraser_size)
-        row.addWidget(QLabel("Shape", page))
+        row.addWidget(_labeled_control("Size", self.eraser_size, page))
         self.eraser_shape = QComboBox(page)
         self.eraser_shape.addItem("Circle", False)
         self.eraser_shape.addItem("Square", True)
-        row.addWidget(self.eraser_shape)
+        row.addWidget(_labeled_control("Shape", self.eraser_shape, page))
         self.vector_eraser_label = QLabel("Vector mode", page)
-        row.addWidget(self.vector_eraser_label)
         self.vector_eraser_mode = QComboBox(page)
         self.vector_eraser_mode.addItem("Stroke", "stroke")
         self.vector_eraser_mode.addItem("Point", "point")
         self.vector_eraser_mode.addItem("Intersection", "intersection")
-        row.addWidget(self.vector_eraser_mode)
+        self.vector_eraser_group = _labeled_control(
+            "Vector mode", self.vector_eraser_mode, page
+        )
+        row.addWidget(self.vector_eraser_group)
         self.eraser_sizes_button = QPushButton("Configure sizes…", page)
         row.addWidget(self.eraser_sizes_button)
         self.eraser_transform_handles = QCheckBox(
             "Show transform handles", page
         )
         row.addWidget(self.eraser_transform_handles)
-        row.addStretch(1)
 
         self.eraser_size.currentIndexChanged.connect(
             self._eraser_size_changed
@@ -182,16 +256,14 @@ class ToolSettingsControls(QWidget):
 
     def _build_fill_page(self) -> QWidget:
         page = QWidget(self)
-        row = QHBoxLayout(page)
-        row.setContentsMargins(0, 0, 0, 0)
-        row.setSpacing(7)
+        row = WrappingLayout(page, 7)
         self.fill_close_gaps = QCheckBox("Close gaps", page)
         row.addWidget(self.fill_close_gaps)
         self.fill_gap_threshold = QDoubleSpinBox(page)
         self.fill_gap_threshold.setRange(0, 1000)
         self.fill_gap_threshold.setDecimals(1)
         self.fill_gap_threshold.setSuffix(" px")
-        row.addWidget(self.fill_gap_threshold)
+        row.addWidget(_labeled_control("Gap", self.fill_gap_threshold, page))
         self.fill_narrow_areas = QCheckBox("Fill narrow areas", page)
         row.addWidget(self.fill_narrow_areas)
         self.fill_area_scaling = QCheckBox("Area scaling", page)
@@ -200,17 +272,15 @@ class ToolSettingsControls(QWidget):
         self.fill_area_amount.setRange(-1000, 1000)
         self.fill_area_amount.setDecimals(1)
         self.fill_area_amount.setSuffix(" px")
-        row.addWidget(self.fill_area_amount)
+        row.addWidget(_labeled_control("Amount", self.fill_area_amount, page))
         self.fill_area_mode = QComboBox(page)
         self.fill_area_mode.addItem("Round", "round")
         self.fill_area_mode.addItem("Rectangle", "rectangle")
-        row.addWidget(self.fill_area_mode)
-        row.addWidget(QLabel("Mode", page))
+        row.addWidget(_labeled_control("Edge", self.fill_area_mode, page))
         self.fill_mode = QComboBox(page)
         self.fill_mode.addItem("Normal", "normal")
         self.fill_mode.addItem("Enclose and Fill", "enclose")
-        row.addWidget(self.fill_mode)
-        row.addStretch(1)
+        row.addWidget(_labeled_control("Mode", self.fill_mode, page))
         for control, signal in (
             (self.fill_close_gaps, self.fill_close_gaps.toggled),
             (self.fill_gap_threshold, self.fill_gap_threshold.valueChanged),
@@ -247,8 +317,8 @@ class ToolSettingsControls(QWidget):
         else:
             self.context_label.setText("No settings for the current tool")
             self.stack.setCurrentWidget(self.empty_page)
-        self.vector_eraser_label.setVisible(vector_active)
-        self.vector_eraser_mode.setVisible(vector_active)
+        self.vector_eraser_label.setVisible(False)
+        self.vector_eraser_group.setVisible(vector_active)
 
     def refresh(self) -> None:
         self._loading = True
@@ -393,16 +463,12 @@ class TextObjectControls(QObject):
 
     def _build_object_widget(self) -> QWidget:
         widget = QWidget()
-        layout = QVBoxLayout(widget)
+        layout = WrappingLayout(widget)
         layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(3)
-
-        preset_row = QHBoxLayout()
-        preset_row.setContentsMargins(0, 0, 0, 0)
-        preset_row.addWidget(QLabel("Preset", widget))
+        layout.setSpacing(5)
         self.preset_combo = QComboBox(widget)
         self.preset_combo.setMinimumWidth(120)
-        preset_row.addWidget(self.preset_combo, 1)
+        layout.addWidget(_labeled_control("Preset", self.preset_combo, widget))
         self.preset_save = self._small_button(
             "S", "Overwrite selected preset", widget
         )
@@ -417,18 +483,14 @@ class TextObjectControls(QObject):
             self.preset_save, self.preset_rename,
             self.preset_remove, self.preset_add,
         ):
-            preset_row.addWidget(button)
-        layout.addLayout(preset_row)
+            layout.addWidget(button)
 
-        flags = QHBoxLayout()
         self.opacity_lock = QCheckBox("Lock opacity", widget)
         # Opacity inheritance is owned by the pinned outliner row.  Retain a
         # hidden compatibility widget so older integrations can still inspect
         # the state without exposing a second editor.
         self.opacity_lock.hide()
-        flags.addWidget(self.opacity_lock)
-        flags.addStretch(1)
-        layout.addLayout(flags)
+        layout.addWidget(self.opacity_lock)
 
         self.preset_combo.activated.connect(self._apply_preset)
         self.preset_save.clicked.connect(self._save_preset)
@@ -439,12 +501,9 @@ class TextObjectControls(QObject):
 
     def _build_typography_widget(self) -> QWidget:
         widget = QWidget()
-        layout = QVBoxLayout(widget)
+        layout = WrappingLayout(widget)
         layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(3)
-
-        font_row = QHBoxLayout()
-        font_row.addWidget(QLabel("Font", widget))
+        layout.setSpacing(5)
         self.font_family = QComboBox(widget)
         self.font_family.setMinimumWidth(180)
         families = QFontDatabase.families()
@@ -453,30 +512,25 @@ class TextObjectControls(QObject):
         self.font_family.addItems(
             families or [QApplication.font().family() or "Sans Serif"]
         )
-        font_row.addWidget(self.font_family, 1)
+        layout.addWidget(_labeled_control("Font", self.font_family, widget))
         self.preview_fonts = QCheckBox("Preview fonts", widget)
-        font_row.addWidget(self.preview_fonts)
-        layout.addLayout(font_row)
+        layout.addWidget(self.preview_fonts)
 
-        metrics = QHBoxLayout()
-        metrics.addWidget(QLabel("Size", widget))
         self.font_size = _FontSizeSpinBox(widget)
         self.font_size.setRange(6, 250)
         self.font_size.setSingleStep(1)
         self.font_size.setKeyboardTracking(False)
         self.font_size.setMaximumWidth(72)
-        metrics.addWidget(self.font_size)
+        layout.addWidget(_labeled_control("Size", self.font_size, widget))
         self.bold = QCheckBox("Bold", widget)
         self.italic = QCheckBox("Italic", widget)
-        metrics.addWidget(self.bold)
-        metrics.addWidget(self.italic)
-        metrics.addWidget(QLabel("Kerning", widget))
+        layout.addWidget(self.bold)
+        layout.addWidget(self.italic)
         self.kerning = QDoubleSpinBox(widget)
         self.kerning.setRange(-20, 100)
         self.kerning.setSingleStep(0.1)
         self.kerning.setMaximumWidth(78)
-        metrics.addWidget(self.kerning)
-        layout.addLayout(metrics)
+        layout.addWidget(_labeled_control("Kerning", self.kerning, widget))
 
         self.font_family.currentTextChanged.connect(
             lambda value: self._apply_field("font_family", value)
@@ -498,16 +552,13 @@ class TextObjectControls(QObject):
 
     def _build_layout_widget(self) -> QWidget:
         widget = QWidget()
-        layout = QVBoxLayout(widget)
+        layout = WrappingLayout(widget)
         layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(3)
-
-        first = QHBoxLayout()
-        first.addWidget(QLabel("Layout", widget))
+        layout.setSpacing(5)
         self.layout_mode = QComboBox(widget)
         self.layout_mode.addItem("Strict to parent", "strict")
         self.layout_mode.addItem("Free transform", "free")
-        first.addWidget(self.layout_mode)
+        layout.addWidget(_labeled_control("Layout", self.layout_mode, widget))
         self.align_button = QToolButton(widget)
         self.align_button.setText("Align")
         self.align_button.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
@@ -532,25 +583,23 @@ class TextObjectControls(QObject):
         action = QWidgetAction(self.align_menu)
         action.setDefaultWidget(alignment_widget)
         self.align_menu.addAction(action)
-        first.addWidget(self.align_button)
-        first.addStretch(1)
-        layout.addLayout(first)
+        layout.addWidget(self.align_button)
 
-        second = QHBoxLayout()
-        self.margin_label = QLabel("Margin", widget)
         self.margin = QDoubleSpinBox(widget)
         self.margin.setRange(0, 500)
         self.margin.setSuffix(" px")
         self.margin.setKeyboardTracking(False)
-        second.addWidget(self.margin_label)
-        second.addWidget(self.margin)
-        self.geometry_reference_label = QLabel("Shape reference", widget)
+        margin_group = _labeled_control("Margin", self.margin, widget)
+        self.margin_label = margin_group.layout().itemAt(0).widget()
+        layout.addWidget(margin_group)
         self.geometry_reference = QComboBox(widget)
         self.geometry_reference.addItem("Direct parent", "direct")
         self.geometry_reference.addItem("Closest compound", "compound")
-        second.addWidget(self.geometry_reference_label)
-        second.addWidget(self.geometry_reference)
-        layout.addLayout(second)
+        reference_group = _labeled_control(
+            "Shape reference", self.geometry_reference, widget
+        )
+        self.geometry_reference_label = reference_group.layout().itemAt(0).widget()
+        layout.addWidget(reference_group)
 
         self.layout_mode.currentIndexChanged.connect(self._layout_mode_changed)
         self.margin.editingFinished.connect(

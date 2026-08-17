@@ -1,5 +1,5 @@
 {
-  "schema_version": 16,
+  "schema_version": 17,
   "id": "2a9f55d8898c4d968c06336933bff773",
   "name": "Chapter 1",
   "size": [
@@ -133,7 +133,10 @@
       "last_raster_id": null,
       "compound_enabled": false,
       "compound_operation": "add",
-      "ignore_parent_mask": false
+      "ignore_parent_mask": false,
+      "modifier_ids": [],
+      "transform_frame": null,
+      "transform_quad": null
     },
     {
       "id": "25bca1b4207841d488065c0c089a731c",
@@ -247,7 +250,10 @@
       "last_raster_id": "4610bf480d734010adeaf647fac57f56",
       "compound_enabled": false,
       "compound_operation": "add",
-      "ignore_parent_mask": false
+      "ignore_parent_mask": false,
+      "modifier_ids": [],
+      "transform_frame": null,
+      "transform_quad": null
     },
     {
       "id": "522af5ab266d4a28882d067a49687769",
@@ -361,7 +367,10 @@
       "last_raster_id": null,
       "compound_enabled": true,
       "compound_operation": "add",
-      "ignore_parent_mask": false
+      "ignore_parent_mask": false,
+      "modifier_ids": [],
+      "transform_frame": null,
+      "transform_quad": null
     },
     {
       "id": "f77cb9154ae64e26855bb5b98ba4e531",
@@ -427,7 +436,10 @@
       "last_raster_id": null,
       "compound_enabled": false,
       "compound_operation": "add",
-      "ignore_parent_mask": false
+      "ignore_parent_mask": false,
+      "modifier_ids": [],
+      "transform_frame": null,
+      "transform_quad": null
     },
     {
       "id": "d7fd7612e6fd4aa8be0ca5c403fdc778",
@@ -547,7 +559,10 @@
       "last_raster_id": "b490ba9436114523afa5e496ac5c783f",
       "compound_enabled": false,
       "compound_operation": "add",
-      "ignore_parent_mask": false
+      "ignore_parent_mask": false,
+      "modifier_ids": [],
+      "transform_frame": null,
+      "transform_quad": null
     },
     {
       "id": "ea5e5c25d23646fabf0541ce16c669a8",
@@ -647,7 +662,12 @@
       "last_raster_id": null,
       "compound_enabled": true,
       "compound_operation": "add",
-      "ignore_parent_mask": false
+      "ignore_parent_mask": false,
+      "modifier_ids": [
+        "ad49478209ac4c168ee93281dad18be8"
+      ],
+      "transform_frame": null,
+      "transform_quad": null
     },
     {
       "id": "4b02bbf95a2b4f75a7d1b628a0fe9ecd",
@@ -670,16 +690,13 @@
           {
             "id": "034c67bfa6644f98828cea37610bc286",
             "position": [
-              875.0,
-              1326.0
+              876.7714939120955,
+              1307.5812810966418
             ],
-            "point_type": "bezier",
+            "point_type": "vector",
             "incoming": null,
-            "outgoing": [
-              909.0,
-              1428.0
-            ],
-            "handles_locked": false,
+            "outgoing": null,
+            "handles_locked": true,
             "roundness": 0.0,
             "roundness_enabled": false,
             "width_multiplier": 5.9
@@ -687,13 +704,13 @@
           {
             "id": "4decbdac56924f04b36dd957519706f8",
             "position": [
-              736.0,
-              1498.0
+              727.7714939120955,
+              1209.5812810966418
             ],
             "point_type": "bezier",
             "incoming": [
-              834.0,
-              1480.0
+              936.7714939120955,
+              1183.5812810966418
             ],
             "outgoing": null,
             "handles_locked": false,
@@ -716,7 +733,10 @@
       "last_raster_id": null,
       "compound_enabled": false,
       "compound_operation": "add",
-      "ignore_parent_mask": false
+      "ignore_parent_mask": false,
+      "modifier_ids": [],
+      "transform_frame": null,
+      "transform_quad": null
     },
     {
       "id": "a2e741f7107b4172ba63f7ff7703e2d7",
@@ -816,7 +836,10 @@
       "last_raster_id": null,
       "compound_enabled": true,
       "compound_operation": "add",
-      "ignore_parent_mask": false
+      "ignore_parent_mask": false,
+      "modifier_ids": [],
+      "transform_frame": null,
+      "transform_quad": null
     },
     {
       "id": "f53bea9cfc1b49888785699a7da282fd",
@@ -882,7 +905,10 @@
       "last_raster_id": null,
       "compound_enabled": false,
       "compound_operation": "add",
-      "ignore_parent_mask": false
+      "ignore_parent_mask": false,
+      "modifier_ids": [],
+      "transform_frame": null,
+      "transform_quad": null
     }
   ],
   "objects": [
@@ -902,6 +928,7 @@
       "geometry_reference": "direct",
       "ignore_parent_mask": false,
       "underlay_opacity": 0.0,
+      "modifier_ids": [],
       "tile_size": 256,
       "interaction_rect": [
         125.0,
@@ -928,6 +955,7 @@
       "geometry_reference": "direct",
       "ignore_parent_mask": false,
       "underlay_opacity": 0.0,
+      "modifier_ids": [],
       "strokes": [
         {
           "id": "8040260c724043019f9c2bae895ea497",
@@ -23376,6 +23404,7 @@
       "geometry_reference": "direct",
       "ignore_parent_mask": false,
       "underlay_opacity": 0.0,
+      "modifier_ids": [],
       "text": "I don't get it.",
       "size": [
         360.0,
@@ -23408,6 +23437,7 @@
       "geometry_reference": "direct",
       "ignore_parent_mask": false,
       "underlay_opacity": 0.0,
+      "modifier_ids": [],
       "strokes": [],
       "fill_child_ids": [],
       "drawing_revision": 0,
@@ -23430,12 +23460,15 @@
       "geometry_reference": "direct",
       "ignore_parent_mask": false,
       "underlay_opacity": 0.0,
+      "modifier_ids": [
+        "ad49478209ac4c168ee93281dad18be8"
+      ],
       "source": {
         "type": "blender_comic_view",
         "project_uuid": "bdf1aec65cf84149a0a07569c8c3341e",
         "view_uuid": "bb6339a045144df4b60fe894eee5b6c2",
         "display_name": "Comic View 1",
-        "last_revision": 14
+        "last_revision": 16
       },
       "source_filename": "last-frame.png",
       "source_mime_type": "image/png",
@@ -23486,6 +23519,10 @@
       "geometry_reference": "direct",
       "ignore_parent_mask": false,
       "underlay_opacity": 0.0,
+      "modifier_ids": [
+        "ad49478209ac4c168ee93281dad18be8",
+        "1d7357bafcfd44e7ab1f15968ab88d21"
+      ],
       "strokes": [
         {
           "id": "1d9d7a04f7d14b66aba53591392f5576",
@@ -44665,10 +44702,124 @@
               "opacity": 0.9999999195337343
             }
           ]
+        },
+        {
+          "id": "58fa00cc2fd64e0f8b9beb25f9bfa889",
+          "color": "#FFA3765C",
+          "closed": false,
+          "start_cap": "round",
+          "end_cap": "round",
+          "render_revision": 0,
+          "points": [
+            {
+              "id": "6b6d27d725904a8f8431dc92a2fa0e62",
+              "position": [
+                1276.689377666249,
+                1553.3971448355667
+              ],
+              "incoming": null,
+              "outgoing": [
+                1228.6947266393756,
+                1559.4781457154015
+              ],
+              "width": 11.999999034404812,
+              "opacity": 0.9999999195337343
+            },
+            {
+              "id": "a656e6c3a1a34c35913a05bf3313eefe",
+              "position": [
+                1132.7054245856293,
+                1571.6401474750714
+              ],
+              "incoming": [
+                1180.7000756125026,
+                1565.5591465952366
+              ],
+              "outgoing": null,
+              "width": 11.999999034404812,
+              "opacity": 0.9999999195337343
+            }
+          ]
+        },
+        {
+          "id": "0a80bae24b254e29b9619e6877806da1",
+          "color": "#FFA3765C",
+          "closed": false,
+          "start_cap": "round",
+          "end_cap": "round",
+          "render_revision": 0,
+          "points": [
+            {
+              "id": "9678a73e732d495691571db9c6aadf1a",
+              "position": [
+                789.1159182630636,
+                1499.1140016792097
+              ],
+              "incoming": null,
+              "outgoing": [
+                707.9970427577396,
+                1505.0358461065955
+              ],
+              "width": 11.999999034404812,
+              "opacity": 0.9999999195337343
+            },
+            {
+              "id": "99a249095917409e91963409a08b9798",
+              "position": [
+                545.7592917470917,
+                1516.8795349613672
+              ],
+              "incoming": [
+                626.8781672524157,
+                1510.9576905339813
+              ],
+              "outgoing": null,
+              "width": 11.999999034404812,
+              "opacity": 0.9999999195337343
+            }
+          ]
+        },
+        {
+          "id": "523363f48b2f49f4a01d9955feb38067",
+          "color": "#FFA3765C",
+          "closed": false,
+          "start_cap": "round",
+          "end_cap": "round",
+          "render_revision": 0,
+          "points": [
+            {
+              "id": "fae42326f3694a5895c2a153e6b910e3",
+              "position": [
+                451.6438766041168,
+                1308.6836744998345
+              ],
+              "incoming": null,
+              "outgoing": [
+                450.5103762659483,
+                1308.804506179786
+              ],
+              "width": 11.999999034404812,
+              "opacity": 0.9999999195337343
+            },
+            {
+              "id": "77dd36fbf2f64f52a8fe7cbc2291dbd3",
+              "position": [
+                448.24337558961133,
+                1309.0461695396884
+              ],
+              "incoming": [
+                449.37687592777985,
+                1308.925337859737
+              ],
+              "outgoing": null,
+              "width": 11.999999034404812,
+              "opacity": 0.9999999195337343
+            }
+          ]
         }
       ],
       "fill_child_ids": [],
-      "drawing_revision": 41,
+      "drawing_revision": 44,
       "transform_frame": [
         -102.15432694378671,
         1058.359166132759,
@@ -44710,6 +44861,9 @@
       "geometry_reference": "direct",
       "ignore_parent_mask": false,
       "underlay_opacity": 0.0,
+      "modifier_ids": [
+        "ad49478209ac4c168ee93281dad18be8"
+      ],
       "strokes": [
         {
           "id": "d534c97e0b394389922cc747676fcb89",
@@ -53076,6 +53230,9 @@
       "geometry_reference": "direct",
       "ignore_parent_mask": false,
       "underlay_opacity": 0.0,
+      "modifier_ids": [
+        "ad49478209ac4c168ee93281dad18be8"
+      ],
       "tile_size": 256,
       "interaction_rect": [
         -49.0,
@@ -53102,6 +53259,7 @@
       "geometry_reference": "direct",
       "ignore_parent_mask": false,
       "underlay_opacity": 0.0,
+      "modifier_ids": [],
       "text": "I'm sorry,\nwhat?",
       "size": [
         360.0,
@@ -53151,6 +53309,7 @@
       "geometry_reference": "direct",
       "ignore_parent_mask": false,
       "underlay_opacity": 0.0,
+      "modifier_ids": [],
       "gradient_type": "color_fill",
       "field_type": "line",
       "line_field": {
@@ -53253,6 +53412,7 @@
       "geometry_reference": "direct",
       "ignore_parent_mask": false,
       "underlay_opacity": 0.0,
+      "modifier_ids": [],
       "gradient_type": "color_fill",
       "field_type": "parent_shape",
       "line_field": {
@@ -53316,21 +53476,21 @@
       "shape_field": {
         "center_auto": false,
         "manual_center": [
-          475.4783888182651,
-          1632.6509317710043
+          454.1344509406881,
+          1649.912933273723
         ],
         "reverse_direction": false,
         "uniform": false,
         "distance": 120.0
       },
-      "gradient_revision": 47,
+      "gradient_revision": 242,
       "ramp": {
         "value_type": "color",
         "interpolation": "linear",
         "stops": [
           {
             "id": "c8f13156fb834927bd2dedabffcc9b8c",
-            "position": 0.18292682926829268,
+            "position": 0.11449016100178891,
             "color": "#FF000000"
           },
           {
@@ -53358,6 +53518,7 @@
       "geometry_reference": "direct",
       "ignore_parent_mask": false,
       "underlay_opacity": 0.0,
+      "modifier_ids": [],
       "text": "Words.",
       "size": [
         360.0,
@@ -53373,6 +53534,34 @@
       "vertical_alignment": "middle",
       "margin": 24.0,
       "transform_quad": null
+    }
+  ],
+  "modifiers": [
+    {
+      "id": "ad49478209ac4c168ee93281dad18be8",
+      "type": "hsl",
+      "name": "Hue / Saturation / Lightness",
+      "intensity": 100.0,
+      "expanded": true,
+      "hue": -8.0,
+      "saturation": 27.0,
+      "lightness": 12.0
+    },
+    {
+      "id": "1d7357bafcfd44e7ab1f15968ab88d21",
+      "type": "blur",
+      "name": "Blur",
+      "intensity": 100.0,
+      "expanded": true,
+      "strength": 39.0,
+      "mode": "focal",
+      "focal_center": [
+        519.5348215870289,
+        1384.068134899952
+      ],
+      "focal_radius": 644.4501004253253,
+      "focal_ramp": 0.6289080690503795,
+      "focal_angle": 0.004574117946980081
     }
   ]
 }

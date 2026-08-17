@@ -7,7 +7,7 @@ from dataclasses import dataclass, field
 from typing import Any, Iterable, Iterator, Literal
 
 
-SCHEMA_VERSION = 16
+SCHEMA_VERSION = 17
 SERIES_SCHEMA_VERSION = 17
 CHAPTER_WIDTH = 1080
 DEFAULT_CHAPTER_HEIGHT = 3240
@@ -623,6 +623,132 @@ class ChildRef:
 
 
 @dataclass
+class HueSaturationLightnessModifier:
+    """A shared, nondestructive HSL adjustment."""
+
+    modifier_id: str = field(default_factory=new_id)
+    modifier_type: Literal["hsl"] = "hsl"
+    name: str = "Hue / Saturation / Lightness"
+    intensity: float = 100.0
+    expanded: bool = True
+    hue: float = 0.0
+    saturation: float = 0.0
+    lightness: float = 0.0
+
+    def validate(self) -> None:
+        self.name = str(self.name or "Hue / Saturation / Lightness")
+        self.expanded = bool(self.expanded)
+        values = tuple(float(value) for value in (
+            self.intensity, self.hue, self.saturation, self.lightness
+        ))
+        if not all(math.isfinite(value) for value in values):
+            raise ValueError("HSL modifier values must be finite")
+        self.intensity = max(0.0, min(100.0, values[0]))
+        self.hue = max(-180.0, min(180.0, values[1]))
+        self.saturation = max(-100.0, min(100.0, values[2]))
+        self.lightness = max(-100.0, min(100.0, values[3]))
+
+    def to_dict(self) -> dict[str, Any]:
+        self.validate()
+        return {
+            "id": self.modifier_id,
+            "type": self.modifier_type,
+            "name": self.name,
+            "intensity": self.intensity,
+            "expanded": self.expanded,
+            "hue": self.hue,
+            "saturation": self.saturation,
+            "lightness": self.lightness,
+        }
+
+
+@dataclass
+class BlurModifier:
+    """A full-frame or document-space focal blur."""
+
+    modifier_id: str = field(default_factory=new_id)
+    modifier_type: Literal["blur"] = "blur"
+    name: str = "Blur"
+    intensity: float = 100.0
+    expanded: bool = True
+    strength: float = 8.0
+    mode: Literal["full", "focal"] = "full"
+    focal_center: tuple[float, float] = (0.0, 0.0)
+    focal_radius: float = 100.0
+    focal_ramp: float = 0.5
+    focal_angle: float = 0.0
+
+    def validate(self) -> None:
+        self.name = str(self.name or "Blur")
+        self.expanded = bool(self.expanded)
+        if self.mode not in {"full", "focal"}:
+            raise ValueError("Unknown blur mode")
+        values = tuple(float(value) for value in (
+            self.intensity, self.strength, *self.focal_center,
+            self.focal_radius, self.focal_ramp, self.focal_angle,
+        ))
+        if not all(math.isfinite(value) for value in values):
+            raise ValueError("Blur modifier values must be finite")
+        self.intensity = max(0.0, min(100.0, values[0]))
+        self.strength = max(0.0, min(100.0, values[1]))
+        self.focal_center = (values[2], values[3])
+        self.focal_radius = max(1.0, values[4])
+        self.focal_ramp = max(0.0, min(1.0, values[5]))
+        self.focal_angle = values[6]
+
+    def to_dict(self) -> dict[str, Any]:
+        self.validate()
+        return {
+            "id": self.modifier_id,
+            "type": self.modifier_type,
+            "name": self.name,
+            "intensity": self.intensity,
+            "expanded": self.expanded,
+            "strength": self.strength,
+            "mode": self.mode,
+            "focal_center": list(self.focal_center),
+            "focal_radius": self.focal_radius,
+            "focal_ramp": self.focal_ramp,
+            "focal_angle": self.focal_angle,
+        }
+
+
+ModifierInstance = HueSaturationLightnessModifier | BlurModifier
+
+
+def modifier_from_dict(data: dict[str, Any]) -> ModifierInstance:
+    modifier_type = str(data.get("type", ""))
+    common = {
+        "modifier_id": str(data.get("id") or new_id()),
+        "name": str(data.get("name", "")),
+        "intensity": float(data.get("intensity", 100.0)),
+        "expanded": bool(data.get("expanded", True)),
+    }
+    if modifier_type == "hsl":
+        result: ModifierInstance = HueSaturationLightnessModifier(
+            **common,
+            hue=float(data.get("hue", 0.0)),
+            saturation=float(data.get("saturation", 0.0)),
+            lightness=float(data.get("lightness", 0.0)),
+        )
+    elif modifier_type == "blur":
+        center = data.get("focal_center", [0.0, 0.0])
+        result = BlurModifier(
+            **common,
+            strength=float(data.get("strength", 8.0)),
+            mode=str(data.get("mode", "full")),
+            focal_center=(float(center[0]), float(center[1])),
+            focal_radius=float(data.get("focal_radius", 100.0)),
+            focal_ramp=float(data.get("focal_ramp", 0.5)),
+            focal_angle=float(data.get("focal_angle", 0.0)),
+        )
+    else:
+        raise ValueError(f"Unknown modifier type: {modifier_type}")
+    result.validate()
+    return result
+
+
+@dataclass
 class LayerNode:
     layer_id: str = field(default_factory=new_id)
     name: str = "Layer"
@@ -641,6 +767,9 @@ class LayerNode:
     compound_enabled: bool = False
     compound_operation: Literal["add", "subtract", "ignore"] = "add"
     ignore_parent_mask: bool = False
+    modifier_ids: list[str] = field(default_factory=list)
+    transform_frame: tuple[float, float, float, float] | None = None
+    transform_quad: list[tuple[float, float]] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -657,11 +786,22 @@ class LayerNode:
             "compound_enabled": self.compound_enabled,
             "compound_operation": self.compound_operation,
             "ignore_parent_mask": self.ignore_parent_mask,
+            "modifier_ids": list(self.modifier_ids),
+            "transform_frame": (
+                list(self.transform_frame)
+                if self.transform_frame is not None else None
+            ),
+            "transform_quad": (
+                [list(point) for point in self.transform_quad]
+                if self.transform_quad is not None else None
+            ),
         }
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "LayerNode":
         translation = data.get("translation", [0, 0])
+        transform_frame = data.get("transform_frame")
+        transform_quad = data.get("transform_quad")
         result = cls(
             layer_id=str(data["id"]), name=str(data.get("name", "Layer")),
             is_page=bool(data.get("is_page", False)), parent_id=data.get("parent_id"),
@@ -689,6 +829,15 @@ class LayerNode:
             compound_enabled=bool(data.get("compound_enabled", False)),
             compound_operation=str(data.get("compound_operation", "add")),
             ignore_parent_mask=bool(data.get("ignore_parent_mask", False)),
+            modifier_ids=[str(item) for item in data.get("modifier_ids", [])],
+            transform_frame=(
+                tuple(float(value) for value in transform_frame)
+                if transform_frame is not None else None
+            ),
+            transform_quad=(
+                [_point(point) for point in transform_quad]
+                if transform_quad is not None else None
+            ),
         )
         legacy_radius = float(data.get("vertex_radius", 0.0))
         if legacy_radius and result.bound and result.bound.primitive != "ellipse":
@@ -753,6 +902,7 @@ class DocumentObject:
     geometry_reference: Literal["direct", "compound"] = "direct"
     ignore_parent_mask: bool = False
     underlay_opacity: float = 0.0
+    modifier_ids: list[str] = field(default_factory=list)
 
     def common_dict(self) -> dict[str, Any]:
         return {
@@ -764,6 +914,7 @@ class DocumentObject:
             "geometry_reference": self.geometry_reference,
             "ignore_parent_mask": self.ignore_parent_mask,
             "underlay_opacity": self.underlay_opacity,
+            "modifier_ids": list(self.modifier_ids),
         }
 
     def to_dict(self) -> dict[str, Any]:
@@ -1786,6 +1937,7 @@ def object_from_dict(data: dict[str, Any]) -> ObjectEntity:
         geometry_reference=str(data.get("geometry_reference", "direct")),
         ignore_parent_mask=bool(data.get("ignore_parent_mask", False)),
         underlay_opacity=float(data.get("underlay_opacity", 0.0)),
+        modifier_ids=[str(item) for item in data.get("modifier_ids", [])],
     )
     object_type = str(data.get("type", "object"))
     if object_type == "gradient":
@@ -1968,6 +2120,7 @@ class ChapterDocument:
     root_page_ids: list[str] = field(default_factory=list)
     layers: dict[str, LayerNode] = field(default_factory=dict)
     objects: dict[str, ObjectEntity] = field(default_factory=dict)
+    modifiers: dict[str, ModifierInstance] = field(default_factory=dict)
     document_kind: Literal["chapter", "asset"] = "chapter"
     schema_version: int = SCHEMA_VERSION
 
@@ -1993,6 +2146,10 @@ class ChapterDocument:
             referenced.add(("layer", page_id))
         for layer in self.layers.values():
             layer.ignore_parent_mask = bool(layer.ignore_parent_mask)
+            layer.modifier_ids = list(dict.fromkeys(
+                str(item) for item in layer.modifier_ids
+                if str(item) in self.modifiers
+            ))
             if layer.layer_kind not in {"bounded", "open_shape", "fill"}:
                 raise ValueError("Unknown layer kind")
             if layer.compound_operation not in {"add", "subtract", "ignore"}:
@@ -2009,6 +2166,9 @@ class ChapterDocument:
                 layer.vertex_radius = 0.0
                 layer.compound_enabled = False
                 layer.ignore_parent_mask = False
+                layer.modifier_ids.clear()
+                layer.transform_frame = None
+                layer.transform_quad = None
             elif layer.bound is None:
                 raise ValueError("Bounded layers require geometry")
             else:
@@ -2029,6 +2189,43 @@ class ChapterDocument:
                 layer.border_width = min(40.0, layer.border_width)
                 layer.compound_enabled = False
                 layer.ignore_parent_mask = False
+                layer.modifier_ids.clear()
+                layer.transform_frame = None
+                layer.transform_quad = None
+            if layer.transform_frame is not None:
+                if len(layer.transform_frame) != 4 or not all(
+                    math.isfinite(float(value))
+                    for value in layer.transform_frame
+                ):
+                    raise ValueError("Layer transform frame is invalid")
+                layer.transform_frame = tuple(
+                    float(value) for value in layer.transform_frame
+                )
+                if (
+                    layer.transform_frame[2] <= 0
+                    or layer.transform_frame[3] <= 0
+                ):
+                    raise ValueError("Layer transform frame must have positive size")
+            if layer.transform_quad is not None:
+                if len(layer.transform_quad) != 4 or not all(
+                    math.isfinite(float(value))
+                    for point in layer.transform_quad for value in point
+                ):
+                    raise ValueError("Layer transform quad must have four points")
+                layer.transform_quad = [_point(point) for point in layer.transform_quad]
+                area = abs(sum(
+                    layer.transform_quad[index][0]
+                    * layer.transform_quad[(index + 1) % 4][1]
+                    - layer.transform_quad[(index + 1) % 4][0]
+                    * layer.transform_quad[index][1]
+                    for index in range(4)
+                ))
+                if area <= 1e-6:
+                    raise ValueError("Layer transform quad is degenerate")
+            if (layer.transform_frame is None) != (layer.transform_quad is None):
+                raise ValueError(
+                    "Layer transform frame and quad must be stored together"
+                )
             if not layer.is_page and layer.parent_id not in self.layers:
                 raise ValueError(f"Layer {layer.layer_id} has no valid parent")
             if (
@@ -2062,6 +2259,14 @@ class ChapterDocument:
                     raise ValueError(f"Unknown child kind: {child.kind}")
         owned_fill_ids: set[str] = set()
         for obj in self.objects.values():
+            obj.modifier_ids = list(dict.fromkeys(
+                str(item) for item in obj.modifier_ids
+                if str(item) in self.modifiers
+            ))
+            if not isinstance(
+                obj, (RasterObject, VectorDrawingObject, ImageObject)
+            ):
+                obj.modifier_ids.clear()
             try:
                 underlay = float(obj.underlay_opacity)
             except (TypeError, ValueError):
@@ -2197,7 +2402,101 @@ class ChapterDocument:
                 )
         if referenced != expected:
             raise ValueError("Document contains unreachable entities")
+        for modifier_id, modifier in list(self.modifiers.items()):
+            if modifier.modifier_id != modifier_id:
+                modifier.modifier_id = modifier_id
+            modifier.validate()
+        referenced_modifiers = {
+            modifier_id
+            for layer in self.layers.values() for modifier_id in layer.modifier_ids
+        } | {
+            modifier_id
+            for obj in self.objects.values() for modifier_id in obj.modifier_ids
+        }
+        self.modifiers = {
+            modifier_id: modifier
+            for modifier_id, modifier in self.modifiers.items()
+            if modifier_id in referenced_modifiers
+        }
         self._assert_acyclic()
+
+    def modifier_target_ids(self, modifier_id: str) -> list[tuple[str, str]]:
+        result = [
+            ("layer", layer.layer_id) for layer in self.layers.values()
+            if modifier_id in layer.modifier_ids
+        ]
+        result.extend(
+            ("object", obj.object_id) for obj in self.objects.values()
+            if modifier_id in obj.modifier_ids
+        )
+        return result
+
+    def modifier_target(
+        self, kind: str, entity_id: str,
+    ) -> LayerNode | ObjectEntity | None:
+        if kind == "layer":
+            layer = self.layers.get(entity_id)
+            if (
+                layer is not None and not layer.is_page
+                and layer.layer_kind != "fill" and layer.bound is not None
+            ):
+                return layer
+            return None
+        obj = self.objects.get(entity_id)
+        return obj if isinstance(
+            obj, (RasterObject, VectorDrawingObject, ImageObject)
+        ) else None
+
+    def add_modifier(
+        self, modifier: ModifierInstance,
+        targets: Iterable[tuple[str, str]],
+    ) -> None:
+        if modifier.modifier_id in self.modifiers:
+            raise ValueError("Duplicate modifier ID")
+        resolved = [self.modifier_target(*target) for target in targets]
+        if not resolved or any(target is None for target in resolved):
+            raise ValueError("Modifier targets must be eligible")
+        modifier.validate()
+        self.modifiers[modifier.modifier_id] = modifier
+        for target in resolved:
+            if modifier.modifier_id not in target.modifier_ids:
+                target.modifier_ids.append(modifier.modifier_id)
+
+    def set_modifier_targets(
+        self, modifier_id: str, targets: Iterable[tuple[str, str]],
+    ) -> None:
+        if modifier_id not in self.modifiers:
+            raise ValueError("Unknown modifier")
+        desired = set(targets)
+        if any(self.modifier_target(*target) is None for target in desired):
+            raise ValueError("Modifier targets must be eligible")
+        for layer in self.layers.values():
+            if ("layer", layer.layer_id) not in desired:
+                layer.modifier_ids = [
+                    item for item in layer.modifier_ids if item != modifier_id
+                ]
+        for obj in self.objects.values():
+            if ("object", obj.object_id) not in desired:
+                obj.modifier_ids = [
+                    item for item in obj.modifier_ids if item != modifier_id
+                ]
+        for kind, entity_id in desired:
+            target = self.modifier_target(kind, entity_id)
+            if modifier_id not in target.modifier_ids:
+                target.modifier_ids.append(modifier_id)
+        if not desired:
+            self.modifiers.pop(modifier_id, None)
+
+    def remove_modifier(self, modifier_id: str) -> None:
+        for layer in self.layers.values():
+            layer.modifier_ids = [
+                item for item in layer.modifier_ids if item != modifier_id
+            ]
+        for obj in self.objects.values():
+            obj.modifier_ids = [
+                item for item in obj.modifier_ids if item != modifier_id
+            ]
+        self.modifiers.pop(modifier_id, None)
 
     def _assert_acyclic(self) -> None:
         visiting: set[str] = set()
@@ -2584,6 +2883,59 @@ class ChapterDocument:
                 for fill in self.vector_fill_children(entity.object_id):
                     fill.parent_layer_id = new_parent_id
 
+    def move_entities(
+        self, entities: Iterable[tuple[str, str]],
+        new_parent_id: str, index: int,
+    ) -> None:
+        """Move an ordered block of ordinary objects atomically.
+
+        Multi-row hierarchy dragging intentionally supports only raster and
+        vector drawings.  The caller supplies the desired visual order.
+        """
+        ordered: list[tuple[str, str]] = []
+        seen: set[tuple[str, str]] = set()
+        for kind, entity_id in entities:
+            key = (str(kind), str(entity_id))
+            if key not in seen:
+                ordered.append(key)
+                seen.add(key)
+        if not ordered:
+            raise ValueError("No objects to move")
+        parent = self.layers.get(new_parent_id)
+        if parent is None or parent.layer_kind == "fill":
+            raise ValueError("Objects require a container layer")
+        moving: list[DocumentObject] = []
+        for kind, entity_id in ordered:
+            obj = self.objects.get(entity_id) if kind == "object" else None
+            if not isinstance(obj, (RasterObject, VectorDrawingObject)):
+                raise ValueError("Multi-move supports raster/vector objects only")
+            moving.append(obj)
+
+        moving_ids = {obj.object_id for obj in moving}
+        destination_before = list(parent.children)
+        index = max(0, min(int(index), len(destination_before)))
+        removed_before_index = sum(
+            1 for child in destination_before[:index]
+            if child.kind == "object" and child.entity_id in moving_ids
+        )
+        for layer in self.layers.values():
+            layer.children = [
+                child for child in layer.children
+                if not (
+                    child.kind == "object" and child.entity_id in moving_ids
+                )
+            ]
+        insertion = max(0, min(
+            index - removed_before_index, len(parent.children)
+        ))
+        refs = [ChildRef("object", obj.object_id) for obj in moving]
+        parent.children[insertion:insertion] = refs
+        for obj in moving:
+            obj.parent_layer_id = new_parent_id
+            if isinstance(obj, VectorDrawingObject):
+                for fill in self.vector_fill_children(obj.object_id):
+                    fill.parent_layer_id = new_parent_id
+
     def delete_entity(self, kind: str, entity_id: str) -> set[str]:
         deleted_objects: set[str] = set()
         if kind == "object":
@@ -2618,10 +2970,12 @@ class ChapterDocument:
                     deleted_objects.update(
                         self.delete_entity("object", center.object_id)
                     )
+            removed_modifier_ids = list(obj.modifier_ids)
             self.objects.pop(entity_id)
             parent = self.layers[obj.parent_layer_id]
             parent.children = [r for r in parent.children if r.entity_id != entity_id]
             deleted_objects.add(entity_id)
+            self._garbage_collect_modifiers(removed_modifier_ids)
             return deleted_objects
         layer = self.layers[entity_id]
         for child in list(layer.children):
@@ -2631,8 +2985,22 @@ class ChapterDocument:
         else:
             parent = self.layers[layer.parent_id]
             parent.children = [r for r in parent.children if r.entity_id != entity_id]
+        removed_modifier_ids = list(layer.modifier_ids)
         del self.layers[entity_id]
+        self._garbage_collect_modifiers(removed_modifier_ids)
         return deleted_objects
+
+    def _garbage_collect_modifiers(
+        self, candidates: Iterable[str] | None = None,
+    ) -> None:
+        candidates = set(candidates or self.modifiers)
+        referenced = {
+            item for layer in self.layers.values() for item in layer.modifier_ids
+        } | {
+            item for obj in self.objects.values() for item in obj.modifier_ids
+        }
+        for modifier_id in candidates - referenced:
+            self.modifiers.pop(modifier_id, None)
 
     def layer_world_translation(self, layer_id: str) -> tuple[float, float]:
         x = y = 0.0
@@ -2775,6 +3143,9 @@ class ChapterDocument:
             "root_page_ids": list(self.root_page_ids),
             "layers": [layer.to_dict() for layer in self.layers.values()],
             "objects": [obj.to_dict() for obj in self.objects.values()],
+            "modifiers": [
+                modifier.to_dict() for modifier in self.modifiers.values()
+            ],
         }
 
     @classmethod
@@ -2836,6 +3207,14 @@ class ChapterDocument:
             root_page_ids=[str(item) for item in data.get("root_page_ids", [])],
             layers={item.layer_id: item for item in layers},
             objects={item.object_id: item for item in objects},
+            modifiers={
+                item.modifier_id: item
+                for item in (
+                    modifier_from_dict(raw)
+                    for raw in data.get("modifiers", [])
+                    if isinstance(raw, dict)
+                )
+            },
             schema_version=schema,
         )
         for obj in result.objects.values():

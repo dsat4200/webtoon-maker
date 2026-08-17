@@ -182,7 +182,7 @@
             "state": {
               "type": "search",
               "state": {
-                "query": "assets",
+                "query": "fill",
                 "matchingCase": false,
                 "explainSearch": false,
                 "collapseAll": false,
@@ -203,7 +203,8 @@
               "title": "Bookmarks"
             }
           }
-        ]
+        ],
+        "currentTab": 1
       }
     ],
     "direction": "horizontal",
@@ -312,7 +313,7 @@
       "bases:Create new base": false
     }
   },
-  "active": "71557ce85ddec883",
+  "active": "cf162466b4a134b7",
   "lastOpenFiles": [
     "Chapters/Chapter 1-5.md",
     "Not Implemented.md",

@@ -208,7 +208,7 @@ def test_legacy_text_migrates_to_editable_free_quad():
         item.pop(key, None)
     loaded = ChapterDocument.from_dict(data)
     migrated = loaded.objects[text.object_id]
-    assert loaded.schema_version == 16
+    assert loaded.schema_version == 17
     assert migrated.layout_mode == "free"
     assert len(migrated.transform_quad) == 4
     assert migrated.text == "Legacy"
@@ -232,7 +232,7 @@ def test_drawing_underlay_migrates_round_trips_and_clamps():
     vector.underlay_opacity = 2.0
 
     loaded = ChapterDocument.from_dict(chapter.to_dict())
-    assert loaded.schema_version == 16
+    assert loaded.schema_version == 17
     assert loaded.objects[raster.object_id].underlay_opacity == pytest.approx(
         0.375
     )

@@ -7,17 +7,18 @@ import shutil
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Callable, Literal
 
-from PySide6.QtCore import QRectF, Qt
-from PySide6.QtGui import QImage
+from PySide6.QtCore import QPointF, QRectF, Qt
+from PySide6.QtGui import QImage, QPolygonF, QTransform
 
 from .models import (
     BoundGeometry, ChapterDocument, ChildRef, ColorFillGradientObject,
     DocumentObject, EmbeddedImageSourceDescriptor, GradientObject, ImageObject,
     LayerNode, RasterObject, ShapeStyle,
     SpeedLineCenterObject, SpeedLinesGradientObject, TextObject,
-    VectorDrawingObject, VectorFillObject, new_id, object_from_dict,
+    VectorDrawingObject, VectorFillObject, modifier_from_dict, new_id,
+    object_from_dict,
 )
 from .images import ImageStore
 from .persistence import atomic_json
@@ -34,12 +35,92 @@ LAST_GOOD_DIR = "last_good"
 ASSET_PADDING = 64.0
 
 
+def _rect_quad(rect: QRectF) -> list[tuple[float, float]]:
+    return [
+        rect.topLeft().toTuple(), rect.topRight().toTuple(),
+        rect.bottomRight().toTuple(), rect.bottomLeft().toTuple(),
+    ]
+
+
+def _quad_transform(
+    frame: tuple[float, float, float, float],
+    quad: list[tuple[float, float]],
+) -> QTransform:
+    source = QRectF(*frame)
+    result = QTransform.quadToQuad(
+        QPolygonF([
+            source.topLeft(), source.topRight(),
+            source.bottomRight(), source.bottomLeft(),
+        ]),
+        QPolygonF([QPointF(*point) for point in quad]),
+    )
+    return result if isinstance(result, QTransform) else QTransform()
+
+
+def _layer_local_transform(layer: LayerNode) -> QTransform:
+    if layer.transform_frame is not None and layer.transform_quad is not None:
+        return _quad_transform(layer.transform_frame, layer.transform_quad)
+    result = QTransform()
+    result.translate(layer.translate_x, layer.translate_y)
+    return result
+
+
+def _layer_world_transform(
+    document: ChapterDocument, layer_id: str,
+) -> QTransform:
+    result = QTransform()
+    for layer in document.ancestor_layers(layer_id):
+        result = _layer_local_transform(layer) * result
+    return result
+
+
+def _mapped_rect(transform: QTransform, rect: QRectF) -> QRectF:
+    return transform.map(QPolygonF([
+        rect.topLeft(), rect.topRight(), rect.bottomRight(), rect.bottomLeft(),
+    ])).boundingRect()
+
+
+def _translate_layer(layer: LayerNode, dx: float, dy: float) -> None:
+    if layer.transform_quad is not None:
+        layer.transform_quad = [
+            (x + dx, y + dy) for x, y in layer.transform_quad
+        ]
+    else:
+        layer.translate_x += dx
+        layer.translate_y += dy
+
+
 def _copy_layer(layer: LayerNode) -> LayerNode:
     return LayerNode.from_dict(layer.to_dict())
 
 
 def _copy_object(obj: DocumentObject) -> DocumentObject:
     return object_from_dict(obj.to_dict())
+
+
+def _clone_referenced_modifiers(
+    source: ChapterDocument, destination: ChapterDocument,
+    layers: list[LayerNode], objects: list[DocumentObject],
+) -> dict[str, str]:
+    """Clone only modifier identities referenced by the copied targets."""
+    referenced = {
+        modifier_id
+        for target in [*layers, *objects]
+        for modifier_id in target.modifier_ids
+        if modifier_id in source.modifiers
+    }
+    identifier_map: dict[str, str] = {}
+    for old_id in referenced:
+        clone = modifier_from_dict(source.modifiers[old_id].to_dict())
+        clone.modifier_id = new_id()
+        identifier_map[old_id] = clone.modifier_id
+        destination.modifiers[clone.modifier_id] = clone
+    for target in [*layers, *objects]:
+        target.modifier_ids = [
+            identifier_map[item]
+            for item in target.modifier_ids if item in identifier_map
+        ]
+    return identifier_map
 
 
 def _translate_bound(bound: BoundGeometry | None, dx: float, dy: float) -> None:
@@ -53,6 +134,108 @@ def _translate_bound(bound: BoundGeometry | None, dx: float, dy: float) -> None:
                 node.incoming = (node.incoming[0] + dx, node.incoming[1] + dy)
             if node.outgoing is not None:
                 node.outgoing = (node.outgoing[0] + dx, node.outgoing[1] + dy)
+
+
+def _map_bound(
+    bound: BoundGeometry | None, mapper: Callable[[QPointF], QPointF],
+) -> None:
+    if bound is None:
+        return
+    for contour in bound.iter_contours():
+        for node in contour.nodes:
+            node.position = mapper(QPointF(node.x, node.y)).toTuple()
+            if node.incoming is not None:
+                node.incoming = mapper(QPointF(*node.incoming)).toTuple()
+            if node.outgoing is not None:
+                node.outgoing = mapper(QPointF(*node.outgoing)).toTuple()
+
+
+def _transformable_frame_and_quad(
+    obj: RasterObject | VectorDrawingObject | ImageObject,
+) -> tuple[tuple[float, float, float, float], list[tuple[float, float]]]:
+    if isinstance(obj, ImageObject):
+        frame = obj.transform_frame or (
+            0.0, 0.0, float(obj.pixel_width), float(obj.pixel_height)
+        )
+        quad = obj.transform_quad or _rect_quad(QRectF(
+            obj.x, obj.y, obj.pixel_width, obj.pixel_height
+        ))
+        return tuple(frame), list(quad)
+    if obj.transform_frame is not None:
+        frame = tuple(obj.transform_frame)
+    elif isinstance(obj, RasterObject):
+        rect = QRectF(*obj.interaction_rect).translated(obj.x, obj.y)
+        frame = (rect.x(), rect.y(), rect.width(), rect.height())
+    else:
+        left, top, width, height = obj.derived_bounds()
+        frame = (
+            obj.x + left, obj.y + top, max(1.0, width), max(1.0, height)
+        )
+    return frame, list(obj.transform_quad or _rect_quad(QRectF(*frame)))
+
+
+def _map_object_parent_coordinates(
+    obj: DocumentObject, mapper: Callable[[QPointF], QPointF],
+    document: ChapterDocument,
+) -> None:
+    """Map every parent-coordinate field through an arbitrary homography."""
+    moved_by_quad = False
+    if isinstance(obj, TextObject):
+        source_quad = obj.transform_quad or _rect_quad(QRectF(
+            obj.x, obj.y, obj.width, obj.height
+        ))
+        obj.transform_quad = [
+            mapper(QPointF(*point)).toTuple() for point in source_quad
+        ]
+        obj.layout_mode = "free"
+        moved_by_quad = True
+    elif isinstance(obj, (RasterObject, VectorDrawingObject, ImageObject)):
+        frame, source_quad = _transformable_frame_and_quad(obj)
+        obj.transform_frame = frame
+        obj.transform_quad = [
+            mapper(QPointF(*point)).toTuple() for point in source_quad
+        ]
+        moved_by_quad = True
+    if isinstance(obj, GradientObject):
+        _map_bound(obj.line_field.geometry, mapper)
+        radial = obj.radial_field
+        radial.origin_x, radial.origin_y = mapper(QPointF(
+            radial.origin_x, radial.origin_y
+        )).toTuple()
+        if radial.manual_center is not None:
+            radial.manual_center = mapper(
+                QPointF(*radial.manual_center)
+            ).toTuple()
+        if obj.shape_field.manual_center is not None:
+            obj.shape_field.manual_center = mapper(
+                QPointF(*obj.shape_field.manual_center)
+            ).toTuple()
+        if isinstance(obj, SpeedLinesGradientObject):
+            center = document.objects.get(obj.center_shape_id)
+            if isinstance(center, SpeedLineCenterObject):
+                _map_bound(center.geometry, mapper)
+    if not moved_by_quad:
+        obj.x, obj.y = mapper(QPointF(obj.x, obj.y)).toTuple()
+
+
+def _set_layer_mapping(
+    layer: LayerNode, mapper: Callable[[QPointF], QPointF],
+) -> None:
+    if layer.bound is None:
+        origin = mapper(QPointF())
+        layer.translate_x, layer.translate_y = origin.toTuple()
+        layer.transform_frame = None
+        layer.transform_quad = None
+        return
+    left, top, width, height = layer.bound.bbox()
+    frame = (left, top, max(1.0, width), max(1.0, height))
+    layer.transform_frame = frame
+    layer.transform_quad = [
+        mapper(QPointF(*point)).toTuple()
+        for point in _rect_quad(QRectF(*frame))
+    ]
+    layer.translate_x = 0.0
+    layer.translate_y = 0.0
 
 
 def _renew_bound_ids(bound: BoundGeometry | None) -> None:
@@ -152,8 +335,10 @@ def entity_visual_bounds(document: ChapterDocument, tiles: TileStore,
     """Return a conservative world-space bound for an entity subtree."""
     if kind == "object":
         obj = document.objects[entity_id]
-        wx, wy = document.layer_world_translation(obj.parent_layer_id)
-        result = _object_local_bounds(obj, document, tiles).translated(wx, wy)
+        result = _mapped_rect(
+            _layer_world_transform(document, obj.parent_layer_id),
+            _object_local_bounds(obj, document, tiles),
+        )
         if isinstance(obj, VectorDrawingObject):
             for fill_id in obj.fill_child_ids:
                 if fill_id in document.objects:
@@ -163,15 +348,17 @@ def entity_visual_bounds(document: ChapterDocument, tiles: TileStore,
         return result
 
     layer = document.layers[entity_id]
-    wx, wy = document.layer_world_translation(entity_id)
+    world_transform = _layer_world_transform(document, entity_id)
     result = QRectF()
     found = False
     if layer.layer_kind == "fill" and layer.parent_id:
         parent = document.layers.get(layer.parent_id)
         if parent is not None and parent.bound is not None:
-            px, py = document.layer_world_translation(parent.layer_id)
             left, top, width, height = parent.bound.bbox()
-            result = QRectF(px + left, py + top, max(1.0, width), max(1.0, height))
+            result = _mapped_rect(
+                _layer_world_transform(document, parent.layer_id),
+                QRectF(left, top, max(1.0, width), max(1.0, height)),
+            )
             found = True
     if layer.bound is not None:
         left, top, width, height = layer.bound.bbox()
@@ -182,10 +369,10 @@ def entity_visual_bounds(document: ChapterDocument, tiles: TileStore,
                 default=1.0,
             )
             padding += layer.shape_style.base_thickness * maximum / 2
-        result = QRectF(
-            wx + left - padding, wy + top - padding,
+        result = _mapped_rect(world_transform, QRectF(
+            left - padding, top - padding,
             max(1.0, width + padding * 2), max(1.0, height + padding * 2),
-        )
+        ))
         found = True
     for child in layer.children:
         child_bounds = entity_visual_bounds(
@@ -193,7 +380,10 @@ def entity_visual_bounds(document: ChapterDocument, tiles: TileStore,
         )
         result = child_bounds if not found else result.united(child_bounds)
         found = True
-    return result if found else QRectF(wx, wy, 1.0, 1.0)
+    return (
+        result if found
+        else _mapped_rect(world_transform, QRectF(0, 0, 1.0, 1.0))
+    )
 
 
 def _collect_subtree(document: ChapterDocument, kind: str,
@@ -348,23 +538,27 @@ def extract_asset(
         asset.layers[layer_id] = _copy_layer(document.layers[layer_id])
     for object_id in object_ids:
         asset.objects[object_id] = _copy_object(document.objects[object_id])
+    _clone_referenced_modifiers(
+        document, asset,
+        [asset.layers[item] for item in layer_ids],
+        [asset.objects[item] for item in object_ids],
+    )
 
-    source_parent_world = (0.0, 0.0)
     if kind == "layer":
         root = asset.layers[entity_id]
         source = document.layers[entity_id]
-        if source.parent_id:
-            source_parent_world = document.layer_world_translation(source.parent_id)
+        source_world = _layer_world_transform(document, source.layer_id)
         if root.is_page:
             root.is_page = False
         root.parent_id = container.layer_id
-        root.translate_x += source_parent_world[0]
-        root.translate_y += source_parent_world[1]
+        _set_layer_mapping(root, source_world.map)
     else:
         root = asset.objects[entity_id]
-        source_parent_world = document.layer_world_translation(root.parent_layer_id)
+        source_parent_world = _layer_world_transform(
+            document, root.parent_layer_id
+        )
         root.parent_layer_id = container.layer_id
-        _translate_object(root, *source_parent_world, asset)
+        _map_object_parent_coordinates(root, source_parent_world.map, asset)
         if isinstance(root, VectorDrawingObject):
             for fill_id in root.fill_child_ids:
                 asset.objects[fill_id].parent_layer_id = container.layer_id
@@ -402,8 +596,7 @@ def extract_asset(
     bounds = entity_visual_bounds(asset, asset_tiles, kind, entity_id)
     dx, dy = ASSET_PADDING - bounds.left(), ASSET_PADDING - bounds.top()
     if kind == "layer":
-        asset.layers[entity_id].translate_x += dx
-        asset.layers[entity_id].translate_y += dy
+        _translate_layer(asset.layers[entity_id], dx, dy)
     else:
         _translate_object(asset.objects[entity_id], dx, dy, asset)
     width = max(256, int(math.ceil(bounds.width() + ASSET_PADDING * 2)))
@@ -501,6 +694,11 @@ def instantiate_asset(
         _renew_internal_ids(None, obj)
         cloned_objects[obj.object_id] = obj
 
+    cloned_modifier_ids = _clone_referenced_modifiers(
+        source, target, list(cloned_layers.values()),
+        list(cloned_objects.values()),
+    )
+
     root_id = (
         layer_map[manifest.root_id]
         if manifest.root_kind == "layer" else object_map[manifest.root_id]
@@ -518,15 +716,33 @@ def instantiate_asset(
     target.objects.update(cloned_objects)
     parent.children.insert(0, ChildRef(manifest.root_kind, root_id))
 
-    parent_world = target.layer_world_translation(parent_id)
+    parent_inverse, valid = _layer_world_transform(
+        target, parent_id
+    ).inverted()
+    if not valid:
+        raise ValueError("Asset destination transform is not invertible")
     bx, by, bw, bh = manifest.visual_bounds
-    dx = world_x - (bx + bw / 2 + parent_world[0])
-    dy = world_y - (by + bh / 2 + parent_world[1])
+    dx = world_x - (bx + bw / 2)
+    dy = world_y - (by + bh / 2)
+
+    def place_parent_point(point: QPointF) -> QPointF:
+        return parent_inverse.map(point + QPointF(dx, dy))
+
     if manifest.root_kind == "layer":
-        cloned_layers[root_id].translate_x += dx
-        cloned_layers[root_id].translate_y += dy
+        source_world = _layer_world_transform(source, manifest.root_id)
+        _set_layer_mapping(
+            cloned_layers[root_id],
+            lambda point: place_parent_point(source_world.map(point)),
+        )
     else:
-        _translate_object(cloned_objects[root_id], dx, dy, target)
+        source_parent = _layer_world_transform(
+            source, source.objects[manifest.root_id].parent_layer_id
+        )
+        _map_object_parent_coordinates(
+            cloned_objects[root_id],
+            lambda point: place_parent_point(source_parent.map(point)),
+            target,
+        )
 
     for old_id, new_object_id in object_map.items():
         if isinstance(source.objects[old_id], RasterObject):
@@ -549,6 +765,8 @@ def instantiate_asset(
             target_tiles.remove_object(object_id)
             if target_images is not None:
                 target_images.remove(object_id)
+        for modifier_id in cloned_modifier_ids.values():
+            target.modifiers.pop(modifier_id, None)
         raise
     return manifest.root_kind, root_id, set(cloned_objects)
 

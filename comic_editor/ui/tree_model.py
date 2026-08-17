@@ -9,7 +9,7 @@ from PySide6.QtGui import QColor
 
 from comic_editor.core.models import (
     ChapterDocument, GradientObject, ImageObject, LayerNode, SpeedLinesGradientObject,
-    TextObject, VectorDrawingObject, VectorFillObject,
+    RasterObject, TextObject, VectorDrawingObject, VectorFillObject,
 )
 
 
@@ -31,6 +31,7 @@ class HierarchyModel(QAbstractItemModel):
         self.chapter = chapter
         self.root = TreeItem("root", "")
         self._items: dict[tuple[str, str], TreeItem] = {}
+        self.link_highlights: set[tuple[str, str]] = set()
         self.rebuild()
 
     def set_chapter(self, chapter: ChapterDocument | None) -> None:
@@ -186,6 +187,8 @@ class HierarchyModel(QAbstractItemModel):
                 )
             return "Drag objects between page or container layers."
         if role == Qt.BackgroundRole:
+            if (item.kind, item.entity_id) in self.link_highlights:
+                return QColor("#b85b12")
             return QColor("#303238") if item.kind == "layer" else QColor("#050505")
         if role == Qt.ForegroundRole:
             return QColor("#eeeeee")
@@ -271,20 +274,63 @@ class HierarchyModel(QAbstractItemModel):
         return [self.MIME]
 
     def mimeData(self, indexes) -> QMimeData:
-        index = next((item for item in indexes if item.column() == 0), QModelIndex())
         data = QMimeData()
-        if index.isValid():
-            item = self.item_for_index(index)
-            data.setData(self.MIME, json.dumps({
-                "kind": item.kind, "id": item.entity_id
-            }).encode("utf-8"))
+        candidates = {
+            (self.item_for_index(index).kind,
+             self.item_for_index(index).entity_id)
+            for index in indexes if index.isValid() and index.column() == 0
+        }
+        ordered: list[dict[str, str]] = []
+        def visit(item: TreeItem) -> None:
+            key = (item.kind, item.entity_id)
+            if key in candidates:
+                ordered.append({"kind": item.kind, "id": item.entity_id})
+            for child in item.children:
+                visit(child)
+        visit(self.root)
+        if ordered:
+            payload = dict(ordered[0])
+            payload["entities"] = ordered
+            data.setData(
+                self.MIME, json.dumps(payload).encode("utf-8")
+            )
         return data
+
+    @staticmethod
+    def _payload_entities(payload: dict) -> list[tuple[str, str]]:
+        raw = payload.get("entities")
+        if not isinstance(raw, list):
+            raw = [payload]
+        result: list[tuple[str, str]] = []
+        for item in raw:
+            if isinstance(item, dict) and item.get("kind") and item.get("id"):
+                key = (str(item["kind"]), str(item["id"]))
+                if key not in result:
+                    result.append(key)
+        return result
 
     def canDropMimeData(self, data, action, row, column, parent) -> bool:
         if not data.hasFormat(self.MIME) or self.chapter is None:
             return False
         payload = json.loads(bytes(data.data(self.MIME)).decode("utf-8"))
+        entities = self._payload_entities(payload)
+        if not entities:
+            return False
         item = self.item_for_index(parent)
+        if len(entities) > 1:
+            if item.kind != "layer":
+                return False
+            parent_layer = self.chapter.layers.get(item.entity_id)
+            if parent_layer is None or parent_layer.layer_kind == "fill":
+                return False
+            return all(
+                kind == "object" and isinstance(
+                    self.chapter.objects.get(entity_id),
+                    (RasterObject, VectorDrawingObject),
+                )
+                for kind, entity_id in entities
+            )
+        payload = {"kind": entities[0][0], "id": entities[0][1]}
         if item.kind == "object":
             parent_object = self.chapter.objects.get(item.entity_id)
             moving_object = self.chapter.objects.get(payload["id"])
@@ -318,13 +364,18 @@ class HierarchyModel(QAbstractItemModel):
         if not self.canDropMimeData(data, action, row, column, parent):
             return False
         payload = json.loads(bytes(data.data(self.MIME)).decode("utf-8"))
+        entities = self._payload_entities(payload)
         parent_item = self.item_for_index(parent)
         new_parent = None if parent_item is self.root else parent_item.entity_id
         if row < 0:
             row = len(parent_item.children)
         before = self.chapter.to_dict()
         try:
-            self.chapter.move_entity(payload["kind"], payload["id"], new_parent, row)
+            if len(entities) > 1:
+                self.chapter.move_entities(entities, new_parent, row)
+            else:
+                kind, entity_id = entities[0]
+                self.chapter.move_entity(kind, entity_id, new_parent, row)
             self.chapter.validate()
         except ValueError:
             restored = ChapterDocument.from_dict(before)
@@ -334,3 +385,16 @@ class HierarchyModel(QAbstractItemModel):
         self.rebuild()
         self.mutationCommitted.emit(before, after, "Reorder hierarchy")
         return True
+
+    def set_link_highlights(
+        self, targets: set[tuple[str, str]] | None,
+    ) -> None:
+        previous = self.link_highlights
+        self.link_highlights = set(targets or ())
+        changed = previous | self.link_highlights
+        for kind, entity_id in changed:
+            index = self.index_for_entity(kind, entity_id)
+            if index.isValid():
+                self.dataChanged.emit(
+                    index, index.siblingAtColumn(2), [Qt.BackgroundRole]
+                )

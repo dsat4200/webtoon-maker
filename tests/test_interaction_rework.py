@@ -682,3 +682,16 @@ def test_eyedropper_samples_normal_compositor_without_overlays(qapp):
         raster.object_id, QPointF(20, 20), 30, QColor("#FF336699")
     )
     assert canvas.sample_composited_color(QPointF(120, 120)) == "#FF336699"
+
+    canvas.set_tool(ToolKind.EYEDROPPER)
+    pointer = canvas.document_to_widget(QPointF(120, 120))
+    canvas._tool_press(pointer, 1.0)
+    assert canvas._eyedropper_sampling
+    assert canvas._eyedropper_widget_point == pointer
+    assert canvas._eyedropper_last_color == "#FF336699"
+    moved = pointer + QPointF(9, 7)
+    canvas._tool_move(moved, 1.0)
+    assert canvas._eyedropper_widget_point == moved
+    canvas._tool_release()
+    assert not canvas._eyedropper_sampling
+    assert canvas._eyedropper_widget_point is None

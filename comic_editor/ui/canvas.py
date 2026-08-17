@@ -11,10 +11,11 @@ import json
 import mimetypes
 import re
 import urllib.parse
-from collections import deque
+from collections import OrderedDict, deque
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
+from typing import Iterable
 
 import numpy as np
 
@@ -49,6 +50,7 @@ from comic_editor.core.models import (
     ColorGradientRamp, ColorGradientStop, DocumentObject, GradientObject,
     LineGradientField, LayerNode, RadialGradientField,
     ImageObject, PathContour, PathNode, RasterObject, ShapeStyle, TextObject,
+    BlurModifier,
     SpeedLineCenterObject, SpeedLinesGradientObject, VectorDrawingObject,
     VectorFillObject, VectorStroke, VectorStrokePoint,
     ImageSourceDescriptor, canonical_argb, image_source_from_dict,
@@ -70,6 +72,7 @@ from comic_editor.core.vector_geometry import (
     stroke_cubics, tangent_bridge, trace_cubic_faces,
 )
 from comic_editor.ui.windows_input import configure_simultaneous_pen_touch
+from comic_editor.ui.modifier_rendering import apply_modifier_stack
 
 
 class ToolKind(Enum):
@@ -242,6 +245,7 @@ class CanvasSessionState:
     active_page_id: str
     active_layer_id: str
     selected_object_id: str
+    selected_entities: list[tuple[str, str]]
     center_x: float
     center_y: float
     scale: float
@@ -253,6 +257,8 @@ class CanvasSessionState:
     gradient_geometry_cache: dict
     gradient_scalar_cache: dict
     gradient_render_cache: dict
+    modifier_render_cache: OrderedDict
+    modifier_render_cache_bytes: int
 
 
 class CanvasPerformanceMonitor:
@@ -289,6 +295,7 @@ class _CanvasLogic:
     documentChanged = Signal(object)
     visualChanged = Signal(object)
     selectionChanged = Signal(str, str)
+    selectionSetChanged = Signal(object)
     hierarchyChanged = Signal()
     chapterReplaced = Signal(object)
     cameraChanged = Signal()
@@ -323,6 +330,9 @@ class _CanvasLogic:
         self.active_page_id = ""
         self.active_layer_id = ""
         self.selected_object_id = ""
+        self.selected_entities: list[tuple[str, str]] = []
+        self.active_modifier_id = ""
+        self._modifier_handle_drag: dict | None = None
         self.center_x = 540.0
         self.center_y = 540.0
         self.scale = 0.6
@@ -346,6 +356,7 @@ class _CanvasLogic:
         self._drawing = False
         self._eyedropper_sampling = False
         self._eyedropper_last_color = ""
+        self._eyedropper_widget_point: QPointF | None = None
         self._last_draw_point = QPointF()
         self._last_pressure = 1.0
         self._stroke_before: dict[tuple[int, int], QImage | None] = {}
@@ -380,6 +391,10 @@ class _CanvasLogic:
         self._transform_gizmo_key: tuple | None = None
         self._transform_gizmo_slot: int | None = None
         self._render_excluded_object_id = ""
+        self._render_modifier_sources: set[tuple[str, str]] = set()
+        self._modifier_render_cache: OrderedDict[tuple, QImage] = OrderedDict()
+        self._modifier_render_cache_bytes = 0
+        self._modifier_render_cache_budget = 64 * 1024 * 1024
         self._rendering_compound_references = False
         self._rendering_outward_gradient = False
         self._live_underlay_object_id = ""
@@ -454,6 +469,12 @@ class _CanvasLogic:
         self._input_press_modifiers = None
         self._active_gradient_control: tuple[str, str] | None = None
         self._geometry_transform_target: tuple[str, str] | None = None
+        self._multi_transform_start_world_quads: dict[
+            str, list[tuple[float, float]]
+        ] = {}
+        self._multi_transform_preview_quads: dict[
+            str, list[tuple[float, float]]
+        ] = {}
         self._shape_control_dragged = False
         self._shape_hover_insert: tuple[int, float, QPointF] | None = None
         self._shape_hover_target: dict | None = None
@@ -747,6 +768,44 @@ class _CanvasLogic:
         if not self._visual_frame_timer.isActive():
             self._visual_frame_timer.start(0)
 
+    def _object_has_effect_modifiers(self, object_id: str) -> bool:
+        if self.chapter is None:
+            return False
+        obj = self.chapter.objects.get(object_id)
+        return bool(
+            obj is not None and (
+                obj.modifier_ids
+                or any(
+                    layer.modifier_ids
+                    for layer in self.chapter.ancestor_layers(
+                        obj.parent_layer_id
+                    )
+                )
+            )
+        )
+
+    def modifier_expanded_dirty(
+        self, object_id: str, world: QRectF,
+    ) -> QRectF:
+        """Expand source dirtiness by every applicable blur footprint."""
+        if self.chapter is None or world.isEmpty():
+            return QRectF(world)
+        obj = self.chapter.objects.get(object_id)
+        if obj is None:
+            return QRectF(world)
+        modifier_ids = list(obj.modifier_ids)
+        for layer in self.chapter.ancestor_layers(obj.parent_layer_id):
+            modifier_ids.extend(layer.modifier_ids)
+        padding = max((
+            modifier.strength * 3.0
+            for modifier_id in modifier_ids
+            if isinstance(
+                (modifier := self.chapter.modifiers.get(modifier_id)),
+                BlurModifier,
+            ) and modifier.intensity > 0
+        ), default=0.0)
+        return QRectF(world).adjusted(-padding, -padding, padding, padding)
+
     def _flush_visual_dirty(self) -> None:
         world = QRectF(self._visual_pending_world)
         widget = QRect(self._visual_pending_widget)
@@ -903,6 +962,8 @@ class _CanvasLogic:
         self._gradient_geometry_cache.clear()
         self._gradient_scalar_cache.clear()
         self._gradient_render_cache.clear()
+        self._modifier_render_cache.clear()
+        self._modifier_render_cache_bytes = 0
         self._promoted_vector_preview = None
         self._invalidate_scene_cache()
         self._ensure_raster_frames()
@@ -912,6 +973,7 @@ class _CanvasLogic:
         self.active_page_id = ""
         self.active_layer_id = ""
         self.selected_object_id = ""
+        self.selected_entities = []
         self._selected_vector_stroke_ids.clear()
         self._selected_vector_point_ids.clear()
         self._clear_vector_render_cache()
@@ -958,6 +1020,7 @@ class _CanvasLogic:
             active_page_id=self.active_page_id,
             active_layer_id=self.active_layer_id,
             selected_object_id=self.selected_object_id,
+            selected_entities=list(self.selected_entities),
             center_x=self.center_x, center_y=self.center_y,
             scale=self.scale, rotation=self.rotation,
             compound_cache=self._compound_path_cache,
@@ -967,6 +1030,8 @@ class _CanvasLogic:
             gradient_geometry_cache=self._gradient_geometry_cache,
             gradient_scalar_cache=self._gradient_scalar_cache,
             gradient_render_cache=self._gradient_render_cache,
+            modifier_render_cache=self._modifier_render_cache,
+            modifier_render_cache_bytes=self._modifier_render_cache_bytes,
         )
 
     def restore_session_state(self, state: CanvasSessionState) -> None:
@@ -983,6 +1048,7 @@ class _CanvasLogic:
             state.active_page_id, state.active_layer_id
         )
         self.selected_object_id = state.selected_object_id
+        self.selected_entities = list(state.selected_entities)
         self.center_x, self.center_y = state.center_x, state.center_y
         self.scale, self.rotation = state.scale, state.rotation
         self._compound_path_cache = state.compound_cache
@@ -992,6 +1058,8 @@ class _CanvasLogic:
         self._gradient_geometry_cache = state.gradient_geometry_cache
         self._gradient_scalar_cache = state.gradient_scalar_cache
         self._gradient_render_cache = state.gradient_render_cache
+        self._modifier_render_cache = state.modifier_render_cache
+        self._modifier_render_cache_bytes = state.modifier_render_cache_bytes
         self._promoted_vector_preview = None
         self._invalidate_scene_cache()
         self._touch_frame_timer.stop()
@@ -1000,6 +1068,7 @@ class _CanvasLogic:
         self.update()
         self.hierarchyChanged.emit()
         self.selectionChanged.emit(self.selected_kind, self.selected_id)
+        self.selectionSetChanged.emit(list(self.selected_entities))
         self.toolChanged.emit(self.tool)
 
     def clear_document(self) -> None:
@@ -1016,12 +1085,15 @@ class _CanvasLogic:
         self.selected_kind = self.selected_id = ""
         self.active_page_id = self.active_layer_id = ""
         self.selected_object_id = ""
+        self.selected_entities = []
         self._compound_path_cache.clear()
         self._clear_vector_render_cache()
         self._vector_spatial_indexes.clear()
         self._gradient_geometry_cache.clear()
         self._gradient_scalar_cache.clear()
         self._gradient_render_cache.clear()
+        self._modifier_render_cache.clear()
+        self._modifier_render_cache_bytes = 0
         self._promoted_vector_preview = None
         self._invalidate_scene_cache()
         self._clear_asset_drag_preview()
@@ -1046,6 +1118,8 @@ class _CanvasLogic:
         self._gradient_geometry_cache.clear()
         self._gradient_scalar_cache.clear()
         self._gradient_render_cache.clear()
+        self._modifier_render_cache.clear()
+        self._modifier_render_cache_bytes = 0
         self._promoted_vector_preview = None
         self._invalidate_scene_cache()
         valid = (
@@ -1057,10 +1131,23 @@ class _CanvasLogic:
             self.selected_kind = ""
             self.selected_id = ""
             self.selected_object_id = ""
+            self.selected_entities = []
+        else:
+            restored: list[tuple[str, str]] = []
+            for kind, entity_id in self.selected_entities:
+                if kind != "object":
+                    continue
+                obj = self.chapter.objects.get(entity_id)
+                if isinstance(obj, (RasterObject, VectorDrawingObject)):
+                    restored.append((kind, entity_id))
+            if len(restored) < 2:
+                restored = [(self.selected_kind, self.selected_id)]
+            self.selected_entities = restored
         self._sync_selection_levels()
         self.chapterReplaced.emit(self.chapter)
         self.hierarchyChanged.emit()
         self.selectionChanged.emit(self.selected_kind, self.selected_id)
+        self.selectionSetChanged.emit(list(self.selected_entities))
         self.update()
 
     def push_model_change(self, before: dict, after: dict, label: str) -> None:
@@ -1113,6 +1200,59 @@ class _CanvasLogic:
             visible = inverse.mapRect(visible)
         return visible.translated(-obj.x, -obj.y)
 
+    def _layer_parent_transform(self, layer: LayerNode) -> QTransform:
+        if (
+            self._geometry_transform_target == ("layer_group", layer.layer_id)
+            and self._transform_preview_quad is not None
+            and layer.bound is not None
+        ):
+            left, top, width, height = layer.bound.bbox()
+            return self._quad_transform(
+                QRectF(left, top, max(1.0, width), max(1.0, height)),
+                list(self._transform_preview_quad),
+            )
+        if layer.transform_frame is not None and layer.transform_quad is not None:
+            return self._quad_transform(
+                QRectF(*layer.transform_frame), list(layer.transform_quad)
+            )
+        transform = QTransform()
+        transform.translate(layer.translate_x, layer.translate_y)
+        return transform
+
+    def layer_world_transform(self, layer_id: str) -> QTransform:
+        transform = QTransform()
+        for layer in self.chapter.ancestor_layers(layer_id):
+            transform = self._layer_parent_transform(layer) * transform
+        return transform
+
+    def _document_layer_world_transform(
+        self, document: ChapterDocument, layer_id: str,
+    ) -> QTransform:
+        """Resolve a layer's complete local-to-document mapping."""
+        transform = QTransform()
+        for layer in document.ancestor_layers(layer_id):
+            if document is self.chapter:
+                local = self._layer_parent_transform(layer)
+            elif (
+                layer.transform_frame is not None
+                and layer.transform_quad is not None
+            ):
+                local = self._quad_transform(
+                    QRectF(*layer.transform_frame),
+                    list(layer.transform_quad),
+                )
+            else:
+                local = QTransform()
+                local.translate(layer.translate_x, layer.translate_y)
+            transform = local * transform
+        return transform
+
+    def _layer_world_to_local(
+        self, layer_id: str, point: QPointF,
+    ) -> QPointF:
+        inverse, valid = self.layer_world_transform(layer_id).inverted()
+        return inverse.map(point) if valid else QPointF(point)
+
     def _drawing_local_rect_to_world(
         self,
         obj: RasterObject | VectorDrawingObject,
@@ -1130,18 +1270,16 @@ class _CanvasLogic:
             parent_polygon = self._drawing_object_transform(obj).map(
                 parent_polygon
             )
-        layer_x, layer_y = self.chapter.layer_world_translation(
-            obj.parent_layer_id
-        )
-        return parent_polygon.translated(layer_x, layer_y).boundingRect()
+        return self.layer_world_transform(obj.parent_layer_id).map(
+            parent_polygon
+        ).boundingRect()
 
     def _vector_local_point(
         self, drawing: VectorDrawingObject, world: QPointF,
     ) -> QPointF:
-        layer_x, layer_y = self.chapter.layer_world_translation(
-            drawing.parent_layer_id
+        parent_local = self._layer_world_to_local(
+            drawing.parent_layer_id, world
         )
-        parent_local = QPointF(world.x() - layer_x, world.y() - layer_y)
         if drawing.transform_quad is not None:
             inverse, valid = self._drawing_object_transform(
                 drawing
@@ -1156,10 +1294,7 @@ class _CanvasLogic:
     def _raster_local_point(
         self, obj: RasterObject, world: QPointF,
     ) -> QPointF:
-        layer_x, layer_y = self.chapter.layer_world_translation(
-            obj.parent_layer_id
-        )
-        parent_local = QPointF(world.x() - layer_x, world.y() - layer_y)
+        parent_local = self._layer_world_to_local(obj.parent_layer_id, world)
         if obj.transform_quad is not None:
             inverse, valid = self._drawing_object_transform(obj).inverted()
             if valid:
@@ -1174,10 +1309,7 @@ class _CanvasLogic:
             parent_local = self._drawing_object_transform(obj).map(
                 parent_local
             )
-        layer_x, layer_y = self.chapter.layer_world_translation(
-            obj.parent_layer_id
-        )
-        return QPointF(parent_local.x() + layer_x, parent_local.y() + layer_y)
+        return self.layer_world_transform(obj.parent_layer_id).map(parent_local)
 
     def _vector_world_point(
         self, obj: VectorDrawingObject, local: QPointF,
@@ -1185,10 +1317,26 @@ class _CanvasLogic:
         parent_local = QPointF(local.x() + obj.x, local.y() + obj.y)
         if obj.transform_quad is not None:
             parent_local = self._drawing_object_transform(obj).map(parent_local)
-        layer_x, layer_y = self.chapter.layer_world_translation(
-            obj.parent_layer_id
+        return self.layer_world_transform(obj.parent_layer_id).map(parent_local)
+
+    def _drawing_local_to_world_transform(
+        self, obj: RasterObject | VectorDrawingObject,
+    ) -> QTransform:
+        """Return the projective drawing-local to document transform."""
+        frame = QRectF(*self._object_transform_frame(obj)).translated(
+            -obj.x, -obj.y
         )
-        return parent_local + QPointF(layer_x, layer_y)
+        if frame.width() <= 0 or frame.height() <= 0:
+            return QTransform()
+        destination: list[tuple[float, float]] = []
+        for point in self._rect_quad(frame):
+            mapped = (
+                self._raster_world_point(obj, QPointF(*point))
+                if isinstance(obj, RasterObject)
+                else self._vector_world_point(obj, QPointF(*point))
+            )
+            destination.append(mapped.toTuple())
+        return self._quad_transform(frame, destination)
 
     def _capture_vector_graph(
         self, drawing: VectorDrawingObject,
@@ -1417,6 +1565,7 @@ class _CanvasLogic:
         ):
             self._commit_text_edit()
         self.selected_kind, self.selected_id = kind, entity_id
+        self.selected_entities = [(kind, entity_id)]
         if kind == "object":
             obj = self.chapter.objects[entity_id]
             self.selected_object_id = entity_id
@@ -1451,8 +1600,76 @@ class _CanvasLogic:
         if self.tool != previous_tool:
             self.toolChanged.emit(self.tool)
         self.selectionChanged.emit(kind, entity_id)
+        self.selectionSetChanged.emit(list(self.selected_entities))
         self._invalidate_scene_cache()
         self.update()
+
+    def set_selection_set(
+        self, entities: Iterable[tuple[str, str]],
+        primary: tuple[str, str] | None = None,
+    ) -> bool:
+        """Select an outliner-authored raster/vector object set."""
+        if self.chapter is None:
+            return False
+        ordered: list[tuple[str, str]] = []
+        for kind, entity_id in entities:
+            key = (str(kind), str(entity_id))
+            if key not in ordered:
+                ordered.append(key)
+        if not ordered:
+            self.clear_selection()
+            return True
+        if len(ordered) == 1:
+            self.set_selection(*ordered[0], activate_default_tool=True)
+            return True
+        if any(
+            kind != "object" or not isinstance(
+                self.chapter.objects.get(entity_id),
+                (RasterObject, VectorDrawingObject),
+            )
+            for kind, entity_id in ordered
+        ):
+            return False
+        primary = primary if primary in ordered else ordered[-1]
+        primary_id = primary[1]
+        if primary_id != self.selected_object_id:
+            if self._vector_gesture_mode is not None:
+                self._cancel_vector_gesture(restore=True)
+            self._cancel_text_property_drag()
+            self._clear_transform_preview()
+            self._transform_pivot = None
+            self._transform_pivot_custom = False
+        self._pending_drawing_selection_press = None
+        self._pending_raster_transform_press = None
+        self._gradient_preview_active = False
+        self._selected_shape_node_id = ""
+        self._selected_shape_node_ids.clear()
+        self._shape_hover_insert = None
+        self._selected_vector_stroke_ids.clear()
+        self._selected_vector_point_ids.clear()
+        self._clear_drawing_selection()
+        self.vectorSelectionChanged.emit(set(), set())
+        if self._text_editing:
+            self._commit_text_edit()
+        obj = self.chapter.objects[primary_id]
+        self.selected_kind, self.selected_id = primary
+        self.selected_object_id = primary_id
+        self.active_layer_id = obj.parent_layer_id
+        self.active_page_id = self.chapter.page_for_layer(
+            obj.parent_layer_id
+        ).layer_id
+        self.selected_entities = ordered
+        if self.tool != ToolKind.TRANSFORM:
+            self.tool = ToolKind.TRANSFORM
+            self.toolChanged.emit(self.tool)
+        self.selectionSetChanged.emit(list(self.selected_entities))
+        # Compatibility consumers still key off the primary-selection signal.
+        # Re-emit after installing the complete set so tree synchronization
+        # cannot collapse the selection to the primary row.
+        self.selectionChanged.emit(*primary)
+        self._invalidate_scene_cache()
+        self.update()
+        return True
 
     def clear_selection(self) -> None:
         """Clear the current entity and notify every selection consumer."""
@@ -1471,6 +1688,7 @@ class _CanvasLogic:
         self.selected_kind = ""
         self.selected_id = ""
         self.selected_object_id = ""
+        self.selected_entities = []
         self.active_layer_id = ""
         self.active_page_id = ""
         self._selected_shape_node_id = ""
@@ -1481,6 +1699,7 @@ class _CanvasLogic:
         self._clear_drawing_selection()
         self.vectorSelectionChanged.emit(set(), set())
         self.selectionChanged.emit("", "")
+        self.selectionSetChanged.emit([])
         self._invalidate_scene_cache()
         self.update()
 
@@ -1515,6 +1734,7 @@ class _CanvasLogic:
         if tool != ToolKind.EYEDROPPER and self._eyedropper_sampling:
             self._eyedropper_sampling = False
             self._eyedropper_last_color = ""
+            self._eyedropper_widget_point = None
             self.eyedropperGestureChanged.emit(False)
         if tool != ToolKind.VECTOR_EDIT:
             self._hover_vector_point_id = ""
@@ -1744,12 +1964,27 @@ class _CanvasLogic:
             QColor.NameFormat.HexArgb
         ).upper()
 
+    def entity_world_rect(
+        self, kind: str, entity_id: str,
+    ) -> QRectF | None:
+        if self.chapter is None:
+            return None
+        if kind == "object":
+            return self.object_world_rect(entity_id)
+        layer = self.chapter.layers.get(entity_id)
+        if layer is None or layer.bound is None:
+            return None
+        return self.layer_world_transform(entity_id).map(
+            self.layer_effective_path(entity_id)
+        ).boundingRect()
+
     def _sample_eyedropper(self, world: QPointF) -> bool:
         color = self.sample_composited_color(world)
         if color is None:
             return False
         self._eyedropper_last_color = color
         self.colorSampled.emit(color)
+        self.update()
         return True
 
     def scroll_to_fraction(self, fraction: float) -> None:
@@ -2424,7 +2659,11 @@ class _CanvasLogic:
         cached = cache.get(layer_id)
         if cached is not None:
             return QPainterPath(cached)
-        root_x, root_y = document.layer_world_translation(layer_id)
+        root_inverse, invertible = self._document_layer_world_transform(
+            document, layer_id
+        ).inverted()
+        if not invertible:
+            return QPainterPath()
         additions = QPainterPath(self._layer_operand_path(layer))
         additions.setFillRule(Qt.OddEvenFill)
         subtractions = QPainterPath()
@@ -2454,12 +2693,11 @@ class _CanvasLogic:
                     if child.compound_enabled
                     else self._layer_operand_path(child)
                 )
-                child_x, child_y = document.layer_world_translation(
-                    child.layer_id
+                operand = root_inverse.map(
+                    self._document_layer_world_transform(
+                        document, child.layer_id
+                    ).map(operand)
                 )
-                transform = QTransform()
-                transform.translate(child_x - root_x, child_y - root_y)
-                operand = transform.map(operand)
                 if child.compound_operation == "subtract":
                     subtractions = combine(subtractions, operand)
                 else:
@@ -2472,9 +2710,7 @@ class _CanvasLogic:
                 and virtual_path_world is not None
                 and not virtual_path_world.isEmpty()
             ):
-                transform = QTransform()
-                transform.translate(-root_x, -root_y)
-                operand = transform.map(virtual_path_world)
+                operand = root_inverse.map(virtual_path_world)
                 if virtual_operation == "subtract":
                     subtractions = combine(subtractions, operand)
                 elif virtual_operation != "ignore":
@@ -2510,6 +2746,7 @@ class _CanvasLogic:
         if (
             not self._transform_static_cache.isNull()
             and self._transform_preview_quad is not None
+            and self._geometry_transform_target is None
             and (
                 isinstance(
                     self.chapter.objects.get(self.selected_object_id),
@@ -2540,6 +2777,7 @@ class _CanvasLogic:
             self._clear_live_underlay_context()
             painter.restore()
             self._draw_selection(painter)
+            self._draw_focal_modifier_handles(painter)
             self._performance.frame_ms.append(
                 (time.perf_counter_ns() - frame_started) / 1_000_000
             )
@@ -2551,6 +2789,9 @@ class _CanvasLogic:
                 VectorDrawingObject,
             )
             and not self._vector_eraser_background_cache.isNull()
+            and not self._object_has_effect_modifiers(
+                self.selected_object_id
+            )
         )
         if live_vector_eraser:
             painter.setTransform(QTransform())
@@ -2589,12 +2830,14 @@ class _CanvasLogic:
             painter.restore()
         painter.save()
         self._draw_selection(painter)
+        self._draw_focal_modifier_handles(painter)
         self._draw_creation_preview(painter)
         self._draw_asset_drag_preview(painter)
         painter.restore()
         painter.setTransform(QTransform())
         self._draw_tablet_hover(painter)
         self._draw_simplify_hover(painter)
+        self._draw_eyedropper_swatch(painter)
         self._performance.frame_ms.append(
             (time.perf_counter_ns() - frame_started) / 1_000_000
         )
@@ -2619,14 +2862,15 @@ class _CanvasLogic:
         )
         target = self.chapter.layers.get(self._asset_drag_parent_id)
         if isinstance(root, ImageObject) and target is not None and not target.is_page:
-            wx, wy = self.chapter.layer_world_translation(target.layer_id)
-            bounds = self.layer_effective_path(target.layer_id).boundingRect()
+            bounds = self.layer_world_transform(target.layer_id).map(
+                self.layer_effective_path(target.layer_id)
+            ).boundingRect()
             aspect = root.pixel_width / max(1.0, root.pixel_height)
             height = max(1.0, bounds.height())
             width = height * aspect
             destination = QRectF(
-                wx + bounds.center().x() - width / 2,
-                wy + bounds.center().y() - height / 2,
+                bounds.center().x() - width / 2,
+                bounds.center().y() - height / 2,
                 width, height,
             )
         painter.save()
@@ -2643,8 +2887,9 @@ class _CanvasLogic:
         painter.save()
         layer = self.chapter.layers.get(self._asset_drag_parent_id)
         if layer is not None and layer.bound is not None:
-            wx, wy = self.chapter.layer_world_translation(layer.layer_id)
-            painter.translate(wx, wy)
+            painter.setTransform(
+                self.layer_world_transform(layer.layer_id), True
+            )
             pen = QPen(QColor("#56a8ff"), 2.0 / max(self.scale, 0.05), Qt.DashLine)
             painter.setPen(pen)
             painter.setBrush(Qt.NoBrush)
@@ -2706,10 +2951,7 @@ class _CanvasLogic:
             return []
         before_model = self.chapter.to_dict()
         before_images = self.images.snapshot()
-        layer_x, layer_y = self.chapter.layer_world_translation(parent_id)
-        local_center = QPointF(
-            world_center.x() - layer_x, world_center.y() - layer_y
-        )
+        local_center = self._layer_world_to_local(parent_id, world_center)
         created: list[str] = []
         for offset, (
             source_index, filename, mime_type, data, image,
@@ -2819,14 +3061,14 @@ class _CanvasLogic:
         source_path = self._document_layer_effective_path(
             source, root.layer_id, {}
         )
-        source_x, source_y = source.layer_world_translation(root.layer_id)
+        source_path = self._document_layer_world_transform(
+            source, root.layer_id
+        ).map(source_path)
         bounds_x, bounds_y, bounds_width, bounds_height = manifest.visual_bounds
         transform = QTransform()
         transform.translate(
-            source_x + self._asset_drag_world.x()
-            - (bounds_x + bounds_width / 2),
-            source_y + self._asset_drag_world.y()
-            - (bounds_y + bounds_height / 2),
+            self._asset_drag_world.x() - (bounds_x + bounds_width / 2),
+            self._asset_drag_world.y() - (bounds_y + bounds_height / 2),
         )
         return transform.map(source_path), root.compound_operation
 
@@ -2897,12 +3139,7 @@ class _CanvasLogic:
                 virtual_path_world=virtual_path,
                 virtual_operation=virtual_operation,
             )
-            world_x, world_y = self.chapter.layer_world_translation(
-                layer.layer_id
-            )
-            transform = QTransform()
-            transform.translate(world_x, world_y)
-            path = transform.map(path)
+            path = self.layer_world_transform(layer.layer_id).map(path)
             result = path if result is None else result.intersected(path)
 
         stored = QPainterPath(result) if result is not None else None
@@ -2938,9 +3175,8 @@ class _CanvasLogic:
             if not layer.visible:
                 return next_order
             if layer.bound is not None and layer.layer_kind != "fill":
-                wx, wy = self.chapter.layer_world_translation(layer_id)
                 if self.layer_effective_path(layer_id).contains(
-                    QPointF(world.x() - wx, world.y() - wy)
+                    self._layer_world_to_local(layer_id, world)
                 ):
                     candidates.append((depth, -order, layer_id))
             for child in layer.children:
@@ -3488,22 +3724,22 @@ class _CanvasLogic:
         ancestors = self.chapter.ancestor_layers(obj.parent_layer_id)
         if any(not layer.visible or layer.opacity <= 0 for layer in ancestors):
             return
-        world_x, world_y = self.chapter.layer_world_translation(
-            obj.parent_layer_id
-        )
         painter.save()
         painter.setOpacity(
             self.chapter.effective_object_opacity(obj.object_id)
             * self._live_underlay_amount
         )
-        painter.translate(world_x, world_y)
+        parent_transform = self.layer_world_transform(obj.parent_layer_id)
+        painter.setTransform(parent_transform, True)
+        inverse, valid = parent_transform.inverted()
+        local_visible = inverse.mapRect(visible) if valid else visible
         if isinstance(obj, VectorDrawingObject):
             self._render_vector_drawing(
-                painter, obj, visible.translated(-world_x, -world_y)
+                painter, obj, local_visible
             )
         elif isinstance(obj, RasterObject):
             self._render_raster_content(
-                painter, obj, visible.translated(-world_x, -world_y),
+                painter, obj, local_visible,
                 use_transform_preview=True,
             )
         else:
@@ -3595,12 +3831,14 @@ class _CanvasLogic:
                     )
                 else:
                     obj = document.objects[entity_id]
-                    wx, wy = document.layer_world_translation(
+                    parent_transform = self.layer_world_transform(
                         obj.parent_layer_id
                     )
-                    painter.translate(wx, wy)
+                    inverse, valid = parent_transform.inverted()
+                    painter.setTransform(parent_transform, True)
                     self._render_object(
-                        painter, obj, 1.0, bounds.translated(-wx, -wy)
+                        painter, obj, 1.0,
+                        inverse.mapRect(bounds) if valid else bounds,
                     )
             finally:
                 if painter.isActive():
@@ -3669,6 +3907,14 @@ class _CanvasLogic:
     ) -> None:
         if not layer.visible or layer.opacity <= 0:
             return
+        if (
+            layer.modifier_ids
+            and ("layer", layer.layer_id) not in self._render_modifier_sources
+        ):
+            self._render_modified_layer(
+                painter, layer, parent_opacity, visible_world
+            )
+            return
         if layer.layer_kind == "fill":
             parent = self.chapter.layers.get(layer.parent_id)
             if parent is None or parent.bound is None:
@@ -3682,11 +3928,11 @@ class _CanvasLogic:
             painter.restore()
             return
         painter.save()
-        painter.translate(layer.translate_x, layer.translate_y)
-        world_x, world_y = self.chapter.layer_world_translation(
-            layer.layer_id
+        painter.setTransform(self._layer_parent_transform(layer), True)
+        inverse, valid = self.layer_world_transform(layer.layer_id).inverted()
+        local_visible = (
+            inverse.mapRect(visible_world) if valid else QRectF(visible_world)
         )
-        local_visible = visible_world.translated(-world_x, -world_y)
         self._render_outward_gradient_children(
             painter, layer, parent_opacity * layer.opacity, local_visible
         )
@@ -3714,10 +3960,6 @@ class _CanvasLogic:
             )
             painter.save()
             painter.setClipPath(clip_path, Qt.IntersectClip)
-            world_x, world_y = self.chapter.layer_world_translation(
-                layer.layer_id
-            )
-            local_visible = visible_world.translated(-world_x, -world_y)
             for child in reversed(layer.children):
                 if self._child_ignores_parent_mask(child):
                     continue
@@ -3758,8 +4000,6 @@ class _CanvasLogic:
             painter.setClipPath(layer_path, Qt.IntersectClip)
             painter.fillPath(layer_path, QColor(layer.fill_color))
             painter.restore()
-        world_x, world_y = self.chapter.layer_world_translation(layer.layer_id)
-        local_visible = visible_world.translated(-world_x, -world_y)
         painter.save()
         painter.setClipPath(layer_path, Qt.IntersectClip)
         for child in reversed(layer.children):
@@ -3803,14 +4043,105 @@ class _CanvasLogic:
         painter.restore()
         return
 
+    def _render_modified_layer(
+        self, painter: QPainter, layer: LayerNode, parent_opacity: float,
+        visible_world: QRectF,
+    ) -> None:
+        world_bounds = self.entity_world_rect("layer", layer.layer_id)
+        modifiers = [
+            self.chapter.modifiers[item] for item in layer.modifier_ids
+            if item in self.chapter.modifiers
+        ]
+        if world_bounds is None or world_bounds.isEmpty() or not modifiers:
+            self._render_modifier_sources.add(("layer", layer.layer_id))
+            try:
+                self._render_layer(painter, layer, parent_opacity, visible_world)
+            finally:
+                self._render_modifier_sources.discard(("layer", layer.layer_id))
+            return
+        parent_transform = (
+            self.layer_world_transform(layer.parent_id)
+            if layer.parent_id else QTransform()
+        )
+        parent_inverse, valid = parent_transform.inverted()
+        if not valid:
+            return
+        local = parent_inverse.mapRect(world_bounds)
+        if layer.layer_kind == "open_shape":
+            padding = (
+                layer.shape_style.base_thickness / 2
+                + layer.shape_style.outline_thickness + 2
+            )
+            local.adjust(-padding, -padding, padding, padding)
+        bounds = QRectF(
+            math.floor(local.left()), math.floor(local.top()),
+            max(1, math.ceil(local.right()) - math.floor(local.left())),
+            max(1, math.ceil(local.bottom()) - math.floor(local.top())),
+        )
+        world_origin = parent_transform.map(bounds.topLeft())
+        cache_key = (
+            "layer", layer.layer_id,
+            self._modifier_layer_signature(layer.layer_id),
+            self._rect_signature(bounds), world_origin.toTuple(),
+        )
+        processed = self._modifier_cache_get(cache_key)
+        if processed is None:
+            image = QImage(
+                max(1, math.ceil(bounds.width())),
+                max(1, math.ceil(bounds.height())),
+                QImage.Format.Format_ARGB32_Premultiplied,
+            )
+            image.fill(Qt.GlobalColor.transparent)
+            source = QPainter(image)
+            source.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+            source.translate(-bounds.left(), -bounds.top())
+            self._render_modifier_sources.add(("layer", layer.layer_id))
+            try:
+                self._render_layer(source, layer, 1.0, visible_world)
+                drawing = self._active_vector_drawing()
+                modified_ancestors = (
+                    [
+                        candidate.layer_id
+                        for candidate in self.chapter.ancestor_layers(
+                            drawing.parent_layer_id
+                        )
+                        if candidate.modifier_ids
+                    ]
+                    if drawing is not None else []
+                )
+                if (
+                    drawing is not None and not drawing.modifier_ids
+                    and modified_ancestors
+                    and modified_ancestors[-1] == layer.layer_id
+                ):
+                    self._render_modified_vector_pencil_preview(
+                        source, layer.parent_id or ""
+                    )
+            finally:
+                self._render_modifier_sources.discard(("layer", layer.layer_id))
+                source.end()
+            processed = apply_modifier_stack(
+                image, modifiers, world_origin.toTuple(),
+            )
+            self._modifier_cache_put(cache_key, processed)
+        painter.save()
+        painter.setOpacity(parent_opacity)
+        transform = self._layer_parent_transform(layer)
+        painter.setClipPath(
+            transform.map(self.layer_effective_path(layer.layer_id)),
+            Qt.ClipOperation.IntersectClip,
+        )
+        painter.drawImage(bounds.topLeft(), processed)
+        painter.restore()
+
     def _render_compound_layer_contents(
         self, painter: QPainter, layer: LayerNode, parent_opacity: float,
         visible_world: QRectF,
     ) -> None:
         layer_path = self.layer_effective_path(layer.layer_id)
         opacity = parent_opacity * layer.opacity
-        world_x, world_y = self.chapter.layer_world_translation(layer.layer_id)
-        local_visible = visible_world.translated(-world_x, -world_y)
+        inverse, valid = self.layer_world_transform(layer.layer_id).inverted()
+        local_visible = inverse.mapRect(visible_world) if valid else visible_world
         painter.save()
         painter.setClipPath(layer_path, Qt.IntersectClip)
         if layer.fill_color:
@@ -3872,7 +4203,7 @@ class _CanvasLogic:
         if not layer.visible:
             return
         painter.save()
-        painter.translate(layer.translate_x, layer.translate_y)
+        painter.setTransform(self._layer_parent_transform(layer), True)
         path = (
             self.layer_effective_path(layer.layer_id)
             if layer.compound_enabled else self._layer_operand_path(layer)
@@ -3880,8 +4211,8 @@ class _CanvasLogic:
         painter.save()
         painter.setClipPath(path, Qt.IntersectClip)
         opacity = parent_opacity * layer.opacity
-        world_x, world_y = self.chapter.layer_world_translation(layer.layer_id)
-        local_visible = visible_world.translated(-world_x, -world_y)
+        inverse, valid = self.layer_world_transform(layer.layer_id).inverted()
+        local_visible = inverse.mapRect(visible_world) if valid else visible_world
         for child in reversed(layer.children):
             if self._child_ignores_parent_mask(child):
                 continue
@@ -3967,9 +4298,11 @@ class _CanvasLogic:
         self, painter: QPainter, compound_id: str, parent_opacity: float,
         visible_world: QRectF,
     ) -> None:
-        compound_x, compound_y = self.chapter.layer_world_translation(
+        compound_inverse, valid = self.layer_world_transform(
             compound_id
-        )
+        ).inverted()
+        if not valid:
+            return
         references: list[DocumentObject] = []
 
         def collect(layer: LayerNode) -> None:
@@ -3994,7 +4327,7 @@ class _CanvasLogic:
         self._rendering_compound_references = True
         try:
             for obj in references:
-                parent_x, parent_y = self.chapter.layer_world_translation(
+                parent_transform = self.layer_world_transform(
                     obj.parent_layer_id
                 )
                 branch_opacity = parent_opacity
@@ -4005,11 +4338,13 @@ class _CanvasLogic:
                         break
                     cursor = self.chapter.layers[cursor.parent_id]
                 painter.save()
-                painter.translate(
-                    parent_x - compound_x, parent_y - compound_y
+                painter.setTransform(
+                    parent_transform * compound_inverse, True
                 )
-                local_visible = visible_world.translated(
-                    -parent_x, -parent_y
+                parent_inverse, invertible = parent_transform.inverted()
+                local_visible = (
+                    parent_inverse.mapRect(visible_world)
+                    if invertible else visible_world
                 )
                 self._render_object(
                     painter, obj, branch_opacity, local_visible
@@ -4395,6 +4730,9 @@ class _CanvasLogic:
     ) -> None:
         painter.save()
         destination = (
+            list(self._multi_transform_preview_quads[drawing.object_id])
+            if drawing.object_id in self._multi_transform_preview_quads
+            else
             list(self._transform_preview_quad)
             if (
                 drawing.object_id == self.selected_object_id
@@ -6177,6 +6515,14 @@ class _CanvasLogic:
             and not self._rendering_outward_gradient
         ):
             return
+        if (
+            obj.modifier_ids
+            and ("object", obj.object_id) not in self._render_modifier_sources
+        ):
+            self._render_modified_object(
+                painter, obj, parent_opacity, local_visible
+            )
+            return
         painter.save()
         opacity = (
             parent_opacity
@@ -6185,6 +6531,13 @@ class _CanvasLogic:
         if obj.object_id == self._live_underlay_object_id:
             opacity *= 1.0 - self._live_underlay_amount
         painter.setOpacity(opacity)
+        self._render_object_content(painter, obj, local_visible)
+        painter.restore()
+
+    def _render_object_content(
+        self, painter: QPainter, obj: DocumentObject,
+        local_visible: QRectF,
+    ) -> None:
         if isinstance(obj, VectorDrawingObject):
             self._render_vector_drawing(painter, obj, local_visible)
         elif isinstance(obj, GradientObject):
@@ -6197,6 +6550,178 @@ class _CanvasLogic:
             self._render_image_object(painter, obj)
         elif isinstance(obj, TextObject):
             self._draw_text_object(painter, obj)
+
+    @staticmethod
+    def _rect_signature(rect: QRectF) -> tuple[float, float, float, float]:
+        return (
+            round(rect.x(), 5), round(rect.y(), 5),
+            round(rect.width(), 5), round(rect.height(), 5),
+        )
+
+    def _modifier_parameter_signature(self, ids: Iterable[str]) -> tuple[str, ...]:
+        return tuple(
+            json.dumps(
+                self.chapter.modifiers[item].to_dict(),
+                sort_keys=True, separators=(",", ":"),
+            )
+            for item in ids if item in self.chapter.modifiers
+        )
+
+    def _modifier_object_signature(self, obj: DocumentObject) -> tuple:
+        pixels: tuple = ()
+        if isinstance(obj, RasterObject):
+            pixels = tuple(sorted(
+                (key, int(image.cacheKey()))
+                for key, image in self.tiles.object_tiles(
+                    obj.object_id
+                ).items()
+            ))
+        elif isinstance(obj, ImageObject):
+            pixels = (int(self.images.image(obj.object_id).cacheKey()),)
+        live = ()
+        if obj.object_id == self.selected_object_id:
+            live = (
+                self._vector_eraser_preview_revision,
+                tuple(sorted(
+                    (key, int(image.cacheKey()))
+                    for key, image in self._vector_preview_tiles.object_tiles(
+                        self._vector_preview_id
+                    ).items()
+                )),
+                tuple(self._multi_transform_preview_quads.get(
+                    obj.object_id, ()
+                )),
+            )
+        return (
+            json.dumps(
+                obj.to_dict(), sort_keys=True, separators=(",", ":")
+            ),
+            self._modifier_parameter_signature(obj.modifier_ids),
+            pixels, live,
+        )
+
+    def _modifier_layer_signature(self, layer_id: str) -> tuple:
+        layer = self.chapter.layers[layer_id]
+        children = []
+        for reference in layer.children:
+            if reference.kind == "layer":
+                children.append(self._modifier_layer_signature(
+                    reference.entity_id
+                ))
+            else:
+                children.append(self._modifier_object_signature(
+                    self.chapter.objects[reference.entity_id]
+                ))
+        preview = (
+            tuple(self._transform_preview_quad or ())
+            if self._geometry_transform_target == ("layer_group", layer_id)
+            else ()
+        )
+        return (
+            json.dumps(
+                layer.to_dict(), sort_keys=True, separators=(",", ":")
+            ),
+            self._modifier_parameter_signature(layer.modifier_ids),
+            tuple(children), preview,
+        )
+
+    def _modifier_cache_get(self, key: tuple) -> QImage | None:
+        image = self._modifier_render_cache.pop(key, None)
+        if image is None:
+            return None
+        self._modifier_render_cache[key] = image
+        return QImage(image)
+
+    def _modifier_cache_put(self, key: tuple, image: QImage) -> None:
+        size = int(image.sizeInBytes())
+        if size <= 0 or size > self._modifier_render_cache_budget:
+            return
+        previous = self._modifier_render_cache.pop(key, None)
+        if previous is not None:
+            self._modifier_render_cache_bytes -= int(previous.sizeInBytes())
+        self._modifier_render_cache[key] = QImage(image)
+        self._modifier_render_cache_bytes += size
+        while (
+            self._modifier_render_cache
+            and self._modifier_render_cache_bytes
+            > self._modifier_render_cache_budget
+        ):
+            _old_key, old_image = self._modifier_render_cache.popitem(
+                last=False
+            )
+            self._modifier_render_cache_bytes -= int(old_image.sizeInBytes())
+
+    def _render_modified_object(
+        self, painter: QPainter, obj: DocumentObject,
+        parent_opacity: float, local_visible: QRectF,
+    ) -> None:
+        modifiers = [
+            self.chapter.modifiers[item] for item in obj.modifier_ids
+            if item in self.chapter.modifiers
+        ]
+        world_bounds = self.object_world_rect(obj.object_id)
+        if world_bounds is None or world_bounds.isEmpty() or not modifiers:
+            self._render_modifier_sources.add(("object", obj.object_id))
+            try:
+                self._render_object(painter, obj, parent_opacity, local_visible)
+            finally:
+                self._render_modifier_sources.discard(("object", obj.object_id))
+            return
+        layer_transform = self.layer_world_transform(obj.parent_layer_id)
+        layer_inverse, valid = layer_transform.inverted()
+        if not valid:
+            return
+        local = layer_inverse.mapRect(world_bounds)
+        expansion = max((
+            modifier.strength * 3.0
+            for modifier in modifiers if isinstance(modifier, BlurModifier)
+        ), default=0.0)
+        local.adjust(-expansion, -expansion, expansion, expansion)
+        bounds = QRectF(
+            math.floor(local.left()), math.floor(local.top()),
+            max(1, math.ceil(local.right()) - math.floor(local.left())),
+            max(1, math.ceil(local.bottom()) - math.floor(local.top())),
+        )
+        world_origin = layer_transform.map(bounds.topLeft())
+        cache_key = (
+            "object", obj.object_id,
+            self._modifier_object_signature(obj),
+            self._rect_signature(bounds), world_origin.toTuple(),
+        )
+        processed = self._modifier_cache_get(cache_key)
+        if processed is None:
+            image = QImage(
+                max(1, math.ceil(bounds.width())),
+                max(1, math.ceil(bounds.height())),
+                QImage.Format.Format_ARGB32_Premultiplied,
+            )
+            image.fill(Qt.GlobalColor.transparent)
+            source = QPainter(image)
+            source.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+            source.translate(-bounds.left(), -bounds.top())
+            self._render_modifier_sources.add(("object", obj.object_id))
+            try:
+                self._render_object_content(source, obj, bounds)
+                if isinstance(obj, VectorDrawingObject):
+                    self._render_modified_vector_pencil_preview(
+                        source, obj.parent_layer_id
+                    )
+            finally:
+                self._render_modifier_sources.discard(("object", obj.object_id))
+                source.end()
+            processed = apply_modifier_stack(
+                image, modifiers, world_origin.toTuple(),
+            )
+            self._modifier_cache_put(cache_key, processed)
+        opacity = (
+            parent_opacity
+            if obj.opacity_locked else parent_opacity * obj.opacity
+        )
+        if obj.object_id == self._live_underlay_object_id:
+            opacity *= 1.0 - self._live_underlay_amount
+        painter.save()
+        painter.setOpacity(opacity)
+        painter.drawImage(bounds.topLeft(), processed)
         painter.restore()
 
     def _render_raster_content(
@@ -6209,7 +6734,9 @@ class _CanvasLogic:
             and self._transform_preview_quad is not None
         )
         destination = (
-            list(self._transform_preview_quad) if preview
+            list(self._multi_transform_preview_quads[obj.object_id])
+            if obj.object_id in self._multi_transform_preview_quads
+            else list(self._transform_preview_quad) if preview
             else list(obj.transform_quad) if obj.transform_quad is not None
             else None
         )
@@ -6284,15 +6811,18 @@ class _CanvasLogic:
             else self.layer_effective_path(reference.layer_id)
         )
         bounds = path.boundingRect()
-        parent_x, parent_y = self.chapter.layer_world_translation(
-            parent.layer_id
-        )
-        reference_x, reference_y = self.chapter.layer_world_translation(
+        reference_world = self.layer_world_transform(
             reference.layer_id
+        ).map(path)
+        parent_inverse, valid = self.layer_world_transform(
+            parent.layer_id
+        ).inverted()
+        local_bounds = (
+            parent_inverse.map(reference_world).boundingRect()
+            if valid else bounds
         )
-        left = bounds.left() + reference_x - parent_x
-        top = bounds.top() + reference_y - parent_y
-        width, height = bounds.width(), bounds.height()
+        left, top = local_bounds.left(), local_bounds.top()
+        width, height = local_bounds.width(), local_bounds.height()
         margin = min(max(0.0, obj.margin), max(0.0, min(width, height) / 2 - 1))
         return QRectF(
             left + margin, top + margin,
@@ -6460,9 +6990,7 @@ class _CanvasLogic:
             return
         painter.save()
         for layer in self.chapter.ancestor_layers(obj.parent_layer_id):
-            wx, wy = self.chapter.layer_world_translation(layer.layer_id)
-            transform = QTransform()
-            transform.translate(wx, wy)
+            transform = self.layer_world_transform(layer.layer_id)
             if layer.bound is not None:
                 painter.setClipPath(
                     transform.map(self.layer_effective_path(layer.layer_id)),
@@ -6483,12 +7011,16 @@ class _CanvasLogic:
             and self._selected_vector_drawing() is not None
         ):
             drawing = self._selected_vector_drawing()
-            layer_x, layer_y = self.chapter.layer_world_translation(
-                drawing.parent_layer_id
-            )
             radius = 12.0 / max(self.scale, 0.05)
             painter.save()
-            painter.translate(layer_x + drawing.x, layer_y + drawing.y)
+            painter.setTransform(
+                self.layer_world_transform(drawing.parent_layer_id), True
+            )
+            if drawing.transform_quad is not None:
+                painter.setTransform(
+                    self._drawing_object_transform(drawing), True
+                )
+            painter.translate(drawing.x, drawing.y)
             overlay = QColor(255, 139, 30, 72)
             sweep = self._vector_simplify_overlay or self._vector_sweep
             if len(sweep) == 1:
@@ -6516,11 +7048,17 @@ class _CanvasLogic:
         ):
             return
         drawing = self._active_vector_drawing()
-        layer_x, layer_y = self.chapter.layer_world_translation(
-            drawing.parent_layer_id
-        )
+        if drawing.modifier_ids or any(
+            layer.modifier_ids for layer in self.chapter.ancestor_layers(
+                drawing.parent_layer_id
+            )
+        ):
+            # The isolated modifier source pass owns this live overlay.
+            return
         painter.save()
-        painter.translate(layer_x, layer_y)
+        parent_transform = self.layer_world_transform(drawing.parent_layer_id)
+        painter.setTransform(parent_transform, True)
+        parent_inverse, valid = parent_transform.inverted()
         if drawing.transform_quad is not None:
             painter.setTransform(
                 self._drawing_object_transform(drawing), True
@@ -6528,7 +7066,8 @@ class _CanvasLogic:
         painter.translate(drawing.x, drawing.y)
         local_visible = self._drawing_local_visible_rect(
             drawing,
-            self.visible_document_rect().translated(-layer_x, -layer_y),
+            parent_inverse.mapRect(self.visible_document_rect())
+            if valid else self.visible_document_rect(),
         )
         tile_size = self._vector_preview_tiles.tile_size
         for (tile_x, tile_y), image in self._vector_preview_tiles.iter_tiles(
@@ -6604,6 +7143,8 @@ class _CanvasLogic:
         source_height = geometry["height"] if geometry else obj.pixel_height
         source = QRectF(0, 0, source_width, source_height)
         destination = self._image_local_quad(obj)
+        if obj.object_id in self._multi_transform_preview_quads:
+            destination = list(self._multi_transform_preview_quads[obj.object_id])
         if (
             obj.object_id == self.selected_object_id
             and self._transform_preview_quad is not None
@@ -6634,6 +7175,47 @@ class _CanvasLogic:
             )
         else:
             painter.drawImage(source, image)
+        painter.restore()
+
+    def _render_modified_vector_pencil_preview(
+        self, painter: QPainter, coordinate_parent_id: str,
+    ) -> None:
+        drawing = self._active_vector_drawing()
+        if (
+            drawing is None or self._vector_gesture_mode != "pencil"
+            or not self._vector_samples
+        ):
+            return
+        if coordinate_parent_id != drawing.parent_layer_id:
+            ancestors = {
+                layer.layer_id for layer in self.chapter.ancestor_layers(
+                    drawing.parent_layer_id
+                )
+            }
+            if coordinate_parent_id not in ancestors:
+                return
+        coordinate_transform = (
+            self.layer_world_transform(coordinate_parent_id)
+            if coordinate_parent_id else QTransform()
+        )
+        coordinate_inverse, valid = coordinate_transform.inverted()
+        if not valid:
+            return
+        relative = self.layer_world_transform(
+            drawing.parent_layer_id
+        ) * coordinate_inverse
+        painter.save()
+        painter.setTransform(relative, True)
+        if drawing.transform_quad is not None:
+            painter.setTransform(
+                self._drawing_object_transform(drawing), True
+            )
+        painter.translate(drawing.x, drawing.y)
+        tile_size = self._vector_preview_tiles.tile_size
+        for (tile_x, tile_y), image in self._vector_preview_tiles.iter_tiles(
+            self._vector_preview_id, None
+        ):
+            painter.drawImage(tile_x * tile_size, tile_y * tile_size, image)
         painter.restore()
 
     def _draw_simplify_hover(self, painter: QPainter) -> None:
@@ -6720,9 +7302,10 @@ class _CanvasLogic:
         painter.setBrush(Qt.NoBrush)
         if self.selected_object_id and self.active_layer_id in self.chapter.layers:
             active = self.chapter.layers[self.active_layer_id]
-            world_x, world_y = self.chapter.layer_world_translation(active.layer_id)
             painter.save()
-            painter.translate(world_x, world_y)
+            painter.setTransform(
+                self.layer_world_transform(active.layer_id), True
+            )
             orange = QPen(
                 QColor("#f2a23a"), 2 / max(self.scale, 0.05), Qt.DotLine
             )
@@ -6736,44 +7319,65 @@ class _CanvasLogic:
         if self.selected_kind == "layer":
             layer = self.chapter.layers.get(self.selected_id)
             if layer:
-                world_x, world_y = self.chapter.layer_world_translation(layer.layer_id)
                 if self.tool == ToolKind.SHAPE_EDIT and layer.bound is not None:
                     self._draw_shape_overlay(painter)
-                painter.translate(world_x, world_y)
                 if layer.bound is not None:
+                    painter.save()
+                    painter.setTransform(
+                        self.layer_world_transform(layer.layer_id), True
+                    )
                     painter.drawPath(self.layer_effective_path(layer.layer_id))
+                    painter.restore()
                 if (
-                    self.tool == ToolKind.SHAPE_EDIT
+                    self.tool in {ToolKind.SHAPE_EDIT, ToolKind.TRANSFORM}
                     and layer.bound is not None
                 ):
-                    if (
-                        self._geometry_transform_target
-                        == ("layer", layer.layer_id)
-                        and self._transform_preview_quad is not None
-                    ):
-                        control_quad = self._transform_preview_quad
-                    else:
-                        left, top, width, height = layer.bound.bbox()
-                        control_quad = self._rect_quad(QRectF(
-                            left, top, max(1.0, width),
-                            max(1.0, height)
-                        ))
-                    self._draw_transform_controls(
-                        painter, control_quad,
-                        (
-                            QPointF(
-                                self._transform_pivot.x() - world_x,
-                                self._transform_pivot.y() - world_y,
-                            )
-                            if self._transform_pivot is not None else None
-                        ),
-                        use_global_pivot=False,
-                    )
+                    cage = self._active_transform_cage()
+                    if cage is not None:
+                        self._draw_transform_controls(
+                            painter, cage[0], self._transform_pivot,
+                            use_global_pivot=True,
+                        )
                 if self.tool == ToolKind.BOUND_EDIT and layer.bound is not None:
+                    painter.save()
+                    painter.setTransform(
+                        self.layer_world_transform(layer.layer_id), True
+                    )
                     self._draw_shape_edit_handles(
                         painter, layer.bound, layer.shape_style
                     )
+                    painter.restore()
         else:
+            if len(self.selected_entities) > 1:
+                painter.save()
+                painter.setPen(QPen(
+                    QColor("#7fd2ff"),
+                    1.3 / max(self.scale, 0.05), Qt.PenStyle.DotLine,
+                ))
+                for kind, entity_id in self.selected_entities:
+                    if kind != "object":
+                        continue
+                    local_preview = self._multi_transform_preview_quads.get(
+                        entity_id
+                    )
+                    if local_preview is not None:
+                        obj = self.chapter.objects.get(entity_id)
+                        transform = self.layer_world_transform(
+                            obj.parent_layer_id
+                        )
+                        outline = [
+                            transform.map(QPointF(*value))
+                            for value in local_preview
+                        ]
+                    else:
+                        outline = [
+                            QPointF(*value) for value in (
+                                self.object_world_quad(entity_id) or []
+                            )
+                        ]
+                    if outline:
+                        painter.drawPolygon(QPolygonF(outline))
+                painter.restore()
             quad = self._selected_world_quad()
             if quad:
                 polygon = QPolygonF([QPointF(*point) for point in quad])
@@ -6858,13 +7462,12 @@ class _CanvasLogic:
                     self.tool == ToolKind.SHAPE_EDIT
                     and isinstance(selected_object, SpeedLineCenterObject)
                 ):
-                    layer_x, layer_y = (
-                        self.chapter.layer_world_translation(
-                            selected_object.parent_layer_id
-                        )
-                    )
                     painter.save()
-                    painter.translate(layer_x, layer_y)
+                    painter.setTransform(
+                        self.layer_world_transform(
+                            selected_object.parent_layer_id
+                        ), True
+                    )
                     self._draw_shape_edit_handles(
                         painter, selected_object.geometry
                     )
@@ -6912,14 +7515,14 @@ class _CanvasLogic:
     def _gradient_local_to_world(
         self, obj: GradientObject, point: tuple[float, float],
     ) -> QPointF:
-        x, y = self.chapter.layer_world_translation(obj.parent_layer_id)
-        return QPointF(point[0] + x, point[1] + y)
+        return self.layer_world_transform(obj.parent_layer_id).map(
+            QPointF(*point)
+        )
 
     def _gradient_world_to_local(
         self, obj: GradientObject, point: QPointF,
     ) -> QPointF:
-        x, y = self.chapter.layer_world_translation(obj.parent_layer_id)
-        return QPointF(point.x() - x, point.y() - y)
+        return self._layer_world_to_local(obj.parent_layer_id, point)
 
     @staticmethod
     def _rotated_gradient_point(
@@ -7092,13 +7695,10 @@ class _CanvasLogic:
         if isinstance(obj, SpeedLinesGradientObject):
             center = self.chapter.speed_center_for(obj.object_id)
             if center is not None:
-                center_x, center_y = (
-                    self.chapter.layer_world_translation(
-                        center.parent_layer_id
-                    )
-                )
                 painter.save()
-                painter.translate(center_x, center_y)
+                painter.setTransform(
+                    self.layer_world_transform(center.parent_layer_id), True
+                )
                 painter.setPen(QPen(
                     QColor("#9BDDF0"), 1.5 / scale, Qt.DashLine
                 ))
@@ -7106,11 +7706,10 @@ class _CanvasLogic:
                 painter.restore()
                 painter.setPen(QPen(QColor("#ff9f22"), 2 / scale))
         if obj.field_type == "line":
-            layer_x, layer_y = self.chapter.layer_world_translation(
-                obj.parent_layer_id
-            )
             painter.save()
-            painter.translate(layer_x, layer_y)
+            painter.setTransform(
+                self.layer_world_transform(obj.parent_layer_id), True
+            )
             painter.drawPath(self.bound_path(obj.line_field.geometry))
             selected_id = self._selected_shape_node_id
             for node in obj.line_field.geometry.nodes:
@@ -7585,22 +8184,46 @@ class _CanvasLogic:
             ToolKind.DRAW_SELECT_STROKE,
         } and self._selection_transform_quad:
             return list(self._selection_transform_quad), "selection"
-        if self.selected_kind == "layer" and self.tool == ToolKind.SHAPE_EDIT:
+        if self.selected_kind == "layer" and self.tool in {
+            ToolKind.SHAPE_EDIT, ToolKind.TRANSFORM,
+        }:
             layer = self.chapter.layers.get(self.selected_id)
             if layer is None or layer.bound is None:
                 return None
-            wx, wy = self.chapter.layer_world_translation(layer.layer_id)
             if (
-                self._geometry_transform_target == ("layer", layer.layer_id)
+                self._geometry_transform_target in {
+                    ("layer", layer.layer_id),
+                    ("layer_group", layer.layer_id),
+                }
                 and self._transform_preview_quad is not None
             ):
                 local_quad = self._transform_preview_quad
+                transform = (
+                    self.layer_world_transform(layer.parent_id)
+                    if self._geometry_transform_target[0] == "layer_group"
+                    and layer.parent_id else
+                    QTransform()
+                    if self._geometry_transform_target[0] == "layer_group"
+                    else self.layer_world_transform(layer.layer_id)
+                )
             else:
                 left, top, width, height = layer.bound.bbox()
                 local_quad = self._rect_quad(QRectF(
                     left, top, max(1.0, width), max(1.0, height)
                 ))
-            return [(x + wx, y + wy) for x, y in local_quad], "object"
+                transform = self.layer_world_transform(layer.layer_id)
+            return [
+                transform.map(QPointF(x, y)).toTuple()
+                for x, y in local_quad
+            ], "object"
+        if len(self.selected_entities) > 1 and self.tool == ToolKind.TRANSFORM:
+            quad = (
+                self._transform_preview_quad
+                if self._geometry_transform_target == ("multi", "")
+                and self._transform_preview_quad is not None
+                else self._multi_selection_cage()
+            )
+            return (list(quad), "object") if quad else None
         if self.selected_kind != "object" or not self.selected_object_id:
             return None
         obj = self.chapter.objects.get(self.selected_object_id)
@@ -7967,6 +8590,120 @@ class _CanvasLogic:
                     self._vector_world_point(drawing, QPointF(*position)),
                     radius, radius
                 )
+        painter.restore()
+
+    def _draw_eyedropper_swatch(self, painter: QPainter) -> None:
+        if (
+            not self._eyedropper_sampling
+            or not self._eyedropper_last_color
+            or self._eyedropper_widget_point is None
+        ):
+            return
+        radius = 15.0
+        center = QPointF(
+            self._eyedropper_widget_point.x(),
+            self._eyedropper_widget_point.y() - 40.0,
+        )
+        center.setX(max(radius + 2, min(self.width() - radius - 2, center.x())))
+        center.setY(max(radius + 2, min(self.height() - radius - 2, center.y())))
+        circle = QPainterPath()
+        circle.addEllipse(center, radius, radius)
+        painter.save()
+        painter.setTransform(QTransform())
+        painter.setClipPath(circle)
+        cell = 5
+        bounds = circle.boundingRect().toAlignedRect()
+        for row, y in enumerate(range(bounds.top(), bounds.bottom() + 1, cell)):
+            for column, x in enumerate(
+                range(bounds.left(), bounds.right() + 1, cell)
+            ):
+                painter.fillRect(
+                    QRect(x, y, cell, cell),
+                    QColor("#d6d6d6" if (row + column) % 2 else "#8f8f8f"),
+                )
+        painter.fillPath(circle, QColor(self._eyedropper_last_color))
+        painter.setClipping(False)
+        outline = QColor("#ffffff")
+        if QColor(self._eyedropper_last_color).lightnessF() > 0.72:
+            outline = QColor("#171717")
+        painter.setBrush(Qt.NoBrush)
+        painter.setPen(QPen(outline, 2.0))
+        painter.drawPath(circle)
+        painter.restore()
+
+    def _active_focal_modifier(self) -> BlurModifier | None:
+        if self.chapter is None or not self.active_modifier_id:
+            return None
+        modifier = self.chapter.modifiers.get(self.active_modifier_id)
+        if not isinstance(modifier, BlurModifier) or modifier.mode != "focal":
+            return None
+        if not any(
+            target in self.chapter.modifier_target_ids(modifier.modifier_id)
+            for target in self.selected_entities
+        ):
+            return None
+        return modifier
+
+    @staticmethod
+    def _focal_points(
+        modifier: BlurModifier,
+    ) -> tuple[QPointF, QPointF, QPointF]:
+        center = QPointF(*modifier.focal_center)
+        direction = QPointF(
+            math.cos(modifier.focal_angle),
+            math.sin(modifier.focal_angle),
+        )
+        end = center + direction * modifier.focal_radius
+        ramp = center + direction * (
+            modifier.focal_radius * modifier.focal_ramp
+        )
+        return center, ramp, end
+
+    def _transform_single_target_focal_modifiers(
+        self, kind: str, entity_id: str, transform: QTransform,
+    ) -> None:
+        """Keep a sole target's document-space focal rig attached to it."""
+        target = self.chapter.modifier_target(kind, entity_id)
+        if target is None:
+            return
+        for modifier_id in target.modifier_ids:
+            modifier = self.chapter.modifiers.get(modifier_id)
+            if not isinstance(modifier, BlurModifier) or len(
+                self.chapter.modifier_target_ids(modifier_id)
+            ) != 1:
+                continue
+            center, _ramp, end = self._focal_points(modifier)
+            mapped_center = transform.map(center)
+            mapped_end = transform.map(end)
+            delta = mapped_end - mapped_center
+            modifier.focal_center = mapped_center.toTuple()
+            modifier.focal_radius = max(
+                1.0, math.hypot(delta.x(), delta.y())
+            )
+            modifier.focal_angle = math.atan2(delta.y(), delta.x())
+
+    def _draw_focal_modifier_handles(self, painter: QPainter) -> None:
+        modifier = self._active_focal_modifier()
+        if modifier is None:
+            return
+        center, ramp, end = self._focal_points(modifier)
+        scale = max(0.05, self.scale)
+        painter.save()
+        painter.setBrush(Qt.NoBrush)
+        painter.setPen(QPen(
+            QColor("#ff7417"), 1.7 / scale, Qt.PenStyle.SolidLine
+        ))
+        painter.drawLine(center, end)
+        painter.setPen(QPen(
+            QColor("#ff8b26"), 1.4 / scale, Qt.PenStyle.DotLine
+        ))
+        painter.drawEllipse(
+            center, modifier.focal_radius, modifier.focal_radius
+        )
+        for point, radius in ((center, 7.0), (ramp, 5.5), (end, 6.5)):
+            painter.setPen(QPen(QColor("#452005"), 1.5 / scale))
+            painter.setBrush(QColor("#ff8b26"))
+            painter.drawEllipse(point, radius / scale, radius / scale)
         painter.restore()
 
     def _draw_path_node_handle(
@@ -8646,6 +9383,7 @@ class _CanvasLogic:
                 "bound": BoundGeometry.path(self._creation_nodes, False),
                 "style": self._creation_style or ShapeStyle(),
                 "offset": QPointF(),
+                "transform": QTransform(),
                 "layer": None,
                 "compound_parent": self._compound_parent_for_child_parent(
                     self._creation_parent_id
@@ -8656,12 +9394,12 @@ class _CanvasLogic:
             layer = self.chapter.layers.get(self.selected_id)
             if layer is None or layer.bound is None or layer.layer_kind == "fill":
                 return None
-            wx, wy = self.chapter.layer_world_translation(layer.layer_id)
             return {
                 "mode": "edit",
                 "bound": layer.bound,
                 "style": layer.shape_style,
-                "offset": QPointF(wx, wy),
+                "offset": QPointF(),
+                "transform": self.layer_world_transform(layer.layer_id),
                 "layer": layer,
                 "compound_parent": self._compound_parent_for_child_parent(
                     layer.parent_id
@@ -8676,8 +9414,11 @@ class _CanvasLogic:
             return None
         left, top, width, height = context["bound"].bbox()
         offset = context["offset"]
-        top_right = QPointF(left + width, top) + offset
-        bottom_right = QPointF(left + width, top + height) + offset
+        transform = context["transform"]
+        top_right = transform.map(QPointF(left + width, top) + offset)
+        bottom_right = transform.map(
+            QPointF(left + width, top + height) + offset
+        )
         edge = bottom_right - top_right
         handles: dict[str, QPointF] = {}
         if not context["bound"].closed:
@@ -8689,7 +9430,7 @@ class _CanvasLogic:
         )
         occupied = [
             self.document_to_widget(
-                QPointF(node.x, node.y) + offset
+                transform.map(QPointF(node.x, node.y) + offset)
             )
             for contour in context["bound"].iter_contours()
             for node in contour.nodes
@@ -8728,10 +9469,10 @@ class _CanvasLogic:
                 handles["outline_thickness"] = midpoint + direction * 24
 
         world_corners = [
-            QPointF(left, top) + offset,
-            QPointF(left + width, top) + offset,
-            QPointF(left + width, top + height) + offset,
-            QPointF(left, top + height) + offset,
+            transform.map(QPointF(left, top) + offset),
+            transform.map(QPointF(left + width, top) + offset),
+            transform.map(QPointF(left + width, top + height) + offset),
+            transform.map(QPointF(left, top + height) + offset),
         ]
         bounds = self.camera_transform().map(
             QPolygonF(world_corners)
@@ -8953,9 +9694,7 @@ class _CanvasLogic:
             virtual_operation=self._creation_compound_operation,
         )
         original = self.layer_effective_path(parent.layer_id)
-        wx, wy = self.chapter.layer_world_translation(parent.layer_id)
-        transform = QTransform()
-        transform.translate(wx, wy)
+        transform = self.layer_world_transform(parent.layer_id)
         return transform.map(original), transform.map(prospective)
 
     def _draw_creation_preview(self, painter: QPainter) -> None:
@@ -9060,47 +9799,37 @@ class _CanvasLogic:
         obj = self.chapter.objects.get(object_id)
         if obj is None:
             return None
-        layer_x, layer_y = self.chapter.layer_world_translation(obj.parent_layer_id)
+        layer_transform = self.layer_world_transform(obj.parent_layer_id)
+        def world_quad(local_quad):
+            return [
+                layer_transform.map(QPointF(x, y)).toTuple()
+                for x, y in local_quad
+            ]
         if isinstance(obj, TextObject):
             local_quad = (
                 self._rect_quad(self._strict_text_rect(obj))
                 if obj.layout_mode == "strict" else self._text_quad(obj)
             )
-            return [(x + layer_x, y + layer_y) for x, y in local_quad]
+            return world_quad(local_quad)
         if isinstance(obj, RasterObject):
             if obj.transform_quad is not None:
-                return [
-                    (x + layer_x, y + layer_y)
-                    for x, y in obj.transform_quad
-                ]
+                return world_quad(obj.transform_quad)
             bounds = QRectF(*obj.interaction_rect)
             local = QRectF(
                 obj.x + bounds.x(), obj.y + bounds.y(),
                 bounds.width(), bounds.height(),
             )
-            return [
-                (x + layer_x, y + layer_y)
-                for x, y in self._rect_quad(local)
-            ]
+            return world_quad(self._rect_quad(local))
         if isinstance(obj, VectorDrawingObject):
             if obj.transform_quad is not None:
-                return [
-                    (x + layer_x, y + layer_y)
-                    for x, y in obj.transform_quad
-                ]
+                return world_quad(obj.transform_quad)
             left, top, width, height = obj.derived_bounds()
             local = QRectF(
                 obj.x + left, obj.y + top, max(1.0, width), max(1.0, height)
             )
-            return [
-                (x + layer_x, y + layer_y)
-                for x, y in self._rect_quad(local)
-            ]
+            return world_quad(self._rect_quad(local))
         if isinstance(obj, ImageObject):
-            return [
-                (x + layer_x, y + layer_y)
-                for x, y in self._image_local_quad(obj)
-            ]
+            return world_quad(self._image_local_quad(obj))
         if isinstance(obj, VectorFillObject):
             owner = self.chapter.objects.get(obj.owner_drawing_id)
             owner_x = owner.x if isinstance(owner, VectorDrawingObject) else 0.0
@@ -9110,10 +9839,7 @@ class _CanvasLogic:
                 owner_x + left, owner_y + top,
                 max(1.0, width), max(1.0, height),
             )
-            return [
-                (x + layer_x, y + layer_y)
-                for x, y in self._rect_quad(local)
-            ]
+            return world_quad(self._rect_quad(local))
         if isinstance(obj, GradientObject):
             if obj.field_type == "line":
                 bounds = self.bound_path(
@@ -9137,9 +9863,7 @@ class _CanvasLogic:
                         (-field.radius_x, radius_y),
                     )
                 ]
-                return [
-                    (x + layer_x, y + layer_y) for x, y in corners
-                ]
+                return world_quad(corners)
             else:
                 bounds = self.layer_effective_path(
                     obj.parent_layer_id
@@ -9148,18 +9872,17 @@ class _CanvasLogic:
                 bounds.left(), bounds.top(),
                 max(1.0, bounds.width()), max(1.0, bounds.height()),
             )
-            return [
-                (x + layer_x, y + layer_y)
-                for x, y in self._rect_quad(bounds)
-            ]
-        return [
-            (layer_x + obj.x, layer_y + obj.y),
-            (layer_x + obj.x + 80, layer_y + obj.y),
-            (layer_x + obj.x + 80, layer_y + obj.y + 80),
-            (layer_x + obj.x, layer_y + obj.y + 80),
-        ]
+            return world_quad(self._rect_quad(bounds))
+        return world_quad(self._rect_quad(QRectF(obj.x, obj.y, 80, 80)))
 
     def _selected_world_quad(self) -> list[tuple[float, float]] | None:
+        if len(self.selected_entities) > 1:
+            if (
+                self._geometry_transform_target == ("multi", "")
+                and self._transform_preview_quad is not None
+            ):
+                return list(self._transform_preview_quad)
+            return self._multi_selection_cage()
         if (
             self._geometry_transform_target is not None
             and self._geometry_transform_target[0] == "object"
@@ -9169,11 +9892,9 @@ class _CanvasLogic:
                 self._geometry_transform_target[1]
             )
             if obj is not None:
-                layer_x, layer_y = self.chapter.layer_world_translation(
-                    obj.parent_layer_id
-                )
+                transform = self.layer_world_transform(obj.parent_layer_id)
                 return [
-                    (x + layer_x, y + layer_y)
+                    transform.map(QPointF(x, y)).toTuple()
                     for x, y in self._transform_preview_quad
                 ]
         if (
@@ -9182,9 +9903,9 @@ class _CanvasLogic:
             and self.selected_object_id
         ):
             obj = self.chapter.objects[self.selected_object_id]
-            layer_x, layer_y = self.chapter.layer_world_translation(obj.parent_layer_id)
+            transform = self.layer_world_transform(obj.parent_layer_id)
             return [
-                (x + layer_x, y + layer_y)
+                transform.map(QPointF(x, y)).toTuple()
                 for x, y in self._transform_preview_quad
             ]
         return self.object_world_quad(self.selected_id)
@@ -9206,20 +9927,20 @@ class _CanvasLogic:
                 self._geometry_transform_target == ("layer", layer.layer_id)
                 and self._transform_preview_quad is not None
             ):
-                wx, wy = self.chapter.layer_world_translation(layer.layer_id)
-                rect = QPolygonF([
-                    QPointF(x + wx, y + wy)
-                    for x, y in self._transform_preview_quad
-                ]).boundingRect()
+                transform = self.layer_world_transform(layer.layer_id)
+                rect = transform.map(QPolygonF([
+                    QPointF(x, y) for x, y in self._transform_preview_quad
+                ])).boundingRect()
                 polygon = self.camera_transform().map(QPolygonF(rect))
                 return polygon.boundingRect().toAlignedRect()
             if layer.bound is None and layer.parent_id:
                 layer = self.chapter.layers[layer.parent_id]
             if layer.bound is None:
                 return QRect()
-            wx, wy = self.chapter.layer_world_translation(layer.layer_id)
             x, y, width, height = layer.bound.bbox()
-            rect = QRectF(wx + x, wy + y, width, height)
+            rect = self.layer_world_transform(layer.layer_id).mapRect(
+                QRectF(x, y, width, height)
+            )
             if layer.layer_kind == "open_shape":
                 padding = (
                     layer.shape_style.base_thickness
@@ -9267,7 +9988,6 @@ class _CanvasLogic:
             if child.ignore_parent_mask:
                 skipped_masks.add(parent.layer_id)
         for layer in layers:
-            wx, wy = self.chapter.layer_world_translation(layer.layer_id)
             if not layer.visible:
                 return False
             if (
@@ -9275,7 +9995,8 @@ class _CanvasLogic:
                 and layer.layer_id not in skipped_masks
             ):
                 path = self.layer_effective_path(layer.layer_id)
-                if not path.contains(QPointF(point.x() - wx, point.y() - wy)):
+                local = self._layer_world_to_local(layer.layer_id, point)
+                if not path.contains(local):
                     return False
         return True
 
@@ -9352,10 +10073,7 @@ class _CanvasLogic:
         if isinstance(obj, GradientObject):
             if not obj.opacity_locked and obj.opacity <= 0:
                 return False
-            layer_x, layer_y = self.chapter.layer_world_translation(
-                obj.parent_layer_id
-            )
-            local = QPointF(point.x() - layer_x, point.y() - layer_y)
+            local = self._layer_world_to_local(obj.parent_layer_id, point)
             if self._is_outward_gradient(obj):
                 if obj.field_type == "radial":
                     field = obj.radial_field
@@ -9412,9 +10130,9 @@ class _CanvasLogic:
             if not parent.visible:
                 return False
             if parent.bound is not None and not current.ignore_parent_mask:
-                wx, wy = self.chapter.layer_world_translation(parent.layer_id)
                 path = self.layer_effective_path(parent.layer_id)
-                if not path.contains(QPointF(point.x() - wx, point.y() - wy)):
+                local = self._layer_world_to_local(parent.layer_id, point)
+                if not path.contains(local):
                     return False
             current = parent
         return True
@@ -9445,21 +10163,16 @@ class _CanvasLogic:
             is not None
         ):
             return False
-        wx, wy = self.chapter.layer_world_translation(layer_id)
-        local = QPointF(point.x() - wx, point.y() - wy)
         path = (
             self.layer_shape_path(layer)
             if raw else self.layer_effective_path(layer_id)
         )
+        world_path = self.layer_world_transform(layer_id).map(path)
         stroker = QPainterPathStroker()
-        visible_width = max(
-            24.0 / max(self.scale, 0.05),
-            layer.shape_style.outline_thickness * 2,
-        )
-        stroker.setWidth(visible_width)
-        border = stroker.createStroke(path)
-        return border.contains(local) or (
-            layer.layer_kind == "open_shape" and path.contains(local)
+        stroker.setWidth(24.0 / max(self.scale, 0.05))
+        border = stroker.createStroke(world_path)
+        return border.contains(point) or (
+            layer.layer_kind == "open_shape" and world_path.contains(point)
         )
 
     def hit_test_shape_edit_layers(
@@ -10287,14 +11000,6 @@ class _CanvasLogic:
         if event.key() == Qt.Key_Escape and self._page_creation_anchor_id:
             self._cancel_page_creation()
             event.accept()
-            return
-        if (
-            self.tool == ToolKind.SHAPE_EDIT
-            and self._geometry_transform_target is not None
-            and self._transform_start_quad is not None
-        ):
-            self._update_geometry_transform_preview(point)
-            self.update()
             return
         if (
             event.key() == Qt.Key_Escape
@@ -11132,12 +11837,10 @@ class _CanvasLogic:
     def _drawing_local_point(
         self, obj: RasterObject | VectorDrawingObject, world: QPointF,
     ) -> QPointF:
-        layer_x, layer_y = self.chapter.layer_world_translation(
-            obj.parent_layer_id
-        )
-        return QPointF(
-            world.x() - layer_x - obj.x,
-            world.y() - layer_y - obj.y,
+        return (
+            self._raster_local_point(obj, world)
+            if isinstance(obj, RasterObject)
+            else self._vector_local_point(obj, world)
         )
 
     def _point_inside_drawing_bounds(
@@ -11362,27 +12065,27 @@ class _CanvasLogic:
             return
         self._selection_transform_quad = target
         if isinstance(obj, VectorDrawingObject):
-            layer_x, layer_y = self.chapter.layer_world_translation(
-                obj.parent_layer_id
-            )
-            offset = QPointF(layer_x + obj.x, layer_y + obj.y)
-            transform = self._quad_to_quad_transform(start, target)
-            width_scale = math.sqrt(abs(transform.determinant()))
+            world_transform = self._quad_to_quad_transform(start, target)
+            local_to_world = self._drawing_local_to_world_transform(obj)
+            world_to_local, valid = local_to_world.inverted()
+            if not valid:
+                return
+            width_scale = math.sqrt(abs(world_transform.determinant()))
             self._selection_vector_preview = {}
             for point_id, source in self._selection_vector_points.items():
-                mapped = transform.map(
-                    QPointF(*source["position"]) + offset
-                ) - offset
+                mapped = world_to_local.map(world_transform.map(
+                    local_to_world.map(QPointF(*source["position"]))
+                ))
                 incoming = source["incoming"]
                 if incoming is not None:
-                    incoming = (
-                        transform.map(QPointF(*incoming) + offset) - offset
-                    ).toTuple()
+                    incoming = world_to_local.map(world_transform.map(
+                        local_to_world.map(QPointF(*incoming))
+                    )).toTuple()
                 outgoing = source["outgoing"]
                 if outgoing is not None:
-                    outgoing = (
-                        transform.map(QPointF(*outgoing) + offset) - offset
-                    ).toTuple()
+                    outgoing = world_to_local.map(world_transform.map(
+                        local_to_world.map(QPointF(*outgoing))
+                    )).toTuple()
                 self._selection_vector_preview[point_id] = {
                     "position": mapped.toTuple(),
                     "incoming": incoming,
@@ -11490,15 +12193,15 @@ class _CanvasLogic:
             or self._drawing_selection_path.isEmpty()
         ):
             return
-        layer_x, layer_y = self.chapter.layer_world_translation(
-            obj.parent_layer_id
-        )
-        offset = QPointF(layer_x + obj.x, layer_y + obj.y)
+        local_to_world = self._drawing_local_to_world_transform(obj)
+        world_to_local, valid = local_to_world.inverted()
+        if not valid:
+            return
         source_quad = [
-            (x - offset.x(), y - offset.y()) for x, y in start
+            world_to_local.map(QPointF(x, y)).toTuple() for x, y in start
         ]
         destination_local = [
-            (x - offset.x(), y - offset.y())
+            world_to_local.map(QPointF(x, y)).toTuple()
             for x, y in destination
         ]
         transform = self._quad_to_quad_transform(
@@ -11687,21 +12390,13 @@ class _CanvasLogic:
         if bounds.isNull() or bounds.isEmpty():
             self._selection_transform_quad = None
             return
-        layer_x, layer_y = self.chapter.layer_world_translation(
-            obj.parent_layer_id
-        )
-        offset_x, offset_y = layer_x + obj.x, layer_y + obj.y
+        transform = self._drawing_local_to_world_transform(obj)
         self._selection_transform_quad = [
-            (bounds.left() + offset_x, bounds.top() + offset_y),
-            (bounds.right() + offset_x, bounds.top() + offset_y),
-            (bounds.right() + offset_x, bounds.bottom() + offset_y),
-            (bounds.left() + offset_x, bounds.bottom() + offset_y),
+            transform.map(QPointF(*point)).toTuple()
+            for point in self._rect_quad(bounds)
         ]
         if self._selection_pivot is None:
-            center = bounds.center()
-            self._selection_pivot = QPointF(
-                center.x() + offset_x, center.y() + offset_y
-            )
+            self._selection_pivot = transform.map(bounds.center())
 
     def _begin_drawing_selection(
         self, world: QPointF, widget: QPointF, *,
@@ -11871,10 +12566,7 @@ class _CanvasLogic:
         obj = self._drawing_selection_object()
         if obj is None:
             return
-        layer_x, layer_y = self.chapter.layer_world_translation(
-            obj.parent_layer_id
-        )
-        offset = QPointF(layer_x + obj.x, layer_y + obj.y)
+        transform = self._drawing_local_to_world_transform(obj)
         painter.save()
         painter.setBrush(Qt.NoBrush)
         painter.setPen(QPen(
@@ -11882,9 +12574,10 @@ class _CanvasLogic:
             Qt.DashLine,
         ))
         if isinstance(obj, RasterObject) and not self._drawing_selection_path.isEmpty():
-            painter.translate(offset)
+            painter.save()
+            painter.setTransform(transform, True)
             painter.drawPath(self._drawing_selection_path)
-            painter.translate(-offset)
+            painter.restore()
         if self._drawing_selection_gesture:
             preview = QPainterPath()
             if self.tool == ToolKind.DRAW_SELECT_RECT:
@@ -11894,9 +12587,10 @@ class _CanvasLogic:
                 ).normalized())
             else:
                 preview.addPolygon(QPolygonF(self._drawing_selection_gesture))
-            painter.translate(offset)
+            painter.save()
+            painter.setTransform(transform, True)
             painter.drawPath(preview)
-            painter.translate(-offset)
+            painter.restore()
         if self._hover_vector_stroke_id and isinstance(
             obj, VectorDrawingObject
         ):
@@ -11908,9 +12602,10 @@ class _CanvasLogic:
                     QColor("#239cff"), 5 / max(self.scale, 0.05),
                     Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin,
                 ))
-                painter.translate(offset)
+                painter.save()
+                painter.setTransform(transform, True)
                 painter.drawPath(self._vector_centerline_path(stroke))
-                painter.translate(-offset)
+                painter.restore()
         quad = self._selection_transform_quad
         if quad:
             painter.setPen(QPen(
@@ -12284,9 +12979,13 @@ class _CanvasLogic:
         drawing = self._active_vector_drawing()
         if drawing is None:
             return
-        self._queue_visual_dirty(
+        modified = self._object_has_effect_modifiers(drawing.object_id)
+        world_dirty = self.modifier_expanded_dirty(
+            drawing.object_id,
             self._drawing_local_rect_to_world(drawing, dirty),
-            scene=False, notify_preview=False,
+        )
+        self._queue_visual_dirty(
+            world_dirty, scene=modified, notify_preview=False,
         )
 
     def _begin_vector_pencil(
@@ -12636,6 +13335,14 @@ class _CanvasLogic:
         world_dirty = self._drawing_local_rect_to_world(
             drawing, changed_bounds
         )
+        if self._object_has_effect_modifiers(drawing.object_id):
+            self._queue_visual_dirty(
+                self.modifier_expanded_dirty(
+                    drawing.object_id, world_dirty
+                ),
+                scene=True, notify_preview=False,
+            )
+            return
         widget_dirty = self._world_dirty_to_widget(world_dirty)
         if not widget_dirty.isEmpty():
             # The eraser owns a separate background, so repaint it directly;
@@ -13705,10 +14412,7 @@ class _CanvasLogic:
             if layer.shape_style.outline_thickness <= 0:
                 layer.shape_style.outline_thickness = 4.0
         elif layer.bound.closed:
-            world_x, world_y = self.chapter.layer_world_translation(
-                layer.layer_id
-            )
-            local = QPointF(world.x() - world_x, world.y() - world_y)
+            local = self._layer_world_to_local(layer.layer_id, world)
             if not self.layer_effective_path(layer.layer_id).contains(local):
                 return False
             layer.shape_style.primary_color = self.primary_color
@@ -13870,6 +14574,74 @@ class _CanvasLogic:
             self._finish_vector_fill(drawing)
 
     # ---- tool actions --------------------------------------------------
+    def _begin_modifier_handle(self, widget_point: QPointF) -> bool:
+        modifier = self._active_focal_modifier()
+        if modifier is None:
+            return False
+        points = self._focal_points(modifier)
+        widget_points = [self.camera_transform().map(point) for point in points]
+        hit = next((
+            index for index, candidate in enumerate(widget_points)
+            if math.dist(widget_point.toTuple(), candidate.toTuple()) <= 12.0
+        ), None)
+        if hit is None:
+            return False
+        self._modifier_handle_drag = {
+            "handle": ("center", "ramp", "end")[hit],
+            "before": self.chapter.to_dict(),
+            "press": self.widget_to_document(widget_point),
+            "center": tuple(modifier.focal_center),
+            "radius": modifier.focal_radius,
+            "ramp": modifier.focal_ramp,
+            "angle": modifier.focal_angle,
+        }
+        return True
+
+    def _move_modifier_handle(self, widget_point: QPointF) -> bool:
+        state = self._modifier_handle_drag
+        modifier = self._active_focal_modifier()
+        if state is None or modifier is None:
+            return False
+        point = self.widget_to_document(widget_point)
+        if state["handle"] == "center":
+            delta = point - state["press"]
+            modifier.focal_center = (
+                state["center"][0] + delta.x(),
+                state["center"][1] + delta.y(),
+            )
+        elif state["handle"] == "end":
+            center = QPointF(*modifier.focal_center)
+            delta = point - center
+            modifier.focal_radius = max(1.0, math.hypot(delta.x(), delta.y()))
+            modifier.focal_angle = math.atan2(delta.y(), delta.x())
+        else:
+            center = QPointF(*modifier.focal_center)
+            axis = QPointF(
+                math.cos(modifier.focal_angle),
+                math.sin(modifier.focal_angle),
+            )
+            projection = QPointF.dotProduct(point - center, axis)
+            modifier.focal_ramp = max(
+                0.0, min(1.0, projection / modifier.focal_radius)
+            )
+        modifier.validate()
+        self._invalidate_scene_cache()
+        self.documentChanged.emit(None)
+        self.update()
+        return True
+
+    def _finish_modifier_handle(self) -> bool:
+        state, self._modifier_handle_drag = self._modifier_handle_drag, None
+        if state is None or self.chapter is None:
+            return False
+        after = self.chapter.to_dict()
+        if state["before"] != after:
+            self.push_model_change(
+                state["before"], after, "Edit focal blur"
+            )
+        self.interactionFinished.emit()
+        return True
+
     def _dispatch_tool_press(
         self, widget_point: QPointF, pressure: float, modifiers,
     ) -> None:
@@ -13891,9 +14663,20 @@ class _CanvasLogic:
         self._press_widget_point = QPointF(widget_point)
         self._press_document_point = QPointF(point)
         if self.tool == ToolKind.EYEDROPPER:
+            self._eyedropper_widget_point = QPointF(widget_point)
             if self._sample_eyedropper(point):
                 self._eyedropper_sampling = True
                 self.eyedropperGestureChanged.emit(True)
+            return
+        if self._begin_modifier_handle(widget_point):
+            return
+        if self.tool == ToolKind.TRANSFORM and self._begin_multi_transform(point):
+            return
+        if (
+            self.tool == ToolKind.TRANSFORM
+            and self.selected_kind == "layer"
+            and self._begin_geometry_transform(point)
+        ):
             return
         if self._begin_page_gap_interaction(point):
             return
@@ -13909,8 +14692,11 @@ class _CanvasLogic:
         if self.tool == ToolKind.SHAPE_EDIT:
             target = self._shape_edit_target()
             if target is not None:
-                bound, wx, wy, style = target
-                local = QPointF(point.x() - wx, point.y() - wy)
+                bound, transform, style = target
+                inverse, valid = transform.inverted()
+                if not valid:
+                    return
+                local = inverse.map(point)
                 hit = self._shape_hit_test(
                     bound, local, geometry_only=style is None
                 )
@@ -14124,15 +14910,18 @@ class _CanvasLogic:
                 self.commit_active_text_edit()
                 obj = self.chapter.objects[self.selected_object_id]
                 world_quad = self.object_world_quad(obj.object_id)
-                layer_x, layer_y = self.chapter.layer_world_translation(
+                inverse, valid = self.layer_world_transform(
                     obj.parent_layer_id
-                )
+                ).inverted()
+                if not valid:
+                    return
                 self._transform_handle_index = handle
                 self._transform_drag_mode = mode
                 self._model_before = self.chapter.to_dict()
                 self._drag_start_doc = point
                 self._transform_start_quad = [
-                    (x - layer_x, y - layer_y) for x, y in world_quad
+                    inverse.map(QPointF(x, y)).toTuple()
+                    for x, y in world_quad
                 ]
                 self._transform_preview_quad = list(
                     self._transform_start_quad
@@ -14159,8 +14948,15 @@ class _CanvasLogic:
             world_quad = self.object_world_quad(self.selected_object_id)
             if not world_quad:
                 return
-            layer_x, layer_y = self.chapter.layer_world_translation(obj.parent_layer_id)
-            local_quad = [(x - layer_x, y - layer_y) for x, y in world_quad]
+            inverse, valid = self.layer_world_transform(
+                obj.parent_layer_id
+            ).inverted()
+            if not valid:
+                return
+            local_quad = [
+                inverse.map(QPointF(x, y)).toTuple()
+                for x, y in world_quad
+            ]
             mode, handle = self._transform_control_hit(world_quad, point)
             if not mode:
                 self._select_foreign_object_at(point, widget_point)
@@ -14263,7 +15059,11 @@ class _CanvasLogic:
             return
         point = self.widget_to_document(widget_point)
         if self.tool == ToolKind.EYEDROPPER and self._eyedropper_sampling:
+            self._eyedropper_widget_point = QPointF(widget_point)
             self._sample_eyedropper(point)
+            self.update()
+            return
+        if self._move_modifier_handle(widget_point):
             return
         if self.tool == ToolKind.VECTOR_EDIT and self._vector_before is None:
             drawing = self._selected_vector_drawing()
@@ -14287,6 +15087,13 @@ class _CanvasLogic:
             return
         if self.tool == ToolKind.INSERT_PAGE_GAP:
             self._update_page_gap_hover(point)
+            return
+        if (
+            self._geometry_transform_target is not None
+            and self._transform_start_quad is not None
+        ):
+            self._update_geometry_transform_preview(point)
+            self.update()
             return
         if (
             self._model_before is not None
@@ -14473,17 +15280,10 @@ class _CanvasLogic:
             )
         ):
             obj = self.chapter.objects[self.selected_object_id]
-            layer_x, layer_y = self.chapter.layer_world_translation(obj.parent_layer_id)
-            local_point = QPointF(
-                point.x() - layer_x - obj.x,
-                point.y() - layer_y - obj.y,
-            )
+            local_point = self._raster_local_point(obj, point)
             if self.settings.snap_to_grid:
                 snapped = self._snap(point, obj.parent_layer_id)
-                local_point = QPointF(
-                    snapped.x() - layer_x - obj.x,
-                    snapped.y() - layer_y - obj.y,
-                )
+                local_point = self._raster_local_point(obj, snapped)
             rect = self._resize_axis_rect(
                 QRectF(*self._drag_start_value), self._active_handle, local_point
             )
@@ -14520,10 +15320,13 @@ class _CanvasLogic:
             color = self._eyedropper_last_color
             self._eyedropper_sampling = False
             self._eyedropper_last_color = ""
+            self._eyedropper_widget_point = None
             if color:
                 self.colorSampleCommitted.emit(color)
             self.eyedropperGestureChanged.emit(False)
             self.interactionFinished.emit()
+            return
+        if self._finish_modifier_handle():
             return
         if self._finish_shape_property_drag():
             return
@@ -14651,6 +15454,7 @@ class _CanvasLogic:
             and self._model_before is not None
             and self._transform_preview_quad is not None
             and self.selected_object_id
+            and self._geometry_transform_target is None
         ):
             self._commit_object_transform()
             self.interactionFinished.emit()
@@ -14863,7 +15667,10 @@ class _CanvasLogic:
         ):
             return None
         before = before or self.chapter.to_dict()
-        parent_x, parent_y = self.chapter.layer_world_translation(parent_id)
+        parent_transform = self.layer_world_transform(parent_id)
+        parent_inverse, valid = parent_transform.inverted()
+        if not valid:
+            return None
         parent_bounds = self.layer_effective_path(parent_id).boundingRect()
         count = sum(
             isinstance(item, GradientObject)
@@ -14885,28 +15692,34 @@ class _CanvasLogic:
             local = BoundGeometry.from_dict(world_geometry.to_dict())
             for contour in local.iter_contours():
                 for node in contour.nodes:
-                    node.x -= parent_x
-                    node.y -= parent_y
+                    node.position = parent_inverse.map(
+                        QPointF(*node.position)
+                    ).toTuple()
                     if node.incoming is not None:
-                        node.incoming = (
-                            node.incoming[0] - parent_x,
-                            node.incoming[1] - parent_y,
-                        )
+                        node.incoming = parent_inverse.map(
+                            QPointF(*node.incoming)
+                        ).toTuple()
                     if node.outgoing is not None:
-                        node.outgoing = (
-                            node.outgoing[0] - parent_x,
-                            node.outgoing[1] - parent_y,
-                        )
+                        node.outgoing = parent_inverse.map(
+                            QPointF(*node.outgoing)
+                        ).toTuple()
             local.closed = False
             local.normalize_bezier_handles()
             obj.line_field = LineGradientField(local)
         elif radial is not None:
             (world_x, world_y), radius = radial
+            local_center = parent_inverse.map(QPointF(world_x, world_y))
+            local_edge = parent_inverse.map(QPointF(
+                world_x + radius, world_y
+            ))
+            local_radius = max(1.0, math.dist(
+                local_center.toTuple(), local_edge.toTuple()
+            ))
             obj.radial_field = RadialGradientField(
-                origin_x=world_x - parent_x,
-                origin_y=world_y - parent_y,
-                radius_x=radius,
-                radius_y=radius,
+                origin_x=local_center.x(),
+                origin_y=local_center.y(),
+                radius_x=local_radius,
+                radius_y=local_radius,
             )
         else:
             center = parent_bounds.center()
@@ -14972,16 +15785,33 @@ class _CanvasLogic:
             self.update()
             return
         before = self.chapter.to_dict()
-        layer_x, layer_y = self.chapter.layer_world_translation(parent_id)
+        parent_transform = self.layer_world_transform(parent_id)
+        parent_inverse, valid = parent_transform.inverted()
+        if not valid:
+            return
         count = sum(
             isinstance(item, RasterObject)
             for item in self.chapter.objects.values()
         ) + 1
         obj = RasterObject(
             name=f"Raster {count}",
-            x=world.left() - layer_x, y=world.top() - layer_y,
             interaction_rect=(0.0, 0.0, world.width(), world.height()),
         )
+        local_quad = [
+            parent_inverse.map(point).toTuple()
+            for point in (
+                world.topLeft(), world.topRight(),
+                world.bottomRight(), world.bottomLeft(),
+            )
+        ]
+        if parent_transform.type() in {
+            QTransform.TransformationType.TxNone,
+            QTransform.TransformationType.TxTranslate,
+        }:
+            obj.x, obj.y = local_quad[0]
+        else:
+            obj.transform_frame = (0.0, 0.0, world.width(), world.height())
+            obj.transform_quad = local_quad
         self.chapter.add_object(parent_id, obj, index=insertion_index)
         after = self.chapter.to_dict()
         self.push_model_change(before, after, "Add raster object")
@@ -14999,8 +15829,7 @@ class _CanvasLogic:
         ):
             return False
         layer = self.chapter.layers[self.active_layer_id]
-        world_x, world_y = self.chapter.layer_world_translation(layer.layer_id)
-        local = QPointF(point.x() - world_x, point.y() - world_y)
+        local = self._layer_world_to_local(layer.layer_id, point)
         if layer.bound is None:
             return False
         path = self.layer_effective_path(layer.layer_id)
@@ -15010,7 +15839,8 @@ class _CanvasLogic:
             return True
         stroker = QPainterPathStroker()
         stroker.setWidth(24.0 / max(self.scale, 0.05))
-        return not stroker.createStroke(path).contains(local)
+        world_path = self.layer_world_transform(layer.layer_id).map(path)
+        return not stroker.createStroke(world_path).contains(point)
 
     def _request_object_selection(
         self, point: QPointF, widget_point: QPointF,
@@ -15083,11 +15913,10 @@ class _CanvasLogic:
 
     def _shape_edit_target(
         self,
-    ) -> tuple[BoundGeometry, float, float, ShapeStyle | None] | None:
+    ) -> tuple[BoundGeometry, QTransform, ShapeStyle | None] | None:
         """Resolve the geometry edited by the shape-edit tool.
 
-        Returns (bound, world offset, world offset, style) for the selected
-        layer's bound or a selected speed-center object's geometry.
+        Returns geometry, its local-to-document transform, and optional style.
         """
         if self.selected_kind == "layer":
             layer = self.chapter.layers.get(self.selected_id)
@@ -15096,15 +15925,19 @@ class _CanvasLogic:
                 or layer.bound is None
             ):
                 return None
-            wx, wy = self.chapter.layer_world_translation(layer.layer_id)
-            return layer.bound, wx, wy, layer.shape_style
+            return (
+                layer.bound,
+                self.layer_world_transform(layer.layer_id),
+                layer.shape_style,
+            )
         if self.selected_kind == "object":
             obj = self.chapter.objects.get(self.selected_id)
             if isinstance(obj, SpeedLineCenterObject):
-                wx, wy = self.chapter.layer_world_translation(
-                    obj.parent_layer_id
+                return (
+                    obj.geometry,
+                    self.layer_world_transform(obj.parent_layer_id),
+                    None,
                 )
-                return obj.geometry, wx, wy, None
         return None
 
     def _delete_selected_shape_node(
@@ -15170,8 +16003,11 @@ class _CanvasLogic:
         target = self._shape_edit_target()
         if target is None:
             return False
-        bound, wx, wy, style = target
-        local = QPointF(world_point.x() - wx, world_point.y() - wy)
+        bound, transform, style = target
+        inverse, valid = transform.inverted()
+        if not valid:
+            return False
+        local = inverse.map(world_point)
         bound.normalize_bezier_handles()
         hit = self._shape_hit_test(
             bound, local, geometry_only=style is None
@@ -15406,13 +16242,16 @@ class _CanvasLogic:
         target = self._shape_edit_target()
         if target is None:
             return
-        bound, wx, wy, _style = target
+        bound, transform, _style = target
+        inverse, valid = transform.inverted()
+        if not valid:
+            return
         layer_id = (
             self.chapter.objects[self.selected_id].parent_layer_id
             if self.selected_kind == "object"
             else self.selected_id
         )
-        local = QPointF(world_point.x() - wx, world_point.y() - wy)
+        local = inverse.map(world_point)
         selected = self._selected_shape_node(bound)
         control = self._active_shape_control or ""
         if (
@@ -15428,8 +16267,7 @@ class _CanvasLogic:
             snapped = self._snap(world_point, layer_id)
             original = BoundGeometry.from_dict(self._drag_start_value)
             effective_index = self._move_bound_handle(
-                bound, index, QPointF(snapped.x() - wx, snapped.y() - wy),
-                original,
+                bound, index, inverse.map(snapped), original,
             )
             if effective_index < 4:
                 self._selected_shape_node_id = (
@@ -15438,29 +16276,29 @@ class _CanvasLogic:
         elif control.startswith("rectangle_point:"):
             index = int(control.split(":", 1)[1])
             snapped = self._snap(world_point, layer_id)
-            bound.nodes[index].position = (
-                snapped.x() - wx, snapped.y() - wy
-            )
+            bound.nodes[index].position = inverse.map(snapped).toTuple()
         elif control.startswith("rectangle_edge:"):
             index = int(control.split(":", 1)[1])
             original = BoundGeometry.from_dict(self._drag_start_value)
             first_index, second_index = index, (index + 1) % 4
-            delta = world_point - self._drag_start_doc
-            original_midpoint = QPointF(
+            original_midpoint_local = QPointF(
                 (
                     original.nodes[first_index].x
                     + original.nodes[second_index].x
-                ) / 2 + wx,
+                ) / 2,
                 (
                     original.nodes[first_index].y
                     + original.nodes[second_index].y
-                ) / 2 + wy,
+                ) / 2,
+            )
+            original_midpoint = transform.map(original_midpoint_local)
+            destination = world_point + (
+                original_midpoint - self._drag_start_doc
             )
             if self.settings.snap_to_grid:
-                target = self._snap(
-                    original_midpoint + delta, layer_id
-                )
-                delta = target - original_midpoint
+                destination = self._snap(destination, layer_id)
+            local_destination = inverse.map(destination)
+            delta = local_destination - original_midpoint_local
             for node_index in (first_index, second_index):
                 source = original.nodes[node_index]
                 bound.nodes[node_index].position = (
@@ -15513,7 +16351,7 @@ class _CanvasLogic:
                 bound.nodes[index].roundness_enabled = radius > 0
         elif control == "node" and selected is not None:
             snapped = self._snap(world_point, layer_id)
-            target = QPointF(snapped.x() - wx, snapped.y() - wy)
+            target = inverse.map(snapped)
             primary_start = self._shape_drag_nodes.get(
                 selected.node_id, self._drag_start_value
             )
@@ -15553,7 +16391,7 @@ class _CanvasLogic:
                 )
         elif control in {"incoming", "outgoing"} and selected is not None:
             snapped = self._snap(world_point, layer_id)
-            target = (snapped.x() - wx, snapped.y() - wy)
+            target = inverse.map(snapped).toTuple()
             self._move_shape_bezier_handle(
                 bound, selected, control, target
             )
@@ -15581,16 +16419,20 @@ class _CanvasLogic:
                 selected.roundness_enabled = True
         elif control == "translate":
             original = BoundGeometry.from_dict(self._drag_start_value)
-            dx = world_point.x() - self._drag_start_doc.x()
-            dy = world_point.y() - self._drag_start_doc.y()
+            local_start = inverse.map(self._drag_start_doc)
+            local_current = inverse.map(world_point)
+            dx = local_current.x() - local_start.x()
+            dy = local_current.y() - local_start.y()
             if self.settings.snap_to_grid:
-                anchor = QPointF(
-                    wx + original.nodes[0].x + dx,
-                    wy + original.nodes[0].y + dy,
+                anchor_local = QPointF(
+                    original.nodes[0].x + dx,
+                    original.nodes[0].y + dy,
                 )
-                snapped = self._snap(anchor, layer_id)
-                dx = snapped.x() - wx - original.nodes[0].x
-                dy = snapped.y() - wy - original.nodes[0].y
+                snapped = inverse.map(self._snap(
+                    transform.map(anchor_local), layer_id
+                ))
+                dx = snapped.x() - original.nodes[0].x
+                dy = snapped.y() - original.nodes[0].y
             bound.nodes = [
                 PathNode.from_dict(node.to_dict()) for node in original.nodes
             ]
@@ -15621,8 +16463,11 @@ class _CanvasLogic:
             self._shape_hover_insert = None
             self.setToolTip("")
             return
-        bound, wx, wy, style = target
-        local = QPointF(world_point.x() - wx, world_point.y() - wy)
+        bound, transform, style = target
+        inverse, valid = transform.inverted()
+        if not valid:
+            return
+        local = inverse.map(world_point)
         hit = self._shape_hit_test(
             bound, local, geometry_only=style is None
         )
@@ -15828,22 +16673,25 @@ class _CanvasLogic:
             return None
         parent_id, insertion_index = placement
         before = self.chapter.to_dict()
-        parent_x, parent_y = self.chapter.layer_world_translation(parent_id)
         local = BoundGeometry.from_dict(bound.to_dict())
+        parent_inverse, valid = self.layer_world_transform(
+            parent_id
+        ).inverted()
+        if not valid:
+            return None
         for contour in local.iter_contours():
             for node in contour.nodes:
-                node.x -= parent_x
-                node.y -= parent_y
+                node.position = parent_inverse.map(
+                    QPointF(*node.position)
+                ).toTuple()
                 if node.incoming:
-                    node.incoming = (
-                        node.incoming[0] - parent_x,
-                        node.incoming[1] - parent_y,
-                    )
+                    node.incoming = parent_inverse.map(
+                        QPointF(*node.incoming)
+                    ).toTuple()
                 if node.outgoing:
-                    node.outgoing = (
-                        node.outgoing[0] - parent_x,
-                        node.outgoing[1] - parent_y,
-                    )
+                    node.outgoing = parent_inverse.map(
+                        QPointF(*node.outgoing)
+                    ).toTuple()
         numbered = []
         for candidate in self.chapter.layers.values():
             if candidate.name.startswith("Layer "):
@@ -15946,8 +16794,31 @@ class _CanvasLogic:
         if geometry is None:
             return False
         before = self.chapter.to_dict()
-        root_x, root_y = self.chapter.layer_world_translation(layer_id)
+        root_world = self.layer_world_transform(layer_id)
+        root_inverse, valid = root_world.inverted()
+        if not valid:
+            return False
         removed_layers: set[str] = set()
+
+        def old_parent_to_root(parent_id: str, point: QPointF) -> QPointF:
+            return root_inverse.map(
+                self.layer_world_transform(parent_id).map(point)
+            )
+
+        def translation_between_parents(
+            parent_id: str,
+        ) -> tuple[float, float] | None:
+            origin = old_parent_to_root(parent_id, QPointF())
+            axis_x = old_parent_to_root(parent_id, QPointF(1, 0)) - origin
+            axis_y = old_parent_to_root(parent_id, QPointF(0, 1)) - origin
+            if (
+                abs(axis_x.x() - 1.0) < 1e-7
+                and abs(axis_x.y()) < 1e-7
+                and abs(axis_y.x()) < 1e-7
+                and abs(axis_y.y() - 1.0) < 1e-7
+            ):
+                return origin.x(), origin.y()
+            return None
 
         def removed_opacity(parent_id: str) -> float:
             factor = 1.0
@@ -15959,62 +16830,89 @@ class _CanvasLogic:
             return factor
 
         def reparent_object(obj: DocumentObject) -> ChildRef:
-            old_x, old_y = self.chapter.layer_world_translation(
-                obj.parent_layer_id
-            )
-            dx, dy = old_x - root_x, old_y - root_y
+            old_parent_id = obj.parent_layer_id
             moved_by_quad = False
             if isinstance(obj, TextObject):
                 if (
                     obj.layout_mode == "strict"
                     and obj.geometry_reference == "direct"
                 ):
-                    rect = self._strict_text_rect(obj).translated(dx, dy)
-                    obj.transform_quad = self._rect_quad(rect)
-                    obj.layout_mode = "free"
-                elif obj.layout_mode == "free" and obj.transform_quad:
+                    rect = self._strict_text_rect(obj)
                     obj.transform_quad = [
-                        (x + dx, y + dy) for x, y in obj.transform_quad
+                        old_parent_to_root(
+                            old_parent_id, QPointF(*point)
+                        ).toTuple()
+                        for point in self._rect_quad(rect)
+                    ]
+                    obj.layout_mode = "free"
+                elif obj.layout_mode == "free":
+                    source_quad = self._text_quad(obj)
+                    obj.transform_quad = [
+                        old_parent_to_root(
+                            old_parent_id, QPointF(x, y)
+                        ).toTuple()
+                        for x, y in source_quad
                     ]
                     moved_by_quad = True
-            elif isinstance(obj, (RasterObject, VectorDrawingObject, ImageObject)) \
-                    and obj.transform_quad:
-                obj.transform_quad = [
-                    (x + dx, y + dy) for x, y in obj.transform_quad
-                ]
-                moved_by_quad = True
+            elif isinstance(
+                obj, (RasterObject, VectorDrawingObject, ImageObject)
+            ):
+                simple_offset = translation_between_parents(old_parent_id)
+                if simple_offset is not None and obj.transform_quad is None:
+                    if obj.transform_frame is not None:
+                        left, top, width, height = obj.transform_frame
+                        obj.transform_frame = (
+                            left + simple_offset[0],
+                            top + simple_offset[1], width, height,
+                        )
+                else:
+                    if obj.transform_frame is None:
+                        obj.transform_frame = self._object_transform_frame(obj)
+                    source_quad = (
+                        list(obj.transform_quad)
+                        if obj.transform_quad is not None
+                        else self._rect_quad(QRectF(*obj.transform_frame))
+                    )
+                    obj.transform_quad = [
+                        old_parent_to_root(
+                            old_parent_id, QPointF(x, y)
+                        ).toTuple()
+                        for x, y in source_quad
+                    ]
+                    moved_by_quad = True
             elif isinstance(obj, GradientObject):
                 for contour in obj.line_field.geometry.iter_contours():
                     for node in contour.nodes:
-                        node.x += dx
-                        node.y += dy
+                        node.position = old_parent_to_root(
+                            old_parent_id, QPointF(node.x, node.y)
+                        ).toTuple()
                         if node.incoming is not None:
-                            node.incoming = (
-                                node.incoming[0] + dx,
-                                node.incoming[1] + dy,
-                            )
+                            node.incoming = old_parent_to_root(
+                                old_parent_id, QPointF(*node.incoming)
+                            ).toTuple()
                         if node.outgoing is not None:
-                            node.outgoing = (
-                                node.outgoing[0] + dx,
-                                node.outgoing[1] + dy,
-                            )
+                            node.outgoing = old_parent_to_root(
+                                old_parent_id, QPointF(*node.outgoing)
+                            ).toTuple()
                 radial = obj.radial_field
-                radial.origin_x += dx
-                radial.origin_y += dy
+                radial.origin_x, radial.origin_y = old_parent_to_root(
+                    old_parent_id,
+                    QPointF(radial.origin_x, radial.origin_y),
+                ).toTuple()
                 if radial.manual_center is not None:
-                    radial.manual_center = (
-                        radial.manual_center[0] + dx,
-                        radial.manual_center[1] + dy,
-                    )
+                    radial.manual_center = old_parent_to_root(
+                        old_parent_id, QPointF(*radial.manual_center)
+                    ).toTuple()
                 if obj.shape_field.manual_center is not None:
-                    obj.shape_field.manual_center = (
-                        obj.shape_field.manual_center[0] + dx,
-                        obj.shape_field.manual_center[1] + dy,
-                    )
+                    obj.shape_field.manual_center = old_parent_to_root(
+                        old_parent_id,
+                        QPointF(*obj.shape_field.manual_center),
+                    ).toTuple()
                 obj.touch_revision()
             if not moved_by_quad:
-                obj.x += dx
-                obj.y += dy
+                obj.x, obj.y = old_parent_to_root(
+                    old_parent_id, QPointF(obj.x, obj.y)
+                ).toTuple()
             opacity_factor = removed_opacity(obj.parent_layer_id)
             if opacity_factor != 1.0:
                 if obj.opacity_locked:
@@ -16030,12 +16928,24 @@ class _CanvasLogic:
 
         def preserve_ignored(candidate: LayerNode) -> ChildRef:
             opacity_factor = removed_opacity(candidate.parent_id)
-            world_x, world_y = self.chapter.layer_world_translation(
-                candidate.layer_id
+            candidate_world = self.layer_world_transform(candidate.layer_id)
+            left, top, width, height = candidate.bound.bbox()
+            frame = QRectF(
+                left, top, max(1.0, width), max(1.0, height)
             )
+            destination = [
+                root_inverse.map(
+                    candidate_world.map(QPointF(*point))
+                ).toTuple()
+                for point in self._rect_quad(frame)
+            ]
             candidate.parent_id = layer_id
-            candidate.translate_x = world_x - root_x
-            candidate.translate_y = world_y - root_y
+            candidate.transform_frame = (
+                frame.x(), frame.y(), frame.width(), frame.height()
+            )
+            candidate.transform_quad = destination
+            candidate.translate_x = 0.0
+            candidate.translate_y = 0.0
             candidate.opacity *= opacity_factor
             return ChildRef("layer", candidate.layer_id)
 
@@ -16073,13 +16983,17 @@ class _CanvasLogic:
             else:
                 rebuilt.extend(flatten_branch(child))
                 removed_layers.add(child.layer_id)
+        removed_modifier_ids: list[str] = []
         for removed_id in removed_layers:
-            self.chapter.layers.pop(removed_id, None)
+            removed = self.chapter.layers.pop(removed_id, None)
+            if removed is not None:
+                removed_modifier_ids.extend(removed.modifier_ids)
         layer.children = rebuilt
         layer.bound = geometry
         layer.layer_kind = "bounded"
         layer.compound_enabled = False
         layer.compound_operation = "add"
+        self.chapter._garbage_collect_modifiers(removed_modifier_ids)
         self._compound_path_cache.clear()
         after = self.chapter.to_dict()
         self.push_model_change(before, after, "Flatten compound shape")
@@ -16297,13 +17211,10 @@ class _CanvasLogic:
             frame.left(), frame.top(), max(1.0, frame.width()),
             max(1.0, frame.height()),
         )
-        if obj.transform_quad is not None:
-            world = self._drawing_local_rect_to_world(obj, local)
-        else:
-            layer_x, layer_y = self.chapter.layer_world_translation(
-                obj.parent_layer_id
-            )
-            world = local.translated(layer_x + obj.x, layer_y + obj.y)
+        world = self.modifier_expanded_dirty(
+            obj.object_id,
+            self._drawing_local_rect_to_world(obj, local),
+        )
         self._stroke_dirty_world = (
             QRectF(world) if self._stroke_dirty_world.isEmpty()
             else self._stroke_dirty_world.united(world)
@@ -16457,6 +17368,48 @@ class _CanvasLogic:
             return self._transform_control_hit(quad, point)
         return "", None
 
+    def _multi_selection_cage(self) -> list[tuple[float, float]] | None:
+        if self.chapter is None or len(self.selected_entities) < 2:
+            return None
+        rect = QRectF()
+        first = True
+        for kind, entity_id in self.selected_entities:
+            if kind != "object":
+                return None
+            candidate = self.object_world_rect(entity_id)
+            if candidate is None:
+                continue
+            rect = QRectF(candidate) if first else rect.united(candidate)
+            first = False
+        return None if first else self._rect_quad(rect)
+
+    def _begin_multi_transform(self, point: QPointF) -> bool:
+        cage = self._multi_selection_cage()
+        if cage is None:
+            return False
+        mode, handle = self._transform_control_hit(cage, point)
+        if not mode:
+            return False
+        self._geometry_transform_target = ("multi", "")
+        self._transform_handle_index = handle
+        self._transform_drag_mode = mode
+        self._model_before = self.chapter.to_dict()
+        self._drag_start_doc = QPointF(point)
+        self._transform_start_quad = list(cage)
+        self._transform_preview_quad = list(cage)
+        self._multi_transform_start_world_quads = {
+            entity_id: list(self.object_world_quad(entity_id) or [])
+            for kind, entity_id in self.selected_entities if kind == "object"
+        }
+        self._multi_transform_preview_quads.clear()
+        pivot = self._transform_pivot or QRectF(
+            QPointF(*cage[0]), QPointF(*cage[2])
+        ).center()
+        self._transform_rotate_start = math.atan2(
+            point.y() - pivot.y(), point.x() - pivot.x()
+        )
+        return True
+
     def _begin_geometry_transform(self, point: QPointF) -> bool:
         if self.chapter is None:
             return False
@@ -16464,14 +17417,32 @@ class _CanvasLogic:
             layer = self.chapter.layers.get(self.selected_id)
             if layer is None or layer.bound is None:
                 return False
-            parent_id = layer.layer_id
-            wx, wy = self.chapter.layer_world_translation(parent_id)
             left, top, width, height = layer.bound.bbox()
-            local_quad = self._rect_quad(QRectF(
+            frame_quad = self._rect_quad(QRectF(
                 left, top, max(1.0, width), max(1.0, height)
             ))
-            world_quad = [(x + wx, y + wy) for x, y in local_quad]
-            target = ("layer", layer.layer_id)
+            world_quad = [
+                self.layer_world_transform(layer.layer_id).map(
+                    QPointF(x, y)
+                ).toTuple()
+                for x, y in frame_quad
+            ]
+            if self.tool == ToolKind.TRANSFORM:
+                parent_transform = (
+                    self.layer_world_transform(layer.parent_id)
+                    if layer.parent_id else QTransform()
+                )
+                inverse, valid = parent_transform.inverted()
+                if not valid:
+                    return False
+                local_quad = [
+                    inverse.map(QPointF(x, y)).toTuple()
+                    for x, y in world_quad
+                ]
+                target = ("layer_group", layer.layer_id)
+            else:
+                local_quad = frame_quad
+                target = ("layer", layer.layer_id)
         else:
             obj = self.chapter.objects.get(self.selected_id)
             if (
@@ -16481,15 +17452,20 @@ class _CanvasLogic:
             ):
                 return False
             parent_id = obj.parent_layer_id
-            wx, wy = self.chapter.layer_world_translation(parent_id)
             world_quad = self.object_world_quad(obj.object_id)
             if not world_quad:
                 return False
-            local_quad = [(x - wx, y - wy) for x, y in world_quad]
+            inverse, valid = self.layer_world_transform(parent_id).inverted()
+            if not valid:
+                return False
+            local_quad = [
+                inverse.map(QPointF(x, y)).toTuple()
+                for x, y in world_quad
+            ]
             target = ("object", obj.object_id)
-        mode, handle = self._raster_transform_control_hit(
-            world_quad, point
-        )
+        mode, handle = self._raster_transform_control_hit(world_quad, point)
+        if not mode and self.tool == ToolKind.TRANSFORM:
+            mode, handle = self._transform_control_hit(world_quad, point)
         if not mode:
             return False
         self._geometry_transform_target = target
@@ -16514,38 +17490,53 @@ class _CanvasLogic:
         kind, entity_id = self._geometry_transform_target
         if kind == "layer":
             return entity_id
+        if kind == "layer_group":
+            return self.chapter.layers[entity_id].parent_id or ""
+        if kind == "multi":
+            return ""
         obj = self.chapter.objects.get(entity_id)
         return obj.parent_layer_id if obj is not None else ""
 
     def _update_geometry_transform_preview(self, point: QPointF) -> None:
-        parent_id = self._geometry_transform_parent_id()
-        if not parent_id or self._transform_start_quad is None:
+        if self._geometry_transform_target == ("multi", ""):
+            self._update_multi_transform_preview(point)
             return
-        layer_x, layer_y = self.chapter.layer_world_translation(parent_id)
-        local_point = (point.x() - layer_x, point.y() - layer_y)
+        parent_id = self._geometry_transform_parent_id()
+        if self._transform_start_quad is None:
+            return
+        parent_transform = (
+            self.layer_world_transform(parent_id)
+            if parent_id else QTransform()
+        )
+        inverse, valid = parent_transform.inverted()
+        if not valid:
+            return
+        mapped_point = inverse.map(point)
+        mapped_start = inverse.map(self._drag_start_doc)
+        local_point = mapped_point.toTuple()
         start = list(self._transform_start_quad)
-        dx = point.x() - self._drag_start_doc.x()
-        dy = point.y() - self._drag_start_doc.y()
+        dx = mapped_point.x() - mapped_start.x()
+        dy = mapped_point.y() - mapped_start.y()
         if self._transform_drag_mode == "pivot":
             self._transform_pivot = QPointF(point)
             self._transform_pivot_custom = True
             return
         if self._transform_drag_mode == "rotate":
-            world_pivot = self._transform_pivot or QPointF(
-                sum(x for x, _ in start) / 4 + layer_x,
-                sum(y for _, y in start) / 4 + layer_y,
+            world_pivot = self._transform_pivot or parent_transform.map(QPointF(
+                sum(x for x, _ in start) / 4,
+                sum(y for _, y in start) / 4,
+            ))
+            pivot = inverse.map(world_pivot)
+            local_angle = math.atan2(
+                mapped_point.y() - pivot.y(), mapped_point.x() - pivot.x()
+            )
+            start_angle = math.atan2(
+                mapped_start.y() - pivot.y(), mapped_start.x() - pivot.x()
             )
             angle = (
-                math.atan2(
-                    point.y() - world_pivot.y(),
-                    point.x() - world_pivot.x(),
-                )
-                - self._transform_rotate_start
+                local_angle - start_angle
             )
             cosine, sine = math.cos(angle), math.sin(angle)
-            pivot = QPointF(
-                world_pivot.x() - layer_x, world_pivot.y() - layer_y
-            )
             candidate = [
                 (
                     pivot.x() + (x - pivot.x()) * cosine
@@ -16591,6 +17582,12 @@ class _CanvasLogic:
         if self._quad_is_valid(candidate):
             self._transform_preview_quad = candidate
 
+        if self._geometry_transform_target and (
+            self._geometry_transform_target[0] == "layer_group"
+        ):
+            self._compound_path_cache.clear()
+            self._invalidate_scene_cache()
+
     def _commit_geometry_transform(self) -> None:
         target = self._geometry_transform_target
         before = self._model_before
@@ -16619,7 +17616,48 @@ class _CanvasLogic:
             return mapped.x(), mapped.y()
 
         kind, entity_id = target
-        if kind == "layer":
+        if kind == "multi":
+            for object_id, destination_quad in (
+                self._multi_transform_preview_quads.items()
+            ):
+                obj = self.chapter.objects.get(object_id)
+                if not isinstance(obj, (RasterObject, VectorDrawingObject)):
+                    continue
+                if obj.transform_frame is None:
+                    obj.transform_frame = self._object_transform_frame(obj)
+                obj.transform_quad = list(destination_quad)
+                self._transform_single_target_focal_modifiers(
+                    "object", object_id, transform
+                )
+            self._multi_transform_start_world_quads.clear()
+            self._multi_transform_preview_quads.clear()
+            label = "Transform objects"
+        elif kind == "layer_group":
+            layer = self.chapter.layers[entity_id]
+            parent_transform = (
+                self.layer_world_transform(layer.parent_id)
+                if layer.parent_id else QTransform()
+            )
+            world_transform = QTransform.quadToQuad(
+                parent_transform.map(QPolygonF([
+                    QPointF(*value) for value in source
+                ])),
+                parent_transform.map(QPolygonF([
+                    QPointF(*value) for value in destination
+                ])),
+            )
+            self._transform_single_target_focal_modifiers(
+                "layer", entity_id, world_transform
+            )
+            left, top, width, height = layer.bound.bbox()
+            layer.transform_frame = (
+                left, top, max(1.0, width), max(1.0, height)
+            )
+            layer.transform_quad = list(destination)
+            layer.translate_x = 0.0
+            layer.translate_y = 0.0
+            label = "Transform shape group"
+        elif kind == "layer":
             layer = self.chapter.layers[entity_id]
             for contour in layer.bound.iter_contours():
                 for node in contour.nodes:
@@ -16673,6 +17711,9 @@ class _CanvasLogic:
             self.push_model_change(before, after, label)
             self.hierarchyChanged.emit()
         self.documentChanged.emit(QRectF())
+        if kind in {"layer", "layer_group"}:
+            self._compound_path_cache.clear()
+        self._invalidate_scene_cache()
         self.update()
 
     @staticmethod
@@ -16763,15 +17804,18 @@ class _CanvasLogic:
         )
         if not mode:
             return False
-        layer_x, layer_y = self.chapter.layer_world_translation(
+        parent_inverse, valid = self.layer_world_transform(
             obj.parent_layer_id
-        )
+        ).inverted()
+        if not valid:
+            return False
         self._transform_handle_index = handle
         self._transform_drag_mode = mode
         self._model_before = self.chapter.to_dict()
         self._drag_start_doc = QPointF(point)
         self._transform_start_quad = [
-            (x - layer_x, y - layer_y) for x, y in world_quad
+            parent_inverse.map(QPointF(x, y)).toTuple()
+            for x, y in world_quad
         ]
         self._transform_preview_quad = list(self._transform_start_quad)
         pivot = self._transform_pivot or QPointF(
@@ -16836,12 +17880,16 @@ class _CanvasLogic:
     ) -> tuple[float, float]:
         if not self.settings.snap_to_grid:
             return point
-        layer_x, layer_y = self.chapter.layer_world_translation(layer_id)
+        transform = self.layer_world_transform(layer_id)
+        inverse, valid = transform.inverted()
+        if not valid:
+            return point
+        world = transform.map(QPointF(*point))
         grid = self.chapter.effective_grid(layer_id)
         snapped_x, snapped_y = grid.snap(
-            point[0] + layer_x, point[1] + layer_y
+            world.x(), world.y()
         )
-        return snapped_x - layer_x, snapped_y - layer_y
+        return inverse.map(QPointF(snapped_x, snapped_y)).toTuple()
 
     def _update_transform_preview(self, point: QPointF) -> None:
         obj = self.chapter.objects[self.selected_object_id]
@@ -16850,29 +17898,34 @@ class _CanvasLogic:
             if isinstance(obj, ImageObject) and self._transform_preview_quad
             else None
         )
-        layer_x, layer_y = self.chapter.layer_world_translation(obj.parent_layer_id)
-        local_point = (point.x() - layer_x, point.y() - layer_y)
+        parent_transform = self.layer_world_transform(obj.parent_layer_id)
+        inverse, valid = parent_transform.inverted()
+        if not valid:
+            return
+        mapped_point = inverse.map(point)
+        mapped_start = inverse.map(self._drag_start_doc)
+        local_point = mapped_point.toTuple()
         start = list(self._transform_start_quad)
-        dx = point.x() - self._drag_start_doc.x()
-        dy = point.y() - self._drag_start_doc.y()
+        dx = mapped_point.x() - mapped_start.x()
+        dy = mapped_point.y() - mapped_start.y()
         if self._transform_drag_mode == "pivot":
             self._transform_pivot = QPointF(point)
             self._transform_pivot_custom = True
             return
         if self._transform_drag_mode == "rotate":
-            world_pivot = self._transform_pivot or QPointF(
-                sum(x for x, _ in start) / 4 + layer_x,
-                sum(y for _, y in start) / 4 + layer_y,
-            )
+            world_pivot = self._transform_pivot or parent_transform.map(QPointF(
+                sum(x for x, _ in start) / 4,
+                sum(y for _, y in start) / 4,
+            ))
+            pivot = inverse.map(world_pivot)
             current_angle = math.atan2(
-                point.y() - world_pivot.y(),
-                point.x() - world_pivot.x(),
+                mapped_point.y() - pivot.y(), mapped_point.x() - pivot.x()
             )
-            angle = current_angle - self._transform_rotate_start
+            start_angle = math.atan2(
+                mapped_start.y() - pivot.y(), mapped_start.x() - pivot.x()
+            )
+            angle = current_angle - start_angle
             cosine, sine = math.cos(angle), math.sin(angle)
-            pivot = QPointF(
-                world_pivot.x() - layer_x, world_pivot.y() - layer_y
-            )
             candidate = [
                 (
                     pivot.x()
@@ -16934,12 +17987,85 @@ class _CanvasLogic:
             if isinstance(obj, ImageObject) and old_preview is not None:
                 polygons = []
                 for quad in (old_preview, candidate):
-                    polygons.append(QPolygonF([
-                        QPointF(x + layer_x, y + layer_y) for x, y in quad
-                    ]).boundingRect())
+                    polygons.append(parent_transform.map(QPolygonF([
+                        QPointF(x, y) for x, y in quad
+                    ])).boundingRect())
                 self._queue_visual_dirty(
                     polygons[0].united(polygons[1]), notify_preview=False
                 )
+
+    def _update_multi_transform_preview(self, point: QPointF) -> None:
+        start = list(self._transform_start_quad or [])
+        if len(start) != 4:
+            return
+        if self._transform_drag_mode == "pivot":
+            self._transform_pivot = QPointF(point)
+            self._transform_pivot_custom = True
+            return
+        if self._transform_drag_mode == "translate":
+            dx = point.x() - self._drag_start_doc.x()
+            dy = point.y() - self._drag_start_doc.y()
+            candidate = [(x + dx, y + dy) for x, y in start]
+        elif self._transform_drag_mode == "rotate":
+            pivot = self._transform_pivot or QPolygonF(
+                [QPointF(*value) for value in start]
+            ).boundingRect().center()
+            angle = math.atan2(
+                point.y() - pivot.y(), point.x() - pivot.x()
+            ) - self._transform_rotate_start
+            cosine, sine = math.cos(angle), math.sin(angle)
+            candidate = [(
+                pivot.x() + (x - pivot.x()) * cosine - (y - pivot.y()) * sine,
+                pivot.y() + (x - pivot.x()) * sine + (y - pivot.y()) * cosine,
+            ) for x, y in start]
+        elif self.settings.transform_mode == "uniform":
+            handle = self._transform_handle_index
+            anchors = start + self._edge_midpoints(start)
+            opposite = [2, 3, 0, 1, 6, 7, 4, 5][handle]
+            origin, initial = anchors[opposite], anchors[handle]
+            factor = math.dist(origin, point.toTuple()) / max(
+                math.dist(origin, initial), 1e-6
+            )
+            candidate = [(
+                origin[0] + (x - origin[0]) * factor,
+                origin[1] + (y - origin[1]) * factor,
+            ) for x, y in start]
+        else:
+            handle = self._transform_handle_index
+            candidate = list(start)
+            if handle < 4:
+                candidate[handle] = point.toTuple()
+            else:
+                edge = handle - 4
+                midpoint = self._edge_midpoints(start)[edge]
+                change = point.x() - midpoint[0], point.y() - midpoint[1]
+                for index in (edge, (edge + 1) % 4):
+                    candidate[index] = (
+                        start[index][0] + change[0],
+                        start[index][1] + change[1],
+                    )
+        if not self._quad_is_valid(candidate):
+            return
+        self._transform_preview_quad = candidate
+        transform = QTransform.quadToQuad(
+            QPolygonF([QPointF(*value) for value in start]),
+            QPolygonF([QPointF(*value) for value in candidate]),
+        )
+        self._multi_transform_preview_quads = {}
+        for object_id, quad in self._multi_transform_start_world_quads.items():
+            obj = self.chapter.objects.get(object_id)
+            if obj is None:
+                continue
+            inverse, valid = self.layer_world_transform(
+                obj.parent_layer_id
+            ).inverted()
+            if not valid:
+                continue
+            self._multi_transform_preview_quads[object_id] = [
+                inverse.map(transform.map(QPointF(*value))).toTuple()
+                for value in quad
+            ]
+        self._invalidate_scene_cache()
 
     def _commit_object_transform(self) -> None:
         object_id = self.selected_object_id
@@ -16972,6 +18098,15 @@ class _CanvasLogic:
             obj, (RasterObject, VectorDrawingObject, ImageObject, TextObject)
         ):
             return
+        parent_transform = self.layer_world_transform(obj.parent_layer_id)
+        world_transform = QTransform.quadToQuad(
+            parent_transform.map(QPolygonF([
+                QPointF(*value) for value in source
+            ])),
+            parent_transform.map(QPolygonF([
+                QPointF(*value) for value in destination
+            ])),
+        )
         if drag_mode == "translate" and obj.transform_quad is None:
             obj.x += destination[0][0] - source[0][0]
             obj.y += destination[0][1] - source[0][1]
@@ -16987,6 +18122,9 @@ class _CanvasLogic:
             else:
                 obj.transform_frame = self._object_transform_frame(obj)
             obj.transform_quad = destination
+        self._transform_single_target_focal_modifiers(
+            "object", object_id, world_transform
+        )
         after_model = self.chapter.to_dict()
         if before_model != after_model:
             label = {
@@ -16997,6 +18135,7 @@ class _CanvasLogic:
             self.push_model_change(before_model, after_model, label)
             self.hierarchyChanged.emit()
         self.documentChanged.emit(QRectF())
+        self._invalidate_scene_cache()
         self.update()
 
     def _clear_transform_preview(self) -> None:
@@ -17005,6 +18144,9 @@ class _CanvasLogic:
         self._transform_preview_quad = None
         self._transform_handle_index = None
         self._transform_drag_mode = None
+        self._geometry_transform_target = None
+        self._multi_transform_start_world_quads.clear()
+        self._multi_transform_preview_quads.clear()
         self._transform_static_cache = QImage()
         self._text_transform_cache = QImage()
         self._render_excluded_object_id = ""
@@ -17095,17 +18237,18 @@ class _CanvasLogic:
             for layer in self.chapter.ancestor_layers(obj.parent_layer_id):
                 if not layer.visible or layer.opacity <= 0 or layer.bound is None:
                     return
-                painter.translate(layer.translate_x, layer.translate_y)
+                painter.setTransform(self._layer_parent_transform(layer), True)
                 painter.setClipPath(
                     self.layer_effective_path(layer.layer_id),
                     Qt.IntersectClip,
                 )
                 opacity *= layer.opacity
-            world_x, world_y = self.chapter.layer_world_translation(
+            inverse, valid = self.layer_world_transform(
                 obj.parent_layer_id
-            )
+            ).inverted()
             self._render_object(
-                painter, obj, opacity, visible.translated(-world_x, -world_y)
+                painter, obj, opacity,
+                inverse.mapRect(visible) if valid else visible,
             )
         finally:
             painter.restore()
@@ -17247,15 +18390,18 @@ class _CanvasLogic:
         self.commit_active_text_edit()
         obj = self.chapter.objects[self.selected_object_id]
         world_quad = self.object_world_quad(obj.object_id)
-        layer_x, layer_y = self.chapter.layer_world_translation(
+        parent_inverse, valid = self.layer_world_transform(
             obj.parent_layer_id
-        )
+        ).inverted()
+        if not valid:
+            return False
         self._transform_handle_index = handle
         self._transform_drag_mode = mode
         self._model_before = self.chapter.to_dict()
         self._drag_start_doc = QPointF(point)
         self._transform_start_quad = [
-            (x - layer_x, y - layer_y) for x, y in world_quad
+            parent_inverse.map(QPointF(x, y)).toTuple()
+            for x, y in world_quad
         ]
         self._transform_preview_quad = list(self._transform_start_quad)
         pivot = self._transform_pivot or QPointF(
@@ -17472,26 +18618,22 @@ class _CanvasLogic:
     def _text_edit_layout(
         self, obj: TextObject,
     ) -> tuple[QTextDocument, QPointF, QTransform]:
-        layer_x, layer_y = self.chapter.layer_world_translation(obj.parent_layer_id)
+        layer_transform = self.layer_world_transform(obj.parent_layer_id)
         if obj.layout_mode == "strict":
             rect = self._strict_text_rect(obj)
             document = self._text_document(obj, rect.width())
             offset = self._text_vertical_offset(obj, document, rect.height())
+            local = QTransform()
+            local.translate(rect.left(), rect.top() + offset)
             return (
-                document,
-                QPointF(layer_x + rect.left(), layer_y + rect.top() + offset),
-                QTransform(),
+                document, QPointF(), local * layer_transform,
             )
         source = QRectF(0, 0, max(1.0, obj.width), max(1.0, obj.height))
         document = self._text_document(obj, source.width())
         offset = self._text_vertical_offset(obj, document, source.height())
         transform = self._quad_transform(source, self._text_quad(obj))
         transform.translate(0, offset)
-        return (
-            document,
-            QPointF(layer_x, layer_y),
-            transform,
-        )
+        return document, QPointF(), transform * layer_transform
 
     def _text_local_point(
         self, obj: TextObject, world: QPointF,
@@ -17599,9 +18741,9 @@ class _CanvasLogic:
             return
         if self._strict_margin_edge is not None:
             parent = self.chapter.layers[obj.parent_layer_id]
-            layer_x, layer_y = self.chapter.layer_world_translation(obj.parent_layer_id)
+            local = self._layer_world_to_local(obj.parent_layer_id, point)
             left, top, width, height = parent.bound.bbox()
-            local_x, local_y = point.x() - layer_x, point.y() - layer_y
+            local_x, local_y = local.x(), local.y()
             candidates = [
                 local_y - top, left + width - local_x,
                 top + height - local_y, local_x - left,

@@ -4,7 +4,7 @@ from pathlib import Path
 
 from PySide6.QtCore import QSize, Qt
 from PySide6.QtGui import QIcon
-from PySide6.QtWidgets import QDockWidget, QTabBar
+from PySide6.QtWidgets import QDockWidget, QPushButton, QTabBar, QWidget
 
 from comic_editor.core.models import (
     BoundGeometry,
@@ -18,6 +18,7 @@ from comic_editor.core.tiles import TileStore
 from comic_editor.ui.canvas import ToolKind
 from comic_editor.ui import icons as icons_module
 from comic_editor.ui.main_window import MainWindow, ResponsiveToolButton
+from comic_editor.ui.tool_ribbon_pages import WrappingLayout
 
 
 def _vector_chapter():
@@ -49,7 +50,7 @@ def test_main_window_ribbon_is_contextual_and_tools_are_renamed(qapp):
         assert window.tool_buttons[ToolKind.RASTER_PENCIL].text() == "Pencil"
         assert window.tool_buttons[ToolKind.RASTER_ERASER].text() == "Eraser"
         assert window.ribbon.page_keys() == [
-            "tool_settings", "asset_library", "blender_views",
+            "tool_settings", "modifiers", "asset_library", "blender_views",
             "vector_tools", "gradient_tools",
         ]
         assert window.ribbon.orientation == Qt.Orientation.Vertical
@@ -129,6 +130,24 @@ def test_bottom_left_color_picker_is_visible_and_responsive(qapp):
         assert window.palette_editor.isVisibleTo(window)
     finally:
         window.deleteLater()
+
+
+def test_tool_settings_flow_layout_wraps_without_horizontal_overflow(qapp):
+    host = QWidget()
+    layout = WrappingLayout(host)
+    buttons = []
+    for label in ("Preset", "Size", "Pressure", "Transform handles"):
+        button = QPushButton(label, host)
+        button.setFixedWidth(90)
+        buttons.append(button)
+        layout.addWidget(button)
+    try:
+        assert layout.heightForWidth(110) > layout.heightForWidth(420)
+        host.resize(110, layout.heightForWidth(110))
+        layout.setGeometry(host.rect())
+        assert all(button.geometry().right() < host.width() for button in buttons)
+    finally:
+        host.deleteLater()
 
 
 def test_project_view_controls_and_icon_tool_strip(qapp):
