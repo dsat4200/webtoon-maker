@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import pytest
 import numpy as np
-from PySide6.QtCore import QItemSelectionModel, QPointF, QRectF, Qt
-from PySide6.QtGui import QColor, QImage, QPainter
+from PySide6.QtCore import QItemSelectionModel, QPoint, QPointF, QRectF, Qt
+from PySide6.QtGui import (
+    QColor, QContextMenuEvent, QImage, QPainter, QTransform,
+)
 from PySide6.QtTest import QTest
 
 from comic_editor.core.assets import extract_asset, instantiate_asset
@@ -18,7 +20,11 @@ from comic_editor.core.tiles import TileStore
 from comic_editor.ui.canvas import CanvasWidget, ToolKind
 from comic_editor.ui import canvas as canvas_module
 from comic_editor.ui.main_window import MainWindow
-from comic_editor.ui.modifier_rendering import apply_modifier_stack
+from comic_editor.ui.mask_controls import MaskAlphaSlider, MaskButton
+from comic_editor.ui.modifier_rendering import (
+    BlurPyramidCache, OutlineDistanceCache, apply_modifier_stack,
+)
+from comic_editor.ui.tool_ribbon_pages import ToolSettingsControls
 
 
 def _document():
@@ -238,6 +244,274 @@ def test_masked_hue_interpolates_and_outline_is_outside_only():
     assert outlined.pixelColor(3, 1).red() == 255
     assert outlined.pixelColor(2, 1).blue() > 0
     assert outlined.pixelColor(2, 1).alpha() > 0
+
+
+def test_exact_outline_distance_is_reused_for_warmed_parameter_changes():
+    image = QImage(9, 9, QImage.Format.Format_ARGB32_Premultiplied)
+    image.fill(Qt.GlobalColor.transparent)
+    image.setPixelColor(4, 4, QColor("white"))
+    cache = OutlineDistanceCache()
+
+    first = apply_modifier_stack(
+        image, [OutlineModifier(thickness=1.2, color="#FFFF0000")],
+        (0, 0), outline_distance_cache=cache,
+    )
+    second = apply_modifier_stack(
+        image, [OutlineModifier(thickness=3.0, color="#800000FF")],
+        (0, 0), outline_distance_cache=cache,
+    )
+
+    assert cache.computations == 1
+    assert first.pixelColor(5, 4).alpha() > first.pixelColor(5, 5).alpha()
+    assert second.pixelColor(7, 4).blue() > 0
+    assert second.pixelColor(7, 4).alpha() < 255
+
+
+def test_blue_mask_overlay_has_zero_to_thirty_five_percent_alpha(qapp):
+    values = np.array([[0.0, 0.5, 1.0]], dtype=np.float32)
+    overlay = CanvasWidget._blue_mask_image(values)
+
+    assert overlay.pixelColor(0, 0).alpha() == 0
+    assert overlay.pixelColor(1, 0).alpha() in {44, 45}
+    assert overlay.pixelColor(2, 0).alpha() == 89
+    assert overlay.pixelColor(2, 0).name() == "#64b5f6"
+
+
+def test_assigned_mask_context_menu_detaches_only_after_action(qapp):
+    button = MaskButton()
+    button.setChecked(True)
+    detached = []
+    button.detachRequested.connect(lambda: detached.append(True))
+    position = QPoint(3, 3)
+    event = QContextMenuEvent(
+        QContextMenuEvent.Reason.Mouse, position,
+        button.mapToGlobal(position),
+    )
+
+    button.contextMenuEvent(event)
+
+    assert detached == []
+    action = button._context_menu.actions()[0]
+    assert action.text() == "Remove Mask"
+    action.trigger()
+    assert detached == [True]
+    button._context_menu.close()
+
+
+def test_mask_stroke_consumes_curve_and_touches_revision_once(qapp):
+    chapter, _page, _first, _second, _raster, _vector = _document()
+    mask = ToneMask()
+    chapter.masks[mask.mask_id] = mask
+    canvas = CanvasWidget(EditorSettings())
+    canvas.set_document(chapter, TileStore())
+    canvas.set_tone_mask_mode(mask.mask_id)
+    canvas.set_tool(ToolKind.RASTER_PENCIL)
+    revision = mask.revision
+
+    canvas._begin_mask_stroke(QPointF(20, 20), 0.25)
+    canvas._continue_mask_stroke(QPointF(30, 35), 0.5)
+    canvas._continue_mask_stroke(QPointF(42, 24), 0.75)
+    canvas._continue_mask_stroke(QPointF(55, 40), 1.0)
+    canvas._end_mask_stroke()
+
+    assert mask.revision == revision + 1
+    tile = canvas.tiles.tile(mask.mask_id, (0, 0))
+    assert tile is not None
+    assert tile.pixelColor(30, 35).alpha() > 0
+    assert tile.pixelColor(42, 24).alpha() > 0
+    canvas.command_stack.undo()
+    assert canvas.tiles.tile(mask.mask_id, (0, 0)) is None
+
+
+def test_mask_pencil_pressure_replaces_alpha_and_allows_inversion(qapp):
+    chapter, _page, _first, _second, _raster, _vector = _document()
+    mask = ToneMask()
+    chapter.masks[mask.mask_id] = mask
+    settings = EditorSettings(
+        mask_pencil_pressure_sensitive=True,
+        mask_pencil_from_alpha=0.0,
+        mask_pencil_to_alpha=1.0,
+    )
+    canvas = CanvasWidget(settings)
+    canvas.set_document(chapter, TileStore())
+    canvas.set_tone_mask_mode(mask.mask_id)
+    canvas.set_tool(ToolKind.RASTER_PENCIL)
+    canvas._device_supports_pressure = True
+
+    canvas._begin_mask_stroke(QPointF(30, 30), 1.0)
+    canvas._end_mask_stroke()
+    assert canvas.tiles.tile(mask.mask_id, (0, 0)).pixelColor(30, 30).alpha() == 255
+
+    canvas._begin_mask_stroke(QPointF(30, 30), 0.5)
+    canvas._end_mask_stroke()
+    assert canvas.tiles.tile(mask.mask_id, (0, 0)).pixelColor(30, 30).alpha() in {
+        127, 128,
+    }
+
+    settings.mask_pencil_from_alpha = 1.0
+    settings.mask_pencil_to_alpha = 0.0
+    canvas._begin_mask_stroke(QPointF(30, 30), 1.0)
+    canvas._end_mask_stroke()
+    remaining = canvas.tiles.tile(mask.mask_id, (0, 0))
+    assert remaining is None or remaining.pixelColor(30, 30).alpha() == 0
+
+
+def test_mask_pencil_pressure_off_uses_to_and_retains_from(qapp):
+    settings = EditorSettings(
+        mask_pencil_pressure_sensitive=False,
+        mask_pencil_from_alpha=0.2,
+        mask_pencil_to_alpha=0.7,
+    )
+    controls = ToolSettingsControls(settings)
+    controls.set_context(
+        ToolKind.RASTER_PENCIL, vector_active=False, mask_active=True
+    )
+    assert controls.stack.currentWidget() is controls.mask_pencil_page
+    assert controls.context_label.text() == "Mask Pencil"
+    assert controls.mask_pencil_alpha.pressure_sensitive is False
+    assert controls.mask_pencil_alpha.from_alpha == pytest.approx(0.2)
+    assert controls.mask_pencil_alpha.to_alpha == pytest.approx(0.7)
+
+    controls.mask_pencil_pressure.setChecked(True)
+    assert settings.mask_pencil_pressure_sensitive is True
+    assert settings.mask_pencil_from_alpha == pytest.approx(0.2)
+    assert controls.mask_pencil_alpha.pressure_sensitive is True
+
+
+def test_mask_alpha_slider_switches_between_one_and_two_handles(qapp):
+    slider = MaskAlphaSlider(0.8, 0.2, True)
+    slider.resize(240, 40)
+    assert slider.pressure_sensitive is True
+    slider.setPressureSensitive(False)
+    slider.setValues(0.8, 0.6)
+    assert slider.pressure_sensitive is False
+    assert slider.from_alpha == pytest.approx(0.8)
+    assert slider.to_alpha == pytest.approx(0.6)
+    slider.setPressureSensitive(True)
+    assert slider.from_alpha == pytest.approx(0.8)
+
+
+def test_blur_pyramid_reuses_source_for_scalar_and_masked_strengths():
+    image = QImage(65, 49, QImage.Format.Format_ARGB32_Premultiplied)
+    image.fill(Qt.GlobalColor.transparent)
+    painter = QPainter(image)
+    painter.fillRect(20, 12, 24, 25, QColor("#ff8040"))
+    painter.end()
+    cache = BlurPyramidCache()
+
+    first = apply_modifier_stack(
+        image, [BlurModifier(strength=3)], (0, 0),
+        blur_pyramid_cache=cache,
+    )
+    modifier = BlurModifier(strength=30)
+    mask_id = "vary"
+    modifier.parameter_masks["strength"] = ParameterMaskBinding(
+        mask_id, 1, 30
+    )
+    field = np.tile(np.linspace(0, 1, 65, dtype=np.float32), (49, 1))
+    second = apply_modifier_stack(
+        image, [modifier], (0, 0),
+        {(modifier.modifier_id, "strength"): field},
+        blur_pyramid_cache=cache,
+    )
+
+    assert cache.builds == 1
+    assert cache.bytes <= 64 * 1024 * 1024
+    assert first.pixelColor(19, 24).alpha() > 0
+    assert second.pixelColor(15, 24).alpha() > 0
+
+    changed = QImage(image)
+    changed.setPixelColor(0, 0, QColor("white"))
+    apply_modifier_stack(
+        changed, [BlurModifier(strength=4)], (0, 0),
+        blur_pyramid_cache=cache,
+    )
+    assert cache.builds == 2
+
+
+def test_blur_pyramid_budget_omits_oversized_entries():
+    image = QImage(32, 32, QImage.Format.Format_ARGB32_Premultiplied)
+    image.fill(QColor("white"))
+    cache = BlurPyramidCache(budget=64)
+    apply_modifier_stack(
+        image, [BlurModifier(strength=8)], (0, 0),
+        blur_pyramid_cache=cache,
+    )
+    assert cache.bytes == 0
+    assert not cache._values
+
+
+def test_mask_paint_reuses_cached_contributor_coverage(qapp, monkeypatch):
+    chapter, _page, _first, _second, raster, _vector = _document()
+    mask = ToneMask(contributors=[("object", raster.object_id)])
+    chapter.masks[mask.mask_id] = mask
+    tiles = TileStore()
+    canvas = CanvasWidget(EditorSettings())
+    canvas.set_document(chapter, tiles)
+    calls = 0
+    original = canvas._render_base_mask_contributor
+
+    def counted(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(canvas, "_render_base_mask_contributor", counted)
+    visible = QRectF(0, 0, 100, 100)
+    first = canvas.render_tone_mask_field(
+        mask.mask_id, 100, 100, QTransform(), visible
+    )
+    tiles.paint_dab(
+        mask.mask_id, QPointF(20, 20), 12, QColor("white")
+    )
+    second = canvas.render_tone_mask_field(
+        mask.mask_id, 100, 100, QTransform(), visible
+    )
+
+    assert calls == 1
+    assert first[20, 20] == 0
+    assert second[20, 20] > 0
+
+
+def test_canvas_outline_reuses_source_and_distance_for_property_changes(
+    qapp, monkeypatch,
+):
+    chapter = ChapterDocument(name="Cached outline", height=300)
+    page = chapter.add_page(
+        "Page", BoundGeometry.rectangle(0, 0, 1080, 300)
+    )
+    layer = chapter.add_layer(
+        page.layer_id, "Layer", BoundGeometry.rectangle(0, 0, 200, 200)
+    )
+    raster = chapter.add_object(
+        layer.layer_id, RasterObject(interaction_rect=(0, 0, 60, 60))
+    )
+    modifier = OutlineModifier(thickness=4, color="#FFFF0000")
+    chapter.add_modifier(modifier, [("object", raster.object_id)])
+    tiles = TileStore()
+    tiles.paint_dab(
+        raster.object_id, QPointF(30, 30), 20, QColor("white")
+    )
+    canvas = CanvasWidget(EditorSettings())
+    canvas.set_document(chapter, tiles)
+    source_renders = 0
+    original = canvas._render_object_content
+
+    def counted(*args, **kwargs):
+        nonlocal source_renders
+        source_renders += 1
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(canvas, "_render_object_content", counted)
+    image = QImage(1080, 300, QImage.Format.Format_ARGB32_Premultiplied)
+    image.fill(Qt.GlobalColor.transparent)
+    canvas.render_preview(image)
+    modifier.thickness = 12
+    modifier.color = "#800000FF"
+    canvas.render_preview(image)
+
+    assert source_renders == 1
+    assert canvas._outline_distance_cache.computations == 1
 
 
 def test_object_modifier_render_cache_updates_pixels_and_reuses_result(

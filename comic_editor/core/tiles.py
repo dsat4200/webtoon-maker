@@ -5,9 +5,11 @@ import math
 from pathlib import Path
 from typing import Iterator
 
+import numpy as np
 from PIL import Image as PILImage
 from PySide6.QtCore import QPointF, QRect, QRectF, Qt
 from PySide6.QtGui import QColor, QImage, QPainter, QPainterPath, QPolygonF, QTransform
+from scipy.ndimage import label as connected_components
 
 
 TILE_SIZE = 256
@@ -74,11 +76,12 @@ class TileStore:
         opacity: float = 1.0, erase: bool = False, square: bool = False,
         antialias: bool = True,
         before: dict[tuple[int, int], QImage | None] | None = None,
+        replace_alpha: bool = False,
     ) -> QRectF:
         return self._paint_samples(
             object_id, [(QPointF(point), float(size), float(opacity))],
             color, erase=erase, square=square, antialias=antialias,
-            before=before,
+            before=before, replace_alpha=replace_alpha,
         )
 
     def paint_segment(
@@ -88,6 +91,7 @@ class TileStore:
         erase: bool = False, square: bool = False,
         antialias: bool = True, density: float = 1.0,
         before: dict[tuple[int, int], QImage | None] | None = None,
+        replace_alpha: bool = False,
     ) -> QRectF:
         """Paint one pressure-varying segment with one painter per tile.
 
@@ -115,6 +119,7 @@ class TileStore:
         return self._paint_samples(
             object_id, samples, color, erase=erase, square=square,
             antialias=antialias, before=before,
+            replace_alpha=replace_alpha,
         )
 
     def paint_line(
@@ -123,18 +128,181 @@ class TileStore:
         erase: bool = False, square: bool = False, antialias: bool = True,
         density: float = 1.0,
         before: dict[tuple[int, int], QImage | None] | None = None,
+        replace_alpha: bool = False,
     ) -> QRectF:
         return self.paint_segment(
             object_id, start, end, size, size, color,
             opacity_start, opacity_end, erase, square, antialias,
-            density, before,
+            density, before, replace_alpha,
         )
+
+    def flood_fill(
+        self, object_id: str, point: QPointF, bounds: QRectF,
+        color: QColor, tolerance: int = 16,
+        before: dict[tuple[int, int], QImage | None] | None = None,
+    ) -> QRectF:
+        """Four-connected RGBA fill over a finite sparse-tile frame.
+
+        Connectivity is resolved per tile with SciPy's compiled component
+        labeling, then component labels are joined across tile edges.  This
+        avoids constructing one potentially enormous frame-sized image while
+        keeping transparent sparse areas fast.
+        """
+        frame = QRectF(bounds).normalized()
+        left, top = math.floor(frame.left()), math.floor(frame.top())
+        right = math.ceil(frame.right()) - 1
+        bottom = math.ceil(frame.bottom()) - 1
+        seed_x, seed_y = math.floor(point.x()), math.floor(point.y())
+        if (
+            right < left or bottom < top
+            or not (left <= seed_x <= right and top <= seed_y <= bottom)
+        ):
+            return QRectF()
+        tolerance = max(0, min(255, int(tolerance)))
+        tile_size = self.tile_size
+        object_tiles = self._tiles.setdefault(object_id, {})
+        rgba_cache: dict[tuple[int, int], np.ndarray] = {}
+        label_cache: dict[tuple[int, int], np.ndarray] = {}
+
+        def tile_key(x: int, y: int) -> tuple[int, int]:
+            return math.floor(x / tile_size), math.floor(y / tile_size)
+
+        def rgba_for(key: tuple[int, int]) -> np.ndarray:
+            cached = rgba_cache.get(key)
+            if cached is not None:
+                return cached
+            source = object_tiles.get(key)
+            if source is None:
+                array = np.zeros((tile_size, tile_size, 4), dtype=np.uint8)
+            else:
+                converted = source.convertToFormat(QImage.Format_RGBA8888)
+                view = np.frombuffer(
+                    converted.constBits(), dtype=np.uint8,
+                    count=converted.sizeInBytes(),
+                ).reshape(converted.height(), converted.bytesPerLine())
+                array = view[:, :converted.width() * 4].reshape(
+                    converted.height(), converted.width(), 4
+                ).copy()
+            rgba_cache[key] = array
+            return array
+
+        seed_key = tile_key(seed_x, seed_y)
+        seed_local = (
+            seed_x - seed_key[0] * tile_size,
+            seed_y - seed_key[1] * tile_size,
+        )
+        target = rgba_for(seed_key)[seed_local[1], seed_local[0]].copy()
+
+        def labels_for(key: tuple[int, int]) -> np.ndarray:
+            cached = label_cache.get(key)
+            if cached is not None:
+                return cached
+            rgba = rgba_for(key)
+            delta = np.abs(
+                rgba.astype(np.int16) - target.astype(np.int16)
+            )
+            matching = (
+                delta[..., 3] <= tolerance
+                if int(target[3]) == 0
+                else np.max(delta, axis=2) <= tolerance
+            )
+            origin_x, origin_y = key[0] * tile_size, key[1] * tile_size
+            valid_left = max(0, left - origin_x)
+            valid_right = min(tile_size - 1, right - origin_x)
+            valid_top = max(0, top - origin_y)
+            valid_bottom = min(tile_size - 1, bottom - origin_y)
+            if (
+                valid_right < valid_left or valid_bottom < valid_top
+            ):
+                matching[:] = False
+            else:
+                if valid_left:
+                    matching[:, :valid_left] = False
+                if valid_right + 1 < tile_size:
+                    matching[:, valid_right + 1:] = False
+                if valid_top:
+                    matching[:valid_top, :] = False
+                if valid_bottom + 1 < tile_size:
+                    matching[valid_bottom + 1:, :] = False
+            labels, _count = connected_components(
+                matching,
+                structure=np.array(
+                    [[0, 1, 0], [1, 1, 1], [0, 1, 0]], dtype=np.uint8
+                ),
+            )
+            labels = labels.astype(np.int32, copy=False)
+            label_cache[key] = labels
+            return labels
+
+        seed_label = int(labels_for(seed_key)[seed_local[1], seed_local[0]])
+        if seed_label <= 0:
+            return QRectF()
+        pending = [(seed_key, seed_label)]
+        connected: dict[tuple[int, int], set[int]] = {}
+        seen: set[tuple[tuple[int, int], int]] = set()
+        directions = (
+            ((-1, 0), (slice(None), 0), (slice(None), -1)),
+            ((1, 0), (slice(None), -1), (slice(None), 0)),
+            ((0, -1), (0, slice(None)), (-1, slice(None))),
+            ((0, 1), (-1, slice(None)), (0, slice(None))),
+        )
+        while pending:
+            key, component = pending.pop()
+            node = key, int(component)
+            if node in seen:
+                continue
+            seen.add(node)
+            labels = labels_for(key)
+            connected.setdefault(key, set()).add(int(component))
+            for (dx, dy), own_edge, other_edge in directions:
+                edge = labels[own_edge]
+                positions = edge == component
+                if not np.any(positions):
+                    continue
+                neighbor = key[0] + dx, key[1] + dy
+                adjacent = labels_for(neighbor)[other_edge]
+                for candidate in np.unique(adjacent[positions]):
+                    if candidate > 0:
+                        pending.append((neighbor, int(candidate)))
+
+        replacement = np.array([
+            color.red(), color.green(), color.blue(), color.alpha()
+        ], dtype=np.uint8)
+        dirty = QRectF()
+        for key, components in connected.items():
+            labels = labels_for(key)
+            selected = np.isin(labels, tuple(components))
+            if not np.any(selected):
+                continue
+            rgba = rgba_for(key)
+            if np.all(rgba[selected] == replacement):
+                continue
+            if before is not None and key not in before:
+                original = object_tiles.get(key)
+                before[key] = QImage(original) if original is not None else None
+            rgba[selected] = replacement
+            ys, xs = np.nonzero(selected)
+            origin_x, origin_y = key[0] * tile_size, key[1] * tile_size
+            changed = QRectF(
+                origin_x + int(xs.min()), origin_y + int(ys.min()),
+                int(xs.max() - xs.min() + 1),
+                int(ys.max() - ys.min() + 1),
+            )
+            dirty = changed if dirty.isEmpty() else dirty.united(changed)
+            contiguous = np.ascontiguousarray(rgba)
+            image = QImage(
+                contiguous.data, tile_size, tile_size, tile_size * 4,
+                QImage.Format_RGBA8888,
+            ).copy().convertToFormat(QImage.Format_ARGB32_Premultiplied)
+            self.set_tile(object_id, key, image)
+        return dirty
 
     def _paint_samples(
         self, object_id: str,
         samples: list[tuple[QPointF, float, float]], color: QColor,
         *, erase: bool, square: bool, antialias: bool,
         before: dict[tuple[int, int], QImage | None] | None,
+        replace_alpha: bool = False,
     ) -> QRectF:
         if not samples:
             return QRectF()
@@ -152,7 +320,13 @@ class TileStore:
             )
             dirty = dab_rect if dirty.isEmpty() else dirty.united(dab_rect)
             for key in self.keys_for_rect(dab_rect):
-                if erase and key not in object_tiles:
+                if (
+                    key not in object_tiles
+                    and (
+                        erase
+                        or (replace_alpha and float(opacity) <= 0.0)
+                    )
+                ):
                     continue
                 grouped.setdefault(key, []).append((point, size, opacity))
         if not grouped:
@@ -170,7 +344,9 @@ class TileStore:
             painter.setRenderHint(QPainter.Antialiasing, antialias)
             painter.setCompositionMode(
                 QPainter.CompositionMode_Clear
-                if erase else QPainter.CompositionMode_SourceOver
+                if erase else
+                QPainter.CompositionMode_Source
+                if replace_alpha else QPainter.CompositionMode_SourceOver
             )
             painter.setPen(Qt.NoPen)
             if erase:
@@ -197,7 +373,10 @@ class TileStore:
                     ))
                 else:
                     painter.drawEllipse(local, half, half)
-                if not erase and cache_known and opacity > 0:
+                if (
+                    not erase and not replace_alpha
+                    and cache_known and opacity > 0
+                ):
                     dab_bounds = (
                         max(0, math.floor(local.x() - half)),
                         max(0, math.floor(local.y() - half)),
@@ -214,7 +393,7 @@ class TileStore:
                             max(approximate[3], dab_bounds[3]),
                         )
             painter.end()
-            if erase or not cache_known:
+            if erase or replace_alpha or not cache_known:
                 self._alpha_bounds_dirty.add((object_id, key[0], key[1]))
             else:
                 bounds_cache[key] = approximate

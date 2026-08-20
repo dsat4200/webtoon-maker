@@ -206,7 +206,6 @@ class RibbonWidget(QWidget):
         else:
             layout.addWidget(self.tab_bar)
             layout.addWidget(self.pages_stack, 1)
-
     def add_page(
         self, key: str, title: str, *, visible: bool = True
     ) -> RibbonPage:
@@ -329,3 +328,57 @@ class RibbonWidget(QWidget):
         self.pages_stack.setCurrentWidget(page)
         if emit:
             self.pageChanged.emit(key)
+
+
+class VerticalTabWidget(QWidget):
+    """Compact inspector tab host using the vertical ribbon appearance."""
+
+    currentChanged = Signal(int)
+
+    def __init__(self, parent: QWidget | None = None):
+        super().__init__(parent)
+        self.setObjectName("ribbon")
+        self.setProperty("orientation", "vertical")
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+        self.pages_stack = QStackedWidget(self)
+        self.pages_stack.setObjectName("ribbonPageStack")
+        self.tab_bar = QTabBar(self)
+        self.tab_bar.setObjectName("ribbonTabs")
+        self.tab_bar.setDrawBase(False)
+        self.tab_bar.setExpanding(False)
+        self.tab_bar.setUsesScrollButtons(True)
+        self.tab_bar.setShape(QTabBar.Shape.RoundedEast)
+        layout.addWidget(self.pages_stack, 1)
+        layout.addWidget(self.tab_bar)
+        self.tab_bar.currentChanged.connect(self._set_index)
+
+    def addTab(self, page: QWidget, title: str) -> int:  # noqa: N802
+        index = self.pages_stack.addWidget(page)
+        self.tab_bar.addTab(str(title))
+        if self.tab_bar.currentIndex() < 0:
+            self.tab_bar.setCurrentIndex(index)
+        return index
+
+    def indexOf(self, page: QWidget) -> int:  # noqa: N802
+        return self.pages_stack.indexOf(page)
+
+    def setCurrentWidget(self, page: QWidget) -> None:  # noqa: N802
+        index = self.pages_stack.indexOf(page)
+        if index >= 0:
+            self.tab_bar.setCurrentIndex(index)
+
+    def currentWidget(self) -> QWidget | None:  # noqa: N802
+        return self.pages_stack.currentWidget()
+
+    def currentIndex(self) -> int:  # noqa: N802
+        return self.tab_bar.currentIndex()
+
+    def setCurrentIndex(self, index: int) -> None:  # noqa: N802
+        self.tab_bar.setCurrentIndex(index)
+
+    def _set_index(self, index: int) -> None:
+        if 0 <= index < self.pages_stack.count():
+            self.pages_stack.setCurrentIndex(index)
+        self.currentChanged.emit(index)

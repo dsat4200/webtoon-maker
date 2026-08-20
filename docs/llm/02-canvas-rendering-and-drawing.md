@@ -128,6 +128,16 @@ At raster stroke start, the canvas records the frame and an initially empty map 
 
 The frame is an interaction/selection affordance only. It neither clips rendering nor removes pixels. Shape Edit can change the frame but cannot shrink it inside actual alpha content.
 
+### Raster flood fill
+
+For a selected Raster, Fill inverse-maps the pointer through its persistent
+quad and uses the local interaction frame as a finite domain. `TileStore`
+labels four-connected matching components inside each touched tile with
+SciPy, joins matching labels across tile edges, and allocates only components
+reached from the seed. Matching compares straight RGBA by maximum per-channel
+difference; transparent seed pixels ignore hidden RGB. The changed tiles form
+one `TilePatchCommand`, while the persistent transform is left untouched.
+
 ### Raster rendering and transforms
 
 Normal raster rendering translates by object `(x, y)`, queries only tiles intersecting the local visible rectangle, and draws each image at `tile_index × 256`.
@@ -256,6 +266,36 @@ All mouse, tablet, wheel, touch, key, double-click, and IME events enter the can
 Touch hardware and high-frequency desktop pen input may report more events than a full recursive render can sustain. Touch navigation and modifier-drag mouse/pen navigation therefore keep only their newest pending packet and apply it with a zero-delay single-shot timer. Release synchronously applies the final pointer position. Each packet updates camera layout, clipping, transforms, overlays, and newly revealed content live; no viewport screenshot is stretched.
 
 Vector stroke bitmaps are reused at unchanged scale for pan and rotation. Alt+Shift drag zoom, touch pinch, and Ctrl+wheel bursts temporarily reuse vector bitmaps from the gesture's starting scale while the rest of the scene stays live. Release/touch completion, or 120 ms without another Ctrl+wheel event, clears that override and performs one crisp final-scale redraw. Alt+Shift drag zoom also preserves the initial click's document point at its original widget-space position while scale changes.
+
+## Tone-mask and modifier rendering
+
+Mask editing does not replace the scene with a grayscale render. Contributor
+coverage and sparse raster paint are cached separately, converted to a
+`#64B5F6` overlay with `35% × mask` alpha, and patched only over dirty tiles.
+Mouse/tablet samples are queued until the next event-loop turn, all samples
+are spacing-interpolated, and release flushes synchronously. A gesture
+snapshots each touched tile once and increments the persistent mask revision
+once.
+
+While Pencil is active in mask mode, it ignores the normal pencil pressure
+curves. Brush size stays at the selected S/M/L size and pressure linearly maps
+the configurable From alpha to To alpha (default 0 to 1). Disabling pressure
+uses the To alpha as a single constant value while retaining From for later.
+Mask pencil dabs replace alpha rather than accumulating it, so they can lower
+or clear existing coverage; Mask Eraser behavior is unchanged.
+
+Modifier rendering separates the isolated source/stage image, parameterized
+final output, and alpha-distance caches. Outline stages reserve the complete
+100-document-pixel supported halo. `scipy.ndimage.distance_transform_edt`
+produces the exact outside distance field, which is byte-budgeted and keyed by
+source alpha; color, thickness, opacity, intensity, and mask changes reuse it.
+Source-alpha edits invalidate the applicable stage and its outline halo.
+Blur stages instead use a per-canvas, 64 MiB LRU of sequential premultiplied
+RGBA8 levels at effective radii 0, 1, 3, 7, 15, 31, 63, and 127. Scalar blur
+interpolates only its neighboring levels. Spatially masked blur processes only
+the levels intersecting the endpoint range, one full-size level at a time,
+instead of constructing sixteen full-resolution Gaussian images. Parameter,
+focal-rig, intensity, and mask edits reuse the source pyramid.
 
 ## Rendering invariants and limitations
 

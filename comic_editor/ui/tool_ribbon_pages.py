@@ -30,6 +30,7 @@ from PySide6.QtWidgets import (
 
 from comic_editor.core.models import RasterObject, TextObject
 from comic_editor.core.settings import TextPreset
+from comic_editor.ui.mask_controls import MaskAlphaSlider
 
 
 def _tool_value(tool: object) -> str:
@@ -171,6 +172,8 @@ class ToolSettingsControls(QWidget):
         self.stack.addWidget(self.empty_page)
         self.pencil_page = self._build_pencil_page()
         self.stack.addWidget(self.pencil_page)
+        self.mask_pencil_page = self._build_mask_pencil_page()
+        self.stack.addWidget(self.mask_pencil_page)
         self.eraser_page = self._build_eraser_page()
         self.stack.addWidget(self.eraser_page)
         self.fill_page = self._build_fill_page()
@@ -209,6 +212,31 @@ class ToolSettingsControls(QWidget):
         self.pencil_sizes_button.clicked.connect(self.brushSizesRequested)
         self.pencil_transform_handles.toggled.connect(
             self._drawing_handles_changed
+        )
+        return page
+
+    def _build_mask_pencil_page(self) -> QWidget:
+        page = QWidget(self)
+        row = WrappingLayout(page)
+        self.mask_pencil_size = QComboBox(page)
+        for label, value in (("S", "small"), ("M", "medium"), ("L", "large")):
+            self.mask_pencil_size.addItem(label, value)
+        row.addWidget(_labeled_control("Size", self.mask_pencil_size, page))
+        self.mask_pencil_pressure = QCheckBox("Pressure sensitivity", page)
+        row.addWidget(self.mask_pencil_pressure)
+        self.mask_pencil_alpha = MaskAlphaSlider(parent=page)
+        row.addWidget(_labeled_control("Alpha", self.mask_pencil_alpha, page))
+        self.mask_pencil_size.currentIndexChanged.connect(
+            self._mask_pencil_size_changed
+        )
+        self.mask_pencil_pressure.toggled.connect(
+            self._mask_pencil_pressure_changed
+        )
+        self.mask_pencil_alpha.valuesChanging.connect(
+            self._mask_pencil_alpha_changed
+        )
+        self.mask_pencil_alpha.valuesCommitted.connect(
+            self._mask_pencil_alpha_changed
         )
         return page
 
@@ -257,30 +285,52 @@ class ToolSettingsControls(QWidget):
     def _build_fill_page(self) -> QWidget:
         page = QWidget(self)
         row = WrappingLayout(page, 7)
+        self._vector_fill_widgets: list[QWidget] = []
+        self._raster_fill_widgets: list[QWidget] = []
         self.fill_close_gaps = QCheckBox("Close gaps", page)
         row.addWidget(self.fill_close_gaps)
+        self._vector_fill_widgets.append(self.fill_close_gaps)
         self.fill_gap_threshold = QDoubleSpinBox(page)
         self.fill_gap_threshold.setRange(0, 1000)
         self.fill_gap_threshold.setDecimals(1)
         self.fill_gap_threshold.setSuffix(" px")
-        row.addWidget(_labeled_control("Gap", self.fill_gap_threshold, page))
+        gap_group = _labeled_control("Gap", self.fill_gap_threshold, page)
+        row.addWidget(gap_group)
+        self._vector_fill_widgets.append(gap_group)
         self.fill_narrow_areas = QCheckBox("Fill narrow areas", page)
         row.addWidget(self.fill_narrow_areas)
+        self._vector_fill_widgets.append(self.fill_narrow_areas)
         self.fill_area_scaling = QCheckBox("Area scaling", page)
         row.addWidget(self.fill_area_scaling)
+        self._vector_fill_widgets.append(self.fill_area_scaling)
         self.fill_area_amount = QDoubleSpinBox(page)
         self.fill_area_amount.setRange(-1000, 1000)
         self.fill_area_amount.setDecimals(1)
         self.fill_area_amount.setSuffix(" px")
-        row.addWidget(_labeled_control("Amount", self.fill_area_amount, page))
+        amount_group = _labeled_control(
+            "Amount", self.fill_area_amount, page
+        )
+        row.addWidget(amount_group)
+        self._vector_fill_widgets.append(amount_group)
         self.fill_area_mode = QComboBox(page)
         self.fill_area_mode.addItem("Round", "round")
         self.fill_area_mode.addItem("Rectangle", "rectangle")
-        row.addWidget(_labeled_control("Edge", self.fill_area_mode, page))
+        edge_group = _labeled_control("Edge", self.fill_area_mode, page)
+        row.addWidget(edge_group)
+        self._vector_fill_widgets.append(edge_group)
         self.fill_mode = QComboBox(page)
         self.fill_mode.addItem("Normal", "normal")
         self.fill_mode.addItem("Enclose and Fill", "enclose")
-        row.addWidget(_labeled_control("Mode", self.fill_mode, page))
+        mode_group = _labeled_control("Mode", self.fill_mode, page)
+        row.addWidget(mode_group)
+        self._vector_fill_widgets.append(mode_group)
+        self.raster_fill_tolerance = QSpinBox(page)
+        self.raster_fill_tolerance.setRange(0, 255)
+        tolerance_group = _labeled_control(
+            "Tolerance", self.raster_fill_tolerance, page
+        )
+        row.addWidget(tolerance_group)
+        self._raster_fill_widgets.append(tolerance_group)
         for control, signal in (
             (self.fill_close_gaps, self.fill_close_gaps.toggled),
             (self.fill_gap_threshold, self.fill_gap_threshold.valueChanged),
@@ -289,25 +339,39 @@ class ToolSettingsControls(QWidget):
             (self.fill_area_amount, self.fill_area_amount.valueChanged),
             (self.fill_area_mode, self.fill_area_mode.currentIndexChanged),
             (self.fill_mode, self.fill_mode.currentIndexChanged),
+            (
+                self.raster_fill_tolerance,
+                self.raster_fill_tolerance.valueChanged,
+            ),
         ):
             del control
             signal.connect(self._fill_changed)
         return page
 
-    def set_context(self, tool: object, vector_active: bool) -> None:
+    def set_context(
+        self, tool: object, vector_active: bool,
+        raster_active: bool = False, mask_active: bool = False,
+    ) -> None:
         value = _tool_value(tool)
         if value == "raster_pencil":
-            self.context_label.setText(
-                "Vector Pencil" if vector_active else "Pencil"
-            )
-            self.stack.setCurrentWidget(self.pencil_page)
+            if mask_active:
+                self.context_label.setText("Mask Pencil")
+                self.stack.setCurrentWidget(self.mask_pencil_page)
+            else:
+                self.context_label.setText(
+                    "Vector Pencil" if vector_active else "Pencil"
+                )
+                self.stack.setCurrentWidget(self.pencil_page)
         elif value == "raster_eraser":
             self.context_label.setText(
                 "Vector Eraser" if vector_active else "Eraser"
             )
             self.stack.setCurrentWidget(self.eraser_page)
         elif value == "fill":
-            self.context_label.setText("Vector Fill" if vector_active else "Fill")
+            self.context_label.setText(
+                "Vector Fill" if vector_active
+                else "Raster Fill" if raster_active else "Fill"
+            )
             self.stack.setCurrentWidget(self.fill_page)
         elif value in {
             "draw_select_rect", "draw_select_lasso", "draw_select_stroke",
@@ -319,6 +383,10 @@ class ToolSettingsControls(QWidget):
             self.stack.setCurrentWidget(self.empty_page)
         self.vector_eraser_label.setVisible(False)
         self.vector_eraser_group.setVisible(vector_active)
+        for widget in self._vector_fill_widgets:
+            widget.setVisible(not raster_active)
+        for widget in self._raster_fill_widgets:
+            widget.setVisible(raster_active)
 
     def refresh(self) -> None:
         self._loading = True
@@ -349,6 +417,21 @@ class ToolSettingsControls(QWidget):
                 self.settings.vector_eraser_mode
             ))
         )
+        self.mask_pencil_size.setCurrentIndex(
+            max(0, self.mask_pencil_size.findData(
+                self.settings.active_pencil_size
+            ))
+        )
+        self.mask_pencil_pressure.setChecked(
+            self.settings.mask_pencil_pressure_sensitive
+        )
+        self.mask_pencil_alpha.setPressureSensitive(
+            self.settings.mask_pencil_pressure_sensitive
+        )
+        self.mask_pencil_alpha.setValues(
+            self.settings.mask_pencil_from_alpha,
+            self.settings.mask_pencil_to_alpha,
+        )
         self.pencil_transform_handles.setChecked(
             self.settings.pencil_transform_handles_visible
         )
@@ -367,6 +450,9 @@ class ToolSettingsControls(QWidget):
         )
         self.fill_mode.setCurrentIndex(
             max(0, self.fill_mode.findData(self.settings.fill_mode))
+        )
+        self.raster_fill_tolerance.setValue(
+            self.settings.raster_fill_tolerance
         )
         self.fill_gap_threshold.setEnabled(self.settings.fill_close_gaps)
         self.fill_area_amount.setEnabled(self.settings.fill_area_scaling)
@@ -395,6 +481,30 @@ class ToolSettingsControls(QWidget):
             self.brushSizeSelected.emit(
                 "raster_pencil", str(self.pencil_size.currentData())
             )
+
+    def _mask_pencil_size_changed(self) -> None:
+        if not self._loading:
+            self.brushSizeSelected.emit(
+                "raster_pencil", str(self.mask_pencil_size.currentData())
+            )
+
+    def _mask_pencil_pressure_changed(self, enabled: bool) -> None:
+        if self._loading:
+            return
+        self.settings.mask_pencil_pressure_sensitive = bool(enabled)
+        self.settings.clamp()
+        self.mask_pencil_alpha.setPressureSensitive(enabled)
+        self.settingsChanged.emit()
+
+    def _mask_pencil_alpha_changed(
+        self, from_alpha: float, to_alpha: float,
+    ) -> None:
+        if self._loading:
+            return
+        self.settings.mask_pencil_from_alpha = float(from_alpha)
+        self.settings.mask_pencil_to_alpha = float(to_alpha)
+        self.settings.clamp()
+        self.settingsChanged.emit()
 
     def _eraser_size_changed(self) -> None:
         if not self._loading:
@@ -427,6 +537,9 @@ class ToolSettingsControls(QWidget):
         self.settings.fill_area_amount = self.fill_area_amount.value()
         self.settings.fill_area_mode = str(self.fill_area_mode.currentData())
         self.settings.fill_mode = str(self.fill_mode.currentData())
+        self.settings.raster_fill_tolerance = (
+            self.raster_fill_tolerance.value()
+        )
         self.settings.clamp()
         self.fill_gap_threshold.setEnabled(self.settings.fill_close_gaps)
         self.fill_area_amount.setEnabled(self.settings.fill_area_scaling)

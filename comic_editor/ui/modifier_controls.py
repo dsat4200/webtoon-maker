@@ -11,6 +11,7 @@ from PySide6.QtWidgets import (
 from comic_editor.core.models import (
     BlurModifier, HueSaturationLightnessModifier, ModifierInstance,
     OutlineModifier,
+    canonical_argb,
 )
 from comic_editor.ui.icons import iconoir
 from comic_editor.ui.mask_controls import DualEndpointSlider, MaskButton
@@ -254,10 +255,18 @@ class ModifierCard(QFrame):
         return row
 
     def _choose_color(self, button: QPushButton) -> None:
-        color = QColorDialog.getColor(QColor(self.modifier.color), self)
+        color = QColorDialog.getColor(
+            QColor(self.modifier.color), self, "Outline Color",
+            QColorDialog.ColorDialogOption.ShowAlphaChannel,
+        )
         if color.isValid():
+            value = canonical_argb(color.name(QColor.NameFormat.HexArgb))
+            button.setText(value)
+            button.setStyleSheet(
+                f"QPushButton {{ background: {QColor(value).name()}; }}"
+            )
             self.owner.set_parameter(
-                self.modifier.modifier_id, "color", color.name(QColor.HexArgb),
+                self.modifier.modifier_id, "color", value,
                 True,
             )
 
@@ -362,9 +371,15 @@ class ModifierControls(QWidget):
             self.stack_layout.insertWidget(self.stack_layout.count() - 1, card)
 
     def _changed(self) -> None:
-        self.canvas._invalidate_scene_cache()
-        self.canvas.documentChanged.emit(None)
-        self.canvas.update()
+        bounds = self._default_bounds()
+        if bounds is None or bounds.isEmpty():
+            self.canvas._invalidate_scene_cache()
+            self.canvas.update()
+            return
+        dirty = bounds.adjusted(-320.0, -320.0, 320.0, 320.0)
+        self.canvas._queue_visual_dirty(
+            dirty, scene=True, notify_preview=False
+        )
 
     def _push(self, before, label: str) -> None:
         after = self.canvas.chapter.to_dict()

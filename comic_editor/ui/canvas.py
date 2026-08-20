@@ -73,7 +73,8 @@ from comic_editor.core.vector_geometry import (
 )
 from comic_editor.ui.windows_input import configure_simultaneous_pen_touch
 from comic_editor.ui.modifier_rendering import (
-    apply_modifier_stack, apply_opacity_mask,
+    BlurPyramidCache, OutlineDistanceCache, apply_modifier_stack,
+    apply_opacity_mask,
 )
 
 
@@ -261,6 +262,10 @@ class CanvasSessionState:
     gradient_render_cache: dict
     modifier_render_cache: OrderedDict
     modifier_render_cache_bytes: int
+    modifier_source_cache: OrderedDict
+    modifier_source_cache_bytes: int
+    outline_distance_cache: OutlineDistanceCache
+    blur_pyramid_cache: BlurPyramidCache
 
 
 class CanvasPerformanceMonitor:
@@ -338,6 +343,22 @@ class _CanvasLogic:
         self.preview_tone_mask_id = ""
         self._mask_stroke_dirty = QRectF()
         self._mask_stroke_revision_before = 0
+        self._mask_sample_queue: deque[tuple[QPointF, float, float]] = deque()
+        self._mask_sample_timer = QTimer(self)
+        self._mask_sample_timer.setSingleShot(True)
+        self._mask_sample_timer.setInterval(0)
+        self._mask_sample_timer.timeout.connect(self._flush_mask_samples)
+        self._mask_runtime_revision = 0
+        self._mask_has_painted_sample = False
+        self._tone_mask_overlay_cache = QImage()
+        self._tone_mask_overlay_key: tuple | None = None
+        self._tone_mask_tile_cache: OrderedDict[tuple, QImage] = OrderedDict()
+        self._tone_mask_contributor_cache: OrderedDict[
+            tuple, np.ndarray
+        ] = OrderedDict()
+        self._tone_mask_contributor_cache_bytes = 0
+        self._tone_mask_contributor_cache_budget = 64 * 1024 * 1024
+        self._preserve_tone_mask_contributors_once = False
         self._modifier_handle_drag: dict | None = None
         self.center_x = 540.0
         self.center_y = 540.0
@@ -402,6 +423,11 @@ class _CanvasLogic:
         self._modifier_render_cache: OrderedDict[tuple, QImage] = OrderedDict()
         self._modifier_render_cache_bytes = 0
         self._modifier_render_cache_budget = 64 * 1024 * 1024
+        self._modifier_source_cache: OrderedDict[tuple, QImage] = OrderedDict()
+        self._modifier_source_cache_bytes = 0
+        self._modifier_source_cache_budget = 64 * 1024 * 1024
+        self._outline_distance_cache = OutlineDistanceCache()
+        self._blur_pyramid_cache = BlurPyramidCache()
         self._rendering_compound_references = False
         self._rendering_outward_gradient = False
         self._live_underlay_object_id = ""
@@ -719,6 +745,14 @@ class _CanvasLogic:
         self._scene_dirty_widget = QRect()
         self._scene_cache_key = None
 
+    def _invalidate_tone_mask_overlay(self, *, contributors: bool = True) -> None:
+        if contributors:
+            self._tone_mask_overlay_cache = QImage()
+            self._tone_mask_overlay_key = None
+            self._tone_mask_contributor_cache.clear()
+            self._tone_mask_contributor_cache_bytes = 0
+        self._tone_mask_tile_cache.clear()
+
     def _world_dirty_to_widget(self, world: QRectF) -> QRect:
         if world.isEmpty():
             return QRect()
@@ -736,6 +770,11 @@ class _CanvasLogic:
         return widget
 
     def _document_visual_changed(self, world_rect) -> None:
+        if self._preserve_tone_mask_contributors_once:
+            self._preserve_tone_mask_contributors_once = False
+            self._invalidate_tone_mask_overlay(contributors=False)
+        elif not self._drawing or not self.active_tone_mask_id:
+            self._invalidate_tone_mask_overlay()
         if self._preserve_scene_cache_once:
             self._preserve_scene_cache_once = False
             return
@@ -997,6 +1036,11 @@ class _CanvasLogic:
         self._gradient_render_cache.clear()
         self._modifier_render_cache.clear()
         self._modifier_render_cache_bytes = 0
+        self._modifier_source_cache.clear()
+        self._modifier_source_cache_bytes = 0
+        self._outline_distance_cache.clear()
+        self._blur_pyramid_cache.clear()
+        self._invalidate_tone_mask_overlay()
         self._promoted_vector_preview = None
         self._invalidate_scene_cache()
         self._ensure_raster_frames()
@@ -1065,6 +1109,10 @@ class _CanvasLogic:
             gradient_render_cache=self._gradient_render_cache,
             modifier_render_cache=self._modifier_render_cache,
             modifier_render_cache_bytes=self._modifier_render_cache_bytes,
+            modifier_source_cache=self._modifier_source_cache,
+            modifier_source_cache_bytes=self._modifier_source_cache_bytes,
+            outline_distance_cache=self._outline_distance_cache,
+            blur_pyramid_cache=self._blur_pyramid_cache,
         )
 
     def restore_session_state(self, state: CanvasSessionState) -> None:
@@ -1093,6 +1141,11 @@ class _CanvasLogic:
         self._gradient_render_cache = state.gradient_render_cache
         self._modifier_render_cache = state.modifier_render_cache
         self._modifier_render_cache_bytes = state.modifier_render_cache_bytes
+        self._modifier_source_cache = state.modifier_source_cache
+        self._modifier_source_cache_bytes = state.modifier_source_cache_bytes
+        self._outline_distance_cache = state.outline_distance_cache
+        self._blur_pyramid_cache = state.blur_pyramid_cache
+        self._invalidate_tone_mask_overlay()
         self._promoted_vector_preview = None
         self._invalidate_scene_cache()
         self._touch_frame_timer.stop()
@@ -1127,6 +1180,11 @@ class _CanvasLogic:
         self._gradient_render_cache.clear()
         self._modifier_render_cache.clear()
         self._modifier_render_cache_bytes = 0
+        self._modifier_source_cache.clear()
+        self._modifier_source_cache_bytes = 0
+        self._outline_distance_cache.clear()
+        self._blur_pyramid_cache.clear()
+        self._invalidate_tone_mask_overlay()
         self._promoted_vector_preview = None
         self._invalidate_scene_cache()
         self._clear_asset_drag_preview()
@@ -1153,6 +1211,11 @@ class _CanvasLogic:
         self._gradient_render_cache.clear()
         self._modifier_render_cache.clear()
         self._modifier_render_cache_bytes = 0
+        self._modifier_source_cache.clear()
+        self._modifier_source_cache_bytes = 0
+        self._outline_distance_cache.clear()
+        self._blur_pyramid_cache.clear()
+        self._invalidate_tone_mask_overlay()
         self._promoted_vector_preview = None
         self._invalidate_scene_cache()
         valid = (
@@ -1846,6 +1909,10 @@ class _CanvasLogic:
             or (
                 self.selected_kind != "layer"
                 and self._active_vector_drawing() is None
+                and not isinstance(
+                    self.chapter.objects.get(self.selected_object_id),
+                    RasterObject,
+                )
             )
         ):
             return False
@@ -2938,28 +3005,78 @@ class _CanvasLogic:
             self._end_mask_stroke()
         self.active_tone_mask_id = str(mask_id)
         self.preview_tone_mask_id = ""
-        self._invalidate_scene_cache()
+        self._mask_sample_timer.stop()
+        self._mask_sample_queue.clear()
+        self._invalidate_tone_mask_overlay()
         self.update()
+
+    @staticmethod
+    def _blue_mask_image(values: np.ndarray) -> QImage:
+        alpha = np.ascontiguousarray(
+            np.clip(values, 0.0, 1.0) * (0.35 * 255.0),
+            dtype=np.uint8,
+        )
+        height, width = alpha.shape
+        rgba = np.empty((height, width, 4), dtype=np.uint8)
+        rgba[..., 0] = 0x64
+        rgba[..., 1] = 0xB5
+        rgba[..., 2] = 0xF6
+        rgba[..., 3] = alpha
+        return QImage(
+            rgba.data, width, height, width * 4,
+            QImage.Format.Format_RGBA8888,
+        ).copy().convertToFormat(QImage.Format.Format_ARGB32_Premultiplied)
+
+    def _blue_mask_tile(self, key: tuple[int, int], tile: QImage) -> QImage:
+        cache_key = (key, int(tile.cacheKey()))
+        cached = self._tone_mask_tile_cache.get(cache_key)
+        if cached is not None:
+            self._tone_mask_tile_cache.move_to_end(cache_key)
+            return cached
+        image = self._blue_mask_image(self._image_alpha_array(tile))
+        self._tone_mask_tile_cache[cache_key] = image
+        while len(self._tone_mask_tile_cache) > 128:
+            self._tone_mask_tile_cache.popitem(last=False)
+        return image
 
     def _draw_tone_mask_preview(self, painter: QPainter) -> None:
         mask_id = self.active_tone_mask_id or self.preview_tone_mask_id
         if not mask_id or self.chapter is None:
             return
         width, height = max(1, self.width()), max(1, self.height())
-        field = self.render_tone_mask_field(
-            mask_id, width, height, self.camera_transform(),
-            self.visible_document_rect(),
+        mask = self.chapter.masks.get(mask_id)
+        if mask is None:
+            return
+        transform = self.camera_transform()
+        transform_key = tuple(round(value, 6) for value in (
+            transform.m11(), transform.m12(), transform.m13(),
+            transform.m21(), transform.m22(), transform.m23(),
+            transform.m31(), transform.m32(), transform.m33(),
+        ))
+        cache_key = (
+            mask_id, width, height, transform_key,
+            tuple(mask.contributors), int(mask.revision),
         )
-        values = np.ascontiguousarray(
-            np.clip(field * 255.0, 0, 255).astype(np.uint8)
-        )
-        image = QImage(
-            values.data, width, height, width,
-            QImage.Format.Format_Grayscale8,
-        ).copy()
+        if self._tone_mask_overlay_key != cache_key:
+            field = self.render_tone_mask_field(
+                mask_id, width, height, transform,
+                self.visible_document_rect(), include_paint=False,
+            )
+            self._tone_mask_overlay_cache = self._blue_mask_image(field)
+            self._tone_mask_overlay_key = cache_key
         painter.save()
         painter.setTransform(QTransform())
-        painter.drawImage(0, 0, image)
+        painter.drawImage(0, 0, self._tone_mask_overlay_cache)
+        painter.setCompositionMode(QPainter.CompositionMode.CompositionMode_Plus)
+        painter.setTransform(transform)
+        painter.setClipRect(QRectF(0, 0, self.chapter.width, self.chapter.height))
+        visible = self.visible_document_rect()
+        for key, tile in self.tiles.iter_tiles(mask_id, visible):
+            painter.drawImage(
+                key[0] * self.tiles.tile_size,
+                key[1] * self.tiles.tile_size,
+                self._blue_mask_tile(key, tile),
+            )
         painter.restore()
 
     def _cancel_external_drag_downloads(self) -> None:
@@ -4166,9 +4283,7 @@ class _CanvasLogic:
                 modifier, "strength", modifier.strength
             ) * 3.0
             if isinstance(modifier, BlurModifier)
-            else self._modifier_maximum(
-                modifier, "thickness", modifier.thickness
-            )
+            else 100.0
             if isinstance(modifier, OutlineModifier)
             else 0.0
             for modifier in modifiers
@@ -4180,47 +4295,58 @@ class _CanvasLogic:
             max(1, math.ceil(local.bottom()) - math.floor(local.top())),
         )
         world_origin = parent_transform.map(bounds.topLeft())
+        layer_signature = self._modifier_layer_signature(layer.layer_id)
         cache_key = (
             "layer", layer.layer_id,
-            self._modifier_layer_signature(layer.layer_id),
+            layer_signature,
             self._rect_signature(bounds), world_origin.toTuple(),
         )
         processed = self._modifier_cache_get(cache_key)
         if processed is None:
-            image = QImage(
-                max(1, math.ceil(bounds.width())),
-                max(1, math.ceil(bounds.height())),
-                QImage.Format.Format_ARGB32_Premultiplied,
+            source_key = (
+                "layer-source", layer.layer_id,
+                layer_signature[0], layer_signature[3], layer_signature[4],
+                self._rect_signature(bounds), world_origin.toTuple(),
             )
-            image.fill(Qt.GlobalColor.transparent)
-            source = QPainter(image)
-            source.setRenderHint(QPainter.RenderHint.Antialiasing, True)
-            source.translate(-bounds.left(), -bounds.top())
-            self._render_modifier_sources.add(("layer", layer.layer_id))
-            try:
-                self._render_layer(source, layer, 1.0, visible_world)
-                drawing = self._active_vector_drawing()
-                modified_ancestors = (
-                    [
-                        candidate.layer_id
-                        for candidate in self.chapter.ancestor_layers(
-                            drawing.parent_layer_id
-                        )
-                        if candidate.modifier_ids
-                    ]
-                    if drawing is not None else []
+            image = self._modifier_source_cache_get(source_key)
+            if image is None:
+                image = QImage(
+                    max(1, math.ceil(bounds.width())),
+                    max(1, math.ceil(bounds.height())),
+                    QImage.Format.Format_ARGB32_Premultiplied,
                 )
-                if (
-                    drawing is not None and not drawing.modifier_ids
-                    and modified_ancestors
-                    and modified_ancestors[-1] == layer.layer_id
-                ):
-                    self._render_modified_vector_pencil_preview(
-                        source, layer.parent_id or ""
+                image.fill(Qt.GlobalColor.transparent)
+                source = QPainter(image)
+                source.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+                source.translate(-bounds.left(), -bounds.top())
+                self._render_modifier_sources.add(("layer", layer.layer_id))
+                try:
+                    self._render_layer(source, layer, 1.0, visible_world)
+                    drawing = self._active_vector_drawing()
+                    modified_ancestors = (
+                        [
+                            candidate.layer_id
+                            for candidate in self.chapter.ancestor_layers(
+                                drawing.parent_layer_id
+                            )
+                            if candidate.modifier_ids
+                        ]
+                        if drawing is not None else []
                     )
-            finally:
-                self._render_modifier_sources.discard(("layer", layer.layer_id))
-                source.end()
+                    if (
+                        drawing is not None and not drawing.modifier_ids
+                        and modified_ancestors
+                        and modified_ancestors[-1] == layer.layer_id
+                    ):
+                        self._render_modified_vector_pencil_preview(
+                            source, layer.parent_id or ""
+                        )
+                finally:
+                    self._render_modifier_sources.discard(
+                        ("layer", layer.layer_id)
+                    )
+                    source.end()
+                self._modifier_source_cache_put(source_key, image)
             width, height = image.width(), image.height()
             world_to_image = self._world_to_image_transform(
                 parent_transform, bounds, width, height
@@ -4231,6 +4357,8 @@ class _CanvasLogic:
                     modifiers, width, height,
                     world_to_image, visible_world,
                 ),
+                outline_distance_cache=self._outline_distance_cache,
+                blur_pyramid_cache=self._blur_pyramid_cache,
             )
             if layer.opacity_mask is not None:
                 binding = layer.opacity_mask
@@ -6913,41 +7041,79 @@ class _CanvasLogic:
     def render_tone_mask_field(
         self, mask_id: str, width: int, height: int,
         world_to_image: QTransform, visible_world: QRectF,
+        *, include_paint: bool = True,
     ) -> np.ndarray:
         mask = self.chapter.masks.get(mask_id) if self.chapter else None
         width, height = max(1, int(width)), max(1, int(height))
         if mask is None:
             return np.zeros((height, width), dtype=np.float32)
-        result = np.zeros((height, width), dtype=np.float32)
-        for kind, entity_id in mask.contributors:
-            image = QImage(
+        transform_signature = tuple(round(value, 6) for value in (
+            world_to_image.m11(), world_to_image.m12(), world_to_image.m13(),
+            world_to_image.m21(), world_to_image.m22(), world_to_image.m23(),
+            world_to_image.m31(), world_to_image.m32(), world_to_image.m33(),
+        ))
+        contributor_key = (
+            mask_id, width, height, transform_signature,
+            self._rect_signature(visible_world), tuple(mask.contributors),
+        )
+        cached = self._tone_mask_contributor_cache.pop(
+            contributor_key, None
+        )
+        if cached is None:
+            result = np.zeros((height, width), dtype=np.float32)
+            for kind, entity_id in mask.contributors:
+                image = QImage(
+                    width, height, QImage.Format.Format_ARGB32_Premultiplied
+                )
+                image.fill(Qt.GlobalColor.transparent)
+                painter = QPainter(image)
+                painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+                painter.setRenderHint(
+                    QPainter.RenderHint.SmoothPixmapTransform, True
+                )
+                painter.setTransform(world_to_image)
+                self._render_base_mask_contributor(
+                    painter, kind, entity_id, visible_world
+                )
+                painter.end()
+                result += self._image_alpha_array(image)
+            result = np.clip(result, 0.0, 1.0)
+            size = int(result.nbytes)
+            if 0 < size <= self._tone_mask_contributor_cache_budget:
+                self._tone_mask_contributor_cache[
+                    contributor_key
+                ] = result.copy()
+                self._tone_mask_contributor_cache_bytes += size
+                while (
+                    self._tone_mask_contributor_cache
+                    and self._tone_mask_contributor_cache_bytes
+                    > self._tone_mask_contributor_cache_budget
+                ):
+                    _old_key, old = (
+                        self._tone_mask_contributor_cache.popitem(last=False)
+                    )
+                    self._tone_mask_contributor_cache_bytes -= int(old.nbytes)
+        else:
+            self._tone_mask_contributor_cache[contributor_key] = cached
+            result = cached.copy()
+        if include_paint:
+            paint = QImage(
                 width, height, QImage.Format.Format_ARGB32_Premultiplied
             )
-            image.fill(Qt.GlobalColor.transparent)
-            painter = QPainter(image)
-            painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+            paint.fill(Qt.GlobalColor.transparent)
+            painter = QPainter(paint)
             painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
             painter.setTransform(world_to_image)
-            self._render_base_mask_contributor(
-                painter, kind, entity_id, visible_world
-            )
+            for (tile_x, tile_y), tile in self.tiles.iter_tiles(
+                mask_id, visible_world
+            ):
+                painter.drawImage(
+                    tile_x * self.tiles.tile_size,
+                    tile_y * self.tiles.tile_size,
+                    tile,
+                )
             painter.end()
-            result += self._image_alpha_array(image)
-        paint = QImage(
-            width, height, QImage.Format.Format_ARGB32_Premultiplied
-        )
-        paint.fill(Qt.GlobalColor.transparent)
-        painter = QPainter(paint)
-        painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
-        painter.setTransform(world_to_image)
-        for (tile_x, tile_y), tile in self.tiles.iter_tiles(mask_id):
-            painter.drawImage(
-                tile_x * self.tiles.tile_size,
-                tile_y * self.tiles.tile_size,
-                tile,
-            )
-        painter.end()
-        result += self._image_alpha_array(paint)
+            result += self._image_alpha_array(paint)
         return np.clip(result, 0.0, 1.0)
 
     @staticmethod
@@ -7081,6 +7247,30 @@ class _CanvasLogic:
             )
             self._modifier_render_cache_bytes -= int(old_image.sizeInBytes())
 
+    def _modifier_source_cache_get(self, key: tuple) -> QImage | None:
+        image = self._modifier_source_cache.pop(key, None)
+        if image is None:
+            return None
+        self._modifier_source_cache[key] = image
+        return QImage(image)
+
+    def _modifier_source_cache_put(self, key: tuple, image: QImage) -> None:
+        size = int(image.sizeInBytes())
+        if size <= 0 or size > self._modifier_source_cache_budget:
+            return
+        previous = self._modifier_source_cache.pop(key, None)
+        if previous is not None:
+            self._modifier_source_cache_bytes -= int(previous.sizeInBytes())
+        self._modifier_source_cache[key] = QImage(image)
+        self._modifier_source_cache_bytes += size
+        while (
+            self._modifier_source_cache
+            and self._modifier_source_cache_bytes
+            > self._modifier_source_cache_budget
+        ):
+            _old_key, old = self._modifier_source_cache.popitem(last=False)
+            self._modifier_source_cache_bytes -= int(old.sizeInBytes())
+
     def _render_modified_object(
         self, painter: QPainter, obj: DocumentObject,
         parent_opacity: float, local_visible: QRectF,
@@ -7110,9 +7300,7 @@ class _CanvasLogic:
                 modifier, "strength", modifier.strength
             ) * 3.0
             if isinstance(modifier, BlurModifier)
-            else self._modifier_maximum(
-                modifier, "thickness", modifier.thickness
-            )
+            else 100.0
             if isinstance(modifier, OutlineModifier)
             else 0.0
             for modifier in modifiers
@@ -7124,32 +7312,43 @@ class _CanvasLogic:
             max(1, math.ceil(local.bottom()) - math.floor(local.top())),
         )
         world_origin = layer_transform.map(bounds.topLeft())
+        object_signature = self._modifier_object_signature(obj)
         cache_key = (
             "object", obj.object_id,
-            self._modifier_object_signature(obj),
+            object_signature,
             self._rect_signature(bounds), world_origin.toTuple(),
         )
         processed = self._modifier_cache_get(cache_key)
         if processed is None:
-            image = QImage(
-                max(1, math.ceil(bounds.width())),
-                max(1, math.ceil(bounds.height())),
-                QImage.Format.Format_ARGB32_Premultiplied,
+            source_key = (
+                "object-source", obj.object_id,
+                object_signature[0], object_signature[3], object_signature[4],
+                self._rect_signature(bounds), world_origin.toTuple(),
             )
-            image.fill(Qt.GlobalColor.transparent)
-            source = QPainter(image)
-            source.setRenderHint(QPainter.RenderHint.Antialiasing, True)
-            source.translate(-bounds.left(), -bounds.top())
-            self._render_modifier_sources.add(("object", obj.object_id))
-            try:
-                self._render_object_content(source, obj, bounds)
-                if isinstance(obj, VectorDrawingObject):
-                    self._render_modified_vector_pencil_preview(
-                        source, obj.parent_layer_id
+            image = self._modifier_source_cache_get(source_key)
+            if image is None:
+                image = QImage(
+                    max(1, math.ceil(bounds.width())),
+                    max(1, math.ceil(bounds.height())),
+                    QImage.Format.Format_ARGB32_Premultiplied,
+                )
+                image.fill(Qt.GlobalColor.transparent)
+                source = QPainter(image)
+                source.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+                source.translate(-bounds.left(), -bounds.top())
+                self._render_modifier_sources.add(("object", obj.object_id))
+                try:
+                    self._render_object_content(source, obj, bounds)
+                    if isinstance(obj, VectorDrawingObject):
+                        self._render_modified_vector_pencil_preview(
+                            source, obj.parent_layer_id
+                        )
+                finally:
+                    self._render_modifier_sources.discard(
+                        ("object", obj.object_id)
                     )
-            finally:
-                self._render_modifier_sources.discard(("object", obj.object_id))
-                source.end()
+                    source.end()
+                self._modifier_source_cache_put(source_key, image)
             width, height = image.width(), image.height()
             world_to_image = self._world_to_image_transform(
                 layer_transform, bounds, width, height
@@ -7160,6 +7359,8 @@ class _CanvasLogic:
                     modifiers, width, height,
                     world_to_image, world_bounds,
                 ),
+                outline_distance_cache=self._outline_distance_cache,
+                blur_pyramid_cache=self._blur_pyramid_cache,
             )
             if obj.opacity_mask is not None:
                 binding = obj.opacity_mask
@@ -14589,6 +14790,49 @@ class _CanvasLogic:
             "mode": self.settings.fill_mode,
         }
 
+    def _raster_fill_visual_changed(
+        self, object_id: str, world: QRectF,
+    ) -> None:
+        if self.chapter is None or object_id not in self.chapter.objects:
+            return
+        self._modifier_source_cache.clear()
+        self._modifier_source_cache_bytes = 0
+        self._outline_distance_cache.clear()
+        widget = self._mark_scene_dirty_world(world)
+        self.documentChanged.emit(world)
+        if not widget.isEmpty():
+            self.update(widget)
+
+    def _apply_raster_fill(
+        self, obj: RasterObject, world_point: QPointF,
+    ) -> bool:
+        local = self._raster_local_point(obj, world_point)
+        frame = QRectF(*obj.interaction_rect)
+        if not frame.contains(local):
+            return False
+        before: dict[tuple[int, int], QImage | None] = {}
+        dirty_local = self.tiles.flood_fill(
+            obj.object_id, local, frame, QColor(self.primary_color),
+            self.settings.raster_fill_tolerance, before,
+        )
+        if dirty_local.isEmpty() or not before:
+            return False
+        after = self.tiles.snapshot(obj.object_id, set(before))
+        dirty_world = self.modifier_expanded_dirty(
+            obj.object_id,
+            self._drawing_local_rect_to_world(obj, dirty_local),
+        )
+        callback = lambda object_id=obj.object_id, rect=QRectF(dirty_world): (
+            self._raster_fill_visual_changed(object_id, rect)
+        )
+        self.command_stack.push(TilePatchCommand(
+            "Raster fill", self.tiles, obj.object_id,
+            before, after, callback,
+        ), already_done=True)
+        self._raster_fill_visual_changed(obj.object_id, dirty_world)
+        self.interactionFinished.emit()
+        return True
+
     def _face_path(
         self, face, drawing: VectorDrawingObject | None = None,
     ) -> QPainterPath:
@@ -15129,6 +15373,8 @@ class _CanvasLogic:
         ):
             self._begin_mask_stroke(point, pressure)
             return
+        if self.active_tone_mask_id and self.tool == ToolKind.FILL:
+            return
         if self.tool == ToolKind.EYEDROPPER:
             self._eyedropper_widget_point = QPointF(widget_point)
             if self._sample_eyedropper(point):
@@ -15274,8 +15520,10 @@ class _CanvasLogic:
                 self._begin_vector_gesture(drawing, point, pressure)
             return
         if self.tool == ToolKind.FILL:
-            drawing = self._active_vector_drawing()
-            if drawing is not None:
+            selected = self.chapter.objects.get(self.selected_object_id)
+            if isinstance(selected, RasterObject):
+                self._apply_raster_fill(selected, point)
+            elif (drawing := self._active_vector_drawing()) is not None:
                 self._begin_vector_gesture(drawing, point, pressure)
             elif self.selected_kind == "layer":
                 self._apply_shape_fill(point)
@@ -17495,61 +17743,111 @@ class _CanvasLogic:
         self._stroke_before = {}
         self._mask_stroke_dirty = QRectF()
         self._mask_stroke_revision_before = mask.revision
-        size, opacity = self._brush_values(self._last_pressure)
-        dirty = self.tiles.paint_dab(
-            mask.mask_id, point, size, QColor("#ffffffff"), opacity,
-            erase=self.tool == ToolKind.RASTER_ERASER,
-            square=(
-                self.settings.eraser_square
-                and self.tool == ToolKind.RASTER_ERASER
-            ),
-            antialias=(
-                self._stroke_preset.antialiasing
-                if self.tool == ToolKind.RASTER_PENCIL else False
-            ),
-            before=self._stroke_before,
+        self._mask_sample_queue.clear()
+        self._mask_has_painted_sample = False
+        self._mask_sample_queue.append(
+            (QPointF(point), float(pressure), time.monotonic())
         )
-        mask.touch()
-        self._mask_stroke_dirty = dirty
-        self._invalidate_scene_cache()
-        self.update()
+        # The initial contact must appear immediately. Subsequent packets are
+        # collected and painted together at the next event-loop opportunity.
+        self._flush_mask_samples()
+
+    def _mask_brush_values(self, pressure: float) -> tuple[float, float]:
+        """Return the dedicated mask brush's constant size and alpha."""
+        if self.tool == ToolKind.RASTER_ERASER:
+            return self._brush_values(pressure)
+        if self.settings.mask_pencil_pressure_sensitive:
+            amount = (
+                self.settings.mask_pencil_from_alpha
+                + max(0.0, min(1.0, float(pressure)))
+                * (
+                    self.settings.mask_pencil_to_alpha
+                    - self.settings.mask_pencil_from_alpha
+                )
+            )
+        else:
+            amount = self.settings.mask_pencil_to_alpha
+        return self._stroke_base_size, max(0.0, min(1.0, amount))
 
     def _continue_mask_stroke(self, point: QPointF, pressure: float) -> None:
+        if (
+            self.chapter is None
+            or self.active_tone_mask_id not in self.chapter.masks
+            or not self._drawing
+        ):
+            return
+        self._mask_sample_queue.append(
+            (QPointF(point), float(pressure), time.monotonic())
+        )
+        if not self._mask_sample_timer.isActive():
+            self._mask_sample_timer.start()
+
+    def _flush_mask_samples(self) -> None:
+        if (
+            not self._drawing or self.chapter is None
+            or not self.active_tone_mask_id
+        ):
+            self._mask_sample_queue.clear()
+            return
         mask = self.chapter.masks.get(self.active_tone_mask_id)
         if mask is None:
+            self._mask_sample_queue.clear()
             return
-        current_pressure = self._effective_pressure(pressure)
-        size_start, opacity_start = self._brush_values(self._last_pressure)
-        size_end, opacity_end = self._brush_values(current_pressure)
-        dirty = self.tiles.paint_segment(
-            mask.mask_id, self._last_draw_point, point,
-            size_start, size_end, QColor("#ffffffff"),
-            opacity_start, opacity_end,
-            erase=self.tool == ToolKind.RASTER_ERASER,
-            square=(
-                self.settings.eraser_square
-                and self.tool == ToolKind.RASTER_ERASER
-            ),
-            antialias=(
-                self._stroke_preset.antialiasing
-                if self.tool == ToolKind.RASTER_PENCIL else False
-            ),
-            density=(
-                self._stroke_preset.density
-                if self.tool == ToolKind.RASTER_PENCIL else 1.0
-            ),
-            before=self._stroke_before,
+        dirty = QRectF()
+        erasing = self.tool == ToolKind.RASTER_ERASER
+        while self._mask_sample_queue:
+            point, raw_pressure, _timestamp = self._mask_sample_queue.popleft()
+            pressure = self._effective_pressure(raw_pressure)
+            if not self._mask_has_painted_sample:
+                self._last_draw_point = QPointF(point)
+                self._last_pressure = pressure
+                size, opacity = self._mask_brush_values(pressure)
+                changed = self.tiles.paint_dab(
+                    mask.mask_id, point, size, QColor("#ffffffff"), opacity,
+                    erase=erasing,
+                    square=self.settings.eraser_square and erasing,
+                    antialias=not erasing,
+                    before=self._stroke_before,
+                    replace_alpha=not erasing,
+                )
+                self._mask_has_painted_sample = True
+            else:
+                size_start, opacity_start = self._mask_brush_values(
+                    self._last_pressure
+                )
+                size_end, opacity_end = self._mask_brush_values(pressure)
+                changed = self.tiles.paint_segment(
+                    mask.mask_id, self._last_draw_point, point,
+                    size_start, size_end, QColor("#ffffffff"),
+                    opacity_start, opacity_end,
+                    erase=erasing,
+                    square=self.settings.eraser_square and erasing,
+                    antialias=not erasing,
+                    density=1.0,
+                    before=self._stroke_before,
+                    replace_alpha=not erasing,
+                )
+                self._last_draw_point = QPointF(point)
+                self._last_pressure = pressure
+            if not changed.isEmpty():
+                dirty = changed if dirty.isEmpty() else dirty.united(changed)
+        if dirty.isEmpty():
+            return
+        self._mask_runtime_revision += 1
+        self._mask_stroke_dirty = (
+            dirty if self._mask_stroke_dirty.isEmpty()
+            else self._mask_stroke_dirty.united(dirty)
         )
-        self._last_draw_point = QPointF(point)
-        self._last_pressure = current_pressure
-        if not dirty.isEmpty():
-            self._mask_stroke_dirty = (
-                dirty if self._mask_stroke_dirty.isEmpty()
-                else self._mask_stroke_dirty.united(dirty)
-            )
-            mask.touch()
-            self._invalidate_scene_cache()
-            self.update()
+        self._invalidate_tone_mask_overlay(contributors=False)
+        # Parameter masks are document-anchored. A conservative effect halo
+        # covers the maximum 100 px outline and 100 px Gaussian blur support
+        # without throwing away the rest of the warmed scene cache.
+        scene_dirty = dirty.adjusted(-300.0, -300.0, 300.0, 300.0)
+        widget_dirty = self._mark_scene_dirty_world(scene_dirty)
+        overlay_dirty = self._world_dirty_to_widget(dirty)
+        repaint = widget_dirty.united(overlay_dirty)
+        if not repaint.isEmpty():
+            self.update(repaint)
 
     def _restore_mask_revision(self, mask_id: str, revision: object) -> None:
         mask = self.chapter.masks.get(mask_id) if self.chapter else None
@@ -17566,9 +17864,12 @@ class _CanvasLogic:
         if mask is None or not self._drawing:
             self._drawing = False
             return
+        self._mask_sample_timer.stop()
+        self._flush_mask_samples()
         keys = set(self._stroke_before)
-        if self.tool == ToolKind.RASTER_ERASER:
-            self.tiles.prune_empty(mask.mask_id, keys)
+        self.tiles.prune_empty(mask.mask_id, keys)
+        if keys:
+            mask.touch()
         after = self.tiles.snapshot(mask.mask_id, keys)
         command = TilePatchCommand(
             "Paint mask" if self.tool == ToolKind.RASTER_PENCIL else "Erase mask",
@@ -17583,8 +17884,11 @@ class _CanvasLogic:
         self._stroke_before = {}
         self._stroke_preset = None
         self._mask_stroke_dirty = QRectF()
+        self._mask_sample_queue.clear()
+        self._mask_has_painted_sample = False
         self._drawing = False
-        self._invalidate_scene_cache()
+        self._invalidate_tone_mask_overlay(contributors=False)
+        self._preserve_tone_mask_contributors_once = True
         self.documentChanged.emit(dirty)
         self.interactionFinished.emit()
         self.update()

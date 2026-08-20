@@ -455,6 +455,41 @@ def test_raster_pencil_expands_frame_with_24px_content_margin(qapp):
     assert frame.right() >= content.right() + 24
 
 
+def test_transformed_raster_fill_is_local_tile_aware_and_undoable(qapp):
+    settings = EditorSettings(snap_to_grid=False, raster_fill_tolerance=0)
+    canvas, chapter, _page, layer = _canvas_document(settings)
+    raster = chapter.add_object(
+        layer.layer_id,
+        RasterObject(
+            x=50, y=60,
+            interaction_rect=(0, 0, 16, 8),
+            transform_frame=(50, 60, 16, 8),
+            transform_quad=[
+                (100, 120), (132, 120), (132, 136), (100, 136),
+            ],
+        ),
+    )
+    canvas.set_active_colors("#FF336699", "#FFFFFFFF")
+    canvas.set_selection("object", raster.object_id)
+
+    assert canvas.set_tool(ToolKind.FILL)
+    world_seed = canvas._raster_world_point(raster, QPointF(3, 3))
+    assert canvas._apply_raster_fill(raster, world_seed)
+    tile = canvas.tiles.tile(raster.object_id, (0, 0))
+    assert tile.pixelColor(3, 3) == QColor("#336699")
+    assert raster.transform_quad == [
+        (100, 120), (132, 120), (132, 136), (100, 136),
+    ]
+    assert canvas.command_stack.can_undo
+
+    canvas.command_stack.undo()
+    assert canvas.tiles.tile(raster.object_id, (0, 0)) is None
+    canvas.command_stack.redo()
+    assert canvas.tiles.tile(raster.object_id, (0, 0)).pixelColor(
+        3, 3
+    ) == QColor("#336699")
+
+
 def test_eraser_recalculates_exact_padded_bounds_and_undoes_frame(qapp):
     canvas, chapter, page, layer = _canvas_document()
     raster = chapter.add_object(

@@ -64,7 +64,7 @@ from comic_editor.ui.gradient_tools import (
 )
 from comic_editor.ui.pencil_settings_dialog import PencilSettingsDialog
 from comic_editor.ui.preview import ChapterPreview
-from comic_editor.ui.ribbon import RibbonWidget
+from comic_editor.ui.ribbon import RibbonWidget, VerticalTabWidget
 from comic_editor.ui.tool_ribbon_pages import (
     TextObjectControls, ToolSettingsControls, VectorToolsControls,
 )
@@ -731,7 +731,7 @@ class MainWindow(QMainWindow):
         self.settings_scroll.setMinimumHeight(56)
         self.settings_scroll.setWidget(self.selection_settings)
         self.masks_panel = MasksPanel(hierarchy_panel)
-        self.settings_tabs = QTabWidget(hierarchy_panel)
+        self.settings_tabs = VerticalTabWidget(hierarchy_panel)
         self.settings_tabs.addTab(self.settings_scroll, "Settings")
         self.settings_tabs.addTab(self.masks_panel, "Masks")
         self.tree = QTreeView()
@@ -756,6 +756,8 @@ class MainWindow(QMainWindow):
         self._tablet_outliner_press: dict | None = None
         self._mouse_outliner_press: dict | None = None
         self._forwarding_outliner_mouse = False
+        self._tablet_outliner_contact = False
+        self._tablet_outliner_suppress_mouse_until = 0.0
         self._tablet_drop_indicator = QFrame(self.tree.viewport())
         self._tablet_drop_indicator.setObjectName("tabletDropIndicator")
         self._tablet_drop_indicator.setStyleSheet(
@@ -791,6 +793,19 @@ class MainWindow(QMainWindow):
         self.outliner_splitter.setStretchFactor(0, 0)
         self.outliner_splitter.setStretchFactor(1, 1)
         hierarchy_layout.addWidget(self.outliner_splitter, 1)
+
+        self.exit_mask_mode_button = QPushButton(
+            "Exit Mask Mode", self.canvas
+        )
+        self.exit_mask_mode_button.setObjectName("exitMaskModeButton")
+        self.exit_mask_mode_button.setToolTip(
+            "Commit contributor changes and return to normal canvas editing"
+        )
+        self.exit_mask_mode_button.move(10, 10)
+        self.exit_mask_mode_button.hide()
+        self.exit_mask_mode_button.clicked.connect(
+            lambda: self._finish_mask_mode(True)
+        )
 
         self.hierarchy_dock.setWidget(hierarchy_panel)
         self.addDockWidget(Qt.RightDockWidgetArea, self.hierarchy_dock)
@@ -1646,6 +1661,8 @@ class MainWindow(QMainWindow):
         if event.type() == QEvent.TabletPress:
             if not inside:
                 return False
+            self._tablet_outliner_contact = True
+            self._tablet_outliner_suppress_mouse_until = time.monotonic() + 0.2
             index = self.tree.indexAt(local).siblingAtColumn(0)
             if self.canvas.active_tone_mask_id and index.isValid():
                 self._tablet_outliner_press = {
@@ -1689,18 +1706,10 @@ class MainWindow(QMainWindow):
                         self._cancel_outliner_tablet_press()
                         event.accept()
                         return True
+                    rows = self.tree.selectionModel().selectedRows(0)
                     if not self.tree.selectionModel().isSelected(source):
-                        self.tree.selectionModel().select(
-                            source,
-                            QItemSelectionModel.ClearAndSelect
-                            | QItemSelectionModel.Rows,
-                        )
-                    self.tree.selectionModel().setCurrentIndex(
-                        source, QItemSelectionModel.NoUpdate
-                    )
-                    state["mime"] = self.hierarchy_model.mimeData(
-                        self.tree.selectionModel().selectedRows(0)
-                    )
+                        rows = [source]
+                    state["mime"] = self.hierarchy_model.mimeData(rows)
                     state["dragging"] = True
             if state["dragging"]:
                 target = QApplication.widgetAt(global_position.toPoint())
@@ -1747,6 +1756,8 @@ class MainWindow(QMainWindow):
             )
         self._tablet_drop_indicator.hide()
         self._tablet_outliner_press = None
+        self._tablet_outliner_contact = False
+        self._tablet_outliner_suppress_mouse_until = time.monotonic() + 0.15
         event.accept()
         return True
 
@@ -1787,8 +1798,27 @@ class MainWindow(QMainWindow):
     def _cancel_outliner_tablet_press(self) -> None:
         self._tablet_drop_indicator.hide()
         self._tablet_outliner_press = None
+        self._tablet_outliner_contact = False
+        self._tablet_outliner_suppress_mouse_until = time.monotonic() + 0.15
+
+    def _suppress_outliner_compat_mouse(self, watched, event) -> bool:
+        return bool(
+            watched is self.tree.viewport()
+            and not self._forwarding_outliner_mouse
+            and event.type() in {
+                QEvent.MouseButtonPress, QEvent.MouseMove,
+                QEvent.MouseButtonRelease,
+            }
+            and (
+                self._tablet_outliner_contact
+                or time.monotonic() < self._tablet_outliner_suppress_mouse_until
+            )
+        )
 
     def eventFilter(self, watched, event) -> bool:  # noqa: N802
+        if self._suppress_outliner_compat_mouse(watched, event):
+            event.accept()
+            return True
         if (
             watched is self.tree.viewport()
             and event.type() == QEvent.MouseButtonPress
@@ -3027,7 +3057,8 @@ class MainWindow(QMainWindow):
         shape_selected = (
             self.chapter is not None and self.canvas.selected_kind == "object"
             and isinstance(
-                selected_object, (VectorDrawingObject, VectorFillObject)
+                selected_object,
+                (RasterObject, VectorDrawingObject, VectorFillObject),
             )
         ) or (
             self.chapter is not None
@@ -3180,7 +3211,9 @@ class MainWindow(QMainWindow):
         elif self._manual_ribbon_page:
             self._select_ribbon_page(self._manual_ribbon_page)
         self.tool_settings_controls.set_context(
-            self.canvas.tool, vector_active=vector_tool_context
+            self.canvas.tool, vector_active=vector_tool_context,
+            raster_active=isinstance(selected_object, RasterObject),
+            mask_active=bool(self.canvas.active_tone_mask_id),
         )
         if text_active:
             self.text_object_controls.refresh()
@@ -4000,7 +4033,8 @@ class MainWindow(QMainWindow):
         if self.chapter is None:
             return
         if (
-            self._mask_context == context
+            self._mask_context is not None
+            and self._mask_context[:3] == context[:3]
             and self.canvas.active_tone_mask_id
         ):
             self._finish_mask_mode(True)
@@ -4065,6 +4099,7 @@ class MainWindow(QMainWindow):
         self.selection_common.refresh()
         self.modifier_controls.refresh()
         self._refresh_masks_panel()
+        self._sync_tool_buttons()
         self.canvas.update()
 
     def _enter_mask_mode(
@@ -4081,9 +4116,12 @@ class MainWindow(QMainWindow):
         self.hierarchy_model.set_mask_highlights(set(mask.contributors))
         self.masks_panel.set_active(mask_id)
         self.settings_tabs.setCurrentWidget(self.masks_panel)
+        self.exit_mask_mode_button.raise_()
+        self.exit_mask_mode_button.show()
         self.selection_common.refresh()
         self.modifier_controls.refresh()
         self._refresh_masks_panel()
+        self._sync_tool_buttons()
 
     def _finish_mask_mode(self, commit: bool) -> bool:
         mask_id = self.canvas.active_tone_mask_id
@@ -4096,6 +4134,7 @@ class MainWindow(QMainWindow):
             mask.contributors = list(original)
             mask.touch()
         self.canvas.set_tone_mask_mode("")
+        self.exit_mask_mode_button.hide()
         self.hierarchy_model.set_mask_highlights(None)
         self._mask_context = None
         self._mask_original_contributors = []
@@ -4113,6 +4152,7 @@ class MainWindow(QMainWindow):
         self.selection_common.refresh()
         self.modifier_controls.refresh()
         self._refresh_masks_panel()
+        self._sync_tool_buttons()
         return True
 
     def _apply_mask_contributors(
@@ -4556,6 +4596,7 @@ class MainWindow(QMainWindow):
         self.chapter = chapter
         if self.canvas.active_tone_mask_id not in chapter.masks:
             self.canvas.set_tone_mask_mode("")
+            self.exit_mask_mode_button.hide()
             self._mask_context = None
             self.hierarchy_model.set_mask_highlights(None)
         if self.active_session is not None:

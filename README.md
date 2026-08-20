@@ -21,6 +21,9 @@ workflow.
 - Drawn rectangle, circle, or custom-shape page insertion with editable gaps
 - Nested rectangle, circle, and polygon bounded layers
 - Non-destructive hierarchical masks
+- Chapter-local reusable tone masks for opacity and modifier parameters, with
+  live contributor alpha, raster paint, and a translucent blue edit overlay
+- Linked non-destructive HSL, blur, and exact outside-outline modifier stacks
 - Sparse 256×256 raster tiles
 - Explicit, non-clipping raster interaction frames with drag-to-create
 - Named pressure-curve pencil presets, independent pressure channels,
@@ -49,7 +52,8 @@ workflow.
 ## Run
 
 On Windows, run `start.bat`. It installs the required Python packages,
-including PySide6 and Pillow (which provides `PIL`), before starting the app.
+including PySide6, Pillow, NumPy, and SciPy, before starting the app. SciPy's
+compiled Euclidean distance transform powers accurate realtime outlines.
 
 Or run the equivalent commands manually:
 
@@ -220,7 +224,11 @@ points first, then selected strokes, then every stroke when nothing is
 selected. Redraw amount and pressure limits use sliders with manual numeric
 entry, and selecting vector points switches Redraw to Point Select.
 
-Fill uses the active primary color and only the active entity. On a shape,
+Fill uses the active primary color and only the active entity. On a Raster,
+it performs a four-connected contiguous pixel fill inside that object's finite
+interaction frame. Raster Tool Settings provide a 0–255 straight-RGBA
+tolerance; transformed rasters are filled in object-local coordinates without
+baking their transform. On a shape,
 clicking near its border changes the outline and clicking its interior sets
 the fill. On a Vector Drawing, clicking or dragging through bounded faces
 creates separate Vector Fill children behind its strokes. Enclose and Fill
@@ -240,6 +248,30 @@ secondary for their fill/core. Color palettes are also per series: single
 click applies a swatch to the active slot, double-click edits it, and the
 context menu removes it. Palette names, swatches, and active colors save
 automatically.
+
+The right inspector uses the same dark vertical-tab treatment as the left
+ribbon for Settings and Masks. Parameter and opacity mask buttons open mask
+editing; right-click an assigned orange button for **Remove Mask**, click the
+same button again or use **Exit Mask Mode** to commit contributor changes, and
+press Escape to cancel the current contributor edit. Mask mode leaves the
+normal comic visible and overlays coverage in translucent light blue. In mask
+mode Pencil becomes a dedicated alpha brush: pressure maps linearly between
+configurable From and To values (0 to 1 by default), or paints one constant To
+value when pressure is disabled. It replaces existing mask alpha so light
+pressure can lower coverage; Eraser still removes it. Both use queued tile
+strokes and one Undo command per gesture.
+
+HSL, Blur, and Outline modifiers remain attached to their objects rather than
+appearing in the outliner. Their processed results are cached separately from
+their isolated source images. Outline color, thickness, opacity, intensity,
+and parameter-mask edits therefore reuse the same exact alpha distance field;
+only source-alpha changes rebuild it.
+
+Blur stages use a session-local 64 MiB premultiplied multiresolution pyramid
+with effective radii 0, 1, 3, 7, 15, 31, 63, and 127. Strength, focal,
+intensity, and mask edits reuse that pyramid; canvas preview, save, and export
+all use the same result. Run `python tests/benchmark_masked_blur.py` for the
+opt-in 1080p warmed benchmark.
 
 Drag the divider beside the left sidebar to change its width, the divider
 between Tools and Colors to change their heights, or the divider below the

@@ -4,10 +4,12 @@ from __future__ import annotations
 import json
 
 from PySide6.QtCore import QPointF, QRectF, QSize, Qt, Signal
-from PySide6.QtGui import QColor, QMouseEvent, QPainter, QPen
+from PySide6.QtGui import (
+    QColor, QContextMenuEvent, QLinearGradient, QMouseEvent, QPainter, QPen,
+)
 from PySide6.QtWidgets import (
     QFrame, QGridLayout, QHBoxLayout, QLabel, QPushButton, QScrollArea,
-    QSizePolicy, QToolButton, QVBoxLayout, QWidget,
+    QMenu, QSizePolicy, QToolButton, QVBoxLayout, QWidget,
 )
 
 from comic_editor.ui.icons import iconoir, iconoir_tinted
@@ -54,12 +56,19 @@ class MaskButton(QToolButton):
         self.hoverChanged.emit(False)
         super().leaveEvent(event)
 
-    def mousePressEvent(self, event: QMouseEvent) -> None:  # noqa: N802
-        if event.button() == Qt.RightButton and self.isChecked():
-            self.detachRequested.emit()
-            event.accept()
+    def contextMenuEvent(self, event: QContextMenuEvent) -> None:  # noqa: N802
+        if not self.isChecked():
+            event.ignore()
             return
-        super().mousePressEvent(event)
+        menu = QMenu(self)
+        action = menu.addAction("Remove Mask")
+        action.triggered.connect(self.detachRequested.emit)
+        # popup() keeps tests and tablet event delivery non-blocking.  Retain
+        # the menu until Qt closes it.
+        self._context_menu = menu
+        menu.aboutToHide.connect(lambda: setattr(self, "_context_menu", None))
+        menu.popup(event.globalPos())
+        event.accept()
 
     @staticmethod
     def _entities(mime) -> list[tuple[str, str]]:
@@ -187,6 +196,136 @@ class DualEndpointSlider(QWidget):
         else:
             self.white = value
         self.valuesChanging.emit(self.black, self.white)
+        self.update()
+
+
+class MaskAlphaSlider(QWidget):
+    """Black-to-white mask value control with one or two alpha handles."""
+
+    valuesChanging = Signal(float, float)
+    valuesCommitted = Signal(float, float)
+
+    def __init__(
+        self, from_alpha: float = 0.0, to_alpha: float = 1.0,
+        pressure_sensitive: bool = True, parent: QWidget | None = None,
+    ):
+        super().__init__(parent)
+        self.from_alpha = self._clamp(from_alpha)
+        self.to_alpha = self._clamp(to_alpha)
+        self.pressure_sensitive = bool(pressure_sensitive)
+        self._active = ""
+        self.setMinimumWidth(150)
+        self.setMinimumHeight(38)
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self._sync_tooltip()
+
+    @staticmethod
+    def _clamp(value: float) -> float:
+        return max(0.0, min(1.0, float(value)))
+
+    def _track(self) -> QRectF:
+        return QRectF(9, 8, max(1.0, self.width() - 18.0), 9)
+
+    def _position(self, value: float) -> float:
+        track = self._track()
+        return track.left() + self._clamp(value) * track.width()
+
+    def _value(self, x: float) -> float:
+        track = self._track()
+        return self._clamp(
+            (x - track.left()) / max(1.0, track.width())
+        )
+
+    def _sync_tooltip(self) -> None:
+        self.setToolTip(
+            "Pen pressure maps linearly from From to To; handles may cross"
+            if self.pressure_sensitive else
+            "Constant mask alpha value"
+        )
+
+    def setPressureSensitive(self, enabled: bool) -> None:  # noqa: N802
+        self.pressure_sensitive = bool(enabled)
+        self._active = ""
+        self._sync_tooltip()
+        self.update()
+
+    def setValues(self, from_alpha: float, to_alpha: float) -> None:  # noqa: N802
+        self.from_alpha = self._clamp(from_alpha)
+        self.to_alpha = self._clamp(to_alpha)
+        self.update()
+
+    def paintEvent(self, _event) -> None:  # noqa: N802
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing, True)
+        track = self._track()
+        gradient = QLinearGradient(track.topLeft(), track.topRight())
+        gradient.setColorAt(0.0, QColor("#000000"))
+        gradient.setColorAt(1.0, QColor("#ffffff"))
+        painter.setPen(QPen(QColor("#6b6e75"), 1))
+        painter.setBrush(gradient)
+        painter.drawRoundedRect(track, 3, 3)
+        handles = (
+            (("from", self.from_alpha, "From"),
+             ("to", self.to_alpha, "To"))
+            if self.pressure_sensitive else
+            (("to", self.to_alpha, "Value"),)
+        )
+        for name, value, label in handles:
+            x = self._position(value)
+            shade = round(value * 255)
+            painter.setPen(QPen(
+                QColor("#ff8a24") if self._active == name
+                else QColor("#17181b"),
+                2 if self._active == name else 1,
+            ))
+            painter.setBrush(QColor(shade, shade, shade))
+            painter.drawEllipse(QPointF(x, 12.5), 6, 6)
+            painter.setPen(QColor("#d7d7da"))
+            painter.drawText(
+                QRectF(x - 34, 23, 68, 14), Qt.AlignCenter,
+                f"{label} {round(value * 100)}%",
+            )
+
+    def mousePressEvent(self, event: QMouseEvent) -> None:  # noqa: N802
+        if event.button() != Qt.LeftButton:
+            return super().mousePressEvent(event)
+        if self.pressure_sensitive:
+            x = event.position().x()
+            self._active = (
+                "from"
+                if abs(x - self._position(self.from_alpha))
+                <= abs(x - self._position(self.to_alpha))
+                else "to"
+            )
+        else:
+            self._active = "to"
+        self._move(event.position().x())
+        event.accept()
+
+    def mouseMoveEvent(self, event: QMouseEvent) -> None:  # noqa: N802
+        if self._active and event.buttons() & Qt.LeftButton:
+            self._move(event.position().x())
+            event.accept()
+            return
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event: QMouseEvent) -> None:  # noqa: N802
+        if self._active:
+            self._move(event.position().x())
+            self._active = ""
+            self.update()
+            self.valuesCommitted.emit(self.from_alpha, self.to_alpha)
+            event.accept()
+            return
+        super().mouseReleaseEvent(event)
+
+    def _move(self, x: float) -> None:
+        value = self._value(x)
+        if self._active == "from":
+            self.from_alpha = value
+        else:
+            self.to_alpha = value
+        self.valuesChanging.emit(self.from_alpha, self.to_alpha)
         self.update()
 
 

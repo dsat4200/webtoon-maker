@@ -102,7 +102,7 @@ def default_text_presets() -> list[dict]:
 
 @dataclass
 class EditorSettings:
-    settings_version: int = 16
+    settings_version: int = 18
     tablet_mode: bool = False
     brush_size: int = 12
     eraser_size: int = 28
@@ -152,6 +152,10 @@ class EditorSettings:
     fill_area_amount: float = 0.0
     fill_area_mode: str = "round"
     fill_mode: str = "normal"
+    raster_fill_tolerance: int = 16
+    mask_pencil_pressure_sensitive: bool = True
+    mask_pencil_from_alpha: float = 0.0
+    mask_pencil_to_alpha: float = 1.0
     ui_splitter_sizes: dict[str, list[int]] = field(default_factory=dict)
     navigator_expanded: bool = False
     recent_series: list[str] = field(default_factory=list)
@@ -166,7 +170,7 @@ class EditorSettings:
         self.clamp()
 
     def clamp(self) -> None:
-        self.settings_version = 16
+        self.settings_version = 18
         self.blender_bridge_host = str(
             self.blender_bridge_host or "127.0.0.1"
         ).strip()
@@ -335,6 +339,18 @@ class EditorSettings:
             self.fill_area_mode = "round"
         if self.fill_mode not in {"normal", "enclose"}:
             self.fill_mode = "normal"
+        self.raster_fill_tolerance = max(
+            0, min(255, int(self.raster_fill_tolerance))
+        )
+        self.mask_pencil_pressure_sensitive = bool(
+            self.mask_pencil_pressure_sensitive
+        )
+        self.mask_pencil_from_alpha = max(
+            0.0, min(1.0, float(self.mask_pencil_from_alpha))
+        )
+        self.mask_pencil_to_alpha = max(
+            0.0, min(1.0, float(self.mask_pencil_to_alpha))
+        )
         self.recent_series = list(dict.fromkeys(self.recent_series or []))[:12]
 
     def pencil_size(self) -> int:
@@ -439,13 +455,19 @@ def load_settings() -> EditorSettings:
                 hotkeys.setdefault("eyedropper", "I")
                 hotkeys.setdefault("reset_rotation", "Ctrl+Shift+0")
                 holds.setdefault("eyedropper", True)
+            if int(raw.get("settings_version", 1)) < 17:
+                raw.setdefault("raster_fill_tolerance", 16)
+            if int(raw.get("settings_version", 1)) < 18:
+                raw.setdefault("mask_pencil_pressure_sensitive", True)
+                raw.setdefault("mask_pencil_from_alpha", 0.0)
+                raw.setdefault("mask_pencil_to_alpha", 1.0)
             raw.pop("transform_snap_to_grid", None)
             stored_presets = raw.get("text_presets")
             if isinstance(stored_presets, list):
                 for preset in stored_presets:
                     if isinstance(preset, dict):
                         preset.pop("transform_snap", None)
-            raw["settings_version"] = 16
+            raw["settings_version"] = 18
             valid = {item.name for item in dataclasses.fields(EditorSettings)}
             result = EditorSettings(**{
                 key: value for key, value in raw.items() if key in valid

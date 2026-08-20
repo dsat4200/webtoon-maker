@@ -1,5 +1,5 @@
 {
-  "schema_version": 17,
+  "schema_version": 18,
   "id": "2a9f55d8898c4d968c06336933bff773",
   "name": "Chapter 1",
   "size": [
@@ -136,7 +136,8 @@
       "ignore_parent_mask": false,
       "modifier_ids": [],
       "transform_frame": null,
-      "transform_quad": null
+      "transform_quad": null,
+      "opacity_mask": null
     },
     {
       "id": "25bca1b4207841d488065c0c089a731c",
@@ -253,7 +254,8 @@
       "ignore_parent_mask": false,
       "modifier_ids": [],
       "transform_frame": null,
-      "transform_quad": null
+      "transform_quad": null,
+      "opacity_mask": null
     },
     {
       "id": "522af5ab266d4a28882d067a49687769",
@@ -370,7 +372,8 @@
       "ignore_parent_mask": false,
       "modifier_ids": [],
       "transform_frame": null,
-      "transform_quad": null
+      "transform_quad": null,
+      "opacity_mask": null
     },
     {
       "id": "f77cb9154ae64e26855bb5b98ba4e531",
@@ -439,7 +442,8 @@
       "ignore_parent_mask": false,
       "modifier_ids": [],
       "transform_frame": null,
-      "transform_quad": null
+      "transform_quad": null,
+      "opacity_mask": null
     },
     {
       "id": "d7fd7612e6fd4aa8be0ca5c403fdc778",
@@ -562,7 +566,8 @@
       "ignore_parent_mask": false,
       "modifier_ids": [],
       "transform_frame": null,
-      "transform_quad": null
+      "transform_quad": null,
+      "opacity_mask": null
     },
     {
       "id": "ea5e5c25d23646fabf0541ce16c669a8",
@@ -675,7 +680,8 @@
         "ad49478209ac4c168ee93281dad18be8"
       ],
       "transform_frame": null,
-      "transform_quad": null
+      "transform_quad": null,
+      "opacity_mask": null
     },
     {
       "id": "4b02bbf95a2b4f75a7d1b628a0fe9ecd",
@@ -744,7 +750,8 @@
       "ignore_parent_mask": false,
       "modifier_ids": [],
       "transform_frame": null,
-      "transform_quad": null
+      "transform_quad": null,
+      "opacity_mask": null
     },
     {
       "id": "a2e741f7107b4172ba63f7ff7703e2d7",
@@ -847,7 +854,8 @@
       "ignore_parent_mask": false,
       "modifier_ids": [],
       "transform_frame": null,
-      "transform_quad": null
+      "transform_quad": null,
+      "opacity_mask": null
     },
     {
       "id": "f53bea9cfc1b49888785699a7da282fd",
@@ -916,7 +924,8 @@
       "ignore_parent_mask": false,
       "modifier_ids": [],
       "transform_frame": null,
-      "transform_quad": null
+      "transform_quad": null,
+      "opacity_mask": null
     },
     {
       "id": "fbd265cae55c4246b360495abbf74bbd",
@@ -985,7 +994,8 @@
       "ignore_parent_mask": false,
       "modifier_ids": [],
       "transform_frame": null,
-      "transform_quad": null
+      "transform_quad": null,
+      "opacity_mask": null
     },
     {
       "id": "81916fd3ff4646f4b259068c1dd7f85f",
@@ -1108,7 +1118,8 @@
       "ignore_parent_mask": false,
       "modifier_ids": [],
       "transform_frame": null,
-      "transform_quad": null
+      "transform_quad": null,
+      "opacity_mask": null
     }
   ],
   "objects": [
@@ -1129,6 +1140,7 @@
       "ignore_parent_mask": false,
       "underlay_opacity": 0.0,
       "modifier_ids": [],
+      "opacity_mask": null,
       "tile_size": 256,
       "interaction_rect": [
         125.0,
@@ -1156,6 +1168,7 @@
       "ignore_parent_mask": false,
       "underlay_opacity": 0.0,
       "modifier_ids": [],
+      "opacity_mask": null,
       "strokes": [
         {
           "id": "8040260c724043019f9c2bae895ea497",
@@ -23605,6 +23618,7 @@
       "ignore_parent_mask": false,
       "underlay_opacity": 0.0,
       "modifier_ids": [],
+      "opacity_mask": null,
       "text": "I don't get it.",
       "size": [
         360.0,
@@ -23638,6 +23652,7 @@
       "ignore_parent_mask": false,
       "underlay_opacity": 0.0,
       "modifier_ids": [],
+      "opacity_mask": null,
       "strokes": [],
       "fill_child_ids": [],
       "drawing_revision": 0,
@@ -23663,6 +23678,7 @@
       "modifier_ids": [
         "ad49478209ac4c168ee93281dad18be8"
       ],
+      "opacity_mask": null,
       "source": {
         "type": "blender_comic_view",
         "project_uuid": "bdf1aec65cf84149a0a07569c8c3341e",
@@ -23723,6 +23739,7 @@
         "ad49478209ac4c168ee93281dad18be8",
         "1d7357bafcfd44e7ab1f15968ab88d21"
       ],
+      "opacity_mask": null,
       "strokes": [
         {
           "id": "1d9d7a04f7d14b66aba53591392f5576",
@@ -45085,6 +45102,7 @@
       "modifier_ids": [
         "ad49478209ac4c168ee93281dad18be8"
       ],
+      "opacity_mask": null,
       "strokes": [
         {
           "id": "d534c97e0b394389922cc747676fcb89",
@@ -53454,6 +53472,7 @@
       "modifier_ids": [
         "ad49478209ac4c168ee93281dad18be8"
       ],
+      "opacity_mask": null,
       "tile_size": 256,
       "interaction_rect": [
         -49.0,
@@ -53481,6 +53500,7 @@
       "ignore_parent_mask": false,
       "underlay_opacity": 0.0,
       "modifier_ids": [],
+      "opacity_mask": null,
       "text": "I'm sorry,\nbut..",
       "size": [
         360.0,
@@ -53531,6 +53551,7 @@
       "ignore_parent_mask": false,
       "underlay_opacity": 0.0,
       "modifier_ids": [],
+      "opacity_mask": null,
       "gradient_type": "color_fill",
       "field_type": "line",
       "line_field": {
@@ -53634,6 +53655,7 @@
       "ignore_parent_mask": false,
       "underlay_opacity": 0.0,
       "modifier_ids": [],
+      "opacity_mask": null,
       "gradient_type": "color_fill",
       "field_type": "parent_shape",
       "line_field": {
@@ -53740,6 +53762,7 @@
       "ignore_parent_mask": false,
       "underlay_opacity": 0.0,
       "modifier_ids": [],
+      "opacity_mask": null,
       "text": "Words.",
       "size": [
         360.0,
@@ -53773,6 +53796,7 @@
       "ignore_parent_mask": false,
       "underlay_opacity": 0.0,
       "modifier_ids": [],
+      "opacity_mask": null,
       "text": "What did you mean\nby that?",
       "size": [
         360.0,
@@ -53816,7 +53840,8 @@
       "expanded": true,
       "hue": -8.0,
       "saturation": 27.0,
-      "lightness": 12.0
+      "lightness": 12.0,
+      "parameter_masks": {}
     },
     {
       "id": "1d7357bafcfd44e7ab1f15968ab88d21",
@@ -53832,7 +53857,9 @@
       ],
       "focal_radius": 644.4501004253253,
       "focal_ramp": 0.6289080690503795,
-      "focal_angle": 0.004574117946980081
+      "focal_angle": 0.004574117946980081,
+      "parameter_masks": {}
     }
-  ]
+  ],
+  "masks": []
 }

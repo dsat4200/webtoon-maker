@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from PySide6.QtCore import QObject, Signal
 from PySide6.QtTest import QTest
-from PySide6.QtWidgets import QScrollArea, QSlider, QSpinBox
+from PySide6.QtWidgets import QScrollArea, QSlider, QSpinBox, QTabBar
 
 from comic_editor.core.models import (
     BoundGeometry, ChapterDocument, ColorFillGradientObject, PathNode,
@@ -92,6 +92,8 @@ def test_layer_settings_kind_rows_and_position_above_tree(qapp, monkeypatch):
     assert settings_host.layout().indexOf(window.settings_tabs) >= 0
     assert window.settings_tabs.indexOf(window.settings_scroll) >= 0
     assert window.settings_tabs.indexOf(window.masks_panel) >= 0
+    assert window.settings_tabs.tab_bar.shape() == QTabBar.Shape.RoundedEast
+    assert window.settings_tabs.property("orientation") == "vertical"
     assert settings_host.layout().indexOf(window.selection_common) >= 0
     assert settings_host.layout().indexOf(window.settings_scroll) < settings_host.layout().indexOf(window.selection_common)
     assert isinstance(window.settings_scroll, QScrollArea)

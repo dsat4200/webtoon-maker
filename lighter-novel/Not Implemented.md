@@ -84,6 +84,8 @@
 
 
 
+not yet
+add the ability to right click a layer and click "show as mask only". this sets the layer to only appear in masks and not visually in the canvas on its own. however, if currently selected, it should show as normal for the sake of editing. these layers should have opacity say (percent) " - Mask"
 
 
 

@@ -85,7 +85,7 @@ Windows convenience launcher. It changes the working directory to the batch file
 
 ### `requirements.txt`
 
-Declares PySide6 6.7+, Pillow 10+, NumPy 2+, and pytest 8+. PySide6 supplies the native UI/QPainter/OpenGL wrapper, Pillow is used for alpha bounding boxes, NumPy builds complex gradient fields, and pytest drives the suite.
+Declares PySide6 6.7+, Pillow 10+, NumPy 2+, SciPy 1.14+, and pytest 8+. PySide6 supplies the native UI/QPainter/OpenGL wrapper, Pillow is used for alpha bounding boxes, NumPy builds complex gradient fields, SciPy supplies compiled connected-component and exact Euclidean-distance operations for raster Fill and Outline, and pytest drives the suite.
 
 ### `pytest.ini`
 
@@ -127,7 +127,7 @@ Marks the UI package with a PySide6 interface docstring. It has no runtime logic
 
 The canonical saved-data model and invariant layer.
 
-- Declares schema version 16, chapter width 1080, default height 3240, growth margin 1080, and chapter/asset document kinds.
+- Declares schema version 18, chapter width 1080, default height 3240, growth margin 1080, and chapter/asset document kinds.
 - Normalizes colors to canonical ARGB and generates stable UUID IDs.
 - Defines grids, path nodes/contours, shape style, and unified rectangle/ellipse/custom `BoundGeometry`.
 - Defines mixed layer/object child references and `LayerNode` with shape, fill, page, mask, grid, and compound fields.
@@ -177,7 +177,7 @@ Defines small extensibility registries for object and bound types. It registers 
 
 ### `comic_editor/core/settings.py`
 
-Defines per-user editor settings and their version-15 migration, including the
+Defines per-user editor settings and their version-17 migration, including the
 loopback Blender bridge endpoint and token.
 
 - Supplies default hotkeys and Hold flags.
@@ -193,6 +193,7 @@ Owns sparse raster pixels.
 
 - Allocates premultiplied ARGB QImages per object/tile only when touched.
 - Paints circle/square dabs and density-spaced lines with SourceOver or Clear composition.
+- Performs finite, four-connected, tolerance-based sparse raster flood fills using compiled per-tile component labeling.
 - Tracks dirty tile coordinates and snapshots selected tile sets for undo.
 - Iterates tiles with optional rectangle culling, prunes empty tiles, and calculates alpha bounds.
 - Transforms an object into a new sparse tile set through quad-to-quad projective mapping and inverse source queries.
@@ -240,6 +241,22 @@ The largest and most central runtime script.
 - Implements hit testing and all mouse, tablet, touch, key, wheel, IME, and navigation behavior.
 - Implements page creation/gutters, drawing selections/transforms, vector pencil/eraser/redraw/connect/simplify/fill, shape creation/edit/flatten with draft compound/style gizmos, raster creation/strokes/transforms, text editing/word selection, selection-scoped typography gizmos, and cached free-text transform previews.
 - Provides software and OpenGL-backed widget classes plus the OpenGL probe/factory.
+
+### `comic_editor/ui/modifier_rendering.py`
+
+Evaluates premultiplied HSL, variable blur, and outside Outline stages. It
+uses SciPy's exact Euclidean distance transform and a byte-budgeted alpha-only
+LRU so warmed Outline parameter changes do not recompute source geometry. A
+separate 64 MiB session LRU stores reduced premultiplied RGBA8 blur pyramids,
+avoiding the former sixteen-full-resolution-image masked-blur path.
+
+### `comic_editor/ui/modifier_controls.py` and `mask_controls.py`
+
+Build linked modifier cards, maskable dual-endpoint parameter controls, the
+one/two-handle Mask Pencil alpha control,
+canonical alpha-aware Outline colors, the assigned-mask context menu, and the
+saved-mask grid. Preview edits issue partial canvas invalidations and commit
+one model command at gesture completion.
 
 See the dedicated canvas document for the rendering pipeline.
 
@@ -300,13 +317,13 @@ The fixed-width chapter navigator. It renders the chapter into a small cached im
 
 ### `comic_editor/ui/ribbon.py`
 
-Generic ribbon primitives: titled groups, horizontally scrolling pages, and a tab widget with stable page keys, page visibility, explicit selection, and tab rebuilding. It contains no drawing-specific business logic.
+Generic ribbon primitives: titled groups, horizontally scrolling pages, a tab widget with stable page keys, and the compact `RoundedEast` vertical inspector host shared by Settings/Masks. It contains no drawing-specific business logic.
 
 ### `comic_editor/ui/tool_ribbon_pages.py`
 
 Defines four contextual ribbon control owners.
 
-- `ToolSettingsControls`: Pencil preset/size, Eraser size/shape/vector mode, Fill tracing/area/mode settings, and drawing-selection transform mode.
+- `ToolSettingsControls`: Pencil preset/size, Eraser size/shape/vector mode, Vector Fill tracing/area/mode settings, Raster Fill tolerance, and drawing-selection transform mode.
 - `VectorToolsControls`: free/uniform transform mode; thickness/opacity Redraw parameter, interaction, operation, amount and pressure maximum; Connect; and Simplify amount/tool/apply.
 - `RasterObjectControls`: Raster name, visibility, opacity lock/value, mask escape, underlay, geometry reference, and transform mode, with coalesced slider changes.
 - `TextObjectControls`: selected-text preset CRUD, visibility/opacity, font preview mode, integer size, bold/italic, manual kerning, strict/free layout, alignment, margin, geometry reference, and transform mode.

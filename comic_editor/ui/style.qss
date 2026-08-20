@@ -123,6 +123,14 @@ QWidget#ribbon[orientation="vertical"] QTabBar#ribbonTabs::tab:selected {
     border-bottom: none;
     border-left-color: #80c8ff;
 }
+QPushButton#exitMaskModeButton {
+    background: #4a2b14;
+    border: 1px solid #ff8a24;
+    color: #ffffff;
+    font-weight: 600;
+    padding: 6px 10px;
+}
+QPushButton#exitMaskModeButton:hover { background: #63371a; }
 QTabBar#projectTabs {
     background: #18181c;
     border-bottom: 1px solid #36363d;
