@@ -417,10 +417,13 @@ class TileStore:
                 return None
             return minimum_x, minimum_y, maximum_x + 1, maximum_y + 1
 
-    def load_directory(self, root: Path, object_ids: set[str]) -> None:
-        self._tiles.clear()
-        self._alpha_bounds.clear()
-        self._alpha_bounds_dirty.clear()
+    def load_directory(
+        self, root: Path, object_ids: set[str], *, clear: bool = True,
+    ) -> None:
+        if clear:
+            self._tiles.clear()
+            self._alpha_bounds.clear()
+            self._alpha_bounds_dirty.clear()
         for object_id in object_ids:
             directory = root / object_id
             if not directory.is_dir():

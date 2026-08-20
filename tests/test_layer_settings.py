@@ -89,7 +89,9 @@ def test_layer_settings_kind_rows_and_position_above_tree(qapp, monkeypatch):
     layout = window.hierarchy_dock.widget().layout()
     assert layout.indexOf(window.outliner_splitter) >= 0
     settings_host = window.outliner_splitter.widget(0)
-    assert settings_host.layout().indexOf(window.settings_scroll) >= 0
+    assert settings_host.layout().indexOf(window.settings_tabs) >= 0
+    assert window.settings_tabs.indexOf(window.settings_scroll) >= 0
+    assert window.settings_tabs.indexOf(window.masks_panel) >= 0
     assert settings_host.layout().indexOf(window.selection_common) >= 0
     assert settings_host.layout().indexOf(window.settings_scroll) < settings_host.layout().indexOf(window.selection_common)
     assert isinstance(window.settings_scroll, QScrollArea)

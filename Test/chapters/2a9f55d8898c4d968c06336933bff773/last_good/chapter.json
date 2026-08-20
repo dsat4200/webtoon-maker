@@ -573,6 +573,14 @@
       "children": [
         {
           "kind": "layer",
+          "id": "81916fd3ff4646f4b259068c1dd7f85f"
+        },
+        {
+          "kind": "layer",
+          "id": "fbd265cae55c4246b360495abbf74bbd"
+        },
+        {
+          "kind": "layer",
           "id": "4b02bbf95a2b4f75a7d1b628a0fe9ecd"
         },
         {
@@ -594,8 +602,8 @@
           {
             "id": "ee6f142371fc402094db441e3b3b3510",
             "position": [
-              746.7714939120955,
-              1232.5812810966418
+              748.4175150148822,
+              1230.08465208038
             ],
             "point_type": "vector",
             "incoming": null,
@@ -608,8 +616,8 @@
           {
             "id": "e4cf574d54fc4ecfbdb06827d9e0e870",
             "position": [
-              990.7714939120955,
-              1285.5812810966418
+              992.4175150148822,
+              1283.08465208038
             ],
             "point_type": "vector",
             "incoming": null,
@@ -622,8 +630,8 @@
           {
             "id": "2d31ba14570541cf8ac5e3ce1fdfeba0",
             "position": [
-              993.7714939120955,
-              1441.5812810966418
+              995.4175150148822,
+              1439.08465208038
             ],
             "point_type": "vector",
             "incoming": null,
@@ -636,8 +644,8 @@
           {
             "id": "a409f0efc2ac400fa02e3aa14a13ee3a",
             "position": [
-              724.7714939120955,
-              1376.5812810966418
+              726.4175150148822,
+              1374.08465208038
             ],
             "point_type": "vector",
             "incoming": null,
@@ -897,6 +905,198 @@
         "primary_color": "#FFFFFFFF",
         "base_thickness": 12,
         "outline_color": "#FF000000",
+        "outline_thickness": 4,
+        "start_cap": "round",
+        "end_cap": "round"
+      },
+      "grid_override": null,
+      "last_raster_id": null,
+      "compound_enabled": false,
+      "compound_operation": "add",
+      "ignore_parent_mask": false,
+      "modifier_ids": [],
+      "transform_frame": null,
+      "transform_quad": null
+    },
+    {
+      "id": "fbd265cae55c4246b360495abbf74bbd",
+      "name": "Layer 6",
+      "is_page": false,
+      "layer_kind": "open_shape",
+      "parent_id": "ea5e5c25d23646fabf0541ce16c669a8",
+      "children": [],
+      "visible": true,
+      "opacity": 1.0,
+      "translation": [
+        0.0,
+        0.0
+      ],
+      "bound": {
+        "type": "path",
+        "closed": false,
+        "primitive": "custom",
+        "nodes": [
+          {
+            "id": "7ec207e94dd04697b2bb766b50738ad5",
+            "position": [
+              940.7714939120955,
+              1397.5812810966418
+            ],
+            "point_type": "vector",
+            "incoming": null,
+            "outgoing": null,
+            "handles_locked": true,
+            "roundness": 0.0,
+            "roundness_enabled": false,
+            "width_multiplier": 1.0
+          },
+          {
+            "id": "93585873a5db408bb9edac2f777d7841",
+            "position": [
+              931.7714939120955,
+              1508.5812810966418
+            ],
+            "point_type": "bezier",
+            "incoming": [
+              1002.7714939120955,
+              1430.5812810966418
+            ],
+            "outgoing": null,
+            "handles_locked": false,
+            "roundness": 0.0,
+            "roundness_enabled": false,
+            "width_multiplier": 3.4
+          }
+        ],
+        "additional_contours": []
+      },
+      "shape_style": {
+        "primary_color": "#FFFFFFFF",
+        "base_thickness": 12,
+        "outline_color": "#FFA3765C",
+        "outline_thickness": 4,
+        "start_cap": "round",
+        "end_cap": "round"
+      },
+      "grid_override": null,
+      "last_raster_id": null,
+      "compound_enabled": false,
+      "compound_operation": "add",
+      "ignore_parent_mask": false,
+      "modifier_ids": [],
+      "transform_frame": null,
+      "transform_quad": null
+    },
+    {
+      "id": "81916fd3ff4646f4b259068c1dd7f85f",
+      "name": "Layer 7",
+      "is_page": false,
+      "layer_kind": "bounded",
+      "parent_id": "ea5e5c25d23646fabf0541ce16c669a8",
+      "children": [
+        {
+          "kind": "object",
+          "id": "142c1da72d7a44be8ab2e50e8009e411"
+        }
+      ],
+      "visible": true,
+      "opacity": 1.0,
+      "translation": [
+        0.0,
+        0.0
+      ],
+      "bound": {
+        "type": "path",
+        "closed": true,
+        "primitive": "ellipse",
+        "nodes": [
+          {
+            "id": "3d369cba0d824b4f8ebd30ee0ee1f23d",
+            "position": [
+              882.2503314216017,
+              1431.5812810966418
+            ],
+            "point_type": "bezier",
+            "incoming": [
+              772.0812115572692,
+              1431.5812810966418
+            ],
+            "outgoing": [
+              992.4194512859342,
+              1431.5812810966418
+            ],
+            "handles_locked": true,
+            "roundness": 0.0,
+            "roundness_enabled": false,
+            "width_multiplier": 1.0
+          },
+          {
+            "id": "b61250cf539d4570ae50b6ca623ac7b6",
+            "position": [
+              1081.729168931108,
+              1616.5812810966418
+            ],
+            "point_type": "bezier",
+            "incoming": [
+              1081.729168931108,
+              1514.4086023836417
+            ],
+            "outgoing": [
+              1081.729168931108,
+              1718.7539598096419
+            ],
+            "handles_locked": true,
+            "roundness": 0.0,
+            "roundness_enabled": false,
+            "width_multiplier": 1.0
+          },
+          {
+            "id": "86947f910f1c40359dbdeefad8333ee0",
+            "position": [
+              882.2503314216017,
+              1801.5812810966418
+            ],
+            "point_type": "bezier",
+            "incoming": [
+              992.4194512859342,
+              1801.5812810966418
+            ],
+            "outgoing": [
+              772.0812115572692,
+              1801.5812810966418
+            ],
+            "handles_locked": true,
+            "roundness": 0.0,
+            "roundness_enabled": false,
+            "width_multiplier": 1.0
+          },
+          {
+            "id": "b13a81e9b0484d768596d4bfc7f3a20f",
+            "position": [
+              682.7714939120955,
+              1616.5812810966418
+            ],
+            "point_type": "bezier",
+            "incoming": [
+              682.7714939120955,
+              1718.7539598096419
+            ],
+            "outgoing": [
+              682.7714939120955,
+              1514.4086023836417
+            ],
+            "handles_locked": true,
+            "roundness": 0.0,
+            "roundness_enabled": false,
+            "width_multiplier": 1.0
+          }
+        ],
+        "additional_contours": []
+      },
+      "shape_style": {
+        "primary_color": "#FFFFFFFF",
+        "base_thickness": 8,
+        "outline_color": "#FFA3765C",
         "outline_thickness": 4,
         "start_cap": "round",
         "end_cap": "round"
@@ -44816,10 +45016,31 @@
               "opacity": 0.9999999195337343
             }
           ]
+        },
+        {
+          "id": "44f3c8df692c44618bb0271cc8902397",
+          "color": "#FF000000",
+          "closed": false,
+          "start_cap": "round",
+          "end_cap": "round",
+          "render_revision": 0,
+          "points": [
+            {
+              "id": "c55db82813084dc2b32e78fc8d1e1d98",
+              "position": [
+                99.75356061604712,
+                1432.895925781274
+              ],
+              "incoming": null,
+              "outgoing": null,
+              "width": 11.999999034404812,
+              "opacity": 0.9999999195337343
+            }
+          ]
         }
       ],
       "fill_child_ids": [],
-      "drawing_revision": 44,
+      "drawing_revision": 45,
       "transform_frame": [
         -102.15432694378671,
         1058.359166132759,
@@ -53260,7 +53481,7 @@
       "ignore_parent_mask": false,
       "underlay_opacity": 0.0,
       "modifier_ids": [],
-      "text": "I'm sorry,\nwhat?",
+      "text": "I'm sorry,\nbut..",
       "size": [
         360.0,
         120.0
@@ -53534,6 +53755,56 @@
       "vertical_alignment": "middle",
       "margin": 24.0,
       "transform_quad": null
+    },
+    {
+      "id": "142c1da72d7a44be8ab2e50e8009e411",
+      "type": "text",
+      "name": "Text 4",
+      "custom_name": false,
+      "parent_layer_id": "81916fd3ff4646f4b259068c1dd7f85f",
+      "position": [
+        0.0,
+        0.0
+      ],
+      "visible": true,
+      "opacity": 1.0,
+      "opacity_locked": true,
+      "geometry_reference": "direct",
+      "ignore_parent_mask": false,
+      "underlay_opacity": 0.0,
+      "modifier_ids": [],
+      "text": "What did you mean\nby that?",
+      "size": [
+        360.0,
+        120.0
+      ],
+      "font_family": "Cammi Sans Superbold",
+      "font_size": 41.0,
+      "bold": false,
+      "italic": false,
+      "kerning": 0.0,
+      "layout_mode": "free",
+      "horizontal_alignment": "center",
+      "vertical_alignment": "middle",
+      "margin": 24.0,
+      "transform_quad": [
+        [
+          716.3292338845729,
+          1441.5712430832941
+        ],
+        [
+          1076.888850154383,
+          1566.0391303335803
+        ],
+        [
+          994.4392881479429,
+          1747.8198326527436
+        ],
+        [
+          650.9795982412919,
+          1747.8198326527436
+        ]
+      ]
     }
   ],
   "modifiers": [
@@ -53551,9 +53822,9 @@
       "id": "1d7357bafcfd44e7ab1f15968ab88d21",
       "type": "blur",
       "name": "Blur",
-      "intensity": 100.0,
+      "intensity": 45.0,
       "expanded": true,
-      "strength": 39.0,
+      "strength": 100.0,
       "mode": "focal",
       "focal_center": [
         519.5348215870289,

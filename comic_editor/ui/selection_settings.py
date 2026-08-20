@@ -14,12 +14,17 @@ from comic_editor.core.models import (
 from comic_editor.ui.layer_settings import LayerSettingsPanel
 from comic_editor.ui.tool_ribbon_pages import RasterObjectControls
 from comic_editor.ui.icons import iconoir
+from comic_editor.ui.mask_controls import DualEndpointSlider, MaskButton
 
 
 class SelectionCommonControls(QWidget):
     """Pinned visibility and opacity controls for the exact selection."""
 
     changed = Signal()
+    maskRequested = Signal(object)
+    maskPreviewRequested = Signal(str, bool)
+    maskContributorsDropped = Signal(object, object)
+    maskDetachRequested = Signal(object)
 
     def __init__(self, canvas, parent: QWidget | None = None):
         super().__init__(parent)
@@ -42,6 +47,9 @@ class SelectionCommonControls(QWidget):
         self.opacity_lock = QCheckBox("Lock opacity", self)
         self.opacity = QSlider(Qt.Orientation.Horizontal, self)
         self.opacity.setRange(0, 100)
+        self.opacity_mask_button = MaskButton(self)
+        self.opacity_endpoints = DualEndpointSlider(0, 100, 0, 100, self)
+        self.opacity_endpoints.hide()
         self.opacity_value = QLabel("100%", self)
         self.opacity_value.setMinimumWidth(38)
         self.opacity_value.setAlignment(
@@ -50,13 +58,33 @@ class SelectionCommonControls(QWidget):
         layout.addWidget(self.visible_button)
         layout.addWidget(self.opacity_lock)
         layout.addWidget(QLabel("Opacity", self))
+        layout.addWidget(self.opacity_mask_button)
         layout.addWidget(self.opacity, 1)
+        layout.addWidget(self.opacity_endpoints, 1)
         layout.addWidget(self.opacity_value)
         self.visible_button.toggled.connect(self._visibility_changed)
         self.opacity_lock.toggled.connect(self._opacity_lock_changed)
         self.opacity.sliderPressed.connect(self._begin_opacity_drag)
         self.opacity.valueChanged.connect(self._opacity_changed)
         self.opacity.sliderReleased.connect(self._finish_opacity_drag)
+        self.opacity_mask_button.clicked.connect(self._request_mask)
+        self.opacity_mask_button.hoverChanged.connect(self._preview_mask)
+        self.opacity_mask_button.entitiesDropped.connect(
+            self._drop_mask_contributors
+        )
+        self.opacity_mask_button.detachRequested.connect(
+            lambda: self.maskDetachRequested.emit(self._mask_context())
+        )
+        self.opacity_endpoints.valuesChanging.connect(
+            lambda black, white: self._set_mask_endpoints(
+                black, white, False
+            )
+        )
+        self.opacity_endpoints.valuesCommitted.connect(
+            lambda black, white: self._set_mask_endpoints(
+                black, white, True
+            )
+        )
         self.refresh()
 
     def _selected(self):
@@ -89,6 +117,21 @@ class SelectionCommonControls(QWidget):
         # not disable the common edit path: the first real value change
         # snapshots the effective value and unlocks the object atomically.
         self.opacity.setEnabled(enabled)
+        binding = getattr(target, "opacity_mask", None) if target else None
+        maskable = (
+            enabled
+            and not bool(getattr(target, "is_page", False))
+            and getattr(target, "layer_kind", "bounded") != "fill"
+        )
+        self.opacity_mask_button.setVisible(maskable)
+        self.opacity_mask_button.setChecked(binding is not None)
+        self.opacity.setVisible(binding is None)
+        self.opacity_endpoints.setVisible(binding is not None)
+        if binding is not None:
+            self.opacity_endpoints.setValues(
+                binding.black_value * 100.0,
+                binding.white_value * 100.0,
+            )
         if target is not None:
             self.visible.setChecked(bool(target.visible))
             self._update_visibility_button(bool(target.visible))
@@ -116,6 +159,64 @@ class SelectionCommonControls(QWidget):
             self._opacity_start_value = 100
             self.opacity_value.setText("—")
         self._updating = False
+
+    def _mask_context(self):
+        target = self._selected()
+        if (
+            target is None or bool(getattr(target, "is_page", False))
+            or getattr(target, "layer_kind", "bounded") == "fill"
+        ):
+            return None
+        if self.canvas.selected_kind == "object":
+            try:
+                current = self.canvas.chapter.effective_object_opacity(
+                    target.object_id
+                ) * 100.0
+            except (AttributeError, KeyError):
+                current = float(getattr(target, "opacity", 1.0)) * 100.0
+        else:
+            current = float(getattr(target, "opacity", 1.0)) * 100.0
+        return (
+            "opacity", self.canvas.selected_kind, self.canvas.selected_id,
+            0.0, 100.0, 0.0, current,
+        )
+
+    def _request_mask(self) -> None:
+        context = self._mask_context()
+        if context is not None:
+            self.maskRequested.emit(context)
+
+    def _preview_mask(self, hovered: bool) -> None:
+        target = self._selected()
+        binding = getattr(target, "opacity_mask", None) if target else None
+        self.maskPreviewRequested.emit(
+            binding.mask_id if binding is not None else "", bool(hovered)
+        )
+
+    def _drop_mask_contributors(self, entities) -> None:
+        context = self._mask_context()
+        if context is not None:
+            self.maskContributorsDropped.emit(context, entities)
+
+    def _set_mask_endpoints(
+        self, black: float, white: float, commit: bool,
+    ) -> None:
+        target = self._selected()
+        binding = getattr(target, "opacity_mask", None) if target else None
+        if target is None or binding is None or self._updating:
+            return
+        if self._opacity_before is None:
+            self._opacity_before = self.canvas.chapter.to_dict()
+        binding.black_value = float(black) / 100.0
+        binding.white_value = float(white) / 100.0
+        target.opacity = binding.white_value
+        if hasattr(target, "opacity_locked"):
+            target.opacity_locked = False
+        self.canvas._invalidate_scene_cache()
+        self.canvas.documentChanged.emit(None)
+        self.canvas.update()
+        if commit:
+            self._finish_opacity_drag()
 
     def _update_visibility_button(self, visible: bool) -> None:
         self.visible_button.setIcon(iconoir("eye" if visible else "eye-closed"))

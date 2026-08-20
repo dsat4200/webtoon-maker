@@ -2,16 +2,18 @@
 from __future__ import annotations
 
 from PySide6.QtCore import QPoint, Qt, Signal
-from PySide6.QtGui import QMouseEvent
+from PySide6.QtGui import QColor, QMouseEvent
 from PySide6.QtWidgets import (
-    QComboBox, QFrame, QHBoxLayout, QLabel, QMenu, QPushButton, QSlider,
-    QSpinBox, QToolButton, QVBoxLayout, QWidget,
+    QColorDialog, QComboBox, QFrame, QHBoxLayout, QLabel, QMenu, QPushButton,
+    QSlider, QSpinBox, QToolButton, QVBoxLayout, QWidget,
 )
 
 from comic_editor.core.models import (
     BlurModifier, HueSaturationLightnessModifier, ModifierInstance,
+    OutlineModifier,
 )
 from comic_editor.ui.icons import iconoir
+from comic_editor.ui.mask_controls import DualEndpointSlider, MaskButton
 
 
 class ModifierTitleBar(QFrame):
@@ -124,7 +126,7 @@ class ModifierCard(QFrame):
                 "Lightness", -100, 100, round(modifier.lightness),
                 "lightness", "%",
             ))
-        else:
+        elif isinstance(modifier, BlurModifier):
             form.addWidget(self._slider_row(
                 "Strength", 0, 100, round(modifier.strength),
                 "strength", " px",
@@ -144,6 +146,26 @@ class ModifierCard(QFrame):
             )
             mode_layout.addWidget(mode, 1)
             form.addWidget(mode_row)
+        elif isinstance(modifier, OutlineModifier):
+            form.addWidget(self._slider_row(
+                "Thickness", 0, 100, round(modifier.thickness),
+                "thickness", " px",
+            ))
+            form.addWidget(self._slider_row(
+                "Opacity", 0, 100, round(modifier.opacity),
+                "opacity", "%",
+            ))
+            color_row = QWidget(body)
+            color_layout = QHBoxLayout(color_row)
+            color_layout.setContentsMargins(0, 0, 0, 0)
+            color_layout.addWidget(QLabel("Color", color_row))
+            color = QPushButton(modifier.color, color_row)
+            color.setStyleSheet(
+                f"QPushButton {{ background: {QColor(modifier.color).name()}; }}"
+            )
+            color.clicked.connect(lambda: self._choose_color(color))
+            color_layout.addWidget(color, 1)
+            form.addWidget(color_row)
         outer.addWidget(body)
         body.setVisible(modifier.expanded)
 
@@ -163,6 +185,48 @@ class ModifierCard(QFrame):
         layout = QHBoxLayout(row)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.addWidget(QLabel(label, row))
+        binding = self.modifier.parameter_masks.get(attribute)
+        mask_button = MaskButton(row)
+        mask_button.setChecked(binding is not None)
+        context = (
+            "modifier", self.modifier.modifier_id, attribute,
+            float(minimum), float(maximum), 0.0, float(value),
+        )
+        mask_button.clicked.connect(
+            lambda _checked=False, value=context:
+            self.owner.request_mask(value)
+        )
+        mask_button.hoverChanged.connect(
+            lambda hovered, value=context:
+            self.owner.preview_mask(value, hovered)
+        )
+        mask_button.entitiesDropped.connect(
+            lambda entities, value=context:
+            self.owner.drop_mask_contributors(value, entities)
+        )
+        mask_button.detachRequested.connect(
+            lambda value=context: self.owner.detach_mask(value)
+        )
+        layout.addWidget(mask_button)
+        if binding is not None:
+            endpoints = DualEndpointSlider(
+                minimum, maximum,
+                binding.black_value, binding.white_value, row,
+            )
+            endpoints.valuesChanging.connect(
+                lambda black, white: self.owner.set_mask_endpoints(
+                    self.modifier.modifier_id, attribute,
+                    black, white, False,
+                )
+            )
+            endpoints.valuesCommitted.connect(
+                lambda black, white: self.owner.set_mask_endpoints(
+                    self.modifier.modifier_id, attribute,
+                    black, white, True,
+                )
+            )
+            layout.addWidget(endpoints, 1)
+            return row
         slider = QSlider(Qt.Orientation.Horizontal, row)
         slider.setRange(minimum, maximum)
         slider.setValue(value)
@@ -189,9 +253,21 @@ class ModifierCard(QFrame):
         layout.addWidget(value_box)
         return row
 
+    def _choose_color(self, button: QPushButton) -> None:
+        color = QColorDialog.getColor(QColor(self.modifier.color), self)
+        if color.isValid():
+            self.owner.set_parameter(
+                self.modifier.modifier_id, "color", color.name(QColor.HexArgb),
+                True,
+            )
+
 
 class ModifierControls(QWidget):
     linkModeChanged = Signal(object)
+    maskRequested = Signal(object)
+    maskPreviewRequested = Signal(str, bool)
+    maskContributorsDropped = Signal(object, object)
+    maskDetachRequested = Signal(object)
 
     def __init__(self, canvas, parent=None):
         super().__init__(parent)
@@ -215,6 +291,9 @@ class ModifierControls(QWidget):
         )
         menu.addAction("Blur").triggered.connect(
             lambda: self.add_modifier("blur")
+        )
+        menu.addAction("Outline").triggered.connect(
+            lambda: self.add_modifier("outline")
         )
         self.add_button.setMenu(menu)
         layout.addWidget(self.add_button)
@@ -309,7 +388,7 @@ class ModifierControls(QWidget):
         before = chapter.to_dict()
         if modifier_type == "hsl":
             modifier: ModifierInstance = HueSaturationLightnessModifier()
-        else:
+        elif modifier_type == "blur":
             bounds = self._default_bounds()
             center = bounds.center() if bounds is not None else QPoint()
             modifier = BlurModifier(
@@ -320,6 +399,8 @@ class ModifierControls(QWidget):
                     if bounds is not None else 100.0,
                 ),
             )
+        else:
+            modifier = OutlineModifier()
         chapter.add_modifier(modifier, targets)
         self.active_modifier_id = modifier.modifier_id
         self.canvas.active_modifier_id = modifier.modifier_id
@@ -369,6 +450,43 @@ class ModifierControls(QWidget):
         before, self._parameter_before = self._parameter_before, None
         if before is not None:
             self._push(before, "Edit modifier")
+
+    def request_mask(self, context: tuple) -> None:
+        self.maskRequested.emit(context)
+
+    def preview_mask(self, context: tuple, hovered: bool) -> None:
+        chapter = self.canvas.chapter
+        modifier = chapter.modifiers.get(context[1]) if chapter else None
+        binding = modifier.parameter_masks.get(context[2]) if modifier else None
+        self.maskPreviewRequested.emit(
+            binding.mask_id if binding is not None else "", bool(hovered)
+        )
+
+    def drop_mask_contributors(
+        self, context: tuple, entities: list[tuple[str, str]],
+    ) -> None:
+        self.maskContributorsDropped.emit(context, entities)
+
+    def detach_mask(self, context: tuple) -> None:
+        self.maskDetachRequested.emit(context)
+
+    def set_mask_endpoints(
+        self, modifier_id: str, attribute: str,
+        black: float, white: float, commit: bool,
+    ) -> None:
+        chapter = self.canvas.chapter
+        modifier = chapter.modifiers.get(modifier_id) if chapter else None
+        binding = modifier.parameter_masks.get(attribute) if modifier else None
+        if binding is None:
+            return
+        if self._parameter_before is None:
+            self._parameter_before = chapter.to_dict()
+        binding.black_value = float(black)
+        binding.white_value = float(white)
+        modifier.validate()
+        self._changed()
+        if commit:
+            self.finish_parameter_drag()
 
     def begin_reorder(self, _modifier_id: str) -> None:
         if self._reorder_before is None and self.canvas.chapter is not None:

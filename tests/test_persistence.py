@@ -8,7 +8,7 @@ import pytest
 from PySide6.QtCore import QPointF
 from PySide6.QtGui import QColor
 
-from comic_editor.core.models import ChapterDocument, RasterObject
+from comic_editor.core.models import ChapterDocument, RasterObject, ToneMask
 from comic_editor.core.persistence import SeriesRepository
 
 
@@ -26,6 +26,26 @@ def test_series_chapter_and_sparse_tiles_round_trip(tmp_path):
     assert loaded_series.name == "Demo Series"
     assert loaded.to_dict() == chapter.to_dict()
     assert {key for key, _ in loaded_tiles.iter_tiles(raster.object_id)} == {(0, 0), (3, 8)}
+
+
+def test_mask_paint_uses_dedicated_resource_directory(tmp_path):
+    repository = SeriesRepository(tmp_path / "mask-demo")
+    series = repository.create("Masks")
+    chapter, tiles = repository.create_chapter(series, "Panel")
+    mask = ToneMask(name="Light", saved=True)
+    chapter.masks[mask.mask_id] = mask
+    tiles.paint_dab(
+        mask.mask_id, QPointF(300, 540), 24, QColor("white")
+    )
+    repository.save_chapter(chapter, tiles)
+
+    loaded, loaded_tiles = repository.load_chapter(chapter.chapter_id)
+    assert mask.mask_id in loaded.masks
+    assert [key for key, _tile in loaded_tiles.iter_tiles(mask.mask_id)] == [(1, 2)]
+    assert (
+        repository.chapter_root(chapter.chapter_id)
+        / "masks" / mask.mask_id / "1_2.png"
+    ).is_file()
 
 
 def test_autosave_recovery_is_newer_and_independent(tmp_path):

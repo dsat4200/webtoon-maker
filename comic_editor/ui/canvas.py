@@ -50,7 +50,7 @@ from comic_editor.core.models import (
     ColorGradientRamp, ColorGradientStop, DocumentObject, GradientObject,
     LineGradientField, LayerNode, RadialGradientField,
     ImageObject, PathContour, PathNode, RasterObject, ShapeStyle, TextObject,
-    BlurModifier,
+    BlurModifier, OutlineModifier, ToneMask,
     SpeedLineCenterObject, SpeedLinesGradientObject, VectorDrawingObject,
     VectorFillObject, VectorStroke, VectorStrokePoint,
     ImageSourceDescriptor, canonical_argb, image_source_from_dict,
@@ -72,7 +72,9 @@ from comic_editor.core.vector_geometry import (
     stroke_cubics, tangent_bridge, trace_cubic_faces,
 )
 from comic_editor.ui.windows_input import configure_simultaneous_pen_touch
-from comic_editor.ui.modifier_rendering import apply_modifier_stack
+from comic_editor.ui.modifier_rendering import (
+    apply_modifier_stack, apply_opacity_mask,
+)
 
 
 class ToolKind(Enum):
@@ -332,6 +334,10 @@ class _CanvasLogic:
         self.selected_object_id = ""
         self.selected_entities: list[tuple[str, str]] = []
         self.active_modifier_id = ""
+        self.active_tone_mask_id = ""
+        self.preview_tone_mask_id = ""
+        self._mask_stroke_dirty = QRectF()
+        self._mask_stroke_revision_before = 0
         self._modifier_handle_drag: dict | None = None
         self.center_x = 540.0
         self.center_y = 540.0
@@ -392,6 +398,7 @@ class _CanvasLogic:
         self._transform_gizmo_slot: int | None = None
         self._render_excluded_object_id = ""
         self._render_modifier_sources: set[tuple[str, str]] = set()
+        self._render_base_alpha = False
         self._modifier_render_cache: OrderedDict[tuple, QImage] = OrderedDict()
         self._modifier_render_cache_bytes = 0
         self._modifier_render_cache_budget = 64 * 1024 * 1024
@@ -774,13 +781,29 @@ class _CanvasLogic:
         obj = self.chapter.objects.get(object_id)
         return bool(
             obj is not None and (
-                obj.modifier_ids
+                self._object_is_mask_contributor(object_id)
+                or obj.modifier_ids or obj.opacity_mask is not None
                 or any(
-                    layer.modifier_ids
+                    layer.modifier_ids or layer.opacity_mask is not None
                     for layer in self.chapter.ancestor_layers(
                         obj.parent_layer_id
                     )
                 )
+            )
+        )
+
+    def _object_is_mask_contributor(self, object_id: str) -> bool:
+        obj = self.chapter.objects.get(object_id) if self.chapter else None
+        ancestors = {
+            ("layer", layer.layer_id)
+            for layer in self.chapter.ancestor_layers(obj.parent_layer_id)
+        } if obj is not None else set()
+        return bool(
+            self.chapter is not None
+            and any(
+                ("object", object_id) in mask.contributors
+                or bool(ancestors.intersection(mask.contributors))
+                for mask in self.chapter.masks.values()
             )
         )
 
@@ -793,16 +816,26 @@ class _CanvasLogic:
         obj = self.chapter.objects.get(object_id)
         if obj is None:
             return QRectF(world)
+        if self._object_is_mask_contributor(object_id):
+            return QRectF(
+                0, 0, self.chapter.width, self.chapter.height
+            )
         modifier_ids = list(obj.modifier_ids)
         for layer in self.chapter.ancestor_layers(obj.parent_layer_id):
             modifier_ids.extend(layer.modifier_ids)
         padding = max((
-            modifier.strength * 3.0
+            self._modifier_maximum(
+                modifier, "strength", modifier.strength
+            ) * 3.0
+            if isinstance(modifier, BlurModifier)
+            else self._modifier_maximum(
+                modifier, "thickness", modifier.thickness
+            )
+            if isinstance(modifier, OutlineModifier)
+            else 0.0
             for modifier_id in modifier_ids
-            if isinstance(
-                (modifier := self.chapter.modifiers.get(modifier_id)),
-                BlurModifier,
-            ) and modifier.intensity > 0
+            if (modifier := self.chapter.modifiers.get(modifier_id)) is not None
+            and modifier.intensity > 0
         ), default=0.0)
         return QRectF(world).adjusted(-padding, -padding, padding, padding)
 
@@ -2747,6 +2780,7 @@ class _CanvasLogic:
             not self._transform_static_cache.isNull()
             and self._transform_preview_quad is not None
             and self._geometry_transform_target is None
+            and not (self.active_tone_mask_id or self.preview_tone_mask_id)
             and (
                 isinstance(
                     self.chapter.objects.get(self.selected_object_id),
@@ -2829,10 +2863,12 @@ class _CanvasLogic:
             self._draw_page_gap_overlay(painter)
             painter.restore()
         painter.save()
-        self._draw_selection(painter)
-        self._draw_focal_modifier_handles(painter)
-        self._draw_creation_preview(painter)
-        self._draw_asset_drag_preview(painter)
+        self._draw_tone_mask_preview(painter)
+        if not (self.active_tone_mask_id or self.preview_tone_mask_id):
+            self._draw_selection(painter)
+            self._draw_focal_modifier_handles(painter)
+            self._draw_creation_preview(painter)
+            self._draw_asset_drag_preview(painter)
         painter.restore()
         painter.setTransform(QTransform())
         self._draw_tablet_hover(painter)
@@ -2860,6 +2896,7 @@ class _CanvasLogic:
                 self._asset_drag_manifest.root_id
             ) if self._asset_drag_manifest.root_kind == "object" else None
         )
+
         target = self.chapter.layers.get(self._asset_drag_parent_id)
         if isinstance(root, ImageObject) and target is not None and not target.is_page:
             bounds = self.layer_world_transform(target.layer_id).map(
@@ -2894,6 +2931,35 @@ class _CanvasLogic:
             painter.setPen(pen)
             painter.setBrush(Qt.NoBrush)
             painter.drawPath(self.layer_effective_path(layer.layer_id))
+        painter.restore()
+
+    def set_tone_mask_mode(self, mask_id: str) -> None:
+        if self._drawing and self.active_tone_mask_id:
+            self._end_mask_stroke()
+        self.active_tone_mask_id = str(mask_id)
+        self.preview_tone_mask_id = ""
+        self._invalidate_scene_cache()
+        self.update()
+
+    def _draw_tone_mask_preview(self, painter: QPainter) -> None:
+        mask_id = self.active_tone_mask_id or self.preview_tone_mask_id
+        if not mask_id or self.chapter is None:
+            return
+        width, height = max(1, self.width()), max(1, self.height())
+        field = self.render_tone_mask_field(
+            mask_id, width, height, self.camera_transform(),
+            self.visible_document_rect(),
+        )
+        values = np.ascontiguousarray(
+            np.clip(field * 255.0, 0, 255).astype(np.uint8)
+        )
+        image = QImage(
+            values.data, width, height, width,
+            QImage.Format.Format_Grayscale8,
+        ).copy()
+        painter.save()
+        painter.setTransform(QTransform())
+        painter.drawImage(0, 0, image)
         painter.restore()
 
     def _cancel_external_drag_downloads(self) -> None:
@@ -3660,15 +3726,20 @@ class _CanvasLogic:
             root_object.transform_quad = None
         after = self.chapter.to_dict()
         after_images = self.images.snapshot()
+        before_mask_ids = {
+            str(item.get("id")) for item in before.get("masks", [])
+        }
+        created_masks = set(self.chapter.masks) - before_mask_ids
+        resource_ids = set(created_objects) | created_masks
         tile_payload = {
             object_id: self.tiles.object_tiles(object_id)
-            for object_id in created_objects
+            for object_id in resource_ids
         }
 
         def restore(state: dict, resources: dict, with_tiles: bool) -> None:
             self.replace_chapter(state)
             self.images.restore(resources)
-            for object_id in created_objects:
+            for object_id in resource_ids:
                 if with_tiles:
                     self.tiles.replace_object_tiles(
                         object_id, tile_payload.get(object_id, {})
@@ -3905,10 +3976,14 @@ class _CanvasLogic:
         self, painter: QPainter, layer: LayerNode, parent_opacity: float,
         visible_world: QRectF,
     ) -> None:
-        if not layer.visible or layer.opacity <= 0:
+        if not layer.visible or (
+            layer.opacity <= 0 and layer.opacity_mask is None
+            and not self._render_base_alpha
+        ):
             return
         if (
-            layer.modifier_ids
+            (layer.modifier_ids or layer.opacity_mask is not None)
+            and not self._render_base_alpha
             and ("layer", layer.layer_id) not in self._render_modifier_sources
         ):
             self._render_modified_layer(
@@ -3920,7 +3995,11 @@ class _CanvasLogic:
             if parent is None or parent.bound is None:
                 return
             painter.save()
-            painter.setOpacity(parent_opacity * layer.opacity)
+            painter.setOpacity(
+                parent_opacity * (
+                    1.0 if self._render_base_alpha else layer.opacity
+                )
+            )
             painter.fillPath(
                 self.layer_effective_path(parent.layer_id),
                 QColor(layer.fill_color or "#111111"),
@@ -3933,8 +4012,14 @@ class _CanvasLogic:
         local_visible = (
             inverse.mapRect(visible_world) if valid else QRectF(visible_world)
         )
+        layer_opacity = (
+            1.0
+            if self._render_base_alpha
+            or ("layer", layer.layer_id) in self._render_modifier_sources
+            else layer.opacity
+        )
         self._render_outward_gradient_children(
-            painter, layer, parent_opacity * layer.opacity, local_visible
+            painter, layer, parent_opacity * layer_opacity, local_visible
         )
         if layer.compound_enabled:
             self._render_compound_layer_contents(
@@ -3944,7 +4029,7 @@ class _CanvasLogic:
             return
         if layer.layer_kind == "open_shape":
             style = layer.shape_style
-            opacity = parent_opacity * layer.opacity
+            opacity = parent_opacity * layer_opacity
             painter.setOpacity(opacity)
             core = self.open_shape_mesh(
                 layer.bound, style.base_thickness, 0,
@@ -3993,7 +4078,7 @@ class _CanvasLogic:
             painter.restore()
             return
         layer_path = self.bound_path(layer.bound, layer.vertex_radius)
-        opacity = parent_opacity * layer.opacity
+        opacity = parent_opacity * layer_opacity
         if layer.fill_color:
             painter.save()
             painter.setOpacity(opacity)
@@ -4052,7 +4137,10 @@ class _CanvasLogic:
             self.chapter.modifiers[item] for item in layer.modifier_ids
             if item in self.chapter.modifiers
         ]
-        if world_bounds is None or world_bounds.isEmpty() or not modifiers:
+        if (
+            world_bounds is None or world_bounds.isEmpty()
+            or (not modifiers and layer.opacity_mask is None)
+        ):
             self._render_modifier_sources.add(("layer", layer.layer_id))
             try:
                 self._render_layer(painter, layer, parent_opacity, visible_world)
@@ -4073,6 +4161,19 @@ class _CanvasLogic:
                 + layer.shape_style.outline_thickness + 2
             )
             local.adjust(-padding, -padding, padding, padding)
+        expansion = max((
+            self._modifier_maximum(
+                modifier, "strength", modifier.strength
+            ) * 3.0
+            if isinstance(modifier, BlurModifier)
+            else self._modifier_maximum(
+                modifier, "thickness", modifier.thickness
+            )
+            if isinstance(modifier, OutlineModifier)
+            else 0.0
+            for modifier in modifiers
+        ), default=0.0)
+        local.adjust(-expansion, -expansion, expansion, expansion)
         bounds = QRectF(
             math.floor(local.left()), math.floor(local.top()),
             max(1, math.ceil(local.right()) - math.floor(local.left())),
@@ -4120,12 +4221,34 @@ class _CanvasLogic:
             finally:
                 self._render_modifier_sources.discard(("layer", layer.layer_id))
                 source.end()
+            width, height = image.width(), image.height()
+            world_to_image = self._world_to_image_transform(
+                parent_transform, bounds, width, height
+            )
             processed = apply_modifier_stack(
                 image, modifiers, world_origin.toTuple(),
+                self._modifier_mask_fields(
+                    modifiers, width, height,
+                    world_to_image, visible_world,
+                ),
             )
+            if layer.opacity_mask is not None:
+                binding = layer.opacity_mask
+                processed = apply_opacity_mask(
+                    processed,
+                    self.render_tone_mask_field(
+                        binding.mask_id, width, height,
+                        world_to_image, visible_world,
+                    ),
+                    binding.black_value, binding.white_value,
+                )
             self._modifier_cache_put(cache_key, processed)
         painter.save()
-        painter.setOpacity(parent_opacity)
+        painter.setOpacity(
+            parent_opacity * (
+                1.0 if layer.opacity_mask is not None else layer.opacity
+            )
+        )
         transform = self._layer_parent_transform(layer)
         painter.setClipPath(
             transform.map(self.layer_effective_path(layer.layer_id)),
@@ -4139,7 +4262,11 @@ class _CanvasLogic:
         visible_world: QRectF,
     ) -> None:
         layer_path = self.layer_effective_path(layer.layer_id)
-        opacity = parent_opacity * layer.opacity
+        opacity = parent_opacity * (
+            1.0 if self._render_base_alpha
+            or ("layer", layer.layer_id) in self._render_modifier_sources
+            else layer.opacity
+        )
         inverse, valid = self.layer_world_transform(layer.layer_id).inverted()
         local_visible = inverse.mapRect(visible_world) if valid else visible_world
         painter.save()
@@ -4210,7 +4337,11 @@ class _CanvasLogic:
         )
         painter.save()
         painter.setClipPath(path, Qt.IntersectClip)
-        opacity = parent_opacity * layer.opacity
+        opacity = parent_opacity * (
+            1.0 if self._render_base_alpha
+            or ("layer", layer.layer_id) in self._render_modifier_sources
+            else layer.opacity
+        )
         inverse, valid = self.layer_world_transform(layer.layer_id).inverted()
         local_visible = inverse.mapRect(visible_world) if valid else visible_world
         for child in reversed(layer.children):
@@ -6516,7 +6647,8 @@ class _CanvasLogic:
         ):
             return
         if (
-            obj.modifier_ids
+            (obj.modifier_ids or obj.opacity_mask is not None)
+            and not self._render_base_alpha
             and ("object", obj.object_id) not in self._render_modifier_sources
         ):
             self._render_modified_object(
@@ -6559,12 +6691,306 @@ class _CanvasLogic:
         )
 
     def _modifier_parameter_signature(self, ids: Iterable[str]) -> tuple[str, ...]:
-        return tuple(
-            json.dumps(
-                self.chapter.modifiers[item].to_dict(),
-                sort_keys=True, separators=(",", ":"),
+        result: list[str] = []
+        mask_ids: set[str] = set()
+        for item in ids:
+            modifier = self.chapter.modifiers.get(item)
+            if modifier is None:
+                continue
+            result.append(json.dumps(
+                modifier.to_dict(), sort_keys=True, separators=(",", ":"),
+            ))
+            mask_ids.update(
+                binding.mask_id
+                for binding in modifier.parameter_masks.values()
             )
-            for item in ids if item in self.chapter.modifiers
+        result.extend(
+            repr(self._tone_mask_signature(mask_id))
+            for mask_id in sorted(mask_ids)
+        )
+        return tuple(result)
+
+    def _tone_mask_signature(self, mask_id: str) -> tuple:
+        mask = self.chapter.masks.get(mask_id)
+        if mask is None:
+            return (mask_id, "missing")
+
+        def entity_signature(kind: str, entity_id: str) -> tuple:
+            entity = self.chapter.mask_contributor(kind, entity_id)
+            if entity is None:
+                return kind, entity_id, "missing"
+            pixels: tuple = ()
+            if isinstance(entity, RasterObject):
+                pixels = tuple(sorted(
+                    (key, int(image.cacheKey()))
+                    for key, image in self.tiles.object_tiles(
+                        entity.object_id
+                    ).items()
+                ))
+            elif isinstance(entity, ImageObject):
+                pixels = (int(self.images.image(entity.object_id).cacheKey()),)
+            elif (
+                isinstance(entity, VectorDrawingObject)
+                and entity.object_id == self.selected_object_id
+            ):
+                pixels = (
+                    self._vector_eraser_preview_revision,
+                    tuple(sorted(
+                        (key, int(image.cacheKey()))
+                        for key, image in self._vector_preview_tiles.object_tiles(
+                            self._vector_preview_id
+                        ).items()
+                    )),
+                )
+            children: tuple = ()
+            if isinstance(entity, LayerNode):
+                children = tuple(
+                    entity_signature(child.kind, child.entity_id)
+                    for child in entity.children
+                )
+                ancestor_layers = self.chapter.ancestor_layers(
+                    entity.layer_id
+                )[:-1]
+            else:
+                ancestor_layers = self.chapter.ancestor_layers(
+                    entity.parent_layer_id
+                )
+            ancestors = tuple(
+                json.dumps(layer.to_dict(), sort_keys=True)
+                for layer in ancestor_layers
+            )
+            return (
+                kind, entity_id,
+                json.dumps(entity.to_dict(), sort_keys=True),
+                pixels, children, ancestors,
+            )
+
+        paint = tuple(sorted(
+            (key, int(image.cacheKey()))
+            for key, image in self.tiles.object_tiles(mask_id).items()
+        ))
+        return (
+            json.dumps(mask.to_dict(), sort_keys=True), paint,
+            tuple(entity_signature(*item) for item in mask.contributors),
+        )
+
+    def _ancestor_mask_path(
+        self, kind: str, entity_id: str,
+    ) -> QPainterPath | None:
+        if kind == "object":
+            entity = self.chapter.objects.get(entity_id)
+            if entity is None:
+                return QPainterPath()
+            layer_id = entity.parent_layer_id
+            layers = self.chapter.ancestor_layers(layer_id)
+            direct_ignore = bool(entity.ignore_parent_mask)
+        else:
+            entity = self.chapter.layers.get(entity_id)
+            if entity is None:
+                return QPainterPath()
+            layers = self.chapter.ancestor_layers(entity_id)
+            layers = layers[:-1]
+            direct_ignore = bool(entity.ignore_parent_mask)
+        skipped: set[str] = set()
+        if direct_ignore and layers:
+            skipped.add(layers[-1].layer_id)
+        full_chain = self.chapter.ancestor_layers(
+            entity.parent_layer_id if kind == "layer" and entity.parent_id
+            else layer_id if kind == "object" else entity_id
+        )
+        for parent, child in zip(full_chain, full_chain[1:]):
+            if child.ignore_parent_mask:
+                skipped.add(parent.layer_id)
+        result: QPainterPath | None = None
+        for layer in layers:
+            if not layer.visible:
+                return QPainterPath()
+            if layer.bound is None or layer.layer_id in skipped:
+                continue
+            path = self.layer_world_transform(layer.layer_id).map(
+                self.layer_effective_path(layer.layer_id)
+            )
+            result = path if result is None else result.intersected(path)
+        return result
+
+    def _render_base_mask_contributor(
+        self, painter: QPainter, kind: str, entity_id: str,
+        visible_world: QRectF,
+    ) -> None:
+        entity = self.chapter.mask_contributor(kind, entity_id)
+        if entity is None or not entity.visible:
+            return
+        ancestors = (
+            self.chapter.ancestor_layers(entity.parent_layer_id)
+            if kind == "object"
+            else self.chapter.ancestor_layers(entity_id)[:-1]
+        )
+        if any(not layer.visible for layer in ancestors):
+            return
+        painter.save()
+        clip = self._ancestor_mask_path(kind, entity_id)
+        if clip is not None:
+            if clip.isEmpty():
+                painter.restore()
+                return
+            painter.setClipPath(clip, Qt.ClipOperation.IntersectClip)
+        previous = self._render_base_alpha
+        self._render_base_alpha = True
+        try:
+            if kind == "object":
+                parent_transform = self.layer_world_transform(
+                    entity.parent_layer_id
+                )
+                inverse, valid = parent_transform.inverted()
+                painter.setTransform(parent_transform, True)
+                self._render_object_content(
+                    painter, entity,
+                    inverse.mapRect(visible_world) if valid else visible_world,
+                )
+                if isinstance(entity, VectorDrawingObject):
+                    self._render_modified_vector_pencil_preview(
+                        painter, entity.parent_layer_id
+                    )
+                return
+            layer = entity
+            if layer.layer_kind == "fill":
+                parent = self.chapter.layers.get(layer.parent_id)
+                if parent is not None and parent.bound is not None:
+                    painter.fillPath(
+                        self.layer_world_transform(parent.layer_id).map(
+                            self.layer_effective_path(parent.layer_id)
+                        ),
+                        QColor(layer.fill_color or "#ffffffff"),
+                    )
+                return
+            if layer.fill_color:
+                painter.setTransform(
+                    self.layer_world_transform(layer.layer_id), True
+                )
+                path = self.layer_effective_path(layer.layer_id)
+                if layer.layer_kind == "open_shape":
+                    path = self.open_shape_mesh(
+                        layer.bound, layer.shape_style.base_thickness, 0,
+                        layer.shape_style.start_cap,
+                        layer.shape_style.end_cap,
+                    )
+                painter.fillPath(path, QColor(layer.fill_color))
+                if layer.border_width > 0:
+                    painter.setPen(QPen(
+                        QColor(layer.border_color), layer.border_width * 2,
+                        Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin,
+                    ))
+                    painter.setBrush(Qt.NoBrush)
+                    painter.drawPath(path)
+                return
+            parent_transform = (
+                self.layer_world_transform(layer.parent_id)
+                if layer.parent_id else QTransform()
+            )
+            inverse, valid = parent_transform.inverted()
+            painter.setTransform(parent_transform, True)
+            self._render_layer(
+                painter, layer, 1.0,
+                inverse.mapRect(visible_world) if valid else visible_world,
+            )
+        finally:
+            self._render_base_alpha = previous
+            painter.restore()
+
+    @staticmethod
+    def _image_alpha_array(image: QImage) -> np.ndarray:
+        converted = image.convertToFormat(QImage.Format.Format_RGBA8888)
+        view = np.frombuffer(
+            converted.constBits(), dtype=np.uint8,
+            count=converted.sizeInBytes(),
+        ).reshape(converted.height(), converted.bytesPerLine())
+        return (
+            view[:, :converted.width() * 4]
+            .reshape(converted.height(), converted.width(), 4)[..., 3]
+            .astype(np.float32) / 255.0
+        )
+
+    def render_tone_mask_field(
+        self, mask_id: str, width: int, height: int,
+        world_to_image: QTransform, visible_world: QRectF,
+    ) -> np.ndarray:
+        mask = self.chapter.masks.get(mask_id) if self.chapter else None
+        width, height = max(1, int(width)), max(1, int(height))
+        if mask is None:
+            return np.zeros((height, width), dtype=np.float32)
+        result = np.zeros((height, width), dtype=np.float32)
+        for kind, entity_id in mask.contributors:
+            image = QImage(
+                width, height, QImage.Format.Format_ARGB32_Premultiplied
+            )
+            image.fill(Qt.GlobalColor.transparent)
+            painter = QPainter(image)
+            painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+            painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
+            painter.setTransform(world_to_image)
+            self._render_base_mask_contributor(
+                painter, kind, entity_id, visible_world
+            )
+            painter.end()
+            result += self._image_alpha_array(image)
+        paint = QImage(
+            width, height, QImage.Format.Format_ARGB32_Premultiplied
+        )
+        paint.fill(Qt.GlobalColor.transparent)
+        painter = QPainter(paint)
+        painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
+        painter.setTransform(world_to_image)
+        for (tile_x, tile_y), tile in self.tiles.iter_tiles(mask_id):
+            painter.drawImage(
+                tile_x * self.tiles.tile_size,
+                tile_y * self.tiles.tile_size,
+                tile,
+            )
+        painter.end()
+        result += self._image_alpha_array(paint)
+        return np.clip(result, 0.0, 1.0)
+
+    @staticmethod
+    def _world_to_image_transform(
+        parent_transform: QTransform, bounds: QRectF,
+        width: int, height: int,
+    ) -> QTransform:
+        world = parent_transform.map(QPolygonF([
+            bounds.topLeft(), bounds.topRight(),
+            bounds.bottomRight(), bounds.bottomLeft(),
+        ]))
+        destination = QPolygonF([
+            QPointF(0, 0), QPointF(width, 0),
+            QPointF(width, height), QPointF(0, height),
+        ])
+        result = QTransform.quadToQuad(world, destination)
+        return result if isinstance(result, QTransform) else QTransform()
+
+    def _modifier_mask_fields(
+        self, modifiers, width: int, height: int,
+        world_to_image: QTransform, visible_world: QRectF,
+    ) -> dict[tuple[str, str], np.ndarray]:
+        result: dict[tuple[str, str], np.ndarray] = {}
+        rendered: dict[str, np.ndarray] = {}
+        for modifier in modifiers:
+            for attribute, binding in modifier.parameter_masks.items():
+                field = rendered.get(binding.mask_id)
+                if field is None:
+                    field = self.render_tone_mask_field(
+                        binding.mask_id, width, height,
+                        world_to_image, visible_world,
+                    )
+                    rendered[binding.mask_id] = field
+                result[(modifier.modifier_id, attribute)] = field
+        return result
+
+    @staticmethod
+    def _modifier_maximum(modifier, attribute: str, fallback: float) -> float:
+        binding = modifier.parameter_masks.get(attribute)
+        return max(
+            float(fallback),
+            float(binding.black_value) if binding is not None else fallback,
+            float(binding.white_value) if binding is not None else fallback,
         )
 
     def _modifier_object_signature(self, obj: DocumentObject) -> tuple:
@@ -6597,6 +7023,8 @@ class _CanvasLogic:
                 obj.to_dict(), sort_keys=True, separators=(",", ":")
             ),
             self._modifier_parameter_signature(obj.modifier_ids),
+            self._tone_mask_signature(obj.opacity_mask.mask_id)
+            if obj.opacity_mask is not None else (),
             pixels, live,
         )
 
@@ -6622,6 +7050,8 @@ class _CanvasLogic:
                 layer.to_dict(), sort_keys=True, separators=(",", ":")
             ),
             self._modifier_parameter_signature(layer.modifier_ids),
+            self._tone_mask_signature(layer.opacity_mask.mask_id)
+            if layer.opacity_mask is not None else (),
             tuple(children), preview,
         )
 
@@ -6660,7 +7090,10 @@ class _CanvasLogic:
             if item in self.chapter.modifiers
         ]
         world_bounds = self.object_world_rect(obj.object_id)
-        if world_bounds is None or world_bounds.isEmpty() or not modifiers:
+        if (
+            world_bounds is None or world_bounds.isEmpty()
+            or (not modifiers and obj.opacity_mask is None)
+        ):
             self._render_modifier_sources.add(("object", obj.object_id))
             try:
                 self._render_object(painter, obj, parent_opacity, local_visible)
@@ -6673,8 +7106,16 @@ class _CanvasLogic:
             return
         local = layer_inverse.mapRect(world_bounds)
         expansion = max((
-            modifier.strength * 3.0
-            for modifier in modifiers if isinstance(modifier, BlurModifier)
+            self._modifier_maximum(
+                modifier, "strength", modifier.strength
+            ) * 3.0
+            if isinstance(modifier, BlurModifier)
+            else self._modifier_maximum(
+                modifier, "thickness", modifier.thickness
+            )
+            if isinstance(modifier, OutlineModifier)
+            else 0.0
+            for modifier in modifiers
         ), default=0.0)
         local.adjust(-expansion, -expansion, expansion, expansion)
         bounds = QRectF(
@@ -6709,13 +7150,33 @@ class _CanvasLogic:
             finally:
                 self._render_modifier_sources.discard(("object", obj.object_id))
                 source.end()
+            width, height = image.width(), image.height()
+            world_to_image = self._world_to_image_transform(
+                layer_transform, bounds, width, height
+            )
             processed = apply_modifier_stack(
                 image, modifiers, world_origin.toTuple(),
+                self._modifier_mask_fields(
+                    modifiers, width, height,
+                    world_to_image, world_bounds,
+                ),
             )
+            if obj.opacity_mask is not None:
+                binding = obj.opacity_mask
+                processed = apply_opacity_mask(
+                    processed,
+                    self.render_tone_mask_field(
+                        binding.mask_id, width, height,
+                        world_to_image, world_bounds,
+                    ),
+                    binding.black_value, binding.white_value,
+                )
             self._modifier_cache_put(cache_key, processed)
-        opacity = (
-            parent_opacity
-            if obj.opacity_locked else parent_opacity * obj.opacity
+        opacity = parent_opacity if self._render_base_alpha else (
+            parent_opacity if obj.opacity_mask is not None else (
+                parent_opacity
+                if obj.opacity_locked else parent_opacity * obj.opacity
+            )
         )
         if obj.object_id == self._live_underlay_object_id:
             opacity *= 1.0 - self._live_underlay_amount
@@ -14662,6 +15123,12 @@ class _CanvasLogic:
         point = self.widget_to_document(widget_point)
         self._press_widget_point = QPointF(widget_point)
         self._press_document_point = QPointF(point)
+        if (
+            self.active_tone_mask_id
+            and self.tool in {ToolKind.RASTER_PENCIL, ToolKind.RASTER_ERASER}
+        ):
+            self._begin_mask_stroke(point, pressure)
+            return
         if self.tool == ToolKind.EYEDROPPER:
             self._eyedropper_widget_point = QPointF(widget_point)
             if self._sample_eyedropper(point):
@@ -15058,6 +15525,9 @@ class _CanvasLogic:
             self._clear_detached_input_state()
             return
         point = self.widget_to_document(widget_point)
+        if self.active_tone_mask_id and self._drawing:
+            self._continue_mask_stroke(point, pressure)
+            return
         if self.tool == ToolKind.EYEDROPPER and self._eyedropper_sampling:
             self._eyedropper_widget_point = QPointF(widget_point)
             self._sample_eyedropper(point)
@@ -15316,6 +15786,9 @@ class _CanvasLogic:
             self._update_shape_hover(point)
 
     def _tool_release(self) -> None:
+        if self.active_tone_mask_id and self._drawing:
+            self._end_mask_stroke()
+            return
         if self._eyedropper_sampling:
             color = self._eyedropper_last_color
             self._eyedropper_sampling = False
@@ -17002,6 +17475,119 @@ class _CanvasLogic:
         self.set_selection("layer", layer_id)
         self.update()
         return True
+
+    def _begin_mask_stroke(self, point: QPointF, pressure: float) -> None:
+        mask = (
+            self.chapter.masks.get(self.active_tone_mask_id)
+            if self.chapter else None
+        )
+        if mask is None:
+            return
+        self._drawing = True
+        self._last_draw_point = QPointF(point)
+        self._last_pressure = self._effective_pressure(pressure)
+        self._stroke_preset = BrushPreset.from_dict(self._preset.to_dict())
+        self._stroke_base_size = float(
+            self.settings.active_eraser_pixels()
+            if self.tool == ToolKind.RASTER_ERASER
+            else self.settings.pencil_size()
+        )
+        self._stroke_before = {}
+        self._mask_stroke_dirty = QRectF()
+        self._mask_stroke_revision_before = mask.revision
+        size, opacity = self._brush_values(self._last_pressure)
+        dirty = self.tiles.paint_dab(
+            mask.mask_id, point, size, QColor("#ffffffff"), opacity,
+            erase=self.tool == ToolKind.RASTER_ERASER,
+            square=(
+                self.settings.eraser_square
+                and self.tool == ToolKind.RASTER_ERASER
+            ),
+            antialias=(
+                self._stroke_preset.antialiasing
+                if self.tool == ToolKind.RASTER_PENCIL else False
+            ),
+            before=self._stroke_before,
+        )
+        mask.touch()
+        self._mask_stroke_dirty = dirty
+        self._invalidate_scene_cache()
+        self.update()
+
+    def _continue_mask_stroke(self, point: QPointF, pressure: float) -> None:
+        mask = self.chapter.masks.get(self.active_tone_mask_id)
+        if mask is None:
+            return
+        current_pressure = self._effective_pressure(pressure)
+        size_start, opacity_start = self._brush_values(self._last_pressure)
+        size_end, opacity_end = self._brush_values(current_pressure)
+        dirty = self.tiles.paint_segment(
+            mask.mask_id, self._last_draw_point, point,
+            size_start, size_end, QColor("#ffffffff"),
+            opacity_start, opacity_end,
+            erase=self.tool == ToolKind.RASTER_ERASER,
+            square=(
+                self.settings.eraser_square
+                and self.tool == ToolKind.RASTER_ERASER
+            ),
+            antialias=(
+                self._stroke_preset.antialiasing
+                if self.tool == ToolKind.RASTER_PENCIL else False
+            ),
+            density=(
+                self._stroke_preset.density
+                if self.tool == ToolKind.RASTER_PENCIL else 1.0
+            ),
+            before=self._stroke_before,
+        )
+        self._last_draw_point = QPointF(point)
+        self._last_pressure = current_pressure
+        if not dirty.isEmpty():
+            self._mask_stroke_dirty = (
+                dirty if self._mask_stroke_dirty.isEmpty()
+                else self._mask_stroke_dirty.united(dirty)
+            )
+            mask.touch()
+            self._invalidate_scene_cache()
+            self.update()
+
+    def _restore_mask_revision(self, mask_id: str, revision: object) -> None:
+        mask = self.chapter.masks.get(mask_id) if self.chapter else None
+        if mask is not None and revision is not None:
+            mask.revision = int(revision)
+
+    def _mask_tiles_changed(self) -> None:
+        self._invalidate_scene_cache()
+        self.documentChanged.emit(QRectF())
+        self.update()
+
+    def _end_mask_stroke(self) -> None:
+        mask = self.chapter.masks.get(self.active_tone_mask_id) if self.chapter else None
+        if mask is None or not self._drawing:
+            self._drawing = False
+            return
+        keys = set(self._stroke_before)
+        if self.tool == ToolKind.RASTER_ERASER:
+            self.tiles.prune_empty(mask.mask_id, keys)
+        after = self.tiles.snapshot(mask.mask_id, keys)
+        command = TilePatchCommand(
+            "Paint mask" if self.tool == ToolKind.RASTER_PENCIL else "Erase mask",
+            self.tiles, mask.mask_id, self._stroke_before, after,
+            self._mask_tiles_changed,
+            self._mask_stroke_revision_before, mask.revision,
+            lambda revision, mask_id=mask.mask_id:
+            self._restore_mask_revision(mask_id, revision),
+        )
+        self.command_stack.push(command, already_done=True)
+        dirty = QRectF(self._mask_stroke_dirty)
+        self._stroke_before = {}
+        self._stroke_preset = None
+        self._mask_stroke_dirty = QRectF()
+        self._drawing = False
+        self._invalidate_scene_cache()
+        self.documentChanged.emit(dirty)
+        self.interactionFinished.emit()
+        self.update()
 
     def _begin_stroke(self, point: QPointF, pressure: float) -> None:
         if self.chapter is None or self.selected_kind != "object":

@@ -1,0 +1,255 @@
+{
+  "schema_version": 17,
+  "id": "b66a90ce7b2a4cca8624211cd38b465e",
+  "name": "Chapter 2",
+  "size": [
+    1080,
+    3240
+  ],
+  "document_kind": "chapter",
+  "background": "#ffffff",
+  "grid": {
+    "enabled": true,
+    "size": 120,
+    "divisions": 4,
+    "origin": [
+      0.0,
+      0.0
+    ],
+    "color": "#5d7d9c",
+    "opacity": 0.25
+  },
+  "root_page_ids": [
+    "1305952c8e1a43748bc2c2b8eec7b111"
+  ],
+  "layers": [
+    {
+      "id": "1305952c8e1a43748bc2c2b8eec7b111",
+      "name": "Page 1",
+      "is_page": true,
+      "layer_kind": "bounded",
+      "parent_id": null,
+      "children": [
+        {
+          "kind": "layer",
+          "id": "3c8c1337a7354db19a404bc9e4f4c6e4"
+        }
+      ],
+      "visible": true,
+      "opacity": 1.0,
+      "translation": [
+        0,
+        0
+      ],
+      "bound": {
+        "type": "path",
+        "closed": true,
+        "primitive": "rectangle",
+        "nodes": [
+          {
+            "id": "240046e499b84d4f9048c89a176c2898",
+            "position": [
+              0.0,
+              0.0
+            ],
+            "point_type": "vector",
+            "incoming": null,
+            "outgoing": null,
+            "handles_locked": true,
+            "roundness": 0.0,
+            "roundness_enabled": false,
+            "width_multiplier": 1.0
+          },
+          {
+            "id": "2514d16d2ad94a6591397d7b743975ae",
+            "position": [
+              1080.0,
+              0.0
+            ],
+            "point_type": "vector",
+            "incoming": null,
+            "outgoing": null,
+            "handles_locked": true,
+            "roundness": 0.0,
+            "roundness_enabled": false,
+            "width_multiplier": 1.0
+          },
+          {
+            "id": "b304d49a97ae4491ae1a132bf7705f4d",
+            "position": [
+              1080.0,
+              1080.0
+            ],
+            "point_type": "vector",
+            "incoming": null,
+            "outgoing": null,
+            "handles_locked": true,
+            "roundness": 0.0,
+            "roundness_enabled": false,
+            "width_multiplier": 1.0
+          },
+          {
+            "id": "6f23534fdca94dbc9b227b6959e4969c",
+            "position": [
+              0.0,
+              1080.0
+            ],
+            "point_type": "vector",
+            "incoming": null,
+            "outgoing": null,
+            "handles_locked": true,
+            "roundness": 0.0,
+            "roundness_enabled": false,
+            "width_multiplier": 1.0
+          }
+        ],
+        "additional_contours": []
+      },
+      "shape_style": {
+        "primary_color": null,
+        "base_thickness": 8,
+        "outline_color": "#111111",
+        "outline_thickness": 4,
+        "start_cap": "round",
+        "end_cap": "round"
+      },
+      "grid_override": null,
+      "last_raster_id": null,
+      "compound_enabled": false,
+      "compound_operation": "add",
+      "ignore_parent_mask": false,
+      "modifier_ids": [],
+      "transform_frame": null,
+      "transform_quad": null
+    },
+    {
+      "id": "3c8c1337a7354db19a404bc9e4f4c6e4",
+      "name": "Drawing Layer",
+      "is_page": false,
+      "layer_kind": "bounded",
+      "parent_id": "1305952c8e1a43748bc2c2b8eec7b111",
+      "children": [
+        {
+          "kind": "object",
+          "id": "844b3588c9114aada0eb349650f48756"
+        }
+      ],
+      "visible": true,
+      "opacity": 1.0,
+      "translation": [
+        0.0,
+        0.0
+      ],
+      "bound": {
+        "type": "path",
+        "closed": true,
+        "primitive": "rectangle",
+        "nodes": [
+          {
+            "id": "240046e499b84d4f9048c89a176c2898",
+            "position": [
+              0.0,
+              0.0
+            ],
+            "point_type": "vector",
+            "incoming": null,
+            "outgoing": null,
+            "handles_locked": true,
+            "roundness": 0.0,
+            "roundness_enabled": false,
+            "width_multiplier": 1.0
+          },
+          {
+            "id": "2514d16d2ad94a6591397d7b743975ae",
+            "position": [
+              1080.0,
+              0.0
+            ],
+            "point_type": "vector",
+            "incoming": null,
+            "outgoing": null,
+            "handles_locked": true,
+            "roundness": 0.0,
+            "roundness_enabled": false,
+            "width_multiplier": 1.0
+          },
+          {
+            "id": "b304d49a97ae4491ae1a132bf7705f4d",
+            "position": [
+              1080.0,
+              1080.0
+            ],
+            "point_type": "vector",
+            "incoming": null,
+            "outgoing": null,
+            "handles_locked": true,
+            "roundness": 0.0,
+            "roundness_enabled": false,
+            "width_multiplier": 1.0
+          },
+          {
+            "id": "6f23534fdca94dbc9b227b6959e4969c",
+            "position": [
+              0.0,
+              1080.0
+            ],
+            "point_type": "vector",
+            "incoming": null,
+            "outgoing": null,
+            "handles_locked": true,
+            "roundness": 0.0,
+            "roundness_enabled": false,
+            "width_multiplier": 1.0
+          }
+        ],
+        "additional_contours": []
+      },
+      "shape_style": {
+        "primary_color": null,
+        "base_thickness": 8,
+        "outline_color": "#111111",
+        "outline_thickness": 0,
+        "start_cap": "round",
+        "end_cap": "round"
+      },
+      "grid_override": null,
+      "last_raster_id": "844b3588c9114aada0eb349650f48756",
+      "compound_enabled": false,
+      "compound_operation": "add",
+      "ignore_parent_mask": false,
+      "modifier_ids": [],
+      "transform_frame": null,
+      "transform_quad": null
+    }
+  ],
+  "objects": [
+    {
+      "id": "844b3588c9114aada0eb349650f48756",
+      "type": "raster",
+      "name": "Raster 1",
+      "custom_name": false,
+      "parent_layer_id": "3c8c1337a7354db19a404bc9e4f4c6e4",
+      "position": [
+        0.0,
+        0.0
+      ],
+      "visible": true,
+      "opacity": 1.0,
+      "opacity_locked": true,
+      "geometry_reference": "direct",
+      "ignore_parent_mask": false,
+      "underlay_opacity": 0.0,
+      "modifier_ids": [],
+      "tile_size": 256,
+      "interaction_rect": [
+        0.0,
+        0.0,
+        120.0,
+        120.0
+      ],
+      "transform_frame": null,
+      "transform_quad": null
+    }
+  ],
+  "modifiers": []
+}

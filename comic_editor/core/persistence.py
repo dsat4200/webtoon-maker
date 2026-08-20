@@ -180,18 +180,22 @@ class SeriesRepository:
             object_id for object_id, obj in chapter.objects.items()
             if isinstance(obj, ImageObject)
         }
+        mask_ids = set(chapter.masks)
         chapter_root = self.chapter_root(chapter.chapter_id)
         if autosave:
             destination = chapter_root / "autosave"
             tile_root = destination / "raster"
+            mask_root = destination / "masks"
             image_root = destination / "images"
             tiles.save_directory(tile_root, raster_object_ids, complete=True)
+            tiles.save_directory(mask_root, mask_ids, complete=True)
             images.save_directory(image_root, image_object_ids, complete=True)
             atomic_json(destination / CHAPTER_FILE, chapter.to_dict())
             atomic_json(destination / "recovery.json", {"saved_at": time.time()})
             return
         destination = chapter_root
         tile_root = destination / "raster"
+        mask_root = destination / "masks"
         image_root = destination / "images"
         destination.mkdir(parents=True, exist_ok=True)
         manifest = destination / CHAPTER_FILE
@@ -206,12 +210,15 @@ class SeriesRepository:
                 shutil.copytree(tile_root, backup / "raster")
             if image_root.is_dir():
                 shutil.copytree(image_root, backup / "images")
+            if mask_root.is_dir():
+                shutil.copytree(mask_root, backup / "masks")
         atomic_json(pending, {"started_at": time.time()})
         try:
             # Tile files are published before the manifest. If the process is
             # interrupted, PENDING_FILE causes the previous complete revision
             # to be restored on the next open.
             tiles.save_directory(tile_root, raster_object_ids, complete=True)
+            tiles.save_directory(mask_root, mask_ids, complete=True)
             images.save_directory(image_root, image_object_ids, complete=True)
             atomic_json(manifest, chapter.to_dict())
             pending.unlink(missing_ok=True)
@@ -243,6 +250,9 @@ class SeriesRepository:
             if isinstance(obj, RasterObject)
         }
         tiles.load_directory(source / "raster", object_ids)
+        tiles.load_directory(
+            source / "masks", set(chapter.masks), clear=False
+        )
         images = ImageStore()
         images.load_directory(source / "images", {
             object_id: (obj.source_filename, obj.source_mime_type)
@@ -274,6 +284,12 @@ class SeriesRepository:
         backup_raster = backup / "raster"
         if backup_raster.is_dir():
             shutil.copytree(backup_raster, raster)
+        masks = root / "masks"
+        if masks.exists():
+            shutil.rmtree(masks)
+        backup_masks = backup / "masks"
+        if backup_masks.is_dir():
+            shutil.copytree(backup_masks, masks)
         images = root / "images"
         if images.exists():
             shutil.rmtree(images)

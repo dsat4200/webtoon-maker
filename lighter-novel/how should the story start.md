@@ -1,3 +1,15 @@
+
+phoebe goes to an abandoned library
+- finds an old dusty book
+
+
+
+
+
+
+AHAHHHHH I CANT WRITE FOR SHIT
+
+
 phoebe is at work, and has a conversation about animals with a coworker.
 - overworked office worker
 
@@ -11,7 +23,46 @@ mmm..i am on tashhhhk..
 (phoebe has a lollipop in her mouth, softcore lol)
 (anime boy figure on her desk)
 
-(clock out )
+phoebe looks at clock
+*lunch time*
+
+"hey you want anything from the vending machine"
+
+"nah i'm good"
+
+phoebe looks at the vending machine
+- artificial brown flavor
+	- "hmm, i do like brown flavor"
+-  ooh but what about vitamin c flavor
+- seaweed
+- jellyfish jerky
+- corn
+- norcal fried bacteria
+- spirulina
+- hmmm
+- beluga cavier
+- the nicest t bone steak
+- whatever
+- anti-inflammatory fish
+- "beef(trademark)" wellington
+- premium air
+
+screen pops up
+robot boss
+"mmm... hey phoebe it looks like you have 30 seconds left of your lunch break. do you want me to pick one for you?"
+
+(clanker clanker clanker clanker)
+"nah i'm fine i'll have the uh, the sour salarymen."
+
+"good choice! the rest were just holograms this time, since I knew you were going to pick the salarymen!".
+
+"If you know what I like, then why did you give me such trash options?"
+
+"I dont have feelings, so why do you like insulting me so much?"
+
+"take it up with human resources" *sticks out tongue* *kicks vending machine*
+
+...
 
 they walk home together, talking
 
@@ -53,6 +104,8 @@ tractor beam pulls up sadie
 
 "so um, i met this guy and I think we're starting to really-"
 
+"yeah i'm so happy for yo-"
+
 (UFO door closes)
 
 
@@ -88,16 +141,8 @@ This angler may go her entire life without seeing another fish
 
 "so, what lengths would she go to..."
 
-lamp overhead, sees a magazine on the floor
-
-turns left and right, no one there
-
-picks up magazine
-
-("cars and guns magazine" (now with bikini babes edition) (featuring dante from the devil may cry series))
-
-lance: what?
-
-zoom out, phoebe behind him coming out of a portal, angler fish light above her
+phoebe sees a dusty book at the corner of her eyes "ANCIENT MAGIC FROM THE 2020s"
 
 (to get what she needs?)
+
+(phoebe holding a crystal ball with lance inside)

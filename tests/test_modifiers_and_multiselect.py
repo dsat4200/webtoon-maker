@@ -1,13 +1,16 @@
 from __future__ import annotations
 
 import pytest
+import numpy as np
 from PySide6.QtCore import QItemSelectionModel, QPointF, QRectF, Qt
-from PySide6.QtGui import QColor, QImage
+from PySide6.QtGui import QColor, QImage, QPainter
+from PySide6.QtTest import QTest
 
 from comic_editor.core.assets import extract_asset, instantiate_asset
 from comic_editor.core.models import (
     BlurModifier, BoundGeometry, ChapterDocument,
-    HueSaturationLightnessModifier, RasterObject, TextObject,
+    HueSaturationLightnessModifier, OutlineModifier,
+    ParameterMaskBinding, RasterObject, TextObject, ToneMask,
     VectorDrawingObject,
 )
 from comic_editor.core.settings import EditorSettings
@@ -59,7 +62,7 @@ def test_modifier_registry_round_trip_validation_and_garbage_collection():
     first.transform_quad = [(30, 25), (285, 35), (275, 290), (25, 270)]
 
     restored = ChapterDocument.from_dict(chapter.to_dict())
-    assert restored.schema_version == 17
+    assert restored.schema_version == 18
     assert restored.objects[text.object_id].modifier_ids == []
     assert orphan.modifier_id not in restored.modifiers
     assert restored.objects[raster.object_id].modifier_ids == [
@@ -148,6 +151,20 @@ def test_assets_clone_modifier_identity_and_preserve_only_internal_sharing():
     )
 
 
+def test_asset_extraction_rejects_external_mask_contributor():
+    chapter, _page, first, second, raster, _vector = _document()
+    outside = chapter.add_object(second.layer_id, RasterObject(name="Outside"))
+    mask = ToneMask(contributors=[("object", outside.object_id)])
+    chapter.masks[mask.mask_id] = mask
+    raster.opacity_locked = False
+    raster.opacity_mask = ParameterMaskBinding(mask.mask_id, 0, 1)
+
+    with pytest.raises(ValueError, match="outside the copied subtree"):
+        extract_asset(
+            chapter, TileStore(), "layer", first.layer_id, "Masked"
+        )
+
+
 def test_hsl_intensity_and_premultiplied_blur_pixels():
     image = QImage(9, 9, QImage.Format.Format_ARGB32_Premultiplied)
     image.fill(Qt.GlobalColor.transparent)
@@ -172,6 +189,55 @@ def test_hsl_intensity_and_premultiplied_blur_pixels():
     )
     assert 0 < blurred.pixelColor(3, 4).alpha() < 255
     assert blurred.pixelColor(4, 4).red() > 0
+
+
+def test_parameter_masks_round_trip_share_contents_but_keep_endpoints():
+    chapter, _page, first, _second, raster, vector = _document()
+    mask = ToneMask(
+        name="Shared", saved=True,
+        contributors=[("object", raster.object_id)],
+    )
+    chapter.masks[mask.mask_id] = mask
+    modifier = HueSaturationLightnessModifier(hue=120)
+    modifier.parameter_masks["hue"] = ParameterMaskBinding(
+        mask.mask_id, -60, 120
+    )
+    chapter.add_modifier(modifier, [("object", raster.object_id)])
+    vector.opacity_locked = False
+    vector.opacity_mask = ParameterMaskBinding(mask.mask_id, .15, .8)
+
+    restored = ChapterDocument.from_dict(chapter.to_dict())
+    restored_mask = restored.masks[mask.mask_id]
+    restored_hue = restored.modifiers[modifier.modifier_id].parameter_masks["hue"]
+    restored_opacity = restored.objects[vector.object_id].opacity_mask
+    assert restored_mask.saved and restored_mask.name == "Shared"
+    assert restored_mask.contributors == [("object", raster.object_id)]
+    assert (restored_hue.black_value, restored_hue.white_value) == (-60, 120)
+    assert (restored_opacity.black_value, restored_opacity.white_value) == (.15, .8)
+
+
+def test_masked_hue_interpolates_and_outline_is_outside_only():
+    image = QImage(9, 3, QImage.Format.Format_ARGB32_Premultiplied)
+    image.fill(Qt.GlobalColor.transparent)
+    image.setPixelColor(3, 1, QColor(255, 0, 0, 255))
+    image.setPixelColor(5, 1, QColor(255, 0, 0, 255))
+    mask_id = "mask"
+    hue = HueSaturationLightnessModifier(hue=120)
+    hue.parameter_masks["hue"] = ParameterMaskBinding(mask_id, 0, 120)
+    field = np.zeros((3, 9), dtype=np.float32)
+    field[:, 5:] = 1.0
+    shifted = apply_modifier_stack(
+        image, [hue], (0, 0), {(hue.modifier_id, "hue"): field}
+    )
+    assert shifted.pixelColor(3, 1).red() > 245
+    assert shifted.pixelColor(5, 1).green() > 245
+
+    outlined = apply_modifier_stack(
+        image, [OutlineModifier(thickness=2, color="#FF0000FF")], (0, 0)
+    )
+    assert outlined.pixelColor(3, 1).red() == 255
+    assert outlined.pixelColor(2, 1).blue() > 0
+    assert outlined.pixelColor(2, 1).alpha() > 0
 
 
 def test_object_modifier_render_cache_updates_pixels_and_reuses_result(
@@ -332,6 +398,102 @@ def test_outliner_multiselect_routes_tools_and_adds_one_shared_modifier(qapp):
         assert window.canvas.selected_entities == [
             ("object", text.object_id)
         ]
+    finally:
+        window.deleteLater()
+
+
+def test_mask_ui_attachment_contributors_and_document_paint_are_undoable(qapp):
+    chapter, _page, _first, _second, raster, vector = _document()
+    window = MainWindow()
+    window._set_chapter(chapter, TileStore())
+    try:
+        window.canvas.set_selection("object", raster.object_id)
+        context = (
+            "opacity", "object", raster.object_id,
+            0.0, 100.0, 0.0, 100.0,
+        )
+        window._request_parameter_mask(context)
+        binding = raster.opacity_mask
+        assert binding is not None
+        assert (binding.black_value, binding.white_value) == (0.0, 1.0)
+        assert window.canvas.active_tone_mask_id == binding.mask_id
+        assert window._toggle_mask_contributor("object", vector.object_id)
+        assert chapter.masks[binding.mask_id].contributors == [
+            ("object", vector.object_id)
+        ]
+        assert window._finish_mask_mode(True)
+        window.canvas.command_stack.undo()
+        assert chapter.masks[binding.mask_id].contributors == []
+        window.canvas.command_stack.redo()
+        assert chapter.masks[binding.mask_id].contributors == [
+            ("object", vector.object_id)
+        ]
+
+        window.canvas.set_tone_mask_mode(binding.mask_id)
+        window.canvas.set_tool(ToolKind.RASTER_PENCIL)
+        window.canvas._begin_mask_stroke(QPointF(75, 85), 1.0)
+        window.canvas._end_mask_stroke()
+        assert list(window.canvas.tiles.iter_tiles(binding.mask_id))
+        window.canvas.command_stack.undo()
+        assert not list(window.canvas.tiles.iter_tiles(binding.mask_id))
+    finally:
+        window.deleteLater()
+
+
+def test_tone_mask_contributor_uses_transformed_base_alpha(qapp):
+    chapter, _page, _first, _second, raster, _vector = _document()
+    raster.interaction_rect = (0, 0, 30, 30)
+    mask = ToneMask(contributors=[("object", raster.object_id)])
+    chapter.masks[mask.mask_id] = mask
+    tiles = TileStore()
+    tiles.paint_dab(raster.object_id, QPointF(10, 10), 12, QColor("black"))
+    canvas = CanvasWidget(EditorSettings())
+    canvas.set_document(chapter, tiles)
+    field = canvas.render_tone_mask_field(
+        mask.mask_id, 600, 600, canvas_module.QTransform(),
+        QRectF(0, 0, 600, 600),
+    )
+    assert field[60, 50] > .9
+    assert field[100, 100] == 0
+
+
+def test_shape_opacity_mask_replaces_scalar_opacity_in_isolated_pass(qapp):
+    chapter, _page, first, _second, _raster, _vector = _document()
+    first.fill_color = "#FFFF0000"
+    first.opacity = .2
+    mask = ToneMask()
+    chapter.masks[mask.mask_id] = mask
+    first.opacity_mask = ParameterMaskBinding(mask.mask_id, 0, 1)
+    tiles = TileStore()
+    tiles.paint_dab(mask.mask_id, QPointF(60, 60), 24, QColor("white"))
+    canvas = CanvasWidget(EditorSettings())
+    canvas.set_document(chapter, tiles)
+    image = QImage(300, 300, QImage.Format.Format_ARGB32_Premultiplied)
+    image.fill(Qt.transparent)
+    painter = QPainter(image)
+    canvas._render_layer(painter, first, 1.0, QRectF(0, 0, 300, 300))
+    painter.end()
+    assert image.pixelColor(60, 60).alpha() > 245
+    assert image.pixelColor(120, 120).alpha() == 0
+
+
+def test_outliner_mouse_selection_is_deferred_until_release(qapp):
+    chapter, _page, _first, _second, raster, vector = _document()
+    window = MainWindow()
+    window._set_chapter(chapter, TileStore())
+    try:
+        window.show()
+        window.canvas.set_selection("object", raster.object_id)
+        qapp.processEvents()
+        index = window.hierarchy_model.index_for_entity(
+            "object", vector.object_id
+        )
+        point = window.tree.visualRect(index).center()
+        QTest.mousePress(window.tree.viewport(), Qt.LeftButton, pos=point)
+        assert window.canvas.selected_id == raster.object_id
+        QTest.mouseRelease(window.tree.viewport(), Qt.LeftButton, pos=point)
+        qapp.processEvents()
+        assert window.canvas.selected_id == vector.object_id
     finally:
         window.deleteLater()
 

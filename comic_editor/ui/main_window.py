@@ -8,6 +8,8 @@ import time
 import math
 from pathlib import Path
 
+import numpy as np
+
 from PySide6.QtCore import (
     QCoreApplication, QEvent, QItemSelection, QItemSelectionModel, QModelIndex,
     QBuffer, QByteArray, QIODevice, QPointF, QRectF, QSignalBlocker, QSize,
@@ -16,7 +18,7 @@ from PySide6.QtCore import (
 )
 from PySide6.QtGui import (
     QAction, QCloseEvent, QCursor, QImage, QImageReader, QKeySequence,
-    QMouseEvent, QShortcut,
+    QMouseEvent, QShortcut, QTransform,
 )
 from PySide6.QtWidgets import (
     QAbstractSpinBox, QApplication, QCheckBox, QComboBox, QDockWidget,
@@ -34,6 +36,7 @@ from comic_editor.core.models import (
     BlenderComicViewSourceDescriptor, EmbeddedImageSourceDescriptor,
     ImageObject, RasterObject, SpeedLineCenterObject, SpeedLinesGradientObject,
     TextObject, VectorDrawingObject, VectorFillObject, new_id,
+    ParameterMaskBinding, ToneMask,
 )
 from comic_editor.core.assets import (
     AssetManifest, AssetRepository, entity_visual_bounds, extract_asset,
@@ -66,6 +69,7 @@ from comic_editor.ui.tool_ribbon_pages import (
     TextObjectControls, ToolSettingsControls, VectorToolsControls,
 )
 from comic_editor.ui.modifier_controls import ModifierControls
+from comic_editor.ui.mask_controls import MaskButton, MasksPanel
 from comic_editor.ui.tree_model import HierarchyModel
 from comic_editor.ui.asset_library import AssetLibraryWidget
 from comic_editor.ui.blender_views import BlenderViewsWidget
@@ -265,6 +269,8 @@ class MainWindow(QMainWindow):
         self._last_autosave = 0.0
         self._loading_chapter = False
         self._blender_relink_object_id = ""
+        self._mask_context: tuple | None = None
+        self._mask_original_contributors: list[tuple[str, str]] = []
         self._build_ui()
         self.blender_sources = BlenderImageSourceController(self.canvas, self)
         self._connect()
@@ -724,6 +730,10 @@ class MainWindow(QMainWindow):
         )
         self.settings_scroll.setMinimumHeight(56)
         self.settings_scroll.setWidget(self.selection_settings)
+        self.masks_panel = MasksPanel(hierarchy_panel)
+        self.settings_tabs = QTabWidget(hierarchy_panel)
+        self.settings_tabs.addTab(self.settings_scroll, "Settings")
+        self.settings_tabs.addTab(self.masks_panel, "Masks")
         self.tree = QTreeView()
         self.tree.setSelectionMode(QTreeView.ExtendedSelection)
         self.tree.setDragDropMode(QTreeView.InternalMove)
@@ -738,8 +748,14 @@ class MainWindow(QMainWindow):
         self.modifier_controls.linkModeChanged.connect(
             self.hierarchy_model.set_link_highlights
         )
+        self.modifier_controls.linkModeChanged.connect(
+            lambda targets: self._finish_mask_mode(True)
+            if targets is not None else None
+        )
         self.tree.setContextMenuPolicy(Qt.CustomContextMenu)
         self._tablet_outliner_press: dict | None = None
+        self._mouse_outliner_press: dict | None = None
+        self._forwarding_outliner_mouse = False
         self._tablet_drop_indicator = QFrame(self.tree.viewport())
         self._tablet_drop_indicator.setObjectName("tabletDropIndicator")
         self._tablet_drop_indicator.setStyleSheet(
@@ -767,7 +783,7 @@ class MainWindow(QMainWindow):
         settings_host_layout = QVBoxLayout(settings_host)
         settings_host_layout.setContentsMargins(0, 0, 0, 0)
         settings_host_layout.setSpacing(2)
-        settings_host_layout.addWidget(self.settings_scroll, 1)
+        settings_host_layout.addWidget(self.settings_tabs, 1)
         self.selection_common.setMinimumHeight(30)
         settings_host_layout.addWidget(self.selection_common, 0)
         self.outliner_splitter.addWidget(settings_host)
@@ -950,6 +966,27 @@ class MainWindow(QMainWindow):
         self.canvas.command_stack.changed_callback = self._command_stack_changed
         self.selection_common.changed.connect(self._hierarchy_changed)
         self.selection_settings.changed.connect(self._hierarchy_changed)
+        self.selection_common.maskRequested.connect(self._request_parameter_mask)
+        self.selection_common.maskPreviewRequested.connect(self._preview_tone_mask)
+        self.selection_common.maskContributorsDropped.connect(
+            self._drop_mask_contributors
+        )
+        self.selection_common.maskDetachRequested.connect(
+            self._detach_parameter_mask
+        )
+        self.modifier_controls.maskRequested.connect(self._request_parameter_mask)
+        self.modifier_controls.maskPreviewRequested.connect(self._preview_tone_mask)
+        self.modifier_controls.maskContributorsDropped.connect(
+            self._drop_mask_contributors
+        )
+        self.modifier_controls.maskDetachRequested.connect(
+            self._detach_parameter_mask
+        )
+        self.masks_panel.newRequested.connect(self._new_saved_mask)
+        self.masks_panel.saveCurrentRequested.connect(self._save_current_mask)
+        self.masks_panel.renameRequested.connect(self._rename_current_mask)
+        self.masks_panel.deleteRequested.connect(self._delete_current_mask)
+        self.masks_panel.maskSelected.connect(self._select_saved_mask)
         self.selection_settings.settingsChanged.connect(
             self._ribbon_settings_changed
         )
@@ -1505,7 +1542,96 @@ class MainWindow(QMainWindow):
             event_type, local, local, global_position,
             button, buttons, modifiers, device,
         )
-        QCoreApplication.sendEvent(viewport, mouse)
+        self._forwarding_outliner_mouse = True
+        try:
+            QCoreApplication.sendEvent(viewport, mouse)
+        finally:
+            self._forwarding_outliner_mouse = False
+
+    def _forward_outliner_mouse_event(self, event) -> bool:
+        if self._forwarding_outliner_mouse or event.type() not in {
+            QEvent.MouseButtonPress, QEvent.MouseMove,
+            QEvent.MouseButtonRelease,
+        }:
+            return False
+        viewport = self.tree.viewport()
+        state = self._mouse_outliner_press
+        if event.type() == QEvent.MouseButtonPress:
+            if event.button() != Qt.LeftButton:
+                return False
+            index = self.tree.indexAt(
+                event.position().toPoint()
+            ).siblingAtColumn(0)
+            self._mouse_outliner_press = {
+                "global": QPointF(event.globalPosition()),
+                "index": index, "dragging": False,
+                "drop": None, "mime": None,
+                "device": event.pointingDevice(),
+                "modifiers": event.modifiers(),
+            }
+            event.accept()
+            return True
+        if state is None:
+            return False
+        global_position = QPointF(event.globalPosition())
+        local = viewport.mapFromGlobal(global_position.toPoint())
+        if event.type() == QEvent.MouseMove:
+            if not event.buttons() & Qt.LeftButton:
+                self._mouse_outliner_press = None
+                return False
+            if not state["dragging"] and (
+                global_position - state["global"]
+            ).manhattanLength() >= QApplication.startDragDistance():
+                source = state["index"]
+                if not source.isValid():
+                    self._mouse_outliner_press = None
+                    event.accept()
+                    return True
+                rows = self.tree.selectionModel().selectedRows(0)
+                if not self.tree.selectionModel().isSelected(source):
+                    rows = [source]
+                state["mime"] = self.hierarchy_model.mimeData(rows)
+                state["dragging"] = True
+            if state["dragging"]:
+                target = QApplication.widgetAt(global_position.toPoint())
+                while target is not None and not isinstance(target, MaskButton):
+                    target = target.parentWidget()
+                state["mask_drop"] = target
+                if isinstance(target, MaskButton):
+                    state["drop"] = None
+                    self._tablet_drop_indicator.hide()
+                else:
+                    state["drop"] = self._tablet_outliner_drop_target(
+                        local, state["mime"]
+                    )
+            event.accept()
+            return True
+        self._mouse_outliner_press = None
+        if state["dragging"]:
+            target = state.get("mask_drop")
+            if isinstance(target, MaskButton):
+                entities = MaskButton._entities(state["mime"])
+                if entities:
+                    target.entitiesDropped.emit(entities)
+            elif (drop := state.get("drop")) is not None:
+                parent, row = drop
+                self.hierarchy_model.dropMimeData(
+                    state["mime"], Qt.MoveAction, row, 0, parent
+                )
+        else:
+            self._send_outliner_mouse(
+                QEvent.MouseButtonPress, state["global"],
+                Qt.LeftButton, Qt.LeftButton,
+                state["modifiers"], state["device"],
+            )
+            self._send_outliner_mouse(
+                QEvent.MouseButtonRelease, global_position,
+                Qt.LeftButton, Qt.NoButton,
+                event.modifiers(), state["device"],
+            )
+        self._tablet_drop_indicator.hide()
+        event.accept()
+        return True
 
     def _forward_outliner_tablet_event(self, watched, event) -> bool:
         if event.type() not in {
@@ -1521,6 +1647,17 @@ class MainWindow(QMainWindow):
             if not inside:
                 return False
             index = self.tree.indexAt(local).siblingAtColumn(0)
+            if self.canvas.active_tone_mask_id and index.isValid():
+                self._tablet_outliner_press = {
+                    "global": QPointF(global_position),
+                    "index": index, "dragging": False,
+                    "drop": None, "mime": None,
+                    "device": event.pointingDevice(),
+                    "modifiers": event.modifiers(),
+                    "mask_toggle": True,
+                }
+                event.accept()
+                return True
             if self.modifier_controls.link_modifier_id and index.isValid():
                 item = self.hierarchy_model.item_for_index(index)
                 self.modifier_controls.toggle_link_target(
@@ -1566,18 +1703,35 @@ class MainWindow(QMainWindow):
                     )
                     state["dragging"] = True
             if state["dragging"]:
-                state["drop"] = self._tablet_outliner_drop_target(
-                    local, state["mime"]
-                )
+                target = QApplication.widgetAt(global_position.toPoint())
+                while target is not None and not isinstance(target, MaskButton):
+                    target = target.parentWidget()
+                state["mask_drop"] = target
+                if isinstance(target, MaskButton):
+                    state["drop"] = None
+                    self._tablet_drop_indicator.hide()
+                else:
+                    state["drop"] = self._tablet_outliner_drop_target(
+                        local, state["mime"]
+                    )
             event.accept()
             return True
         if state["dragging"]:
-            drop = state.get("drop")
-            if drop is not None:
+            mask_drop = state.get("mask_drop")
+            if isinstance(mask_drop, MaskButton):
+                entities = MaskButton._entities(state["mime"])
+                if entities:
+                    mask_drop.entitiesDropped.emit(entities)
+            elif (drop := state.get("drop")) is not None:
                 parent, row = drop
                 self.hierarchy_model.dropMimeData(
                     state["mime"], Qt.MoveAction, row, 0, parent
                 )
+        elif state.get("mask_toggle"):
+            index = state["index"]
+            if index.isValid():
+                item = self.hierarchy_model.item_for_index(index)
+                self._toggle_mask_contributor(item.kind, item.entity_id)
         else:
             # Preserve the tree's native checkbox, selection, and editing tap
             # behavior without asking it to infer a drag from tablet packets.
@@ -1639,6 +1793,33 @@ class MainWindow(QMainWindow):
             watched is self.tree.viewport()
             and event.type() == QEvent.MouseButtonPress
             and event.button() == Qt.MouseButton.LeftButton
+            and self.canvas.active_tone_mask_id
+        ):
+            self._mask_mouse_press_index = self.tree.indexAt(
+                event.position().toPoint()
+            ).siblingAtColumn(0)
+            event.accept()
+            return True
+        if (
+            watched is self.tree.viewport()
+            and event.type() == QEvent.MouseButtonRelease
+            and event.button() == Qt.MouseButton.LeftButton
+            and self.canvas.active_tone_mask_id
+        ):
+            index = self.tree.indexAt(
+                event.position().toPoint()
+            ).siblingAtColumn(0)
+            pressed = getattr(self, "_mask_mouse_press_index", QModelIndex())
+            self._mask_mouse_press_index = QModelIndex()
+            if index.isValid() and index == pressed:
+                item = self.hierarchy_model.item_for_index(index)
+                self._toggle_mask_contributor(item.kind, item.entity_id)
+            event.accept()
+            return True
+        if (
+            watched is self.tree.viewport()
+            and event.type() == QEvent.MouseButtonPress
+            and event.button() == Qt.MouseButton.LeftButton
             and self.modifier_controls.link_modifier_id
         ):
             index = self.tree.indexAt(
@@ -1655,13 +1836,23 @@ class MainWindow(QMainWindow):
             return True
         if self._forward_outliner_tablet_event(watched, event):
             return True
+        if watched is self.tree.viewport() and self._forward_outliner_mouse_event(event):
+            return True
         if event.type() == QEvent.ApplicationDeactivate:
             self._cancel_outliner_tablet_press()
+            self._mouse_outliner_press = None
             self._hotkey_prefix_timer.stop()
             self._hotkey_pending = None
             self._hotkey_pressed.clear()
             self._restore_active_hotkey_tool()
             return super().eventFilter(watched, event)
+        if (
+            event.type() == QEvent.KeyPress
+            and event.key() == Qt.Key_Escape
+            and self._finish_mask_mode(False)
+        ):
+            event.accept()
+            return True
         if (
             event.type() == QEvent.KeyPress
             and event.key() == Qt.Key_Escape
@@ -3764,7 +3955,417 @@ class MainWindow(QMainWindow):
         )
 
     # ---- selection and model synchronization --------------------------
+    def _parameter_binding(self, context: tuple | None):
+        if self.chapter is None or context is None:
+            return None
+        if context[0] == "modifier":
+            modifier = self.chapter.modifiers.get(context[1])
+            return modifier.parameter_masks.get(context[2]) if modifier else None
+        if context[0] == "opacity":
+            target = (
+                self.chapter.layers.get(context[2])
+                if context[1] == "layer"
+                else self.chapter.objects.get(context[2])
+            )
+            return getattr(target, "opacity_mask", None) if target else None
+        return None
+
+    def _set_parameter_binding(
+        self, context: tuple, binding: ParameterMaskBinding | None,
+    ) -> None:
+        if context[0] == "modifier":
+            modifier = self.chapter.modifiers.get(context[1])
+            if modifier is not None:
+                if binding is None:
+                    modifier.parameter_masks.pop(context[2], None)
+                else:
+                    modifier.parameter_masks[context[2]] = binding
+                modifier.validate()
+            return
+        target = (
+            self.chapter.layers.get(context[2])
+            if context[1] == "layer"
+            else self.chapter.objects.get(context[2])
+        )
+        if target is not None:
+            if binding is not None:
+                binding.black_value /= 100.0
+                binding.white_value /= 100.0
+                target.opacity = binding.white_value
+                if hasattr(target, "opacity_locked"):
+                    target.opacity_locked = False
+            target.opacity_mask = binding
+
+    def _request_parameter_mask(self, context: tuple) -> None:
+        if self.chapter is None:
+            return
+        if (
+            self._mask_context == context
+            and self.canvas.active_tone_mask_id
+        ):
+            self._finish_mask_mode(True)
+            return
+        if self.canvas.active_tone_mask_id:
+            self._finish_mask_mode(True)
+        before = self.chapter.to_dict()
+        binding = self._parameter_binding(context)
+        if binding is None:
+            mask = ToneMask(saved=False)
+            self.chapter.masks[mask.mask_id] = mask
+            binding = ParameterMaskBinding(
+                mask.mask_id, float(context[5]), float(context[6])
+            )
+            self._set_parameter_binding(context, binding)
+            self.canvas.push_model_change(
+                before, self.chapter.to_dict(), "Attach parameter mask"
+            )
+            self.canvas.documentChanged.emit(None)
+        self._enter_mask_mode(binding.mask_id, context)
+
+    def _detach_parameter_mask(self, context: tuple | None) -> None:
+        if self.chapter is None or context is None:
+            return
+        binding = self._parameter_binding(context)
+        if binding is None:
+            return
+        mask_id = binding.mask_id
+        if self.canvas.active_tone_mask_id == mask_id:
+            self._finish_mask_mode(True)
+            binding = self._parameter_binding(context)
+            if binding is None:
+                return
+        before = self.chapter.to_dict()
+        if context[0] == "modifier":
+            modifier = self.chapter.modifiers.get(context[1])
+            if modifier is None:
+                return
+            setattr(modifier, context[2], binding.white_value)
+            modifier.parameter_masks.pop(context[2], None)
+            modifier.validate()
+        else:
+            target = (
+                self.chapter.layers.get(context[2])
+                if context[1] == "layer"
+                else self.chapter.objects.get(context[2])
+            )
+            if target is None:
+                return
+            target.opacity = binding.white_value
+            target.opacity_mask = None
+        removed = self.chapter.garbage_collect_masks()
+        # Keep orphaned in-memory paint until the session closes so Undo can
+        # restore an anonymous mask without losing its tile payload. Save only
+        # persists IDs that remain in the chapter registry.
+        del removed
+        self.canvas.push_model_change(
+            before, self.chapter.to_dict(), "Detach parameter mask"
+        )
+        self.canvas._invalidate_scene_cache()
+        self.canvas.documentChanged.emit(None)
+        self.selection_common.refresh()
+        self.modifier_controls.refresh()
+        self._refresh_masks_panel()
+        self.canvas.update()
+
+    def _enter_mask_mode(
+        self, mask_id: str, context: tuple | None = None,
+    ) -> None:
+        if self.chapter is None or mask_id not in self.chapter.masks:
+            return
+        if self.modifier_controls.link_modifier_id:
+            self.modifier_controls.cancel_link_mode()
+        self._mask_context = context
+        mask = self.chapter.masks[mask_id]
+        self._mask_original_contributors = list(mask.contributors)
+        self.canvas.set_tone_mask_mode(mask_id)
+        self.hierarchy_model.set_mask_highlights(set(mask.contributors))
+        self.masks_panel.set_active(mask_id)
+        self.settings_tabs.setCurrentWidget(self.masks_panel)
+        self.selection_common.refresh()
+        self.modifier_controls.refresh()
+        self._refresh_masks_panel()
+
+    def _finish_mask_mode(self, commit: bool) -> bool:
+        mask_id = self.canvas.active_tone_mask_id
+        if not mask_id or self.chapter is None:
+            return False
+        mask = self.chapter.masks.get(mask_id)
+        original = list(self._mask_original_contributors)
+        final = list(mask.contributors) if mask is not None else []
+        if mask is not None and not commit:
+            mask.contributors = list(original)
+            mask.touch()
+        self.canvas.set_tone_mask_mode("")
+        self.hierarchy_model.set_mask_highlights(None)
+        self._mask_context = None
+        self._mask_original_contributors = []
+        if commit and mask is not None and original != final:
+            self.canvas.command_stack.push(CallbackCommand(
+                "Edit mask contributors",
+                lambda values=final, current_id=mask_id:
+                self._apply_mask_contributors(current_id, values),
+                lambda values=original, current_id=mask_id:
+                self._apply_mask_contributors(current_id, values),
+            ), already_done=True)
+            self.canvas.documentChanged.emit(None)
+        self.canvas._invalidate_scene_cache()
+        self.canvas.update()
+        self.selection_common.refresh()
+        self.modifier_controls.refresh()
+        self._refresh_masks_panel()
+        return True
+
+    def _apply_mask_contributors(
+        self, mask_id: str, contributors: list[tuple[str, str]],
+    ) -> None:
+        mask = self.chapter.masks.get(mask_id) if self.chapter else None
+        if mask is None:
+            return
+        mask.contributors = list(contributors)
+        mask.touch()
+        self.canvas._invalidate_scene_cache()
+        self.canvas.documentChanged.emit(None)
+        self.canvas.update()
+        self._refresh_masks_panel()
+
+    def _toggle_mask_contributor(self, kind: str, entity_id: str) -> bool:
+        if self.chapter is None or not self.canvas.active_tone_mask_id:
+            return False
+        mask = self.chapter.masks.get(self.canvas.active_tone_mask_id)
+        target = (kind, entity_id)
+        if mask is None or self.chapter.mask_contributor(*target) is None:
+            return False
+        if target in mask.contributors:
+            mask.contributors.remove(target)
+        else:
+            mask.contributors.append(target)
+        mask.touch()
+        self.hierarchy_model.set_mask_highlights(set(mask.contributors))
+        self.canvas._invalidate_scene_cache()
+        self.canvas.update()
+        self._refresh_masks_panel()
+        return True
+
+    def _drop_mask_contributors(
+        self, context: tuple, entities: list[tuple[str, str]],
+    ) -> None:
+        if self.chapter is None:
+            return
+        binding = self._parameter_binding(context)
+        before = self.chapter.to_dict()
+        if binding is None:
+            mask = ToneMask(saved=False)
+            self.chapter.masks[mask.mask_id] = mask
+            binding = ParameterMaskBinding(
+                mask.mask_id, float(context[5]), float(context[6])
+            )
+            self._set_parameter_binding(context, binding)
+        mask = self.chapter.masks.get(binding.mask_id)
+        if mask is None:
+            return
+        for target in entities:
+            if (
+                self.chapter.mask_contributor(*target) is not None
+                and target not in mask.contributors
+            ):
+                mask.contributors.append(target)
+        mask.touch()
+        self.canvas.push_model_change(
+            before, self.chapter.to_dict(), "Assign mask contributors"
+        )
+        self.canvas.documentChanged.emit(None)
+        self._enter_mask_mode(mask.mask_id, context)
+
+    def _preview_tone_mask(self, mask_id: str, hovered: bool) -> None:
+        self.canvas.preview_tone_mask_id = mask_id if hovered else ""
+        self.canvas.update()
+
+    def _new_saved_mask(self) -> None:
+        if self.chapter is None:
+            return
+        name, accepted = QInputDialog.getText(self, "New Mask", "Mask name")
+        if not accepted or not name.strip():
+            return
+        if self.canvas.active_tone_mask_id:
+            self._finish_mask_mode(True)
+        before = self.chapter.to_dict()
+        mask = ToneMask(name=name.strip(), saved=True)
+        self.chapter.masks[mask.mask_id] = mask
+        self.canvas.push_model_change(before, self.chapter.to_dict(), "Add mask")
+        self.canvas.documentChanged.emit(None)
+        self._enter_mask_mode(mask.mask_id)
+
+    def _save_current_mask(self) -> None:
+        mask = self.chapter.masks.get(self.canvas.active_tone_mask_id) if self.chapter else None
+        if mask is None or mask.saved:
+            return
+        name, accepted = QInputDialog.getText(self, "Save Mask", "Mask name")
+        if not accepted or not name.strip():
+            return
+        before = self.chapter.to_dict()
+        mask.saved = True
+        mask.name = name.strip()
+        mask.touch()
+        self.canvas.push_model_change(before, self.chapter.to_dict(), "Save mask")
+        self.canvas.documentChanged.emit(None)
+        self._refresh_masks_panel()
+
+    def _rename_current_mask(self) -> None:
+        mask = self.chapter.masks.get(self.canvas.active_tone_mask_id) if self.chapter else None
+        if mask is None or not mask.saved:
+            return
+        name, accepted = QInputDialog.getText(
+            self, "Rename Mask", "Mask name", text=mask.name
+        )
+        if not accepted or not name.strip() or name.strip() == mask.name:
+            return
+        before = self.chapter.to_dict()
+        mask.name = name.strip()
+        mask.touch()
+        self.canvas.push_model_change(before, self.chapter.to_dict(), "Rename mask")
+        self.canvas.documentChanged.emit(None)
+        self._refresh_masks_panel()
+
+    def _delete_current_mask(self) -> None:
+        mask_id = self.canvas.active_tone_mask_id or self.masks_panel.active_mask_id
+        mask = self.chapter.masks.get(mask_id) if self.chapter else None
+        if mask is None or not mask.saved:
+            return
+        if mask_id in self.chapter.referenced_mask_ids():
+            answer = QMessageBox.question(
+                self, "Delete Mask",
+                "This mask is in use. Delete it and detach every parameter?",
+                QMessageBox.Yes | QMessageBox.Cancel, QMessageBox.Cancel,
+            )
+            if answer != QMessageBox.Yes:
+                return
+        before = self.chapter.to_dict()
+        paint = self.canvas.tiles.object_tiles(mask_id)
+        self.chapter.detach_mask(mask_id)
+        self.chapter.masks.pop(mask_id, None)
+        self.canvas.tiles.remove_object(mask_id)
+        self._finish_mask_mode(False)
+        after = self.chapter.to_dict()
+
+        def restore(state: dict, with_paint: bool) -> None:
+            self.canvas.replace_chapter(state)
+            if with_paint:
+                self.canvas.tiles.replace_object_tiles(mask_id, paint)
+            else:
+                self.canvas.tiles.remove_object(mask_id)
+            self.canvas._invalidate_scene_cache()
+            self.canvas.documentChanged.emit(None)
+            self.canvas.update()
+
+        self.canvas.command_stack.push(CallbackCommand(
+            "Delete mask",
+            lambda: restore(after, False),
+            lambda: restore(before, True),
+        ), already_done=True)
+        self.canvas.documentChanged.emit(None)
+        self._refresh_masks_panel()
+
+    def _select_saved_mask(self, mask_id: str) -> None:
+        if self.chapter is None or mask_id not in self.chapter.masks:
+            return
+        if self._mask_context is not None:
+            context = self._mask_context
+            if self.canvas.active_tone_mask_id:
+                self._finish_mask_mode(True)
+            before = self.chapter.to_dict()
+            binding = self._parameter_binding(context)
+            if binding is not None and binding.mask_id != mask_id:
+                old_id = binding.mask_id
+                binding.mask_id = mask_id
+                removed = self.chapter.garbage_collect_masks()
+                del removed
+                self.canvas.push_model_change(
+                    before, self.chapter.to_dict(), "Assign saved mask"
+                )
+                self.canvas.documentChanged.emit(None)
+                if old_id == self.canvas.active_tone_mask_id:
+                    self.canvas.set_tone_mask_mode("")
+            self._enter_mask_mode(mask_id, context)
+        else:
+            if self.canvas.active_tone_mask_id:
+                self._finish_mask_mode(True)
+            self._enter_mask_mode(mask_id)
+
+    def _refresh_masks_panel(self) -> None:
+        thumbnails: dict[str, QImage] = {}
+        if self.chapter is not None:
+            width, height = 80, 80
+            transform = QTransform()
+            transform.scale(
+                width / max(1.0, self.chapter.width),
+                height / max(1.0, self.chapter.height),
+            )
+            visible = QRectF(
+                0, 0, self.chapter.width, self.chapter.height
+            )
+            for mask in self.chapter.masks.values():
+                if not mask.saved:
+                    continue
+                field = self.canvas.render_tone_mask_field(
+                    mask.mask_id, width, height, transform, visible
+                )
+                values = np.ascontiguousarray(
+                    np.clip(field * 255.0, 0, 255).astype(np.uint8)
+                )
+                thumbnails[mask.mask_id] = QImage(
+                    values.data, width, height, width,
+                    QImage.Format.Format_Grayscale8,
+                ).copy()
+        self.masks_panel.refresh(self.chapter, thumbnails)
+
+    def _show_selected_saved_mask(self) -> None:
+        if self.chapter is None or not self.canvas.selected_id:
+            return
+        target = (
+            self.chapter.layers.get(self.canvas.selected_id)
+            if self.canvas.selected_kind == "layer"
+            else self.chapter.objects.get(self.canvas.selected_id)
+        )
+        if target is None:
+            return
+        bindings = []
+        if target.opacity_mask is not None:
+            bindings.append(target.opacity_mask)
+        for modifier_id in target.modifier_ids:
+            modifier = self.chapter.modifiers.get(modifier_id)
+            if modifier is not None:
+                bindings.extend(modifier.parameter_masks.values())
+        mask = next((
+            self.chapter.masks.get(binding.mask_id)
+            for binding in bindings
+            if self.chapter.masks.get(binding.mask_id) is not None
+            and self.chapter.masks[binding.mask_id].saved
+        ), None)
+        if mask is not None:
+            self.masks_panel.set_active(mask.mask_id)
+            self.settings_tabs.setCurrentWidget(self.masks_panel)
+
     def _tree_selection_changed(self, selected: QItemSelection, deselected) -> None:
+        if self.canvas.active_tone_mask_id:
+            changed: list[QModelIndex] = []
+            for index in [*selected.indexes(), *deselected.indexes()]:
+                candidate = index.siblingAtColumn(0)
+                if candidate.isValid() and candidate not in changed:
+                    changed.append(candidate)
+            for index in changed:
+                item = self.hierarchy_model.item_for_index(index)
+                self._toggle_mask_contributor(item.kind, item.entity_id)
+            blocker = QSignalBlocker(self.tree.selectionModel())
+            self.tree.selectionModel().clearSelection()
+            for kind, entity_id in self.canvas.selected_entities:
+                index = self.hierarchy_model.index_for_entity(kind, entity_id)
+                if index.isValid():
+                    self.tree.selectionModel().select(
+                        index,
+                        QItemSelectionModel.Select | QItemSelectionModel.Rows,
+                    )
+            del blocker
+            return
         del selected, deselected
         indexes = self.tree.selectionModel().selectedRows(0)
         if not indexes:
@@ -3905,6 +4506,7 @@ class MainWindow(QMainWindow):
         self._expanded_selected_vector_id = new_vector_id
         self.selection_common.refresh()
         self.selection_settings.refresh()
+        self._show_selected_saved_mask()
         self._sync_tool_buttons()
         selected_object = (
             self.chapter.objects.get(entity_id)
@@ -3952,6 +4554,10 @@ class MainWindow(QMainWindow):
 
     def _chapter_replaced(self, chapter: ChapterDocument) -> None:
         self.chapter = chapter
+        if self.canvas.active_tone_mask_id not in chapter.masks:
+            self.canvas.set_tone_mask_mode("")
+            self._mask_context = None
+            self.hierarchy_model.set_mask_highlights(None)
         if self.active_session is not None:
             self.active_session.chapter = chapter
             self.active_session.tiles = self.canvas.tiles
@@ -3961,6 +4567,7 @@ class MainWindow(QMainWindow):
         self._refresh_hierarchy()
         self.selection_common.refresh()
         self.selection_settings.refresh()
+        self._refresh_masks_panel()
         self.preview.invalidate_all()
         self._sync_tool_buttons()
         self._mark_dirty(None)
@@ -3971,6 +4578,7 @@ class MainWindow(QMainWindow):
         self._refresh_hierarchy()
         self.selection_common.refresh()
         self.selection_settings.refresh()
+        self._refresh_masks_panel()
         self.preview.invalidate_all()
         self._sync_tool_buttons()
 
@@ -4513,6 +5121,10 @@ class MainWindow(QMainWindow):
                 copied.replace_object_tiles(
                     object_id, source.object_tiles(object_id)
                 )
+        for mask_id in chapter.masks:
+            copied.replace_object_tiles(
+                mask_id, source.object_tiles(mask_id)
+            )
         return copied
 
     def _write_session_to_clone(

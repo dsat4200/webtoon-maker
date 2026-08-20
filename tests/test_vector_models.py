@@ -71,7 +71,7 @@ def test_vector_drawing_and_fill_round_trip_with_owned_hierarchy():
     restored = ChapterDocument.from_dict(chapter.to_dict())
     restored_drawing = restored.objects[drawing.object_id]
     restored_fill = restored.objects[fill.object_id]
-    assert restored.schema_version == 17
+    assert restored.schema_version == 18
     assert isinstance(restored_drawing, VectorDrawingObject)
     assert isinstance(restored_fill, VectorFillObject)
     assert restored_drawing.fill_child_ids == [fill.object_id]

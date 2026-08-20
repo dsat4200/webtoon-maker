@@ -7,7 +7,7 @@ from dataclasses import dataclass, field
 from typing import Any, Iterable, Iterator, Literal
 
 
-SCHEMA_VERSION = 17
+SCHEMA_VERSION = 18
 SERIES_SCHEMA_VERSION = 17
 CHAPTER_WIDTH = 1080
 DEFAULT_CHAPTER_HEIGHT = 3240
@@ -623,6 +623,137 @@ class ChildRef:
 
 
 @dataclass
+class ParameterMaskBinding:
+    """Map a reusable grayscale mask onto two parameter endpoints."""
+
+    mask_id: str
+    black_value: float = 0.0
+    white_value: float = 0.0
+
+    def validate(self, minimum: float, maximum: float) -> None:
+        self.mask_id = str(self.mask_id)
+        values = float(self.black_value), float(self.white_value)
+        if not self.mask_id or not all(math.isfinite(value) for value in values):
+            raise ValueError("Parameter mask binding is invalid")
+        self.black_value = max(minimum, min(maximum, values[0]))
+        self.white_value = max(minimum, min(maximum, values[1]))
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "mask_id": self.mask_id,
+            "black": self.black_value,
+            "white": self.white_value,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any] | None) -> "ParameterMaskBinding | None":
+        if not isinstance(data, dict) or not data.get("mask_id"):
+            return None
+        return cls(
+            mask_id=str(data["mask_id"]),
+            black_value=float(data.get("black", 0.0)),
+            white_value=float(data.get("white", 0.0)),
+        )
+
+
+@dataclass
+class ToneMask:
+    """Chapter-local tone map made from contributors and raster paint."""
+
+    mask_id: str = field(default_factory=new_id)
+    name: str = ""
+    saved: bool = False
+    contributors: list[tuple[str, str]] = field(default_factory=list)
+    revision: int = 0
+
+    def validate(self) -> None:
+        self.mask_id = str(self.mask_id)
+        if not self.mask_id:
+            raise ValueError("Tone mask requires an ID")
+        self.name = str(self.name).strip()
+        self.saved = bool(self.saved)
+        if self.saved and not self.name:
+            self.name = "Mask"
+        if not self.saved:
+            self.name = ""
+        canonical: list[tuple[str, str]] = []
+        seen: set[tuple[str, str]] = set()
+        for raw in self.contributors:
+            if not isinstance(raw, (list, tuple)) or len(raw) != 2:
+                continue
+            item = str(raw[0]), str(raw[1])
+            if item[0] not in {"layer", "object"} or not item[1] or item in seen:
+                continue
+            seen.add(item)
+            canonical.append(item)
+        self.contributors = canonical
+        self.revision = max(0, int(self.revision))
+
+    def touch(self) -> None:
+        self.revision += 1
+
+    def to_dict(self) -> dict[str, Any]:
+        self.validate()
+        return {
+            "id": self.mask_id,
+            "name": self.name,
+            "saved": self.saved,
+            "contributors": [
+                {"kind": kind, "id": entity_id}
+                for kind, entity_id in self.contributors
+            ],
+            "revision": self.revision,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "ToneMask":
+        contributors = data.get("contributors", [])
+        result = cls(
+            mask_id=str(data.get("id") or new_id()),
+            name=str(data.get("name", "")),
+            saved=bool(data.get("saved", bool(data.get("name")))),
+            contributors=[
+                (str(item.get("kind", "")), str(item.get("id", "")))
+                if isinstance(item, dict) else tuple(item)
+                for item in contributors
+                if isinstance(item, (dict, list, tuple))
+            ],
+            revision=int(data.get("revision", 0)),
+        )
+        result.validate()
+        return result
+
+
+def _parameter_masks_from_dict(
+    data: dict[str, Any] | None,
+) -> dict[str, ParameterMaskBinding]:
+    if not isinstance(data, dict):
+        return {}
+    return {
+        str(name): binding
+        for name, raw in data.items()
+        if (binding := ParameterMaskBinding.from_dict(raw)) is not None
+    }
+
+
+def _parameter_masks_to_dict(
+    bindings: dict[str, ParameterMaskBinding],
+) -> dict[str, dict[str, Any]]:
+    return {name: binding.to_dict() for name, binding in bindings.items()}
+
+
+def _validate_parameter_masks(
+    bindings: dict[str, ParameterMaskBinding],
+    ranges: dict[str, tuple[float, float]],
+) -> None:
+    for name in list(bindings):
+        if name not in ranges:
+            bindings.pop(name, None)
+            continue
+        bindings[name].validate(*ranges[name])
+
+
+@dataclass
 class HueSaturationLightnessModifier:
     """A shared, nondestructive HSL adjustment."""
 
@@ -634,6 +765,7 @@ class HueSaturationLightnessModifier:
     hue: float = 0.0
     saturation: float = 0.0
     lightness: float = 0.0
+    parameter_masks: dict[str, ParameterMaskBinding] = field(default_factory=dict)
 
     def validate(self) -> None:
         self.name = str(self.name or "Hue / Saturation / Lightness")
@@ -647,6 +779,12 @@ class HueSaturationLightnessModifier:
         self.hue = max(-180.0, min(180.0, values[1]))
         self.saturation = max(-100.0, min(100.0, values[2]))
         self.lightness = max(-100.0, min(100.0, values[3]))
+        _validate_parameter_masks(self.parameter_masks, {
+            "intensity": (0.0, 100.0),
+            "hue": (-180.0, 180.0),
+            "saturation": (-100.0, 100.0),
+            "lightness": (-100.0, 100.0),
+        })
 
     def to_dict(self) -> dict[str, Any]:
         self.validate()
@@ -659,6 +797,7 @@ class HueSaturationLightnessModifier:
             "hue": self.hue,
             "saturation": self.saturation,
             "lightness": self.lightness,
+            "parameter_masks": _parameter_masks_to_dict(self.parameter_masks),
         }
 
 
@@ -677,6 +816,7 @@ class BlurModifier:
     focal_radius: float = 100.0
     focal_ramp: float = 0.5
     focal_angle: float = 0.0
+    parameter_masks: dict[str, ParameterMaskBinding] = field(default_factory=dict)
 
     def validate(self) -> None:
         self.name = str(self.name or "Blur")
@@ -695,6 +835,10 @@ class BlurModifier:
         self.focal_radius = max(1.0, values[4])
         self.focal_ramp = max(0.0, min(1.0, values[5]))
         self.focal_angle = values[6]
+        _validate_parameter_masks(self.parameter_masks, {
+            "intensity": (0.0, 100.0),
+            "strength": (0.0, 100.0),
+        })
 
     def to_dict(self) -> dict[str, Any]:
         self.validate()
@@ -710,10 +854,60 @@ class BlurModifier:
             "focal_radius": self.focal_radius,
             "focal_ramp": self.focal_ramp,
             "focal_angle": self.focal_angle,
+            "parameter_masks": _parameter_masks_to_dict(self.parameter_masks),
         }
 
 
-ModifierInstance = HueSaturationLightnessModifier | BlurModifier
+@dataclass
+class OutlineModifier:
+    """Outside outline generated nondestructively from source alpha."""
+
+    modifier_id: str = field(default_factory=new_id)
+    modifier_type: Literal["outline"] = "outline"
+    name: str = "Outline"
+    intensity: float = 100.0
+    expanded: bool = True
+    thickness: float = 8.0
+    opacity: float = 100.0
+    color: str = "#FF000000"
+    parameter_masks: dict[str, ParameterMaskBinding] = field(default_factory=dict)
+
+    def validate(self) -> None:
+        self.name = str(self.name or "Outline")
+        self.expanded = bool(self.expanded)
+        values = tuple(float(value) for value in (
+            self.intensity, self.thickness, self.opacity,
+        ))
+        if not all(math.isfinite(value) for value in values):
+            raise ValueError("Outline modifier values must be finite")
+        self.intensity = max(0.0, min(100.0, values[0]))
+        self.thickness = max(0.0, min(100.0, values[1]))
+        self.opacity = max(0.0, min(100.0, values[2]))
+        self.color = canonical_argb(self.color)
+        _validate_parameter_masks(self.parameter_masks, {
+            "intensity": (0.0, 100.0),
+            "thickness": (0.0, 100.0),
+            "opacity": (0.0, 100.0),
+        })
+
+    def to_dict(self) -> dict[str, Any]:
+        self.validate()
+        return {
+            "id": self.modifier_id,
+            "type": self.modifier_type,
+            "name": self.name,
+            "intensity": self.intensity,
+            "expanded": self.expanded,
+            "thickness": self.thickness,
+            "opacity": self.opacity,
+            "color": self.color,
+            "parameter_masks": _parameter_masks_to_dict(self.parameter_masks),
+        }
+
+
+ModifierInstance = (
+    HueSaturationLightnessModifier | BlurModifier | OutlineModifier
+)
 
 
 def modifier_from_dict(data: dict[str, Any]) -> ModifierInstance:
@@ -723,6 +917,9 @@ def modifier_from_dict(data: dict[str, Any]) -> ModifierInstance:
         "name": str(data.get("name", "")),
         "intensity": float(data.get("intensity", 100.0)),
         "expanded": bool(data.get("expanded", True)),
+        "parameter_masks": _parameter_masks_from_dict(
+            data.get("parameter_masks")
+        ),
     }
     if modifier_type == "hsl":
         result: ModifierInstance = HueSaturationLightnessModifier(
@@ -741,6 +938,13 @@ def modifier_from_dict(data: dict[str, Any]) -> ModifierInstance:
             focal_radius=float(data.get("focal_radius", 100.0)),
             focal_ramp=float(data.get("focal_ramp", 0.5)),
             focal_angle=float(data.get("focal_angle", 0.0)),
+        )
+    elif modifier_type == "outline":
+        result = OutlineModifier(
+            **common,
+            thickness=float(data.get("thickness", 8.0)),
+            opacity=float(data.get("opacity", 100.0)),
+            color=str(data.get("color", "#FF000000")),
         )
     else:
         raise ValueError(f"Unknown modifier type: {modifier_type}")
@@ -770,6 +974,7 @@ class LayerNode:
     modifier_ids: list[str] = field(default_factory=list)
     transform_frame: tuple[float, float, float, float] | None = None
     transform_quad: list[tuple[float, float]] | None = None
+    opacity_mask: ParameterMaskBinding | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -794,6 +999,10 @@ class LayerNode:
             "transform_quad": (
                 [list(point) for point in self.transform_quad]
                 if self.transform_quad is not None else None
+            ),
+            "opacity_mask": (
+                self.opacity_mask.to_dict()
+                if self.opacity_mask is not None else None
             ),
         }
 
@@ -837,6 +1046,9 @@ class LayerNode:
             transform_quad=(
                 [_point(point) for point in transform_quad]
                 if transform_quad is not None else None
+            ),
+            opacity_mask=ParameterMaskBinding.from_dict(
+                data.get("opacity_mask")
             ),
         )
         legacy_radius = float(data.get("vertex_radius", 0.0))
@@ -903,6 +1115,7 @@ class DocumentObject:
     ignore_parent_mask: bool = False
     underlay_opacity: float = 0.0
     modifier_ids: list[str] = field(default_factory=list)
+    opacity_mask: ParameterMaskBinding | None = None
 
     def common_dict(self) -> dict[str, Any]:
         return {
@@ -915,6 +1128,10 @@ class DocumentObject:
             "ignore_parent_mask": self.ignore_parent_mask,
             "underlay_opacity": self.underlay_opacity,
             "modifier_ids": list(self.modifier_ids),
+            "opacity_mask": (
+                self.opacity_mask.to_dict()
+                if self.opacity_mask is not None else None
+            ),
         }
 
     def to_dict(self) -> dict[str, Any]:
@@ -1938,6 +2155,7 @@ def object_from_dict(data: dict[str, Any]) -> ObjectEntity:
         ignore_parent_mask=bool(data.get("ignore_parent_mask", False)),
         underlay_opacity=float(data.get("underlay_opacity", 0.0)),
         modifier_ids=[str(item) for item in data.get("modifier_ids", [])],
+        opacity_mask=ParameterMaskBinding.from_dict(data.get("opacity_mask")),
     )
     object_type = str(data.get("type", "object"))
     if object_type == "gradient":
@@ -2121,6 +2339,7 @@ class ChapterDocument:
     layers: dict[str, LayerNode] = field(default_factory=dict)
     objects: dict[str, ObjectEntity] = field(default_factory=dict)
     modifiers: dict[str, ModifierInstance] = field(default_factory=dict)
+    masks: dict[str, ToneMask] = field(default_factory=dict)
     document_kind: Literal["chapter", "asset"] = "chapter"
     schema_version: int = SCHEMA_VERSION
 
@@ -2136,6 +2355,10 @@ class ChapterDocument:
         self.width = max(1, int(self.width))
         self.height = max(1, int(self.height))
         self.grid.validate()
+        for mask_id, mask in list(self.masks.items()):
+            if mask.mask_id != mask_id:
+                mask.mask_id = mask_id
+            mask.validate()
         if len(set(self.root_page_ids)) != len(self.root_page_ids):
             raise ValueError("Duplicate root page")
         referenced: set[tuple[str, str]] = set()
@@ -2169,6 +2392,7 @@ class ChapterDocument:
                 layer.modifier_ids.clear()
                 layer.transform_frame = None
                 layer.transform_quad = None
+                layer.opacity_mask = None
             elif layer.bound is None:
                 raise ValueError("Bounded layers require geometry")
             else:
@@ -2183,6 +2407,8 @@ class ChapterDocument:
             layer.shape_style.validate()
             layer.border_width = max(0.0, float(layer.border_width))
             layer.opacity = max(0.0, min(1.0, float(layer.opacity)))
+            if layer.opacity_mask is not None:
+                layer.opacity_mask.validate(0.0, 1.0)
             if layer.is_page and layer.layer_id not in self.root_page_ids:
                 raise ValueError("Page layers must be chapter roots")
             if layer.is_page:
@@ -2192,6 +2418,7 @@ class ChapterDocument:
                 layer.modifier_ids.clear()
                 layer.transform_frame = None
                 layer.transform_quad = None
+                layer.opacity_mask = None
             if layer.transform_frame is not None:
                 if len(layer.transform_frame) != 4 or not all(
                     math.isfinite(float(value))
@@ -2338,6 +2565,8 @@ class ChapterDocument:
             ):
                 raise ValueError(f"Object {object_id} requires a container layer")
             obj.opacity = max(0.0, min(1.0, float(obj.opacity)))
+            if obj.opacity_mask is not None:
+                obj.opacity_mask.validate(0.0, 1.0)
             obj.ignore_parent_mask = bool(obj.ignore_parent_mask)
             if isinstance(obj, VectorFillObject):
                 obj.ignore_parent_mask = bool(owner.ignore_parent_mask)
@@ -2406,6 +2635,28 @@ class ChapterDocument:
             if modifier.modifier_id != modifier_id:
                 modifier.modifier_id = modifier_id
             modifier.validate()
+            modifier.parameter_masks = {
+                name: binding
+                for name, binding in modifier.parameter_masks.items()
+                if binding.mask_id in self.masks
+            }
+        for layer in self.layers.values():
+            if (
+                layer.opacity_mask is not None
+                and layer.opacity_mask.mask_id not in self.masks
+            ):
+                layer.opacity_mask = None
+        for obj in self.objects.values():
+            if (
+                obj.opacity_mask is not None
+                and obj.opacity_mask.mask_id not in self.masks
+            ):
+                obj.opacity_mask = None
+        for mask in self.masks.values():
+            mask.contributors = [
+                contributor for contributor in mask.contributors
+                if self.mask_contributor(*contributor) is not None
+            ]
         referenced_modifiers = {
             modifier_id
             for layer in self.layers.values() for modifier_id in layer.modifier_ids
@@ -2418,7 +2669,57 @@ class ChapterDocument:
             for modifier_id, modifier in self.modifiers.items()
             if modifier_id in referenced_modifiers
         }
+        referenced_masks = self.referenced_mask_ids()
+        self.masks = {
+            mask_id: mask for mask_id, mask in self.masks.items()
+            if mask.saved or mask_id in referenced_masks
+        }
         self._assert_acyclic()
+
+    def mask_contributor(
+        self, kind: str, entity_id: str,
+    ) -> LayerNode | ObjectEntity | None:
+        if kind == "layer":
+            layer = self.layers.get(entity_id)
+            return layer if layer is not None and not layer.is_page else None
+        if kind == "object":
+            obj = self.objects.get(entity_id)
+            return obj if not isinstance(obj, SpeedLineCenterObject) else None
+        return None
+
+    def referenced_mask_ids(self) -> set[str]:
+        result = {
+            target.opacity_mask.mask_id
+            for target in [*self.layers.values(), *self.objects.values()]
+            if target.opacity_mask is not None
+        }
+        for modifier in self.modifiers.values():
+            result.update(
+                binding.mask_id
+                for binding in modifier.parameter_masks.values()
+            )
+        return result
+
+    def detach_mask(self, mask_id: str) -> None:
+        for target in [*self.layers.values(), *self.objects.values()]:
+            if target.opacity_mask is not None and target.opacity_mask.mask_id == mask_id:
+                target.opacity = target.opacity_mask.white_value
+                target.opacity_mask = None
+        for modifier in self.modifiers.values():
+            for name, binding in list(modifier.parameter_masks.items()):
+                if binding.mask_id == mask_id:
+                    setattr(modifier, name, binding.white_value)
+                    modifier.parameter_masks.pop(name, None)
+
+    def garbage_collect_masks(self) -> set[str]:
+        referenced = self.referenced_mask_ids()
+        removed = {
+            mask_id for mask_id, mask in self.masks.items()
+            if not mask.saved and mask_id not in referenced
+        }
+        for mask_id in removed:
+            self.masks.pop(mask_id, None)
+        return removed
 
     def modifier_target_ids(self, modifier_id: str) -> list[tuple[str, str]]:
         result = [
@@ -2497,6 +2798,7 @@ class ChapterDocument:
                 item for item in obj.modifier_ids if item != modifier_id
             ]
         self.modifiers.pop(modifier_id, None)
+        self.garbage_collect_masks()
 
     def _assert_acyclic(self) -> None:
         visiting: set[str] = set()
@@ -2938,6 +3240,15 @@ class ChapterDocument:
 
     def delete_entity(self, kind: str, entity_id: str) -> set[str]:
         deleted_objects: set[str] = set()
+
+        def remove_mask_contributor(target: tuple[str, str]) -> None:
+            for mask in self.masks.values():
+                if target in mask.contributors:
+                    mask.contributors = [
+                        item for item in mask.contributors if item != target
+                    ]
+                    mask.touch()
+
         if kind == "object":
             obj = self.objects[entity_id]
             if isinstance(obj, VectorFillObject):
@@ -2949,6 +3260,7 @@ class ChapterDocument:
                     ]
                     owner.touch_revision()
                 del self.objects[entity_id]
+                remove_mask_contributor(("object", entity_id))
                 deleted_objects.add(entity_id)
                 return deleted_objects
             if isinstance(obj, SpeedLineCenterObject):
@@ -2957,6 +3269,7 @@ class ChapterDocument:
                     owner.center_shape_id = ""
                     owner.touch_revision()
                 del self.objects[entity_id]
+                remove_mask_contributor(("object", entity_id))
                 deleted_objects.add(entity_id)
                 return deleted_objects
             if isinstance(obj, VectorDrawingObject):
@@ -2972,6 +3285,7 @@ class ChapterDocument:
                     )
             removed_modifier_ids = list(obj.modifier_ids)
             self.objects.pop(entity_id)
+            remove_mask_contributor(("object", entity_id))
             parent = self.layers[obj.parent_layer_id]
             parent.children = [r for r in parent.children if r.entity_id != entity_id]
             deleted_objects.add(entity_id)
@@ -2987,6 +3301,7 @@ class ChapterDocument:
             parent.children = [r for r in parent.children if r.entity_id != entity_id]
         removed_modifier_ids = list(layer.modifier_ids)
         del self.layers[entity_id]
+        remove_mask_contributor(("layer", entity_id))
         self._garbage_collect_modifiers(removed_modifier_ids)
         return deleted_objects
 
@@ -3001,6 +3316,7 @@ class ChapterDocument:
         }
         for modifier_id in candidates - referenced:
             self.modifiers.pop(modifier_id, None)
+        self.garbage_collect_masks()
 
     def layer_world_translation(self, layer_id: str) -> tuple[float, float]:
         x = y = 0.0
@@ -3146,6 +3462,7 @@ class ChapterDocument:
             "modifiers": [
                 modifier.to_dict() for modifier in self.modifiers.values()
             ],
+            "masks": [mask.to_dict() for mask in self.masks.values()],
         }
 
     @classmethod
@@ -3212,6 +3529,14 @@ class ChapterDocument:
                 for item in (
                     modifier_from_dict(raw)
                     for raw in data.get("modifiers", [])
+                    if isinstance(raw, dict)
+                )
+            },
+            masks={
+                item.mask_id: item
+                for item in (
+                    ToneMask.from_dict(raw)
+                    for raw in data.get("masks", [])
                     if isinstance(raw, dict)
                 )
             },

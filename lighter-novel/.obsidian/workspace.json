@@ -50,20 +50,6 @@
             }
           },
           {
-            "id": "81614177842f7cc9",
-            "type": "leaf",
-            "state": {
-              "type": "markdown",
-              "state": {
-                "file": "Untitled 3.md",
-                "mode": "source",
-                "source": false
-              },
-              "icon": "lucide-file",
-              "title": "Untitled 3"
-            }
-          },
-          {
             "id": "6648fe92b3c63e2b",
             "type": "leaf",
             "state": {
@@ -182,7 +168,7 @@
             "state": {
               "type": "search",
               "state": {
-                "query": "fill",
+                "query": "",
                 "matchingCase": false,
                 "explainSearch": false,
                 "collapseAll": false,
@@ -203,8 +189,7 @@
               "title": "Bookmarks"
             }
           }
-        ],
-        "currentTab": 1
+        ]
       }
     ],
     "direction": "horizontal",
@@ -313,12 +298,15 @@
       "bases:Create new base": false
     }
   },
-  "active": "cf162466b4a134b7",
+  "active": "070462876a897018",
   "lastOpenFiles": [
-    "Chapters/Chapter 1-5.md",
-    "Not Implemented.md",
-    "Pasted image 20260816190558.png",
     "how should the story start.md",
+    "Ideal Process notes.md",
+    "How the portals work.md",
+    "Not Implemented.md",
+    "Pasted image 20260817004047.png",
+    "Chapters/Chapter 1-5.md",
+    "Pasted image 20260816190558.png",
     "3d merge 2.md",
     "prompt to start the 3d merge.md",
     "Basic 3D - blender pipeline.md",
@@ -337,7 +325,6 @@
     "tooltips.md",
     "story settings.md",
     "Steal Clip Studio Paint Models and Params, poses.md",
-    "Ideal Process notes.md",
     "the current process, for now.md",
     "Chapters/Chapter 2.md",
     "Pasted image 20260730190248.png",
@@ -346,9 +333,7 @@
     "Pasted image 20260729230030.png",
     "Pasted image 20260729230012.png",
     "Pasted image 20260729225844.png",
-    "Pasted image 20260729205056.png",
     "Chapters",
-    "QA Testing.md",
-    "How the portals work.md"
+    "QA Testing.md"
   ]
 }

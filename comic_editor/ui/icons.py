@@ -37,3 +37,9 @@ def iconoir(name: str, size: int = 20) -> QIcon:
     icon.addPixmap(disabled, QIcon.Mode.Disabled, QIcon.State.Off)
     icon.addPixmap(disabled, QIcon.Mode.Disabled, QIcon.State.On)
     return icon
+
+
+@lru_cache(maxsize=64)
+def iconoir_tinted(name: str, color: str, size: int = 20) -> QIcon:
+    """Return one explicitly colored Iconoir glyph."""
+    return QIcon(_render_icon(name, str(color), size))

@@ -6,11 +6,19 @@
     {
       "id": "2a9f55d8898c4d968c06336933bff773",
       "name": "Chapter 1"
+    },
+    {
+      "id": "b66a90ce7b2a4cca8624211cd38b465e",
+      "name": "Chapter 2"
     }
   ],
-  "primary_color": "#FFA3765C",
+  "primary_color": "#FF90DE00",
   "secondary_color": "#FFFFFFFF",
   "color_history": [
+    "#FF90DE00",
+    "#FFF4F4F4",
+    "#FFFF0000",
+    "#FF000000",
     "#FFA3765C",
     "#FF5C63A3",
     "#FF34396B"

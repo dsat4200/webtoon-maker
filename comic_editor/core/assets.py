@@ -17,7 +17,7 @@ from .models import (
     DocumentObject, EmbeddedImageSourceDescriptor, GradientObject, ImageObject,
     LayerNode, RasterObject, ShapeStyle,
     SpeedLineCenterObject, SpeedLinesGradientObject, TextObject,
-    VectorDrawingObject, VectorFillObject, modifier_from_dict, new_id,
+    ToneMask, VectorDrawingObject, VectorFillObject, modifier_from_dict, new_id,
     object_from_dict,
 )
 from .images import ImageStore
@@ -120,6 +120,72 @@ def _clone_referenced_modifiers(
             identifier_map[item]
             for item in target.modifier_ids if item in identifier_map
         ]
+    return identifier_map
+
+
+def _clone_referenced_masks(
+    source: ChapterDocument, destination: ChapterDocument,
+    layers: list[LayerNode], objects: list[DocumentObject],
+    layer_map: dict[str, str], object_map: dict[str, str],
+    source_tiles: TileStore, destination_tiles: TileStore,
+) -> dict[str, str]:
+    """Clone parameter masks and reject contributors outside the copy."""
+    modifiers = [
+        destination.modifiers[modifier_id]
+        for target in [*layers, *objects]
+        for modifier_id in target.modifier_ids
+        if modifier_id in destination.modifiers
+    ]
+    bindings = [
+        target.opacity_mask for target in [*layers, *objects]
+        if target.opacity_mask is not None
+    ]
+    bindings.extend(
+        binding for modifier in modifiers
+        for binding in modifier.parameter_masks.values()
+    )
+    referenced = {
+        binding.mask_id for binding in bindings
+        if binding.mask_id in source.masks
+    }
+    identifier_map: dict[str, str] = {}
+    for old_id in referenced:
+        source_mask = source.masks[old_id]
+        outside = [
+            (kind, entity_id)
+            for kind, entity_id in source_mask.contributors
+            if (
+                kind == "layer" and entity_id not in layer_map
+            ) or (
+                kind == "object" and entity_id not in object_map
+            )
+        ]
+        if outside:
+            raise ValueError(
+                "A parameter mask depends on contributors outside the "
+                "copied subtree. Detach those contributors or rasterize "
+                "the result before copying it as an asset."
+            )
+        clone = ToneMask.from_dict(source_mask.to_dict())
+        clone.mask_id = new_id()
+        clone.name = ""
+        clone.saved = False
+        clone.contributors = [
+            (
+                kind,
+                layer_map[entity_id] if kind == "layer"
+                else object_map[entity_id],
+            )
+            for kind, entity_id in source_mask.contributors
+        ]
+        identifier_map[old_id] = clone.mask_id
+        destination.masks[clone.mask_id] = clone
+        destination_tiles.replace_object_tiles(
+            clone.mask_id, source_tiles.object_tiles(old_id)
+        )
+    for binding in bindings:
+        if binding.mask_id in identifier_map:
+            binding.mask_id = identifier_map[binding.mask_id]
     return identifier_map
 
 
@@ -538,10 +604,19 @@ def extract_asset(
         asset.layers[layer_id] = _copy_layer(document.layers[layer_id])
     for object_id in object_ids:
         asset.objects[object_id] = _copy_object(document.objects[object_id])
+    asset_tiles = TileStore(tiles.tile_size)
     _clone_referenced_modifiers(
         document, asset,
         [asset.layers[item] for item in layer_ids],
         [asset.objects[item] for item in object_ids],
+    )
+    _clone_referenced_masks(
+        document, asset,
+        [asset.layers[item] for item in layer_ids],
+        [asset.objects[item] for item in object_ids],
+        {item: item for item in layer_ids},
+        {item: item for item in object_ids},
+        tiles, asset_tiles,
     )
 
     if kind == "layer":
@@ -566,7 +641,6 @@ def extract_asset(
             asset.objects[root.center_shape_id].parent_layer_id = container.layer_id
     container.children = [ChildRef(kind, entity_id)]
 
-    asset_tiles = TileStore(tiles.tile_size)
     asset_images = ImageStore()
     for object_id in object_ids:
         if isinstance(asset.objects[object_id], RasterObject):
@@ -698,6 +772,11 @@ def instantiate_asset(
         source, target, list(cloned_layers.values()),
         list(cloned_objects.values()),
     )
+    cloned_mask_ids = _clone_referenced_masks(
+        source, target, list(cloned_layers.values()),
+        list(cloned_objects.values()), layer_map, object_map,
+        source_tiles, target_tiles,
+    )
 
     root_id = (
         layer_map[manifest.root_id]
@@ -767,6 +846,9 @@ def instantiate_asset(
                 target_images.remove(object_id)
         for modifier_id in cloned_modifier_ids.values():
             target.modifiers.pop(modifier_id, None)
+        for mask_id in cloned_mask_ids.values():
+            target.masks.pop(mask_id, None)
+            target_tiles.remove_object(mask_id)
         raise
     return manifest.root_kind, root_id, set(cloned_objects)
 
@@ -1077,6 +1159,9 @@ class AssetRepository:
             if isinstance(obj, RasterObject)
         }
         tiles.load_directory(source / "raster", raster_ids)
+        tiles.load_directory(
+            source / "masks", set(manifest.document.masks), clear=False
+        )
         images = ImageStore()
         images.load_directory(source / "images", {
             object_id: (obj.source_filename, obj.source_mime_type)
@@ -1101,10 +1186,12 @@ class AssetRepository:
             object_id for object_id, obj in manifest.document.objects.items()
             if isinstance(obj, ImageObject)
         }
+        mask_ids = set(manifest.document.masks)
         root = self.asset_root(manifest.asset_id)
         if autosave:
             destination = root / "autosave"
             tiles.save_directory(destination / "raster", raster_ids, complete=True)
+            tiles.save_directory(destination / "masks", mask_ids, complete=True)
             images.save_directory(destination / "images", image_ids, complete=True)
             atomic_json(destination / ASSET_FILE, manifest.to_dict())
             atomic_json(destination / "recovery.json", {"saved_at": time.time()})
@@ -1121,11 +1208,14 @@ class AssetRepository:
                 shutil.copytree(root / "raster", backup / "raster")
             if (root / "images").is_dir():
                 shutil.copytree(root / "images", backup / "images")
+            if (root / "masks").is_dir():
+                shutil.copytree(root / "masks", backup / "masks")
             if (root / THUMBNAIL_FILE).is_file():
                 shutil.copy2(root / THUMBNAIL_FILE, backup / THUMBNAIL_FILE)
         atomic_json(root / PENDING_FILE, {"started_at": time.time()})
         try:
             tiles.save_directory(root / "raster", raster_ids, complete=True)
+            tiles.save_directory(root / "masks", mask_ids, complete=True)
             images.save_directory(root / "images", image_ids, complete=True)
             if thumbnail is not None:
                 temporary = root / f".{THUMBNAIL_FILE}.tmp"
@@ -1165,7 +1255,7 @@ class AssetRepository:
         backup = root / LAST_GOOD_DIR
         if not (backup / ASSET_FILE).is_file():
             raise OSError("The first asset save was interrupted and has no recoverable revision")
-        for name in ("raster", "images"):
+        for name in ("raster", "images", "masks"):
             target = root / name
             if target.exists():
                 shutil.rmtree(target)

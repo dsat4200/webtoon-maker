@@ -32,6 +32,7 @@ class HierarchyModel(QAbstractItemModel):
         self.root = TreeItem("root", "")
         self._items: dict[tuple[str, str], TreeItem] = {}
         self.link_highlights: set[tuple[str, str]] = set()
+        self.mask_highlights: set[tuple[str, str]] = set()
         self.rebuild()
 
     def set_chapter(self, chapter: ChapterDocument | None) -> None:
@@ -187,6 +188,8 @@ class HierarchyModel(QAbstractItemModel):
                 )
             return "Drag objects between page or container layers."
         if role == Qt.BackgroundRole:
+            if (item.kind, item.entity_id) in self.mask_highlights:
+                return QColor("#5f9f72")
             if (item.kind, item.entity_id) in self.link_highlights:
                 return QColor("#b85b12")
             return QColor("#303238") if item.kind == "layer" else QColor("#050505")
@@ -392,6 +395,19 @@ class HierarchyModel(QAbstractItemModel):
         previous = self.link_highlights
         self.link_highlights = set(targets or ())
         changed = previous | self.link_highlights
+        for kind, entity_id in changed:
+            index = self.index_for_entity(kind, entity_id)
+            if index.isValid():
+                self.dataChanged.emit(
+                    index, index.siblingAtColumn(2), [Qt.BackgroundRole]
+                )
+
+    def set_mask_highlights(
+        self, targets: set[tuple[str, str]] | None,
+    ) -> None:
+        previous = self.mask_highlights
+        self.mask_highlights = set(targets or ())
+        changed = previous | self.mask_highlights
         for kind, entity_id in changed:
             index = self.index_for_entity(kind, entity_id)
             if index.isValid():
