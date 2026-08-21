@@ -5,7 +5,9 @@ import json
 from dataclasses import dataclass, field
 
 from PySide6.QtCore import QAbstractItemModel, QMimeData, QModelIndex, Qt, Signal
+from PySide6.QtCore import QRect
 from PySide6.QtGui import QColor, QIcon, QPainter, QPen, QPixmap
+from PySide6.QtWidgets import QApplication, QStyledItemDelegate, QStyle, QStyleOptionViewItem
 
 from comic_editor.core.models import (
     ChapterDocument, GradientObject, ImageObject, LayerNode, SpeedLinesGradientObject,
@@ -183,12 +185,7 @@ class HierarchyModel(QAbstractItemModel):
                     return "Blender Comic View"
                 return entity.object_type.title()
             if index.column() == 2:
-                suffix = (
-                    " - Mask only"
-                    if bool(getattr(entity, "mask_only", False))
-                    else ""
-                )
-                return f"{round(entity.opacity * 100)}%{suffix}"
+                return f"{round(entity.opacity * 100)}%"
         if (
             role == Qt.DecorationRole and index.column() == 0
             and entity.fill_reference
@@ -422,3 +419,63 @@ class HierarchyModel(QAbstractItemModel):
                 self.dataChanged.emit(
                     index, index.siblingAtColumn(2), [Qt.BackgroundRole]
                 )
+
+
+class EyeVisibilityDelegate(QStyledItemDelegate):
+    _eye = None
+    _eye_closed = None
+
+    def _icons(self):
+        if EyeVisibilityDelegate._eye is None:
+            from comic_editor.ui.icons import iconoir
+            EyeVisibilityDelegate._eye = iconoir("eye", 16)
+            EyeVisibilityDelegate._eye_closed = iconoir("eye-closed", 16)
+        return EyeVisibilityDelegate._eye, EyeVisibilityDelegate._eye_closed
+
+    def paint(self, painter, option, index):
+        if index.column() != 0:
+            super().paint(painter, option, index)
+            return
+        eye, eye_closed = self._icons()
+        visible = index.data(Qt.CheckStateRole) == Qt.Checked
+        opt = QStyleOptionViewItem(option)
+        self.initStyleOption(opt, index)
+        opt.features &= ~QStyleOptionViewItem.ViewItemFeature.HasCheckIndicator
+        opt.text = ""
+        opt.icon = QIcon()
+        widget = option.widget
+        style = widget.style() if widget is not None else QApplication.style()
+        style.drawControl(QStyle.ControlElement.CE_ItemViewItem, opt, painter, widget)
+        icon = eye if visible else eye_closed
+        pix = icon.pixmap(16, 16)
+        r = option.rect
+        ix = r.left() + 4
+        iy = r.top() + (r.height() - 16) // 2
+        painter.drawPixmap(ix, iy, pix)
+        display = index.data(Qt.DisplayRole)
+        if display:
+            ref = index.data(Qt.DecorationRole)
+            has_ref = ref is not None
+            text_x = ix + 20 + (18 if has_ref else 0)
+            if has_ref and hasattr(ref, "pixmap"):
+                rp = ref.pixmap(16, 16)
+                painter.drawPixmap(ix + 20, iy, rp)
+            painter.setPen(opt.palette.color(opt.palette.ColorRole.Text) if not (opt.state & QStyle.StateFlag.State_Selected) else opt.palette.color(opt.palette.ColorRole.HighlightedText))
+            text_rect = r.adjusted(text_x - r.left(), 0, 0, 0)
+            painter.drawText(text_rect, Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft, str(display))
+
+    def editorEvent(self, event, model, option, index):
+        if index.column() != 0 or not index.isValid():
+            return super().editorEvent(event, model, option, index)
+        if event.type() in (event.Type.MouseButtonRelease, event.Type.MouseButtonDblClick):
+            r = option.rect
+            ix = r.left() + 4
+            iy = r.top() + (r.height() - 16) // 2
+            icon_rect = QRect(ix, iy, 16, 16)
+            pos = event.position().toPoint() if hasattr(event, "position") else event.pos()
+            if icon_rect.contains(pos):
+                current = index.data(Qt.CheckStateRole)
+                new_state = Qt.Unchecked if current == Qt.Checked else Qt.Checked
+                return model.setData(index, new_state, Qt.CheckStateRole)
+            return False
+        return super().editorEvent(event, model, option, index)

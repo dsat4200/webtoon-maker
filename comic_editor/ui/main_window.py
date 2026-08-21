@@ -760,6 +760,9 @@ class MainWindow(QMainWindow):
             lambda targets: self._finish_mask_mode(True)
             if targets is not None else None
         )
+        from comic_editor.ui.tree_model import EyeVisibilityDelegate
+        self.tree.setItemDelegateForColumn(0, EyeVisibilityDelegate(self.tree))
+        self.tree.viewport().installEventFilter(self)
         self.tree.setContextMenuPolicy(Qt.CustomContextMenu)
         self._tablet_outliner_press: dict | None = None
         self._mouse_outliner_press: dict | None = None
@@ -3195,7 +3198,7 @@ class MainWindow(QMainWindow):
         self._gradient_ribbon_context = gradient_active
         self._selected_gradient_ribbon_id = selected_gradient_id
         self.ribbon.set_page_visible("vector_tools", active)
-        self.tool_settings_group.setVisible(not text_active)
+        self.tool_settings_group.setVisible(not text_active and not gradient_selected)
         for group in (
             self.text_object_group,
             self.text_typography_group,
@@ -3238,10 +3241,10 @@ class MainWindow(QMainWindow):
             self.vector_tools_controls.set_selection_summary(
                 selected_points, selected_strokes, len(drawing.strokes)
             )
-        if gradient_active:
+        if gradient_active or gradient_selected:
             self.gradient_tools_controls.refresh()
             self._sync_gradient_presets()
-        gradient_controls_active = (
+        gradient_controls_active = gradient_selected or (
             self.canvas.tool == ToolKind.GRADIENT and gradient_active
         )
         for group in (

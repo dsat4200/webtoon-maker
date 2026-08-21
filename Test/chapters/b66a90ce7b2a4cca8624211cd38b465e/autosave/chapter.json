@@ -741,11 +741,15 @@
         },
         {
           "kind": "object",
-          "id": "193ab0cfbb4a4a86acb1d1572718f4e2"
+          "id": "938b4031d755444497da7629528927c0"
         },
         {
           "kind": "object",
           "id": "8fc4bc3269044e488b0554b0fffe6862"
+        },
+        {
+          "kind": "object",
+          "id": "715d740ec48e427c98cbc5635057d3e4"
         }
       ],
       "visible": true,
@@ -13029,39 +13033,6 @@
       ]
     },
     {
-      "id": "193ab0cfbb4a4a86acb1d1572718f4e2",
-      "type": "raster",
-      "name": "Raster 2",
-      "custom_name": false,
-      "parent_layer_id": "79da821594e540f89fde54676fe51f6d",
-      "position": [
-        150.0,
-        1320.0
-      ],
-      "visible": true,
-      "opacity": 1.0,
-      "mask_only": false,
-      "fill_reference": false,
-      "opacity_locked": true,
-      "geometry_reference": "direct",
-      "ignore_parent_mask": false,
-      "underlay_opacity": 0.0,
-      "modifier_ids": [
-        "e7e55692222349bdafe4001d2c6969b4",
-        "30aea4c3dfbc4fc8aca245658e0313f0"
-      ],
-      "opacity_mask": null,
-      "tile_size": 256,
-      "interaction_rect": [
-        0.0,
-        0.0,
-        690.0,
-        1200.0
-      ],
-      "transform_frame": null,
-      "transform_quad": null
-    },
-    {
       "id": "1443611d99b049fa87f02061c292a899",
       "type": "raster",
       "name": "Raster 3",
@@ -13081,7 +13052,7 @@
       "underlay_opacity": 0.0,
       "modifier_ids": [],
       "opacity_mask": {
-        "mask_id": "f512b20786444f36a79a7030d253d215",
+        "mask_id": "894ee9e8d2ff46f9be3c086c986c6ef7",
         "black": 0.0,
         "white": 1.0
       },
@@ -13094,30 +13065,163 @@
       ],
       "transform_frame": null,
       "transform_quad": null
+    },
+    {
+      "id": "938b4031d755444497da7629528927c0",
+      "type": "raster",
+      "name": "Raster 3",
+      "custom_name": false,
+      "parent_layer_id": "79da821594e540f89fde54676fe51f6d",
+      "position": [
+        450.0,
+        1500.0
+      ],
+      "visible": true,
+      "opacity": 1.0,
+      "mask_only": false,
+      "fill_reference": false,
+      "opacity_locked": false,
+      "geometry_reference": "direct",
+      "ignore_parent_mask": false,
+      "underlay_opacity": 0.0,
+      "modifier_ids": [
+        "0cb027df2603416f9a2c227d480f3fda"
+      ],
+      "opacity_mask": null,
+      "tile_size": 256,
+      "interaction_rect": [
+        0.0,
+        0.0,
+        420.0,
+        390.0
+      ],
+      "transform_frame": null,
+      "transform_quad": null
+    },
+    {
+      "id": "715d740ec48e427c98cbc5635057d3e4",
+      "type": "gradient",
+      "name": "Gradient 1",
+      "custom_name": false,
+      "parent_layer_id": "79da821594e540f89fde54676fe51f6d",
+      "position": [
+        0.0,
+        0.0
+      ],
+      "visible": true,
+      "opacity": 1.0,
+      "mask_only": true,
+      "fill_reference": false,
+      "opacity_locked": true,
+      "geometry_reference": "direct",
+      "ignore_parent_mask": false,
+      "underlay_opacity": 0.0,
+      "modifier_ids": [],
+      "opacity_mask": null,
+      "gradient_type": "color_fill",
+      "field_type": "line",
+      "line_field": {
+        "geometry": {
+          "type": "path",
+          "closed": false,
+          "primitive": "custom",
+          "nodes": [
+            {
+              "id": "da9466529e5647ccb8179b177d2d1ab9",
+              "position": [
+                600.0,
+                1680.0
+              ],
+              "point_type": "vector",
+              "incoming": null,
+              "outgoing": null,
+              "handles_locked": true,
+              "roundness": 0.0,
+              "roundness_enabled": false,
+              "width_multiplier": 1.0
+            },
+            {
+              "id": "2867fb3c5b3e43d389d488655503bc89",
+              "position": [
+                750.0,
+                1680.0
+              ],
+              "point_type": "vector",
+              "incoming": null,
+              "outgoing": null,
+              "handles_locked": true,
+              "roundness": 0.0,
+              "roundness_enabled": false,
+              "width_multiplier": 1.0
+            }
+          ],
+          "additional_contours": []
+        },
+        "direction_mode": "parallel",
+        "reverse_direction": false,
+        "perpendicular_distance": 120.0
+      },
+      "radial_field": {
+        "origin": [
+          540.0,
+          540.0
+        ],
+        "radii": [
+          270.0,
+          270.0
+        ],
+        "rotation": 0.0,
+        "ellipse_enabled": false,
+        "center_auto": true,
+        "manual_center": null,
+        "reverse_direction": false,
+        "uniform": false,
+        "distance": 120.0
+      },
+      "shape_field": {
+        "center_auto": true,
+        "manual_center": null,
+        "reverse_direction": false,
+        "uniform": false,
+        "distance": 120.0
+      },
+      "gradient_revision": 35,
+      "ramp": {
+        "value_type": "color",
+        "interpolation": "linear",
+        "stops": [
+          {
+            "id": "dc6aa32eb8a34a78a6a54ecb4110b398",
+            "position": 0.0,
+            "color": "#FF000000"
+          },
+          {
+            "id": "2c9a8852732e48f1ab7496a2741c52d9",
+            "position": 0.9964221824686941,
+            "color": "#00FFFFFF"
+          }
+        ]
+      },
+      "loaded_preset_id": ""
     }
   ],
   "modifiers": [
     {
-      "id": "30aea4c3dfbc4fc8aca245658e0313f0",
+      "id": "0cb027df2603416f9a2c227d480f3fda",
       "type": "outline",
       "name": "Outline",
       "intensity": 100.0,
       "expanded": true,
-      "thickness": 3.0,
+      "thickness": 8.0,
       "opacity": 100.0,
-      "color": "#FFFFFFFF",
-      "parameter_masks": {}
-    },
-    {
-      "id": "e7e55692222349bdafe4001d2c6969b4",
-      "type": "hsl",
-      "name": "Hue / Saturation / Lightness",
-      "intensity": 100.0,
-      "expanded": true,
-      "hue": 0.0,
-      "saturation": -100.0,
-      "lightness": -100.0,
-      "parameter_masks": {}
+      "color": "#FFFF0000",
+      "parameter_masks": {
+        "thickness": {
+          "mask_id": "55f5d1db39f943a7a72b927c04db920d",
+          "black": 10.344827586206897,
+          "white": 1.7241379310344827
+        }
+      }
     }
   ],
   "masks": [
@@ -13129,13 +13233,25 @@
       "revision": 9
     },
     {
-      "id": "f512b20786444f36a79a7030d253d215",
+      "id": "894ee9e8d2ff46f9be3c086c986c6ef7",
       "name": "",
       "saved": false,
       "contributors": [
         {
           "kind": "object",
-          "id": "193ab0cfbb4a4a86acb1d1572718f4e2"
+          "id": "938b4031d755444497da7629528927c0"
+        }
+      ],
+      "revision": 1
+    },
+    {
+      "id": "55f5d1db39f943a7a72b927c04db920d",
+      "name": "",
+      "saved": false,
+      "contributors": [
+        {
+          "kind": "object",
+          "id": "715d740ec48e427c98cbc5635057d3e4"
         }
       ],
       "revision": 1

@@ -14,29 +14,30 @@
 - [x] add a "show as mask only" button to settings in the top right of objects. gradient should show its own settings in the top right window, instead of parent shape settings. it should also show the name, ignore direct parent mask, and show underlay settings, like raster and vector do.
 
 
-- [ ] add a trash button to the left of the hide button in the opacity row. if multiple objects are selected, it can delete multiple. delete should prompt the user if they are sure. 
-- [ ] instead of "lock opacity" with a checkmark, make it a lock icon button that is either pressed (on) or non-pressed (off)
-- [ ] if multiple objects are selected, eyeball icon should hide all selected objects.
-	- however, hiding individual via their boxes should still do individual.
-- [ ] add a toggleable mask button with a mask icon to the right of the opacity slider (thats either pressed or not pressed). if pressed, the object is set to view as mask only (the feature that's currently only visible by right click)
+- [x] add a trash button to the left of the hide button in the opacity row. if multiple objects are selected, it can delete multiple. delete should prompt the user if they are sure. 
+- [x] instead of "lock opacity" with a checkmark, make it a lock icon button that is either pressed (on) or non-pressed (off)
+
+
+- [x] add a toggleable mask button with a mask icon to the right of the opacity slider (thats either pressed or not pressed). if pressed, the object is set to view as mask only (the feature that's currently only visible by right click)
 	- instead of "mask only" text, put that show as mask only icon toggle button to the right of the opacity percent value, that's either pressed or unpressed.
-- [ ] change the simple checkbox on each object to a toggleable eyeball icon button.
-- [ ]  show as mask only button icon should be different from the use mask / toggle mask mode button. use https://iconoir.com mask-square icon.
-- [ ] current tool tool settings while a gradient is selected should show the settings,, instead of just showing them below the gradient
-- [ ] add a delete operation, where, if delete hotkey is pressed (just as a hotkey for now), if on a vector layer or raster layer, it deletes everything on that layer (without asking for confirmation)
-- [ ] clicking a mask mode button should show a "delete mask" button above the mask mode button.
-
-bugs:
-- exit mask button not clickable with pen
+- [x] change the simple checkbox on each object to a toggleable eyeball icon button.
+- [x]  show as mask only button icon should be different from the use mask / toggle mask mode button. use https://iconoir.com mask-square icon.
+- [x] current tool tool settings while a gradient is selected should show the settings,, instead of just showing them below the gradient
+- [x] add a delete operation, where, if delete hotkey is pressed (just as a hotkey for now), if on a vector layer or raster layer, it deletes everything on that layer (without asking for confirmation)
 
 
 
 
-
-
-
-
-
+- [ ] make it possible to select objects of any type for select multiple, for basic functionality support like multi delete, hide, lock, among other object operations
+	- notably, multi selection hides the mask buttons on the object operations row (what i'm naming the row that has the trash, eye, lock, opacity, mask, opacity slider, and show as mask only ui elements)
+- [ ] in mask mode, show a "remove mask" button next to the exit mask mode button.
+- [ ] the "show only as mask" toggle button should additionally exist to the right of the opacity value on each object's row in the outliner.
+- [ ] add a "draw shape" option to the create shape menu, that acts like a lasso tool during creation, but with orange instead of blue. the active selection becomes a panel when you hit finish. it should convert the outside of your filled selection into vector points for this, and have an outline by default. it should have the same layer settings in the layer settings window as any other shape.
+	- [ ] shift and alt still add and remove from your selection. however, just click dragging elsewhere while there is a selection deletes that selection, like it would in any other drawing program.
+- [ ] undo be able to undo selection actions.
+- [ ] opening a project should open the most recent chapter that was open.
+- [ ] outline modifier should not contribute to a mask.
+- [ ] backspace should be possible to select as a hotkey. add an x button to the left of a hotkey field in hotkey settings to clear (instead of using backspace to do that)
 
 liasing on off toggle.
 

@@ -12296,6 +12296,16 @@ class _CanvasLogic:
             self._clear_detached_input_state()
             event.accept()
             return
+        for child in self.children():
+            if child.objectName() == "exitMaskModeButton" and child.isVisible():
+                if child.geometry().contains(event.position().toPoint()):
+                    if event.type() == QEvent.TabletRelease:
+                        try:
+                            child.click()
+                        except Exception:
+                            pass
+                    event.ignore()
+                    return
         self._tablet_hover_widget = QPointF(event.position())
         hover_world = self.widget_to_document(event.position())
         if self.tool == ToolKind.SHAPE_CREATE and self._creation_nodes:

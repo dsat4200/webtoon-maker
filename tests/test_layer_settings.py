@@ -98,7 +98,10 @@ def test_raster_context_menu_toggles_mask_only_with_undo(qapp, monkeypatch):
         opacity_index = raster_index.siblingAtColumn(2)
         assert window.hierarchy_model.data(
             opacity_index, Qt.DisplayRole
-        ) == "100% - Mask only"
+        ) == "100%"
+        assert window.hierarchy_model.data(
+            opacity_index, Qt.DisplayRole
+        ) != "100% - Mask only"
 
         window.canvas.command_stack.undo()
         qapp.processEvents()

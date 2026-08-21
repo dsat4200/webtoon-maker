@@ -4,8 +4,8 @@ from __future__ import annotations
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
     QCheckBox, QComboBox, QFormLayout, QGroupBox, QHBoxLayout, QLabel,
-    QLineEdit, QPushButton, QSlider, QStackedWidget, QToolButton, QVBoxLayout,
-    QWidget,
+    QLineEdit, QMessageBox, QPushButton, QSlider, QStackedWidget, QToolButton,
+    QVBoxLayout, QWidget,
 )
 
 from comic_editor.core.models import (
@@ -35,16 +35,24 @@ class SelectionCommonControls(QWidget):
         layout = QHBoxLayout(self)
         layout.setContentsMargins(4, 2, 4, 2)
         layout.setSpacing(5)
+        self.trash_button = QToolButton(self)
+        self.trash_button.setAutoRaise(True)
+        self.trash_button.setFixedSize(30, 28)
+        self.trash_button.setAccessibleName("Delete")
+        self.trash_button.setToolTip("Delete selected")
+        self.trash_button.setIcon(iconoir("trash"))
         self.visible_button = QToolButton(self)
         self.visible_button.setCheckable(True)
         self.visible_button.setAutoRaise(True)
         self.visible_button.setFixedSize(30, 28)
         self.visible_button.setAccessibleName("Visibility")
         self.visible_button.setToolTip("Visible (click to hide)")
-        # Keep the historical attribute name for integrations that access the
-        # common control directly.
         self.visible = self.visible_button
-        self.opacity_lock = QCheckBox("Lock opacity", self)
+        self.opacity_lock = QToolButton(self)
+        self.opacity_lock.setCheckable(True)
+        self.opacity_lock.setAutoRaise(True)
+        self.opacity_lock.setFixedSize(30, 28)
+        self.opacity_lock.setAccessibleName("Lock opacity")
         self.opacity = QSlider(Qt.Orientation.Horizontal, self)
         self.opacity.setRange(0, 100)
         self.opacity_mask_button = MaskButton(self)
@@ -55,6 +63,13 @@ class SelectionCommonControls(QWidget):
         self.opacity_value.setAlignment(
             Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
         )
+        self.mask_only_button = QToolButton(self)
+        self.mask_only_button.setCheckable(True)
+        self.mask_only_button.setAutoRaise(True)
+        self.mask_only_button.setFixedSize(30, 28)
+        self.mask_only_button.setAccessibleName("Show as mask only")
+        self.mask_only_button.setToolTip("Show as mask only")
+        layout.addWidget(self.trash_button)
         layout.addWidget(self.visible_button)
         layout.addWidget(self.opacity_lock)
         layout.addWidget(QLabel("Opacity", self))
@@ -62,8 +77,11 @@ class SelectionCommonControls(QWidget):
         layout.addWidget(self.opacity, 1)
         layout.addWidget(self.opacity_endpoints, 1)
         layout.addWidget(self.opacity_value)
+        layout.addWidget(self.mask_only_button)
+        self.trash_button.clicked.connect(self._delete_selected)
         self.visible_button.toggled.connect(self._visibility_changed)
         self.opacity_lock.toggled.connect(self._opacity_lock_changed)
+        self.mask_only_button.toggled.connect(self._mask_only_changed)
         self.opacity.sliderPressed.connect(self._begin_opacity_drag)
         self.opacity.valueChanged.connect(self._opacity_changed)
         self.opacity.sliderReleased.connect(self._finish_opacity_drag)
@@ -101,10 +119,38 @@ class SelectionCommonControls(QWidget):
         if isinstance(target, TextObject):
             self.canvas.commit_active_text_edit()
 
+    def _selected_entities(self):
+        chapter = self.canvas.chapter
+        if chapter is None:
+            return []
+        entities = getattr(self.canvas, "selected_entities", [])
+        if len(entities) > 1:
+            result = []
+            for kind, eid in entities:
+                ent = chapter.objects.get(eid) if kind == "object" else chapter.layers.get(eid)
+                if ent is not None:
+                    result.append((kind, eid, ent))
+            if result:
+                return result
+        target = self._selected()
+        if target is not None:
+            return [(self.canvas.selected_kind, self.canvas.selected_id, target)]
+        return []
+
     def refresh(self) -> None:
         target = self._selected()
         self._updating = True
         enabled = target is not None
+        all_entities = self._selected_entities()
+        multi = len(all_entities) > 1
+        self.trash_button.setEnabled(enabled)
+        self.trash_button.setVisible(enabled)
+        if enabled and multi:
+            self.trash_button.setToolTip(f"Delete {len(all_entities)} selected objects")
+        elif enabled:
+            is_page = bool(getattr(target, "is_page", False))
+            self.trash_button.setEnabled(not is_page)
+            self.trash_button.setToolTip("Delete selected")
         self.visible.setEnabled(enabled)
         object_target = (
             enabled
@@ -113,9 +159,6 @@ class SelectionCommonControls(QWidget):
         )
         self.opacity_lock.setVisible(object_target)
         self.opacity_lock.setEnabled(object_target)
-        # Opacity locking controls inheritance during rendering.  It does
-        # not disable the common edit path: the first real value change
-        # snapshots the effective value and unlocks the object atomically.
         self.opacity.setEnabled(enabled)
         binding = getattr(target, "opacity_mask", None) if target else None
         maskable = (
@@ -131,12 +174,29 @@ class SelectionCommonControls(QWidget):
                 binding.black_value * 100.0,
                 binding.white_value * 100.0,
             )
+        self.mask_only_button.setVisible(maskable)
+        self.mask_only_button.setEnabled(maskable)
         if target is not None:
-            self.visible.setChecked(bool(target.visible))
-            self._update_visibility_button(bool(target.visible))
+            if multi:
+                visibles = [bool(e.visible) for _, _, e in all_entities]
+                all_visible = all(visibles)
+                all_hidden = not any(visibles)
+                mixed = not all_visible and not all_hidden
+                self.visible.setChecked(all_visible)
+                self._update_visibility_button(all_visible, mixed=mixed, count=len(all_entities))
+                mask_only_vals = [bool(getattr(e, "mask_only", False)) for _, _, e in all_entities]
+                all_mask = all(mask_only_vals)
+                mixed_mask = not all_mask and any(mask_only_vals)
+                self.mask_only_button.setChecked(all_mask)
+                self._update_mask_only_button(all_mask, mixed=mixed_mask)
+            else:
+                self.visible.setChecked(bool(target.visible))
+                self._update_visibility_button(bool(target.visible))
+                self._update_mask_only_button(bool(getattr(target, "mask_only", False)))
             self.opacity_lock.setChecked(
                 bool(getattr(target, "opacity_locked", False))
             )
+            self._update_lock_button(bool(getattr(target, "opacity_locked", False)))
             if self.canvas.selected_kind == "object":
                 try:
                     opacity = self.canvas.chapter.effective_object_opacity(
@@ -154,6 +214,9 @@ class SelectionCommonControls(QWidget):
             self.visible.setChecked(False)
             self._update_visibility_button(False)
             self.opacity_lock.setChecked(False)
+            self._update_lock_button(False)
+            self.mask_only_button.setChecked(False)
+            self._update_mask_only_button(False)
             self.opacity.setValue(100)
             self._opacity_start_value = 100
             self.opacity_value.setText("—")
@@ -216,24 +279,101 @@ class SelectionCommonControls(QWidget):
         if commit:
             self._finish_opacity_drag()
 
-    def _update_visibility_button(self, visible: bool) -> None:
-        self.visible_button.setIcon(iconoir("eye" if visible else "eye-closed"))
-        self.visible_button.setToolTip(
-            "Visible (click to hide)" if visible
-            else "Hidden (click to show)"
-        )
-
-    def _visibility_changed(self, checked: bool) -> None:
-        target = self._selected()
-        if self._updating or target is None:
+    def _update_visibility_button(self, visible: bool, mixed: bool = False, count: int | None = None) -> None:
+        if mixed:
+            self.visible_button.setIcon(iconoir("eye"))
+            self.visible_button.setToolTip(f"Mixed visibility ({count} selected) — click to show all" if count else "Mixed visibility — click to show all")
             return
-        self._commit_text(target)
-        target = self._selected()
-        if target is None:
+        self.visible_button.setIcon(iconoir("eye" if visible else "eye-closed"))
+        if count is not None and count > 1:
+            self.visible_button.setToolTip(
+                f"Visible — click to hide all {count}" if visible else f"Hidden — click to show all {count}"
+            )
+        else:
+            self.visible_button.setToolTip(
+                "Visible (click to hide)" if visible
+                else "Hidden (click to show)"
+            )
+
+    def _update_lock_button(self, locked: bool) -> None:
+        self.opacity_lock.setIcon(iconoir("lock" if locked else "unlock"))
+        self.opacity_lock.setToolTip("Opacity locked — click to unlock" if locked else "Opacity unlocked — click to lock")
+
+    def _update_mask_only_button(self, mask_only: bool, mixed: bool = False) -> None:
+        self.mask_only_button.setIcon(iconoir("mask-square"))
+        if mixed:
+            self.mask_only_button.setToolTip("Mixed mask only — click to enable for all")
+        else:
+            self.mask_only_button.setToolTip("Shown as mask only — click to show normally" if mask_only else "Show as mask only — click to hide visually and show only in masks")
+
+    def _delete_selected(self) -> None:
+        chapter = self.canvas.chapter
+        if chapter is None or not self.canvas.selected_id:
+            return
+        entities = self._selected_entities()
+        if not entities:
+            return
+        deletable = []
+        for kind, eid, ent in entities:
+            if bool(getattr(ent, "is_page", False)):
+                continue
+            deletable.append((kind, eid))
+        if not deletable:
+            return
+        if len(deletable) == 1:
+            msg = "Delete the selected entity and all of its descendants?"
+        else:
+            msg = f"Delete {len(deletable)} selected objects and their descendants?"
+        if QMessageBox.question(self, "Delete selection", msg) != QMessageBox.Yes:
+            return
+        before = chapter.to_dict()
+        for kind, eid in deletable:
+            if kind == "object" and eid not in chapter.objects:
+                continue
+            if kind == "layer" and eid not in chapter.layers:
+                continue
+            try:
+                chapter.delete_entity(kind, eid)
+            except Exception:
+                continue
+        after = chapter.to_dict()
+        self.canvas.clear_selection()
+        self.canvas.push_model_change(before, after, "Delete entities" if len(deletable) > 1 else "Delete entity")
+        self.canvas.hierarchyChanged.emit()
+        self.canvas.documentChanged.emit(None)
+        self.canvas.update()
+        self.changed.emit()
+
+    def _mask_only_changed(self, checked: bool) -> None:
+        if self._updating:
+            return
+        entities = self._selected_entities()
+        if not entities:
             return
         before = self.canvas.chapter.to_dict()
-        target.visible = bool(checked)
-        self._update_visibility_button(bool(checked))
+        for _, _, ent in entities:
+            if bool(getattr(ent, "is_page", False)):
+                continue
+            ent.mask_only = bool(checked)
+        self._update_mask_only_button(bool(checked))
+        self._push(before, "Change mask only", hierarchy=True)
+
+    def _visibility_changed(self, checked: bool) -> None:
+        if self._updating:
+            return
+        entities = self._selected_entities()
+        if not entities:
+            return
+        target = self._selected()
+        if target is not None:
+            self._commit_text(target)
+            entities = self._selected_entities()
+            if not entities:
+                return
+        before = self.canvas.chapter.to_dict()
+        for _, _, ent in entities:
+            ent.visible = bool(checked)
+        self._update_visibility_button(bool(checked), count=len(entities) if len(entities) > 1 else None)
         self._push(before, "Change visibility", hierarchy=True)
 
     def _opacity_lock_changed(self, checked: bool) -> None:
@@ -251,6 +391,7 @@ class SelectionCommonControls(QWidget):
             return
         before = self.canvas.chapter.to_dict()
         target.opacity_locked = bool(checked)
+        self._update_lock_button(bool(checked))
         if target.opacity_locked:
             parent = self.canvas.chapter.layers.get(target.parent_layer_id)
             if parent is not None:

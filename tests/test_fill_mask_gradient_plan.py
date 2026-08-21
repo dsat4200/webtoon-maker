@@ -121,7 +121,8 @@ def test_mask_only_is_hidden_from_preview_but_contributes_scaled_alpha(qapp):
 
     model = HierarchyModel(chapter)
     index = model.index_for_entity("layer", layer.layer_id).siblingAtColumn(2)
-    assert model.data(index, Qt.ItemDataRole.DisplayRole) == "50% - Mask only"
+    assert model.data(index, Qt.ItemDataRole.DisplayRole) == "50%"
+    assert chapter.layers[layer.layer_id].mask_only
 
 
 def test_mask_dependency_cycle_is_rejected():
@@ -277,7 +278,8 @@ def test_mask_only_raster_reveals_only_for_exact_selection_and_masks(qapp):
     index = model.index_for_entity(
         "object", raster.object_id
     ).siblingAtColumn(2)
-    assert model.data(index, Qt.ItemDataRole.DisplayRole) == "50% - Mask only"
+    assert model.data(index, Qt.ItemDataRole.DisplayRole) == "50%"
+    assert raster.mask_only
 
 
 def test_mask_only_object_contribution_includes_attached_opacity_mask(qapp):
