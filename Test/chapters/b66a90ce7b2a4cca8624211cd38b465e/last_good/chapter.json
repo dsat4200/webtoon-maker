@@ -45,6 +45,10 @@
         {
           "kind": "layer",
           "id": "dde417d906bb4af9811c3e568ea172c7"
+        },
+        {
+          "kind": "layer",
+          "id": "cc822c7df1d44a6681abf55b4c722c39"
         }
       ],
       "visible": true,
@@ -91,8 +95,8 @@
           {
             "id": "b304d49a97ae4491ae1a132bf7705f4d",
             "position": [
-              1020.0,
-              2760.0
+              1110.0,
+              3210.0
             ],
             "point_type": "vector",
             "incoming": null,
@@ -105,8 +109,8 @@
           {
             "id": "6f23534fdca94dbc9b227b6959e4969c",
             "position": [
-              -60.0,
-              2760.0
+              30.0,
+              3210.0
             ],
             "point_type": "vector",
             "incoming": null,
@@ -751,6 +755,10 @@
       "layer_kind": "bounded",
       "parent_id": "1305952c8e1a43748bc2c2b8eec7b111",
       "children": [
+        {
+          "kind": "layer",
+          "id": "fd677cc9abb04e9980f4f8b70117181a"
+        },
         {
           "kind": "object",
           "id": "1443611d99b049fa87f02061c292a899"
@@ -3445,6 +3453,836 @@
       },
       "grid_override": null,
       "last_raster_id": "f3adbba58560412f844c28a5590e5cd5",
+      "compound_enabled": false,
+      "compound_operation": "add",
+      "ignore_parent_mask": false,
+      "modifier_ids": [],
+      "transform_frame": null,
+      "transform_quad": null,
+      "opacity_mask": null
+    },
+    {
+      "id": "cc822c7df1d44a6681abf55b4c722c39",
+      "name": "Panel",
+      "is_page": false,
+      "layer_kind": "bounded",
+      "parent_id": "1305952c8e1a43748bc2c2b8eec7b111",
+      "children": [],
+      "visible": true,
+      "opacity": 1.0,
+      "mask_only": false,
+      "fill_reference": false,
+      "translation": [
+        0.0,
+        0.0
+      ],
+      "bound": {
+        "type": "path",
+        "closed": true,
+        "primitive": "custom",
+        "nodes": [
+          {
+            "id": "04d9fee3c11e434db67e7e555f57b532",
+            "position": [
+              73.89525774834965,
+              3025.5022308489806
+            ],
+            "point_type": "vector",
+            "incoming": null,
+            "outgoing": null,
+            "handles_locked": true,
+            "roundness": 0.0,
+            "roundness_enabled": false,
+            "width_multiplier": 1.0
+          },
+          {
+            "id": "458b7ed4b2b04e4880cf90abd465829d",
+            "position": [
+              73.89525774834965,
+              2958.7258159077574
+            ],
+            "point_type": "vector",
+            "incoming": null,
+            "outgoing": null,
+            "handles_locked": true,
+            "roundness": 0.0,
+            "roundness_enabled": false,
+            "width_multiplier": 1.0
+          },
+          {
+            "id": "c83b6476c14d4928a69c3a2898b31b2c",
+            "position": [
+              78.66500167272272,
+              2918.1829925505867
+            ],
+            "point_type": "vector",
+            "incoming": null,
+            "outgoing": null,
+            "handles_locked": true,
+            "roundness": 0.0,
+            "roundness_enabled": false,
+            "width_multiplier": 1.0
+          },
+          {
+            "id": "a6d61981be5a41718565040918d27ee8",
+            "position": [
+              90.58936148365535,
+              2882.409913117789
+            ],
+            "point_type": "vector",
+            "incoming": null,
+            "outgoing": null,
+            "handles_locked": true,
+            "roundness": 0.0,
+            "roundness_enabled": false,
+            "width_multiplier": 1.0
+          },
+          {
+            "id": "875592a7edee46ee85951b58065881eb",
+            "position": [
+              112.05320914333413,
+              2841.867089760618
+            ],
+            "point_type": "vector",
+            "incoming": null,
+            "outgoing": null,
+            "handles_locked": true,
+            "roundness": 0.0,
+            "roundness_enabled": false,
+            "width_multiplier": 1.0
+          },
+          {
+            "id": "ddd63390e572481793cec8c643b33bf6",
+            "position": [
+              112.05320914333413,
+              2837.0973458362446
+            ],
+            "point_type": "vector",
+            "incoming": null,
+            "outgoing": null,
+            "handles_locked": true,
+            "roundness": 0.0,
+            "roundness_enabled": false,
+            "width_multiplier": 1.0
+          },
+          {
+            "id": "71992dc7629f4b09bc23dabfc858b4b7",
+            "position": [
+              131.1321848408263,
+              2818.0183701387523
+            ],
+            "point_type": "vector",
+            "incoming": null,
+            "outgoing": null,
+            "handles_locked": true,
+            "roundness": 0.0,
+            "roundness_enabled": false,
+            "width_multiplier": 1.0
+          },
+          {
+            "id": "6db67ec9990d489d9629f780023da444",
+            "position": [
+              145.44141661394553,
+              2820.4032421009388
+            ],
+            "point_type": "vector",
+            "incoming": null,
+            "outgoing": null,
+            "handles_locked": true,
+            "roundness": 0.0,
+            "roundness_enabled": false,
+            "width_multiplier": 1.0
+          },
+          {
+            "id": "98aef39d00cd4171a72ee0b053ae8bd8",
+            "position": [
+              197.90859978204912,
+              2870.4855533068558
+            ],
+            "point_type": "vector",
+            "incoming": null,
+            "outgoing": null,
+            "handles_locked": true,
+            "roundness": 0.0,
+            "roundness_enabled": false,
+            "width_multiplier": 1.0
+          },
+          {
+            "id": "24e81ec362c6472fb3a25c8ae303435e",
+            "position": [
+              250.37578295015282,
+              2930.1073523615196
+            ],
+            "point_type": "vector",
+            "incoming": null,
+            "outgoing": null,
+            "handles_locked": true,
+            "roundness": 0.0,
+            "roundness_enabled": false,
+            "width_multiplier": 1.0
+          },
+          {
+            "id": "60c993f3e01f46f78be6d8ccbb0d94f2",
+            "position": [
+              278.99424649639127,
+              2973.035047680877
+            ],
+            "point_type": "vector",
+            "incoming": null,
+            "outgoing": null,
+            "handles_locked": true,
+            "roundness": 0.0,
+            "roundness_enabled": false,
+            "width_multiplier": 1.0
+          },
+          {
+            "id": "a37ab892bd0547d782a87f040cd158c7",
+            "position": [
+              288.5337343451372,
+              2982.574535529623
+            ],
+            "point_type": "vector",
+            "incoming": null,
+            "outgoing": null,
+            "handles_locked": true,
+            "roundness": 0.0,
+            "roundness_enabled": false,
+            "width_multiplier": 1.0
+          },
+          {
+            "id": "57e824a7a54943239703237f4864bc5b",
+            "position": [
+              290.9186063073239,
+              2989.7291514161825
+            ],
+            "point_type": "vector",
+            "incoming": null,
+            "outgoing": null,
+            "handles_locked": true,
+            "roundness": 0.0,
+            "roundness_enabled": false,
+            "width_multiplier": 1.0
+          },
+          {
+            "id": "d114261929a3405c89cdeffe8b8a7637",
+            "position": [
+              302.8429661182565,
+              3001.653511227115
+            ],
+            "point_type": "vector",
+            "incoming": null,
+            "outgoing": null,
+            "handles_locked": true,
+            "roundness": 0.0,
+            "roundness_enabled": false,
+            "width_multiplier": 1.0
+          },
+          {
+            "id": "f647c45912344297b2d8f00551393ce8",
+            "position": [
+              312.3824539670027,
+              3001.653511227115
+            ],
+            "point_type": "vector",
+            "incoming": null,
+            "outgoing": null,
+            "handles_locked": true,
+            "roundness": 0.0,
+            "roundness_enabled": false,
+            "width_multiplier": 1.0
+          },
+          {
+            "id": "7f197dce52b44f8388480d3fb697de58",
+            "position": [
+              357.6950212485467,
+              2975.4199196430636
+            ],
+            "point_type": "vector",
+            "incoming": null,
+            "outgoing": null,
+            "handles_locked": true,
+            "roundness": 0.0,
+            "roundness_enabled": false,
+            "width_multiplier": 1.0
+          },
+          {
+            "id": "edbe232c0759492f90496d51c7374fbb",
+            "position": [
+              388.69835675697163,
+              2956.340943945571
+            ],
+            "point_type": "vector",
+            "incoming": null,
+            "outgoing": null,
+            "handles_locked": true,
+            "roundness": 0.0,
+            "roundness_enabled": false,
+            "width_multiplier": 1.0
+          },
+          {
+            "id": "819d4dd1ffdc457ba1ef40f605b7e130",
+            "position": [
+              431.62605207632896,
+              2922.9527364749597
+            ],
+            "point_type": "vector",
+            "incoming": null,
+            "outgoing": null,
+            "handles_locked": true,
+            "roundness": 0.0,
+            "roundness_enabled": false,
+            "width_multiplier": 1.0
+          },
+          {
+            "id": "fc39118300004d9c9c6728f87b17fd0e",
+            "position": [
+              474.5537473956865,
+              2896.719144890908
+            ],
+            "point_type": "vector",
+            "incoming": null,
+            "outgoing": null,
+            "handles_locked": true,
+            "roundness": 0.0,
+            "roundness_enabled": false,
+            "width_multiplier": 1.0
+          },
+          {
+            "id": "7aae3d68346e403bb59a0a9ac40cd952",
+            "position": [
+              529.4058025259767,
+              2868.1006813446693
+            ],
+            "point_type": "vector",
+            "incoming": null,
+            "outgoing": null,
+            "handles_locked": true,
+            "roundness": 0.0,
+            "roundness_enabled": false,
+            "width_multiplier": 1.0
+          },
+          {
+            "id": "1db3110717354ffaa6a857a94b104f9a",
+            "position": [
+              574.7183698075207,
+              2853.7914495715504
+            ],
+            "point_type": "vector",
+            "incoming": null,
+            "outgoing": null,
+            "handles_locked": true,
+            "roundness": 0.0,
+            "roundness_enabled": false,
+            "width_multiplier": 1.0
+          },
+          {
+            "id": "38d466b895754ade9acf130fdbab3b2c",
+            "position": [
+              620.030937089065,
+              2853.7914495715504
+            ],
+            "point_type": "vector",
+            "incoming": null,
+            "outgoing": null,
+            "handles_locked": true,
+            "roundness": 0.0,
+            "roundness_enabled": false,
+            "width_multiplier": 1.0
+          },
+          {
+            "id": "4190323cc913442d92a65f5fb2f278b7",
+            "position": [
+              639.1099127865571,
+              2858.5611934959234
+            ],
+            "point_type": "vector",
+            "incoming": null,
+            "outgoing": null,
+            "handles_locked": true,
+            "roundness": 0.0,
+            "roundness_enabled": false,
+            "width_multiplier": 1.0
+          },
+          {
+            "id": "a296b155eebd4e409e79e171d53a2578",
+            "position": [
+              658.1888884840494,
+              2870.4855533068558
+            ],
+            "point_type": "vector",
+            "incoming": null,
+            "outgoing": null,
+            "handles_locked": true,
+            "roundness": 0.0,
+            "roundness_enabled": false,
+            "width_multiplier": 1.0
+          },
+          {
+            "id": "8a125355726d4494b7832e8c2aa23f71",
+            "position": [
+              684.4224800681011,
+              2901.488888815281
+            ],
+            "point_type": "vector",
+            "incoming": null,
+            "outgoing": null,
+            "handles_locked": true,
+            "roundness": 0.0,
+            "roundness_enabled": false,
+            "width_multiplier": 1.0
+          },
+          {
+            "id": "9592590438b447f69e48f68eb3fb0bbc",
+            "position": [
+              722.5804314630857,
+              2965.8804317943172
+            ],
+            "point_type": "vector",
+            "incoming": null,
+            "outgoing": null,
+            "handles_locked": true,
+            "roundness": 0.0,
+            "roundness_enabled": false,
+            "width_multiplier": 1.0
+          },
+          {
+            "id": "1571f723766544f9844cec7c21c1d05b",
+            "position": [
+              753.5837669715106,
+              3006.4232551514883
+            ],
+            "point_type": "vector",
+            "incoming": null,
+            "outgoing": null,
+            "handles_locked": true,
+            "roundness": 0.0,
+            "roundness_enabled": false,
+            "width_multiplier": 1.0
+          },
+          {
+            "id": "d27b56c86b3a4f3e8c76ba9893a3c961",
+            "position": [
+              758.3535108958836,
+              3006.4232551514883
+            ],
+            "point_type": "vector",
+            "incoming": null,
+            "outgoing": null,
+            "handles_locked": true,
+            "roundness": 0.0,
+            "roundness_enabled": false,
+            "width_multiplier": 1.0
+          },
+          {
+            "id": "d0c617a98e704f39bea8461ff86e186e",
+            "position": [
+              791.741718366495,
+              2982.574535529623
+            ],
+            "point_type": "vector",
+            "incoming": null,
+            "outgoing": null,
+            "handles_locked": true,
+            "roundness": 0.0,
+            "roundness_enabled": false,
+            "width_multiplier": 1.0
+          },
+          {
+            "id": "51941fa4ede04e07819dea1228bb8476",
+            "position": [
+              896.6760847027024,
+              2930.1073523615196
+            ],
+            "point_type": "vector",
+            "incoming": null,
+            "outgoing": null,
+            "handles_locked": true,
+            "roundness": 0.0,
+            "roundness_enabled": false,
+            "width_multiplier": 1.0
+          },
+          {
+            "id": "f7b9d7a8917844f4aa82f0c16a5f105f",
+            "position": [
+              934.8340360976867,
+              2913.4132486262133
+            ],
+            "point_type": "vector",
+            "incoming": null,
+            "outgoing": null,
+            "handles_locked": true,
+            "roundness": 0.0,
+            "roundness_enabled": false,
+            "width_multiplier": 1.0
+          },
+          {
+            "id": "957a0139107d488d98fe51f8c6aa8d5e",
+            "position": [
+              961.0676276817387,
+              2906.258632739654
+            ],
+            "point_type": "vector",
+            "incoming": null,
+            "outgoing": null,
+            "handles_locked": true,
+            "roundness": 0.0,
+            "roundness_enabled": false,
+            "width_multiplier": 1.0
+          },
+          {
+            "id": "4179e331396741db8c4f393b0dcf6c66",
+            "position": [
+              994.4558351523501,
+              2906.258632739654
+            ],
+            "point_type": "vector",
+            "incoming": null,
+            "outgoing": null,
+            "handles_locked": true,
+            "roundness": 0.0,
+            "roundness_enabled": false,
+            "width_multiplier": 1.0
+          },
+          {
+            "id": "ca23ed1bddd3474a9a2b6007313744fc",
+            "position": [
+              1003.9953230010963,
+              2913.4132486262133
+            ],
+            "point_type": "vector",
+            "incoming": null,
+            "outgoing": null,
+            "handles_locked": true,
+            "roundness": 0.0,
+            "roundness_enabled": false,
+            "width_multiplier": 1.0
+          },
+          {
+            "id": "2a27dc2d651f4dd7a1836c738bb623a5",
+            "position": [
+              1011.1499388876557,
+              2920.567864512773
+            ],
+            "point_type": "vector",
+            "incoming": null,
+            "outgoing": null,
+            "handles_locked": true,
+            "roundness": 0.0,
+            "roundness_enabled": false,
+            "width_multiplier": 1.0
+          },
+          {
+            "id": "f40cd48cb74d4d999f15a1062aa2cd8c",
+            "position": [
+              1011.1499388876557,
+              2925.337608437146
+            ],
+            "point_type": "vector",
+            "incoming": null,
+            "outgoing": null,
+            "handles_locked": true,
+            "roundness": 0.0,
+            "roundness_enabled": false,
+            "width_multiplier": 1.0
+          },
+          {
+            "id": "d9c924fe625f45949dbb270e61e85b66",
+            "position": [
+              1015.9196828120289,
+              2927.722480399333
+            ],
+            "point_type": "vector",
+            "incoming": null,
+            "outgoing": null,
+            "handles_locked": true,
+            "roundness": 0.0,
+            "roundness_enabled": false,
+            "width_multiplier": 1.0
+          },
+          {
+            "id": "69da7afd9d63481d9488e113be724015",
+            "position": [
+              1034.998658509521,
+              2973.035047680877
+            ],
+            "point_type": "vector",
+            "incoming": null,
+            "outgoing": null,
+            "handles_locked": true,
+            "roundness": 0.0,
+            "roundness_enabled": false,
+            "width_multiplier": 1.0
+          },
+          {
+            "id": "656cdd897d934205a55ca04fd2cf4fc7",
+            "position": [
+              1042.1532743960806,
+              3018.347614962421
+            ],
+            "point_type": "vector",
+            "incoming": null,
+            "outgoing": null,
+            "handles_locked": true,
+            "roundness": 0.0,
+            "roundness_enabled": false,
+            "width_multiplier": 1.0
+          },
+          {
+            "id": "0de109bd8775403589debd3c8fb870a6",
+            "position": [
+              1042.1532743960806,
+              3075.5845420548976
+            ],
+            "point_type": "vector",
+            "incoming": null,
+            "outgoing": null,
+            "handles_locked": true,
+            "roundness": 0.0,
+            "roundness_enabled": false,
+            "width_multiplier": 1.0
+          },
+          {
+            "id": "d3a97271f28c4a4cbf503ed120a77949",
+            "position": [
+              1027.8440426229615,
+              3108.9727495255092
+            ],
+            "point_type": "vector",
+            "incoming": null,
+            "outgoing": null,
+            "handles_locked": true,
+            "roundness": 0.0,
+            "roundness_enabled": false,
+            "width_multiplier": 1.0
+          },
+          {
+            "id": "2b56186df01140eda41e9452a1570993",
+            "position": [
+              1023.0742986985883,
+              3118.512237374255
+            ],
+            "point_type": "vector",
+            "incoming": null,
+            "outgoing": null,
+            "handles_locked": true,
+            "roundness": 0.0,
+            "roundness_enabled": false,
+            "width_multiplier": 1.0
+          },
+          {
+            "id": "32d33da4c50a411ab94de5a499d8cd17",
+            "position": [
+              994.4558351523501,
+              3142.3609569961204
+            ],
+            "point_type": "vector",
+            "incoming": null,
+            "outgoing": null,
+            "handles_locked": true,
+            "roundness": 0.0,
+            "roundness_enabled": false,
+            "width_multiplier": 1.0
+          },
+          {
+            "id": "ac1cb5283e3d49e4bb4791c2f6a06620",
+            "position": [
+              958.682755719552,
+              3161.4399326936127
+            ],
+            "point_type": "vector",
+            "incoming": null,
+            "outgoing": null,
+            "handles_locked": true,
+            "roundness": 0.0,
+            "roundness_enabled": false,
+            "width_multiplier": 1.0
+          },
+          {
+            "id": "02ea4f7e392e4e4293480b5bd15159b7",
+            "position": [
+              937.2189080598732,
+              3168.594548580172
+            ],
+            "point_type": "vector",
+            "incoming": null,
+            "outgoing": null,
+            "handles_locked": true,
+            "roundness": 0.0,
+            "roundness_enabled": false,
+            "width_multiplier": 1.0
+          },
+          {
+            "id": "687689a2590b4aa1a04a0d3f4378f0be",
+            "position": [
+              894.2912127405159,
+              3175.7491644667316
+            ],
+            "point_type": "vector",
+            "incoming": null,
+            "outgoing": null,
+            "handles_locked": true,
+            "roundness": 0.0,
+            "roundness_enabled": false,
+            "width_multiplier": 1.0
+          },
+          {
+            "id": "caed905e45b84312abe245b08ee90ce0",
+            "position": [
+              553.2545221478422,
+              3170.9794205423586
+            ],
+            "point_type": "vector",
+            "incoming": null,
+            "outgoing": null,
+            "handles_locked": true,
+            "roundness": 0.0,
+            "roundness_enabled": false,
+            "width_multiplier": 1.0
+          },
+          {
+            "id": "c1925108a1144bb3910d869ede555a1b",
+            "position": [
+              546.0999062612825,
+              3168.594548580172
+            ],
+            "point_type": "vector",
+            "incoming": null,
+            "outgoing": null,
+            "handles_locked": true,
+            "roundness": 0.0,
+            "roundness_enabled": false,
+            "width_multiplier": 1.0
+          },
+          {
+            "id": "252f306c759e400cb8ee71d78f8d6124",
+            "position": [
+              462.6293875847539,
+              3166.2096766179857
+            ],
+            "point_type": "vector",
+            "incoming": null,
+            "outgoing": null,
+            "handles_locked": true,
+            "roundness": 0.0,
+            "roundness_enabled": false,
+            "width_multiplier": 1.0
+          },
+          {
+            "id": "68204fc6ce9a47e382bbb55b5ec1b4c5",
+            "position": [
+              386.3134847947849,
+              3151.900444844867
+            ],
+            "point_type": "vector",
+            "incoming": null,
+            "outgoing": null,
+            "handles_locked": true,
+            "roundness": 0.0,
+            "roundness_enabled": false,
+            "width_multiplier": 1.0
+          },
+          {
+            "id": "9a61d660abc24969ad0f28ab2bff38a3",
+            "position": [
+              202.6783437064222,
+              3147.130700920494
+            ],
+            "point_type": "vector",
+            "incoming": null,
+            "outgoing": null,
+            "handles_locked": true,
+            "roundness": 0.0,
+            "roundness_enabled": false,
+            "width_multiplier": 1.0
+          }
+        ],
+        "additional_contours": []
+      },
+      "shape_style": {
+        "primary_color": "#00000000",
+        "base_thickness": 8,
+        "outline_color": "#FF000000",
+        "outline_thickness": 2,
+        "start_cap": "round",
+        "end_cap": "round"
+      },
+      "grid_override": null,
+      "last_raster_id": null,
+      "compound_enabled": false,
+      "compound_operation": "add",
+      "ignore_parent_mask": false,
+      "modifier_ids": [],
+      "transform_frame": null,
+      "transform_quad": null,
+      "opacity_mask": null
+    },
+    {
+      "id": "fd677cc9abb04e9980f4f8b70117181a",
+      "name": "Layer 9",
+      "is_page": false,
+      "layer_kind": "open_shape",
+      "parent_id": "79da821594e540f89fde54676fe51f6d",
+      "children": [],
+      "visible": true,
+      "opacity": 1.0,
+      "mask_only": false,
+      "fill_reference": false,
+      "translation": [
+        0.0,
+        0.0
+      ],
+      "bound": {
+        "type": "path",
+        "closed": false,
+        "primitive": "custom",
+        "nodes": [
+          {
+            "id": "d95ec8d3430b4e659683492a820837fc",
+            "position": [
+              -120.0,
+              2850.0
+            ],
+            "point_type": "bezier",
+            "incoming": null,
+            "outgoing": [
+              -120.0,
+              2850.0
+            ],
+            "handles_locked": false,
+            "roundness": 0.0,
+            "roundness_enabled": false,
+            "width_multiplier": 1.0
+          },
+          {
+            "id": "04fdbcaf85bf49b1be69ea56680f7ab4",
+            "position": [
+              210.0,
+              2790.0
+            ],
+            "point_type": "bezier",
+            "incoming": [
+              390.0,
+              2700.0
+            ],
+            "outgoing": null,
+            "handles_locked": false,
+            "roundness": 0.0,
+            "roundness_enabled": false,
+            "width_multiplier": 1.0
+          }
+        ],
+        "additional_contours": []
+      },
+      "shape_style": {
+        "primary_color": "#FFFFFFFF",
+        "base_thickness": 12,
+        "outline_color": "#FF000000",
+        "outline_thickness": 4,
+        "start_cap": "round",
+        "end_cap": "round"
+      },
+      "grid_override": null,
+      "last_raster_id": null,
       "compound_enabled": false,
       "compound_operation": "add",
       "ignore_parent_mask": false,
@@ -27418,7 +28256,7 @@
         450.0,
         1500.0
       ],
-      "visible": true,
+      "visible": false,
       "opacity": 1.0,
       "mask_only": false,
       "fill_reference": false,
@@ -27432,10 +28270,10 @@
       "opacity_mask": null,
       "tile_size": 256,
       "interaction_rect": [
-        0.0,
-        0.0,
-        420.0,
-        390.0
+        29.0,
+        4.0,
+        351.0,
+        335.0
       ],
       "transform_frame": null,
       "transform_quad": null

@@ -14096,9 +14096,15 @@ class _CanvasLogic:
         before = self.chapter.to_dict()
         bound = BoundGeometry.path(nodes, closed=True)
         bound.primitive = "custom"
-        style = ShapeStyle(primary_color="#00000000", outline_thickness=2, outline_color="#FF000000")
+        bound.additional_contours = []
+        bound.normalize_bezier_handles()
+        bound.validate()
+        fill = getattr(self, "secondary_color", None) or getattr(self.settings, "secondary_color", None) or "#FFFFFFFF"
+        line = getattr(self, "primary_color", None) or getattr(self.settings, "primary_color", None) or "#FF000000"
+        style = ShapeStyle(primary_color=fill, outline_thickness=2, outline_color=line)
+        style.validate()
         try:
-            layer = self.chapter.add_layer(parent_id, "Panel", bound, style=style)
+            layer = self.chapter.add_layer(parent_id, "Panel", bound, style=style, layer_kind="bounded")
         except Exception:
             self._clear_drawing_selection()
             return False
@@ -17711,8 +17717,6 @@ class _CanvasLogic:
                 return
             if self.tool == ToolKind.DRAW_SHAPE and self._pending_drawing_selection_press is not None:
                 self._pending_drawing_selection_press = None
-                self.interactionFinished.emit()
-                return
             self._finish_drawing_selection()
             self.interactionFinished.emit()
             return
