@@ -161,7 +161,7 @@ def test_parent_shape_gradient_reaches_center_and_is_parent_masked(qapp):
     assert image.pixelColor(200, 400).name() == "#ffffff"
 
 
-def test_gradient_creation_is_bottommost_and_selection_uses_shape_edit(qapp):
+def test_gradient_creation_is_bottommost_and_selects_gradient_tool(qapp):
     chapter = ChapterDocument(height=700)
     page = chapter.add_page(
         bound=BoundGeometry.rectangle(0, 0, 400, 400)
@@ -177,7 +177,7 @@ def test_gradient_creation_is_bottommost_and_selection_uses_shape_edit(qapp):
     assert page.children[-1].entity_id == gradient.object_id
     assert page.children[0].entity_id == existing.object_id
     assert canvas.selected_id == gradient.object_id
-    assert canvas.tool == ToolKind.SHAPE_EDIT
+    assert canvas.tool == ToolKind.GRADIENT
     assert gradient.ramp.stops[0].color == "#FF102030"
     assert gradient.ramp.stops[-1].color == "#FFABCDEF"
     canvas.command_stack.undo()
@@ -197,7 +197,7 @@ def test_object_select_hits_gradient_in_parent_interior(qapp):
     )
 
     assert canvas.selected_id == gradient.object_id
-    assert canvas.tool == ToolKind.SHAPE_EDIT
+    assert canvas.tool == ToolKind.GRADIENT
 
 
 def test_line_and_radial_creation_flows_commit_one_gradient(qapp):
@@ -271,13 +271,16 @@ def test_gradient_context_ribbon_and_preset_loading_are_isolated(
     window._set_chapter(chapter, TileStore())
     try:
         window.canvas.set_selection("layer", page.layer_id)
+        window.canvas.set_tool(ToolKind.GRADIENT)
         qapp.processEvents()
-        assert window.ribbon.is_page_visible("gradient_tools")
+        assert window.ribbon.current_key() == "tool_settings"
+        assert not window.gradient_create_group.isHidden()
 
         window.canvas.set_selection("object", gradient.object_id)
         qapp.processEvents()
-        assert window.canvas.tool == ToolKind.SHAPE_EDIT
-        assert window.ribbon.current_key() == "gradient_tools"
+        assert window.canvas.tool == ToolKind.GRADIENT
+        assert window.ribbon.current_key() == "tool_settings"
+        assert not window.gradient_type_group.isHidden()
 
         preset = series.gradient_ramp_presets[0]
         window._load_gradient_preset(preset.preset_id)

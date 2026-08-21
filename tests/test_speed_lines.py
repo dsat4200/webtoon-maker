@@ -13,9 +13,13 @@ def _legacy_payload() -> tuple[dict, str, str, str]:
     page = chapter.add_page(bound=BoundGeometry.rectangle(0, 0, 400, 300))
     drawing = chapter.add_object(
         page.layer_id,
-        VectorDrawingObject(fill_child_ids=["legacy-gradient"]),
+        VectorDrawingObject(),
     )
     payload = chapter.to_dict()
+    next(
+        item for item in payload["objects"]
+        if item["id"] == drawing.object_id
+    )["fill_child_ids"] = ["legacy-gradient"]
     payload["objects"].extend([
         {
             "id": "legacy-gradient", "type": "gradient",
@@ -39,11 +43,11 @@ def test_legacy_speed_lines_are_omitted_with_warning_and_references_repaired():
     warnings: list[str] = []
     restored = ChapterDocument.from_dict(payload, warnings=warnings)
 
-    assert restored.schema_version == 18
+    assert restored.schema_version == 20
     assert warnings == ["Omitted 2 unsupported Speed Lines objects."]
     assert legacy_id not in restored.objects
     assert "legacy-center" not in restored.objects
-    assert restored.objects[drawing_id].fill_child_ids == []
+    assert "fill_child_ids" not in restored.objects[drawing_id].to_dict()
     assert all(
         child.entity_id not in {legacy_id, "legacy-center"}
         for child in restored.layers[page_id].children

@@ -224,8 +224,6 @@ class LayerSettingsPanel(QGroupBox):
     def _layer_title(layer) -> str:
         if layer.is_page:
             return "Page"
-        if layer.layer_kind == "fill":
-            return "Fill Layer"
         if layer.layer_kind == "open_shape":
             return "Open Shape"
         return {
@@ -268,14 +266,11 @@ class LayerSettingsPanel(QGroupBox):
         self.name.setText(layer.name)
         self.visible.setChecked(layer.visible)
         self.opacity.setValue(round(layer.opacity * 100))
-        self.ignore_parent_mask.setVisible(
-            not layer.is_page and layer.layer_kind != "fill"
-        )
+        self.ignore_parent_mask.setVisible(not layer.is_page)
         self.ignore_parent_mask.setChecked(layer.ignore_parent_mask)
 
-        is_fill = layer.layer_kind == "fill"
         is_open = layer.layer_kind == "open_shape"
-        compound_capable = not layer.is_page and not is_fill
+        compound_capable = not layer.is_page
         self.compound_enabled.setVisible(compound_capable)
         self.compound_enabled.setChecked(layer.compound_enabled)
         compound_parent = (
@@ -295,7 +290,6 @@ class LayerSettingsPanel(QGroupBox):
         is_rectangle = (
             layer.bound is not None
             and layer.bound.primitive == "rectangle"
-            and not is_fill
         )
         self._set_pair_visible(
             self.rectangle_mode_label, self.rectangle_mode, is_rectangle
@@ -308,7 +302,7 @@ class LayerSettingsPanel(QGroupBox):
 
         self.fill_enabled.setText("Stroke" if is_open else "Fill")
         self.fill_enabled.setChecked(bool(layer.fill_color))
-        self.fill_enabled.setEnabled(not is_fill and not is_open)
+        self.fill_enabled.setEnabled(not is_open)
         self._set_color_button(
             self.fill_color, layer.fill_color or "#ffffff"
         )
@@ -321,11 +315,9 @@ class LayerSettingsPanel(QGroupBox):
         self.base_thickness_slider.setValue(base_thickness)
         self._set_thickness_visible(
             self.border_width_label, self.border_width_row,
-            self.border_width_slider, self.border_width, not is_fill,
+            self.border_width_slider, self.border_width, True,
         )
-        self._set_pair_visible(
-            self.border_color_label, self.border_color, not is_fill
-        )
+        self._set_pair_visible(self.border_color_label, self.border_color, True)
         border_maximum = 40 if layer.is_page else 500
         self.border_width_slider.setRange(0, border_maximum)
         self.border_width.setRange(0, border_maximum)
@@ -352,12 +344,10 @@ class LayerSettingsPanel(QGroupBox):
             self.point_roundness.setValue(selected_node.roundness)
 
         effective_grid = chapter.effective_grid(layer.layer_id)
-        self.grid_override.setVisible(not is_fill)
+        self.grid_override.setVisible(True)
+        self._set_pair_visible(self.grid_size_label, self.grid_size, True)
         self._set_pair_visible(
-            self.grid_size_label, self.grid_size, not is_fill
-        )
-        self._set_pair_visible(
-            self.grid_divisions_label, self.grid_divisions, not is_fill
+            self.grid_divisions_label, self.grid_divisions, True
         )
         self.grid_override.setChecked(layer.grid_override is not None)
         self.grid_size.setValue(effective_grid.size)
@@ -422,24 +412,23 @@ class LayerSettingsPanel(QGroupBox):
         before = chapter.to_dict()
         layer.name = self.name.text().strip() or layer.name
         layer.visible = self.visible.isChecked()
-        if not layer.is_page and layer.layer_kind != "fill":
+        if not layer.is_page:
             layer.ignore_parent_mask = self.ignore_parent_mask.isChecked()
         chapter.set_layer_opacity(layer.layer_id, self.opacity.value() / 100)
         layer.fill_color = (
             str(self.fill_color.property("color"))
-            if layer.layer_kind in {"fill", "open_shape"}
+            if layer.layer_kind == "open_shape"
             or self.fill_enabled.isChecked()
             else None
         )
-        if layer.layer_kind != "fill":
-            layer.shape_style.base_thickness = self.base_thickness.value()
-            layer.border_width = self.border_width.value()
-            layer.border_color = str(self.border_color.property("color"))
-            layer.compound_enabled = self.compound_enabled.isChecked()
-            operation = self.compound_operation.currentData()
-            if operation in {"add", "subtract", "ignore"}:
-                layer.compound_operation = operation
-        if layer.layer_kind != "fill" and self.grid_override.isChecked():
+        layer.shape_style.base_thickness = self.base_thickness.value()
+        layer.border_width = self.border_width.value()
+        layer.border_color = str(self.border_color.property("color"))
+        layer.compound_enabled = self.compound_enabled.isChecked()
+        operation = self.compound_operation.currentData()
+        if operation in {"add", "subtract", "ignore"}:
+            layer.compound_operation = operation
+        if self.grid_override.isChecked():
             if layer.grid_override is None:
                 inherited = (
                     chapter.effective_grid(layer.parent_id)

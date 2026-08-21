@@ -10,6 +10,7 @@ import zlib
 import json
 import mimetypes
 import re
+import threading
 import urllib.parse
 from collections import OrderedDict, deque
 from dataclasses import dataclass
@@ -21,7 +22,7 @@ import numpy as np
 
 from PySide6.QtCore import (
     QBuffer, QByteArray, QEvent, QIODevice, QPoint, QPointF, QRect, QRectF, Qt,
-    QTimer, QUrl, Signal,
+    QObject, QRunnable, QThreadPool, QTimer, QUrl, Signal,
 )
 from PySide6.QtGui import (
     QAbstractTextDocumentLayout, QBrush, QColor, QFont, QFontMetricsF,
@@ -52,7 +53,7 @@ from comic_editor.core.models import (
     ImageObject, PathContour, PathNode, RasterObject, ShapeStyle, TextObject,
     BlurModifier, OutlineModifier, ToneMask,
     SpeedLineCenterObject, SpeedLinesGradientObject, VectorDrawingObject,
-    VectorFillObject, VectorStroke, VectorStrokePoint,
+    VectorStroke, VectorStrokePoint,
     ImageSourceDescriptor, canonical_argb, image_source_from_dict,
     object_from_dict,
 )
@@ -64,12 +65,12 @@ from comic_editor.core.vector_geometry import (
     Cubic, CubicSpan, FreehandSample, centerline_hit, connect_cubic_paths,
     corridor_contains, corridor_hits_path, corridor_path_intervals,
     cubic_derivative, cubic_eval, cubic_subsegment,
-    distance_to_polyline, erase_stroke_by_corridor, find_face_containing,
+    distance_to_polyline, erase_stroke_by_corridor,
     fit_freehand, flatten_stroke, interpolate_stroke_attribute,
     nearest_on_path,
     nearest_on_stroke, path_self_intersections, point_in_polygon,
     path_intersections, simplify_cubic_segments,
-    stroke_cubics, tangent_bridge, trace_cubic_faces,
+    stroke_cubics, tangent_bridge,
 )
 from comic_editor.ui.windows_input import configure_simultaneous_pen_touch
 from comic_editor.ui.modifier_rendering import (
@@ -84,6 +85,7 @@ class ToolKind(Enum):
     RASTER_ERASER = "raster_eraser"
     EYEDROPPER = "eyedropper"
     FILL = "fill"
+    GRADIENT = "gradient"
     TEXT_EDIT = "text_edit"
     TRANSFORM = "transform"
     SHAPE_EDIT = "shape_edit"
@@ -107,6 +109,174 @@ RASTER_FRAME_MARGIN = 24.0
 SHAPE_CONTROL_SCALE = 1.5
 ASSET_MIME = "application/x-webtoon-asset"
 VECTOR_RENDER_CACHE_BUDGET = 64 * 1024 * 1024
+
+
+class _FillWorkerSignals(QObject):
+    finished = Signal(object, object)
+
+
+class _FillWorker(QRunnable):
+    """Run a fill against detached tiles and return a patch, never live data."""
+
+    def __init__(
+        self, store: TileStore, object_id: str, point: QPointF | None,
+        frame: QRectF, color: QColor, profile: dict[str, object],
+        region_policy: str,
+        selection_tile, reference_tiles: dict[tuple[int, int], QImage] | None,
+        cancel_event: threading.Event, context: dict,
+    ) -> None:
+        super().__init__()
+        self.store = store
+        self.object_id = object_id
+        self.point = QPointF(point) if point is not None else None
+        self.frame = QRectF(frame)
+        self.color = QColor(color)
+        self.profile = dict(profile)
+        self.region_policy = str(region_policy)
+        self.selection_tile = selection_tile
+        self.reference_tiles = reference_tiles
+        self.cancel_event = cancel_event
+        self.context = context
+        self.signals = _FillWorkerSignals()
+
+    def run(self) -> None:
+        before: dict[tuple[int, int], QImage | None] = {}
+        try:
+            dirty = self.store.advanced_fill(
+                self.object_id, self.point, self.frame, self.color,
+                self.profile, before, region_policy=self.region_policy,
+                selection_tile=self.selection_tile,
+                reference_tile=(
+                    None if self.reference_tiles is None
+                    else self.reference_tiles.get
+                ),
+                cancel_check=self.cancel_event.is_set,
+            )
+            after = (
+                self.store.snapshot(self.object_id, set(before))
+                if before and not self.cancel_event.is_set() else {}
+            )
+            result = {
+                **self.context, "before": before, "after": after,
+                "dirty": QRectF(dirty), "cancelled": self.cancel_event.is_set(),
+                "error": None,
+            }
+        except Exception as error:  # pragma: no cover - defensive worker gate
+            result = {
+                **self.context, "before": {}, "after": {},
+                "dirty": QRectF(), "cancelled": self.cancel_event.is_set(),
+                "error": error,
+            }
+        self.signals.finished.emit(self, result)
+
+
+class _FillReplayWorker(QRunnable):
+    """Rebuild a recorded fill gesture against detached pre-fill tiles."""
+
+    def __init__(
+        self, store: TileStore, object_id: str, frame: QRectF,
+        steps: list[tuple[QPointF | None, QPainterPath | None, str]],
+        selection_path: QPainterPath, color: QColor,
+        profile: dict[str, object],
+        reference_tiles: dict[tuple[int, int], QImage] | None,
+        cancel_event: threading.Event, context: dict,
+    ) -> None:
+        super().__init__()
+        self.store = store
+        self.object_id = object_id
+        self.frame = QRectF(frame)
+        self.steps = steps
+        self.selection_path = QPainterPath(selection_path)
+        self.color = QColor(color)
+        self.profile = dict(profile)
+        self.reference_tiles = reference_tiles
+        self.cancel_event = cancel_event
+        self.context = context
+        self.signals = _FillWorkerSignals()
+
+    def run(self) -> None:
+        before: dict[tuple[int, int], QImage | None] = {}
+        dirty = QRectF()
+        size = self.store.tile_size
+
+        def mask_for(path: QPainterPath, key: tuple[int, int]):
+            if path.isEmpty():
+                return None
+            image = QImage(
+                size, size, QImage.Format.Format_ARGB32_Premultiplied
+            )
+            image.fill(Qt.GlobalColor.transparent)
+            painter = QPainter(image)
+            painter.translate(-key[0] * size, -key[1] * size)
+            painter.fillPath(path, QColor("white"))
+            painter.end()
+            rgba = image.convertToFormat(QImage.Format.Format_RGBA8888)
+            values = np.frombuffer(bytes(rgba.constBits()), dtype=np.uint8)
+            return values.reshape((size, size, 4))[..., 3] > 0
+
+        try:
+            for point, extra_path, policy in self.steps:
+                if self.cancel_event.is_set():
+                    break
+                selection = QPainterPath(self.selection_path)
+                if extra_path is not None:
+                    selection = (
+                        QPainterPath(extra_path) if selection.isEmpty()
+                        else selection.intersected(extra_path)
+                    )
+                changed = self.store.advanced_fill(
+                    self.object_id, point, self.frame, self.color,
+                    self.profile, before, region_policy=policy,
+                    reference_tile=(
+                        None if self.reference_tiles is None
+                        else self.reference_tiles.get
+                    ),
+                    selection_tile=lambda key, path=selection: mask_for(
+                        path, key
+                    ),
+                    cancel_check=self.cancel_event.is_set,
+                )
+                if not changed.isEmpty():
+                    dirty = (
+                        QRectF(changed) if dirty.isEmpty()
+                        else dirty.united(changed)
+                    )
+            after = (
+                self.store.snapshot(self.object_id, set(before))
+                if before and not self.cancel_event.is_set() else {}
+            )
+            result = {
+                **self.context, "before": before, "after": after,
+                "dirty": dirty, "cancelled": self.cancel_event.is_set(),
+                "error": None,
+            }
+        except Exception as error:  # pragma: no cover - defensive worker gate
+            result = {
+                **self.context, "before": {}, "after": {},
+                "dirty": QRectF(), "cancelled": self.cancel_event.is_set(),
+                "error": error,
+            }
+        self.signals.finished.emit(self, result)
+
+
+@dataclass
+class _FillReplayState:
+    chapter: ChapterDocument
+    object_id: str
+    object_model: str
+    command: TilePatchCommand
+    history_revision: int
+    base_tiles: dict[tuple[int, int], QImage]
+    steps: list[tuple[QPointF | None, QPainterPath | None, str]]
+    selection_path: QPainterPath
+    color: QColor
+    profile: dict[str, object]
+    reference_entities: list[tuple[str, str]]
+    reference_signature: tuple
+    reference_settings: tuple
+    reference_tiles: dict[tuple[int, int], QImage]
+    current_signature: tuple
+    dirty_world: QRectF
 VECTOR_RENDER_INDEX_CELL = 256.0
 WHEEL_ZOOM_SETTLE_MS = 120
 
@@ -420,6 +590,9 @@ class _CanvasLogic:
         self._render_excluded_object_id = ""
         self._render_modifier_sources: set[tuple[str, str]] = set()
         self._render_base_alpha = False
+        self._interactive_render = False
+        self._render_exclude_text = False
+        self._rendering_mask_contributor = 0
         self._modifier_render_cache: OrderedDict[tuple, QImage] = OrderedDict()
         self._modifier_render_cache_bytes = 0
         self._modifier_render_cache_budget = 64 * 1024 * 1024
@@ -494,6 +667,7 @@ class _CanvasLogic:
         self._gradient_creation_type = ""
         self._gradient_creation_family = "color_fill"
         self._gradient_creation_before: dict | None = None
+        self._gradient_tool_field_type = "line"
         self._selected_shape_node_id = ""
         self._selected_shape_node_ids: set[str] = set()
         self._shape_drag_nodes: dict[str, dict] = {}
@@ -543,6 +717,7 @@ class _CanvasLogic:
         self._preset = settings.active_brush_preset()
         self.primary_color = canonical_argb(settings.brush_color)
         self.secondary_color = "#FFFFFFFF"
+        self.active_color_slot = "primary"
         self._predictive: tuple[QPointF, QPointF, float, QColor] | None = None
         self._compound_path_cache: dict[str, QPainterPath] = {}
         # Stroke images are deliberately cached independently.  A drawing can
@@ -614,6 +789,37 @@ class _CanvasLogic:
         self._selection_vector_preview_revision = 0
         self._selection_before_tiles: dict[tuple[int, int], QImage] | None = None
         self._selection_before_model: dict | None = None
+        self._fill_before: dict[tuple[int, int], QImage | None] = {}
+        self._fill_dirty_world = QRectF()
+        self._fill_gesture_active = False
+        self._fill_gesture_points: list[QPointF] = []
+        self._fill_last_world = QPointF()
+        self._fill_reference_tile_cache: OrderedDict[tuple, QImage] = OrderedDict()
+        self._fill_reference_tile_cache_bytes = 0
+        self._fill_reference_tile_cache_budget = 64 * 1024 * 1024
+        self._preserve_fill_reference_cache = False
+        self._fill_job_generation = 0
+        self._fill_job_cancel: threading.Event | None = None
+        self._fill_workers: set[QRunnable] = set()
+        self._fill_job_error: Exception | None = None
+        self._fill_replay_state: _FillReplayState | None = None
+        self._fill_replay_generation = 0
+        self._fill_replay_cancel: threading.Event | None = None
+        self._fill_replay_pending_tolerance: int | None = None
+        self._fill_replay_timer = QTimer(self)
+        self._fill_replay_timer.setSingleShot(True)
+        self._fill_replay_timer.timeout.connect(
+            self._recalculate_last_fill_tolerance
+        )
+        self._fill_operation_base_tiles: dict[
+            tuple[int, int], QImage
+        ] = {}
+        self._fill_operation_profile: dict[str, object] = {}
+        self._fill_operation_color = QColor()
+        self._fill_operation_selection = QPainterPath()
+        self._fill_operation_reference_tiles: dict[
+            tuple[int, int], QImage
+        ] = {}
         self._page_creation_anchor_id = ""
         self._page_creation_before: dict | None = None
         self._page_creation_kind = ""
@@ -664,6 +870,7 @@ class _CanvasLogic:
         self._performance = CanvasPerformanceMonitor()
         self.documentChanged.connect(self._clear_compound_path_cache)
         self.documentChanged.connect(self._document_visual_changed)
+        self.documentChanged.connect(self._invalidate_fill_reference_cache)
         self.hierarchyChanged.connect(self._clear_compound_path_cache)
         self.hierarchyChanged.connect(self._invalidate_scene_cache)
         self.setMinimumSize(480, 480)
@@ -752,6 +959,13 @@ class _CanvasLogic:
             self._tone_mask_contributor_cache.clear()
             self._tone_mask_contributor_cache_bytes = 0
         self._tone_mask_tile_cache.clear()
+
+    def _invalidate_fill_reference_cache(self, *args) -> None:
+        del args
+        if self._preserve_fill_reference_cache:
+            return
+        self._fill_reference_tile_cache.clear()
+        self._fill_reference_tile_cache_bytes = 0
 
     def _world_dirty_to_widget(self, world: QRectF) -> QRect:
         if world.isEmpty():
@@ -878,6 +1092,76 @@ class _CanvasLogic:
         ), default=0.0)
         return QRectF(world).adjusted(-padding, -padding, padding, padding)
 
+    def _entity_expanded_dirty(
+        self, kind: str, entity_id: str, world: QRectF,
+    ) -> QRectF:
+        """Conservatively include effects and mask dependants for a subtree."""
+        if self.chapter is None or world.isEmpty():
+            return QRectF(world)
+        targets: list[LayerNode | DocumentObject] = []
+
+        def collect_layer(layer_id: str) -> None:
+            layer = self.chapter.layers.get(layer_id)
+            if layer is None:
+                return
+            targets.append(layer)
+            for child in layer.children:
+                if child.kind == "layer":
+                    collect_layer(child.entity_id)
+                else:
+                    obj = self.chapter.objects.get(child.entity_id)
+                    if obj is not None:
+                        targets.append(obj)
+
+        if kind == "layer":
+            collect_layer(entity_id)
+        else:
+            obj = self.chapter.objects.get(entity_id)
+            if obj is not None:
+                targets.append(obj)
+        target_keys = {
+            (
+                "layer" if isinstance(target, LayerNode) else "object",
+                target.layer_id if isinstance(target, LayerNode)
+                else target.object_id,
+            )
+            for target in targets
+        }
+        if any(
+            target_keys.intersection(mask.contributors)
+            for mask in self.chapter.masks.values()
+        ):
+            return QRectF(0, 0, self.chapter.width, self.chapter.height)
+        modifier_ids: list[str] = []
+        for target in targets:
+            modifier_ids.extend(target.modifier_ids)
+        parent_id = (
+            self.chapter.layers[entity_id].parent_id
+            if kind == "layer" and entity_id in self.chapter.layers
+            else self.chapter.objects[entity_id].parent_layer_id
+            if kind == "object" and entity_id in self.chapter.objects
+            else None
+        )
+        while parent_id:
+            parent = self.chapter.layers[parent_id]
+            modifier_ids.extend(parent.modifier_ids)
+            parent_id = parent.parent_id
+        padding = max((
+            self._modifier_maximum(
+                modifier, "strength", modifier.strength
+            ) * 3.0
+            if isinstance(modifier, BlurModifier)
+            else self._modifier_maximum(
+                modifier, "thickness", modifier.thickness
+            )
+            if isinstance(modifier, OutlineModifier)
+            else 0.0
+            for modifier_id in modifier_ids
+            if (modifier := self.chapter.modifiers.get(modifier_id)) is not None
+            and modifier.intensity > 0
+        ), default=0.0)
+        return QRectF(world).adjusted(-padding, -padding, padding, padding)
+
     def _flush_visual_dirty(self) -> None:
         world = QRectF(self._visual_pending_world)
         widget = QRect(self._visual_pending_widget)
@@ -950,6 +1234,8 @@ class _CanvasLogic:
         )
         self._set_live_underlay_context()
         previous_excluded = self._render_excluded_object_id
+        previous_interactive = self._interactive_render
+        self._interactive_render = True
         if self._text_editing:
             selected = self.chapter.objects.get(self.selected_object_id)
             if isinstance(selected, TextObject):
@@ -961,6 +1247,7 @@ class _CanvasLogic:
                 )
         finally:
             self._render_excluded_object_id = previous_excluded
+            self._interactive_render = previous_interactive
         self._render_selected_drawing_underlay(painter, visible)
         self._clear_live_underlay_context()
         self._draw_grid(painter, visible)
@@ -1025,6 +1312,8 @@ class _CanvasLogic:
         self, chapter: ChapterDocument, tiles: TileStore,
         images: ImageStore | None = None, reset_view: bool = True,
     ) -> None:
+        self._cancel_fill_job()
+        self._clear_fill_replay()
         self._clear_detached_input_state()
         self.chapter = chapter
         self.tiles = tiles
@@ -1197,6 +1486,11 @@ class _CanvasLogic:
         self.settings.brush_color = self.primary_color
         self.update()
 
+    def set_active_color_slot(self, slot: str) -> None:
+        if slot not in {"primary", "secondary"}:
+            raise ValueError("Color slot must be 'primary' or 'secondary'")
+        self.active_color_slot = slot
+
     def replace_chapter(self, state: dict) -> None:
         self._commit_text_edit()
         self._clear_transform_preview()
@@ -1262,9 +1556,6 @@ class _CanvasLogic:
         selected = self.chapter.objects.get(self.selected_id)
         if isinstance(selected, VectorDrawingObject):
             return selected
-        if isinstance(selected, VectorFillObject):
-            owner = self.chapter.objects.get(selected.owner_drawing_id)
-            return owner if isinstance(owner, VectorDrawingObject) else None
         return None
 
     def _drawing_object_transform(
@@ -1437,7 +1728,7 @@ class _CanvasLogic:
     def _capture_vector_graph(
         self, drawing: VectorDrawingObject,
     ) -> dict[str, dict | None]:
-        identifiers = [drawing.object_id, *drawing.fill_child_ids]
+        identifiers = [drawing.object_id]
         return {
             object_id: (
                 self.chapter.objects[object_id].to_dict()
@@ -1508,7 +1799,7 @@ class _CanvasLogic:
         for drawing_id in drawing_ids:
             drawing = self.chapter.objects.get(drawing_id)
             if isinstance(drawing, VectorDrawingObject):
-                identifiers.update((drawing_id, *drawing.fill_child_ids))
+                identifiers.add(drawing_id)
         before = {
             object_id: before.get(object_id)
             for object_id in identifiers
@@ -1635,6 +1926,7 @@ class _CanvasLogic:
         ):
             self._clear_page_gap_editor()
         if entity_id != self.selected_object_id:
+            self._clear_fill_replay()
             if self._vector_gesture_mode is not None:
                 self._cancel_vector_gesture(restore=True)
             self._cancel_text_property_drag()
@@ -1674,10 +1966,8 @@ class _CanvasLogic:
                 obj, VectorDrawingObject
             ):
                 self.tool = ToolKind.RASTER_PENCIL
-            elif activate_default_tool and isinstance(obj, VectorFillObject):
-                self.tool = ToolKind.FILL
             elif activate_default_tool and isinstance(obj, GradientObject):
-                self.tool = ToolKind.SHAPE_EDIT
+                self.tool = ToolKind.GRADIENT
             elif activate_default_tool and isinstance(obj, TextObject):
                 self.tool = ToolKind.TEXT_EDIT
             elif activate_default_tool and isinstance(obj, ImageObject):
@@ -1689,7 +1979,6 @@ class _CanvasLogic:
             layer = self.chapter.layers[entity_id]
             if (
                 activate_default_tool
-                and layer.layer_kind != "fill"
                 and layer.bound is not None
             ):
                 self.tool = ToolKind.SHAPE_EDIT
@@ -1806,6 +2095,10 @@ class _CanvasLogic:
         )
         if tool != self.tool and self._vector_gesture_mode is not None:
             self._cancel_vector_gesture(restore=True)
+        if tool != self.tool and self._fill_gesture_active:
+            self._cancel_fill_gesture(restore=True)
+        if tool != self.tool:
+            self._cancel_fill_job()
         if tool != ToolKind.TEXT_EDIT:
             self._cancel_text_property_drag()
         if (
@@ -1863,16 +2156,6 @@ class _CanvasLogic:
                     "layer", selected.parent_layer_id,
                     activate_default_tool=False,
                 )
-        if (
-            tool == ToolKind.BOUND_EDIT
-            and self.selected_kind == "layer"
-            and self.chapter.layers[self.selected_id].layer_kind == "fill"
-        ):
-            parent_id = self.chapter.layers[self.selected_id].parent_id
-            if parent_id:
-                self.set_selection(
-                    "layer", parent_id, activate_default_tool=False
-                )
         if tool in {ToolKind.RASTER_PENCIL, ToolKind.RASTER_ERASER}:
             if self.selected_kind != "object" or self.chapter is None:
                 return False
@@ -1907,8 +2190,15 @@ class _CanvasLogic:
         if tool == ToolKind.FILL and (
             self.chapter is None
             or (
-                self.selected_kind != "layer"
-                and self._active_vector_drawing() is None
+                not (
+                    self.selected_kind == "layer"
+                    and (
+                        layer := self.chapter.layers.get(self.selected_id)
+                    ) is not None
+                    and not layer.is_page
+                    and layer.bound is not None
+                    and layer.bound.closed
+                )
                 and not isinstance(
                     self.chapter.objects.get(self.selected_object_id),
                     RasterObject,
@@ -2778,10 +3068,7 @@ class _CanvasLogic:
                 if reference.kind != "layer":
                     continue
                 child = document.layers[reference.entity_id]
-                if (
-                    not child.visible or child.layer_kind == "fill"
-                    or child.compound_operation == "ignore"
-                ):
+                if not child.visible or child.compound_operation == "ignore":
                     continue
                 operand = (
                     self._document_layer_effective_path(
@@ -3118,7 +3405,6 @@ class _CanvasLogic:
         """Embed decoded originals and add image objects as one command."""
         if (
             self.chapter is None or parent_id not in self.chapter.layers
-            or self.chapter.layers[parent_id].layer_kind == "fill"
         ):
             return []
         valid: list[tuple[int, str, str, bytes, QImage]] = []
@@ -3237,7 +3523,7 @@ class _CanvasLogic:
         source = manifest.document
         root = source.layers.get(manifest.root_id)
         if (
-            root is None or not root.visible or root.layer_kind == "fill"
+            root is None or not root.visible
             or root.compound_operation == "ignore"
         ):
             return None, "ignore"
@@ -3264,7 +3550,7 @@ class _CanvasLogic:
             return False
         root = manifest.document.layers.get(manifest.root_id)
         return bool(
-            root and root.visible and root.layer_kind != "fill"
+            root and root.visible
             and root.compound_operation != "ignore"
             and any(
                 layer.compound_enabled
@@ -3332,7 +3618,7 @@ class _CanvasLogic:
     def _asset_parent_accepts(self, layer_id: str, manifest: AssetManifest) -> bool:
         layer = self.chapter.layers.get(layer_id)
         if (
-            layer is None or layer.layer_kind == "fill"
+            layer is None
             or any(
                 not ancestor.visible
                 for ancestor in self.chapter.ancestor_layers(layer_id)
@@ -3343,7 +3629,7 @@ class _CanvasLogic:
             return True
         root = manifest.document.objects.get(manifest.root_id)
         if not isinstance(root, GradientObject):
-            return not isinstance(root, (VectorFillObject, SpeedLineCenterObject))
+            return not isinstance(root, SpeedLineCenterObject)
         family = "speed_lines" if isinstance(root, SpeedLinesGradientObject) else "color_fill"
         return not self.chapter.gradient_children(
             layer_id, root.field_type, family=family
@@ -3357,7 +3643,7 @@ class _CanvasLogic:
             next_order = order + 1
             if not layer.visible:
                 return next_order
-            if layer.bound is not None and layer.layer_kind != "fill":
+            if layer.bound is not None:
                 if self.layer_effective_path(layer_id).contains(
                     self._layer_world_to_local(layer_id, world)
                 ):
@@ -4093,6 +4379,16 @@ class _CanvasLogic:
         self, painter: QPainter, layer: LayerNode, parent_opacity: float,
         visible_world: QRectF,
     ) -> None:
+        if (
+            layer.mask_only
+            and self._rendering_mask_contributor <= 0
+            and not (
+                self._interactive_render
+                and self.selected_kind == "layer"
+                and self.selected_id == layer.layer_id
+            )
+        ):
+            return
         if not layer.visible or (
             layer.opacity <= 0 and layer.opacity_mask is None
             and not self._render_base_alpha
@@ -4106,22 +4402,6 @@ class _CanvasLogic:
             self._render_modified_layer(
                 painter, layer, parent_opacity, visible_world
             )
-            return
-        if layer.layer_kind == "fill":
-            parent = self.chapter.layers.get(layer.parent_id)
-            if parent is None or parent.bound is None:
-                return
-            painter.save()
-            painter.setOpacity(
-                parent_opacity * (
-                    1.0 if self._render_base_alpha else layer.opacity
-                )
-            )
-            painter.fillPath(
-                self.layer_effective_path(parent.layer_id),
-                QColor(layer.fill_color or "#111111"),
-            )
-            painter.restore()
             return
         painter.save()
         painter.setTransform(self._layer_parent_transform(layer), True)
@@ -4299,6 +4579,7 @@ class _CanvasLogic:
         cache_key = (
             "layer", layer.layer_id,
             layer_signature,
+            self._render_exclude_text,
             self._rect_signature(bounds), world_origin.toTuple(),
         )
         processed = self._modifier_cache_get(cache_key)
@@ -4306,6 +4587,7 @@ class _CanvasLogic:
             source_key = (
                 "layer-source", layer.layer_id,
                 layer_signature[0], layer_signature[3], layer_signature[4],
+                self._render_exclude_text,
                 self._rect_signature(bounds), world_origin.toTuple(),
             )
             image = self._modifier_source_cache_get(source_key)
@@ -4372,11 +4654,7 @@ class _CanvasLogic:
                 )
             self._modifier_cache_put(cache_key, processed)
         painter.save()
-        painter.setOpacity(
-            parent_opacity * (
-                1.0 if layer.opacity_mask is not None else layer.opacity
-            )
-        )
+        painter.setOpacity(parent_opacity * layer.opacity)
         transform = self._layer_parent_transform(layer)
         painter.setClipPath(
             transform.map(self.layer_effective_path(layer.layer_id)),
@@ -4971,17 +5249,48 @@ class _CanvasLogic:
         self._store_vector_render_cache(key, result)
         return result
 
-    def _render_vector_fill(
-        self, painter: QPainter, fill: VectorFillObject,
-    ) -> None:
-        if not fill.visible:
-            return
-        painter.save()
-        painter.setOpacity(
-            painter.opacity() * (1.0 if fill.opacity_locked else fill.opacity)
+    def _vector_stroke_with_selection_preview(
+        self, stroke: VectorStroke,
+    ) -> VectorStroke:
+        if not self._selection_vector_preview:
+            return stroke
+        preview_points = {
+            point.point_id: self._selection_vector_preview[point.point_id]
+            for point in stroke.points
+            if point.point_id in self._selection_vector_preview
+        }
+        if not preview_points:
+            return stroke
+        return VectorStroke(
+            stroke_id=stroke.stroke_id,
+            color=stroke.color,
+            closed=stroke.closed,
+            start_cap=stroke.start_cap,
+            end_cap=stroke.end_cap,
+            points=[
+                VectorStrokePoint(
+                    point_id=point.point_id,
+                    x=preview_points.get(point.point_id, {}).get(
+                        "position", point.position
+                    )[0],
+                    y=preview_points.get(point.point_id, {}).get(
+                        "position", point.position
+                    )[1],
+                    incoming=preview_points.get(
+                        point.point_id, {}
+                    ).get("incoming", point.incoming),
+                    outgoing=preview_points.get(
+                        point.point_id, {}
+                    ).get("outgoing", point.outgoing),
+                    width=preview_points.get(
+                        point.point_id, {}
+                    ).get("width", point.width),
+                    opacity=point.opacity,
+                )
+                for point in stroke.points
+            ],
+            render_revision=stroke.render_revision,
         )
-        painter.fillPath(self.bound_path(fill.geometry), QColor(fill.fill_color))
-        painter.restore()
 
     def _render_vector_drawing(
         self, painter: QPainter, drawing: VectorDrawingObject,
@@ -5011,11 +5320,6 @@ class _CanvasLogic:
             )
             if local_visible is not None else None
         )
-        # Fill IDs are frontmost-first, so paint them back-to-front.
-        for fill_id in reversed(drawing.fill_child_ids):
-            fill = self.chapter.objects.get(fill_id)
-            if isinstance(fill, VectorFillObject):
-                self._render_vector_fill(painter, fill)
         for stroke_index in self._vector_stroke_indexes(
             drawing, drawing_visible
         ):
@@ -5064,47 +5368,18 @@ class _CanvasLogic:
                         tile_x * tile_size, tile_y * tile_size, image
                     )
                 continue
-            preview_points = {
-                point.point_id: self._selection_vector_preview[point.point_id]
-                for point in stroke.points
-                if point.point_id in self._selection_vector_preview
-            }
-            render_stroke = stroke
+            render_stroke = (
+                self._vector_stroke_with_selection_preview(stroke)
+                if (
+                    drawing.object_id == self.selected_object_id
+                    and self._selection_vector_preview
+                ) else stroke
+            )
             cache_token = None
             if (
-                preview_points
+                render_stroke is not stroke
                 and drawing.object_id == self.selected_object_id
             ):
-                render_stroke = VectorStroke(
-                    stroke_id=stroke.stroke_id,
-                    color=stroke.color,
-                    closed=stroke.closed,
-                    start_cap=stroke.start_cap,
-                    end_cap=stroke.end_cap,
-                    points=[
-                        VectorStrokePoint(
-                            point_id=point.point_id,
-                            x=preview_points.get(point.point_id, {}).get(
-                                "position", point.position
-                            )[0],
-                            y=preview_points.get(point.point_id, {}).get(
-                                "position", point.position
-                            )[1],
-                            incoming=preview_points.get(
-                                point.point_id, {}
-                            ).get("incoming", point.incoming),
-                            outgoing=preview_points.get(
-                                point.point_id, {}
-                            ).get("outgoing", point.outgoing),
-                            width=preview_points.get(
-                                point.point_id, {}
-                            ).get("width", point.width),
-                            opacity=point.opacity,
-                        )
-                        for point in stroke.points
-                    ],
-                    render_revision=stroke.render_revision,
-                )
                 cache_token = (
                     "selection-preview", self._selection_vector_preview_revision
                 )
@@ -6756,7 +7031,19 @@ class _CanvasLogic:
         self, painter: QPainter, obj: DocumentObject, parent_opacity: float,
         local_visible: QRectF,
     ) -> None:
+        if self._render_exclude_text and isinstance(obj, TextObject):
+            return
         if obj.object_id == self._render_excluded_object_id:
+            return
+        if (
+            obj.mask_only
+            and self._rendering_mask_contributor <= 0
+            and not (
+                self._interactive_render
+                and self.selected_kind == "object"
+                and self.selected_id == obj.object_id
+            )
+        ):
             return
         if (
             not self._rendering_compound_references
@@ -6838,10 +7125,16 @@ class _CanvasLogic:
         )
         return tuple(result)
 
-    def _tone_mask_signature(self, mask_id: str) -> tuple:
+    def _tone_mask_signature(
+        self, mask_id: str, _stack: frozenset[str] = frozenset(),
+        *, include_paint: bool = True,
+    ) -> tuple:
         mask = self.chapter.masks.get(mask_id)
         if mask is None:
             return (mask_id, "missing")
+        if mask_id in _stack:
+            return (mask_id, "cycle")
+        stack = _stack | {mask_id}
 
         def entity_signature(kind: str, entity_id: str) -> tuple:
             entity = self.chapter.mask_contributor(kind, entity_id)
@@ -6887,16 +7180,33 @@ class _CanvasLogic:
                 json.dumps(layer.to_dict(), sort_keys=True)
                 for layer in ancestor_layers
             )
+            dependent_mask_ids: set[str] = set()
+            if entity.opacity_mask is not None:
+                dependent_mask_ids.add(entity.opacity_mask.mask_id)
+            for modifier_id in entity.modifier_ids:
+                modifier = self.chapter.modifiers.get(modifier_id)
+                if modifier is not None:
+                    dependent_mask_ids.update(
+                        binding.mask_id
+                        for binding in modifier.parameter_masks.values()
+                    )
             return (
                 kind, entity_id,
                 json.dumps(entity.to_dict(), sort_keys=True),
                 pixels, children, ancestors,
+                tuple(
+                    self._tone_mask_signature(dependent, stack)
+                    for dependent in sorted(dependent_mask_ids)
+                ),
             )
 
-        paint = tuple(sorted(
-            (key, int(image.cacheKey()))
-            for key, image in self.tiles.object_tiles(mask_id).items()
-        ))
+        paint = (
+            tuple(sorted(
+                (key, int(image.cacheKey()))
+                for key, image in self.tiles.object_tiles(mask_id).items()
+            ))
+            if include_paint else ()
+        )
         return (
             json.dumps(mask.to_dict(), sort_keys=True), paint,
             tuple(entity_signature(*item) for item in mask.contributors),
@@ -6922,9 +7232,11 @@ class _CanvasLogic:
         skipped: set[str] = set()
         if direct_ignore and layers:
             skipped.add(layers[-1].layer_id)
-        full_chain = self.chapter.ancestor_layers(
-            entity.parent_layer_id if kind == "layer" and entity.parent_id
-            else layer_id if kind == "object" else entity_id
+        chain_id = (
+            entity.parent_id if kind == "layer" else layer_id
+        )
+        full_chain = (
+            self.chapter.ancestor_layers(chain_id) if chain_id else []
         )
         for parent, child in zip(full_chain, full_chain[1:]):
             if child.ignore_parent_mask:
@@ -6962,8 +7274,7 @@ class _CanvasLogic:
                 painter.restore()
                 return
             painter.setClipPath(clip, Qt.ClipOperation.IntersectClip)
-        previous = self._render_base_alpha
-        self._render_base_alpha = True
+        self._rendering_mask_contributor += 1
         try:
             if kind == "object":
                 parent_transform = self.layer_world_transform(
@@ -6971,8 +7282,13 @@ class _CanvasLogic:
                 )
                 inverse, valid = parent_transform.inverted()
                 painter.setTransform(parent_transform, True)
-                self._render_object_content(
-                    painter, entity,
+                ancestor_opacity = 1.0
+                for ancestor in self.chapter.ancestor_layers(
+                    entity.parent_layer_id
+                ):
+                    ancestor_opacity *= ancestor.opacity
+                self._render_object(
+                    painter, entity, ancestor_opacity,
                     inverse.mapRect(visible_world) if valid else visible_world,
                 )
                 if isinstance(entity, VectorDrawingObject):
@@ -6981,48 +7297,22 @@ class _CanvasLogic:
                     )
                 return
             layer = entity
-            if layer.layer_kind == "fill":
-                parent = self.chapter.layers.get(layer.parent_id)
-                if parent is not None and parent.bound is not None:
-                    painter.fillPath(
-                        self.layer_world_transform(parent.layer_id).map(
-                            self.layer_effective_path(parent.layer_id)
-                        ),
-                        QColor(layer.fill_color or "#ffffffff"),
-                    )
-                return
-            if layer.fill_color:
-                painter.setTransform(
-                    self.layer_world_transform(layer.layer_id), True
-                )
-                path = self.layer_effective_path(layer.layer_id)
-                if layer.layer_kind == "open_shape":
-                    path = self.open_shape_mesh(
-                        layer.bound, layer.shape_style.base_thickness, 0,
-                        layer.shape_style.start_cap,
-                        layer.shape_style.end_cap,
-                    )
-                painter.fillPath(path, QColor(layer.fill_color))
-                if layer.border_width > 0:
-                    painter.setPen(QPen(
-                        QColor(layer.border_color), layer.border_width * 2,
-                        Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin,
-                    ))
-                    painter.setBrush(Qt.NoBrush)
-                    painter.drawPath(path)
-                return
             parent_transform = (
                 self.layer_world_transform(layer.parent_id)
                 if layer.parent_id else QTransform()
             )
             inverse, valid = parent_transform.inverted()
             painter.setTransform(parent_transform, True)
+            ancestor_opacity = 1.0
+            if layer.parent_id:
+                for ancestor in self.chapter.ancestor_layers(layer.parent_id):
+                    ancestor_opacity *= ancestor.opacity
             self._render_layer(
-                painter, layer, 1.0,
+                painter, layer, ancestor_opacity,
                 inverse.mapRect(visible_world) if valid else visible_world,
             )
         finally:
-            self._render_base_alpha = previous
+            self._rendering_mask_contributor -= 1
             painter.restore()
 
     @staticmethod
@@ -7054,7 +7344,8 @@ class _CanvasLogic:
         ))
         contributor_key = (
             mask_id, width, height, transform_signature,
-            self._rect_signature(visible_world), tuple(mask.contributors),
+            self._rect_signature(visible_world),
+            self._tone_mask_signature(mask_id, include_paint=False),
         )
         cached = self._tone_mask_contributor_cache.pop(
             contributor_key, None
@@ -7172,6 +7463,21 @@ class _CanvasLogic:
             pixels = (int(self.images.image(obj.object_id).cacheKey()),)
         live = ()
         if obj.object_id == self.selected_object_id:
+            selection_preview = ()
+            if (
+                isinstance(obj, RasterObject)
+                and self._selection_before_tiles is not None
+                and self._selection_transform_start_quad
+                and self._selection_transform_quad
+                and not self._drawing_selection_path.isEmpty()
+            ):
+                selection_preview = (
+                    self._gradient_path_signature(
+                        self._drawing_selection_path
+                    ),
+                    tuple(self._selection_transform_start_quad),
+                    tuple(self._selection_transform_quad),
+                )
             live = (
                 self._vector_eraser_preview_revision,
                 tuple(sorted(
@@ -7183,6 +7489,7 @@ class _CanvasLogic:
                 tuple(self._multi_transform_preview_quads.get(
                     obj.object_id, ()
                 )),
+                selection_preview,
             )
         return (
             json.dumps(
@@ -7280,6 +7587,15 @@ class _CanvasLogic:
             if item in self.chapter.modifiers
         ]
         world_bounds = self.object_world_rect(obj.object_id)
+        if isinstance(obj, RasterObject):
+            preview_bounds = self._raster_selection_preview_world_bounds(obj)
+            if preview_bounds is not None:
+                world_bounds = (
+                    preview_bounds
+                    if world_bounds is None else world_bounds.united(
+                        preview_bounds
+                    )
+                )
         if (
             world_bounds is None or world_bounds.isEmpty()
             or (not modifiers and obj.opacity_mask is None)
@@ -7374,10 +7690,8 @@ class _CanvasLogic:
                 )
             self._modifier_cache_put(cache_key, processed)
         opacity = parent_opacity if self._render_base_alpha else (
-            parent_opacity if obj.opacity_mask is not None else (
-                parent_opacity
-                if obj.opacity_locked else parent_opacity * obj.opacity
-            )
+            parent_opacity
+            if obj.opacity_locked else parent_opacity * obj.opacity
         )
         if obj.object_id == self._live_underlay_object_id:
             opacity *= 1.0 - self._live_underlay_amount
@@ -7410,6 +7724,12 @@ class _CanvasLogic:
             object_visible = self._drawing_local_visible_rect(
                 obj, local_visible, destination
             )
+            painter.translate(obj.x, obj.y)
+            if self._render_raster_selection_preview(
+                painter, obj, object_visible
+            ):
+                painter.restore()
+                return
             if object_visible is not None:
                 object_visible = object_visible.intersected(
                     QRectF(*obj.interaction_rect)
@@ -7418,20 +7738,137 @@ class _CanvasLogic:
                 obj.object_id, object_visible
             ):
                 painter.drawImage(
-                    obj.x + tile_x * obj.tile_size,
-                    obj.y + tile_y * obj.tile_size,
+                    tile_x * obj.tile_size,
+                    tile_y * obj.tile_size,
                     image,
                 )
             painter.restore()
             return
         painter.translate(obj.x, obj.y)
         object_visible = local_visible.translated(-obj.x, -obj.y)
+        if self._render_raster_selection_preview(
+            painter, obj, object_visible
+        ):
+            return
         for (tile_x, tile_y), image in self.tiles.iter_tiles(
             obj.object_id, object_visible
         ):
             painter.drawImage(
                 tile_x * obj.tile_size, tile_y * obj.tile_size, image
             )
+
+    def _raster_selection_preview_state(
+        self, obj: RasterObject,
+    ) -> tuple[
+        dict[tuple[int, int], QImage], QPainterPath, QTransform,
+    ] | None:
+        before_tiles = self._selection_before_tiles
+        source_quad = self._selection_transform_start_quad
+        destination_quad = self._selection_transform_quad
+        if (
+            obj.object_id != self.selected_object_id
+            or before_tiles is None
+            or not source_quad
+            or not destination_quad
+            or self._drawing_selection_path.isEmpty()
+        ):
+            return None
+        local_to_world = self._drawing_local_to_world_transform(obj)
+        world_to_local, valid = local_to_world.inverted()
+        if not valid:
+            return None
+        source_local = [
+            world_to_local.map(QPointF(x, y)).toTuple()
+            for x, y in source_quad
+        ]
+        destination_local = [
+            world_to_local.map(QPointF(x, y)).toTuple()
+            for x, y in destination_quad
+        ]
+        transform = self._quad_to_quad_transform(
+            source_local, destination_local
+        )
+        if not transform.isInvertible():
+            return None
+        return before_tiles, QPainterPath(self._drawing_selection_path), transform
+
+    @staticmethod
+    def _tile_mapping_bounds(
+        tiles: dict[tuple[int, int], QImage], tile_size: int,
+    ) -> QRectF:
+        bounds = QRectF()
+        first = True
+        for tile_x, tile_y in tiles:
+            tile = QRectF(
+                tile_x * tile_size, tile_y * tile_size,
+                tile_size, tile_size,
+            )
+            bounds = tile if first else bounds.united(tile)
+            first = False
+        return bounds
+
+    @staticmethod
+    def _draw_tile_mapping(
+        painter: QPainter, tiles: dict[tuple[int, int], QImage],
+        tile_size: int, visible: QRectF | None,
+    ) -> None:
+        for (tile_x, tile_y), image in tiles.items():
+            target = QRectF(
+                tile_x * tile_size, tile_y * tile_size,
+                tile_size, tile_size,
+            )
+            if visible is not None and not target.intersects(visible):
+                continue
+            painter.drawImage(target.topLeft(), image)
+
+    def _render_raster_selection_preview(
+        self, painter: QPainter, obj: RasterObject,
+        local_visible: QRectF | None,
+    ) -> bool:
+        state = self._raster_selection_preview_state(obj)
+        if state is None:
+            return False
+        before_tiles, source_path, transform = state
+        tile_bounds = self._tile_mapping_bounds(before_tiles, obj.tile_size)
+        if tile_bounds.isEmpty():
+            return True
+
+        unselected = QPainterPath()
+        unselected.addRect(tile_bounds)
+        unselected = unselected.subtracted(source_path)
+        painter.save()
+        painter.setClipPath(unselected, Qt.ClipOperation.IntersectClip)
+        self._draw_tile_mapping(
+            painter, before_tiles, obj.tile_size, local_visible
+        )
+        painter.restore()
+
+        source_visible = None
+        if local_visible is not None:
+            inverse, valid = transform.inverted()
+            if valid:
+                source_visible = inverse.mapRect(local_visible)
+        painter.save()
+        painter.setRenderHint(QPainter.SmoothPixmapTransform, True)
+        painter.setTransform(transform, True)
+        painter.setClipPath(source_path, Qt.ClipOperation.IntersectClip)
+        self._draw_tile_mapping(
+            painter, before_tiles, obj.tile_size, source_visible
+        )
+        painter.restore()
+        return True
+
+    def _raster_selection_preview_world_bounds(
+        self, obj: RasterObject,
+    ) -> QRectF | None:
+        state = self._raster_selection_preview_state(obj)
+        if state is None:
+            return None
+        _tiles, source_path, transform = state
+        target_path = transform.map(source_path)
+        return self._drawing_local_to_world_transform(obj).map(
+            target_path
+        ).boundingRect()
 
     def _text_document(self, obj: TextObject, width: float) -> QTextDocument:
         document = QTextDocument()
@@ -7931,6 +8368,7 @@ class _CanvasLogic:
             ToolKind.DRAW_SELECT_RECT,
             ToolKind.DRAW_SELECT_LASSO,
             ToolKind.DRAW_SELECT_STROKE,
+            ToolKind.FILL,
         }:
             self._draw_drawing_selection(painter)
         if (
@@ -8063,7 +8501,7 @@ class _CanvasLogic:
                         self._object_transform_cage_visible(selected_object)
                         or self.tool == ToolKind.TRANSFORM
                         or (
-                            self.tool == ToolKind.SHAPE_EDIT
+                            self.tool in {ToolKind.SHAPE_EDIT, ToolKind.GRADIENT}
                             and isinstance(selected_object, GradientObject)
                             and selected_object.field_type in {"line", "radial"}
                         )
@@ -8114,7 +8552,7 @@ class _CanvasLogic:
                         painter, selected_object
                     )
                 if (
-                    self.tool == ToolKind.SHAPE_EDIT
+                    self.tool in {ToolKind.SHAPE_EDIT, ToolKind.GRADIENT}
                     and isinstance(selected_object, GradientObject)
                 ):
                     self._draw_gradient_edit_handles(
@@ -8902,7 +9340,7 @@ class _CanvasLogic:
                 and obj.layout_mode == "free"
             )
             or (
-                self.tool == ToolKind.SHAPE_EDIT
+                self.tool in {ToolKind.SHAPE_EDIT, ToolKind.GRADIENT}
                 and isinstance(obj, GradientObject)
                 and obj.field_type in {"line", "radial"}
             )
@@ -9121,6 +9559,14 @@ class _CanvasLogic:
                 if path.contains(world) or stroker.createStroke(path).contains(world)
                 else ""
             )
+        if (
+            self.tool == ToolKind.TRANSFORM
+            and (
+                self.selected_kind == "layer"
+                or len(self.selected_entities) > 1
+            )
+        ):
+            return self._transform_control_hit(quad, world)[0]
         obj = self.chapter.objects.get(self.selected_object_id)
         if isinstance(obj, (RasterObject, VectorDrawingObject, ImageObject)):
             return self._selected_object_transform_hit(obj, quad, world)[0]
@@ -9218,7 +9664,11 @@ class _CanvasLogic:
                     Qt.RoundCap, Qt.RoundJoin,
                 ))
                 painter.setBrush(Qt.NoBrush)
-                local_path = self._vector_centerline_path(stroke)
+                overlay_stroke = (
+                    self._vector_stroke_with_selection_preview(stroke)
+                    if self._selection_vector_preview else stroke
+                )
+                local_path = self._vector_centerline_path(overlay_stroke)
                 mapped_path = QPainterPath()
                 for polygon in local_path.toSubpathPolygons():
                     mapped_path.addPolygon(QPolygonF([
@@ -10054,7 +10504,7 @@ class _CanvasLogic:
             }
         if self.tool == ToolKind.SHAPE_EDIT and self.selected_kind == "layer":
             layer = self.chapter.layers.get(self.selected_id)
-            if layer is None or layer.bound is None or layer.layer_kind == "fill":
+            if layer is None or layer.bound is None:
                 return None
             return {
                 "mode": "edit",
@@ -10443,7 +10893,12 @@ class _CanvasLogic:
             self._draw_shape_overlay(painter)
         elif len(self._creation_points) >= 2:
             first, second = self._creation_points[0], self._creation_points[-1]
-            if self.tool in {ToolKind.BOX_BOUND, ToolKind.RASTER_CREATE}:
+            if (
+                self.tool == ToolKind.GRADIENT
+                and self._gradient_creation_type == "line"
+            ):
+                painter.drawLine(QPointF(*first), QPointF(*second))
+            elif self.tool in {ToolKind.BOX_BOUND, ToolKind.RASTER_CREATE}:
                 painter.drawRect(QRectF(QPointF(*first), QPointF(*second)).normalized())
             else:
                 radius = math.dist(first, second)
@@ -10492,16 +10947,6 @@ class _CanvasLogic:
             return world_quad(self._rect_quad(local))
         if isinstance(obj, ImageObject):
             return world_quad(self._image_local_quad(obj))
-        if isinstance(obj, VectorFillObject):
-            owner = self.chapter.objects.get(obj.owner_drawing_id)
-            owner_x = owner.x if isinstance(owner, VectorDrawingObject) else 0.0
-            owner_y = owner.y if isinstance(owner, VectorDrawingObject) else 0.0
-            left, top, width, height = obj.derived_bounds()
-            local = QRectF(
-                owner_x + left, owner_y + top,
-                max(1.0, width), max(1.0, height),
-            )
-            return world_quad(self._rect_quad(local))
         if isinstance(obj, GradientObject):
             if obj.field_type == "line":
                 bounds = self.bound_path(
@@ -10672,20 +11117,9 @@ class _CanvasLogic:
             for child in layer.children:
                 if child.kind == "object":
                     result.append(("object", child.entity_id))
-                    obj = self.chapter.objects.get(child.entity_id)
-                    if isinstance(obj, VectorDrawingObject):
-                        result.extend(
-                            ("object", fill_id)
-                            for fill_id in obj.fill_child_ids
-                            if fill_id in self.chapter.objects
-                        )
                 else:
                     candidate = self.chapter.layers[child.entity_id]
-                    if (
-                        not candidate.is_page
-                        and candidate.layer_kind != "fill"
-                        and candidate.bound is not None
-                    ):
+                    if not candidate.is_page and candidate.bound is not None:
                         result.append(("layer", child.entity_id))
                     walk(child.entity_id)
 
@@ -10720,18 +11154,6 @@ class _CanvasLogic:
                 ):
                     return True
             return False
-        if isinstance(obj, VectorFillObject):
-            owner = self.chapter.objects.get(obj.owner_drawing_id)
-            if (
-                not isinstance(owner, VectorDrawingObject)
-                or not owner.visible
-                or (not owner.opacity_locked and owner.opacity <= 0)
-                or (not obj.opacity_locked and obj.opacity <= 0)
-                or QColor(obj.fill_color).alpha() <= 0
-            ):
-                return False
-            local = self._vector_local_point(owner, point)
-            return self.bound_path(obj.geometry).contains(local)
         if isinstance(obj, GradientObject):
             if not obj.opacity_locked and obj.opacity <= 0:
                 return False
@@ -10807,7 +11229,6 @@ class _CanvasLogic:
         if (
             not layer.visible or layer.bound is None
             or (layer.is_page and not include_pages)
-            or layer.layer_kind == "fill"
             or (
                 not raw
                 and not self._point_inside_parent_masks(layer_id, point)
@@ -11449,6 +11870,115 @@ class _CanvasLogic:
             return "rotate"
         return None
 
+    def _update_interaction_cursor(self, widget_point: QPointF) -> None:
+        """Resolve the canvas cursor identically for mouse and pen input."""
+        if self.chapter is None:
+            self.unsetCursor()
+            return
+        point = QPointF(widget_point)
+        world = self.widget_to_document(point)
+        shape_overlay_hit = self._shape_overlay_hit(point)
+        shape_hover_kind = (
+            self._shape_hover_target.get("kind")
+            if (
+                self.tool in {ToolKind.SHAPE_CREATE, ToolKind.SHAPE_EDIT}
+                and self._shape_hover_target
+            ) else None
+        )
+        if shape_hover_kind not in {None, "interior"}:
+            shape_overlay_hit = ""
+        over_text_property = bool(self._text_property_handle_hit(point))
+        selected_object = self.chapter.objects.get(self.selected_object_id)
+        selected_gradient = (
+            selected_object
+            if isinstance(selected_object, GradientObject) else None
+        )
+        gradient_hit = (
+            self._gradient_control_hit(selected_gradient, world)
+            if self.tool in {ToolKind.SHAPE_EDIT, ToolKind.GRADIENT}
+            and selected_gradient is not None else None
+        )
+        page_gap_hit = self._page_gap_hit(world)
+        over_selected_text = False
+        if self.tool == ToolKind.TEXT_EDIT and isinstance(
+            selected_object, TextObject
+        ):
+            text_path = QPainterPath()
+            text_path.addPolygon(QPolygonF([
+                QPointF(*candidate)
+                for candidate in self.object_world_quad(
+                    selected_object.object_id
+                )
+            ]))
+            over_selected_text = text_path.contains(world)
+
+        transform_hover = self._active_transform_hover_kind(world)
+        translation_active = bool(
+            self._transform_drag_mode == "translate"
+            or self._selection_transform_mode == "translate"
+            or self._active_shape_control == "translate"
+            or self._pending_raster_transform_press is not None
+            or self._page_gap_drag_mode == "band"
+        )
+        transform_precision_active = bool(
+            (
+                self._transform_drag_mode
+                and self._transform_drag_mode != "translate"
+            )
+            or (
+                self._selection_transform_mode
+                and self._selection_transform_mode != "translate"
+            )
+        )
+        shape_precision_active = bool(
+            self._active_shape_control
+            and self._active_shape_control != "translate"
+        )
+
+        if translation_active:
+            self.setCursor(Qt.ClosedHandCursor)
+        elif self._page_gap_drag_mode in {"top", "bottom"}:
+            self.setCursor(Qt.PointingHandCursor)
+        elif page_gap_hit == "band":
+            self.setCursor(Qt.OpenHandCursor)
+        elif page_gap_hit in {"top", "bottom"}:
+            self.setCursor(Qt.PointingHandCursor)
+        elif self.tool == ToolKind.INSERT_PAGE_GAP:
+            self.setCursor(
+                Qt.PointingHandCursor
+                if self._page_gap_hover else Qt.ForbiddenCursor
+            )
+        elif self._shape_property_drag is not None:
+            self.setCursor(Qt.CursorShape.SizeHorCursor)
+        elif transform_precision_active or shape_precision_active:
+            self.setCursor(Qt.CrossCursor)
+        elif self._transform_mode_gizmo_rect().contains(point):
+            self.setCursor(Qt.PointingHandCursor)
+        elif shape_overlay_hit in {"base_thickness", "outline_thickness"}:
+            self.setCursor(Qt.CursorShape.SizeHorCursor)
+        elif gradient_hit is not None:
+            self.setCursor(Qt.PointingHandCursor)
+        elif shape_hover_kind not in {None, "interior"}:
+            self.setCursor(Qt.CrossCursor)
+        elif shape_overlay_hit:
+            self.setCursor(Qt.PointingHandCursor)
+        elif over_text_property:
+            self.setCursor(Qt.CursorShape.SizeHorCursor)
+        elif transform_hover in {"handle", "rotate", "pivot"}:
+            self.setCursor(Qt.CrossCursor)
+        elif transform_hover == "translate" or shape_hover_kind == "interior":
+            self.setCursor(Qt.OpenHandCursor)
+        elif self.tool == ToolKind.DRAW_SELECT_STROKE:
+            self.setCursor(Qt.PointingHandCursor)
+        elif self.tool in {
+            ToolKind.DRAW_SELECT_RECT, ToolKind.DRAW_SELECT_LASSO,
+        }:
+            self.setCursor(Qt.CrossCursor)
+        elif over_selected_text:
+            self.setCursor(Qt.CursorShape.IBeamCursor)
+        else:
+            self.unsetCursor()
+
     def mousePressEvent(self, event: QMouseEvent) -> None:  # noqa: N802
         if self.chapter is None:
             self._clear_detached_input_state()
@@ -11469,6 +11999,7 @@ class _CanvasLogic:
         self._dispatch_tool_press(
             event.position(), 1.0, event.modifiers()
         )
+        self._update_interaction_cursor(event.position())
 
     def mouseMoveEvent(self, event: QMouseEvent) -> None:  # noqa: N802
         if self.chapter is None:
@@ -11487,59 +12018,9 @@ class _CanvasLogic:
             self._update_creation_hover(world)
         elif self.tool == ToolKind.SHAPE_EDIT:
             self._update_shape_hover(world)
-        shape_overlay_hit = self._shape_overlay_hit(QPointF(event.position()))
-        if self._shape_hover_target and self._shape_hover_target.get("kind") \
-                not in {None, "interior"}:
-            shape_overlay_hit = ""
-        over_text_property = bool(
-            self._text_property_handle_hit(QPointF(event.position()))
-        )
-        selected_text = self.chapter.objects.get(self.selected_object_id)
-        over_selected_text = False
-        if self.tool == ToolKind.TEXT_EDIT and isinstance(selected_text, TextObject):
-            text_path = QPainterPath()
-            text_path.addPolygon(QPolygonF([
-                QPointF(*point)
-                for point in self.object_world_quad(selected_text.object_id)
-            ]))
-            over_selected_text = text_path.contains(world)
-        transform_hover = self._active_transform_hover_kind(world)
-        cage_drag_active = bool(
-            self._transform_drag_mode
-            or self._selection_transform_mode
-            or self._geometry_transform_target
-        )
-        if cage_drag_active:
-            self.setCursor(Qt.ClosedHandCursor)
-        elif self._transform_mode_gizmo_rect().contains(event.position()):
-            self.setCursor(Qt.PointingHandCursor)
-        elif shape_overlay_hit in {"base_thickness", "outline_thickness"}:
-            self.setCursor(Qt.CursorShape.SizeHorCursor)
-        elif self._shape_hover_target and self._shape_hover_target.get("kind") \
-                not in {None, "interior"}:
-            self.setCursor(Qt.CrossCursor)
-        elif shape_overlay_hit:
-            self.setCursor(Qt.PointingHandCursor)
-        elif over_text_property:
-            self.setCursor(Qt.CursorShape.SizeHorCursor)
-        elif transform_hover in {"handle", "rotate", "pivot"}:
-            self.setCursor(Qt.CrossCursor)
-        elif transform_hover == "translate":
-            self.setCursor(Qt.OpenHandCursor)
-        elif self.tool == ToolKind.DRAW_SELECT_STROKE:
-            self.setCursor(Qt.PointingHandCursor)
-        elif self.tool in {
-            ToolKind.DRAW_SELECT_RECT, ToolKind.DRAW_SELECT_LASSO,
-        }:
-            self.setCursor(Qt.CrossCursor)
-        elif self.tool == ToolKind.TRANSFORM:
-            self.setCursor(Qt.OpenHandCursor)
-        elif over_selected_text:
-            self.setCursor(Qt.CursorShape.IBeamCursor)
-        else:
-            self.unsetCursor()
         input_started = time.perf_counter_ns()
         self._tool_move(event.position(), 1.0)
+        self._update_interaction_cursor(event.position())
         if self._drawing or self._vector_gesture_mode in {"pencil", "eraser"}:
             elapsed = (time.perf_counter_ns() - input_started) / 1_000_000
             self._performance.input_ms.append(elapsed)
@@ -11558,6 +12039,7 @@ class _CanvasLogic:
             return
         if event.button() == Qt.LeftButton:
             self._tool_release()
+            self._update_interaction_cursor(event.position())
 
     def mouseDoubleClickEvent(self, event: QMouseEvent) -> None:  # noqa: N802
         if (
@@ -11668,7 +12150,7 @@ class _CanvasLogic:
             and self._gradient_creation_parent_id
         ):
             self._cancel_gradient_creation()
-            self.set_tool(ToolKind.SHAPE_EDIT)
+            self.set_tool(ToolKind.GRADIENT)
             event.accept()
             return
         if self._handle_text_key(event):
@@ -11680,6 +12162,16 @@ class _CanvasLogic:
             self._cancel_vector_gesture(restore=True)
             self.interactionFinished.emit()
             return
+        if event.key() == Qt.Key_Escape and self._cancel_fill_gesture(
+            restore=True
+        ):
+            self.interactionFinished.emit()
+            event.accept()
+            return
+        if event.key() == Qt.Key_Escape and self._cancel_fill_job():
+            self.interactionFinished.emit()
+            event.accept()
+            return
         if self.tool == ToolKind.SHAPE_CREATE:
             if (
                 event.key() in (Qt.Key_Return, Qt.Key_Enter)
@@ -11690,7 +12182,7 @@ class _CanvasLogic:
             if event.key() == Qt.Key_Escape:
                 if self._gradient_creation_parent_id:
                     self._cancel_gradient_creation()
-                    self.set_tool(ToolKind.SHAPE_EDIT)
+                    self.set_tool(ToolKind.GRADIENT)
                     return
                 self._clear_creation_gesture()
                 self.update()
@@ -11805,6 +12297,11 @@ class _CanvasLogic:
             event.accept()
             return
         self._tablet_hover_widget = QPointF(event.position())
+        hover_world = self.widget_to_document(event.position())
+        if self.tool == ToolKind.SHAPE_CREATE and self._creation_nodes:
+            self._update_creation_hover(hover_world)
+        elif self.tool == ToolKind.SHAPE_EDIT:
+            self._update_shape_hover(hover_world)
         nav = self._navigation_mode()
         if event.type() == QEvent.TabletPress:
             # A real pen-down wins over any finger gesture already in flight.
@@ -11880,6 +12377,8 @@ class _CanvasLogic:
                 self._pen_contact_active = False
                 self._tablet_tool_active = False
                 self._tool_release()
+        if self._nav_mode is None:
+            self._update_interaction_cursor(event.position())
         if not (
             self._drawing
             or self._vector_gesture_mode in {"pencil", "eraser"}
@@ -12660,6 +13159,7 @@ class _CanvasLogic:
         start = self._selection_transform_start_quad
         if not start:
             return
+        previous_quad = list(self._selection_transform_quad or start)
         mode = self._selection_transform_mode
         pivot = self._selection_pivot or QPointF(
             sum(x for x, _ in start) / 4,
@@ -12757,6 +13257,16 @@ class _CanvasLogic:
                     ),
                 }
             self._selection_vector_preview_revision += 1
+        dirty = QPolygonF([
+            QPointF(*candidate) for candidate in previous_quad
+        ]).boundingRect().united(QPolygonF([
+            QPointF(*candidate) for candidate in target
+        ]).boundingRect()).adjusted(-3, -3, 3, 3)
+        if isinstance(obj, RasterObject):
+            if self._object_is_mask_contributor(obj.object_id):
+                self._invalidate_tone_mask_overlay()
+            dirty = self.modifier_expanded_dirty(obj.object_id, dirty)
+        self._mark_scene_dirty_world(dirty)
         self.update()
 
     def _restore_drawing_transform_model(
@@ -14779,17 +15289,6 @@ class _CanvasLogic:
         ):
             self._vector_simplify_overlay.append(sample)
 
-    def _vector_fill_settings(self) -> dict:
-        return {
-            "close_gaps": self.settings.fill_close_gaps,
-            "gap_threshold": self.settings.fill_gap_threshold,
-            "fill_narrow_areas": self.settings.fill_narrow_areas,
-            "area_scaling": self.settings.fill_area_scaling,
-            "area_amount": self.settings.fill_area_amount,
-            "area_mode": self.settings.fill_area_mode,
-            "mode": self.settings.fill_mode,
-        }
-
     def _raster_fill_visual_changed(
         self, object_id: str, world: QRectF,
     ) -> None:
@@ -14803,300 +15302,1083 @@ class _CanvasLogic:
         if not widget.isEmpty():
             self.update(widget)
 
-    def _apply_raster_fill(
-        self, obj: RasterObject, world_point: QPointF,
-    ) -> bool:
-        local = self._raster_local_point(obj, world_point)
-        frame = QRectF(*obj.interaction_rect)
-        if not frame.contains(local):
-            return False
-        before: dict[tuple[int, int], QImage | None] = {}
-        dirty_local = self.tiles.flood_fill(
-            obj.object_id, local, frame, QColor(self.primary_color),
-            self.settings.raster_fill_tolerance, before,
+    def _active_fill_color(self) -> QColor:
+        if self.active_color_slot == "secondary":
+            return QColor(self.secondary_color)
+        return QColor(self.primary_color)
+
+    def _snapshot_fill_object_tiles(
+        self, object_id: str,
+    ) -> dict[tuple[int, int], QImage]:
+        return {
+            key: QImage(image)
+            for key, image in self.tiles.object_tiles(object_id).items()
+        }
+
+    @staticmethod
+    def _fill_reference_settings_signature(
+        profile: dict[str, object],
+    ) -> tuple:
+        return tuple(sorted(
+            (name, repr(profile.get(name))) for name in (
+                "reference_mode", "exclude_editing_target",
+                "exclude_images", "exclude_gradients", "exclude_mask_only",
+                "fill_up_to_vector_path", "include_vector_path",
+            )
+        ))
+
+    def _clear_fill_replay(self) -> None:
+        self._fill_replay_timer.stop()
+        if self._fill_replay_cancel is not None:
+            self._fill_replay_cancel.set()
+            self._fill_replay_cancel = None
+        self._fill_replay_pending_tolerance = None
+        self._fill_replay_generation += 1
+        self._fill_replay_state = None
+
+    def validate_fill_replay_history(self) -> None:
+        state = self._fill_replay_state
+        if (
+            state is not None
+            and self.command_stack.top_undo_command is not state.command
+        ):
+            self._clear_fill_replay()
+
+    def _install_fill_replay(
+        self, obj: RasterObject, command: TilePatchCommand,
+        steps: list[tuple[QPointF | None, QPainterPath | None, str]],
+        dirty_world: QRectF,
+    ) -> None:
+        profile = dict(self._fill_operation_profile)
+        entities = self._fill_reference_entities(obj, profile)
+        self._fill_replay_generation += 1
+        self._fill_replay_state = _FillReplayState(
+            chapter=self.chapter,
+            object_id=obj.object_id,
+            object_model=json.dumps(obj.to_dict(), sort_keys=True),
+            command=command,
+            history_revision=self.command_stack.revision,
+            base_tiles={
+                key: QImage(image)
+                for key, image in self._fill_operation_base_tiles.items()
+            },
+            steps=[
+                (
+                    QPointF(point) if point is not None else None,
+                    QPainterPath(path) if path is not None else None,
+                    str(policy),
+                )
+                for point, path, policy in steps
+            ],
+            selection_path=QPainterPath(self._fill_operation_selection),
+            color=QColor(self._fill_operation_color),
+            profile=profile,
+            reference_entities=list(entities),
+            reference_signature=self._fill_reference_signature(
+                entities, skip_pixels_for=obj.object_id
+            ),
+            reference_settings=self._fill_reference_settings_signature(profile),
+            reference_tiles={
+                key: QImage(image)
+                for key, image in self._fill_operation_reference_tiles.items()
+            },
+            current_signature=self._fill_object_signature(obj.object_id),
+            dirty_world=QRectF(dirty_world),
         )
-        if dirty_local.isEmpty() or not before:
+
+    def _fill_replay_is_eligible(self, state: _FillReplayState) -> bool:
+        if (
+            self.chapter is not state.chapter
+            or self.selected_object_id != state.object_id
+            or self.command_stack.top_undo_command is not state.command
+            or self.command_stack.revision != state.history_revision
+        ):
             return False
-        after = self.tiles.snapshot(obj.object_id, set(before))
+        obj = self.chapter.objects.get(state.object_id)
+        if (
+            not isinstance(obj, RasterObject)
+            or json.dumps(obj.to_dict(), sort_keys=True) != state.object_model
+            or self._fill_object_signature(state.object_id)
+            != state.current_signature
+        ):
+            return False
+        entities = self._fill_reference_entities(obj, state.profile)
+        return (
+            entities == state.reference_entities
+            and self._fill_reference_signature(
+                entities, skip_pixels_for=state.object_id
+            ) == state.reference_signature
+        )
+
+    def request_fill_tolerance_replay(
+        self, tolerance: int, immediate: bool = False,
+    ) -> None:
+        tolerance = max(0, min(255, int(tolerance)))
+        state = self._fill_replay_state
+        if state is None or not self._fill_replay_is_eligible(state):
+            if state is not None:
+                self._clear_fill_replay()
+            return
+        if self._fill_replay_cancel is not None:
+            self._fill_replay_cancel.set()
+            self._fill_replay_cancel = None
+            self._fill_replay_generation += 1
+        self._fill_replay_pending_tolerance = tolerance
+        if immediate:
+            self._fill_replay_timer.stop()
+            self._recalculate_last_fill_tolerance()
+        else:
+            self._fill_replay_timer.start(75)
+
+    def _start_fill_replay_worker(
+        self, state: _FillReplayState, obj: RasterObject,
+        profile: dict[str, object], tolerance: int,
+    ) -> bool:
+        frame = QRectF(*obj.interaction_rect)
+        keys = self.tiles.keys_for_rect(frame)
+        mode = str(profile.get("reference_mode", "editing"))
+        reference_tiles: dict[tuple[int, int], QImage] | None = None
+        if mode != "editing":
+            required = len(keys) * self.tiles.tile_size ** 2 * 4
+            if required > self._fill_reference_tile_cache_budget:
+                return False
+            signature = self._fill_reference_signature(
+                state.reference_entities
+            )
+            reference_tiles = {}
+            for key in keys:
+                stored = state.reference_tiles.get(key)
+                if stored is None:
+                    image = self._fill_reference_tile(
+                        obj, key, profile,
+                        entities=state.reference_entities,
+                        signature=signature,
+                        settings_signature=state.reference_settings,
+                    )
+                    stored = QImage(image) if image is not None else QImage()
+                    state.reference_tiles[key] = QImage(stored)
+                reference_tiles[key] = QImage(stored)
+        detached = TileStore(self.tiles.tile_size)
+        detached.replace_object_tiles(state.object_id, state.base_tiles)
+        self._fill_replay_generation += 1
+        generation = self._fill_replay_generation
+        cancel_event = threading.Event()
+        self._fill_replay_cancel = cancel_event
+        worker = _FillReplayWorker(
+            detached, state.object_id, frame, state.steps,
+            state.selection_path, state.color, profile,
+            reference_tiles, cancel_event, {
+                "generation": generation,
+                "state": state,
+                "tolerance": tolerance,
+                "expected_signature": state.current_signature,
+            },
+        )
+        worker.signals.finished.connect(self._finish_fill_replay_worker)
+        self._fill_workers.add(worker)
+        QThreadPool.globalInstance().start(worker)
+        return True
+
+    def _finish_fill_replay_worker(
+        self, worker: _FillReplayWorker, result: dict,
+    ) -> None:
+        self._fill_workers.discard(worker)
+        generation = int(result.get("generation", -1))
+        if generation == self._fill_replay_generation:
+            self._fill_replay_cancel = None
+        state = result.get("state")
+        if (
+            result.get("cancelled")
+            or result.get("error") is not None
+            or not isinstance(state, _FillReplayState)
+            or state is not self._fill_replay_state
+            or generation != self._fill_replay_generation
+            or state.current_signature != result.get("expected_signature")
+            or not self._fill_replay_is_eligible(state)
+        ):
+            return
+        obj = self.chapter.objects[state.object_id]
+        replay_before = result.get("before") or {}
+        replay_after = result.get("after") or {}
+        keys = set(state.command.before) | set(replay_before)
+        for key in keys:
+            base = state.base_tiles.get(key)
+            image = (
+                replay_after.get(key)
+                if key in replay_before else base
+            )
+            self.tiles.set_tile(
+                state.object_id, key, QImage(image) if image is not None else None
+            )
+            state.command.before[key] = (
+                QImage(base) if base is not None else None
+            )
+            state.command.after[key] = (
+                QImage(image) if image is not None else None
+            )
+        tolerance = max(0, min(255, int(result.get("tolerance", 16))))
+        state.profile["tolerance"] = tolerance
+        state.current_signature = self._fill_object_signature(state.object_id)
+        dirty_local = QRectF(result.get("dirty") or QRectF())
+        new_world = (
+            self.modifier_expanded_dirty(
+                state.object_id,
+                self._drawing_local_rect_to_world(obj, dirty_local),
+            )
+            if not dirty_local.isEmpty() else QRectF()
+        )
+        dirty_world = QRectF(state.dirty_world)
+        if not new_world.isEmpty():
+            dirty_world = (
+                QRectF(new_world) if dirty_world.isEmpty()
+                else dirty_world.united(new_world)
+            )
+        state.dirty_world = QRectF(dirty_world)
+        self._preserve_fill_reference_cache = True
+        try:
+            self._raster_fill_visual_changed(state.object_id, dirty_world)
+        finally:
+            self._preserve_fill_reference_cache = False
+        self.interactionFinished.emit()
+
+    def _recalculate_last_fill_tolerance(self) -> None:
+        state = self._fill_replay_state
+        tolerance = self._fill_replay_pending_tolerance
+        self._fill_replay_pending_tolerance = None
+        if (
+            state is None or tolerance is None
+            or not self._fill_replay_is_eligible(state)
+        ):
+            if state is not None and not self._fill_replay_is_eligible(state):
+                self._clear_fill_replay()
+            return
+        obj = self.chapter.objects[state.object_id]
+        profile = dict(state.profile)
+        profile["tolerance"] = tolerance
+        if (
+            len(self.tiles.keys_for_rect(QRectF(*obj.interaction_rect))) > 16
+            and self._start_fill_replay_worker(
+                state, obj, profile, tolerance
+            )
+        ):
+            return
+        detached = TileStore(self.tiles.tile_size)
+        detached.replace_object_tiles(state.object_id, state.base_tiles)
+        replay_before: dict[tuple[int, int], QImage | None] = {}
+        dirty_local = QRectF()
+
+        def reference_tile(key: tuple[int, int]) -> QImage | None:
+            stored = state.reference_tiles.get(key)
+            if stored is not None:
+                return None if stored.isNull() else QImage(stored)
+            image = self._fill_reference_tile(
+                obj, key, profile, entities=state.reference_entities,
+                signature=self._fill_reference_signature(
+                    state.reference_entities
+                ),
+                settings_signature=state.reference_settings,
+            )
+            state.reference_tiles[key] = (
+                QImage(image) if image is not None else QImage()
+            )
+            return image
+
+        mode = str(profile.get("reference_mode", "editing"))
+        for point, extra_path, policy in state.steps:
+            selection = QPainterPath(state.selection_path)
+            if extra_path is not None:
+                selection = (
+                    QPainterPath(extra_path) if selection.isEmpty()
+                    else selection.intersected(extra_path)
+                )
+            changed = detached.advanced_fill(
+                state.object_id, point, QRectF(*obj.interaction_rect),
+                state.color, profile, replay_before,
+                region_policy=policy,
+                reference_tile=(None if mode == "editing" else reference_tile),
+                selection_tile=lambda key, path=selection: (
+                    self._fill_path_mask_tile(path, key)
+                ),
+            )
+            if not changed.isEmpty():
+                dirty_local = (
+                    QRectF(changed) if dirty_local.isEmpty()
+                    else dirty_local.united(changed)
+                )
+
+        keys = set(state.command.before) | set(replay_before)
+        result_tiles = detached.object_tiles(state.object_id)
+        for key in keys:
+            image = result_tiles.get(key)
+            self.tiles.set_tile(
+                state.object_id, key, QImage(image) if image is not None else None
+            )
+            base = state.base_tiles.get(key)
+            state.command.before[key] = (
+                QImage(base) if base is not None else None
+            )
+            state.command.after[key] = (
+                QImage(image) if image is not None else None
+            )
+        state.profile["tolerance"] = tolerance
+        state.current_signature = self._fill_object_signature(state.object_id)
+        new_world = (
+            self.modifier_expanded_dirty(
+                state.object_id,
+                self._drawing_local_rect_to_world(obj, dirty_local),
+            )
+            if not dirty_local.isEmpty() else QRectF()
+        )
+        dirty_world = QRectF(state.dirty_world)
+        if not new_world.isEmpty():
+            dirty_world = (
+                QRectF(new_world) if dirty_world.isEmpty()
+                else dirty_world.united(new_world)
+            )
+        state.dirty_world = QRectF(dirty_world)
+        self._preserve_fill_reference_cache = True
+        try:
+            self._raster_fill_visual_changed(state.object_id, dirty_world)
+        finally:
+            self._preserve_fill_reference_cache = False
+        self.interactionFinished.emit()
+
+    def _cancel_fill_job(self) -> bool:
+        event = self._fill_job_cancel
+        if event is None:
+            return False
+        event.set()
+        self._fill_job_cancel = None
+        self._fill_job_generation += 1
+        return True
+
+    def _fill_object_signature(self, object_id: str) -> tuple:
+        return tuple(sorted(
+            (key, int(image.cacheKey()))
+            for key, image in self.tiles.object_tiles(object_id).items()
+        ))
+
+    def _start_async_fill(
+        self, obj: RasterObject, local: QPointF | None, frame: QRectF,
+        profile: dict[str, object], extra_path: QPainterPath | None,
+        color: QColor, region_policy: str,
+        reference_tiles: dict[tuple[int, int], QImage] | None = None,
+    ) -> bool:
+        """Run a large editing-layer fill off-thread on detached QImages."""
+        self._cancel_fill_job()
+        self._fill_job_generation += 1
+        generation = self._fill_job_generation
+        cancel_event = threading.Event()
+        self._fill_job_cancel = cancel_event
+        self._fill_job_error = None
+        detached = TileStore(self.tiles.tile_size)
+        detached.replace_object_tiles(
+            obj.object_id, self.tiles.object_tiles(obj.object_id)
+        )
+        selection = QPainterPath(self._drawing_selection_path)
+        if extra_path is not None:
+            selection = (
+                QPainterPath(extra_path) if selection.isEmpty()
+                else selection.intersected(extra_path)
+            )
+        tile_size = self.tiles.tile_size
+
+        def selection_tile(key: tuple[int, int]) -> np.ndarray | None:
+            if selection.isEmpty():
+                return None
+            image = QImage(
+                tile_size, tile_size,
+                QImage.Format.Format_ARGB32_Premultiplied,
+            )
+            image.fill(Qt.GlobalColor.transparent)
+            painter = QPainter(image)
+            painter.translate(-key[0] * tile_size, -key[1] * tile_size)
+            painter.fillPath(selection, QColor("white"))
+            painter.end()
+            rgba = image.convertToFormat(QImage.Format.Format_RGBA8888)
+            values = np.frombuffer(bytes(rgba.constBits()), dtype=np.uint8)
+            return values.reshape((tile_size, tile_size, 4))[..., 3] > 0
+
+        context = {
+            "generation": generation,
+            "chapter": self.chapter,
+            "object_id": obj.object_id,
+            "object_model": json.dumps(obj.to_dict(), sort_keys=True),
+            "base_signature": self._fill_object_signature(obj.object_id),
+        }
+        worker = _FillWorker(
+            detached, obj.object_id, local, frame,
+            color, profile, region_policy, selection_tile,
+            reference_tiles, cancel_event, context,
+        )
+        worker.signals.finished.connect(self._finish_async_fill)
+        self._fill_workers.add(worker)
+        QThreadPool.globalInstance().start(worker)
+        return True
+
+    def _finish_async_fill(
+        self, worker: _FillWorker, result: dict,
+    ) -> None:
+        self._fill_workers.discard(worker)
+        generation = int(result.get("generation", -1))
+        if generation == self._fill_job_generation:
+            self._fill_job_cancel = None
+        error = result.get("error")
+        if isinstance(error, Exception):
+            self._fill_job_error = error
+        object_id = str(result.get("object_id", ""))
+        obj = (
+            self.chapter.objects.get(object_id)
+            if self.chapter is result.get("chapter") else None
+        )
+        if (
+            result.get("cancelled") or error is not None
+            or generation != self._fill_job_generation
+            or not isinstance(obj, RasterObject)
+            or json.dumps(obj.to_dict(), sort_keys=True)
+            != result.get("object_model")
+            or self._fill_object_signature(object_id)
+            != result.get("base_signature")
+        ):
+            self.interactionFinished.emit()
+            return
+        before = result.get("before") or {}
+        after = result.get("after") or {}
+        dirty_local = QRectF(result.get("dirty") or QRectF())
+        if not before or dirty_local.isEmpty():
+            self.interactionFinished.emit()
+            return
+        for key, image in after.items():
+            self.tiles.set_tile(object_id, key, image)
+        dirty_world = self.modifier_expanded_dirty(
+            object_id, self._drawing_local_rect_to_world(obj, dirty_local)
+        )
+        callback = lambda target=object_id, rect=QRectF(dirty_world): (
+            self._raster_fill_visual_changed(target, rect)
+        )
+        command = TilePatchCommand(
+            "Fill Selection", self.tiles, object_id,
+            before, after, callback,
+        )
+        self.command_stack.push(command, already_done=True)
+        self._install_fill_replay(
+            obj, command, [(None, None, "area")], dirty_world
+        )
+        self._raster_fill_visual_changed(object_id, dirty_world)
+        self.interactionFinished.emit()
+
+    def _fill_selection_mask_tile(
+        self, key: tuple[int, int], extra_path: QPainterPath | None = None,
+    ) -> np.ndarray | None:
+        path = QPainterPath(self._drawing_selection_path)
+        if extra_path is not None:
+            path = (
+                QPainterPath(extra_path) if path.isEmpty()
+                else path.intersected(extra_path)
+            )
+        if path.isEmpty():
+            return None
+        return self._fill_path_mask_tile(path, key)
+
+    def _fill_path_mask_tile(
+        self, path: QPainterPath, key: tuple[int, int],
+    ) -> np.ndarray | None:
+        if path.isEmpty():
+            return None
+        size = self.tiles.tile_size
+        image = QImage(
+            size, size, QImage.Format.Format_ARGB32_Premultiplied
+        )
+        image.fill(Qt.GlobalColor.transparent)
+        painter = QPainter(image)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, False)
+        painter.translate(-key[0] * size, -key[1] * size)
+        painter.fillPath(path, QColor("white"))
+        painter.end()
+        return self._image_alpha_array(image) > 0.0
+
+    def _fill_reference_entities(
+        self, target: RasterObject, profile: dict[str, object],
+    ) -> list[tuple[str, str]]:
+        mode = str(profile.get("reference_mode", "editing"))
+        if mode == "editing":
+            return [("object", target.object_id)]
+        candidates: list[tuple[str, str]] = []
+        if mode == "reference":
+            candidates = [
+                ("layer", layer.layer_id)
+                for layer in self.chapter.layers.values()
+                if layer.fill_reference and not layer.is_page
+            ] + [
+                ("object", obj.object_id)
+                for obj in self.chapter.objects.values()
+                if obj.fill_reference
+            ]
+        elif mode == "selected":
+            candidates = list(self.selected_entities)
+        elif mode == "current_folder":
+            parent = self.chapter.layers[target.parent_layer_id]
+            candidates = [
+                (child.kind, child.entity_id) for child in parent.children
+            ]
+        else:
+            for page_id in self.chapter.root_page_ids:
+                page = self.chapter.layers[page_id]
+                candidates.extend(
+                    (child.kind, child.entity_id) for child in page.children
+                )
+
+        def allowed(kind: str, entity_id: str) -> bool:
+            entity = (
+                self.chapter.layers.get(entity_id)
+                if kind == "layer" else self.chapter.objects.get(entity_id)
+            )
+            if entity is None or not entity.visible:
+                return False
+            if (
+                entity_id == target.object_id
+                and bool(profile.get("exclude_editing_target", False))
+            ):
+                return False
+            ancestors = (
+                self.chapter.ancestor_layers(entity_id)
+                if kind == "layer"
+                else self.chapter.ancestor_layers(entity.parent_layer_id)
+            )
+            if any(
+                not ancestor.visible or ancestor.mask_only
+                for ancestor in ancestors
+            ):
+                return False
+            if bool(getattr(entity, "mask_only", False)):
+                return False
+            if isinstance(entity, TextObject):
+                return False
+            if isinstance(entity, ImageObject) and bool(
+                profile.get("exclude_images", False)
+            ):
+                return False
+            if isinstance(entity, GradientObject) and bool(
+                profile.get("exclude_gradients", False)
+            ):
+                return False
+            if isinstance(entity, VectorDrawingObject) and not bool(
+                profile.get("fill_up_to_vector_path", True)
+            ):
+                return False
+            return True
+
+        unique: list[tuple[str, str]] = []
+        for candidate in candidates:
+            if candidate not in unique and allowed(*candidate):
+                unique.append(candidate)
+        selected_layers = {
+            entity_id for kind, entity_id in unique if kind == "layer"
+        }
+
+        def covered_by_selected_layer(kind: str, entity_id: str) -> bool:
+            parent_id = (
+                self.chapter.layers[entity_id].parent_id
+                if kind == "layer" else self.chapter.objects[entity_id].parent_layer_id
+            )
+            while parent_id:
+                if parent_id in selected_layers:
+                    return True
+                parent_id = self.chapter.layers[parent_id].parent_id
+            return False
+
+        unique = [
+            candidate for candidate in unique
+            if not covered_by_selected_layer(*candidate)
+        ]
+        order = {
+            (
+                "layer" if isinstance(entity, LayerNode) else "object",
+                entity.layer_id if isinstance(entity, LayerNode)
+                else entity.object_id,
+            ): index
+            for index, (_kind, entity) in enumerate(
+                self.chapter.iter_render_order()
+            )
+        }
+        return sorted(unique, key=lambda candidate: order.get(candidate, 0))
+
+    def _fill_reference_signature(
+        self, entities: list[tuple[str, str]], *, skip_pixels_for: str = "",
+    ) -> tuple:
+        result: list[tuple] = []
+        for kind, entity_id in entities:
+            entity = (
+                self.chapter.layers[entity_id]
+                if kind == "layer" else self.chapter.objects[entity_id]
+            )
+            pixels: tuple = ()
+            if (
+                isinstance(entity, RasterObject)
+                and entity_id != skip_pixels_for
+            ):
+                pixels = tuple(sorted(
+                    (key, int(image.cacheKey()))
+                    for key, image in self.tiles.object_tiles(entity_id).items()
+                ))
+            elif isinstance(entity, ImageObject):
+                pixels = (int(self.images.image(entity_id).cacheKey()),)
+            result.append((
+                kind, entity_id,
+                json.dumps(entity.to_dict(), sort_keys=True), pixels,
+            ))
+        return tuple(result)
+
+    def _render_fill_reference_entity(
+        self, painter: QPainter, kind: str, entity_id: str,
+        visible_world: QRectF,
+    ) -> None:
+        if kind == "layer":
+            layer = self.chapter.layers[entity_id]
+            parent_transform = (
+                self.layer_world_transform(layer.parent_id)
+                if layer.parent_id else QTransform()
+            )
+            inverse, valid = parent_transform.inverted()
+            painter.save()
+            painter.setTransform(parent_transform, True)
+            self._render_layer(
+                painter, layer, 1.0,
+                inverse.mapRect(visible_world) if valid else visible_world,
+            )
+            painter.restore()
+            return
+        obj = self.chapter.objects[entity_id]
+        parent_transform = self.layer_world_transform(obj.parent_layer_id)
+        inverse, valid = parent_transform.inverted()
+        parent_opacity = 1.0
+        for ancestor in self.chapter.ancestor_layers(obj.parent_layer_id):
+            parent_opacity *= ancestor.opacity
+        painter.save()
+        painter.setTransform(parent_transform, True)
+        self._render_object(
+            painter, obj, parent_opacity,
+            inverse.mapRect(visible_world) if valid else visible_world,
+        )
+        painter.restore()
+
+    def _fill_reference_tile(
+        self, target: RasterObject, key: tuple[int, int],
+        profile: dict[str, object],
+        *, entities: list[tuple[str, str]] | None = None,
+        signature: tuple | None = None,
+        settings_signature: tuple | None = None,
+    ) -> QImage | None:
+        entities = (
+            entities if entities is not None
+            else self._fill_reference_entities(target, profile)
+        )
+        if entities == [("object", target.object_id)]:
+            return self.tiles.tile(target.object_id, key)
+        if signature is None:
+            signature = self._fill_reference_signature(entities)
+        if settings_signature is None:
+            settings_signature = tuple(sorted(
+                (name, repr(profile.get(name))) for name in (
+                    "reference_mode", "exclude_editing_target",
+                    "exclude_images", "exclude_gradients", "exclude_mask_only",
+                    "fill_up_to_vector_path", "include_vector_path",
+                )
+            ))
+        cache_key = (
+            target.object_id, key, signature, settings_signature,
+            tuple(target.transform_quad or ()), target.x, target.y,
+        )
+        cached = self._fill_reference_tile_cache.pop(cache_key, None)
+        if cached is not None:
+            self._fill_reference_tile_cache[cache_key] = cached
+            return QImage(cached)
+        size = self.tiles.tile_size
+        image = QImage(size, size, QImage.Format.Format_ARGB32_Premultiplied)
+        image.fill(Qt.GlobalColor.transparent)
+        local_to_world = self._drawing_local_to_world_transform(target)
+        world_to_local, valid = local_to_world.inverted()
+        if not valid:
+            return image
+        shift = QTransform()
+        shift.translate(-key[0] * size, -key[1] * size)
+        painter = QPainter(image)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
+        painter.setTransform(world_to_local * shift)
+        local_rect = QRectF(
+            key[0] * size, key[1] * size, size, size
+        )
+        visible_world = local_to_world.mapRect(local_rect)
+        previous_interactive = self._interactive_render
+        previous_exclude_text = self._render_exclude_text
+        self._interactive_render = False
+        self._render_exclude_text = True
+        try:
+            for kind, entity_id in entities:
+                self._render_fill_reference_entity(
+                    painter, kind, entity_id, visible_world
+                )
+        finally:
+            self._interactive_render = previous_interactive
+            self._render_exclude_text = previous_exclude_text
+            painter.end()
+        stored = QImage(image)
+        self._fill_reference_tile_cache[cache_key] = stored
+        self._fill_reference_tile_cache_bytes += int(stored.sizeInBytes())
+        while (
+            self._fill_reference_tile_cache
+            and self._fill_reference_tile_cache_bytes
+            > self._fill_reference_tile_cache_budget
+        ):
+            _old_key, old = self._fill_reference_tile_cache.popitem(last=False)
+            self._fill_reference_tile_cache_bytes -= int(old.sizeInBytes())
+        return image
+
+    def _apply_raster_fill(
+        self, obj: RasterObject, world_point: QPointF | None,
+        *, before: dict[tuple[int, int], QImage | None] | None = None,
+        commit: bool = True, extra_path: QPainterPath | None = None,
+        profile_overrides: dict[str, object] | None = None,
+        profile_snapshot: dict[str, object] | None = None,
+        color: QColor | None = None, region_policy: str = "seed",
+        selection_path: QPainterPath | None = None,
+        reference_capture: dict[tuple[int, int], QImage] | None = None,
+    ) -> bool:
+        local = (
+            self._raster_local_point(obj, world_point)
+            if world_point is not None else None
+        )
+        frame = QRectF(*obj.interaction_rect)
+        if local is not None and not frame.contains(local):
+            return False
+        if local is None:
+            clip = QPainterPath(self._drawing_selection_path)
+            if extra_path is not None:
+                clip = (
+                    QPainterPath(extra_path) if clip.isEmpty()
+                    else clip.intersected(extra_path)
+                )
+            if not clip.isEmpty():
+                frame = frame.intersected(clip.boundingRect())
+            if frame.isEmpty():
+                return False
+        patch_before = before if before is not None else {}
+        profile = dict(
+            profile_snapshot
+            if profile_snapshot is not None
+            else self.settings.active_fill_profile()
+        )
+        if profile_overrides:
+            profile.update(profile_overrides)
+        if extra_path is not None:
+            profile["connected_pixels_only"] = False
+        mode = str(profile.get("reference_mode", "editing"))
+        reference_entities = (
+            self._fill_reference_entities(obj, profile)
+            if mode != "editing" else [("object", obj.object_id)]
+        )
+        reference_signature = (
+            self._fill_reference_signature(reference_entities)
+            if mode != "editing" else ()
+        )
+        reference_settings = tuple(sorted(
+            (name, repr(profile.get(name))) for name in (
+                "reference_mode", "exclude_editing_target",
+                "exclude_images", "exclude_gradients", "exclude_mask_only",
+                "fill_up_to_vector_path", "include_vector_path",
+            )
+        ))
+        frozen_selection = QPainterPath(
+            selection_path
+            if selection_path is not None
+            else self._drawing_selection_path
+        )
+        if extra_path is not None:
+            frozen_selection = (
+                QPainterPath(extra_path) if frozen_selection.isEmpty()
+                else frozen_selection.intersected(extra_path)
+            )
+
+        def reference_for(key: tuple[int, int]) -> QImage | None:
+            image = self._fill_reference_tile(
+                obj, key, profile, entities=reference_entities,
+                signature=reference_signature,
+                settings_signature=reference_settings,
+            )
+            if reference_capture is not None and key not in reference_capture:
+                reference_capture[key] = QImage(image) if image is not None else QImage()
+            return image
+
+        dirty_local = self.tiles.advanced_fill(
+            obj.object_id, local, frame,
+            QColor(color) if color is not None else self._active_fill_color(),
+            profile, patch_before, region_policy=region_policy,
+            reference_tile=(
+                None if mode == "editing"
+                else reference_for
+            ),
+            selection_tile=lambda key: self._fill_path_mask_tile(
+                frozen_selection, key
+            ),
+        )
+        if dirty_local.isEmpty() or not patch_before:
+            return False
         dirty_world = self.modifier_expanded_dirty(
             obj.object_id,
             self._drawing_local_rect_to_world(obj, dirty_local),
         )
+        self._fill_dirty_world = (
+            QRectF(dirty_world) if self._fill_dirty_world.isEmpty()
+            else self._fill_dirty_world.united(dirty_world)
+        )
+        preserve_references = (
+            mode != "editing"
+            and ("object", obj.object_id) not in reference_entities
+        )
+        if not commit:
+            self._preserve_fill_reference_cache = preserve_references
+            try:
+                self._raster_fill_visual_changed(obj.object_id, dirty_world)
+            finally:
+                self._preserve_fill_reference_cache = False
+            return True
+        after = self.tiles.snapshot(obj.object_id, set(patch_before))
         callback = lambda object_id=obj.object_id, rect=QRectF(dirty_world): (
             self._raster_fill_visual_changed(object_id, rect)
         )
-        self.command_stack.push(TilePatchCommand(
+        command = TilePatchCommand(
             "Raster fill", self.tiles, obj.object_id,
-            before, after, callback,
-        ), already_done=True)
-        self._raster_fill_visual_changed(obj.object_id, dirty_world)
+            patch_before, after, callback,
+        )
+        self.command_stack.push(command, already_done=True)
+        self._install_fill_replay(
+            obj, command,
+            [(
+                QPointF(local) if local is not None else None,
+                QPainterPath(extra_path) if extra_path is not None else None,
+                region_policy,
+            )],
+            dirty_world,
+        )
+        self._preserve_fill_reference_cache = preserve_references
+        try:
+            self._raster_fill_visual_changed(obj.object_id, dirty_world)
+        finally:
+            self._preserve_fill_reference_cache = False
         self.interactionFinished.emit()
         return True
 
-    def _face_path(
-        self, face, drawing: VectorDrawingObject | None = None,
-    ) -> QPainterPath:
-        path = QPainterPath()
-        if not face.vertices:
-            return path
-        path.moveTo(QPointF(*face.vertices[0]))
-        source_paths = (
-            [
-                stroke_cubics(stroke.points, stroke.closed)
-                for stroke in drawing.strokes
-                if stroke_cubics(stroke.points, stroke.closed)
-            ]
-            if drawing is not None else []
-        )
-        for edge in face.edges:
-            provenance = edge.provenance
-            if (
-                provenance.path_index >= 0
-                and provenance.path_index < len(source_paths)
-                and provenance.segment_index >= 0
-                and provenance.segment_index
-                < len(source_paths[provenance.path_index])
-                and not provenance.virtual
-            ):
-                cubic = source_paths[
-                    provenance.path_index
-                ][provenance.segment_index]
-                subspan = cubic_subsegment(
-                    cubic, provenance.t0, provenance.t1
-                )
-                path.cubicTo(
-                    QPointF(*subspan[1]),
-                    QPointF(*subspan[2]),
-                    QPointF(*subspan[3]),
-                )
-            else:
-                path.lineTo(QPointF(*edge.end))
-        path.closeSubpath()
-        return path
-
-    def _scale_vector_fill_path(self, path: QPainterPath) -> QPainterPath:
-        if (
-            not self.settings.fill_area_scaling
-            or abs(self.settings.fill_area_amount) <= 1.0e-6
-        ):
-            return path
-        amount = self.settings.fill_area_amount
-        stroker = QPainterPathStroker()
-        stroker.setWidth(abs(amount) * 2)
-        stroker.setJoinStyle(
-            Qt.RoundJoin
-            if self.settings.fill_area_mode == "round"
-            else Qt.MiterJoin
-        )
-        stroker.setCapStyle(
-            Qt.RoundCap
-            if self.settings.fill_area_mode == "round"
-            else Qt.SquareCap
-        )
-        border = stroker.createStroke(path)
-        return (
-            path.united(border)
-            if amount > 0 else path.subtracted(border)
-        )
-
-    def _remove_narrow_vector_fill_areas(
-        self, path: QPainterPath,
-    ) -> QPainterPath:
-        """Remove thin corridors without rejecting an otherwise large face."""
-        if self.settings.fill_narrow_areas or path.isEmpty():
-            return path
-        width = max(
-            2.0,
-            self.settings.fill_gap_threshold
-            if self.settings.fill_close_gaps else 2.0,
-        )
-        stroker = QPainterPathStroker()
-        stroker.setWidth(width)
-        stroker.setJoinStyle(Qt.RoundJoin)
-        stroker.setCapStyle(Qt.RoundCap)
-        core = path.subtracted(stroker.createStroke(path))
-        if core.isEmpty():
-            return QPainterPath()
-        restored = core.united(stroker.createStroke(core))
-        return restored.intersected(path)
-
-    def _prepare_vector_fill_path(
-        self, path: QPainterPath,
-    ) -> QPainterPath:
-        return self._scale_vector_fill_path(
-            self._remove_narrow_vector_fill_areas(path)
-        )
-
-    def _geometry_for_face(
-        self, face, drawing: VectorDrawingObject,
-    ) -> BoundGeometry | None:
-        path = self._prepare_vector_fill_path(
-            self._face_path(face, drawing)
-        )
-        if path.isEmpty():
-            return None
-        return self._geometry_from_painter_path(path)
-
-    def _vector_fill_faces(self, drawing: VectorDrawingObject):
-        paths: list[list[Cubic]] = []
-        closed: list[bool] = []
-        for stroke in drawing.strokes:
-            cubics = stroke_cubics(stroke.points, stroke.closed)
-            if not cubics:
-                continue
-            paths.append(cubics)
-            closed.append(stroke.closed)
-        if not paths:
-            return []
-        faces = trace_cubic_faces(
-            paths,
-            closed=closed,
-            gap_threshold=(
-                self.settings.fill_gap_threshold
-                if self.settings.fill_close_gaps else 0.0
-            ),
-            flatten_tolerance=0.2,
-        )
-        return faces
-
-    def _point_hits_vector_stroke(
-        self, drawing: VectorDrawingObject, local: tuple[float, float],
-    ) -> bool:
-        return any(
-            centerline_hit(
-                stroke.points,
-                local,
-                closed=stroke.closed,
-                extra_tolerance=1.0 / max(self.scale, 0.05),
-            ) is not None
-            for stroke in drawing.strokes
-        )
-
-    def _existing_fill_at(
-        self, drawing: VectorDrawingObject, local: tuple[float, float],
-    ) -> VectorFillObject | None:
-        return next((
-            fill
-            for fill in self.chapter.vector_fill_children(drawing.object_id)
-            if self.bound_path(fill.geometry).contains(QPointF(*local))
-        ), None)
-
-    def _finish_vector_fill(
-        self, drawing: VectorDrawingObject,
+    def _begin_fill_gesture(
+        self, obj: RasterObject, world_point: QPointF,
     ) -> None:
-        before = self._vector_before or self._capture_vector_graph(drawing)
-        samples = [sample.point for sample in self._vector_sweep]
-        faces = self._vector_fill_faces(drawing)
-        created = False
-        changed = False
-        settings = self._vector_fill_settings()
-        if self.settings.fill_mode == "enclose":
-            if len(samples) >= 3:
-                lasso = QPainterPath()
-                lasso.addPolygon(QPolygonF([
-                    QPointF(*point) for point in samples
-                ]))
-                lasso.closeSubpath()
-                chosen = []
-                for face in faces:
-                    centroid = (
-                        sum(point[0] for point in face.vertices)
-                        / len(face.vertices),
-                        sum(point[1] for point in face.vertices)
-                        / len(face.vertices),
-                    )
-                    if lasso.contains(QPointF(*centroid)):
-                        chosen.append(face)
-                compiled = QPainterPath()
-                for face in chosen:
-                    compiled = compiled.united(
-                        self._face_path(face, drawing)
-                    )
-                compiled = self._prepare_vector_fill_path(compiled)
-                geometry = self._geometry_from_painter_path(compiled)
-                if geometry is not None:
-                    probe = next(iter(chosen), None)
-                    centroid = (
-                        (
-                            sum(point[0] for point in probe.vertices)
-                            / len(probe.vertices),
-                            sum(point[1] for point in probe.vertices)
-                            / len(probe.vertices),
-                        )
-                        if probe is not None else samples[0]
-                    )
-                    fill = self._existing_fill_at(drawing, centroid)
-                    if fill is None:
-                        fill = VectorFillObject(
-                            geometry=geometry,
-                            fill_color=self.primary_color,
-                            source_lasso=list(samples),
-                            fill_settings=settings,
-                        )
-                        self.chapter.add_vector_fill(
-                            drawing.object_id, fill, index=0
-                        )
-                        created = True
-                    else:
-                        fill.geometry = geometry
-                        fill.fill_color = self.primary_color
-                        fill.source_lasso = list(samples)
-                        fill.source_seed = None
-                        fill.fill_settings = settings
-                        drawing.touch_revision()
-                    changed = True
-        else:
-            used: set[tuple[tuple[float, float], ...]] = set()
-            for seed in samples:
-                if self._point_hits_vector_stroke(drawing, seed):
-                    continue
-                face = find_face_containing(faces, seed)
-                if face is None:
-                    continue
-                signature = tuple(sorted(
-                    (round(point[0], 3), round(point[1], 3))
-                    for point in face.vertices
-                ))
-                if signature in used:
-                    continue
-                used.add(signature)
-                geometry = self._geometry_for_face(face, drawing)
-                if geometry is None:
-                    continue
-                fill = self._existing_fill_at(drawing, seed)
-                if fill is None:
-                    fill = VectorFillObject(
-                        geometry=geometry,
-                        fill_color=self.primary_color,
-                        source_seed=seed,
-                        fill_settings=settings,
-                    )
-                    self.chapter.add_vector_fill(
-                        drawing.object_id, fill, index=0
-                    )
-                    created = True
-                else:
-                    fill.geometry = geometry
-                    fill.fill_color = self.primary_color
-                    fill.source_seed = seed
-                    fill.source_lasso = []
-                    fill.fill_settings = settings
-                    drawing.touch_revision()
-                changed = True
-        self._vector_gesture_mode = None
-        self._vector_sweep = []
-        self._vector_before = None
-        if changed:
-            self._push_vector_change(
-                before, "Vector fill", hierarchy=created
-            )
-        self.set_selection(
-            "object", drawing.object_id, activate_default_tool=False
+        self._clear_fill_replay()
+        self._fill_before = {}
+        self._fill_dirty_world = QRectF()
+        self._fill_operation_base_tiles = self._snapshot_fill_object_tiles(
+            obj.object_id
         )
-        self.tool = ToolKind.FILL
-        self.toolChanged.emit(self.tool)
+        self._fill_operation_profile = dict(
+            self.settings.active_fill_profile()
+        )
+        self._fill_operation_color = self._active_fill_color()
+        self._fill_operation_selection = QPainterPath(
+            self._drawing_selection_path
+        )
+        self._fill_operation_reference_tiles = {}
+        self._fill_gesture_points = [
+            self._raster_local_point(obj, world_point)
+        ]
+        self._fill_last_world = QPointF(world_point)
+        self._fill_gesture_active = True
+        subtool = self.settings.active_fill_subtool
+        if subtool not in {"enclose_fill", "lasso_fill"}:
+            self._apply_raster_fill(
+                obj, world_point, before=self._fill_before, commit=False,
+                profile_snapshot=self._fill_operation_profile,
+                color=self._fill_operation_color,
+                selection_path=self._fill_operation_selection,
+                reference_capture=self._fill_operation_reference_tiles,
+            )
+
+    def _continue_fill_gesture(
+        self, obj: RasterObject, world_point: QPointF,
+    ) -> None:
+        if not self._fill_gesture_active:
+            return
+        local = self._raster_local_point(obj, world_point)
+        subtool = self.settings.active_fill_subtool
+        spacing = (
+            max(1.0, 8.0 / max(self.scale, 0.05))
+            if subtool == "leftover_pen"
+            else max(1.0, 4.0 / max(self.scale, 0.05))
+        )
+        if self._fill_gesture_points and math.dist(
+            self._fill_gesture_points[-1].toTuple(), local.toTuple()
+        ) < spacing:
+            return
+        self._fill_gesture_points.append(local)
+        self._fill_last_world = QPointF(world_point)
+        if subtool not in {"enclose_fill", "lasso_fill"}:
+            self._apply_raster_fill(
+                obj, world_point, before=self._fill_before, commit=False,
+                profile_snapshot=self._fill_operation_profile,
+                color=self._fill_operation_color,
+                selection_path=self._fill_operation_selection,
+                reference_capture=self._fill_operation_reference_tiles,
+            )
+        else:
+            self.update()
+
+    def _finish_fill_gesture(self, obj: RasterObject) -> None:
+        if not self._fill_gesture_active:
+            return
+        subtool = self.settings.active_fill_subtool
+        if (
+            subtool in {"enclose_fill", "lasso_fill"}
+            and len(self._fill_gesture_points) >= 3
+        ):
+            path = QPainterPath()
+            path.addPolygon(QPolygonF(self._fill_gesture_points))
+            path.closeSubpath()
+            self._apply_raster_fill(
+                obj, None, before=self._fill_before,
+                commit=False, extra_path=path,
+                profile_snapshot=self._fill_operation_profile,
+                color=self._fill_operation_color,
+                region_policy=(
+                    "transparent" if subtool == "enclose_fill" else "area"
+                ),
+                selection_path=self._fill_operation_selection,
+                reference_capture=self._fill_operation_reference_tiles,
+            )
+        before = self._fill_before
+        dirty = QRectF(self._fill_dirty_world)
+        gesture_points = [QPointF(point) for point in self._fill_gesture_points]
+        self._fill_before = {}
+        self._fill_dirty_world = QRectF()
+        self._fill_gesture_points = []
+        self._fill_gesture_active = False
+        if not before:
+            self.interactionFinished.emit()
+            self.update()
+            return
+        after = self.tiles.snapshot(obj.object_id, set(before))
+        callback = lambda object_id=obj.object_id, rect=QRectF(dirty): (
+            self._raster_fill_visual_changed(object_id, rect)
+        )
+        label = {
+            "enclose_fill": "Enclose and Fill",
+            "lasso_fill": "Lasso Fill",
+            "leftover_pen": "Leftover Pen",
+        }.get(subtool, "Raster fill")
+        command = TilePatchCommand(
+            label, self.tiles, obj.object_id, before, after, callback,
+        )
+        self.command_stack.push(command, already_done=True)
+        if subtool in {"enclose_fill", "lasso_fill"}:
+            replay_path = QPainterPath()
+            replay_path.addPolygon(QPolygonF(gesture_points))
+            replay_path.closeSubpath()
+            steps = [(
+                None, replay_path,
+                "transparent" if subtool == "enclose_fill" else "area",
+            )]
+        else:
+            steps = [(point, None, "seed") for point in gesture_points]
+        self._install_fill_replay(obj, command, steps, dirty)
+        self._raster_fill_visual_changed(obj.object_id, dirty)
         self.interactionFinished.emit()
+
+    def _cancel_fill_gesture(self, *, restore: bool = True) -> bool:
+        if not self._fill_gesture_active:
+            return False
+        obj = (
+            self.chapter.objects.get(self.selected_object_id)
+            if self.chapter is not None else None
+        )
+        if restore and isinstance(obj, RasterObject):
+            for key, image in self._fill_before.items():
+                self.tiles.set_tile(obj.object_id, key, image)
+            if not self._fill_dirty_world.isEmpty():
+                self._raster_fill_visual_changed(
+                    obj.object_id, self._fill_dirty_world
+                )
+        self._fill_before = {}
+        self._fill_dirty_world = QRectF()
+        self._fill_gesture_points = []
+        self._fill_gesture_active = False
         self.update()
+        return True
+
+    def fill_active_selection(self) -> bool:
+        if self.chapter is None or self._drawing_selection_path.isEmpty():
+            return False
+        obj = self.chapter.objects.get(self.selected_object_id)
+        if not isinstance(obj, RasterObject):
+            return False
+        self._clear_fill_replay()
+        profile = dict(self.settings.active_fill_profile())
+        color = self._active_fill_color()
+        self._fill_operation_base_tiles = self._snapshot_fill_object_tiles(
+            obj.object_id
+        )
+        self._fill_operation_profile = dict(profile)
+        self._fill_operation_color = QColor(color)
+        self._fill_operation_selection = QPainterPath(
+            self._drawing_selection_path
+        )
+        self._fill_operation_reference_tiles = {}
+        frame = QRectF(*obj.interaction_rect).intersected(
+            self._drawing_selection_path.boundingRect()
+        )
+        if (
+            len(self.tiles.keys_for_rect(frame)) > 16
+        ):
+            profile["connected_pixels_only"] = False
+            reference_tiles = None
+            if str(profile.get("reference_mode", "editing")) != "editing":
+                keys = self.tiles.keys_for_rect(frame)
+                required = len(keys) * self.tiles.tile_size ** 2 * 4
+                if required > self._fill_reference_tile_cache_budget:
+                    return self._apply_raster_fill(
+                        obj, None, profile_snapshot=profile, color=color,
+                        region_policy="area",
+                        selection_path=self._fill_operation_selection,
+                        reference_capture=self._fill_operation_reference_tiles,
+                    )
+                entities = self._fill_reference_entities(obj, profile)
+                signature = self._fill_reference_signature(entities)
+                settings_signature = tuple(sorted(
+                    (name, repr(profile.get(name))) for name in (
+                        "reference_mode", "exclude_editing_target",
+                        "exclude_images",
+                        "exclude_gradients", "exclude_mask_only",
+                        "fill_up_to_vector_path", "include_vector_path",
+                    )
+                ))
+                reference_tiles = {
+                    key: self._fill_reference_tile(
+                        obj, key, profile, entities=entities,
+                        signature=signature,
+                        settings_signature=settings_signature,
+                    )
+                    for key in keys
+                }
+                self._fill_operation_reference_tiles = {
+                    key: QImage(image) if image is not None else QImage()
+                    for key, image in reference_tiles.items()
+                }
+            return self._start_async_fill(
+                obj, None, frame, profile, None, color, "area",
+                reference_tiles,
+            )
+        return self._apply_raster_fill(
+            obj, None, profile_snapshot=profile, color=color,
+            region_policy="area",
+            selection_path=self._fill_operation_selection,
+            reference_capture=self._fill_operation_reference_tiles,
+        )
 
     def _apply_shape_fill(self, world: QPointF) -> bool:
         if (
@@ -15107,22 +16389,16 @@ class _CanvasLogic:
             return False
         layer = self.chapter.layers[self.selected_id]
         if (
-            layer.bound is None or layer.is_page
-            or layer.layer_kind == "fill"
+            layer.bound is None or layer.is_page or not layer.bound.closed
         ):
             return False
-        before = self.chapter.to_dict()
-        if self._shape_border_contains(layer.layer_id, world, raw=True):
-            layer.shape_style.outline_color = self.primary_color
-            if layer.shape_style.outline_thickness <= 0:
-                layer.shape_style.outline_thickness = 4.0
-        elif layer.bound.closed:
-            local = self._layer_world_to_local(layer.layer_id, world)
-            if not self.layer_effective_path(layer.layer_id).contains(local):
-                return False
-            layer.shape_style.primary_color = self.primary_color
-        else:
+        local = self._layer_world_to_local(layer.layer_id, world)
+        if not self.layer_effective_path(layer.layer_id).contains(local):
             return False
+        before = self.chapter.to_dict()
+        layer.shape_style.primary_color = self._active_fill_color().name(
+            QColor.NameFormat.HexArgb
+        ).upper()
         after = self.chapter.to_dict()
         self.push_model_change(before, after, "Fill shape")
         self.documentChanged.emit(QRectF())
@@ -15164,9 +16440,6 @@ class _CanvasLogic:
         elif self.tool == ToolKind.VECTOR_SIMPLIFY:
             self._vector_before = {drawing.object_id: drawing.to_dict()}
             self._vector_gesture_mode = "simplify"
-        elif self.tool == ToolKind.FILL:
-            self._vector_before = self._capture_vector_graph(drawing)
-            self._vector_gesture_mode = "fill"
         self._vector_sweep = [
             FreehandSample(local.x(), local.y(), pressure)
         ]
@@ -15187,11 +16460,7 @@ class _CanvasLogic:
     def _continue_vector_gesture(
         self, world: QPointF, pressure: float,
     ) -> None:
-        drawing = (
-            self._active_vector_drawing()
-            if self._vector_gesture_mode == "fill"
-            else self._selected_vector_drawing()
-        )
+        drawing = self._selected_vector_drawing()
         if drawing is None:
             return
         local = self._vector_local_point(drawing, world)
@@ -15208,19 +16477,6 @@ class _CanvasLogic:
         sweep_count = len(self._vector_sweep)
         if not self._vector_sweep:
             self._vector_sweep.append(sample)
-        elif self._vector_gesture_mode == "fill":
-            previous = self._vector_sweep[-1]
-            separation = math.dist(previous.point, sample.point)
-            spacing = max(1.0, 4.0 / max(self.scale, 0.05))
-            steps = min(4096, max(1, math.ceil(separation / spacing)))
-            for step in range(1, steps + 1):
-                amount = step / steps
-                self._vector_sweep.append(FreehandSample(
-                    previous.x + (sample.x - previous.x) * amount,
-                    previous.y + (sample.y - previous.y) * amount,
-                    previous.pressure
-                    + (sample.pressure - previous.pressure) * amount,
-                ))
         elif math.dist(self._vector_sweep[-1].point, sample.point) >= 0.2:
             self._vector_sweep.append(sample)
         if self._vector_gesture_mode == "simplify":
@@ -15240,11 +16496,7 @@ class _CanvasLogic:
         self.update()
 
     def _end_vector_gesture(self) -> None:
-        drawing = (
-            self._active_vector_drawing()
-            if self._vector_gesture_mode == "fill"
-            else self._selected_vector_drawing()
-        )
+        drawing = self._selected_vector_drawing()
         if drawing is None:
             self._cancel_vector_gesture()
             return
@@ -15275,8 +16527,6 @@ class _CanvasLogic:
             self._finish_vector_connect(drawing)
         elif mode == "simplify":
             self._finish_vector_simplify_gesture(drawing)
-        elif mode == "fill":
-            self._finish_vector_fill(drawing)
 
     # ---- tool actions --------------------------------------------------
     def _begin_modifier_handle(self, widget_point: QPointF) -> bool:
@@ -15522,11 +16772,51 @@ class _CanvasLogic:
         if self.tool == ToolKind.FILL:
             selected = self.chapter.objects.get(self.selected_object_id)
             if isinstance(selected, RasterObject):
-                self._apply_raster_fill(selected, point)
-            elif (drawing := self._active_vector_drawing()) is not None:
-                self._begin_vector_gesture(drawing, point, pressure)
+                self._begin_fill_gesture(selected, point)
             elif self.selected_kind == "layer":
                 self._apply_shape_fill(point)
+            return
+        if self.tool == ToolKind.GRADIENT:
+            selected_gradient = self.chapter.objects.get(
+                self.selected_object_id
+            )
+            if isinstance(selected_gradient, GradientObject):
+                self._begin_gradient_edit(selected_gradient, point)
+                return
+            parent_id = self._gradient_tool_parent_id()
+            field_type = (
+                self._gradient_creation_type or self._gradient_tool_field_type
+            )
+            if not parent_id:
+                return
+            matches = self.chapter.gradient_children(
+                parent_id, field_type, family="color_fill"
+            )
+            if matches:
+                self.set_selection(
+                    "object", matches[0].object_id,
+                    activate_default_tool=False,
+                )
+                self._begin_gradient_edit(matches[0], point)
+                return
+            local = self._layer_world_to_local(parent_id, point)
+            if not self.layer_effective_path(parent_id).contains(local):
+                return
+            before = self.chapter.to_dict()
+            if field_type == "parent_shape":
+                self.create_gradient(
+                    parent_id, field_type, before=before,
+                    gradient_type="color_fill",
+                )
+                return
+            self._gradient_creation_parent_id = parent_id
+            self._gradient_creation_type = field_type
+            self._gradient_creation_family = "color_fill"
+            self._gradient_creation_before = before
+            snapped = self._snap(point, parent_id)
+            self._creation_points = [
+                snapped.toTuple(), snapped.toTuple()
+            ]
             return
         if self.tool == ToolKind.TEXT_EDIT and not isinstance(
             self.chapter.objects.get(self.selected_object_id), TextObject
@@ -15560,6 +16850,11 @@ class _CanvasLogic:
                 )
             ):
                 return
+            if (
+                self.selected_kind == "layer"
+                and self._begin_shape_edit(point, modifiers=modifiers)
+            ):
+                return
             if self._begin_geometry_transform(point):
                 return
             if self._select_foreign_object_at(point, widget_point):
@@ -15578,11 +16873,6 @@ class _CanvasLogic:
                 return
             if hits:
                 self.set_selection("layer", hits[0]["id"])
-                return
-            if (
-                self.selected_kind == "layer"
-                and self._begin_shape_edit(point, modifiers=modifiers)
-            ):
                 return
             if (
                 isinstance(selected_gradient, SpeedLineCenterObject)
@@ -15850,7 +17140,7 @@ class _CanvasLogic:
                 else:
                     self.unsetCursor()
             elif (
-                self.tool == ToolKind.SHAPE_EDIT
+                self.tool in {ToolKind.SHAPE_EDIT, ToolKind.GRADIENT}
                 and isinstance(selected_raster, GradientObject)
             ):
                 hit = self._gradient_control_hit(
@@ -15905,6 +17195,20 @@ class _CanvasLogic:
             return
         if self._vector_gesture_mode is not None:
             self._continue_vector_gesture(point, pressure)
+            return
+        if self._fill_gesture_active:
+            obj = self.chapter.objects.get(self.selected_object_id)
+            if isinstance(obj, RasterObject):
+                self._continue_fill_gesture(obj, point)
+            return
+        if (
+            self.tool == ToolKind.GRADIENT
+            and self._gradient_creation_parent_id
+            and len(self._creation_points) >= 2
+        ):
+            snapped = self._snap(point, self._gradient_creation_parent_id)
+            self._creation_points[-1] = snapped.toTuple()
+            self.update()
             return
         if self._pending_raster_transform_press is not None:
             press_widget, press_document = self._pending_raster_transform_press
@@ -15976,7 +17280,7 @@ class _CanvasLogic:
             self.selected_object_id
         )
         if (
-            self.tool == ToolKind.SHAPE_EDIT
+            self.tool in {ToolKind.SHAPE_EDIT, ToolKind.GRADIENT}
             and isinstance(selected_gradient, GradientObject)
             and self._active_gradient_control is not None
         ):
@@ -16088,6 +17392,42 @@ class _CanvasLogic:
             return
         if self._vector_gesture_mode is not None:
             self._end_vector_gesture()
+            return
+        if self._fill_gesture_active:
+            obj = self.chapter.objects.get(self.selected_object_id)
+            if isinstance(obj, RasterObject):
+                self._finish_fill_gesture(obj)
+            else:
+                self._cancel_fill_gesture(restore=True)
+            return
+        if (
+            self.tool == ToolKind.GRADIENT
+            and self._gradient_creation_parent_id
+            and len(self._creation_points) >= 2
+        ):
+            first, second = self._creation_points[0], self._creation_points[-1]
+            field_type = self._gradient_creation_type
+            parent_id = self._gradient_creation_parent_id
+            before = self._gradient_creation_before
+            if math.dist(first, second) < 2:
+                self._cancel_gradient_creation()
+                self.interactionFinished.emit()
+                return
+            if field_type == "radial":
+                self.create_gradient(
+                    parent_id, "radial",
+                    radial=(first, math.dist(first, second)), before=before,
+                    gradient_type="color_fill",
+                )
+            else:
+                geometry = BoundGeometry.path([
+                    PathNode(x=first[0], y=first[1]),
+                    PathNode(x=second[0], y=second[1]),
+                ], False)
+                self.create_gradient(
+                    parent_id, "line", world_geometry=geometry,
+                    before=before, gradient_type="color_fill",
+                )
             return
         if self._pending_raster_transform_press is not None:
             widget_point, point = self._pending_raster_transform_press
@@ -16321,8 +17661,7 @@ class _CanvasLogic:
     ) -> bool:
         if (
             self.chapter is None or parent_id not in self.chapter.layers
-            or self.chapter.layers[parent_id].layer_kind
-            in {"fill", "open_shape"}
+            or self.chapter.layers[parent_id].layer_kind == "open_shape"
         ):
             return False
         self._raster_creation_parent_id = parent_id
@@ -16337,32 +17676,47 @@ class _CanvasLogic:
         if (
             self.chapter is None
             or parent_id not in self.chapter.layers
-            or self.chapter.layers[parent_id].layer_kind == "fill"
             or field_type not in {"line", "radial", "parent_shape"}
             or gradient_type != "color_fill"
         ):
             return False
         family = "color_fill"
-        if self.chapter.gradient_children(
+        self._gradient_tool_field_type = field_type
+        existing = self.chapter.gradient_children(
             parent_id, field_type, family=family
-        ):
-            return False
-        if field_type == "parent_shape":
-            return self.create_gradient(
-                parent_id, field_type, gradient_type=gradient_type
-            ) is not None
+        )
+        if existing:
+            self.set_selection("object", existing[0].object_id)
+            return self.set_tool(ToolKind.GRADIENT)
         self._gradient_creation_parent_id = parent_id
         self._gradient_creation_type = field_type
         self._gradient_creation_family = gradient_type
         self._gradient_creation_before = self.chapter.to_dict()
-        self._clear_creation_gesture()
         self.set_selection(
             "layer", parent_id, activate_default_tool=False
         )
-        return self.set_tool(
-            ToolKind.SHAPE_CREATE
-            if field_type == "line" else ToolKind.CIRCLE_BOUND
-        )
+        return self.set_tool(ToolKind.GRADIENT)
+
+    def set_gradient_field_type(self, field_type: str) -> None:
+        if field_type not in {"line", "radial", "parent_shape"}:
+            return
+        self._gradient_tool_field_type = field_type
+        if not self._creation_points:
+            self._gradient_creation_type = ""
+
+    def _gradient_tool_parent_id(self) -> str:
+        if self.chapter is None:
+            return ""
+        if self._gradient_creation_parent_id in self.chapter.layers:
+            return self._gradient_creation_parent_id
+        if self.selected_kind == "layer":
+            layer = self.chapter.layers.get(self.selected_id)
+            return (
+                layer.layer_id
+                if layer is not None and layer.bound is not None else ""
+            )
+        obj = self.chapter.objects.get(self.selected_object_id)
+        return obj.parent_layer_id if obj is not None else ""
 
     def _cancel_gradient_creation(self) -> None:
         self._gradient_creation_parent_id = ""
@@ -16382,7 +17736,6 @@ class _CanvasLogic:
         if (
             self.chapter is None
             or parent_id not in self.chapter.layers
-            or self.chapter.layers[parent_id].layer_kind == "fill"
             or field_type not in {"line", "radial", "parent_shape"}
             or gradient_type != "color_fill"
         ):
@@ -16470,7 +17823,6 @@ class _CanvasLogic:
         if (
             self.chapter is None
             or parent_id not in self.chapter.layers
-            or self.chapter.layers[parent_id].layer_kind == "fill"
         ):
             return None
         before = self.chapter.to_dict()
@@ -16641,10 +17993,7 @@ class _CanvasLogic:
         """
         if self.selected_kind == "layer":
             layer = self.chapter.layers.get(self.selected_id)
-            if (
-                layer is None or layer.layer_kind == "fill"
-                or layer.bound is None
-            ):
+            if layer is None or layer.bound is None:
                 return None
             return (
                 layer.bound,
@@ -16768,6 +18117,12 @@ class _CanvasLogic:
                 self._active_shape_control = name
                 self._drag_start_doc = QPointF(world_point)
                 self._shape_control_dragged = False
+                if name == "translate" and self.selected_kind == "layer":
+                    layer = self.chapter.layers[self.selected_id]
+                    self._drag_start_value = {
+                        "translate_x": layer.translate_x,
+                        "translate_y": layer.translate_y,
+                    }
             return True
         if kind == "radius":
             index = hit["index"]
@@ -16868,7 +18223,14 @@ class _CanvasLogic:
             self._model_before = self.chapter.to_dict()
             self._active_shape_control = "translate"
             self._drag_start_doc = QPointF(world_point)
-            self._drag_start_value = bound.to_dict()
+            if self.selected_kind == "layer":
+                layer = self.chapter.layers[self.selected_id]
+                self._drag_start_value = {
+                    "translate_x": layer.translate_x,
+                    "translate_y": layer.translate_y,
+                }
+            else:
+                self._drag_start_value = bound.to_dict()
             return True
         return False
 
@@ -16963,6 +18325,9 @@ class _CanvasLogic:
         target = self._shape_edit_target()
         if target is None:
             return
+        dirty_before = entity_visual_bounds(
+            self.chapter, self.tiles, self.selected_kind, self.selected_id
+        )
         bound, transform, _style = target
         inverse, valid = transform.inverted()
         if not valid:
@@ -17139,43 +18504,66 @@ class _CanvasLogic:
                 )
                 selected.roundness_enabled = True
         elif control == "translate":
-            original = BoundGeometry.from_dict(self._drag_start_value)
-            local_start = inverse.map(self._drag_start_doc)
-            local_current = inverse.map(world_point)
-            dx = local_current.x() - local_start.x()
-            dy = local_current.y() - local_start.y()
-            if self.settings.snap_to_grid:
-                anchor_local = QPointF(
-                    original.nodes[0].x + dx,
-                    original.nodes[0].y + dy,
+            if self.selected_kind == "layer":
+                layer = self.chapter.layers[self.selected_id]
+                parent_transform = (
+                    self.layer_world_transform(layer.parent_id)
+                    if layer.parent_id else QTransform()
                 )
-                snapped = inverse.map(self._snap(
-                    transform.map(anchor_local), layer_id
-                ))
-                dx = snapped.x() - original.nodes[0].x
-                dy = snapped.y() - original.nodes[0].y
-            bound.nodes = [
-                PathNode.from_dict(node.to_dict()) for node in original.nodes
-            ]
-            bound.additional_contours = [
-                PathContour.from_dict(contour.to_dict())
-                for contour in original.additional_contours
-            ]
-            for contour in bound.iter_contours():
-                for node in contour.nodes:
-                    node.x += dx
-                    node.y += dy
-                    if node.incoming:
-                        node.incoming = (
-                            node.incoming[0] + dx, node.incoming[1] + dy
-                        )
-                    if node.outgoing:
-                        node.outgoing = (
-                            node.outgoing[0] + dx, node.outgoing[1] + dy
-                        )
+                parent_inverse, parent_valid = parent_transform.inverted()
+                if not parent_valid:
+                    return
+                start = parent_inverse.map(self._drag_start_doc)
+                current = parent_inverse.map(world_point)
+                start_x = float(self._drag_start_value["translate_x"])
+                start_y = float(self._drag_start_value["translate_y"])
+                destination = QPointF(
+                    start_x + current.x() - start.x(),
+                    start_y + current.y() - start.y(),
+                )
+                if self.settings.snap_to_grid:
+                    world_destination = parent_transform.map(destination)
+                    snapped = self._snap(world_destination, layer.layer_id)
+                    destination = parent_inverse.map(snapped)
+                layer.translate_x = destination.x()
+                layer.translate_y = destination.y()
+            else:
+                original = BoundGeometry.from_dict(self._drag_start_value)
+                local_start = inverse.map(self._drag_start_doc)
+                local_current = inverse.map(world_point)
+                dx = local_current.x() - local_start.x()
+                dy = local_current.y() - local_start.y()
+                bound.nodes = [
+                    PathNode.from_dict(node.to_dict())
+                    for node in original.nodes
+                ]
+                bound.additional_contours = [
+                    PathContour.from_dict(contour.to_dict())
+                    for contour in original.additional_contours
+                ]
+                for contour in bound.iter_contours():
+                    for node in contour.nodes:
+                        node.x += dx
+                        node.y += dy
+                        if node.incoming:
+                            node.incoming = (
+                                node.incoming[0] + dx,
+                                node.incoming[1] + dy,
+                            )
+                        if node.outgoing:
+                            node.outgoing = (
+                                node.outgoing[0] + dx,
+                                node.outgoing[1] + dy,
+                            )
         bound.normalize_bezier_handles()
-        self.documentChanged.emit(QRectF())
-        self.update()
+        dirty_after = entity_visual_bounds(
+            self.chapter, self.tiles, self.selected_kind, self.selected_id
+        )
+        dirty = self._entity_expanded_dirty(
+            self.selected_kind, self.selected_id,
+            dirty_before.united(dirty_after).adjusted(-3, -3, 3, 3),
+        )
+        self.documentChanged.emit(dirty)
 
     def _update_shape_hover(self, world_point: QPointF) -> None:
         target = self._shape_edit_target()
@@ -17681,8 +19069,6 @@ class _CanvasLogic:
                 child = self.chapter.layers[reference.entity_id]
                 if child.compound_operation == "ignore" or not child.visible:
                     result.append(preserve_ignored(child))
-                elif child.layer_kind == "fill":
-                    removed_layers.add(child.layer_id)
                 else:
                     result.extend(flatten_branch(child))
                     removed_layers.add(child.layer_id)
@@ -17699,8 +19085,6 @@ class _CanvasLogic:
             child = self.chapter.layers[reference.entity_id]
             if child.compound_operation == "ignore" or not child.visible:
                 rebuilt.append(reference)
-            elif child.layer_kind == "fill":
-                removed_layers.add(child.layer_id)
             else:
                 rebuilt.extend(flatten_branch(child))
                 removed_layers.add(child.layer_id)
@@ -19122,6 +20506,8 @@ class _CanvasLogic:
         ):
             return
         painter.save()
+        previous_interactive = self._interactive_render
+        self._interactive_render = True
         try:
             opacity = 1.0
             for layer in self.chapter.ancestor_layers(obj.parent_layer_id):
@@ -19141,6 +20527,7 @@ class _CanvasLogic:
                 inverse.mapRect(visible) if valid else visible,
             )
         finally:
+            self._interactive_render = previous_interactive
             painter.restore()
 
     def _build_text_transform_cache(self, obj: TextObject) -> None:

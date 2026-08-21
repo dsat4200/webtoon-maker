@@ -1,3 +1,57 @@
+- [x] modifier strengths and parameters (anything with a slider that has a min and a max pretty much) have a box to the left that let you attach a "mask" to them
+- [x] a mask is a tone map - black and white, 0 and 1 (and everything between, greyscale) that maps to the intensity of said parameter. 
+- [x] masks are a selected list of objects, along with an extra selection of pixels, almost like a raster layer, that are added together. an object's alpha channel is what contributes to the mask, pretty much (an alpha of all its pixels). masks can later be used for other things. 
+- [x] for instance, the mask of one object can be set to the opacity slider of another - effectively re-creating a "mask to x layer" option. 
+- [x] add a new "masks" tab (the layer settings window should now be tab-based, with layer settings as one of the tabs). masks show as a grid with icons of each mask and their name. top row above that should be a mask new, rename, and delete option.
+- [x] when a mask button is clicked, the outliner shows (with light green) which objects in the outliner are selected as contributers to that mask. if the object is linked to a saved mask, the program should switch the top right window to the masks tab and show that mask as being selected. 
+- [x] while in mask select mode, selecting objects adds them to the mask. they can also be deselected
+- [x] being in mask mode changes the canvas temporarily such that everything currently on it becomes 10 percent opacity, but the current mask is visible on screen in greyscale full opacity, as a preview that you can also raster draw on for that aspect of mask creation.
+- [x] if no saved mask currently exists, selecting a mask from the mask tab while in mask mode sets that mask as the mask for the parameter you wanted.
+- [x] any parameter that has the mask feature enabled should have a button to the left of the slider that appears "pressed" if a mask exists, but not if none exists. it should have a sort of "contrast" icon - a circle with a black side and a white side, and it should be orange if on, grey if not on.
+- [x] examples of things that should support masks
+	- any parameter in blur, or hsl
+	- the newly introduced outline modifier
+	- the opacity of any shape/vector/raster,blender comic object, etc.
+		- this should apply to the opacity slider between the layer settings window and the outliner. dragging a layer into this box sets it as the mask (for easy "mask as" operations)
+			- as such, clicking an object only selects it after being released. that way, you can drag into another object's opacity mask (or other places) without automatically switching out of that object.
+- [x] hovering over a mask box should show the object's mask in the comic view
+
+
+
+
+- [x] ## synced image support
+- [x] use an image that streams itself from blender, actively reloading when refreshed every second?
+- [x] use a literal actual blender window, displaying it below our window somehow.
+- [x] outline modifier
+	- [x] draws outlines around pixels in an object (or objects, if linked)
+	- [x] has a thickness parameter
+		- a mask button (circle with half filled, half not filled).
+		- supports masks (like the rest do)
+		- for instance, say you drew a "shape" by drawing some raster or vector strokes in a circle
+		- you could then add an outline modifier and change the thickness with a mask. then, altering the original drawing would still show the outline around in real time.
+	- [x] has an opacity parameter
+		- do the same masking thing with the opacity parameter.
+- [x] masks can be spontaneously made for a specific instance/case, or saved.
+- [x] saved masks prompt you for a name and are added to the masks tab. the masks tab only shows masks for that chapter.
+## prompt
+- [x] i still cant drag layers to move them between layers with the stylus
+- [x] dragging the eyedropper should show a circle icon above where you're clicking/dragging that displays the selected color
+- [x] tool options shouln't extend further right, they should wrap to another row beneath if they're too long.
+- [x] allow for selecting multiple objects. doing so lets you drag them to move multiple up and down layers. it also changes the visible tools to only ones that work with multiple objects. for now, that should only be a transform tool (doesn't appear if objects other than raster, vector are selected)
+- [x] for now, multi select should only let you select rasters and vectors
+- [x] add a new tab to the vertical list of options on the left. this tab is for "modifiers"
+- [x] modifiers act like a shader or like a modifier in blender, or an adjustment layer. they aren't visible in the outliner - being attatched to an object. modifier settings should show an "add modifier" button that exposes a list of addable modifiers. for now, the only modifier should be hue/saturation/lightness, and blur)
+    - [x] hsl should have those 3 parameters
+    - [x] blur should have a strength, and 2 modes - full and focal point. full does the whole object/objects. focal point has gui handles (orange)
+        - [x] handle for center, handle for end, and handle for ramp between the two) these 3 handles should appear on a line, with a circle dotted outline around the full radius. translating the center moves all the handles with it.
+- [x] because modifiers are non destructive, drawing, erasing, updating blender objects, etc works like normal, and the modifier will reflect any changes correctly (non destructive and parameterized)
+- [x] modifiers should have their own row/ui element like they do in blender. they appear in a stack that applies from top to bottom, like blender. they can be click dragged from their title to reorder (each modifier should have a title on top, like in blender)
+- [x] modifiers should all have an "intensity" value that appears first on the list. this a horizontal slider from 0 to 100 percent that adjusts how much a modifier is applied.
+- [x] the only modifiers that should appear are ones that exist in the selected object (or in all selected objects if multiple are selected)
+- [x] all modifiers should also have a square chain (link) icon in the top right. when in link select mode, highlight in orange in the outliner which object or objects this modifier is attached to. selecting/deselecting objects or shapes in the outliner adds/removes those from the link state of that modifier. clicking the link button again in this mode toggles things back to normal.
+- [x] when you click add modifier, it should add it to all the currently selected objects, linked. linked modifiers means that the same modifier data/parameters persist between its duplicates in other objects/shapes.
+- [x] transform tool should also appear if a shape is selected. this should move the shape and everything in it (unlike manipulating the handles normally, which just edits the shape bounds and doesn't modify the objects within.
+- [x] click dragging slightly outside the 8 handles of a shape should let you translate it. currently, this isn't working./
 ## more tweaks (next)
 - visibility and opacity sliders should be pinned to the top of the outliner, but below the selected object properties row.
 - text opacity is currently locking and wont let me change it (bug)

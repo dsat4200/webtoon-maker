@@ -1,13 +1,14 @@
 """Versioned, UI-independent series/chapter document model."""
 from __future__ import annotations
 
+import copy
 import math
 import uuid
 from dataclasses import dataclass, field
 from typing import Any, Iterable, Iterator, Literal
 
 
-SCHEMA_VERSION = 18
+SCHEMA_VERSION = 20
 SERIES_SCHEMA_VERSION = 17
 CHAPTER_WIDTH = 1080
 DEFAULT_CHAPTER_HEIGHT = 3240
@@ -957,11 +958,13 @@ class LayerNode:
     layer_id: str = field(default_factory=new_id)
     name: str = "Layer"
     is_page: bool = False
-    layer_kind: Literal["bounded", "open_shape", "fill"] = "bounded"
+    layer_kind: Literal["bounded", "open_shape"] = "bounded"
     parent_id: str | None = None
     children: list[ChildRef] = field(default_factory=list)
     visible: bool = True
     opacity: float = 1.0
+    mask_only: bool = False
+    fill_reference: bool = False
     translate_x: float = 0.0
     translate_y: float = 0.0
     bound: BoundGeometry | None = field(default_factory=BoundGeometry)
@@ -983,6 +986,8 @@ class LayerNode:
             "parent_id": self.parent_id,
             "children": [item.to_dict() for item in self.children],
             "visible": self.visible, "opacity": self.opacity,
+            "mask_only": self.mask_only,
+            "fill_reference": self.fill_reference,
             "translation": [self.translate_x, self.translate_y],
             "bound": self.bound.to_dict() if self.bound is not None else None,
             "shape_style": self.shape_style.to_dict(),
@@ -1018,6 +1023,8 @@ class LayerNode:
             children=[ChildRef.from_dict(item) for item in data.get("children", [])],
             visible=bool(data.get("visible", True)),
             opacity=float(data.get("opacity", 1.0)),
+            mask_only=bool(data.get("mask_only", False)),
+            fill_reference=bool(data.get("fill_reference", False)),
             translate_x=float(translation[0]), translate_y=float(translation[1]),
             bound=(
                 BoundGeometry.from_dict(data["bound"])
@@ -1110,6 +1117,8 @@ class DocumentObject:
     y: float = 0.0
     visible: bool = True
     opacity: float = 1.0
+    mask_only: bool = False
+    fill_reference: bool = False
     opacity_locked: bool = True
     geometry_reference: Literal["direct", "compound"] = "direct"
     ignore_parent_mask: bool = False
@@ -1123,6 +1132,8 @@ class DocumentObject:
             "custom_name": self.custom_name,
             "parent_layer_id": self.parent_layer_id, "position": [self.x, self.y],
             "visible": self.visible, "opacity": self.opacity,
+            "mask_only": self.mask_only,
+            "fill_reference": self.fill_reference,
             "opacity_locked": self.opacity_locked,
             "geometry_reference": self.geometry_reference,
             "ignore_parent_mask": self.ignore_parent_mask,
@@ -2031,7 +2042,6 @@ class VectorDrawingObject(DocumentObject):
     object_type: str = "vector_drawing"
     name: str = "Vector Drawing"
     strokes: list[VectorStroke] = field(default_factory=list)
-    fill_child_ids: list[str] = field(default_factory=list)
     drawing_revision: int = 0
     transform_frame: tuple[float, float, float, float] | None = None
     transform_quad: list[tuple[float, float]] | None = None
@@ -2045,11 +2055,6 @@ class VectorDrawingObject(DocumentObject):
                     f"Vector drawing {self.object_id} has duplicate stroke IDs"
                 )
             ids.add(stroke.stroke_id)
-        if len(set(self.fill_child_ids)) != len(self.fill_child_ids):
-            raise ValueError(
-                f"Vector drawing {self.object_id} references a fill more than once"
-            )
-        self.fill_child_ids = [str(item) for item in self.fill_child_ids]
         self.drawing_revision = max(0, int(self.drawing_revision))
 
     def derived_bounds(self) -> tuple[float, float, float, float]:
@@ -2074,7 +2079,6 @@ class VectorDrawingObject(DocumentObject):
         result = self.common_dict()
         result.update({
             "strokes": [stroke.to_dict() for stroke in self.strokes],
-            "fill_child_ids": list(self.fill_child_ids),
             "drawing_revision": self.drawing_revision,
             "transform_frame": (
                 list(self.transform_frame)
@@ -2087,57 +2091,9 @@ class VectorDrawingObject(DocumentObject):
         })
         return result
 
-
-@dataclass
-class VectorFillObject(DocumentObject):
-    object_type: str = "vector_fill"
-    name: str = "Vector Fill"
-    owner_drawing_id: str = ""
-    geometry: BoundGeometry = field(
-        default_factory=lambda: BoundGeometry.rectangle(0, 0, 1, 1)
-    )
-    fill_color: str = "#FF000000"
-    source_seed: tuple[float, float] | None = None
-    source_lasso: list[tuple[float, float]] = field(default_factory=list)
-    fill_settings: dict[str, Any] = field(default_factory=dict)
-
-    def validate_vector_fill(self) -> None:
-        if not self.owner_drawing_id:
-            raise ValueError(f"Vector fill {self.object_id} has no owner")
-        self.geometry.validate()
-        if not self.geometry.closed or any(
-            not contour.closed for contour in self.geometry.additional_contours
-        ):
-            raise ValueError("Vector fills require closed contours")
-        self.fill_color = canonical_argb(self.fill_color)
-        self.source_seed = (
-            _point(self.source_seed) if self.source_seed is not None else None
-        )
-        self.source_lasso = [_point(point) for point in self.source_lasso]
-        self.fill_settings = dict(self.fill_settings)
-
-    def derived_bounds(self) -> tuple[float, float, float, float]:
-        return self.geometry.bbox()
-
-    def to_dict(self) -> dict[str, Any]:
-        self.validate_vector_fill()
-        result = self.common_dict()
-        result.update({
-            "owner_drawing_id": self.owner_drawing_id,
-            "geometry": self.geometry.to_dict(),
-            "fill_color": self.fill_color,
-            "source_seed": (
-                list(self.source_seed) if self.source_seed is not None else None
-            ),
-            "source_lasso": [list(point) for point in self.source_lasso],
-            "fill_settings": dict(self.fill_settings),
-        })
-        return result
-
-
 ObjectEntity = (
     RasterObject | ImageObject | TextObject | GradientObject
-    | VectorDrawingObject | VectorFillObject
+    | VectorDrawingObject
     | SpeedLineCenterObject | DocumentObject
 )
 
@@ -2150,6 +2106,8 @@ def object_from_dict(data: dict[str, Any]) -> ObjectEntity:
         parent_layer_id=str(data.get("parent_layer_id", "")), x=float(position[0]),
         y=float(position[1]), visible=bool(data.get("visible", True)),
         opacity=float(data.get("opacity", 1.0)),
+        mask_only=bool(data.get("mask_only", False)),
+        fill_reference=bool(data.get("fill_reference", False)),
         opacity_locked=bool(data.get("opacity_locked", True)),
         geometry_reference=str(data.get("geometry_reference", "direct")),
         ignore_parent_mask=bool(data.get("ignore_parent_mask", False)),
@@ -2221,9 +2179,6 @@ def object_from_dict(data: dict[str, Any]) -> ObjectEntity:
                 VectorStroke.from_dict(item)
                 for item in data.get("strokes", [])
             ],
-            fill_child_ids=[
-                str(item) for item in data.get("fill_child_ids", [])
-            ],
             drawing_revision=int(data.get("drawing_revision", 0)),
             transform_frame=(
                 tuple(float(value) for value in raw_frame)
@@ -2235,21 +2190,8 @@ def object_from_dict(data: dict[str, Any]) -> ObjectEntity:
             ),
         )
     if object_type == "vector_fill":
-        return VectorFillObject(
-            **common,
-            owner_drawing_id=str(data.get("owner_drawing_id", "")),
-            geometry=BoundGeometry.from_dict(
-                data.get("geometry") or data.get("bound") or {}
-            ),
-            fill_color=str(data.get("fill_color", "#FF000000")),
-            source_seed=(
-                _point(data["source_seed"])
-                if data.get("source_seed") is not None else None
-            ),
-            source_lasso=[
-                _point(point) for point in data.get("source_lasso", [])
-            ],
-            fill_settings=dict(data.get("fill_settings") or {}),
+        raise ValueError(
+            "Legacy vector fill reached the runtime model without migration"
         )
     if object_type == "raster":
         raw_rect = data.get("interaction_rect", [0, 0, 120, 120])
@@ -2327,6 +2269,231 @@ def object_from_dict(data: dict[str, Any]) -> ObjectEntity:
     return DocumentObject(**common, object_type=object_type)
 
 
+def _migrate_legacy_fill_records(
+    source: dict[str, Any], warnings: list[str] | None,
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    """Convert schema-18 fill entities to ordinary raster placeholders.
+
+    Pixel materialization is intentionally deferred until persistence has
+    loaded the existing tile directory.  This keeps model parsing independent
+    of Qt image storage while ensuring no legacy fill survives at runtime.
+    """
+    data = copy.deepcopy(source)
+    raw_layers = [
+        item for item in data.get("layers", []) if isinstance(item, dict)
+    ]
+    raw_objects = [
+        item for item in data.get("objects", []) if isinstance(item, dict)
+    ]
+    layers = {str(item.get("id", "")): item for item in raw_layers}
+    objects = {str(item.get("id", "")): item for item in raw_objects}
+    plans: list[dict[str, Any]] = []
+
+    def replace_mask_contributor(
+        old_kind: str, entity_id: str, new_kind: str,
+    ) -> None:
+        for mask in data.get("masks", []):
+            if not isinstance(mask, dict):
+                continue
+            rewritten = []
+            for contributor in mask.get("contributors", []):
+                if (
+                    isinstance(contributor, (list, tuple))
+                    and len(contributor) == 2
+                    and str(contributor[0]) == old_kind
+                    and str(contributor[1]) == entity_id
+                ):
+                    rewritten.append([new_kind, entity_id])
+                else:
+                    rewritten.append(contributor)
+            mask["contributors"] = rewritten
+
+    fill_layers = [
+        item for item in raw_layers
+        if str(item.get("layer_kind", "bounded")) == "fill"
+    ]
+    for item in fill_layers:
+        fill_id = str(item.get("id", ""))
+        parent_id = str(item.get("parent_id", ""))
+        parent = layers.get(parent_id)
+        if not fill_id or parent is None:
+            raise ValueError(
+                "Cannot migrate legacy Fill Layer: its parent is missing"
+            )
+        replaced = False
+        for child in parent.get("children", []):
+            if (
+                isinstance(child, dict)
+                and str(child.get("kind", "")) == "layer"
+                and str(child.get("id", "")) == fill_id
+            ):
+                child["kind"] = "object"
+                replaced = True
+        if not replaced:
+            raise ValueError(
+                f"Cannot migrate legacy Fill Layer {fill_id}: hierarchy "
+                "reference is missing"
+            )
+        style = item.get("shape_style") or {}
+        color = str(
+            style.get("primary_color")
+            or item.get("fill_color") or "#FF111111"
+        )
+        parent_geometry = parent.get("bound")
+        if not isinstance(parent_geometry, dict):
+            raise ValueError(
+                f"Cannot migrate legacy Fill Layer {fill_id}: parent "
+                "geometry is missing"
+            )
+        geometry = BoundGeometry.from_dict(parent_geometry)
+        left, top, width, height = geometry.bbox()
+        raster = {
+            "id": fill_id,
+            "type": "raster",
+            "name": str(item.get("name", "Fill")),
+            "custom_name": bool(item.get("custom_name", False)),
+            "parent_layer_id": parent_id,
+            "position": [0.0, 0.0],
+            "visible": bool(item.get("visible", True)),
+            "opacity": float(item.get("opacity", 1.0)),
+            "mask_only": bool(item.get("mask_only", False)),
+            "opacity_locked": False,
+            "fill_reference": bool(item.get("fill_reference", False)),
+            "geometry_reference": "direct",
+            "ignore_parent_mask": False,
+            "underlay_opacity": 0.0,
+            "modifier_ids": [],
+            "opacity_mask": None,
+            "tile_size": 256,
+            "interaction_rect": [
+                float(left), float(top), max(1.0, float(width)),
+                max(1.0, float(height)),
+            ],
+            "transform_frame": None,
+            "transform_quad": None,
+        }
+        raw_objects.append(raster)
+        objects[fill_id] = raster
+        plans.append({
+            "kind": "fill_layer", "object_id": fill_id,
+            "source_layer_id": parent_id, "color": color,
+        })
+        replace_mask_contributor("layer", fill_id, "object")
+        raw_layers.remove(item)
+        layers.pop(fill_id, None)
+        if parent.get("last_raster_id") is None:
+            parent["last_raster_id"] = fill_id
+
+    vector_fills = {
+        str(item.get("id", "")): item for item in raw_objects
+        if str(item.get("type", "")) == "vector_fill"
+    }
+    for owner in list(raw_objects):
+        if str(owner.get("type", "")) != "vector_drawing":
+            continue
+        owner_id = str(owner.get("id", ""))
+        fill_ids = [str(value) for value in owner.get("fill_child_ids", [])]
+        owner.pop("fill_child_ids", None)
+        if not fill_ids:
+            continue
+        parent_id = str(owner.get("parent_layer_id", ""))
+        parent = layers.get(parent_id)
+        if parent is None:
+            raise ValueError(
+                f"Cannot migrate vector fills for {owner_id}: parent is missing"
+            )
+        child_refs = parent.get("children", [])
+        owner_index = next((
+            index for index, child in enumerate(child_refs)
+            if isinstance(child, dict)
+            and str(child.get("kind", "")) == "object"
+            and str(child.get("id", "")) == owner_id
+        ), -1)
+        if owner_index < 0:
+            raise ValueError(
+                f"Cannot migrate vector fills for {owner_id}: hierarchy "
+                "reference is missing"
+            )
+        insert_refs: list[dict[str, str]] = []
+        for fill_id in fill_ids:
+            fill = vector_fills.get(fill_id)
+            if fill is None or str(fill.get("owner_drawing_id", "")) != owner_id:
+                raise ValueError(
+                    f"Cannot migrate vector fill {fill_id}: owner is invalid"
+                )
+            raw_geometry = fill.get("geometry") or fill.get("bound")
+            if not isinstance(raw_geometry, dict):
+                raise ValueError(
+                    f"Cannot migrate vector fill {fill_id}: geometry is missing"
+                )
+            geometry = BoundGeometry.from_dict(raw_geometry)
+            left, top, width, height = geometry.bbox()
+            position = owner.get("position", [0.0, 0.0])
+            original = dict(fill)
+            fill.clear()
+            fill.update({
+                "id": fill_id,
+                "type": "raster",
+                "name": str(original.get("name", "Vector Fill")),
+                "custom_name": bool(original.get("custom_name", False)),
+                "parent_layer_id": parent_id,
+                "position": [float(position[0]), float(position[1])],
+                "visible": bool(original.get("visible", True)),
+                "opacity": float(original.get("opacity", 1.0)),
+                "mask_only": bool(original.get("mask_only", False)),
+                "opacity_locked": bool(
+                    original.get("opacity_locked", True)
+                ),
+                "fill_reference": bool(
+                    original.get("fill_reference", False)
+                ),
+                "geometry_reference": str(
+                    original.get("geometry_reference", "direct")
+                ),
+                "ignore_parent_mask": bool(
+                    original.get("ignore_parent_mask", False)
+                ),
+                "underlay_opacity": float(
+                    original.get("underlay_opacity", 0.0)
+                ),
+                "modifier_ids": list(original.get("modifier_ids", [])),
+                "opacity_mask": original.get("opacity_mask"),
+                "tile_size": 256,
+                "interaction_rect": [
+                    float(left), float(top), max(1.0, float(width)),
+                    max(1.0, float(height)),
+                ],
+                "transform_frame": owner.get("transform_frame"),
+                "transform_quad": owner.get("transform_quad"),
+            })
+            plans.append({
+                "kind": "vector_fill", "object_id": fill_id,
+                "geometry": raw_geometry,
+                "color": str(original.get("fill_color", "#FF000000")),
+            })
+            insert_refs.append({"kind": "object", "id": fill_id})
+        child_refs[owner_index + 1:owner_index + 1] = insert_refs
+
+    orphan_ids = set(vector_fills) - {
+        str(plan["object_id"]) for plan in plans
+        if plan["kind"] == "vector_fill"
+    }
+    if orphan_ids:
+        raise ValueError(
+            "Cannot migrate orphaned vector fill(s): "
+            + ", ".join(sorted(orphan_ids))
+        )
+    data["layers"] = raw_layers
+    data["objects"] = raw_objects
+    data["schema_version"] = SCHEMA_VERSION
+    if plans and warnings is not None:
+        warnings.append(
+            f"Migrated {len(plans)} legacy fill"
+            f"{'s' if len(plans) != 1 else ''} to raster objects."
+        )
+    return data, plans
+
+
 @dataclass
 class ChapterDocument:
     chapter_id: str = field(default_factory=new_id)
@@ -2342,6 +2509,9 @@ class ChapterDocument:
     masks: dict[str, ToneMask] = field(default_factory=dict)
     document_kind: Literal["chapter", "asset"] = "chapter"
     schema_version: int = SCHEMA_VERSION
+    legacy_fill_migrations: list[dict[str, Any]] = field(
+        default_factory=list, repr=False, compare=False
+    )
 
     def validate(self) -> None:
         if self.schema_version > SCHEMA_VERSION:
@@ -2369,31 +2539,19 @@ class ChapterDocument:
             referenced.add(("layer", page_id))
         for layer in self.layers.values():
             layer.ignore_parent_mask = bool(layer.ignore_parent_mask)
+            layer.mask_only = bool(layer.mask_only and not layer.is_page)
+            layer.fill_reference = bool(
+                layer.fill_reference and not layer.is_page
+            )
             layer.modifier_ids = list(dict.fromkeys(
                 str(item) for item in layer.modifier_ids
                 if str(item) in self.modifiers
             ))
-            if layer.layer_kind not in {"bounded", "open_shape", "fill"}:
+            if layer.layer_kind not in {"bounded", "open_shape"}:
                 raise ValueError("Unknown layer kind")
             if layer.compound_operation not in {"add", "subtract", "ignore"}:
                 raise ValueError("Unknown compound operation")
-            if layer.layer_kind == "fill":
-                if layer.is_page or layer.parent_id is None:
-                    raise ValueError("Fill layers require a parent")
-                if layer.bound is not None or layer.children:
-                    raise ValueError("Fill layers are boundless leaves")
-                if not layer.fill_color:
-                    raise ValueError("Fill layers require a fill color")
-                layer.grid_override = None
-                layer.border_width = 0.0
-                layer.vertex_radius = 0.0
-                layer.compound_enabled = False
-                layer.ignore_parent_mask = False
-                layer.modifier_ids.clear()
-                layer.transform_frame = None
-                layer.transform_quad = None
-                layer.opacity_mask = None
-            elif layer.bound is None:
+            if layer.bound is None:
                 raise ValueError("Bounded layers require geometry")
             else:
                 layer.bound.validate()
@@ -2415,6 +2573,8 @@ class ChapterDocument:
                 layer.border_width = min(40.0, layer.border_width)
                 layer.compound_enabled = False
                 layer.ignore_parent_mask = False
+                layer.mask_only = False
+                layer.fill_reference = False
                 layer.modifier_ids.clear()
                 layer.transform_frame = None
                 layer.transform_quad = None
@@ -2455,11 +2615,6 @@ class ChapterDocument:
                 )
             if not layer.is_page and layer.parent_id not in self.layers:
                 raise ValueError(f"Layer {layer.layer_id} has no valid parent")
-            if (
-                layer.parent_id
-                and self.layers[layer.parent_id].layer_kind == "fill"
-            ):
-                raise ValueError("Leaf layers cannot contain entities")
             if layer.parent_id and self.layers[layer.parent_id].is_page is False:
                 pass
             for child in layer.children:
@@ -2475,17 +2630,23 @@ class ChapterDocument:
                     candidate_object = self.objects.get(child.entity_id)
                     if (
                         candidate_object is None
-                        or isinstance(
-                            candidate_object,
-                            (VectorFillObject, SpeedLineCenterObject),
-                        )
+                        or isinstance(candidate_object, SpeedLineCenterObject)
                         or candidate_object.parent_layer_id != layer.layer_id
                     ):
                         raise ValueError("Invalid child object")
                 else:
                     raise ValueError(f"Unknown child kind: {child.kind}")
-        owned_fill_ids: set[str] = set()
         for obj in self.objects.values():
+            obj.mask_only = bool(
+                obj.mask_only and isinstance(
+                    obj,
+                    (
+                        RasterObject, ImageObject, TextObject,
+                        GradientObject, VectorDrawingObject,
+                    ),
+                )
+            )
+            obj.fill_reference = bool(obj.fill_reference)
             obj.modifier_ids = list(dict.fromkeys(
                 str(item) for item in obj.modifier_ids
                 if str(item) in self.modifiers
@@ -2507,40 +2668,9 @@ class ChapterDocument:
             if not isinstance(obj, VectorDrawingObject):
                 continue
             obj.validate_vector()
-            for fill_id in obj.fill_child_ids:
-                if fill_id in owned_fill_ids:
-                    raise ValueError(
-                        f"Vector fill {fill_id} is owned by more than one drawing"
-                    )
-                fill = self.objects.get(fill_id)
-                if not isinstance(fill, VectorFillObject):
-                    raise ValueError(
-                        f"Vector drawing {obj.object_id} references an invalid fill"
-                    )
-                if fill.owner_drawing_id != obj.object_id:
-                    raise ValueError(
-                        f"Vector fill {fill_id} has a mismatched owner"
-                    )
-                if fill.parent_layer_id != obj.parent_layer_id:
-                    raise ValueError(
-                        f"Vector fill {fill_id} does not inherit its owner's layer"
-                    )
-                owned_fill_ids.add(fill_id)
         owned_center_ids: set[str] = set()
         for object_id, obj in self.objects.items():
-            if isinstance(obj, VectorFillObject):
-                obj.validate_vector_fill()
-                owner = self.objects.get(obj.owner_drawing_id)
-                if not isinstance(owner, VectorDrawingObject):
-                    raise ValueError(
-                        f"Vector fill {object_id} requires a Vector Drawing owner"
-                    )
-                parent = self.layers.get(owner.parent_layer_id)
-                if object_id not in owned_fill_ids:
-                    raise ValueError(
-                        f"Vector fill {object_id} is not referenced by its owner"
-                    )
-            elif isinstance(obj, SpeedLineCenterObject):
+            if isinstance(obj, SpeedLineCenterObject):
                 obj.validate_center()
                 owner = self.objects.get(obj.owner_gradient_id)
                 if not isinstance(owner, SpeedLinesGradientObject):
@@ -2559,17 +2689,12 @@ class ChapterDocument:
                 owned_center_ids.add(object_id)
             else:
                 parent = self.layers.get(obj.parent_layer_id)
-            if (
-                parent is None
-                or parent.layer_kind == "fill"
-            ):
+            if parent is None:
                 raise ValueError(f"Object {object_id} requires a container layer")
             obj.opacity = max(0.0, min(1.0, float(obj.opacity)))
             if obj.opacity_mask is not None:
                 obj.opacity_mask.validate(0.0, 1.0)
             obj.ignore_parent_mask = bool(obj.ignore_parent_mask)
-            if isinstance(obj, VectorFillObject):
-                obj.ignore_parent_mask = bool(owner.ignore_parent_mask)
             if obj.geometry_reference not in {"direct", "compound"}:
                 obj.geometry_reference = "direct"
             if isinstance(obj, RasterObject):
@@ -2615,9 +2740,7 @@ class ChapterDocument:
                     raise ValueError("Text transform quad must have four points")
         expected = {("layer", key) for key in self.layers} | {
             ("object", key) for key, obj in self.objects.items()
-            if not isinstance(
-                obj, (VectorFillObject, SpeedLineCenterObject)
-            )
+            if not isinstance(obj, SpeedLineCenterObject)
         }
         for obj in self.objects.values():
             if (
@@ -2657,6 +2780,7 @@ class ChapterDocument:
                 contributor for contributor in mask.contributors
                 if self.mask_contributor(*contributor) is not None
             ]
+        self._assert_mask_dependencies_acyclic()
         referenced_modifiers = {
             modifier_id
             for layer in self.layers.values() for modifier_id in layer.modifier_ids
@@ -2675,6 +2799,65 @@ class ChapterDocument:
             if mask.saved or mask_id in referenced_masks
         }
         self._assert_acyclic()
+
+    def _assert_mask_dependencies_acyclic(self) -> None:
+        """Reject masks that recursively require their own rendered target."""
+        graph: dict[tuple[str, str], set[tuple[str, str]]] = {}
+
+        def layer_subtree(layer_id: str) -> set[tuple[str, str]]:
+            result: set[tuple[str, str]] = {("layer", layer_id)}
+            layer = self.layers.get(layer_id)
+            if layer is None:
+                return result
+            for child in layer.children:
+                if child.kind == "layer":
+                    result.update(layer_subtree(child.entity_id))
+                else:
+                    result.add(("object", child.entity_id))
+            return result
+
+        for kind, values in (
+            ("layer", self.layers.values()), ("object", self.objects.values()),
+        ):
+            for entity in values:
+                entity_id = (
+                    entity.layer_id if isinstance(entity, LayerNode)
+                    else entity.object_id
+                )
+                bindings = []
+                if entity.opacity_mask is not None:
+                    bindings.append(entity.opacity_mask)
+                for modifier_id in entity.modifier_ids:
+                    modifier = self.modifiers.get(modifier_id)
+                    if modifier is not None:
+                        bindings.extend(modifier.parameter_masks.values())
+                dependencies = graph.setdefault((kind, entity_id), set())
+                for binding in bindings:
+                    mask = self.masks.get(binding.mask_id)
+                    if mask is None:
+                        continue
+                    for contributor_kind, contributor_id in mask.contributors:
+                        if contributor_kind == "layer":
+                            dependencies.update(layer_subtree(contributor_id))
+                        else:
+                            dependencies.add(("object", contributor_id))
+
+        visiting: set[tuple[str, str]] = set()
+        complete: set[tuple[str, str]] = set()
+
+        def visit(node: tuple[str, str]) -> None:
+            if node in complete:
+                return
+            if node in visiting:
+                raise ValueError("Mask dependency cycle detected")
+            visiting.add(node)
+            for dependency in graph.get(node, ()):
+                visit(dependency)
+            visiting.remove(node)
+            complete.add(node)
+
+        for node in graph:
+            visit(node)
 
     def mask_contributor(
         self, kind: str, entity_id: str,
@@ -2739,7 +2922,7 @@ class ChapterDocument:
             layer = self.layers.get(entity_id)
             if (
                 layer is not None and not layer.is_page
-                and layer.layer_kind != "fill" and layer.bound is not None
+                and layer.bound is not None
             ):
                 return layer
             return None
@@ -2850,8 +3033,6 @@ class ChapterDocument:
         style: ShapeStyle | None = None,
     ) -> LayerNode:
         parent = self.layers[parent_id]
-        if parent.layer_kind == "fill":
-            raise ValueError("Leaf layers cannot contain entities")
         layer = LayerNode(
             name=name, parent_id=parent_id, layer_kind=layer_kind,
             bound=bound or BoundGeometry.rectangle(0, 0, 720, 720),
@@ -2867,32 +3048,14 @@ class ChapterDocument:
             )
         return layer
 
-    def add_fill_layer(
-        self, parent_id: str, name: str = "Fill", color: str = "#111111",
-    ) -> LayerNode:
-        parent = self.layers[parent_id]
-        if parent.layer_kind == "fill":
-            raise ValueError("Leaf layers cannot contain entities")
-        layer = LayerNode(
-            name=name, parent_id=parent_id, layer_kind="fill",
-            bound=None, shape_style=ShapeStyle(primary_color=color),
-        )
-        self.layers[layer.layer_id] = layer
-        parent.children.insert(0, ChildRef("layer", layer.layer_id))
-        return layer
-
     def add_object(
         self, parent_id: str, obj: ObjectEntity, index: int | None = None,
     ) -> ObjectEntity:
         if isinstance(obj, (SpeedLinesGradientObject, SpeedLineCenterObject)):
             raise ValueError("Speed Lines are no longer supported")
-        if isinstance(obj, VectorFillObject):
-            return self.add_vector_fill(parent_id, obj, index)
         if isinstance(obj, SpeedLineCenterObject):
             return self.add_speed_center(parent_id, obj)
         parent = self.layers[parent_id]
-        if parent.layer_kind == "fill":
-            raise ValueError("Objects require a container layer")
         if isinstance(obj, GradientObject):
             family = (
                 "speed_lines"
@@ -2953,41 +3116,6 @@ class ChapterDocument:
                 result.append(candidate)
         return result
 
-    def add_vector_fill(
-        self, owner_id: str, fill: VectorFillObject,
-        index: int | None = None,
-    ) -> VectorFillObject:
-        """Attach a fill to a Vector Drawing without adding a layer child ref."""
-        owner = self.objects.get(owner_id)
-        if not isinstance(owner, VectorDrawingObject):
-            raise ValueError("Vector fills require a Vector Drawing owner")
-        if fill.object_id in self.objects:
-            raise ValueError(f"Duplicate object ID: {fill.object_id}")
-        fill.owner_drawing_id = owner_id
-        fill.parent_layer_id = owner.parent_layer_id
-        fill.validate_vector_fill()
-        self.objects[fill.object_id] = fill
-        if index is None:
-            owner.fill_child_ids.append(fill.object_id)
-        else:
-            owner.fill_child_ids.insert(
-                max(0, min(int(index), len(owner.fill_child_ids))),
-                fill.object_id,
-            )
-        owner.touch_revision()
-        return fill
-
-    def vector_fill_children(
-        self, drawing_id: str,
-    ) -> list[VectorFillObject]:
-        drawing = self.objects.get(drawing_id)
-        if not isinstance(drawing, VectorDrawingObject):
-            return []
-        return [
-            fill for fill_id in drawing.fill_child_ids
-            if isinstance((fill := self.objects.get(fill_id)), VectorFillObject)
-        ]
-
     def add_speed_center(
         self, owner_id: str, center: SpeedLineCenterObject,
     ) -> SpeedLineCenterObject:
@@ -3020,36 +3148,12 @@ class ChapterDocument:
         return center if isinstance(center, SpeedLineCenterObject) else None
 
 
-    def reorder_vector_fill(
-        self, owner_id: str, fill_id: str, index: int,
-    ) -> None:
-        owner = self.objects.get(owner_id)
-        fill = self.objects.get(fill_id)
-        if (
-            not isinstance(owner, VectorDrawingObject)
-            or not isinstance(fill, VectorFillObject)
-            or fill.owner_drawing_id != owner_id
-            or fill_id not in owner.fill_child_ids
-        ):
-            raise ValueError("Vector fills can only reorder within their owner")
-        old_index = owner.fill_child_ids.index(fill_id)
-        owner.fill_child_ids.pop(old_index)
-        if old_index < index:
-            index -= 1
-        owner.fill_child_ids.insert(
-            max(0, min(int(index), len(owner.fill_child_ids))), fill_id
-        )
-        owner.touch_revision()
-
     def parent_ref_list(self, kind: str, entity_id: str) -> list[ChildRef] | None:
         if kind == "layer" and entity_id in self.root_page_ids:
             return None
         if (
             kind == "object"
-            and isinstance(
-                self.objects.get(entity_id),
-                (VectorFillObject, SpeedLineCenterObject),
-            )
+            and isinstance(self.objects.get(entity_id), SpeedLineCenterObject)
         ):
             return None
         parent_id = (
@@ -3062,14 +3166,6 @@ class ChapterDocument:
         self, kind: Literal["layer", "object"], entity_id: str,
         new_parent_id: str | None, index: int,
     ) -> None:
-        if (
-            kind == "object"
-            and isinstance(self.objects.get(entity_id), VectorFillObject)
-        ):
-            if new_parent_id is None:
-                raise ValueError("Vector fills require their existing owner")
-            self.reorder_vector_fill(new_parent_id, entity_id, index)
-            return
         if kind == "object" and isinstance(
             self.objects.get(entity_id), SpeedLineCenterObject
         ):
@@ -3086,8 +3182,6 @@ class ChapterDocument:
         if new_parent_id is None:
             raise ValueError("Only page layers can be roots")
         new_parent = self.layers[new_parent_id]
-        if new_parent.layer_kind == "fill":
-            raise ValueError("Leaf layers cannot contain entities")
         if kind == "layer":
             cursor: str | None = new_parent_id
             while cursor:
@@ -3181,10 +3275,6 @@ class ChapterDocument:
                                     )
                         center.parent_layer_id = new_parent_id
                 entity.touch_revision()
-            if isinstance(entity, VectorDrawingObject):
-                for fill in self.vector_fill_children(entity.object_id):
-                    fill.parent_layer_id = new_parent_id
-
     def move_entities(
         self, entities: Iterable[tuple[str, str]],
         new_parent_id: str, index: int,
@@ -3204,7 +3294,7 @@ class ChapterDocument:
         if not ordered:
             raise ValueError("No objects to move")
         parent = self.layers.get(new_parent_id)
-        if parent is None or parent.layer_kind == "fill":
+        if parent is None:
             raise ValueError("Objects require a container layer")
         moving: list[DocumentObject] = []
         for kind, entity_id in ordered:
@@ -3234,9 +3324,6 @@ class ChapterDocument:
         parent.children[insertion:insertion] = refs
         for obj in moving:
             obj.parent_layer_id = new_parent_id
-            if isinstance(obj, VectorDrawingObject):
-                for fill in self.vector_fill_children(obj.object_id):
-                    fill.parent_layer_id = new_parent_id
 
     def delete_entity(self, kind: str, entity_id: str) -> set[str]:
         deleted_objects: set[str] = set()
@@ -3251,18 +3338,6 @@ class ChapterDocument:
 
         if kind == "object":
             obj = self.objects[entity_id]
-            if isinstance(obj, VectorFillObject):
-                owner = self.objects.get(obj.owner_drawing_id)
-                if isinstance(owner, VectorDrawingObject):
-                    owner.fill_child_ids = [
-                        item for item in owner.fill_child_ids
-                        if item != entity_id
-                    ]
-                    owner.touch_revision()
-                del self.objects[entity_id]
-                remove_mask_contributor(("object", entity_id))
-                deleted_objects.add(entity_id)
-                return deleted_objects
             if isinstance(obj, SpeedLineCenterObject):
                 owner = self.objects.get(obj.owner_gradient_id)
                 if isinstance(owner, SpeedLinesGradientObject):
@@ -3272,11 +3347,6 @@ class ChapterDocument:
                 remove_mask_contributor(("object", entity_id))
                 deleted_objects.add(entity_id)
                 return deleted_objects
-            if isinstance(obj, VectorDrawingObject):
-                for fill_id in list(obj.fill_child_ids):
-                    deleted_objects.update(
-                        self.delete_entity("object", fill_id)
-                    )
             if isinstance(obj, SpeedLinesGradientObject):
                 center = self.speed_center_for(obj.object_id)
                 if center is not None:
@@ -3392,10 +3462,6 @@ class ChapterDocument:
                 obj = self.objects[child.entity_id]
                 if obj.opacity_locked:
                     obj.opacity = layer.opacity
-                if isinstance(obj, VectorDrawingObject):
-                    for fill in self.vector_fill_children(obj.object_id):
-                        if fill.opacity_locked:
-                            fill.opacity = layer.opacity
 
     def ensure_height_for(self, layer_id: str) -> bool:
         layer = self.layers[layer_id]
@@ -3443,14 +3509,15 @@ class ChapterDocument:
                     yield from walk(self.layers[child.entity_id])
                 else:
                     obj = self.objects[child.entity_id]
-                    if isinstance(obj, VectorDrawingObject):
-                        for fill_id in reversed(obj.fill_child_ids):
-                            yield "object", self.objects[fill_id]
                     yield "object", obj
         for page_id in reversed(self.root_page_ids):
             yield from walk(self.layers[page_id])
 
     def to_dict(self) -> dict[str, Any]:
+        if self.legacy_fill_migrations:
+            raise ValueError(
+                "Legacy fills must be materialized before this document can be saved"
+            )
         return {
             "schema_version": self.schema_version, "id": self.chapter_id,
             "name": self.name, "size": [self.width, self.height],
@@ -3472,6 +3539,21 @@ class ChapterDocument:
         schema = int(data.get("schema_version", 1))
         if schema > SCHEMA_VERSION:
             raise ValueError(f"Unsupported future chapter schema: {schema}")
+        has_legacy_fills = any(
+            isinstance(item, dict)
+            and str(item.get("layer_kind", "")) == "fill"
+            for item in data.get("layers", [])
+        ) or any(
+            isinstance(item, dict)
+            and str(item.get("type", "")) == "vector_fill"
+            for item in data.get("objects", [])
+        )
+        legacy_fill_migrations: list[dict[str, Any]] = []
+        if has_legacy_fills:
+            data, legacy_fill_migrations = _migrate_legacy_fill_records(
+                data, warnings
+            )
+            schema = SCHEMA_VERSION
         size = data.get("size", [CHAPTER_WIDTH, DEFAULT_CHAPTER_HEIGHT])
         unsupported_ids: set[str] = set()
         unsupported_count = 0
@@ -3503,11 +3585,6 @@ class ChapterDocument:
         # drawing children or custom-center fields.  Drop those references
         # before validation so an otherwise usable document still opens.
         for obj in objects:
-            if isinstance(obj, VectorDrawingObject):
-                obj.fill_child_ids = [
-                    child_id for child_id in obj.fill_child_ids
-                    if child_id not in unsupported_ids
-                ]
             if getattr(obj, "center_shape_id", "") in unsupported_ids:
                 obj.center_shape_id = ""
         if warnings is not None and unsupported_count:
@@ -3541,6 +3618,7 @@ class ChapterDocument:
                 )
             },
             schema_version=schema,
+            legacy_fill_migrations=legacy_fill_migrations,
         )
         for obj in result.objects.values():
             if not isinstance(obj, TextObject):

@@ -14,6 +14,7 @@ LABELS = {
     "raster_pencil": "Pencil",
     "raster_eraser": "Eraser",
     "fill": "Fill",
+    "gradient": "Gradient",
     "object_select": "Object Select",
     "transform": "Transform",
     "eyedropper": "Eyedropper",

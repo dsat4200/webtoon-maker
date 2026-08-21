@@ -89,7 +89,7 @@ def test_schema_15_image_migrates_to_embedded_source_without_eager_rewrite():
     restored = ChapterDocument.from_dict(payload)
     linked = restored.objects[image.object_id]
 
-    assert restored.schema_version == 18
+    assert restored.schema_version == 20
     assert isinstance(linked.source, EmbeddedImageSourceDescriptor)
     assert linked.source.filename == "legacy.webp"
     assert linked.source.mime_type == "image/webp"

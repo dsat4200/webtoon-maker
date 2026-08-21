@@ -11,7 +11,7 @@ from PySide6.QtWidgets import (
 
 from comic_editor.core.models import (
     GradientObject,
-    RasterObject, TextObject, VectorDrawingObject, VectorFillObject,
+    RasterObject, TextObject, VectorDrawingObject,
 )
 from comic_editor.core.settings import TextPreset
 
@@ -344,8 +344,6 @@ class ContextInspector(QFrame):
             else (
                 "Vector Drawing"
                 if isinstance(entity, VectorDrawingObject)
-                else "Vector Fill"
-                if isinstance(entity, VectorFillObject)
                 else entity.object_type.title()
             )
         )

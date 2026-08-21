@@ -302,8 +302,14 @@ def test_image_translation_cage_updates_live_and_mode_gizmo_is_global(qapp):
         Qt.KeyboardModifier.NoModifier,
     ))
     assert canvas.cursor().shape() == Qt.CursorShape.OpenHandCursor
-    canvas._tool_press(start, 1.0)
+    canvas.mousePressEvent(QMouseEvent(
+        QEvent.Type.MouseButtonPress, start,
+        QPointF(canvas.mapToGlobal(start.toPoint())),
+        Qt.MouseButton.LeftButton, Qt.MouseButton.LeftButton,
+        Qt.KeyboardModifier.NoModifier,
+    ))
     assert canvas._pending_raster_transform_press is not None
+    assert canvas.cursor().shape() == Qt.CursorShape.ClosedHandCursor
     canvas._tool_move(start + QPointF(32, 20), 1.0)
     moved_widget = start + QPointF(34, 22)
     canvas.mouseMoveEvent(QMouseEvent(
@@ -622,7 +628,9 @@ def test_foreign_image_selection_wins_before_page_fallback(qapp):
     canvas.set_selection("layer", shape.layer_id, activate_default_tool=False)
     canvas.set_tool(ToolKind.SHAPE_EDIT)
     canvas._tool_press(canvas.document_to_widget(QPointF(340, 240)), 1.0)
-    assert canvas.selected_object_id == image.object_id
+    assert canvas.selected_id == shape.layer_id
+    assert canvas.selected_object_id == ""
+    assert canvas._active_shape_control == "translate"
 
 
 def test_draft_point_deletion_clears_all_stale_references(qapp):

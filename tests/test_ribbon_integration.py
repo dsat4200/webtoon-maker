@@ -11,7 +11,6 @@ from comic_editor.core.models import (
     ChapterDocument,
     RasterObject,
     VectorDrawingObject,
-    VectorFillObject,
 )
 from comic_editor.core.persistence import SeriesRepository
 from comic_editor.core.tiles import TileStore
@@ -32,26 +31,22 @@ def _vector_chapter():
     drawing = chapter.add_object(
         layer.layer_id, VectorDrawingObject(name="Lines")
     )
-    fill = chapter.add_vector_fill(
-        drawing.object_id,
-        VectorFillObject(
-            name="Region",
-            geometry=BoundGeometry.rectangle(50, 50, 100, 100),
-        ),
+    raster = chapter.add_object(
+        layer.layer_id, RasterObject(name="Color")
     )
-    return chapter, page, layer, drawing, fill
+    return chapter, page, layer, drawing, raster
 
 
 def test_main_window_ribbon_is_contextual_and_tools_are_renamed(qapp):
     window = MainWindow()
-    chapter, page, layer, drawing, fill = _vector_chapter()
+    chapter, page, layer, drawing, raster = _vector_chapter()
     window._set_chapter(chapter, TileStore())
     try:
         assert window.tool_buttons[ToolKind.RASTER_PENCIL].text() == "Pencil"
         assert window.tool_buttons[ToolKind.RASTER_ERASER].text() == "Eraser"
         assert window.ribbon.page_keys() == [
             "tool_settings", "modifiers", "asset_library", "blender_views",
-            "vector_tools", "gradient_tools",
+            "vector_tools",
         ]
         assert window.ribbon.orientation == Qt.Orientation.Vertical
         assert window.ribbon.tab_bar.shape() == QTabBar.Shape.RoundedEast
@@ -63,7 +58,10 @@ def test_main_window_ribbon_is_contextual_and_tools_are_renamed(qapp):
         assert window.ribbon.current_key() == "vector_tools"
         assert window.canvas.tool == ToolKind.RASTER_PENCIL
 
-        window.canvas.set_selection("object", fill.object_id)
+        window.color_panel.set_active_slot("secondary")
+        assert window.canvas.active_color_slot == "secondary"
+
+        window.canvas.set_selection("object", raster.object_id)
         assert not window.ribbon.is_page_visible("vector_tools")
         window.canvas.set_selection("object", drawing.object_id)
         assert window.ribbon.is_page_visible("vector_tools")
@@ -171,6 +169,7 @@ def test_project_view_controls_and_icon_tool_strip(qapp):
             ToolKind.TEXT_EDIT: "Text Edit",
             ToolKind.TRANSFORM: "Transform",
             ToolKind.SHAPE_EDIT: "Shape Edit",
+            ToolKind.GRADIENT: "Gradient",
             ToolKind.INSERT_PAGE_GAP: "Insert Page Gap",
         }
         for tool, label in expected.items():
@@ -308,15 +307,15 @@ def test_raster_object_ribbon_edits_properties_without_transform_mode(qapp):
         window.deleteLater()
 
 
-def test_add_vector_from_fill_is_anchored_above_owner(qapp):
+def test_add_vector_from_raster_is_anchored_above_selection(qapp):
     window = MainWindow()
-    chapter, page, layer, drawing, fill = _vector_chapter()
+    chapter, page, layer, drawing, raster = _vector_chapter()
     window._set_chapter(chapter, TileStore())
     try:
-        window.canvas.set_selection("object", fill.object_id)
-        owner_index = next(
+        window.canvas.set_selection("object", raster.object_id)
+        selection_index = next(
             index for index, child in enumerate(layer.children)
-            if child.entity_id == drawing.object_id
+            if child.entity_id == raster.object_id
         )
         before_ids = set(chapter.objects)
         window._add_vector_drawing()
@@ -326,40 +325,26 @@ def test_add_vector_from_fill_is_anchored_above_owner(qapp):
         ]
         assert len(created) == 1
         assert isinstance(created[0], VectorDrawingObject)
-        assert layer.children[owner_index].entity_id == created[0].object_id
-        assert layer.children[owner_index + 1].entity_id == drawing.object_id
+        assert layer.children[selection_index].entity_id == created[0].object_id
+        assert layer.children[selection_index + 1].entity_id == raster.object_id
         assert window.canvas.selected_id == created[0].object_id
         assert window.canvas.tool == ToolKind.RASTER_PENCIL
     finally:
         window.deleteLater()
 
 
-def test_vector_branch_stays_open_in_subtree_and_collapses_on_leave(qapp):
+def test_vector_drawing_has_no_synthetic_fill_children(qapp):
     window = MainWindow()
-    chapter, page, layer, drawing, fill = _vector_chapter()
+    chapter, page, layer, drawing, raster = _vector_chapter()
     window._set_chapter(chapter, TileStore())
     try:
         drawing_index = window.hierarchy_model.index_for_entity(
             "object", drawing.object_id
         )
-        assert window.tree.isExpanded(drawing_index)
-        window.canvas.set_selection("object", fill.object_id)
-        drawing_index = window.hierarchy_model.index_for_entity(
-            "object", drawing.object_id
-        )
-        assert window.tree.isExpanded(drawing_index)
-
-        window.hierarchy_model.rebuild()
-        drawing_index = window.hierarchy_model.index_for_entity(
-            "object", drawing.object_id
-        )
-        assert window.tree.isExpanded(drawing_index)
-
-        window.canvas.set_selection("layer", layer.layer_id)
-        drawing_index = window.hierarchy_model.index_for_entity(
-            "object", drawing.object_id
-        )
-        assert not window.tree.isExpanded(drawing_index)
+        assert window.hierarchy_model.rowCount(drawing_index) == 0
+        assert window.hierarchy_model.index_for_entity(
+            "object", raster.object_id
+        ).isValid()
     finally:
         window.deleteLater()
 

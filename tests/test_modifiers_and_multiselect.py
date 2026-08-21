@@ -68,7 +68,7 @@ def test_modifier_registry_round_trip_validation_and_garbage_collection():
     first.transform_quad = [(30, 25), (285, 35), (275, 290), (25, 270)]
 
     restored = ChapterDocument.from_dict(chapter.to_dict())
-    assert restored.schema_version == 18
+    assert restored.schema_version == 20
     assert restored.objects[text.object_id].modifier_ids == []
     assert orphan.modifier_id not in restored.modifiers
     assert restored.objects[raster.object_id].modifier_ids == [
@@ -198,10 +198,13 @@ def test_hsl_intensity_and_premultiplied_blur_pixels():
 
 
 def test_parameter_masks_round_trip_share_contents_but_keep_endpoints():
-    chapter, _page, first, _second, raster, vector = _document()
+    chapter, _page, first, second, raster, vector = _document()
+    controller = chapter.add_object(
+        second.layer_id, RasterObject(name="Mask source")
+    )
     mask = ToneMask(
         name="Shared", saved=True,
-        contributors=[("object", raster.object_id)],
+        contributors=[("object", controller.object_id)],
     )
     chapter.masks[mask.mask_id] = mask
     modifier = HueSaturationLightnessModifier(hue=120)
@@ -217,7 +220,7 @@ def test_parameter_masks_round_trip_share_contents_but_keep_endpoints():
     restored_hue = restored.modifiers[modifier.modifier_id].parameter_masks["hue"]
     restored_opacity = restored.objects[vector.object_id].opacity_mask
     assert restored_mask.saved and restored_mask.name == "Shared"
-    assert restored_mask.contributors == [("object", raster.object_id)]
+    assert restored_mask.contributors == [("object", controller.object_id)]
     assert (restored_hue.black_value, restored_hue.white_value) == (-60, 120)
     assert (restored_opacity.black_value, restored_opacity.white_value) == (.15, .8)
 
@@ -731,7 +734,7 @@ def test_tone_mask_contributor_uses_transformed_base_alpha(qapp):
     assert field[100, 100] == 0
 
 
-def test_shape_opacity_mask_replaces_scalar_opacity_in_isolated_pass(qapp):
+def test_shape_opacity_mask_multiplies_scalar_opacity_in_isolated_pass(qapp):
     chapter, _page, first, _second, _raster, _vector = _document()
     first.fill_color = "#FFFF0000"
     first.opacity = .2
@@ -747,7 +750,7 @@ def test_shape_opacity_mask_replaces_scalar_opacity_in_isolated_pass(qapp):
     painter = QPainter(image)
     canvas._render_layer(painter, first, 1.0, QRectF(0, 0, 300, 300))
     painter.end()
-    assert image.pixelColor(60, 60).alpha() > 245
+    assert image.pixelColor(60, 60).alpha() == pytest.approx(51, abs=2)
     assert image.pixelColor(120, 120).alpha() == 0
 
 

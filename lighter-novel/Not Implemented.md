@@ -1,91 +1,20 @@
-- [x] ## synced image support
-- [x] use an image that streams itself from blender, actively reloading when refreshed every second?
-- [x] use a literal actual blender window, displaying it below our window somehow.
 
-## prompt
-- i still cant drag layers to move them between layers with the stylus
-    
-- dragging the eyedropper should show a circle icon above where you're clicking/dragging that displays the selected color
-    
-- tool options shouln't extend further right, they should wrap to another row beneath if they're too long.
-    
-- allow for selecting multiple objects. doing so lets you drag them to move multiple up and down layers. it also changes the visible tools to only ones that work with multiple objects. for now, that should only be a transform tool (doesn't appear if objects other than raster, vector are selected)
-    
-- for now, multi select should only let you select rasters and vectors
-    
-- add a new tab to the vertical list of options on the left. this tab is for "modifiers"
-    
-- modifiers act like a shader or like a modifier in blender, or an adjustment layer. they aren't visible in the outliner - being attatched to an object. modifier settings should show an "add modifier" button that exposes a list of addable modifiers. for now, the only modifier should be hue/saturation/lightness, and blur)
-    
-    - hsl should have those 3 parameters
-        
-    - blur should have a strength, and 2 modes - full and focal point. full does the whole object/objects. focal point has gui handles (orange)
-        
-        - handle for center, handle for end, and handle for ramp between the two) these 3 handles should appear on a line, with a circle dotted outline around the full radius. translating the center moves all the handles with it.
-            
-- because modifiers are non destructive, drawing, erasing, updating blender objects, etc works like normal, and the modifier will reflect any changes correctly (non destructive and parameterized)
-    
-- modifiers should have their own row/ui element like they do in blender. they appear in a stack that applies from top to bottom, like blender. they can be click dragged from their title to reorder (each modifier should have a title on top, like in blender)
-    
-- modifiers should all have an "intensity" value that appears first on the list. this a horizontal slider from 0 to 100 percent that adjusts how much a modifier is applied.
-    
-- the only modifiers that should appear are ones that exist in the selected object (or in all selected objects if multiple are selected)
-    
-- all modifiers should also have a square chain (link) icon in the top right. when in link select mode, highlight in orange in the outliner which object or objects this modifier is attached to. selecting/deselecting objects or shapes in the outliner adds/removes those from the link state of that modifier. clicking the link button again in this mode toggles things back to normal.
-    
-- when you click add modifier, it should add it to all the currently selected objects, linked. linked modifiers means that the same modifier data/parameters persist between its duplicates in other objects/shapes.
-    
-- transform tool should also appear if a shape is selected. this should move the shape and everything in it (unlike manipulating the handles normally, which just edits the shape bounds and doesn't modify the objects within.
-    
-- click dragging slightly outside the 8 handles of a shape should let you translate it. currently, this isn't working./
-
-
-
-
-## fill pass
-- fill tool in a raster object should let you fill only what's inside the active selection.
-- fill tool in a raster object should act like it does in clip studio paint, with a tolerance, fill holes option, "fill to vector path" option. 
-- https://help.clip-studio.com/en-us/manual_en/420_fill/Fill_Tool.htm#1382793
-- fill tool has a "global" toggle that lets it fill anything by clicking. if a shape is clicked, it changes the fill's background color. if a raster is selected, it fills (with tolerance) the pixels.
-
-
-- add "mask to layer below" or perhaps a masking modal that lets you select what is on the mask (previewing in the editor with white and black, letting you select objects in the outliner like orange)
 ## more
-
-- modifier strengths and parameters (anything with a slider that has a min and a max pretty much) have a box to the left that let you attach a "mask" to them
-- a mask is a tone map - black and white, 0 and 1 (and everything between, greyscale) that maps to the intensity of said parameter. 
-- masks are a selected list of objects, along with an extra selection of pixels, almost like a raster layer, that are added together. an object's alpha channel is what contributes to the mask, pretty much (an alpha of all its pixels). masks can later be used for other things. 
-- for instance, the mask of one object can be set to the opacity slider of another - effectively re-creating a "mask to x layer" option. 
-- add a new "masks" tab (the layer settings window should now be tab-based, with layer settings as one of the tabs). masks show as a grid with icons of each mask and their name. top row above that should be a mask new, rename, and delete option.
-- when a mask button is clicked, the outliner shows (with light green) which objects in the outliner are selected as contributers to that mask. if the object is linked to a saved mask, the program should switch the top right window to the masks tab and show that mask as being selected. 
-- while in mask select mode, selecting objects adds them to the mask. they can also be deselected
-- being in mask mode changes the canvas temporarily such that everything currently on it becomes 10 percent opacity, but the current mask is visible on screen in greyscale full opacity, as a preview that you can also raster draw on for that aspect of mask creation.
-- if no saved mask currently exists, selecting a mask from the mask tab while in mask mode sets that mask as the mask for the parameter you wanted.
-- any parameter that has the mask feature enabled should have a button to the left of the slider that appears "pressed" if a mask exists, but not if none exists. it should have a sort of "contrast" icon - a circle with a black side and a white side, and it should be orange if on, grey if not on.
-- examples of things that should support masks
-	- any parameter in blur, or hsl
-	- the newly introduced outline modifier
-	- the opacity of any shape/vector/raster,blender comic object, etc.
-		- this should apply to the opacity slider between the layer settings window and the outliner. dragging a layer into this box sets it as the mask (for easy "mask as" operations)
-			- as such, clicking an object only selects it after being released. that way, you can drag into another object's opacity mask (or other places) without automatically switching out of that object.
-- hovering over a mask box should show the object's mask in the comic view
-
-- outline modifier
-	- draws outlines around pixels in an object (or objects, if linked)
-	- has a thickness parameter
-		- a mask button (circle with half filled, half not filled).
-		- supports masks (like the rest do)
-		- for instance, say you drew a "shape" by drawing some raster or vector strokes in a circle
-		- you could then add an outline modifier and change the thickness with a mask. then, altering the original drawing would still show the outline around in real time.
-	- has an opacity parameter
-		- do the same masking thing with the opacity parameter.
-- masks can be spontaneously made for a specific instance/case, or saved.
-- saved masks prompt you for a name and are added to the masks tab. the masks tab only shows masks for that chapter.
+- [ ] remove the add fill tool. instead, the fill tool and add fill tool should be consolidated into one visibly. the add fill functionality (changing the background fill of a shape) should only happen if the shape is the currently active selected object.
+- [ ] add the ability to right click a layer and click "show as mask only". this sets the layer to only appear in masks and not visually in the canvas on its own. however, if currently selected, it should show as normal for the sake of editing. these layers should have opacity say (percent) " - Mask only" 
+	- since opacity of a mask affects its alpha (0 to 1 mask value), if a mask has changes to the opacity slider on itself (or a mask on itself), that should affect its mask output contribution.
+- [ ] fill tool in a raster object should let you fill only what's inside the active selection (in a raster layer). if a vector layer is the current active selection, fill shouldnt be visible as an option.
+- [ ] vector fills are currently a little bugged. remove the vector fill code and instead, make fills like they are in clip studio paint, where a raster layer has to be the one to store the fill
+- [ ] https://help.clip-studio.com/en-us/manual_en/420_fill/Fill_Tool.htm
+	- plan to implement all these features of the fill tool. tool settings should be in tool settings. Make sure to do so with optimal performance
+	- https://help.clip-studio.com/en-us/manual_en/420_fill/Advanced_Fill.htm
+	- implement the advanced fill tools too.
+	- reference layers should have its interface
+- [ ] instead of gradients living in the tool settings gradient tools tab, "gradient" should be a tool, and its settings should be in tool settings instead of graident tools. Keep all the features though.
 
 
 
-not yet
-add the ability to right click a layer and click "show as mask only". this sets the layer to only appear in masks and not visually in the canvas on its own. however, if currently selected, it should show as normal for the sake of editing. these layers should have opacity say (percent) " - Mask"
+
 
 
 

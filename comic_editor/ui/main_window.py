@@ -32,10 +32,11 @@ from PySide6.QtWidgets import (
 from comic_editor.core.models import (
     BoundGeometry, ChapterDocument, ColorFillGradientObject,
     ColorGradientRamp, ColorGradientRampPreset, ColorGradientStop,
-    ColorPalette, GradientObject, PaletteSwatch, PathNode,
+    ColorPalette, DocumentObject, GradientObject, LayerNode,
+    PaletteSwatch, PathNode,
     BlenderComicViewSourceDescriptor, EmbeddedImageSourceDescriptor,
     ImageObject, RasterObject, SpeedLineCenterObject, SpeedLinesGradientObject,
-    TextObject, VectorDrawingObject, VectorFillObject, new_id,
+    TextObject, VectorDrawingObject, new_id,
     ParameterMaskBinding, ToneMask,
 )
 from comic_editor.core.assets import (
@@ -365,6 +366,7 @@ class MainWindow(QMainWindow):
         fill_tool = getattr(ToolKind, "FILL", None)
         if fill_tool is not None:
             labels.append((fill_tool, "Fill", "fill-color"))
+        labels.append((ToolKind.GRADIENT, "Gradient", "contrast-circle"))
         labels.extend([
             (ToolKind.TEXT_EDIT, "Text Edit", "text"),
             (ToolKind.TRANSFORM, "Transform", "frame-tool"),
@@ -433,9 +435,7 @@ class MainWindow(QMainWindow):
         self.add_vector_button = ResponsiveToolButton(
             "Add Vector Drawing", "curve-array"
         )
-        self.add_fill_button = ResponsiveToolButton("Add Fill", "fill-color")
         self.tool_toolbar.addWidget(self.add_page_button)
-        self.tool_toolbar.addWidget(self.add_fill_button)
         self.tool_toolbar.addWidget(self.add_text_button)
         self.tool_toolbar.addWidget(self.add_raster_button)
         self.tool_toolbar.addWidget(self.add_vector_button)
@@ -603,37 +603,34 @@ class MainWindow(QMainWindow):
             self.text_layout_group,
         ):
             group.hide()
-        self.gradient_tools_page = self.ribbon.add_page(
-            "gradient_tools", "Gradient Tools", visible=False
-        )
         self.gradient_tools_controls = GradientToolsControls(
             self.canvas, self.ribbon
         )
-        self.gradient_create_group = self.gradient_tools_page.add_group(
+        self.gradient_create_group = self.tool_settings_page.add_group(
             "Create Gradient", minimum_width=420
         )
         self.gradient_create_group.add_widget(
             self.gradient_tools_controls.create_widget
         )
-        self.gradient_type_group = self.gradient_tools_page.add_group(
+        self.gradient_type_group = self.tool_settings_page.add_group(
             "Field & Direction", minimum_width=220
         )
         self.gradient_type_group.add_widget(
             self.gradient_tools_controls.type_parameters_widget
         )
-        self.gradient_parameters_group = self.gradient_tools_page.add_group(
+        self.gradient_parameters_group = self.tool_settings_page.add_group(
             "Color Parameters", minimum_width=230
         )
         self.gradient_parameters_group.add_widget(
             self.gradient_tools_controls.parameters_widget
         )
-        self.gradient_thickness_group = self.gradient_tools_page.add_group(
+        self.gradient_thickness_group = self.tool_settings_page.add_group(
             "Thickness Parameters", minimum_width=230
         )
         self.gradient_thickness_group.add_widget(
             self.gradient_tools_controls.thickness_widget
         )
-        self.gradient_impact_group = self.gradient_tools_page.add_group(
+        self.gradient_impact_group = self.tool_settings_page.add_group(
             "Impact Line Parameters", minimum_width=460
         )
         self.gradient_impact_group.add_widget(
@@ -642,7 +639,18 @@ class MainWindow(QMainWindow):
         self.gradient_tools_controls.contextChanged.connect(
             self._update_gradient_group_visibility
         )
-        self._update_gradient_group_visibility("create")
+        self.gradient_tools_controls.field_type.currentIndexChanged.connect(
+            lambda: self.canvas.set_gradient_field_type(str(
+                self.gradient_tools_controls.field_type.currentData()
+                or "line"
+            ))
+        )
+        for group in (
+            self.gradient_create_group, self.gradient_type_group,
+            self.gradient_parameters_group, self.gradient_thickness_group,
+            self.gradient_impact_group,
+        ):
+            group.hide()
         canvas_shell = QWidget(self)
         canvas_layout = QHBoxLayout(canvas_shell)
         canvas_layout.setContentsMargins(0, 0, 0, 0)
@@ -1090,8 +1098,6 @@ class MainWindow(QMainWindow):
         self.add_raster_button.clicked.connect(self._add_raster)
         self.add_vector_button.clicked.connect(self._add_vector_drawing)
         self.add_text_button.clicked.connect(self._add_text)
-        self.add_fill_button.clicked.connect(self._add_fill)
-
         self.tool_settings_controls.pencilPresetSelected.connect(
             self._pencil_preset_selected
         )
@@ -1109,6 +1115,12 @@ class MainWindow(QMainWindow):
         )
         self.tool_settings_controls.settingsChanged.connect(
             self._ribbon_settings_changed
+        )
+        self.tool_settings_controls.fillSelectionRequested.connect(
+            self._fill_active_selection
+        )
+        self.tool_settings_controls.fillToleranceChanged.connect(
+            self.canvas.request_fill_tolerance_replay
         )
         self.text_object_controls.settingsChanged.connect(
             self._ribbon_settings_changed
@@ -1161,9 +1173,7 @@ class MainWindow(QMainWindow):
             self._series_colors_swapped
         )
         self.color_panel.activeSlotChanged.connect(
-            lambda slot: self.palette_editor.set_new_swatch_color(
-                self.color_panel.active_color()
-            )
+            self._active_color_slot_changed
         )
         self.color_panel.colorCommitted.connect(self._record_color_history)
         self.color_panel.eyedropperRequested.connect(
@@ -1208,6 +1218,7 @@ class MainWindow(QMainWindow):
         }
         for action_id, enum_name in (
             ("fill", "FILL"),
+            ("gradient", "GRADIENT"),
             ("vector_redraw", "VECTOR_REDRAW"),
             ("vector_connect", "VECTOR_CONNECT"),
             ("vector_simplify", "VECTOR_SIMPLIFY"),
@@ -2384,10 +2395,7 @@ class MainWindow(QMainWindow):
             and layer.layer_id in self.chapter.root_page_ids
         ):
             return None
-        if (
-            layer and layer.layer_kind != "fill"
-            and (allow_page or not layer.is_page)
-        ):
+        if layer and (allow_page or not layer.is_page):
             return layer
         return None
 
@@ -2399,11 +2407,6 @@ class MainWindow(QMainWindow):
         ):
             return None
         selected = self.chapter.objects[self.canvas.selected_id]
-        if isinstance(selected, VectorFillObject):
-            owner = self.chapter.objects.get(selected.owner_drawing_id)
-            if not isinstance(owner, VectorDrawingObject):
-                return None
-            selected = owner
         if selected.parent_layer_id != parent_id:
             return None
         siblings = self.chapter.layers[parent_id].children
@@ -2654,23 +2657,11 @@ class MainWindow(QMainWindow):
         self._after_structure(drawing.object_id, "object")
         self._activate_tool(ToolKind.RASTER_PENCIL)
 
-    def _add_fill(self) -> None:
-        parent = self._selected_parent_layer()
-        if parent is None or parent.layer_kind == "fill":
+    def _fill_active_selection(self) -> None:
+        if not self.canvas.fill_active_selection():
             self.statusBar().showMessage(
-                "Select a page or bounded layer first", 4000
+                "Select a raster object with an active selection first", 4000
             )
-            return
-        before = self.chapter.to_dict()
-        count = sum(
-            item.layer_kind == "fill" for item in self.chapter.layers.values()
-        ) + 1
-        layer = self.chapter.add_fill_layer(
-            parent.layer_id, f"Fill {count}", self.settings.brush_color
-        )
-        after = self.chapter.to_dict()
-        self.canvas.push_model_change(before, after, "Add fill layer")
-        self._after_structure(layer.layer_id, "layer")
 
     def _create_gradient(
         self, field_type: str, gradient_type: str = "color_fill",
@@ -2910,16 +2901,25 @@ class MainWindow(QMainWindow):
             else None
         )
         if len(self.canvas.selected_entities) > 1:
-            if tool != ToolKind.TRANSFORM:
+            primary_raster = isinstance(selected_object, RasterObject)
+            if tool not in {ToolKind.TRANSFORM, ToolKind.FILL} or (
+                tool == ToolKind.FILL and not primary_raster
+            ):
                 self.statusBar().showMessage(
-                    "Only Transform is available for multiple objects", 3000
+                    "Use Transform, or Fill with a raster as the primary item",
+                    3000,
                 )
                 self._sync_tool_buttons()
                 return False
-            changed = self.canvas.set_tool(ToolKind.TRANSFORM)
+            changed = self.canvas.set_tool(tool)
             self._sync_tool_buttons()
             return changed
         vector_selected = isinstance(selected_object, VectorDrawingObject)
+        if tool == ToolKind.GRADIENT:
+            self.canvas.set_gradient_field_type(str(
+                self.gradient_tools_controls.field_type.currentData()
+                or "line"
+            ))
         if tool in {ToolKind.RASTER_PENCIL, ToolKind.RASTER_ERASER}:
             if (
                 self.chapter and self.canvas.selected_kind == "layer"
@@ -3009,14 +3009,18 @@ class MainWindow(QMainWindow):
             else None
         )
         if len(self.canvas.selected_entities) > 1:
+            primary_raster = isinstance(selected_object, RasterObject)
             for candidate, button in self.tool_buttons.items():
-                button.setVisible(candidate == ToolKind.TRANSFORM)
-                button.setEnabled(candidate == ToolKind.TRANSFORM)
+                available = candidate == ToolKind.TRANSFORM or (
+                    candidate == ToolKind.FILL and primary_raster
+                )
+                button.setVisible(available)
+                button.setEnabled(available)
             self.tool_buttons[ToolKind.TRANSFORM].setChecked(
                 self.canvas.tool == ToolKind.TRANSFORM
             )
             self.drawing_selection_category.setVisible(False)
-            self.fill_tool_button.setVisible(False)
+            self.fill_tool_button.setVisible(primary_raster)
             self.selection_settings.setVisible(False)
             self._sync_contextual_ribbon()
             return
@@ -3054,19 +3058,13 @@ class MainWindow(QMainWindow):
         self.tool_buttons[ToolKind.RASTER_ERASER].setVisible(
             drawable_selected
         )
-        shape_selected = (
-            self.chapter is not None and self.canvas.selected_kind == "object"
-            and isinstance(
-                selected_object,
-                (RasterObject, VectorDrawingObject, VectorFillObject),
-            )
-        ) or (
+        shape_selected = isinstance(selected_object, RasterObject) or (
             self.chapter is not None
             and self.canvas.selected_kind == "layer"
             and self.canvas.selected_id in self.chapter.layers
             and not self.chapter.layers[self.canvas.selected_id].is_page
-            and self.chapter.layers[self.canvas.selected_id].layer_kind
-            != "fill"
+            and self.chapter.layers[self.canvas.selected_id].bound is not None
+            and self.chapter.layers[self.canvas.selected_id].bound.closed
         )
         self.fill_tool_button.setEnabled(bool(shape_selected))
         self.fill_tool_button.setVisible(bool(shape_selected))
@@ -3076,6 +3074,9 @@ class MainWindow(QMainWindow):
             fill_tool is not None and self.canvas.tool == fill_tool
         )
         self.fill_tool_button.blockSignals(False)
+        gradient_available = bool(self._gradient_context_parent_id())
+        self.tool_buttons[ToolKind.GRADIENT].setVisible(gradient_available)
+        self.tool_buttons[ToolKind.GRADIENT].setEnabled(gradient_available)
         text_selected = isinstance(selected_object, TextObject)
         self.tool_buttons[ToolKind.TEXT_EDIT].setVisible(self.chapter is not None)
         transform_available = (
@@ -3120,8 +3121,6 @@ class MainWindow(QMainWindow):
             layer = self.chapter.layers.get(self.canvas.selected_id)
             if layer is None:
                 return ""
-            if layer.layer_kind == "fill":
-                return layer.parent_id or ""
             return layer.layer_id if layer.bound is not None else ""
         obj = self.chapter.objects.get(self.canvas.selected_id)
         if obj is None:
@@ -3146,6 +3145,15 @@ class MainWindow(QMainWindow):
 
     def _update_gradient_group_visibility(self, context: str) -> None:
         """Show only the controls relevant to the current gradient context."""
+        if self.canvas.tool != ToolKind.GRADIENT:
+            for group in (
+                self.gradient_create_group, self.gradient_type_group,
+                self.gradient_parameters_group,
+                self.gradient_thickness_group,
+                self.gradient_impact_group,
+            ):
+                group.hide()
+            return
         creating = context == "create"
         editing = context == "color"
         self.gradient_create_group.setVisible(creating)
@@ -3167,9 +3175,7 @@ class MainWindow(QMainWindow):
             )
             else None
         )
-        vector_tool_context = isinstance(
-            selected_object, (VectorDrawingObject, VectorFillObject)
-        )
+        vector_tool_context = isinstance(selected_object, VectorDrawingObject)
         text_active = isinstance(selected_object, TextObject)
         selected_gradient = self.gradient_tools_controls.selected_gradient()
         gradient_selected = selected_gradient is not None
@@ -3189,7 +3195,6 @@ class MainWindow(QMainWindow):
         self._gradient_ribbon_context = gradient_active
         self._selected_gradient_ribbon_id = selected_gradient_id
         self.ribbon.set_page_visible("vector_tools", active)
-        self.ribbon.set_page_visible("gradient_tools", gradient_active)
         self.tool_settings_group.setVisible(not text_active)
         for group in (
             self.text_object_group,
@@ -3207,7 +3212,7 @@ class MainWindow(QMainWindow):
         elif entering:
             self._select_ribbon_page("vector_tools")
         elif entering_gradient:
-            self._select_ribbon_page("gradient_tools")
+            self._select_ribbon_page("tool_settings")
         elif self._manual_ribbon_page:
             self._select_ribbon_page(self._manual_ribbon_page)
         self.tool_settings_controls.set_context(
@@ -3236,6 +3241,19 @@ class MainWindow(QMainWindow):
         if gradient_active:
             self.gradient_tools_controls.refresh()
             self._sync_gradient_presets()
+        gradient_controls_active = (
+            self.canvas.tool == ToolKind.GRADIENT and gradient_active
+        )
+        for group in (
+            self.gradient_create_group, self.gradient_type_group,
+            self.gradient_parameters_group, self.gradient_thickness_group,
+            self.gradient_impact_group,
+        ):
+            group.setVisible(gradient_controls_active)
+        if gradient_controls_active:
+            self._update_gradient_group_visibility(
+                "color" if gradient_selected else "create"
+            )
 
     def _apply_vector_redraw(self) -> None:
         method = getattr(self.canvas, "apply_vector_redraw", None)
@@ -3275,17 +3293,77 @@ class MainWindow(QMainWindow):
             return ProjectContext.create(self.repository, self.series)
         return None
 
+    def _mask_only_context_target(
+        self, kind: str, entity_id: str,
+    ) -> LayerNode | DocumentObject | None:
+        if self.chapter is None:
+            return None
+        if kind == "layer":
+            layer = self.chapter.layers.get(entity_id)
+            return layer if layer is not None and not layer.is_page else None
+        if kind != "object":
+            return None
+        obj = self.chapter.objects.get(entity_id)
+        return obj if isinstance(
+            obj,
+            (
+                RasterObject, VectorDrawingObject, ImageObject,
+                TextObject, GradientObject,
+            ),
+        ) else None
+
     def _show_tree_context_menu(self, point) -> None:
         index = self.tree.indexAt(point)
         if not index.isValid() or self.chapter is None:
             return
         index = index.siblingAtColumn(0)
+        selected_indexes = self.tree.selectionModel().selectedRows(0)
+        selected_items = [
+            self.hierarchy_model.item_for_index(candidate)
+            for candidate in selected_indexes
+        ]
+        clicked_item = self.hierarchy_model.item_for_index(index)
+        if not any(
+            candidate.kind == clicked_item.kind
+            and candidate.entity_id == clicked_item.entity_id
+            for candidate in selected_items
+        ):
+            selected_items = [clicked_item]
         self.tree.setCurrentIndex(index)
-        item = self.hierarchy_model.item_for_index(index)
+        item = clicked_item
         self.canvas.set_selection(item.kind, item.entity_id, activate_default_tool=True)
         menu = QMenu(self)
         rename = menu.addAction("Rename")
         copy_asset = menu.addAction("Copy as Asset")
+        mask_only = None
+        mask_only_target = self._mask_only_context_target(
+            item.kind, item.entity_id
+        )
+        if mask_only_target is not None:
+            mask_only = menu.addAction("Show as mask only")
+            mask_only.setCheckable(True)
+            mask_only.setChecked(mask_only_target.mask_only)
+        reference_targets: list[LayerNode | DocumentObject] = []
+        for candidate in selected_items:
+            entity = (
+                self.chapter.layers.get(candidate.entity_id)
+                if candidate.kind == "layer"
+                else self.chapter.objects.get(candidate.entity_id)
+            )
+            if (
+                isinstance(entity, LayerNode) and not entity.is_page
+            ) or isinstance(
+                entity,
+                (RasterObject, ImageObject, VectorDrawingObject),
+            ):
+                reference_targets.append(entity)
+        reference = None
+        if reference_targets:
+            reference = menu.addAction("Set as Reference Layer")
+            reference.setCheckable(True)
+            reference.setChecked(all(
+                entity.fill_reference for entity in reference_targets
+            ))
         rasterize = (
             menu.addAction("Rasterize Image")
             if item.kind == "object" and isinstance(
@@ -3312,6 +3390,24 @@ class MainWindow(QMainWindow):
             self.tree.edit(index)
         elif selected is copy_asset:
             self._copy_selected_as_asset(item.kind, item.entity_id)
+        elif mask_only is not None and selected is mask_only:
+            before = self.chapter.to_dict()
+            mask_only_target.mask_only = mask_only.isChecked()
+            self.canvas.push_model_change(
+                before, self.chapter.to_dict(), "Show as mask only"
+            )
+            self.canvas.hierarchyChanged.emit()
+            self.canvas.documentChanged.emit(None)
+        elif reference is not None and selected is reference:
+            before = self.chapter.to_dict()
+            enabled = reference.isChecked()
+            for entity in reference_targets:
+                entity.fill_reference = enabled
+            self.canvas.push_model_change(
+                before, self.chapter.to_dict(), "Set reference layer"
+            )
+            self.canvas.hierarchyChanged.emit()
+            self.canvas.documentChanged.emit(None)
         elif rasterize is not None and selected is rasterize:
             self._rasterize_image(item.entity_id)
 
@@ -4430,6 +4526,39 @@ class MainWindow(QMainWindow):
             )
         ]
         valid_multi = len(entities) <= 1 or len(eligible) == len(entities)
+        reference_capable = all(
+            (
+                kind == "layer"
+                and entity_id in self.chapter.layers
+                and not self.chapter.layers[entity_id].is_page
+            )
+            or (
+                kind == "object"
+                and isinstance(
+                    self.chapter.objects.get(entity_id),
+                    (RasterObject, ImageObject, VectorDrawingObject),
+                )
+            )
+            for kind, entity_id in entities
+        )
+        if not valid_multi and len(entities) > 1 and reference_capable:
+            self.canvas.set_selection(
+                *primary, activate_default_tool=True
+            )
+            blocker = QSignalBlocker(self.tree.selectionModel())
+            self.tree.selectionModel().clearSelection()
+            for kind, entity_id in entities:
+                index = self.hierarchy_model.index_for_entity(
+                    kind, entity_id
+                )
+                if index.isValid():
+                    self.tree.selectionModel().select(
+                        index,
+                        QItemSelectionModel.Select
+                        | QItemSelectionModel.Rows,
+                    )
+            del blocker
+            return
         if (
             not valid_multi
             and QApplication.keyboardModifiers()
@@ -4528,8 +4657,6 @@ class MainWindow(QMainWindow):
             selected = self.chapter.objects.get(entity_id)
             if isinstance(selected, VectorDrawingObject):
                 new_vector_id = selected.object_id
-            elif isinstance(selected, VectorFillObject):
-                new_vector_id = selected.owner_drawing_id
         previous_vector_id = self._expanded_selected_vector_id
         if previous_vector_id and previous_vector_id != new_vector_id:
             old_index = self.hierarchy_model.index_for_entity(
@@ -4576,6 +4703,7 @@ class MainWindow(QMainWindow):
         self._sync_tool_buttons()
         if tool in {
             ToolKind.RASTER_PENCIL, ToolKind.RASTER_ERASER, ToolKind.TEXT_EDIT,
+            ToolKind.FILL, ToolKind.GRADIENT,
         }:
             # _sync_tool_buttons() refreshes contextual pages first.  Select
             # Tool Settings afterward so entering a raster/vector context
@@ -4906,6 +5034,9 @@ class MainWindow(QMainWindow):
         method = getattr(self.canvas, "set_active_colors", None)
         if method is not None:
             method(primary, secondary)
+            self.canvas.set_active_color_slot(
+                self.color_panel.active_slot()
+            )
         else:
             self.canvas.refresh_brush_settings()
             self.canvas.update()
@@ -4928,6 +5059,12 @@ class MainWindow(QMainWindow):
         self._apply_series_colors_to_canvas(primary, secondary)
         self.palette_editor.set_new_swatch_color(color)
         self._schedule_series_preferences_save()
+
+    def _active_color_slot_changed(self, slot: str) -> None:
+        self.canvas.set_active_color_slot(slot)
+        self.palette_editor.set_new_swatch_color(
+            self.color_panel.active_color()
+        )
 
     def _series_colors_swapped(
         self, primary: str, secondary: str,
@@ -5126,6 +5263,7 @@ class MainWindow(QMainWindow):
         self._refresh_actions()
 
     def _command_stack_changed(self) -> None:
+        self.canvas.validate_fill_replay_history()
         self._mark_dirty(None)
         self._refresh_actions()
 
@@ -5659,7 +5797,6 @@ class MainWindow(QMainWindow):
         self.add_raster_button.setEnabled(active)
         self.add_vector_button.setEnabled(active)
         self.add_text_button.setEnabled(active)
-        self.add_fill_button.setEnabled(active)
         self._sync_tool_buttons()
 
     def _toggle_fullscreen(self) -> None:

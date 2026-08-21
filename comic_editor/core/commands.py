@@ -99,6 +99,7 @@ class CommandStack:
         self.limit = max(1, int(limit))
         self._undo: list[Command] = []
         self._redo: list[Command] = []
+        self._revision = 0
         self.changed_callback: Callable[[], None] | None = None
 
     @property
@@ -109,6 +110,15 @@ class CommandStack:
     def can_redo(self) -> bool:
         return bool(self._redo)
 
+    @property
+    def top_undo_command(self) -> Command | None:
+        """Return the latest undo command without exposing history storage."""
+        return self._undo[-1] if self._undo else None
+
+    @property
+    def revision(self) -> int:
+        return self._revision
+
     def push(self, command: Command, already_done: bool = False) -> None:
         if not already_done:
             command.redo()
@@ -116,6 +126,7 @@ class CommandStack:
         if len(self._undo) > self.limit:
             self._undo.pop(0)
         self._redo.clear()
+        self._revision += 1
         self._notify()
 
     def undo(self) -> None:
@@ -124,6 +135,7 @@ class CommandStack:
         command = self._undo.pop()
         command.undo()
         self._redo.append(command)
+        self._revision += 1
         self._notify()
 
     def redo(self) -> None:
@@ -132,11 +144,13 @@ class CommandStack:
         command = self._redo.pop()
         command.redo()
         self._undo.append(command)
+        self._revision += 1
         self._notify()
 
     def clear(self) -> None:
         self._undo.clear()
         self._redo.clear()
+        self._revision += 1
         self._notify()
 
     def _notify(self) -> None:

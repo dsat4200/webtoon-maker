@@ -60,14 +60,11 @@ OBJECT_TYPES.register(ObjectTypeSpec("image", object_from_dict, False, ("transfo
 OBJECT_TYPES.register(ObjectTypeSpec("text", object_from_dict, False, ("text", "transform")))
 OBJECT_TYPES.register(ObjectTypeSpec(
     "vector_drawing", object_from_dict, False,
-    ("pencil", "eraser", "fill", "vector_edit"),
-))
-OBJECT_TYPES.register(ObjectTypeSpec(
-    "vector_fill", object_from_dict, False, ("fill", "object_select"),
+    ("pencil", "eraser", "vector_edit"),
 ))
 OBJECT_TYPES.register(ObjectTypeSpec(
     "gradient", object_from_dict, False,
-    ("shape_edit", "gradient_tools"),
+    ("gradient",),
 ))
 
 BOUND_TYPES = BoundTypeRegistry()

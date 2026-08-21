@@ -29,7 +29,9 @@ from PySide6.QtWidgets import (
 )
 
 from comic_editor.core.models import RasterObject, TextObject
-from comic_editor.core.settings import TextPreset
+from comic_editor.core.settings import (
+    FILL_BLEND_MODES, FILL_SUBTOOLS, TextPreset,
+)
 from comic_editor.ui.mask_controls import MaskAlphaSlider
 
 
@@ -93,6 +95,16 @@ class WrappingLayout(QLayout):
         spacing = self.spacing()
         for item in self._items:
             hint = item.sizeHint().expandedTo(item.minimumSize())
+            widget = item.widget()
+            full_width = bool(
+                widget is not None and widget.property("flowFullWidth")
+            )
+            if full_width:
+                if x > area.x():
+                    x = area.x()
+                    y += row_height + spacing
+                    row_height = 0
+                hint.setWidth(max(0, area.width()))
             next_x = x + hint.width()
             if x > area.x() and next_x > area.right() + 1:
                 x = area.x()
@@ -100,6 +112,11 @@ class WrappingLayout(QLayout):
                 row_height = 0
             if not test_only:
                 item.setGeometry(QRect(QPoint(x, y), hint))
+            if full_width:
+                x = area.x()
+                y += hint.height() + spacing
+                row_height = 0
+                continue
             x += hint.width() + spacing
             row_height = max(row_height, hint.height())
         return y + row_height - rect.y() + margins.bottom()
@@ -116,6 +133,34 @@ def _labeled_control(
         row.addWidget(QLabel(label, group))
     row.addWidget(control)
     return group
+
+
+def _numeric_slider_control(
+    label: str, minimum: int, maximum: int, parent: QWidget,
+    *, suffix: str = "",
+) -> tuple[QWidget, QSlider, QSpinBox]:
+    group = QWidget(parent)
+    group.setProperty("flowFullWidth", True)
+    row = QHBoxLayout(group)
+    row.setContentsMargins(0, 0, 0, 0)
+    row.setSpacing(6)
+    title = QLabel(label, group)
+    title.setMinimumWidth(88)
+    slider = QSlider(Qt.Orientation.Horizontal, group)
+    slider.setRange(minimum, maximum)
+    slider.setMinimumWidth(80)
+    editor = QSpinBox(group)
+    editor.setRange(minimum, maximum)
+    editor.setSuffix(suffix)
+    editor.setButtonSymbols(QAbstractSpinBox.ButtonSymbols.NoButtons)
+    editor.setKeyboardTracking(True)
+    editor.setMinimumWidth(72)
+    slider.valueChanged.connect(editor.setValue)
+    editor.valueChanged.connect(slider.setValue)
+    row.addWidget(title)
+    row.addWidget(slider, 1)
+    row.addWidget(editor)
+    return group, slider, editor
 
 
 class _FontSizeSpinBox(QSpinBox):
@@ -150,6 +195,8 @@ class ToolSettingsControls(QWidget):
     eraserShapeChanged = Signal(bool)
     vectorEraserModeChanged = Signal(str)
     fillSettingsChanged = Signal()
+    fillToleranceChanged = Signal(int, bool)
+    fillSelectionRequested = Signal()
 
     def __init__(self, settings, parent: QWidget | None = None):
         super().__init__(parent)
@@ -287,51 +334,140 @@ class ToolSettingsControls(QWidget):
         row = WrappingLayout(page, 7)
         self._vector_fill_widgets: list[QWidget] = []
         self._raster_fill_widgets: list[QWidget] = []
+        self.fill_subtool = QComboBox(page)
+        for label, value in (
+            ("Refer only to editing layer", "editing_layer"),
+            ("Refer other layers", "other_layers"),
+            ("Enclose and Fill", "enclose_fill"),
+            ("Lasso Fill", "lasso_fill"),
+            ("Leftover Pen", "leftover_pen"),
+        ):
+            self.fill_subtool.addItem(label, value)
+        row.addWidget(_labeled_control("Subtool", self.fill_subtool, page))
+        (
+            opacity_group, self.fill_opacity_slider, self.fill_opacity,
+        ) = _numeric_slider_control("Opacity", 0, 100, page, suffix="%")
+        row.addWidget(opacity_group)
+        self.fill_connected = QCheckBox("Connected pixels only", page)
+        row.addWidget(self.fill_connected)
+        self.fill_closed_area = QCheckBox("Fill closed area", page)
+        row.addWidget(self.fill_closed_area)
         self.fill_close_gaps = QCheckBox("Close gaps", page)
         row.addWidget(self.fill_close_gaps)
-        self._vector_fill_widgets.append(self.fill_close_gaps)
-        self.fill_gap_threshold = QDoubleSpinBox(page)
-        self.fill_gap_threshold.setRange(0, 1000)
-        self.fill_gap_threshold.setDecimals(1)
-        self.fill_gap_threshold.setSuffix(" px")
-        gap_group = _labeled_control("Gap", self.fill_gap_threshold, page)
+        (
+            gap_group, self.fill_gap_threshold_slider,
+            self.fill_gap_threshold,
+        ) = _numeric_slider_control("Gap", 0, 16, page, suffix=" px")
+        self.fill_gap_group = gap_group
         row.addWidget(gap_group)
-        self._vector_fill_widgets.append(gap_group)
         self.fill_narrow_areas = QCheckBox("Fill narrow areas", page)
         row.addWidget(self.fill_narrow_areas)
-        self._vector_fill_widgets.append(self.fill_narrow_areas)
         self.fill_area_scaling = QCheckBox("Area scaling", page)
         row.addWidget(self.fill_area_scaling)
-        self._vector_fill_widgets.append(self.fill_area_scaling)
-        self.fill_area_amount = QDoubleSpinBox(page)
-        self.fill_area_amount.setRange(-1000, 1000)
-        self.fill_area_amount.setDecimals(1)
-        self.fill_area_amount.setSuffix(" px")
-        amount_group = _labeled_control(
-            "Amount", self.fill_area_amount, page
-        )
+        (
+            amount_group, self.fill_area_amount_slider,
+            self.fill_area_amount,
+        ) = _numeric_slider_control("Amount", -64, 64, page, suffix=" px")
+        self.fill_area_amount_group = amount_group
         row.addWidget(amount_group)
-        self._vector_fill_widgets.append(amount_group)
         self.fill_area_mode = QComboBox(page)
         self.fill_area_mode.addItem("Round", "round")
         self.fill_area_mode.addItem("Rectangle", "rectangle")
+        self.fill_area_mode.addItem("To darkest pixel", "darkest_pixel")
         edge_group = _labeled_control("Edge", self.fill_area_mode, page)
         row.addWidget(edge_group)
-        self._vector_fill_widgets.append(edge_group)
         self.fill_mode = QComboBox(page)
         self.fill_mode.addItem("Normal", "normal")
-        self.fill_mode.addItem("Enclose and Fill", "enclose")
-        mode_group = _labeled_control("Mode", self.fill_mode, page)
-        row.addWidget(mode_group)
-        self._vector_fill_widgets.append(mode_group)
-        self.raster_fill_tolerance = QSpinBox(page)
-        self.raster_fill_tolerance.setRange(0, 255)
-        tolerance_group = _labeled_control(
-            "Tolerance", self.raster_fill_tolerance, page
-        )
+        row.addWidget(_labeled_control("Mode", self.fill_mode, page))
+        (
+            tolerance_group, self.raster_fill_tolerance_slider,
+            self.raster_fill_tolerance,
+        ) = _numeric_slider_control("Tolerance", 0, 255, page)
         row.addWidget(tolerance_group)
         self._raster_fill_widgets.append(tolerance_group)
+        self.fill_antialias = QCheckBox("Anti-aliasing", page)
+        row.addWidget(self.fill_antialias)
+        self.fill_border_reference = QCheckBox("Refer to image border", page)
+        row.addWidget(self.fill_border_reference)
+        self.fill_reference_mode = QComboBox(page)
+        for label, value in (
+            ("Editing layer", "editing"), ("All visible", "all_visible"),
+            ("Reference layers", "reference"), ("Selected", "selected"),
+            ("Current folder", "current_folder"),
+        ):
+            self.fill_reference_mode.addItem(label, value)
+        row.addWidget(_labeled_control(
+            "Refer", self.fill_reference_mode, page
+        ))
+        self.fill_exclusions: dict[str, QCheckBox] = {}
+        for key, label in (
+            ("exclude_editing_target", "Exclude editing target"),
+            ("exclude_page_background", "Exclude page/background"),
+            ("exclude_images", "Exclude images"),
+            ("exclude_gradients", "Exclude gradients"),
+            ("exclude_mask_only", "Exclude mask-only"),
+        ):
+            control = QCheckBox(label, page)
+            self.fill_exclusions[key] = control
+            row.addWidget(control)
+        self.fill_up_to_vector = QCheckBox("Fill up to vector path", page)
+        self.fill_include_vector = QCheckBox("Include vector path", page)
+        row.addWidget(self.fill_up_to_vector)
+        row.addWidget(self.fill_include_vector)
+        self.fill_do_not_start = QLineEdit(page)
+        self.fill_do_not_start.setPlaceholderText("ARGB or empty")
+        self.fill_do_not_start.setMaximumWidth(110)
+        row.addWidget(_labeled_control(
+            "Do not start for", self.fill_do_not_start, page
+        ))
+        self.fill_lasso_input = QComboBox(page)
+        for label, value in (
+            ("Freehand", "freehand"), ("Polyline", "polyline"),
+            ("Combined", "combined"),
+        ):
+            self.fill_lasso_input.addItem(label, value)
+        row.addWidget(_labeled_control(
+            "Lasso input", self.fill_lasso_input, page
+        ))
+        self.fill_multiple_input = QCheckBox("Multiple input", page)
+        self.fill_vector_snap = QCheckBox("Snap to vector path", page)
+        self.fill_sharp_angles = QCheckBox("Sharp angles", page)
+        row.addWidget(self.fill_multiple_input)
+        row.addWidget(self.fill_vector_snap)
+        row.addWidget(self.fill_sharp_angles)
+        numeric_controls = (
+            ("Magnetic", "fill_magnetic_strength", 0, 100),
+            ("Stabilization", "fill_stabilization", 0, 100),
+            ("Speed", "fill_speed_adjustment", -100, 100),
+            ("Post-correction", "fill_post_correction", 0, 100),
+        )
+        for label, name, minimum, maximum in numeric_controls:
+            group, slider, editor = _numeric_slider_control(
+                label, minimum, maximum, page
+            )
+            setattr(self, f"{name}_slider", slider)
+            setattr(self, name, editor)
+            row.addWidget(group)
+        self.fill_blend_mode = QComboBox(page)
+        for value in FILL_BLEND_MODES:
+            self.fill_blend_mode.addItem(
+                value.replace("_", " ").title(), value
+            )
+        row.addWidget(_labeled_control(
+            "Blending", self.fill_blend_mode, page
+        ))
+        self.fill_selection_button = QPushButton("Fill Selection", page)
+        row.addWidget(self.fill_selection_button)
+        self.fill_selection_button.clicked.connect(
+            self.fillSelectionRequested
+        )
+        self.fill_subtool.currentIndexChanged.connect(
+            self._fill_subtool_changed
+        )
         for control, signal in (
+            (self.fill_opacity, self.fill_opacity.valueChanged),
+            (self.fill_connected, self.fill_connected.toggled),
+            (self.fill_closed_area, self.fill_closed_area.toggled),
             (self.fill_close_gaps, self.fill_close_gaps.toggled),
             (self.fill_gap_threshold, self.fill_gap_threshold.valueChanged),
             (self.fill_narrow_areas, self.fill_narrow_areas.toggled),
@@ -343,9 +479,32 @@ class ToolSettingsControls(QWidget):
                 self.raster_fill_tolerance,
                 self.raster_fill_tolerance.valueChanged,
             ),
+            (self.fill_antialias, self.fill_antialias.toggled),
+            (self.fill_border_reference, self.fill_border_reference.toggled),
+            (self.fill_reference_mode, self.fill_reference_mode.currentIndexChanged),
+            (self.fill_up_to_vector, self.fill_up_to_vector.toggled),
+            (self.fill_include_vector, self.fill_include_vector.toggled),
+            (self.fill_do_not_start, self.fill_do_not_start.editingFinished),
+            (self.fill_lasso_input, self.fill_lasso_input.currentIndexChanged),
+            (self.fill_multiple_input, self.fill_multiple_input.toggled),
+            (self.fill_vector_snap, self.fill_vector_snap.toggled),
+            (self.fill_sharp_angles, self.fill_sharp_angles.toggled),
+            (self.fill_magnetic_strength, self.fill_magnetic_strength.valueChanged),
+            (self.fill_stabilization, self.fill_stabilization.valueChanged),
+            (self.fill_speed_adjustment, self.fill_speed_adjustment.valueChanged),
+            (self.fill_post_correction, self.fill_post_correction.valueChanged),
+            (self.fill_blend_mode, self.fill_blend_mode.currentIndexChanged),
         ):
             del control
             signal.connect(self._fill_changed)
+        for control in self.fill_exclusions.values():
+            control.toggled.connect(self._fill_changed)
+        self.raster_fill_tolerance_slider.sliderReleased.connect(
+            self._fill_tolerance_committed
+        )
+        self.raster_fill_tolerance.editingFinished.connect(
+            self._fill_tolerance_committed
+        )
         return page
 
     def set_context(
@@ -368,10 +527,7 @@ class ToolSettingsControls(QWidget):
             )
             self.stack.setCurrentWidget(self.eraser_page)
         elif value == "fill":
-            self.context_label.setText(
-                "Vector Fill" if vector_active
-                else "Raster Fill" if raster_active else "Fill"
-            )
+            self.context_label.setText("Raster Fill" if raster_active else "Fill")
             self.stack.setCurrentWidget(self.fill_page)
         elif value in {
             "draw_select_rect", "draw_select_lasso", "draw_select_stroke",
@@ -384,9 +540,10 @@ class ToolSettingsControls(QWidget):
         self.vector_eraser_label.setVisible(False)
         self.vector_eraser_group.setVisible(vector_active)
         for widget in self._vector_fill_widgets:
-            widget.setVisible(not raster_active)
+            widget.setVisible(False)
         for widget in self._raster_fill_widgets:
-            widget.setVisible(raster_active)
+            widget.setVisible(True)
+        self.fill_selection_button.setEnabled(raster_active)
 
     def refresh(self) -> None:
         self._loading = True
@@ -438,25 +595,50 @@ class ToolSettingsControls(QWidget):
         self.eraser_transform_handles.setChecked(
             self.settings.eraser_transform_handles_visible
         )
-        self.fill_close_gaps.setChecked(self.settings.fill_close_gaps)
-        self.fill_gap_threshold.setValue(self.settings.fill_gap_threshold)
-        self.fill_narrow_areas.setChecked(self.settings.fill_narrow_areas)
-        self.fill_area_scaling.setChecked(self.settings.fill_area_scaling)
-        self.fill_area_amount.setValue(self.settings.fill_area_amount)
+        profile = self.settings.active_fill_profile()
+        self.fill_subtool.setCurrentIndex(max(
+            0, self.fill_subtool.findData(self.settings.active_fill_subtool)
+        ))
+        self.fill_opacity.setValue(int(profile["opacity"]))
+        self.fill_connected.setChecked(bool(profile["connected_pixels_only"]))
+        self.fill_closed_area.setChecked(bool(profile["fill_closed_area"]))
+        self.fill_close_gaps.setChecked(bool(profile["close_gap"]))
+        self.fill_gap_threshold.setValue(float(profile["gap_threshold"]))
+        self.fill_narrow_areas.setChecked(bool(profile["fill_narrow_areas"]))
+        self.fill_area_scaling.setChecked(bool(profile["area_scaling"]))
+        self.fill_area_amount.setValue(float(profile["area_amount"]))
         self.fill_area_mode.setCurrentIndex(
             max(0, self.fill_area_mode.findData(
-                self.settings.fill_area_mode
+                profile["area_mode"]
             ))
         )
-        self.fill_mode.setCurrentIndex(
-            max(0, self.fill_mode.findData(self.settings.fill_mode))
-        )
-        self.raster_fill_tolerance.setValue(
-            self.settings.raster_fill_tolerance
-        )
-        self.fill_gap_threshold.setEnabled(self.settings.fill_close_gaps)
-        self.fill_area_amount.setEnabled(self.settings.fill_area_scaling)
-        self.fill_area_mode.setEnabled(self.settings.fill_area_scaling)
+        self.raster_fill_tolerance.setValue(int(profile["tolerance"]))
+        self.fill_antialias.setChecked(bool(profile["antialiasing"]))
+        self.fill_border_reference.setChecked(bool(profile["border_reference"]))
+        self.fill_reference_mode.setCurrentIndex(max(
+            0, self.fill_reference_mode.findData(profile["reference_mode"])
+        ))
+        for key, control in self.fill_exclusions.items():
+            control.setChecked(bool(profile[key]))
+        self.fill_up_to_vector.setChecked(bool(profile["fill_up_to_vector_path"]))
+        self.fill_include_vector.setChecked(bool(profile["include_vector_path"]))
+        self.fill_do_not_start.setText(str(profile["do_not_start_color"]))
+        self.fill_lasso_input.setCurrentIndex(max(
+            0, self.fill_lasso_input.findData(profile["lasso_input"])
+        ))
+        self.fill_multiple_input.setChecked(bool(profile["multiple_input"]))
+        self.fill_vector_snap.setChecked(bool(profile["vector_path_snapping"]))
+        self.fill_sharp_angles.setChecked(bool(profile["sharp_angles"]))
+        self.fill_magnetic_strength.setValue(int(profile["magnetic_lasso_strength"]))
+        self.fill_stabilization.setValue(int(profile["stabilization"]))
+        self.fill_speed_adjustment.setValue(int(profile["speed_adjustment"]))
+        self.fill_post_correction.setValue(int(profile["post_correction"]))
+        self.fill_blend_mode.setCurrentIndex(max(
+            0, self.fill_blend_mode.findData(profile["blend_mode"])
+        ))
+        self.fill_gap_group.setEnabled(bool(profile["close_gap"]))
+        self.fill_area_amount_group.setEnabled(bool(profile["area_scaling"]))
+        self.fill_area_mode.setEnabled(bool(profile["area_scaling"]))
         self._loading = False
 
     def _drawing_handles_changed(self, *args) -> None:
@@ -530,22 +712,65 @@ class ToolSettingsControls(QWidget):
         del args
         if self._loading:
             return
-        self.settings.fill_close_gaps = self.fill_close_gaps.isChecked()
-        self.settings.fill_gap_threshold = self.fill_gap_threshold.value()
-        self.settings.fill_narrow_areas = self.fill_narrow_areas.isChecked()
-        self.settings.fill_area_scaling = self.fill_area_scaling.isChecked()
-        self.settings.fill_area_amount = self.fill_area_amount.value()
-        self.settings.fill_area_mode = str(self.fill_area_mode.currentData())
-        self.settings.fill_mode = str(self.fill_mode.currentData())
-        self.settings.raster_fill_tolerance = (
-            self.raster_fill_tolerance.value()
-        )
+        profile = self.settings.active_fill_profile()
+        previous_tolerance = int(profile["tolerance"])
+        profile.update({
+            "opacity": self.fill_opacity.value(),
+            "connected_pixels_only": self.fill_connected.isChecked(),
+            "fill_closed_area": self.fill_closed_area.isChecked(),
+            "close_gap": self.fill_close_gaps.isChecked(),
+            "gap_threshold": self.fill_gap_threshold.value(),
+            "fill_narrow_areas": self.fill_narrow_areas.isChecked(),
+            "area_scaling": self.fill_area_scaling.isChecked(),
+            "area_amount": self.fill_area_amount.value(),
+            "area_mode": str(self.fill_area_mode.currentData()),
+            "tolerance": self.raster_fill_tolerance.value(),
+            "antialiasing": self.fill_antialias.isChecked(),
+            "border_reference": self.fill_border_reference.isChecked(),
+            "reference_mode": str(self.fill_reference_mode.currentData()),
+            "fill_up_to_vector_path": self.fill_up_to_vector.isChecked(),
+            "include_vector_path": self.fill_include_vector.isChecked(),
+            "do_not_start_color": self.fill_do_not_start.text().strip(),
+            "lasso_input": str(self.fill_lasso_input.currentData()),
+            "multiple_input": self.fill_multiple_input.isChecked(),
+            "vector_path_snapping": self.fill_vector_snap.isChecked(),
+            "sharp_angles": self.fill_sharp_angles.isChecked(),
+            "magnetic_lasso_strength": self.fill_magnetic_strength.value(),
+            "stabilization": self.fill_stabilization.value(),
+            "speed_adjustment": self.fill_speed_adjustment.value(),
+            "post_correction": self.fill_post_correction.value(),
+            "blend_mode": str(self.fill_blend_mode.currentData()),
+        })
+        for key, control in self.fill_exclusions.items():
+            profile[key] = control.isChecked()
         self.settings.clamp()
-        self.fill_gap_threshold.setEnabled(self.settings.fill_close_gaps)
-        self.fill_area_amount.setEnabled(self.settings.fill_area_scaling)
-        self.fill_area_mode.setEnabled(self.settings.fill_area_scaling)
+        profile = self.settings.active_fill_profile()
+        self.fill_gap_group.setEnabled(bool(profile["close_gap"]))
+        self.fill_area_amount_group.setEnabled(bool(profile["area_scaling"]))
+        self.fill_area_mode.setEnabled(bool(profile["area_scaling"]))
         self.settingsChanged.emit()
         self.fillSettingsChanged.emit()
+        tolerance = int(profile["tolerance"])
+        if tolerance != previous_tolerance:
+            self.fillToleranceChanged.emit(tolerance, False)
+
+    def _fill_subtool_changed(self) -> None:
+        if self._loading:
+            return
+        value = str(self.fill_subtool.currentData())
+        if value not in FILL_SUBTOOLS:
+            return
+        self.settings.active_fill_subtool = value
+        self.settings.clamp()
+        self.refresh()
+        self.settingsChanged.emit()
+        self.fillSettingsChanged.emit()
+
+    def _fill_tolerance_committed(self) -> None:
+        if not self._loading:
+            self.fillToleranceChanged.emit(
+                self.raster_fill_tolerance.value(), True
+            )
 
 
 class TextObjectControls(QObject):

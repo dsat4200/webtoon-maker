@@ -242,7 +242,7 @@ def test_path_node_shape_style_round_trip_and_open_leaf_invariants():
     )
     loaded = ChapterDocument.from_dict(chapter.to_dict())
     result = loaded.layers[line.layer_id]
-    assert loaded.schema_version == 18
+    assert loaded.schema_version == 20
     assert result.layer_kind == "open_shape"
     assert result.bound.closed is False
     assert result.bound.nodes[1].incoming == (70, 30)
@@ -1729,6 +1729,6 @@ def test_bound_edit_hotkey_migrates_to_shape_edit(monkeypatch, tmp_path):
     }), encoding="utf-8")
     monkeypatch.setattr(settings_module, "settings_path", lambda: path)
     loaded = load_settings()
-    assert loaded.settings_version == 18
+    assert loaded.settings_version == 20
     assert loaded.hotkeys["shape_edit"] == "Ctrl+B"
     assert "bound_edit" not in loaded.hotkeys

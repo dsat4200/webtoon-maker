@@ -3,12 +3,13 @@ from __future__ import annotations
 import pytest
 from PySide6.QtCore import QEvent, QPointF, QRectF, Qt
 from PySide6.QtGui import (
-    QColor, QInputMethodEvent, QPointingDevice, QTabletEvent,
+    QColor, QInputMethodEvent, QPolygonF, QPointingDevice, QTabletEvent,
 )
 from PySide6.QtTest import QTest
 
 from comic_editor.core.models import (
-    BoundGeometry, ChapterDocument, RasterObject, TextObject,
+    BoundGeometry, ChapterDocument, OutlineModifier, RasterObject, TextObject,
+    VectorDrawingObject, VectorStroke, VectorStrokePoint,
 )
 from comic_editor.core.settings import EditorSettings
 from comic_editor.core.tiles import TileStore
@@ -65,7 +66,7 @@ def _tablet_event(event_type, position, pressure, button, buttons):
     )
 
 
-def test_bound_center_drag_translates_only_mask_and_is_undoable(qapp):
+def test_bound_center_drag_translates_shape_subtree_and_is_undoable(qapp):
     canvas, chapter, page, layer = _canvas_document()
     raster = chapter.add_object(layer.layer_id, RasterObject(x=90, y=80))
     original_points = list(layer.bound.points)
@@ -75,12 +76,206 @@ def test_bound_center_drag_translates_only_mask_and_is_undoable(qapp):
     canvas._tool_press(_widget(canvas, 200, 200), 1)
     canvas._tool_move(_widget(canvas, 230, 220), 1)
     canvas._tool_release()
-    assert layer.bound.points == [
-        (x + 30, y + 20) for x, y in original_points
-    ]
+    assert layer.bound.points == original_points
+    assert (layer.translate_x, layer.translate_y) == pytest.approx((30, 20))
     assert (raster.x, raster.y) == original_object_position
     canvas.command_stack.undo()
-    assert canvas.chapter.layers[layer.layer_id].bound.points == original_points
+    restored = canvas.chapter.layers[layer.layer_id]
+    assert restored.bound.points == original_points
+    assert (restored.translate_x, restored.translate_y) == (0, 0)
+
+
+def test_raster_selection_transform_renders_live_without_mutating_tiles(qapp):
+    canvas, chapter, _page, layer = _canvas_document()
+    raster = chapter.add_object(
+        layer.layer_id, RasterObject(x=100, y=100)
+    )
+    canvas.tiles.paint_dab(
+        raster.object_id, QPointF(100, 100), 100,
+        QColor("#ffcc3311"), square=True, antialias=False,
+    )
+    outline = OutlineModifier(thickness=5, color="#ff111111")
+    chapter.modifiers[outline.modifier_id] = outline
+    raster.modifier_ids = [outline.modifier_id]
+    canvas.set_selection("object", raster.object_id)
+    canvas.set_tool(ToolKind.DRAW_SELECT_RECT)
+    assert canvas.select_all_drawing()
+    canvas.scale = 1.0
+    canvas.center_x = 450
+    canvas.center_y = 350
+    canvas.show()
+    qapp.processEvents()
+
+    source = QPointF(180, 180)
+    destination = source + QPointF(120, 0)
+    quad = list(canvas._selection_transform_quad)
+    pivot = canvas._selection_pivot
+    press = pivot + QPointF(25, 0)
+    before_model = chapter.to_dict()
+    before_tiles = {
+        key: int(image.cacheKey())
+        for key, image in canvas.tiles.object_tiles(
+            raster.object_id
+        ).items()
+    }
+    before_image = canvas.grab().toImage()
+    source_widget = canvas.document_to_widget(source).toPoint()
+    destination_widget = canvas.document_to_widget(destination).toPoint()
+    source_color = before_image.pixelColor(source_widget)
+    destination_color = before_image.pixelColor(destination_widget)
+    assert source_color != destination_color
+
+    canvas._tool_press(canvas.document_to_widget(press), 1.0)
+    canvas._tool_move(
+        canvas.document_to_widget(press + QPointF(120, 0)), 1.0
+    )
+    qapp.processEvents()
+    preview = canvas.grab().toImage()
+
+    assert chapter.to_dict() == before_model
+    assert {
+        key: int(image.cacheKey())
+        for key, image in canvas.tiles.object_tiles(
+            raster.object_id
+        ).items()
+    } == before_tiles
+    assert preview.pixelColor(source_widget) == destination_color
+    assert preview.pixelColor(destination_widget) == source_color
+    assert canvas._selection_transform_quad == pytest.approx([
+        (x + 120, y) for x, y in quad
+    ])
+
+    canvas._tool_release()
+    committed = canvas.grab().toImage()
+    assert committed.pixelColor(source_widget) == destination_color
+    assert committed.pixelColor(destination_widget) == source_color
+    canvas.command_stack.undo()
+    restored = canvas.grab().toImage()
+    assert restored.pixelColor(source_widget) == source_color
+    assert restored.pixelColor(destination_widget) == destination_color
+
+
+@pytest.mark.parametrize("drawing_kind", ["raster", "vector"])
+def test_tablet_selection_translation_uses_open_and_closed_hand_cursors(
+    qapp, drawing_kind,
+):
+    canvas, chapter, _page, layer = _canvas_document()
+    if drawing_kind == "raster":
+        drawing = chapter.add_object(
+            layer.layer_id, RasterObject(x=80, y=70)
+        )
+        canvas.tiles.paint_dab(
+            drawing.object_id, QPointF(100, 100), 120,
+            QColor("#ff2255aa"), square=True, antialias=False,
+        )
+    else:
+        drawing = chapter.add_object(
+            layer.layer_id,
+            VectorDrawingObject(strokes=[VectorStroke(points=[
+                VectorStrokePoint(x=100, y=100, width=12),
+                VectorStrokePoint(x=220, y=100, width=12),
+                VectorStrokePoint(x=220, y=210, width=12),
+                VectorStrokePoint(x=100, y=210, width=12),
+            ])]),
+        )
+    canvas.set_selection("object", drawing.object_id)
+    canvas.set_tool(ToolKind.DRAW_SELECT_RECT)
+    assert canvas.select_all_drawing()
+    canvas.scale = 1.0
+    quad = list(canvas._selection_transform_quad)
+    center = QPolygonF([QPointF(*point) for point in quad]).boundingRect().center()
+    press_world = center * 0.7 + QPointF(*quad[0]) * 0.3
+    press = canvas.document_to_widget(press_world)
+    moved = press + QPointF(35, 22)
+
+    canvas.tabletEvent(_tablet_event(
+        QEvent.TabletMove, press, 0.0, Qt.NoButton, Qt.NoButton,
+    ))
+    assert canvas.cursor().shape() == Qt.CursorShape.OpenHandCursor
+    canvas.tabletEvent(_tablet_event(
+        QEvent.TabletPress, press, 0.5, Qt.LeftButton, Qt.LeftButton,
+    ))
+    assert canvas.cursor().shape() == Qt.CursorShape.ClosedHandCursor
+    canvas.tabletEvent(_tablet_event(
+        QEvent.TabletMove, moved, 0.5, Qt.NoButton, Qt.LeftButton,
+    ))
+    assert canvas.cursor().shape() == Qt.CursorShape.ClosedHandCursor
+    canvas.tabletEvent(_tablet_event(
+        QEvent.TabletRelease, moved, 0.0, Qt.LeftButton, Qt.NoButton,
+    ))
+    assert canvas.cursor().shape() == Qt.CursorShape.OpenHandCursor
+
+
+def test_tablet_shape_translation_uses_hands_but_handle_stays_precise(qapp):
+    canvas, _chapter, _page, layer = _canvas_document()
+    canvas.set_selection("layer", layer.layer_id)
+    canvas.set_tool(ToolKind.SHAPE_EDIT)
+    canvas.scale = 1.0
+    corner = canvas.document_to_widget(QPointF(*layer.bound.points[0]))
+    canvas.tabletEvent(_tablet_event(
+        QEvent.TabletMove, corner, 0.0, Qt.NoButton, Qt.NoButton,
+    ))
+    assert canvas.cursor().shape() == Qt.CursorShape.CrossCursor
+    canvas.tabletEvent(_tablet_event(
+        QEvent.TabletPress, corner, 0.5, Qt.LeftButton, Qt.LeftButton,
+    ))
+    assert canvas.cursor().shape() == Qt.CursorShape.CrossCursor
+    canvas.tabletEvent(_tablet_event(
+        QEvent.TabletRelease, corner, 0.0, Qt.LeftButton, Qt.NoButton,
+    ))
+
+    interior_world = QPointF(260, 260)
+    interior = canvas.document_to_widget(interior_world)
+    moved = interior + QPointF(30, 20)
+    original = list(layer.bound.points)
+    canvas.tabletEvent(_tablet_event(
+        QEvent.TabletMove, interior, 0.0, Qt.NoButton, Qt.NoButton,
+    ))
+    assert canvas.cursor().shape() == Qt.CursorShape.OpenHandCursor
+    canvas.tabletEvent(_tablet_event(
+        QEvent.TabletPress, interior, 0.5, Qt.LeftButton, Qt.LeftButton,
+    ))
+    assert canvas.cursor().shape() == Qt.CursorShape.ClosedHandCursor
+    canvas.tabletEvent(_tablet_event(
+        QEvent.TabletMove, moved, 0.5, Qt.NoButton, Qt.LeftButton,
+    ))
+    assert canvas.cursor().shape() == Qt.CursorShape.ClosedHandCursor
+    assert layer.bound.points == original
+    assert (layer.translate_x, layer.translate_y) == (30, 20)
+    canvas.tabletEvent(_tablet_event(
+        QEvent.TabletRelease, moved, 0.0, Qt.LeftButton, Qt.NoButton,
+    ))
+    assert canvas.cursor().shape() == Qt.CursorShape.OpenHandCursor
+
+
+def test_tablet_layer_transform_cage_translation_uses_hand_cursors(qapp):
+    canvas, _chapter, _page, layer = _canvas_document()
+    canvas.set_selection("layer", layer.layer_id)
+    canvas.set_tool(ToolKind.TRANSFORM)
+    canvas.scale = 1.0
+    quad, _kind = canvas._active_transform_cage()
+    center = QPolygonF([QPointF(*point) for point in quad]).boundingRect().center()
+    press_world = center * 0.75 + QPointF(*quad[0]) * 0.25
+    press = canvas.document_to_widget(press_world)
+    moved = press + QPointF(40, 25)
+
+    canvas.tabletEvent(_tablet_event(
+        QEvent.TabletMove, press, 0.0, Qt.NoButton, Qt.NoButton,
+    ))
+    assert canvas.cursor().shape() == Qt.CursorShape.OpenHandCursor
+    canvas.tabletEvent(_tablet_event(
+        QEvent.TabletPress, press, 0.5, Qt.LeftButton, Qt.LeftButton,
+    ))
+    assert canvas.cursor().shape() == Qt.CursorShape.ClosedHandCursor
+    canvas.tabletEvent(_tablet_event(
+        QEvent.TabletMove, moved, 0.5, Qt.NoButton, Qt.LeftButton,
+    ))
+    assert canvas.cursor().shape() == Qt.CursorShape.ClosedHandCursor
+    assert canvas._transform_preview_quad != canvas._transform_start_quad
+    canvas.tabletEvent(_tablet_event(
+        QEvent.TabletRelease, moved, 0.0, Qt.LeftButton, Qt.NoButton,
+    ))
+    assert canvas.cursor().shape() == Qt.CursorShape.OpenHandCursor
 
 
 def test_tablet_horizontal_pan_matches_canvas_grab_direction(qapp):

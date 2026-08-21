@@ -7,7 +7,7 @@ from PySide6.QtGui import QGuiApplication, QImage, QPainter, QPainterPath
 import pytest
 
 from comic_editor.core.models import (
-    BoundGeometry, ChapterDocument, VectorDrawingObject, VectorFillObject,
+    BoundGeometry, ChapterDocument, VectorDrawingObject,
     VectorStroke, VectorStrokePoint,
 )
 from comic_editor.core.settings import EditorSettings
@@ -193,13 +193,6 @@ def test_vector_drawing_renders_through_object_pipeline(qapp):
             ],
         ),
     )
-    chapter.add_vector_fill(
-        drawing.object_id,
-        VectorFillObject(
-            geometry=BoundGeometry.rectangle(20, 80, 160, 50),
-            fill_color="#FF0000FF",
-        ),
-    )
     chapter.height = 300
     canvas = CanvasWidget(EditorSettings(predictive_ink=False))
     canvas.set_document(chapter, TileStore())
@@ -251,7 +244,7 @@ def test_shape_edit_maps_to_vector_edit_and_selects_a_stroke(qapp):
     assert stroke.stroke_id in canvas.selected_vector_stroke_ids
 
 
-def test_object_select_prefers_vector_stroke_then_fill_interior(qapp):
+def test_object_select_hits_vector_stroke_but_not_empty_interior(qapp):
     stroke = VectorStroke(
         closed=True,
         points=[
@@ -261,22 +254,15 @@ def test_object_select_prefers_vector_stroke_then_fill_interior(qapp):
             VectorStrokePoint(x=100, y=300, width=8),
         ],
     )
-    canvas, chapter, drawing = _canvas_with_drawing([stroke])
-    fill = chapter.add_vector_fill(
-        drawing.object_id,
-        VectorFillObject(
-            geometry=BoundGeometry.rectangle(100, 100, 200, 200),
-            fill_color="#FFFF0000",
-        ),
-    )
+    canvas, _chapter, drawing = _canvas_with_drawing([stroke])
     canvas.settings.page_scope_select = True
     canvas.set_tool(ToolKind.OBJECT_SELECT)
     assert canvas.hit_test_entities(QPointF(100, 180))[0] == {
         "kind": "object", "id": drawing.object_id,
     }
-    assert canvas.hit_test_entities(QPointF(200, 200))[0] == {
-        "kind": "object", "id": fill.object_id,
-    }
+    assert {
+        "kind": "object", "id": drawing.object_id,
+    } not in canvas.hit_test_entities(QPointF(200, 200))
 
 
 def test_vector_stroke_eraser_removes_touched_stroke(qapp):
@@ -293,7 +279,7 @@ def test_vector_stroke_eraser_removes_touched_stroke(qapp):
     assert len(drawing.strokes) == 1
 
 
-def test_vector_fill_creates_owned_child_and_keeps_drawing_selected(qapp):
+def test_fill_tool_does_not_create_persistent_vector_fill(qapp):
     stroke = VectorStroke(
         closed=True,
         points=[
@@ -304,18 +290,12 @@ def test_vector_fill_creates_owned_child_and_keeps_drawing_selected(qapp):
         ],
     )
     canvas, chapter, drawing = _canvas_with_drawing([stroke])
+    object_ids = set(chapter.objects)
     canvas.set_active_colors("#FF336699", "#FFFFFFFF")
-    assert canvas.set_tool(ToolKind.FILL)
-    canvas._tool_press(
-        canvas.document_to_widget(QPointF(200, 200)), 1.0
-    )
-    canvas._tool_release()
-    fills = chapter.vector_fill_children(drawing.object_id)
-    assert len(fills) == 1
-    assert fills[0].fill_color == "#FF336699"
+    assert not canvas.set_tool(ToolKind.FILL)
+    assert set(chapter.objects) == object_ids
     assert canvas.selected_id == drawing.object_id
-    canvas.command_stack.undo()
-    assert chapter.vector_fill_children(drawing.object_id) == []
+    assert not canvas.command_stack.can_undo
 
 
 def test_intersection_eraser_uses_other_strokes_as_cuts(qapp):
@@ -385,7 +365,7 @@ def test_redraw_apply_targets_points_before_strokes(qapp):
     assert restored.points[1].width == 7
 
 
-def test_shape_fill_changes_border_or_interior_contextually(qapp):
+def test_shape_fill_changes_only_selected_shape_background(qapp):
     chapter = ChapterDocument()
     page = chapter.add_page()
     layer = chapter.add_layer(
@@ -398,11 +378,17 @@ def test_shape_fill_changes_border_or_interior_contextually(qapp):
     canvas.set_selection("layer", layer.layer_id)
     canvas.set_active_colors("#FFCC3300", "#FFFFFFFF")
     assert canvas.set_tool(ToolKind.FILL)
+    outline_before = (
+        layer.shape_style.outline_color,
+        layer.shape_style.outline_thickness,
+    )
     canvas._tool_press(
         canvas.document_to_widget(QPointF(100, 180)), 1.0
     )
-    assert layer.shape_style.outline_color == "#FFCC3300"
-    assert layer.shape_style.outline_thickness == 4
+    assert (
+        layer.shape_style.outline_color,
+        layer.shape_style.outline_thickness,
+    ) == outline_before
     canvas._tool_press(
         canvas.document_to_widget(QPointF(200, 180)), 1.0
     )
@@ -434,105 +420,16 @@ def test_square_vector_eraser_uses_square_hit_shape(qapp):
     assert drawing.strokes == []
 
 
-def test_refill_updates_hidden_child_and_fill_selection_resolves_owner(qapp):
-    stroke = VectorStroke(
-        closed=True,
-        points=[
-            VectorStrokePoint(x=100, y=100, width=6),
-            VectorStrokePoint(x=300, y=100, width=6),
-            VectorStrokePoint(x=300, y=300, width=6),
-            VectorStrokePoint(x=100, y=300, width=6),
-        ],
-    )
-    canvas, chapter, drawing = _canvas_with_drawing([stroke])
-    fill = chapter.add_vector_fill(
-        drawing.object_id,
-        VectorFillObject(
-            geometry=BoundGeometry.rectangle(100, 100, 200, 200),
-            fill_color="#FF112233",
-            visible=False,
-        ),
-    )
-    canvas.set_selection("object", fill.object_id)
-    canvas.set_active_colors("#FF778899", "#FFFFFFFF")
-    assert canvas.tool == ToolKind.FILL
-    canvas._tool_press(
-        canvas.document_to_widget(QPointF(200, 200)), 1.0
-    )
-    canvas._tool_release()
-
-    children = chapter.vector_fill_children(drawing.object_id)
-    assert len(children) == 1
-    assert children[0].object_id == fill.object_id
-    assert children[0].fill_color == "#FF778899"
-    assert canvas.selected_id == drawing.object_id
-
-
 def test_object_select_ignores_fully_transparent_vector_content(qapp):
     stroke = _stroke((100, 100, 10, 1), (300, 100, 10, 1))
     stroke.color = "#00112233"
-    canvas, chapter, drawing = _canvas_with_drawing([stroke])
-    fill = chapter.add_vector_fill(
-        drawing.object_id,
-        VectorFillObject(
-            geometry=BoundGeometry.rectangle(100, 150, 200, 100),
-            fill_color="#00112233",
-        ),
-    )
+    canvas, _chapter, drawing = _canvas_with_drawing([stroke])
     canvas.settings.page_scope_select = True
     canvas.set_tool(ToolKind.OBJECT_SELECT)
 
     assert {
         "kind": "object", "id": drawing.object_id,
     } not in canvas.hit_test_entities(QPointF(200, 100))
-    assert {
-        "kind": "object", "id": fill.object_id,
-    } not in canvas.hit_test_entities(QPointF(200, 200))
-
-
-def test_disabling_fill_narrow_areas_removes_neck_not_whole_face(qapp):
-    canvas, _chapter, _drawing = _canvas_with_drawing()
-    canvas.settings.fill_narrow_areas = False
-    canvas.settings.fill_close_gaps = True
-    canvas.settings.fill_gap_threshold = 8
-    face = QPainterPath()
-    face.addRect(QRectF(0, 0, 40, 40))
-    face.addRect(QRectF(60, 0, 40, 40))
-    face.addRect(QRectF(40, 18, 20, 4))
-
-    processed = canvas._remove_narrow_vector_fill_areas(face)
-
-    assert processed.contains(QPointF(20, 20))
-    assert processed.contains(QPointF(80, 20))
-    assert not processed.contains(QPointF(50, 20))
-
-
-def test_drag_fill_resamples_between_pointer_events(qapp):
-    def rectangle(left):
-        return VectorStroke(
-            closed=True,
-            points=[
-                VectorStrokePoint(x=left, y=20, width=4),
-                VectorStrokePoint(x=left + 80, y=20, width=4),
-                VectorStrokePoint(x=left + 80, y=100, width=4),
-                VectorStrokePoint(x=left, y=100, width=4),
-            ],
-        )
-
-    canvas, chapter, drawing = _canvas_with_drawing([
-        rectangle(20), rectangle(120), rectangle(220),
-    ])
-    canvas.scale = 1.0
-    assert canvas.set_tool(ToolKind.FILL)
-    canvas._tool_press(
-        canvas.document_to_widget(QPointF(60, 60)), 1.0
-    )
-    canvas._tool_move(
-        canvas.document_to_widget(QPointF(260, 60)), 1.0
-    )
-    canvas._tool_release()
-
-    assert len(chapter.vector_fill_children(drawing.object_id)) == 3
 
 
 def test_vector_select_all_and_selection_translate_are_undoable(qapp):
@@ -559,6 +456,48 @@ def test_vector_select_all_and_selection_translate_are_undoable(qapp):
     canvas.command_stack.undo()
     restored = canvas.chapter.objects[drawing.object_id]
     assert restored.strokes[0].points[0].position == pytest.approx((20, 30))
+
+
+def test_vector_selection_translation_repaints_live_before_commit(qapp):
+    stroke = _stroke(
+        (140, 140, 18, 1), (260, 140, 18, 1),
+        (260, 240, 18, 1), (140, 240, 18, 1),
+    )
+    canvas, chapter, drawing = _canvas_with_drawing([stroke])
+    object_ids = set(chapter.objects)
+    assert canvas.set_tool(ToolKind.DRAW_SELECT_RECT)
+    assert canvas.select_all_drawing()
+    canvas.scale = 1.0
+    canvas.center_x = 450
+    canvas.center_y = 350
+    canvas.show()
+    qapp.processEvents()
+
+    source = QPointF(200, 140)
+    destination = source + QPointF(120, 0)
+    press = QPointF(200, 170)
+    source_widget = canvas.document_to_widget(source).toPoint()
+    destination_widget = canvas.document_to_widget(destination).toPoint()
+    before = canvas.grab().toImage()
+    source_color = before.pixelColor(source_widget)
+    destination_color = before.pixelColor(destination_widget)
+    before_model = chapter.to_dict()
+    assert source_color != destination_color
+
+    canvas._tool_press(canvas.document_to_widget(press), 1.0)
+    canvas._tool_move(
+        canvas.document_to_widget(press + QPointF(120, 0)), 1.0
+    )
+    qapp.processEvents()
+    preview = canvas.grab().toImage()
+
+    assert chapter.to_dict() == before_model
+    assert canvas._selection_vector_preview
+    assert preview.pixelColor(source_widget) == destination_color
+    assert preview.pixelColor(destination_widget) == source_color
+
+    canvas._tool_release()
+    assert drawing.strokes[0].points[0].position == pytest.approx((260, 140))
 
 
 def test_simplify_apply_targets_selected_point_incident_spans(qapp):

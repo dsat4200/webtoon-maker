@@ -13,7 +13,7 @@ from comic_editor.core.assets import (
 )
 from comic_editor.core.models import (
     BoundGeometry, ChapterDocument, ColorFillGradientObject, RasterObject,
-    PathNode, ShapeStyle, VectorDrawingObject, VectorFillObject,
+    PathNode, ShapeStyle, VectorDrawingObject,
 )
 from comic_editor.core.persistence import SeriesRepository
 from comic_editor.core.tiles import TileStore
@@ -32,19 +32,20 @@ def _asset_source():
     drawing = chapter.add_object(
         layer.layer_id, VectorDrawingObject(name="Lines")
     )
-    fill = chapter.add_vector_fill(
-        drawing.object_id,
-        VectorFillObject(
-            geometry=BoundGeometry.rectangle(10, 10, 40, 40),
-            fill_color="#FF00AAFF",
-        ),
+    color = chapter.add_object(
+        layer.layer_id,
+        RasterObject(name="Color", interaction_rect=(10, 10, 40, 40)),
     )
     tiles = TileStore()
     tiles.paint_dab(
         raster.object_id, QPointF(15, 20), 18, QColor("#ff2244")
     )
+    tiles.paint_dab(
+        color.object_id, QPointF(30, 30), 40, QColor("#FF00AAFF"),
+        square=True, antialias=False,
+    )
     chapter.validate()
-    return chapter, layer, raster, drawing, fill, tiles
+    return chapter, layer, raster, drawing, color, tiles
 
 
 def _solid_asset():
@@ -97,15 +98,17 @@ def test_asset_documents_allow_fitted_width_and_old_docs_default_to_chapter():
 
 
 def test_extract_and_instantiate_asset_remaps_graph_and_raster_tiles():
-    chapter, layer, raster, drawing, fill, tiles = _asset_source()
+    chapter, layer, raster, drawing, color, tiles = _asset_source()
     manifest, asset_tiles = extract_asset(
         chapter, tiles, "layer", layer.layer_id, "Character"
     )
     assert manifest.document.document_kind == "asset"
     assert manifest.root_id == layer.layer_id
     assert asset_tiles.content_bounds(raster.object_id) is not None
-    copied_drawing = manifest.document.objects[drawing.object_id]
-    assert copied_drawing.fill_child_ids == [fill.object_id]
+    assert isinstance(
+        manifest.document.objects[drawing.object_id], VectorDrawingObject
+    )
+    assert asset_tiles.content_bounds(color.object_id) is not None
 
     target = ChapterDocument(name="Target")
     target_page = target.add_page("Page")
@@ -122,12 +125,13 @@ def test_extract_and_instantiate_asset_remaps_graph_and_raster_tiles():
         if isinstance(target.objects[object_id], RasterObject)
     )
     assert target_tiles.content_bounds(copied_raster_id) is not None
-    placed_drawing = next(
-        obj for obj in target.objects.values()
-        if isinstance(obj, VectorDrawingObject)
+    assert any(
+        isinstance(obj, VectorDrawingObject)
+        for obj in target.objects.values()
     )
-    assert placed_drawing.fill_child_ids[0] in target.objects
-    assert placed_drawing.fill_child_ids[0] != fill.object_id
+    assert sum(
+        isinstance(obj, RasterObject) for obj in target.objects.values()
+    ) == 2
     target.validate()
 
 

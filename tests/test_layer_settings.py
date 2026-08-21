@@ -1,13 +1,13 @@
 from __future__ import annotations
 
-from PySide6.QtCore import QObject, Signal
+from PySide6.QtCore import QObject, Signal, Qt
 from PySide6.QtTest import QTest
-from PySide6.QtWidgets import QScrollArea, QSlider, QSpinBox, QTabBar
+from PySide6.QtWidgets import QMenu, QScrollArea, QSlider, QSpinBox, QTabBar
 
 from comic_editor.core.models import (
-    BoundGeometry, ChapterDocument, ColorFillGradientObject, PathNode,
-    RasterObject, ShapeStyle, TextObject, VectorDrawingObject,
-    VectorFillObject,
+    BoundGeometry, ChapterDocument, ColorFillGradientObject, DocumentObject,
+    ImageObject, PathNode, RasterObject, ShapeStyle, TextObject,
+    VectorDrawingObject,
 )
 from comic_editor.core.tiles import TileStore
 from comic_editor.ui.canvas import ToolKind
@@ -29,6 +29,86 @@ def _window_document(window):
     window.canvas.set_document(chapter, TileStore())
     window._refresh_hierarchy()
     return chapter, page, layer, raster
+
+
+def test_raster_context_menu_toggles_mask_only_with_undo(qapp, monkeypatch):
+    monkeypatch.setattr(main_window_module, "save_settings", lambda _value: None)
+    window = MainWindow()
+    chapter, page, layer, raster = _window_document(window)
+    drawables = [
+        raster,
+        chapter.add_object(layer.layer_id, VectorDrawingObject()),
+        chapter.add_object(layer.layer_id, ImageObject()),
+        chapter.add_object(layer.layer_id, TextObject()),
+        chapter.add_object(layer.layer_id, ColorFillGradientObject()),
+    ]
+    helper = chapter.add_object(
+        layer.layer_id, DocumentObject(object_type="helper")
+    )
+    window._refresh_hierarchy()
+    window.show()
+    qapp.processEvents()
+    seen_actions: list[str] = []
+
+    class ChoosingMaskMenu(QMenu):
+        def exec(self, *_args, **_kwargs):
+            seen_actions.extend(action.text() for action in self.actions())
+            action = next(
+                action for action in self.actions()
+                if action.text() == "Show as mask only"
+            )
+            assert action.isCheckable()
+            assert not action.isChecked()
+            action.setChecked(True)
+            return action
+
+    try:
+        assert window._mask_only_context_target(
+            "layer", layer.layer_id
+        ) is layer
+        assert window._mask_only_context_target("layer", page.layer_id) is None
+        assert all(
+            window._mask_only_context_target("object", obj.object_id) is obj
+            for obj in drawables
+        )
+        assert window._mask_only_context_target(
+            "object", helper.object_id
+        ) is None
+
+        monkeypatch.setattr(main_window_module, "QMenu", ChoosingMaskMenu)
+        page_index = window.hierarchy_model.index_for_entity(
+            "layer", page.layer_id
+        )
+        layer_index = window.hierarchy_model.index_for_entity(
+            "layer", layer.layer_id
+        )
+        raster_index = window.hierarchy_model.index_for_entity(
+            "object", raster.object_id
+        )
+        window.tree.setExpanded(page_index, True)
+        window.tree.setExpanded(layer_index, True)
+        window.tree.scrollTo(raster_index)
+        qapp.processEvents()
+        point = window.tree.visualRect(raster_index).center()
+
+        window._show_tree_context_menu(point)
+
+        assert "Show as mask only" in seen_actions
+        assert raster.mask_only
+        opacity_index = raster_index.siblingAtColumn(2)
+        assert window.hierarchy_model.data(
+            opacity_index, Qt.DisplayRole
+        ) == "100% - Mask only"
+
+        window.canvas.command_stack.undo()
+        qapp.processEvents()
+        assert not window.canvas.chapter.objects[raster.object_id].mask_only
+        window.canvas.command_stack.redo()
+        qapp.processEvents()
+        assert window.canvas.chapter.objects[raster.object_id].mask_only
+    finally:
+        window._dirty = False
+        window.deleteLater()
 
 
 def test_layer_settings_follows_layer_page_and_object_parent(
@@ -76,7 +156,6 @@ def test_layer_settings_kind_rows_and_position_above_tree(qapp, monkeypatch):
     monkeypatch.setattr(main_window_module, "save_settings", lambda _value: None)
     window = MainWindow()
     chapter, page, layer, raster = _window_document(window)
-    fill = chapter.add_fill_layer(layer.layer_id, "Fill", "#ff0000")
     open_shape = chapter.add_layer(
         page.layer_id, "Line",
         BoundGeometry.path([
@@ -100,12 +179,6 @@ def test_layer_settings_kind_rows_and_position_above_tree(qapp, monkeypatch):
     assert window.settings_scroll.widget() is window.selection_settings
     assert window.outliner_splitter.widget(1) is window.tree
     try:
-        window.canvas.set_selection("layer", fill.layer_id, False)
-        window.layer_settings.refresh()
-        assert window.layer_settings.type_label.text() == "Fill Layer"
-        assert window.layer_settings.border_width.isHidden()
-        assert window.layer_settings.grid_size.isHidden()
-
         window.canvas.set_selection("layer", open_shape.layer_id, False)
         window.layer_settings.refresh()
         assert window.layer_settings.type_label.text() == "Open Shape"
@@ -400,9 +473,6 @@ def test_selection_settings_switches_object_pages_and_uses_parent_for_contextual
     drawing = chapter.add_object(
         layer.layer_id, VectorDrawingObject(name="Vector")
     )
-    fill = chapter.add_vector_fill(
-        drawing.object_id, VectorFillObject(name="Fill")
-    )
     text = chapter.add_object(layer.layer_id, TextObject(text="Text"))
     gradient = chapter.add_object(
         layer.layer_id, ColorFillGradientObject()
@@ -415,11 +485,6 @@ def test_selection_settings_switches_object_pages_and_uses_parent_for_contextual
         window.canvas.set_selection("object", drawing.object_id)
         assert panel.stack.currentWidget() is panel.vector_page
         assert panel.vector_controls.ignore_parent_mask.isVisibleTo(panel)
-        window.canvas.set_selection("object", fill.object_id)
-        assert panel.stack.currentWidget() is panel.vector_page
-        assert panel.vector_controls.type_label.text() == "Vector Fill"
-        assert panel.vector_controls.ignore_parent_mask.isHidden()
-        assert panel.vector_controls.underlay_row.isHidden()
 
         for object_id in (text.object_id, gradient.object_id):
             window.canvas.set_selection("object", object_id)

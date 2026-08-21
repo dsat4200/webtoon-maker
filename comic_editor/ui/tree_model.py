@@ -5,11 +5,11 @@ import json
 from dataclasses import dataclass, field
 
 from PySide6.QtCore import QAbstractItemModel, QMimeData, QModelIndex, Qt, Signal
-from PySide6.QtGui import QColor
+from PySide6.QtGui import QColor, QIcon, QPainter, QPen, QPixmap
 
 from comic_editor.core.models import (
     ChapterDocument, GradientObject, ImageObject, LayerNode, SpeedLinesGradientObject,
-    RasterObject, TextObject, VectorDrawingObject, VectorFillObject,
+    RasterObject, TextObject, VectorDrawingObject,
 )
 
 
@@ -25,6 +25,26 @@ class HierarchyModel(QAbstractItemModel):
     mutationCommitted = Signal(object, object, str)
 
     MIME = "application/x-vertical-comic-entity"
+    _reference_icon_cache: QIcon | None = None
+
+    @classmethod
+    def _reference_icon(cls) -> QIcon:
+        if cls._reference_icon_cache is None:
+            pixmap = QPixmap(16, 16)
+            pixmap.fill(Qt.GlobalColor.transparent)
+            painter = QPainter(pixmap)
+            painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+            painter.setPen(QPen(QColor("#f4d35e"), 1.5))
+            painter.setBrush(QColor("#d59b32"))
+            painter.drawRect(6, 6, 4, 7)
+            painter.drawLine(4, 14, 12, 14)
+            painter.drawLine(4, 14, 6, 12)
+            painter.drawLine(12, 14, 10, 12)
+            painter.drawLine(8, 6, 3, 3)
+            painter.drawLine(8, 6, 13, 3)
+            painter.end()
+            cls._reference_icon_cache = QIcon(pixmap)
+        return cls._reference_icon_cache
 
     def __init__(self, chapter: ChapterDocument | None = None, parent=None):
         super().__init__(parent)
@@ -56,12 +76,6 @@ class HierarchyModel(QAbstractItemModel):
             object_item = TreeItem("object", object_id, parent)
             self._items[("object", object_id)] = object_item
             parent.children.append(object_item)
-            obj = self.chapter.objects[object_id]
-            if isinstance(obj, VectorDrawingObject):
-                for fill in self.chapter.vector_fill_children(obj.object_id):
-                    fill_item = TreeItem("object", fill.object_id, object_item)
-                    self._items[("object", fill.object_id)] = fill_item
-                    object_item.children.append(fill_item)
             return object_item
 
         def build_layer(layer_id: str, parent: TreeItem) -> TreeItem:
@@ -151,8 +165,6 @@ class HierarchyModel(QAbstractItemModel):
                 return entity.name
             if index.column() == 1:
                 if item.kind == "layer":
-                    if entity.layer_kind == "fill":
-                        return "Fill Layer"
                     if entity.layer_kind == "open_shape":
                         return "Open Shape"
                     primitive = {
@@ -163,8 +175,6 @@ class HierarchyModel(QAbstractItemModel):
                     return "Page" if entity.is_page else f"{primitive} Layer"
                 if isinstance(entity, VectorDrawingObject):
                     return "Vector Drawing"
-                if isinstance(entity, VectorFillObject):
-                    return "Vector Fill"
                 if isinstance(entity, GradientObject):
                     if isinstance(entity, SpeedLinesGradientObject):
                         return "Speed Lines"
@@ -173,19 +183,26 @@ class HierarchyModel(QAbstractItemModel):
                     return "Blender Comic View"
                 return entity.object_type.title()
             if index.column() == 2:
-                return f"{round(entity.opacity * 100)}%"
+                suffix = (
+                    " - Mask only"
+                    if bool(getattr(entity, "mask_only", False))
+                    else ""
+                )
+                return f"{round(entity.opacity * 100)}%{suffix}"
+        if (
+            role == Qt.DecorationRole and index.column() == 0
+            and entity.fill_reference
+        ):
+            return self._reference_icon()
         if role == Qt.CheckStateRole and index.column() == 0:
             return Qt.Checked if entity.visible else Qt.Unchecked
         if role == Qt.ToolTipRole:
+            if entity.fill_reference:
+                return "Reference layer source for Fill tools."
             if item.kind == "layer":
                 return "Drag to reorder or nest. Page layers remain at the root."
-            if isinstance(entity, VectorFillObject):
-                return "Drag to reorder this fill within its Vector Drawing."
             if isinstance(entity, VectorDrawingObject):
-                return (
-                    "Editable vector strokes. Its Vector Fill objects are "
-                    "ordered beneath it."
-                )
+                return "Editable vector strokes."
             return "Drag objects between page or container layers."
         if role == Qt.BackgroundRole:
             if (item.kind, item.entity_id) in self.mask_highlights:
@@ -324,7 +341,7 @@ class HierarchyModel(QAbstractItemModel):
             if item.kind != "layer":
                 return False
             parent_layer = self.chapter.layers.get(item.entity_id)
-            if parent_layer is None or parent_layer.layer_kind == "fill":
+            if parent_layer is None:
                 return False
             return all(
                 kind == "object" and isinstance(
@@ -335,20 +352,11 @@ class HierarchyModel(QAbstractItemModel):
             )
         payload = {"kind": entities[0][0], "id": entities[0][1]}
         if item.kind == "object":
-            parent_object = self.chapter.objects.get(item.entity_id)
-            moving_object = self.chapter.objects.get(payload["id"])
-            return (
-                payload["kind"] == "object"
-                and isinstance(parent_object, VectorDrawingObject)
-                and isinstance(moving_object, VectorFillObject)
-                and moving_object.owner_drawing_id == parent_object.object_id
-            )
+            return False
         moving_object = (
             self.chapter.objects.get(payload["id"])
             if payload["kind"] == "object" else None
         )
-        if isinstance(moving_object, VectorFillObject):
-            return False
         if (
             item.kind == "layer"
             and self.chapter.layers[item.entity_id].layer_kind

@@ -13,6 +13,7 @@ from .models import (
     ChapterDocument, ChapterReference, ImageObject, RasterObject, SeriesDocument,
 )
 from .images import ImageStore
+from .fill_migration import materialize_legacy_fills
 from .tiles import TileStore
 
 
@@ -253,6 +254,7 @@ class SeriesRepository:
         tiles.load_directory(
             source / "masks", set(chapter.masks), clear=False
         )
+        materialize_legacy_fills(chapter, tiles)
         images = ImageStore()
         images.load_directory(source / "images", {
             object_id: (obj.source_filename, obj.source_mime_type)

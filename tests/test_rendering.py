@@ -5,7 +5,7 @@ from PySide6.QtGui import QColor, QImage, QPainter
 
 from comic_editor.core.models import (
     BoundGeometry, ChapterDocument, RasterObject, VectorDrawingObject,
-    VectorFillObject, VectorStroke, VectorStrokePoint,
+    VectorStroke, VectorStrokePoint,
 )
 from comic_editor.core.settings import EditorSettings
 from comic_editor.core.tiles import TileStore
@@ -184,7 +184,7 @@ def test_selected_raster_underlay_is_live_only_and_bypasses_shape_mask(qapp):
     assert exported.pixelColor(225, 100).lightness() > 220
 
 
-def test_vector_underlay_includes_owned_fills_and_stays_out_of_preview(qapp):
+def test_vector_underlay_shows_selected_strokes_outside_parent_mask(qapp):
     chapter = ChapterDocument(height=320)
     page = chapter.add_page(
         bound=BoundGeometry.rectangle(0, 0, 300, 300)
@@ -206,13 +206,6 @@ def test_vector_underlay_includes_owned_fills_and_stays_out_of_preview(qapp):
         ]),
     )
     drawing.underlay_opacity = 1.0
-    chapter.add_vector_fill(
-        drawing.object_id,
-        VectorFillObject(
-            fill_color="#FFFF0000",
-            geometry=BoundGeometry.circle(210, 150, 25),
-        ),
-    )
     canvas = CanvasWidget(EditorSettings())
     canvas.set_document(chapter, TileStore())
     canvas.set_selection("object", drawing.object_id)
@@ -231,12 +224,10 @@ def test_vector_underlay_includes_owned_fills_and_stays_out_of_preview(qapp):
     canvas._render_selected_drawing_underlay(painter, document_rect)
     canvas._clear_live_underlay_context()
     painter.end()
-    assert live.pixelColor(210, 150).red() > 220
     assert live.pixelColor(210, 100).lightness() < 80
 
     preview = QImage(
         chapter.width, chapter.height, QImage.Format_ARGB32_Premultiplied
     )
     canvas.render_preview(preview)
-    assert preview.pixelColor(210, 150).lightness() > 220
     assert preview.pixelColor(210, 100).lightness() > 220

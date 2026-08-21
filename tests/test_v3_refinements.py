@@ -31,21 +31,9 @@ def _document_canvas(settings: EditorSettings | None = None):
     return canvas, chapter, page, layer
 
 
-def test_fill_layer_is_a_boundless_leaf_and_round_trips():
+def test_fill_layer_creation_api_is_removed():
     chapter = ChapterDocument()
-    page = chapter.add_page()
-    layer = chapter.add_layer(page.layer_id)
-    fill = chapter.add_fill_layer(layer.layer_id, "Backdrop", "#ff0080")
-    chapter.validate()
-    loaded = ChapterDocument.from_dict(chapter.to_dict())
-    migrated = loaded.layers[fill.layer_id]
-    assert migrated.layer_kind == "fill"
-    assert migrated.bound is None
-    assert migrated.fill_color == "#ff0080"
-    with pytest.raises(ValueError, match="cannot contain"):
-        loaded.add_layer(fill.layer_id)
-    with pytest.raises(ValueError, match="container"):
-        loaded.add_object(fill.layer_id, RasterObject())
+    assert not hasattr(chapter, "add_fill_layer")
 
 
 def test_layer_fill_border_and_radius_affect_actual_rendering(qapp):

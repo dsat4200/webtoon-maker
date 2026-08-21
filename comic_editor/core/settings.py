@@ -15,6 +15,7 @@ def default_hotkeys() -> dict[str, str]:
         "raster_pencil": "P",
         "raster_eraser": "E",
         "fill": "F",
+        "gradient": "G",
         "object_select": "S",
         "transform": "T",
         "eyedropper": "I",
@@ -43,6 +44,7 @@ def default_hotkey_hold() -> dict[str, bool]:
         "raster_pencil": False,
         "raster_eraser": False,
         "fill": False,
+        "gradient": False,
         "object_select": False,
         "transform": False,
         "eyedropper": True,
@@ -100,9 +102,71 @@ def default_text_presets() -> list[dict]:
     return [TextPreset().to_dict()]
 
 
+FILL_SUBTOOLS = (
+    "editing_layer", "other_layers", "enclose_fill", "lasso_fill",
+    "leftover_pen",
+)
+
+FILL_BLEND_MODES = (
+    "normal", "darken", "multiply", "color_burn", "linear_burn",
+    "subtract", "darker_color", "lighten", "screen", "color_dodge",
+    "glow_dodge", "add", "add_glow", "lighter_color", "overlay",
+    "soft_light", "hard_light", "difference", "vivid_light",
+    "linear_light", "pin_light", "hard_mix", "exclusion", "hue",
+    "saturation", "color", "luminosity", "divide", "burn",
+    "black_burn", "white_burn", "erase", "erase_compare",
+    "compare_density", "background", "replace_alpha",
+)
+
+
+def default_fill_profile(
+    subtool: str = "editing_layer",
+) -> dict[str, object]:
+    reference_mode = (
+        "editing" if subtool == "editing_layer" else "all_visible"
+    )
+    return {
+        "subtool": subtool,
+        "opacity": 100,
+        "connected_pixels_only": subtool not in {"enclose_fill", "lasso_fill"},
+        "fill_closed_area": True,
+        "tolerance": 16,
+        "close_gap": True,
+        "gap_threshold": 8,
+        "fill_narrow_areas": True,
+        "area_scaling": False,
+        "area_amount": 0,
+        "area_mode": "round",
+        "border_reference": False,
+        "antialiasing": True,
+        "reference_mode": reference_mode,
+        "exclude_editing_target": subtool != "editing_layer",
+        "exclude_page_background": True,
+        "exclude_images": False,
+        "exclude_gradients": False,
+        "exclude_mask_only": True,
+        "fill_up_to_vector_path": True,
+        "include_vector_path": False,
+        "do_not_start_color": "",
+        "magnetic_lasso_strength": 50,
+        "lasso_input": "freehand",
+        "multiple_input": False,
+        "vector_path_snapping": True,
+        "sharp_angles": True,
+        "stabilization": 10,
+        "speed_adjustment": 0,
+        "post_correction": 0,
+        "blend_mode": "normal",
+    }
+
+
+def default_fill_profiles() -> dict[str, dict[str, object]]:
+    return {name: default_fill_profile(name) for name in FILL_SUBTOOLS}
+
+
 @dataclass
 class EditorSettings:
-    settings_version: int = 18
+    settings_version: int = 20
     tablet_mode: bool = False
     brush_size: int = 12
     eraser_size: int = 28
@@ -153,6 +217,10 @@ class EditorSettings:
     fill_area_mode: str = "round"
     fill_mode: str = "normal"
     raster_fill_tolerance: int = 16
+    active_fill_subtool: str = "editing_layer"
+    fill_profiles: dict[str, dict[str, object]] = field(
+        default_factory=default_fill_profiles
+    )
     mask_pencil_pressure_sensitive: bool = True
     mask_pencil_from_alpha: float = 0.0
     mask_pencil_to_alpha: float = 1.0
@@ -170,7 +238,7 @@ class EditorSettings:
         self.clamp()
 
     def clamp(self) -> None:
-        self.settings_version = 18
+        self.settings_version = 20
         self.blender_bridge_host = str(
             self.blender_bridge_host or "127.0.0.1"
         ).strip()
@@ -342,6 +410,74 @@ class EditorSettings:
         self.raster_fill_tolerance = max(
             0, min(255, int(self.raster_fill_tolerance))
         )
+        if self.active_fill_subtool not in FILL_SUBTOOLS:
+            self.active_fill_subtool = "editing_layer"
+        supplied_profiles = (
+            self.fill_profiles if isinstance(self.fill_profiles, dict) else {}
+        )
+        normalized_profiles: dict[str, dict[str, object]] = {}
+        for name in FILL_SUBTOOLS:
+            profile = default_fill_profile(name)
+            supplied_profile = supplied_profiles.get(name)
+            if isinstance(supplied_profile, dict):
+                profile.update({
+                    key: value for key, value in supplied_profile.items()
+                    if key in profile
+                })
+            profile["subtool"] = name
+            profile["opacity"] = max(0, min(100, int(profile["opacity"])))
+            profile["tolerance"] = max(0, min(255, int(profile["tolerance"])))
+            profile["gap_threshold"] = max(
+                0, min(16, round(float(profile["gap_threshold"])))
+            )
+            profile["area_amount"] = max(
+                -64, min(64, round(float(profile["area_amount"])))
+            )
+            if profile["area_mode"] not in {
+                "round", "rectangle", "darkest_pixel",
+            }:
+                profile["area_mode"] = "round"
+            if profile["reference_mode"] not in {
+                "editing", "all_visible", "reference", "selected",
+                "current_folder",
+            }:
+                profile["reference_mode"] = "editing"
+            if profile["lasso_input"] not in {
+                "freehand", "polyline", "combined",
+            }:
+                profile["lasso_input"] = "freehand"
+            if profile["blend_mode"] not in FILL_BLEND_MODES:
+                profile["blend_mode"] = "normal"
+            for key in (
+                "magnetic_lasso_strength", "stabilization",
+                "post_correction",
+            ):
+                profile[key] = max(0, min(100, int(profile[key])))
+            profile["speed_adjustment"] = max(
+                -100, min(100, int(profile["speed_adjustment"]))
+            )
+            for key in (
+                "connected_pixels_only", "fill_closed_area", "close_gap",
+                "fill_narrow_areas", "area_scaling", "border_reference",
+                "antialiasing", "exclude_editing_target",
+                "exclude_page_background", "exclude_images",
+                "exclude_gradients", "exclude_mask_only",
+                "fill_up_to_vector_path", "include_vector_path",
+                "multiple_input", "vector_path_snapping", "sharp_angles",
+            ):
+                profile[key] = bool(profile[key])
+            normalized_profiles[name] = profile
+        self.fill_profiles = normalized_profiles
+        active = self.fill_profiles[self.active_fill_subtool]
+        # Keep legacy fields synchronized for integrations that have not yet
+        # moved to named subtool profiles.
+        self.fill_close_gaps = bool(active["close_gap"])
+        self.fill_gap_threshold = float(active["gap_threshold"])
+        self.fill_narrow_areas = bool(active["fill_narrow_areas"])
+        self.fill_area_scaling = bool(active["area_scaling"])
+        self.fill_area_amount = float(active["area_amount"])
+        self.fill_area_mode = str(active["area_mode"])
+        self.raster_fill_tolerance = int(active["tolerance"])
         self.mask_pencil_pressure_sensitive = bool(
             self.mask_pencil_pressure_sensitive
         )
@@ -367,6 +503,9 @@ class EditorSettings:
 
     def active_eraser_pixels(self) -> int:
         return self.eraser_size_px[self.active_eraser_size]
+
+    def active_fill_profile(self) -> dict[str, object]:
+        return self.fill_profiles[self.active_fill_subtool]
 
 
 def settings_path() -> Path:
@@ -461,13 +600,48 @@ def load_settings() -> EditorSettings:
                 raw.setdefault("mask_pencil_pressure_sensitive", True)
                 raw.setdefault("mask_pencil_from_alpha", 0.0)
                 raw.setdefault("mask_pencil_to_alpha", 1.0)
+            if int(raw.get("settings_version", 1)) < 19:
+                profiles = default_fill_profiles()
+                for profile in profiles.values():
+                    profile.update({
+                        "close_gap": bool(raw.get("fill_close_gaps", True)),
+                        "gap_threshold": float(
+                            raw.get("fill_gap_threshold", 8.0)
+                        ),
+                        "fill_narrow_areas": bool(
+                            raw.get("fill_narrow_areas", True)
+                        ),
+                        "area_scaling": bool(
+                            raw.get("fill_area_scaling", False)
+                        ),
+                        "area_amount": float(
+                            raw.get("fill_area_amount", 0.0)
+                        ),
+                        "area_mode": str(raw.get("fill_area_mode", "round")),
+                        "tolerance": int(
+                            raw.get("raster_fill_tolerance", 16)
+                        ),
+                    })
+                raw.setdefault("active_fill_subtool", "editing_layer")
+                raw.setdefault("fill_profiles", profiles)
+            if int(raw.get("settings_version", 1)) < 20:
+                supplied = raw.get("fill_profiles")
+                if isinstance(supplied, dict):
+                    for profile in supplied.values():
+                        if not isinstance(profile, dict):
+                            continue
+                        for obsolete in (
+                            "color_source", "specified_color",
+                            "target_color_mode", "exclude_text",
+                        ):
+                            profile.pop(obsolete, None)
             raw.pop("transform_snap_to_grid", None)
             stored_presets = raw.get("text_presets")
             if isinstance(stored_presets, list):
                 for preset in stored_presets:
                     if isinstance(preset, dict):
                         preset.pop("transform_snap", None)
-            raw["settings_version"] = 18
+            raw["settings_version"] = 20
             valid = {item.name for item in dataclasses.fields(EditorSettings)}
             result = EditorSettings(**{
                 key: value for key, value in raw.items() if key in valid

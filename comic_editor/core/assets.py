@@ -17,11 +17,12 @@ from .models import (
     DocumentObject, EmbeddedImageSourceDescriptor, GradientObject, ImageObject,
     LayerNode, RasterObject, ShapeStyle,
     SpeedLineCenterObject, SpeedLinesGradientObject, TextObject,
-    ToneMask, VectorDrawingObject, VectorFillObject, modifier_from_dict, new_id,
+    ToneMask, VectorDrawingObject, modifier_from_dict, new_id,
     object_from_dict,
 )
 from .images import ImageStore
 from .persistence import atomic_json
+from .fill_migration import materialize_legacy_fills
 from .tiles import TileStore
 
 
@@ -382,12 +383,6 @@ def _object_local_bounds(obj: DocumentObject, document: ChapterDocument,
         padding = max((point.width for stroke in obj.strokes for point in stroke.points), default=1.0) / 2
         return QRectF(obj.x + left - padding, obj.y + top - padding,
                       max(1.0, width + padding * 2), max(1.0, height + padding * 2))
-    if isinstance(obj, VectorFillObject):
-        left, top, width, height = obj.derived_bounds()
-        owner = document.objects.get(obj.owner_drawing_id)
-        ox = owner.x if isinstance(owner, VectorDrawingObject) else 0.0
-        oy = owner.y if isinstance(owner, VectorDrawingObject) else 0.0
-        return QRectF(ox + left, oy + top, max(1.0, width), max(1.0, height))
     if isinstance(obj, GradientObject):
         parent = document.layers.get(obj.parent_layer_id)
         if parent and parent.bound is not None:
@@ -405,27 +400,12 @@ def entity_visual_bounds(document: ChapterDocument, tiles: TileStore,
             _layer_world_transform(document, obj.parent_layer_id),
             _object_local_bounds(obj, document, tiles),
         )
-        if isinstance(obj, VectorDrawingObject):
-            for fill_id in obj.fill_child_ids:
-                if fill_id in document.objects:
-                    result = result.united(entity_visual_bounds(
-                        document, tiles, "object", fill_id
-                    ))
         return result
 
     layer = document.layers[entity_id]
     world_transform = _layer_world_transform(document, entity_id)
     result = QRectF()
     found = False
-    if layer.layer_kind == "fill" and layer.parent_id:
-        parent = document.layers.get(layer.parent_id)
-        if parent is not None and parent.bound is not None:
-            left, top, width, height = parent.bound.bbox()
-            result = _mapped_rect(
-                _layer_world_transform(document, parent.layer_id),
-                QRectF(left, top, max(1.0, width), max(1.0, height)),
-            )
-            found = True
     if layer.bound is not None:
         left, top, width, height = layer.bound.bbox()
         padding = layer.shape_style.outline_thickness
@@ -462,9 +442,6 @@ def _collect_subtree(document: ChapterDocument, kind: str,
             return
         objects.add(object_id)
         obj = document.objects[object_id]
-        if isinstance(obj, VectorDrawingObject):
-            for fill_id in obj.fill_child_ids:
-                add_object(fill_id)
         if isinstance(obj, SpeedLinesGradientObject) and obj.center_shape_id:
             add_object(obj.center_shape_id)
 
@@ -579,8 +556,6 @@ def extract_asset(
         (SpeedLinesGradientObject, SpeedLineCenterObject),
     ):
         raise ValueError("Speed Lines are no longer supported")
-    if kind == "object" and isinstance(document.objects.get(entity_id), VectorFillObject):
-        entity_id = document.objects[entity_id].owner_drawing_id
     if kind not in {"layer", "object"}:
         raise ValueError("Only layers and objects can be copied as assets")
     if kind == "layer" and entity_id not in document.layers:
@@ -634,9 +609,6 @@ def extract_asset(
         )
         root.parent_layer_id = container.layer_id
         _map_object_parent_coordinates(root, source_parent_world.map, asset)
-        if isinstance(root, VectorDrawingObject):
-            for fill_id in root.fill_child_ids:
-                asset.objects[fill_id].parent_layer_id = container.layer_id
         if isinstance(root, SpeedLinesGradientObject) and root.center_shape_id:
             asset.objects[root.center_shape_id].parent_layer_id = container.layer_id
     container.children = [ChildRef(kind, entity_id)]
@@ -702,8 +674,6 @@ def _renew_internal_ids(layer: LayerNode | None, obj: DocumentObject | None) -> 
             stroke.stroke_id = new_id()
             for point in stroke.points:
                 point.point_id = new_id()
-    if isinstance(obj, VectorFillObject):
-        _renew_bound_ids(obj.geometry)
     if isinstance(obj, GradientObject):
         _renew_bound_ids(obj.line_field.geometry)
         for attribute in ("ramp", "color_ramp", "thickness_ramp"):
@@ -731,7 +701,7 @@ def instantiate_asset(
     if isinstance(root_entity, (SpeedLinesGradientObject, SpeedLineCenterObject)):
         raise ValueError("Speed Lines are no longer supported")
     parent = target.layers.get(parent_id)
-    if parent is None or parent.layer_kind == "fill":
+    if parent is None:
         raise ValueError("Asset destination must be a container layer")
     source = manifest.document
     layer_ids, object_ids = _collect_subtree(source, manifest.root_kind, manifest.root_id)
@@ -757,10 +727,6 @@ def instantiate_asset(
         obj = _copy_object(source.objects[old_id])
         obj.object_id = object_map[old_id]
         obj.parent_layer_id = layer_map.get(obj.parent_layer_id, parent_id)
-        if isinstance(obj, VectorDrawingObject):
-            obj.fill_child_ids = [object_map[item] for item in obj.fill_child_ids]
-        if isinstance(obj, VectorFillObject):
-            obj.owner_drawing_id = object_map[obj.owner_drawing_id]
         if isinstance(obj, SpeedLinesGradientObject) and obj.center_shape_id:
             obj.center_shape_id = object_map[obj.center_shape_id]
         if isinstance(obj, SpeedLineCenterObject):
@@ -1162,6 +1128,7 @@ class AssetRepository:
         tiles.load_directory(
             source / "masks", set(manifest.document.masks), clear=False
         )
+        materialize_legacy_fills(manifest.document, tiles)
         images = ImageStore()
         images.load_directory(source / "images", {
             object_id: (obj.source_filename, obj.source_mime_type)

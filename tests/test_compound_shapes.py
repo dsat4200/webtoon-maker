@@ -56,7 +56,7 @@ def test_compound_fields_and_multiple_contours_round_trip():
     loaded = ChapterDocument.from_dict(chapter.to_dict())
 
     restored = loaded.layers[layer.layer_id]
-    assert loaded.schema_version == 18
+    assert loaded.schema_version == 20
     assert restored.compound_enabled
     assert restored.compound_operation == "subtract"
     assert len(restored.bound.additional_contours) == 1
@@ -265,7 +265,8 @@ def test_compound_selection_and_creation_placement(qapp):
         # Stay clear of the selected compound's explicit center pivot.
         canvas.document_to_widget(QPointF(300, 220)), 1
     )
-    assert canvas.selected_id == child.layer_id
+    assert canvas.selected_id == root.layer_id
+    assert canvas._active_shape_control == "translate"
 
 
 def test_additional_contour_nodes_are_shape_editable(qapp):

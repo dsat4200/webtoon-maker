@@ -9,7 +9,7 @@ from PySide6.QtWidgets import (
 )
 
 from comic_editor.core.models import (
-    ImageObject, RasterObject, TextObject, VectorDrawingObject, VectorFillObject,
+    ImageObject, RasterObject, TextObject, VectorDrawingObject,
 )
 from comic_editor.ui.layer_settings import LayerSettingsPanel
 from comic_editor.ui.tool_ribbon_pages import RasterObjectControls
@@ -121,7 +121,6 @@ class SelectionCommonControls(QWidget):
         maskable = (
             enabled
             and not bool(getattr(target, "is_page", False))
-            and getattr(target, "layer_kind", "bounded") != "fill"
         )
         self.opacity_mask_button.setVisible(maskable)
         self.opacity_mask_button.setChecked(binding is not None)
@@ -164,7 +163,6 @@ class SelectionCommonControls(QWidget):
         target = self._selected()
         if (
             target is None or bool(getattr(target, "is_page", False))
-            or getattr(target, "layer_kind", "bounded") == "fill"
         ):
             return None
         if self.canvas.selected_kind == "object":
@@ -373,9 +371,7 @@ class VectorObjectSettings(QWidget):
         ):
             return None
         target = self.canvas.chapter.objects.get(self.canvas.selected_id)
-        return target if isinstance(
-            target, (VectorDrawingObject, VectorFillObject)
-        ) else None
+        return target if isinstance(target, VectorDrawingObject) else None
 
     def refresh(self) -> None:
         target = self._selected()
@@ -706,7 +702,7 @@ class SelectionSettingsPanel(QWidget):
         elif isinstance(target, ImageObject):
             self.image_controls.refresh()
             self.stack.setCurrentWidget(self.image_page)
-        elif isinstance(target, (VectorDrawingObject, VectorFillObject)):
+        elif isinstance(target, VectorDrawingObject):
             self.vector_controls.refresh()
             self.stack.setCurrentWidget(self.vector_page)
         else:
