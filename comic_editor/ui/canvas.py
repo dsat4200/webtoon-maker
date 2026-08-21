@@ -8448,6 +8448,7 @@ class _CanvasLogic:
             ToolKind.DRAW_SELECT_RECT,
             ToolKind.DRAW_SELECT_LASSO,
             ToolKind.DRAW_SELECT_STROKE,
+            ToolKind.DRAW_SHAPE,
             ToolKind.FILL,
         }:
             self._draw_drawing_selection(painter)
@@ -13936,13 +13937,28 @@ class _CanvasLogic:
             return True
         polygon = QPolygonF(gesture)
         polygon.append(gesture[0])
-        region = QPainterPath()
-        region.addPolygon(polygon)
-        region.closeSubpath()
+        new_path = QPainterPath()
+        new_path.addPolygon(polygon)
+        new_path.closeSubpath()
+        op = getattr(self, "_drawing_selection_operation", "replace")
+        base = QPainterPath(self._drawing_selection_path)
+        if base.isEmpty() or op == "replace":
+            region = new_path
+        elif op == "add":
+            region = base.united(new_path)
+        else:
+            region = base.subtracted(new_path)
+        region = region.simplified()
         if region.isEmpty():
             self._clear_drawing_selection()
             self.update()
             return True
+        polys = region.toFillPolygons()
+        if polys:
+            outline = max(polys, key=lambda p: abs(QPolygonF(p).boundingRect().width() * QPolygonF(p).boundingRect().height()))
+            outline_poly = QPolygonF(outline)
+        else:
+            outline_poly = polygon
         world_rect = region.boundingRect()
         if self.chapter is None:
             self._clear_drawing_selection()
@@ -13961,14 +13977,42 @@ class _CanvasLogic:
             simplify_tolerance = float(getattr(self.settings, "draw_shape_simplify", 2.0))
         except Exception:
             simplify_tolerance = 2.0
-        nodes = []
-        poly_points = polygon.toList() if hasattr(polygon, "toList") else list(polygon)
-        step = max(1, int(len(poly_points) / 50))
-        sampled = poly_points[::step]
-        # simple Douglas-Peucker style reduction via tolerance
-        for pt in sampled:
-            if not nodes or math.hypot(pt.x() - nodes[-1].x, pt.y() - nodes[-1].y) > simplify_tolerance:
-                nodes.append(PathNode(x=float(pt.x()), y=float(pt.y())))
+        pts = [QPointF(p) for p in outline_poly]
+        if len(pts) > 1 and pts[0] == pts[-1]:
+            pts = pts[:-1]
+        def _perp_dist(pt, a, b):
+            if a == b:
+                return math.hypot(pt.x() - a.x(), pt.y() - a.y())
+            dx = b.x() - a.x()
+            dy = b.y() - a.y()
+            t = ((pt.x() - a.x()) * dx + (pt.y() - a.y()) * dy) / (dx * dx + dy * dy)
+            t = max(0.0, min(1.0, t))
+            proj = QPointF(a.x() + t * dx, a.y() + t * dy)
+            return math.hypot(pt.x() - proj.x(), pt.y() - proj.y())
+        def _dp(points, eps):
+            if len(points) <= 2:
+                return points[:]
+            a, b = points[0], points[-1]
+            max_d = -1.0
+            idx = -1
+            for i in range(1, len(points) - 1):
+                d = _perp_dist(points[i], a, b)
+                if d > max_d:
+                    max_d = d
+                    idx = i
+            if max_d > eps:
+                left = _dp(points[: idx + 1], eps)
+                right = _dp(points[idx:], eps)
+                return left[:-1] + right
+            return [a, b]
+        max_pts = 400
+        if len(pts) > max_pts:
+            step = max(1, len(pts) // max_pts)
+            pts = pts[::step]
+        simplified = _dp(pts, simplify_tolerance) if len(pts) > 2 else pts[:]
+        if len(simplified) > 250:
+            simplified = simplified[:: max(1, len(simplified) // 250)]
+        nodes = [PathNode(x=float(p.x()), y=float(p.y())) for p in simplified]
         if len(nodes) < 3:
             nodes = [PathNode(x=float(p.x()), y=float(p.y())) for p in [QPointF(x, y), QPointF(x + w, y), QPointF(x + w, y + h), QPointF(x, y + h)]]
         before = self.chapter.to_dict()
@@ -16865,7 +16909,18 @@ class _CanvasLogic:
             ToolKind.DRAW_SELECT_RECT,
             ToolKind.DRAW_SELECT_LASSO,
             ToolKind.DRAW_SELECT_STROKE,
+            ToolKind.DRAW_SHAPE,
         }:
+            if self.tool == ToolKind.DRAW_SHAPE:
+                if self._selection_operation() == "replace" and not self._drawing_selection_path.isEmpty():
+                    mods = QApplication.keyboardModifiers()
+                    if not (mods & Qt.ShiftModifier or mods & Qt.AltModifier or mods & Qt.ControlModifier):
+                        before = self._selection_snapshot()
+                        self._drawing_selection_path = QPainterPath()
+                        after = self._selection_snapshot()
+                        self._push_selection_undo(before, after)
+                self._begin_drawing_selection(point, widget_point, test_transform=False)
+                return
             drawing = self._drawing_selection_object()
             if (
                 drawing is not None
@@ -17361,8 +17416,9 @@ class _CanvasLogic:
             ToolKind.DRAW_SELECT_RECT,
             ToolKind.DRAW_SELECT_LASSO,
             ToolKind.DRAW_SELECT_STROKE,
+            ToolKind.DRAW_SHAPE,
         }:
-            if self._pending_drawing_selection_press is not None:
+            if self.tool != ToolKind.DRAW_SHAPE and self._pending_drawing_selection_press is not None:
                 press_widget, press_document, _press_pressure = (
                     self._pending_drawing_selection_press
                 )
@@ -17376,6 +17432,8 @@ class _CanvasLogic:
                     )
                     self._continue_drawing_selection(point, widget_point)
                 return
+            if self.tool == ToolKind.DRAW_SHAPE and self._pending_drawing_selection_press is not None:
+                self._pending_drawing_selection_press = None
             self._continue_drawing_selection(point, widget_point)
             return
         if self._vector_gesture_mode is not None:
@@ -17563,13 +17621,18 @@ class _CanvasLogic:
             ToolKind.DRAW_SELECT_RECT,
             ToolKind.DRAW_SELECT_LASSO,
             ToolKind.DRAW_SELECT_STROKE,
+            ToolKind.DRAW_SHAPE,
         }:
-            if self._pending_drawing_selection_press is not None:
+            if self.tool != ToolKind.DRAW_SHAPE and self._pending_drawing_selection_press is not None:
                 widget_point, point, _pressure = (
                     self._pending_drawing_selection_press
                 )
                 self._pending_drawing_selection_press = None
                 self._request_object_selection(point, widget_point)
+                self.interactionFinished.emit()
+                return
+            if self.tool == ToolKind.DRAW_SHAPE and self._pending_drawing_selection_press is not None:
+                self._pending_drawing_selection_press = None
                 self.interactionFinished.emit()
                 return
             self._finish_drawing_selection()

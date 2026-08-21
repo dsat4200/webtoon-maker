@@ -405,6 +405,7 @@ class MainWindow(QMainWindow):
             ("Draw Shape", "selective-tool", ToolKind.DRAW_SHAPE),
         ):
             option = self.shapes_category.addTool(label, icon_name)
+            option.setCheckable(True)
             option.clicked.connect(
                 lambda checked=False, selected=tool:
                 self._activate_tool(selected)
@@ -1253,6 +1254,7 @@ class MainWindow(QMainWindow):
             "toggle_grid": self._toggle_grid,
             "select_all": self.canvas.select_all,
             "delete_selected": self._delete_selected,
+            "clear_canvas": self._clear_canvas,
             "paste_image": self._paste_image,
         }
         self._hotkey_bindings = {
@@ -2888,6 +2890,64 @@ class MainWindow(QMainWindow):
         self.canvas.push_model_change(before, after, "Delete entity")
         self._after_structure("", "")
 
+    def _clear_canvas(self) -> None:
+        if self.chapter is None or self.canvas.chapter is None:
+            return
+        entities = list(self.canvas.selected_entities) if len(self.canvas.selected_entities) > 1 else ([(self.canvas.selected_kind, self.canvas.selected_id)] if self.canvas.selected_id else [])
+        if not entities:
+            return
+        targets: list[tuple[str, str, object]] = []
+        for kind, eid in entities:
+            if kind != "object" or eid not in self.chapter.objects:
+                continue
+            obj = self.chapter.objects[eid]
+            if isinstance(obj, (RasterObject, VectorDrawingObject)):
+                targets.append((kind, eid, obj))
+        if not targets:
+            return
+        before = self.chapter.to_dict()
+        before_tiles = {}
+        for _, eid, obj in targets:
+            if isinstance(obj, RasterObject):
+                before_tiles[eid] = self.canvas.tiles.object_tiles(eid)
+        after_tiles_state = {}
+        for _, eid, obj in targets:
+            if isinstance(obj, RasterObject):
+                self.canvas.tiles.remove_object(eid)
+            elif isinstance(obj, VectorDrawingObject):
+                if obj.strokes:
+                    obj.strokes = []
+                    obj.touch_revision()
+        after = self.chapter.to_dict()
+        def _undo():
+            self.chapter.__dict__.update(ChapterDocument.from_dict(before).__dict__)
+            for eid, tiles in before_tiles.items():
+                if tiles:
+                    self.canvas.tiles.replace_object_tiles(eid, tiles)
+                else:
+                    self.canvas.tiles.remove_object(eid)
+            self.hierarchy_model.rebuild()
+            self.canvas._invalidate_scene_cache()
+            self.canvas.documentChanged.emit(None)
+            self.canvas.update()
+        def _redo():
+            self.chapter.__dict__.update(ChapterDocument.from_dict(after).__dict__)
+            for eid in before_tiles:
+                self.canvas.tiles.remove_object(eid)
+            for _, eid, obj in targets:
+                cur = self.chapter.objects.get(eid)
+                if isinstance(cur, VectorDrawingObject):
+                    cur.strokes = []
+            self.hierarchy_model.rebuild()
+            self.canvas._invalidate_scene_cache()
+            self.canvas.documentChanged.emit(None)
+            self.canvas.update()
+        self.canvas.command_stack.push(CallbackCommand("Clear canvas", _redo, _undo), already_done=True)
+        self.hierarchy_model.rebuild()
+        self.canvas._invalidate_scene_cache()
+        self.canvas.documentChanged.emit(None)
+        self.canvas.update()
+
     def _after_structure(self, entity_id: str, kind: str) -> None:
         self._refresh_hierarchy()
         if entity_id:
@@ -3074,6 +3134,10 @@ class MainWindow(QMainWindow):
                     tool != ToolKind.DRAW_SELECT_STROKE or vector_selected
                 )
             )
+            button.blockSignals(True)
+            button.setChecked(self.canvas.tool == tool)
+            button.blockSignals(False)
+        for tool, button in self.shape_tool_buttons.items():
             button.blockSignals(True)
             button.setChecked(self.canvas.tool == tool)
             button.blockSignals(False)

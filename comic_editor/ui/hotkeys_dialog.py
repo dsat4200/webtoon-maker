@@ -34,6 +34,7 @@ LABELS = {
     "toggle_grid": "Toggle Grid",
     "select_all": "Select All",
     "delete_selected": "Delete Selected",
+    "clear_canvas": "Clear Canvas",
     "paste_image": "Paste Image",
 }
 

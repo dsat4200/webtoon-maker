@@ -149,7 +149,7 @@ class ModifierCard(QFrame):
             form.addWidget(mode_row)
         elif isinstance(modifier, OutlineModifier):
             form.addWidget(self._slider_row(
-                "Thickness", 0, 100, round(modifier.thickness),
+                "Thickness", 0, 25, round(modifier.thickness),
                 "thickness", " px",
             ))
             form.addWidget(self._slider_row(

@@ -1,46 +1,20 @@
 
-- [x] make it possible to select objects of any type for select multiple, for basic functionality support like multi delete, hide, lock, among other object operations
-	- notably, multi selection hides the mask buttons on the object operations row (what i'm naming the row that has the trash, eye, lock, opacity, mask, opacity slider, and show as mask only ui elements)
-- [x] in mask mode, show a "remove mask" button next to the exit mask mode button.
-- [x] the "show only as mask" toggle button should additionally exist to the right of the opacity value on each object's row in the outliner.
-- [x] add a "draw shape" option to the create shape menu, that aon actions.
-- [x] opening a project should open the most recent chapter that was open.
-- [x] outline modifier should not contribute to a mask.
-- [x] backspace should be possible to select as a hotkey. add an x button to the left of a hotkey field in hotkey settings to clear (instead of using backspace to do that)
 
 
-
-
-- [ ] draw shape tool isn't doing anything. it should allow the user to lasso select (but with orange dotted line, preview fill instead of blue) to create a shape, like I mentioned before
-	- [ ] acts like a lasso tool during creation, but with orange instead of blue. the active selection becomes a panel when you hit finish. it should convert the outside of your filled selection into vector points for this, and have an outline by default. it should have the same layer settings in the layer settings window as any other shape.
-	- [ ] shift and alt still add and remove from your selection. however, just click dragging elsewhere while there is a selection deletes that selection, like it would in any other drawing program.
-- [ ] add "clear canvas" hotkey that while in either raster or vector, clears all points and/or pixels. should work in multi select if those are the two types selected. do not prompt for warning when doing this.
-- [ ] make the per-object eyeball icon into a full button with a background, that is grey when visible and light orange when toggled to be invisible.
-- [ ] show as mask only button should update whether it appears toggled or not based on the show as mask only state of the currently selected object.
-- [ ] outline modifier range is way too high. make the maximum like 25 percent as big as it is now.
-
-
-bugs
-- closing shapes still doesn't work.
-
-
-
-
-
-- review the fill tool
-
+## more bugs
+- sometimes drawing a shape draws like a line through the middle and doesn't close it fully.
 
 ## more tweaks
 - [ ] using vector tools and hitting apply while no vector points are selected should make them affect all vector points in the currently active vector object.
 - [ ] instead of having different modes for each parameter in vector tools, just show separate "redraw thickness" and "redraw opacity" UI elements stacked.
 - [ ] also, vector tools UI element groupings should be collapsable with a down arrow / carat icon thing in the top left.
+- [ ] holding to switch to eraser should only work while in pencil mode.
+- [ ] if a selection in lasso mode has already started (in either draw shape or lasso mode), and you hold shift, instead of continuing to draw the selection with each movement, it should act as though the last place you were before pressing shift was the last place you selected, and the current place you're drawing is the next one, and should act as if there's a straight line between those two (basically, hold shift during a lasso selection to select in a straight line). when releasing shift, selection should go back to normal. this only happens if you hold shift WHILE drawing already. if you hold shift before making another pen canvas press, it should add selection like normal (if applicable). 
+- [ ] show as mask only button should appear pressed if its enabled on the selected layer, unpressed if not (as in, with the blue outline and pressed background color)
 
-## image sync tweaks
-- render region box on screen
-- adjustment layer - allows transforms and modifiers simultaneously
-- includes uniform, free, etc
 
-## how to do thought balloons and screaming
+
+## thought balloons and screaming
 i still need to add border types for shapes, like round bubbly ones for thought balloons or pointy ones for screaming (or just have it be one with a sharpness value and sizing parameters... hmmm
 
 
@@ -53,9 +27,10 @@ psd brush support?
 - add brushes to tool settings ribbon (raster/vector pencil) (with preview of a small, curved stroke segment in a square live preview icon, from zero pressure to 100, swoop curve )
 - outside of shapes can be treated as a stroke that supports psd brushes?
 
+## review the fill tool
 
 
-Cage Transform
+## Cage Transform
 - https://help.clip-studio.com/en-us/manual_en/360_transform/Types_of_transformations.htm#1004087
 - just like mesh transformation from clip studio paint. make it a tool, and also make a modifier version with the same parameters
 - these are two different types
@@ -206,16 +181,10 @@ test the fill tool dumbass (vector and raster drawing)
 
 
 
-
-
-## Performance issues
-- pinch zoom is laggy
-- improve performance for vector drawin
-- sweep simplify is super laggy
-- transforming in stroke select mode is slow
-- shape gradient in reverse direction is very slow to update
-
-
+## image sync tweaks
+- render region box on screen
+- adjustment layer - allows transforms and modifiers simultaneously
+- includes uniform, free, etc
 
 
 what are the fill types / textures
@@ -235,6 +204,7 @@ what are the fill types / textures
 transformations
 - cage transform
 - puppet transform
+- distort with texture
 - [x] blur
 - smear
 - [x] hue, saturation, lightness

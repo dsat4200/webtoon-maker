@@ -450,20 +450,28 @@ class EyeVisibilityDelegate(QStyledItemDelegate):
         widget = option.widget
         style = widget.style() if widget is not None else QApplication.style()
         style.drawControl(QStyle.ControlElement.CE_ItemViewItem, opt, painter, widget)
+        r = option.rect
+        btn_rect = QRect(r.left() + 2, r.top() + 2, 24, r.height() - 4)
+        painter.save()
+        painter.setRenderHint(QPainter.Antialiasing, True)
+        bg = QColor("#3a3a42") if visible else QColor("#f2a23a")
+        painter.setPen(Qt.NoPen)
+        painter.setBrush(bg)
+        painter.drawRoundedRect(btn_rect, 4, 4)
+        painter.restore()
         icon = eye if visible else eye_closed
         pix = icon.pixmap(16, 16)
-        r = option.rect
-        ix = r.left() + 4
-        iy = r.top() + (r.height() - 16) // 2
+        ix = btn_rect.center().x() - 8
+        iy = btn_rect.center().y() - 8
         painter.drawPixmap(ix, iy, pix)
         display = index.data(Qt.DisplayRole)
         if display:
             ref = index.data(Qt.DecorationRole)
             has_ref = ref is not None
-            text_x = ix + 20 + (18 if has_ref else 0)
+            text_x = btn_rect.right() + 6 + (18 if has_ref else 0)
             if has_ref and hasattr(ref, "pixmap"):
                 rp = ref.pixmap(16, 16)
-                painter.drawPixmap(ix + 20, iy, rp)
+                painter.drawPixmap(btn_rect.right() + 6, iy, rp)
             painter.setPen(opt.palette.color(opt.palette.ColorRole.Text) if not (opt.state & QStyle.StateFlag.State_Selected) else opt.palette.color(opt.palette.ColorRole.HighlightedText))
             text_rect = r.adjusted(text_x - r.left(), 0, 0, 0)
             painter.drawText(text_rect, Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft, str(display))
@@ -473,11 +481,9 @@ class EyeVisibilityDelegate(QStyledItemDelegate):
             return super().editorEvent(event, model, option, index)
         if event.type() in (event.Type.MouseButtonRelease, event.Type.MouseButtonDblClick):
             r = option.rect
-            ix = r.left() + 4
-            iy = r.top() + (r.height() - 16) // 2
-            icon_rect = QRect(ix, iy, 16, 16)
+            btn_rect = QRect(r.left() + 2, r.top() + 2, 24, r.height() - 4)
             pos = event.position().toPoint() if hasattr(event, "position") else event.pos()
-            if icon_rect.contains(pos):
+            if btn_rect.contains(pos):
                 current = index.data(Qt.CheckStateRole)
                 new_state = Qt.Unchecked if current == Qt.Checked else Qt.Checked
                 return model.setData(index, new_state, Qt.CheckStateRole)

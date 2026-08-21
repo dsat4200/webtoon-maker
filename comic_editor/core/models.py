@@ -882,12 +882,12 @@ class OutlineModifier:
         if not all(math.isfinite(value) for value in values):
             raise ValueError("Outline modifier values must be finite")
         self.intensity = max(0.0, min(100.0, values[0]))
-        self.thickness = max(0.0, min(100.0, values[1]))
+        self.thickness = max(0.0, min(25.0, values[1]))
         self.opacity = max(0.0, min(100.0, values[2]))
         self.color = canonical_argb(self.color)
         _validate_parameter_masks(self.parameter_masks, {
             "intensity": (0.0, 100.0),
-            "thickness": (0.0, 100.0),
+            "thickness": (0.0, 25.0),
             "opacity": (0.0, 100.0),
         })
 

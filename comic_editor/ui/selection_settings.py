@@ -311,11 +311,16 @@ class SelectionCommonControls(QWidget):
         self.opacity_lock.setToolTip("Opacity locked — click to unlock" if locked else "Opacity unlocked — click to lock")
 
     def _update_mask_only_button(self, mask_only: bool, mixed: bool = False) -> None:
-        self.mask_only_button.setIcon(iconoir("mask-square"))
+        from comic_editor.ui.icons import iconoir_tinted
         if mixed:
+            self.mask_only_button.setIcon(iconoir_tinted("mask-square", "#a0a0a8", 20))
             self.mask_only_button.setToolTip("Mixed mask only — click to enable for all")
+        elif mask_only:
+            self.mask_only_button.setIcon(iconoir_tinted("mask-square", "#f2a23a", 20))
+            self.mask_only_button.setToolTip("Shown as mask only — click to show normally")
         else:
-            self.mask_only_button.setToolTip("Shown as mask only — click to show normally" if mask_only else "Show as mask only — click to hide visually and show only in masks")
+            self.mask_only_button.setIcon(iconoir_tinted("mask-square", "#5A5A62", 20))
+            self.mask_only_button.setToolTip("Show as mask only — click to hide visually and show only in masks")
 
     def _delete_selected(self) -> None:
         chapter = self.canvas.chapter

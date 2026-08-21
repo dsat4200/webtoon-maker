@@ -35,6 +35,7 @@ def default_hotkeys() -> dict[str, str]:
         "reset_rotation": "Ctrl+Shift+0",
         "toggle_grid": "Alt+G",
         "delete_selected": "Delete",
+        "clear_canvas": "Backspace",
         "paste_image": "Ctrl+V",
     }
 

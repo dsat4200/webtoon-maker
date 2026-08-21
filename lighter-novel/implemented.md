@@ -1,3 +1,24 @@
+- [x] make it possible to select objects of any type for select multiple, for basic functionality support like multi delete, hide, lock, among other object operations
+	- notably, multi selection hides the mask buttons on the object operations row (what i'm naming the row that has the trash, eye, lock, opacity, mask, opacity slider, and show as mask only ui elements)
+- [x] in mask mode, show a "remove mask" button next to the exit mask mode button.
+- [x] the "show only as mask" toggle button should additionally exist to the right of the opacity value on each object's row in the outliner.
+- [x] add a "draw shape" option to the create shape menu, that aon actions.
+- [x] opening a project should open the most recent chapter that was open.
+- [x] outline modifier should not contribute to a mask.
+- [x] backspace should be possible to select as a hotkey. add an x button to the left of a hotkey field in hotkey settings to clear (instead of using backspace to do that)
+
+
+
+
+- [x] draw shape tool isn't doing anything. it should allow the user to lasso select (but with orange dotted line, preview fill instead of blue) to create a shape, like I mentioned before
+	- [x] acts like a lasso tool during creation, but with orange instead of blue. the active selection becomes a panel when you hit finish. it should convert the outside of your filled selection into vector points for this, and have an outline by default. it should have the same layer settings in the layer settings window as any other shape.
+	- [x] shift and alt still add and remove from your selection. however, just click dragging elsewhere while there is a selection deletes that selection, like it would in any other drawing program.
+- [x] add "clear canvas" hotkey that while in either raster or vector, clears all points and/or pixels. should work in multi select if those are the two types selected. do not prompt for warning when doing this.
+- [x] make the per-object eyeball icon into a full button with a background, that is grey when visible and light orange when toggled to be invisible.
+- [x] show as mask only button should update whether it appears toggled or not based on the show as mask only state of the currently selected object.
+- [x] outline modifier range is way too high. make the maximum like 25 percent as big as it is now.
+
+
 tools
 - [x] add an eyedropper icon in the color picker (with hotkey setting). for now, samples from the whole image.
 - [x] new item in the color window besides picker and pallette - color history
