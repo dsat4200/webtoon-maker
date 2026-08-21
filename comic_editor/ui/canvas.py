@@ -776,6 +776,8 @@ class _CanvasLogic:
         self._drawing_selection_path = QPainterPath()
         self._drawing_selection_gesture: list[QPointF] = []
         self._drawing_selection_operation = "replace"
+        self._drawing_selection_shift_anchor: QPointF | None = None
+        self._drawing_selection_shift_active: bool = False
         self._selection_transform_quad: list[tuple[float, float]] | None = None
         self._selection_transform_start_quad: (
             list[tuple[float, float]] | None
@@ -13060,6 +13062,8 @@ class _CanvasLogic:
     def _clear_drawing_selection(self, *, reset_pivot: bool = True) -> None:
         self._drawing_selection_path = QPainterPath()
         self._drawing_selection_gesture.clear()
+        self._drawing_selection_shift_anchor = None
+        self._drawing_selection_shift_active = False
         self._transform_gizmo_key = None
         self._transform_gizmo_slot = None
         self._selection_transform_quad = None
@@ -13721,6 +13725,28 @@ class _CanvasLogic:
         if self.tool == ToolKind.DRAW_SHAPE:
             if not self._drawing_selection_gesture:
                 return False
+            shift = bool(QGuiApplication.keyboardModifiers() & Qt.ShiftModifier)
+            if shift and not self._drawing_selection_shift_active and len(self._drawing_selection_gesture) >= 1:
+                self._drawing_selection_shift_anchor = QPointF(self._drawing_selection_gesture[-1])
+                self._drawing_selection_shift_active = True
+            elif not shift and self._drawing_selection_shift_active:
+                self._drawing_selection_shift_active = False
+                self._drawing_selection_shift_anchor = None
+            if self._drawing_selection_shift_active:
+                if len(self._drawing_selection_gesture) == 1:
+                    self._drawing_selection_gesture.append(QPointF(world))
+                else:
+                    anchor = self._drawing_selection_shift_anchor
+                    if anchor is not None and len(self._drawing_selection_gesture) >= 2:
+                        self._drawing_selection_gesture = self._drawing_selection_gesture[:-1]
+                        if math.dist(anchor.toTuple(), world.toTuple()) >= 1.0 / max(self.scale, 0.05):
+                            self._drawing_selection_gesture.append(QPointF(world))
+                        else:
+                            self._drawing_selection_gesture.append(QPointF(anchor))
+                    else:
+                        self._drawing_selection_gesture[-1] = QPointF(world)
+                self.update()
+                return True
             if math.dist(self._drawing_selection_gesture[-1].toTuple(), world.toTuple()) >= 1.0 / max(self.scale, 0.05):
                 self._drawing_selection_gesture.append(QPointF(world))
                 self.update()
@@ -13755,10 +13781,29 @@ class _CanvasLogic:
                 self._drawing_selection_gesture.append(QPointF(local))
             else:
                 self._drawing_selection_gesture[-1] = QPointF(local)
-        elif math.dist(
-            self._drawing_selection_gesture[-1].toTuple(), local.toTuple()
-        ) >= 1.5 / max(self.scale, 0.05):
-            self._drawing_selection_gesture.append(QPointF(local))
+        elif self.tool == ToolKind.DRAW_SELECT_LASSO:
+            shift = bool(QGuiApplication.keyboardModifiers() & Qt.ShiftModifier)
+            if shift and not self._drawing_selection_shift_active and len(self._drawing_selection_gesture) >= 1:
+                self._drawing_selection_shift_anchor = QPointF(self._drawing_selection_gesture[-1])
+                self._drawing_selection_shift_active = True
+            elif not shift and self._drawing_selection_shift_active:
+                self._drawing_selection_shift_active = False
+                self._drawing_selection_shift_anchor = None
+            if self._drawing_selection_shift_active:
+                if len(self._drawing_selection_gesture) == 1:
+                    self._drawing_selection_gesture.append(QPointF(local))
+                else:
+                    anchor = self._drawing_selection_shift_anchor
+                    if anchor is not None and len(self._drawing_selection_gesture) >= 1:
+                        if len(self._drawing_selection_gesture) >= 2:
+                            self._drawing_selection_gesture = self._drawing_selection_gesture[:-1]
+                        self._drawing_selection_gesture.append(QPointF(local))
+                    else:
+                        self._drawing_selection_gesture[-1] = QPointF(local)
+                self.update()
+                return True
+            if math.dist(self._drawing_selection_gesture[-1].toTuple(), local.toTuple()) >= 1.5 / max(self.scale, 0.05):
+                self._drawing_selection_gesture.append(QPointF(local))
         self.update()
         return True
 
@@ -13974,9 +14019,9 @@ class _CanvasLogic:
             self._clear_drawing_selection()
             return False
         try:
-            simplify_tolerance = float(getattr(self.settings, "draw_shape_simplify", 2.0))
+            simplify_tolerance = float(getattr(self.settings, "draw_shape_simplify", 1.0))
         except Exception:
-            simplify_tolerance = 2.0
+            simplify_tolerance = 1.0
         pts = [QPointF(p) for p in outline_poly]
         if len(pts) > 1 and pts[0] == pts[-1]:
             pts = pts[:-1]
@@ -14005,13 +14050,15 @@ class _CanvasLogic:
                 right = _dp(points[idx:], eps)
                 return left[:-1] + right
             return [a, b]
-        max_pts = 400
+        max_pts = 800
         if len(pts) > max_pts:
             step = max(1, len(pts) // max_pts)
             pts = pts[::step]
         simplified = _dp(pts, simplify_tolerance) if len(pts) > 2 else pts[:]
-        if len(simplified) > 250:
-            simplified = simplified[:: max(1, len(simplified) // 250)]
+        if len(simplified) < 6 and len(pts) >= 6:
+            simplified = pts[:: max(1, len(pts) // 60)]
+        if len(simplified) > 300:
+            simplified = simplified[:: max(1, len(simplified) // 300)]
         nodes = [PathNode(x=float(p.x()), y=float(p.y())) for p in simplified]
         if len(nodes) < 3:
             nodes = [PathNode(x=float(p.x()), y=float(p.y())) for p in [QPointF(x, y), QPointF(x + w, y), QPointF(x + w, y + h), QPointF(x, y + h)]]

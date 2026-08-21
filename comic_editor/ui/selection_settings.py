@@ -193,6 +193,7 @@ class SelectionCommonControls(QWidget):
             else:
                 self.visible.setChecked(bool(target.visible))
                 self._update_visibility_button(bool(target.visible))
+                self.mask_only_button.setChecked(bool(getattr(target, "mask_only", False)))
                 self._update_mask_only_button(bool(getattr(target, "mask_only", False)))
             if multi:
                 lock_vals = [bool(getattr(e, "opacity_locked", False)) for _, _, e in all_entities if hasattr(e, "opacity_locked")]

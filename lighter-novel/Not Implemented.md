@@ -50,9 +50,54 @@
 ## thought balloons and screaming
 i still need to add border types for shapes, like round bubbly ones for thought balloons or pointy ones for screaming (or just have it be one with a sharpness value and sizing parameters... hmmm
 
+- stroke types. 
+
+
+## New modifier type - stroke modifiers
+- like in blender used to, add modifier button should expose a menu that has different "categories" of modifier. add a new category of modifier called "stroke modifiers".
+- changes what the appearance of a stroke is along its points (does not modify the points)
+- all have a "strength" slider from 0 to 100 that lets you change how much the modifier affects the stroke
+- should be stackable with other stroke modifiers, and have high performance implementation.
+- should apply in order, like modifiers should.
+- visible within the same stack as other modifiers
+- if applied to a closed shape, should appear seamless.
+- parameters of stroke modifiers should still support masking.
+- only appear visible / are only compatible with shapes and vector objects.
+
+## Stroke Modifier - Wobble
+- uses a non-visible random perlin noise map to make the stroke look wobbly.
+- Options
+	- Position - Strength of the noise effect over the point location.
+- Strength - Strength of the noise effect over the point strength (opacity)
+- Noise Scale - Control the noise frequency scale
+- Noise Offset - Moves the noise along the strokes.
+- randomize seed button - changes the seed used by the pseudo random number generator.
+## Stroke Modifier - DotDash
+- makes the stroke appear dotted or dashed. dashes are rectangular and follow the curve. dots do not.
+- Options:
+	- distance - the distance between dots/dashes
+	- dash/dot toggle
+	- length - only in dash mode, changes the length of dashes.
+	- pattern - text-inputtable. spaces and dashes control the repeating pattern of dots/dashes where space is blank and dash is a dash/dot.
+	- roundness - 0 to 100. 100 by default on a dot, but can be slid back to make it look like a square though. on dashes, controls roundness of dash corners.
+
+## Stroke modifier - curve shape
+![[Pasted image 20260821114654.png]]
+handles?
 
 
 
+
+## Stroke modifier - Set brush
+- lets the user change the brush used for that object via a modifier.
+- works on closed an open shapes too.
+- custom dot toggle.
+		- how to handle maps? assets? icon pack? stickers?
+	- angle range - slider that controls
+
+
+
+if applied to a closed shape, behaves differently from on an open shape / vector object.
 
 
 ## Raster/Vector object / pencil features

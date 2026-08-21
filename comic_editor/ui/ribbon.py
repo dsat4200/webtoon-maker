@@ -17,6 +17,7 @@ from PySide6.QtWidgets import (
     QSizePolicy,
     QStackedWidget,
     QTabBar,
+    QToolButton,
     QVBoxLayout,
     QWidget,
 )
@@ -44,19 +45,30 @@ class RibbonGroup(QFrame):
         outer.setContentsMargins(6, 4, 6, 2)
         outer.setSpacing(2)
 
+        header = QHBoxLayout()
+        header.setContentsMargins(0, 0, 0, 0)
+        header.setSpacing(4)
+        self.collapse_button = QToolButton(self)
+        self.collapse_button.setAutoRaise(True)
+        self.collapse_button.setFixedSize(16, 16)
+        self.collapse_button.setArrowType(Qt.DownArrow)
+        self.collapse_button.clicked.connect(self._toggle_collapsed)
+        header.addWidget(self.collapse_button)
+        self.title_label = QLabel(title, self)
+        self.title_label.setObjectName("ribbonGroupTitle")
+        self.title_label.setAlignment(
+            Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter
+        )
+        header.addWidget(self.title_label, 1)
+        outer.addLayout(header)
+        self._collapsed = False
+
         self.content = QWidget(self)
         self.content.setObjectName("ribbonGroupContent")
         self.content_layout = QVBoxLayout(self.content)
         self.content_layout.setContentsMargins(0, 0, 0, 0)
         self.content_layout.setSpacing(4)
         outer.addWidget(self.content, 1)
-
-        self.title_label = QLabel(title, self)
-        self.title_label.setObjectName("ribbonGroupTitle")
-        self.title_label.setAlignment(
-            Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignBottom
-        )
-        outer.addWidget(self.title_label)
 
     @property
     def title(self) -> str:
@@ -75,6 +87,15 @@ class RibbonGroup(QFrame):
 
     def add_stretch(self, stretch: int = 1) -> None:
         self.content_layout.addStretch(stretch)
+
+    def _toggle_collapsed(self) -> None:
+        self._collapsed = not self._collapsed
+        self.content.setVisible(not self._collapsed)
+        self.collapse_button.setArrowType(Qt.RightArrow if self._collapsed else Qt.DownArrow)
+
+    def set_collapsed(self, collapsed: bool) -> None:
+        if bool(collapsed) != self._collapsed:
+            self._toggle_collapsed()
 
 
 class RibbonPage(QScrollArea):

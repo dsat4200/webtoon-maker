@@ -1361,6 +1361,8 @@ class MainWindow(QMainWindow):
                 activated and not tap
                 and self.settings.hotkey_hold.get(action_id, False)
             ):
+                if action_id == "raster_eraser" and previous != ToolKind.RASTER_PENCIL:
+                    return
                 self._hotkey_active_hold = {
                     "action": action_id,
                     "chord": chord,
