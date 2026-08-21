@@ -20,13 +20,21 @@
 - [ ] outline modifier range is way too high. make the maximum like 25 percent as big as it is now.
 
 
+bugs
+- closing shapes still doesn't work.
+
+
+
+
 
 - review the fill tool
 
 
+## more tweaks
+- [ ] using vector tools and hitting apply while no vector points are selected should make them affect all vector points in the currently active vector object.
+- [ ] instead of having different modes for each parameter in vector tools, just show separate "redraw thickness" and "redraw opacity" UI elements stacked.
+- [ ] also, vector tools UI element groupings should be collapsable with a down arrow / carat icon thing in the top left.
 
-bugs
-- closing shapes still doesn't work.
 ## image sync tweaks
 - render region box on screen
 - adjustment layer - allows transforms and modifiers simultaneously
@@ -35,20 +43,6 @@ bugs
 ## how to do thought balloons and screaming
 i still need to add border types for shapes, like round bubbly ones for thought balloons or pointy ones for screaming (or just have it be one with a sharpness value and sizing parameters... hmmm
 
-
-transformations
-- cage warp
-- [x] blur
-- smear
-- [x] hue, saturation, lightness
-
-
-
-
-
-
-bugs
-- draw shape tool isn't doing anything when pressed.
 
 
 
@@ -88,11 +82,18 @@ Cage Transform
 		- trying to use modifier tool on a multi selection with incompatible objects should also throw an error popup. these should tell the user which are not compatible via text in the popup, and also highlighting those objects red in the outliner.
 - implement cage transform while maintaining maximum performance.
 
-cage transform support
-select support for raster mode
-smoothing support
-asset library folders.
-merge layers
+smoothing support for pencil/eraser
+
+
+
+asset library folders should support dragging items from the asset library into them.
+- being inside a folder should make the first element in the grid "Up" which is just the parent folder. dragging into this works too if its there.
+- folders should also be possible drag between folders, moving their children with them.
+
+rasterize should be a right click option on any object (but be hidden in, well, raster objects)
+
+
+merge layers should work between raster objects and between vector objects.
 multiple layer selection
 non destructive erasing (Masks?)
 more key commands
@@ -229,3 +230,11 @@ what are the fill types / textures
 	- gradient ramp support
 - glow object with a child that represents the fill (but what about scale / parameter support?)
 
+
+
+transformations
+- cage transform
+- puppet transform
+- [x] blur
+- smear
+- [x] hue, saturation, lightness
