@@ -402,6 +402,7 @@ class MainWindow(QMainWindow):
             ("Rectangle", "plus-square-dashed", ToolKind.BOX_BOUND),
             ("Circle", "circle", ToolKind.CIRCLE_BOUND),
             ("Free Shape", "path-arrow", ToolKind.SHAPE_CREATE),
+            ("Draw Shape", "selective-tool", ToolKind.DRAW_SHAPE),
         ):
             option = self.shapes_category.addTool(label, icon_name)
             option.clicked.connect(
@@ -760,8 +761,9 @@ class MainWindow(QMainWindow):
             lambda targets: self._finish_mask_mode(True)
             if targets is not None else None
         )
-        from comic_editor.ui.tree_model import EyeVisibilityDelegate
+        from comic_editor.ui.tree_model import EyeVisibilityDelegate, MaskOnlyRowDelegate
         self.tree.setItemDelegateForColumn(0, EyeVisibilityDelegate(self.tree))
+        self.tree.setItemDelegateForColumn(2, MaskOnlyRowDelegate(self.tree))
         self.tree.viewport().installEventFilter(self)
         self.tree.setContextMenuPolicy(Qt.CustomContextMenu)
         self._tablet_outliner_press: dict | None = None
@@ -817,6 +819,15 @@ class MainWindow(QMainWindow):
         self.exit_mask_mode_button.clicked.connect(
             lambda: self._finish_mask_mode(True)
         )
+        self.remove_mask_button = QPushButton("Remove Mask", self.canvas)
+        self.remove_mask_button.setObjectName("removeMaskButton")
+        self.remove_mask_button.setToolTip("Remove the current mask binding")
+        self.remove_mask_button.setStyleSheet(
+            "#removeMaskButton { background: #8b1e1e; color: white; border-radius: 4px; padding: 4px 8px; }"
+            "#removeMaskButton:hover { background: #a52a2a; }"
+        )
+        self.remove_mask_button.hide()
+        self.remove_mask_button.clicked.connect(self._remove_current_mask)
 
         self.hierarchy_dock.setWidget(hierarchy_panel)
         self.addDockWidget(Qt.RightDockWidgetArea, self.hierarchy_dock)
@@ -2209,7 +2220,13 @@ class MainWindow(QMainWindow):
         if not series.chapters:
             QMessageBox.warning(self, "Unable to open series", "The series has no chapters")
             return False
-        chapter_id = series.chapters[0].chapter_id
+        series_key = str(repository.root.resolve()) if hasattr(repository.root, "resolve") else str(repository.root)
+        preferred = self.settings.last_chapter_by_series.get(series_key) or self.settings.last_chapter_by_series.get(str(repository.root))
+        chapter_ids = {c.chapter_id for c in series.chapters}
+        if preferred in chapter_ids:
+            chapter_id = preferred
+        else:
+            chapter_id = series.chapters[0].chapter_id
         recover = False
         if repository.has_recovery(chapter_id):
             recover = QMessageBox.question(
@@ -2346,6 +2363,17 @@ class MainWindow(QMainWindow):
             self.active_session.images = images
             self.active_session.canvas_state = None
         self.hierarchy_model.set_chapter(chapter)
+        if self.repository is not None:
+            try:
+                key = str(self.repository.root.resolve())
+            except Exception:
+                key = str(self.repository.root)
+            self.settings.last_chapter_by_series[key] = chapter.chapter_id
+            try:
+                from comic_editor.core.settings import save_settings
+                save_settings(self.settings)
+            except Exception:
+                pass
         self._dirty = False
         if self.active_session is not None:
             self.active_session.dirty = False
@@ -4201,6 +4229,20 @@ class MainWindow(QMainWindow):
         self._sync_tool_buttons()
         self.canvas.update()
 
+    def _remove_current_mask(self) -> None:
+        if self.chapter is None or not self.canvas.active_tone_mask_id:
+            return
+        if QMessageBox.question(
+            self, "Remove mask",
+            "Remove this mask binding? The mask image will be kept as saved mask.",
+        ) != QMessageBox.Yes:
+            return
+        mask_id = self.canvas.active_tone_mask_id
+        context = self._mask_context
+        if context is not None:
+            self._detach_parameter_mask(context)
+        self._finish_mask_mode(False)
+
     def _enter_mask_mode(
         self, mask_id: str, context: tuple | None = None,
     ) -> None:
@@ -4215,8 +4257,16 @@ class MainWindow(QMainWindow):
         self.hierarchy_model.set_mask_highlights(set(mask.contributors))
         self.masks_panel.set_active(mask_id)
         self.settings_tabs.setCurrentWidget(self.masks_panel)
+        self.exit_mask_mode_button.adjustSize()
+        self.exit_mask_mode_button.move(10, 10)
         self.exit_mask_mode_button.raise_()
         self.exit_mask_mode_button.show()
+        self.remove_mask_button.adjustSize()
+        self.remove_mask_button.move(
+            self.exit_mask_mode_button.geometry().right() + 8, 10
+        )
+        self.remove_mask_button.raise_()
+        self.remove_mask_button.show()
         self.selection_common.refresh()
         self.modifier_controls.refresh()
         self._refresh_masks_panel()
@@ -4234,6 +4284,7 @@ class MainWindow(QMainWindow):
             mask.touch()
         self.canvas.set_tone_mask_mode("")
         self.exit_mask_mode_button.hide()
+        self.remove_mask_button.hide()
         self.hierarchy_model.set_mask_highlights(None)
         self._mask_context = None
         self._mask_original_contributors = []
@@ -4521,66 +4572,11 @@ class MainWindow(QMainWindow):
             current if current.isValid() else indexes[-1]
         )
         primary = (primary_item.kind, primary_item.entity_id)
-        eligible = [
-            (kind, entity_id) for kind, entity_id in entities
-            if kind == "object" and isinstance(
-                self.chapter.objects.get(entity_id),
-                (RasterObject, VectorDrawingObject),
-            )
-        ]
-        valid_multi = len(entities) <= 1 or len(eligible) == len(entities)
-        reference_capable = all(
-            (
-                kind == "layer"
-                and entity_id in self.chapter.layers
-                and not self.chapter.layers[entity_id].is_page
-            )
-            or (
-                kind == "object"
-                and isinstance(
-                    self.chapter.objects.get(entity_id),
-                    (RasterObject, ImageObject, VectorDrawingObject),
-                )
-            )
+        has_page = any(
+            kind == "layer" and self.chapter.layers.get(entity_id) is not None and self.chapter.layers[entity_id].is_page
             for kind, entity_id in entities
         )
-        if not valid_multi and len(entities) > 1 and reference_capable:
-            self.canvas.set_selection(
-                *primary, activate_default_tool=True
-            )
-            blocker = QSignalBlocker(self.tree.selectionModel())
-            self.tree.selectionModel().clearSelection()
-            for kind, entity_id in entities:
-                index = self.hierarchy_model.index_for_entity(
-                    kind, entity_id
-                )
-                if index.isValid():
-                    self.tree.selectionModel().select(
-                        index,
-                        QItemSelectionModel.Select
-                        | QItemSelectionModel.Rows,
-                    )
-            del blocker
-            return
-        if (
-            not valid_multi
-            and QApplication.keyboardModifiers()
-            & Qt.KeyboardModifier.ShiftModifier
-            and eligible
-        ):
-            entities = eligible
-            primary = primary if primary in eligible else eligible[-1]
-            blocker = QSignalBlocker(self.tree.selectionModel())
-            self.tree.selectionModel().clearSelection()
-            for kind, entity_id in entities:
-                index = self.hierarchy_model.index_for_entity(kind, entity_id)
-                self.tree.selectionModel().select(
-                    index,
-                    QItemSelectionModel.Select | QItemSelectionModel.Rows,
-                )
-            del blocker
-            valid_multi = True
-        if not valid_multi:
+        if has_page and len(entities) > 1:
             blocker = QSignalBlocker(self.tree.selectionModel())
             self.tree.selectionModel().select(
                 current,

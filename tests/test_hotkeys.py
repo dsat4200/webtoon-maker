@@ -58,6 +58,8 @@ def test_chord_capture_replaces_clears_and_cancels(qapp):
     QTest.keyClick(editor, Qt.Key_Escape)
     assert editor.chord() == "Ctrl+K"
     QTest.keyClick(editor, Qt.Key_Backspace)
+    assert editor.chord() == "Backspace"
+    editor.setChord("")
     assert editor.chord() == ""
     editor.hide()
 

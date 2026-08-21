@@ -1,48 +1,29 @@
 
-## more
-- [x] remove the add fill tool. instead, the fill tool and add fill tool should be consolidated into one visibly. the add fill functionality (changing the background fill of a shape) should only happen if the shape is the currently active selected object.
-- [x] add the ability to right click a layer and click "show as mask only". this sets the layer to only appear in masks and not visually in the canvas on its own. however, if currently selected, it should show as normal for the sake of editing. these layers should have opacity say (percent) " - Mask only" 
-	- since opacity of a mask affects its alpha (0 to 1 mask value), if a mask has changes to the opacity slider on itself (or a mask on itself), that should affect its mask output contribution.
-- [x] fill tool in a raster object should let you fill only what's inside the active selection (in a raster layer). if a vector layer is the current active selection, fill shouldnt be visible as an option.
-- [x] vector fills are currently a little bugged. remove the vector fill code and instead, make fills like they are in clip studio paint, where a raster layer has to be the one to store the fill
-- [x] https://help.clip-studio.com/en-us/manual_en/420_fill/Fill_Tool.htm
-	- plan to implement all these features of the fill tool. tool settings should be in tool settings. Make sure to do so with optimal performance
-	- https://help.clip-studio.com/en-us/manual_en/420_fill/Advanced_Fill.htm
-	- implement the advanced fill tools too.
-	- reference layers should have its interface
-- [x] instead of gradients living in the tool settings gradient tools tab, "gradient" should be a tool, and its settings should be in tool settings instead of graident tools. Keep all the features though.
-- [x] add a "show as mask only" button to settings in the top right of objects. gradient should show its own settings in the top right window, instead of parent shape settings. it should also show the name, ignore direct parent mask, and show underlay settings, like raster and vector do.
-
-
-- [x] add a trash button to the left of the hide button in the opacity row. if multiple objects are selected, it can delete multiple. delete should prompt the user if they are sure. 
-- [x] instead of "lock opacity" with a checkmark, make it a lock icon button that is either pressed (on) or non-pressed (off)
-
-
-- [x] add a toggleable mask button with a mask icon to the right of the opacity slider (thats either pressed or not pressed). if pressed, the object is set to view as mask only (the feature that's currently only visible by right click)
-	- instead of "mask only" text, put that show as mask only icon toggle button to the right of the opacity percent value, that's either pressed or unpressed.
-- [x] change the simple checkbox on each object to a toggleable eyeball icon button.
-- [x]  show as mask only button icon should be different from the use mask / toggle mask mode button. use https://iconoir.com mask-square icon.
-- [x] current tool tool settings while a gradient is selected should show the settings,, instead of just showing them below the gradient
-- [x] add a delete operation, where, if delete hotkey is pressed (just as a hotkey for now), if on a vector layer or raster layer, it deletes everything on that layer (without asking for confirmation)
-
-
-
-
-- [ ] make it possible to select objects of any type for select multiple, for basic functionality support like multi delete, hide, lock, among other object operations
+- [x] make it possible to select objects of any type for select multiple, for basic functionality support like multi delete, hide, lock, among other object operations
 	- notably, multi selection hides the mask buttons on the object operations row (what i'm naming the row that has the trash, eye, lock, opacity, mask, opacity slider, and show as mask only ui elements)
-- [ ] in mask mode, show a "remove mask" button next to the exit mask mode button.
-- [ ] the "show only as mask" toggle button should additionally exist to the right of the opacity value on each object's row in the outliner.
-- [ ] add a "draw shape" option to the create shape menu, that acts like a lasso tool during creation, but with orange instead of blue. the active selection becomes a panel when you hit finish. it should convert the outside of your filled selection into vector points for this, and have an outline by default. it should have the same layer settings in the layer settings window as any other shape.
+- [x] in mask mode, show a "remove mask" button next to the exit mask mode button.
+- [x] the "show only as mask" toggle button should additionally exist to the right of the opacity value on each object's row in the outliner.
+- [x] add a "draw shape" option to the create shape menu, that aon actions.
+- [x] opening a project should open the most recent chapter that was open.
+- [x] outline modifier should not contribute to a mask.
+- [x] backspace should be possible to select as a hotkey. add an x button to the left of a hotkey field in hotkey settings to clear (instead of using backspace to do that)
+
+
+
+
+- [ ] draw shape tool isn't doing anything. it should allow the user to lasso select (but with orange dotted line, preview fill instead of blue) to create a shape, like I mentioned before
+	- [ ] acts like a lasso tool during creation, but with orange instead of blue. the active selection becomes a panel when you hit finish. it should convert the outside of your filled selection into vector points for this, and have an outline by default. it should have the same layer settings in the layer settings window as any other shape.
 	- [ ] shift and alt still add and remove from your selection. however, just click dragging elsewhere while there is a selection deletes that selection, like it would in any other drawing program.
-- [ ] undo be able to undo selection actions.
-- [ ] opening a project should open the most recent chapter that was open.
-- [ ] outline modifier should not contribute to a mask.
-- [ ] backspace should be possible to select as a hotkey. add an x button to the left of a hotkey field in hotkey settings to clear (instead of using backspace to do that)
+- [ ] add "clear canvas" hotkey that while in either raster or vector, clears all points and/or pixels. should work in multi select if those are the two types selected. do not prompt for warning when doing this.
+- [ ] make the per-object eyeball icon into a full button with a background, that is grey when visible and light orange when toggled to be invisible.
+- [ ] show as mask only button should update whether it appears toggled or not based on the show as mask only state of the currently selected object.
+- [ ] outline modifier range is way too high. make the maximum like 25 percent as big as it is now.
 
-liasing on off toggle.
 
-![[Pasted image 20260817004047.png]]
-above could be opacity mask plus outline modifier on a shape. guy inside popping out could be him inside vs outside the folder.
+
+- review the fill tool
+
+
 
 bugs
 - closing shapes still doesn't work.
@@ -57,35 +38,19 @@ i still need to add border types for shapes, like round bubbly ones for thought 
 
 transformations
 - cage warp
-- blur
+- [x] blur
 - smear
-- hue, saturation, lightness
+- [x] hue, saturation, lightness
 
 
 
-bugs:
-- wont let me drag select to reorder objects with the stylus, only with the mouse
 
 
-tools
-- add an eyedropper icon in the color picker (with hotkey setting). for now, samples from the whole image.
-- new item in the color window besides picker and pallette - color history
-- add the option to hide transform handles while drawing to pencil and eraser tool in tool settings. 
-- add a transform tool for vector/raster that exposes the handles, and click-dragging or pen tap dragging in the bounds translates instead of drawing while in transform mode.
-- add a "reset rotation" tool that only works as a hotkey. it should keep the scale and position navigation the same, but reset rotation of the canvas.
-- line gradients with 2 points shouldn't have the 8 handle transform around them (its redundant)
-- while having point selected in point select mode, pressing delete should delete the points you have selected.
-- the click and drag handle outside a shape to translate it doesn't seem to work.
-- add an export to png button that exports the current chapter to a full size png image. (add a folder where assets and chapters are called exports. the image name should 
-- translating a vector by the handle on the bounds is drawing instead of translating
-	- translating should also be visible live (like raster does)
 
-bugs:
-- [ ] text move handles 
-- [ ] vector edit point preview in a scaled object shows the non-transformed points. also, make the actual point icons about 20 percent smaller, and make their size and transparency settable in tool settings with sliders. also include a toggle to show or hide them, and they should be hidden by default.
-![[Pasted image 20260816003707.png]]
-- ![[Pasted image 20260816190558.png]]
-- the color wheel shows the wrong hue.
+bugs
+- draw shape tool isn't doing anything when pressed.
+
+
 
 
 
@@ -96,16 +61,32 @@ psd brush support?
 
 
 
-
-later
-- multi object select support
-- lasso fill support
-- MODIFIER STACK?
-	- for instance, smudge tool could have parameters and strokes. the strokes could be manipulated?
-	- params:
-		- insensity
-	- modifers can be moved between objects
-	- a modifier can apply to multiple objects and act as a modifier to any object type (acting as an overlay, perhaps like a shader almost?)
+Cage Transform
+- https://help.clip-studio.com/en-us/manual_en/360_transform/Types_of_transformations.htm#1004087
+- just like mesh transformation from clip studio paint. make it a tool, and also make a modifier version with the same parameters
+- these are two different types
+- the modifier tool, if used on a raster or vector, acts like just clip studio paint. it is a tool that can be used and is destructive (unless you undo.)
+- by contrast, the cage transform modifier can not be added to rasters and vectors (intended for objects that can't be traditionally drawn on, (blender shapes, image layers for now)
+- both expose the same settings. in the raster/vector objects they are in tool settings, in the other 2 they are in modifier settings.
+	- show a grid of points that can be transformed, with OK and cancel gizmos below. 
+	- additionally, show (with a margin outside) the traditional 8 handles with translate support, rotate handle, and free/uniform toggle that we've come to expect, outside that grid.
+	- also include a pivot point as a gizmo.
+	- horizontal, vertical flip should be gizmos though (align-vertical-centers as the vertical flip icon, align-horizontal-centers for the horizontal flip icon)
+	- in tool/modifier settings, include the flip buttons.)
+	- no need for the center of rotation option since we have a pivot point gizmo.
+	- if used on an image, always keep original image since on an image its a modifier and those are non destructive. don't show this option.
+	- number of horizontal and vertical lattice points should be options with a slider and inputtable with keyboard numbers to the right. vertical and horizontal should have their own rows in the UI.
+	- include interpolation mode.
+	- allow for multi-point selection like csp has.
+	- ignore puppet warp for now (we can add that in a later pass.)
+	- modifiers can now be selected. being selected makes them blueish with a blue outline (like buttons do when toggled). when a modifier is selected, it should expose gizmos. for now, no modifiers have gizmos though except for this cage transform one for now.
+		- modifiers can only be selected in modifier mode. switching tabs out of modifier mode retains the selection but hides the modifier gizmos
+		- deselecting the object also hides the gizmos but remembers the selection.
+	- mesh transformation used during a multi selection of rasters/vectors should affect any selected objects.
+	- adding a mesh transform modifier while multiple objects are selected, if all objects are compatible with mesh transform modifier, should add the modifier to all selected, and link them. (the same should be the case for all modifiers, really - if all in a selection are compatible with the modifier and its added , they should share a linked modifier)
+		- trying to add a modifier that is not compatible in a multi selection should throw an error popup.
+		- trying to use modifier tool on a multi selection with incompatible objects should also throw an error popup. these should tell the user which are not compatible via text in the popup, and also highlighting those objects red in the outliner.
+- implement cage transform while maintaining maximum performance.
 
 cage transform support
 select support for raster mode

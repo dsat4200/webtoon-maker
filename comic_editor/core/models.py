@@ -3298,9 +3298,11 @@ class ChapterDocument:
             raise ValueError("Objects require a container layer")
         moving: list[DocumentObject] = []
         for kind, entity_id in ordered:
+            if kind == "layer":
+                raise ValueError("Multi-move supports objects only")
             obj = self.objects.get(entity_id) if kind == "object" else None
-            if not isinstance(obj, (RasterObject, VectorDrawingObject)):
-                raise ValueError("Multi-move supports raster/vector objects only")
+            if obj is None:
+                raise ValueError("Unknown object")
             moving.append(obj)
 
         moving_ids = {obj.object_id for obj in moving}

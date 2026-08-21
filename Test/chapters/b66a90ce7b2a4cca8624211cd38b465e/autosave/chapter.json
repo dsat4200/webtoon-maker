@@ -726,7 +726,11 @@
       "modifier_ids": [],
       "transform_frame": null,
       "transform_quad": null,
-      "opacity_mask": null
+      "opacity_mask": {
+        "mask_id": "14118aff88dd4fac81bfb6f8bd52bcef",
+        "black": 0.0,
+        "white": 1.0
+      }
     },
     {
       "id": "79da821594e540f89fde54676fe51f6d",
@@ -833,7 +837,7 @@
         "end_cap": "round"
       },
       "grid_override": null,
-      "last_raster_id": "1443611d99b049fa87f02061c292a899",
+      "last_raster_id": "938b4031d755444497da7629528927c0",
       "compound_enabled": false,
       "compound_operation": "add",
       "ignore_parent_mask": false,
@@ -13255,6 +13259,13 @@
         }
       ],
       "revision": 1
+    },
+    {
+      "id": "14118aff88dd4fac81bfb6f8bd52bcef",
+      "name": "",
+      "saved": false,
+      "contributors": [],
+      "revision": 0
     }
   ]
 }

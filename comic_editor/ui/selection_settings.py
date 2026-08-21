@@ -164,11 +164,12 @@ class SelectionCommonControls(QWidget):
         maskable = (
             enabled
             and not bool(getattr(target, "is_page", False))
+            and not multi
         )
         self.opacity_mask_button.setVisible(maskable)
         self.opacity_mask_button.setChecked(binding is not None)
-        self.opacity.setVisible(binding is None)
-        self.opacity_endpoints.setVisible(binding is not None)
+        self.opacity.setVisible(binding is None or multi)
+        self.opacity_endpoints.setVisible(binding is not None and not multi)
         if binding is not None:
             self.opacity_endpoints.setValues(
                 binding.black_value * 100.0,
@@ -193,10 +194,20 @@ class SelectionCommonControls(QWidget):
                 self.visible.setChecked(bool(target.visible))
                 self._update_visibility_button(bool(target.visible))
                 self._update_mask_only_button(bool(getattr(target, "mask_only", False)))
-            self.opacity_lock.setChecked(
-                bool(getattr(target, "opacity_locked", False))
-            )
-            self._update_lock_button(bool(getattr(target, "opacity_locked", False)))
+            if multi:
+                lock_vals = [bool(getattr(e, "opacity_locked", False)) for _, _, e in all_entities if hasattr(e, "opacity_locked")]
+                if lock_vals:
+                    all_locked = all(lock_vals)
+                    self.opacity_lock.setChecked(all_locked)
+                    self._update_lock_button(all_locked)
+                else:
+                    self.opacity_lock.setChecked(False)
+                    self._update_lock_button(False)
+            else:
+                self.opacity_lock.setChecked(
+                    bool(getattr(target, "opacity_locked", False))
+                )
+                self._update_lock_button(bool(getattr(target, "opacity_locked", False)))
             if self.canvas.selected_kind == "object":
                 try:
                     opacity = self.canvas.chapter.effective_object_opacity(
@@ -377,25 +388,25 @@ class SelectionCommonControls(QWidget):
         self._push(before, "Change visibility", hierarchy=True)
 
     def _opacity_lock_changed(self, checked: bool) -> None:
-        target = self._selected()
-        if (
-            self._updating
-            or target is None
-            or self.canvas.selected_kind != "object"
-            or not hasattr(target, "opacity_locked")
-        ):
+        if self._updating:
             return
-        self._commit_text(target)
-        target = self._selected()
-        if target is None or not hasattr(target, "opacity_locked"):
+        entities = self._selected_entities()
+        if not entities:
             return
+        lockable = [(k, eid, ent) for k, eid, ent in entities if hasattr(ent, "opacity_locked")]
+        if not lockable:
+            return
+        target = self._selected()
+        if target is not None:
+            self._commit_text(target)
         before = self.canvas.chapter.to_dict()
-        target.opacity_locked = bool(checked)
+        for _, _, ent in lockable:
+            ent.opacity_locked = bool(checked)
+            if ent.opacity_locked:
+                parent = self.canvas.chapter.layers.get(getattr(ent, "parent_layer_id", ""))
+                if parent is not None:
+                    ent.opacity = float(parent.opacity)
         self._update_lock_button(bool(checked))
-        if target.opacity_locked:
-            parent = self.canvas.chapter.layers.get(target.parent_layer_id)
-            if parent is not None:
-                target.opacity = float(parent.opacity)
         self._push(before, "Change opacity lock")
 
     def _begin_opacity_drag(self) -> None:

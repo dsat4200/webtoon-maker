@@ -224,9 +224,11 @@ class EditorSettings:
     mask_pencil_pressure_sensitive: bool = True
     mask_pencil_from_alpha: float = 0.0
     mask_pencil_to_alpha: float = 1.0
+    draw_shape_simplify: float = 2.0
     ui_splitter_sizes: dict[str, list[int]] = field(default_factory=dict)
     navigator_expanded: bool = False
     recent_series: list[str] = field(default_factory=list)
+    last_chapter_by_series: dict[str, str] = field(default_factory=dict)
     blender_bridge_host: str = "127.0.0.1"
     blender_bridge_port: int = 47837
     blender_bridge_token: str = ""
@@ -488,6 +490,14 @@ class EditorSettings:
             0.0, min(1.0, float(self.mask_pencil_to_alpha))
         )
         self.recent_series = list(dict.fromkeys(self.recent_series or []))[:12]
+        if not isinstance(self.last_chapter_by_series, dict):
+            self.last_chapter_by_series = {}
+        else:
+            cleaned = {}
+            for k, v in list(self.last_chapter_by_series.items())[:100]:
+                if isinstance(k, str) and isinstance(v, str) and k and v:
+                    cleaned[str(k)] = str(v)
+            self.last_chapter_by_series = cleaned
 
     def pencil_size(self) -> int:
         return self.pencil_size_px[self.active_pencil_size]

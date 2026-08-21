@@ -97,6 +97,7 @@ class ToolKind(Enum):
     DRAW_SELECT_RECT = "draw_select_rect"
     DRAW_SELECT_LASSO = "draw_select_lasso"
     DRAW_SELECT_STROKE = "draw_select_stroke"
+    DRAW_SHAPE = "draw_shape"
     INSERT_PAGE_GAP = "insert_page_gap"
     BOX_BOUND = "box_bound"
     CIRCLE_BOUND = "circle_bound"
@@ -593,6 +594,8 @@ class _CanvasLogic:
         self._interactive_render = False
         self._render_exclude_text = False
         self._rendering_mask_contributor = 0
+        self._suppress_outline_for_mask = False
+        self._suppress_selection_undo = False
         self._modifier_render_cache: OrderedDict[tuple, QImage] = OrderedDict()
         self._modifier_render_cache_bytes = 0
         self._modifier_render_cache_budget = 64 * 1024 * 1024
@@ -1915,6 +1918,7 @@ class _CanvasLogic:
     ) -> None:
         if self.chapter is None:
             return
+        before = None if self._suppress_selection_undo else self._selection_snapshot()
         previous_tool = self.tool
         if (
             self._page_gap_state is not None
@@ -1988,6 +1992,10 @@ class _CanvasLogic:
         self.selectionSetChanged.emit(list(self.selected_entities))
         self._invalidate_scene_cache()
         self.update()
+        if before is not None:
+            after = self._selection_snapshot()
+            if before["kind"] != after["kind"] or before["id"] != after["id"] or before["entities"] != after["entities"] or before["path"] != after["path"]:
+                self._push_selection_undo(before, after)
 
     def set_selection_set(
         self, entities: Iterable[tuple[str, str]],
@@ -1996,6 +2004,7 @@ class _CanvasLogic:
         """Select an outliner-authored raster/vector object set."""
         if self.chapter is None:
             return False
+        before = None if self._suppress_selection_undo else self._selection_snapshot()
         ordered: list[tuple[str, str]] = []
         for kind, entity_id in entities:
             key = (str(kind), str(entity_id))
@@ -2007,16 +2016,22 @@ class _CanvasLogic:
         if len(ordered) == 1:
             self.set_selection(*ordered[0], activate_default_tool=True)
             return True
-        if any(
-            kind != "object" or not isinstance(
-                self.chapter.objects.get(entity_id),
-                (RasterObject, VectorDrawingObject),
-            )
-            for kind, entity_id in ordered
-        ):
-            return False
+        filtered: list[tuple[str, str]] = []
+        for kind, entity_id in ordered:
+            if kind == "layer":
+                layer = self.chapter.layers.get(entity_id)
+                if layer is None or layer.is_page:
+                    return False
+                filtered.append((kind, entity_id))
+            elif kind == "object":
+                if entity_id not in self.chapter.objects:
+                    return False
+                filtered.append((kind, entity_id))
+            else:
+                return False
+        ordered = filtered
         primary = primary if primary in ordered else ordered[-1]
-        primary_id = primary[1]
+        primary_kind, primary_id = primary
         if primary_id != self.selected_object_id:
             if self._vector_gesture_mode is not None:
                 self._cancel_vector_gesture(restore=True)
@@ -2036,13 +2051,24 @@ class _CanvasLogic:
         self.vectorSelectionChanged.emit(set(), set())
         if self._text_editing:
             self._commit_text_edit()
-        obj = self.chapter.objects[primary_id]
         self.selected_kind, self.selected_id = primary
-        self.selected_object_id = primary_id
-        self.active_layer_id = obj.parent_layer_id
-        self.active_page_id = self.chapter.page_for_layer(
-            obj.parent_layer_id
-        ).layer_id
+        if primary_kind == "object":
+            self.selected_object_id = primary_id
+            obj = self.chapter.objects.get(primary_id)
+            self.active_layer_id = obj.parent_layer_id if obj else ""
+            try:
+                self.active_page_id = self.chapter.page_for_layer(
+                    self.active_layer_id
+                ).layer_id if self.active_layer_id else ""
+            except Exception:
+                self.active_page_id = ""
+        else:
+            self.selected_object_id = ""
+            self.active_layer_id = primary_id
+            try:
+                self.active_page_id = self.chapter.page_for_layer(primary_id).layer_id
+            except Exception:
+                self.active_page_id = ""
         self.selected_entities = ordered
         if self.tool != ToolKind.TRANSFORM:
             self.tool = ToolKind.TRANSFORM
@@ -2054,12 +2080,16 @@ class _CanvasLogic:
         self.selectionChanged.emit(*primary)
         self._invalidate_scene_cache()
         self.update()
+        if before is not None:
+            after = self._selection_snapshot()
+            self._push_selection_undo(before, after)
         return True
 
     def clear_selection(self) -> None:
         """Clear the current entity and notify every selection consumer."""
         if self.chapter is None:
             return
+        before = None if self._suppress_selection_undo else self._selection_snapshot()
         if self._vector_gesture_mode is not None:
             self._cancel_vector_gesture(restore=True)
         if (
@@ -2087,6 +2117,50 @@ class _CanvasLogic:
         self.selectionSetChanged.emit([])
         self._invalidate_scene_cache()
         self.update()
+        if before is not None:
+            after = self._selection_snapshot()
+            self._push_selection_undo(before, after)
+
+    def _selection_snapshot(self):
+        return {
+            "kind": self.selected_kind,
+            "id": self.selected_id,
+            "object_id": self.selected_object_id,
+            "layer_id": self.active_layer_id,
+            "page_id": self.active_page_id,
+            "entities": list(self.selected_entities),
+            "path": QPainterPath(self._drawing_selection_path),
+        }
+
+    def _restore_selection_snapshot(self, snap) -> None:
+        self._suppress_selection_undo = True
+        try:
+            self.selected_kind = snap["kind"]
+            self.selected_id = snap["id"]
+            self.selected_object_id = snap["object_id"]
+            self.active_layer_id = snap["layer_id"]
+            self.active_page_id = snap["page_id"]
+            self.selected_entities = list(snap["entities"])
+            self._drawing_selection_path = QPainterPath(snap["path"])
+            self._invalidate_scene_cache()
+            self.selectionChanged.emit(self.selected_kind, self.selected_id)
+            self.selectionSetChanged.emit(list(self.selected_entities))
+            self.update()
+        finally:
+            self._suppress_selection_undo = False
+
+    def _push_selection_undo(self, before, after) -> None:
+        if self._suppress_selection_undo:
+            return
+        if before == after:
+            return
+        if not before["kind"] and not before["id"] and not before["entities"]:
+            return
+        self.command_stack.push(CallbackCommand(
+            "Change selection",
+            lambda b=before: self._restore_selection_snapshot(b),
+            lambda a=after: self._restore_selection_snapshot(a),
+        ), already_done=True)
 
     def set_tool(self, tool: ToolKind) -> bool:
         selected_object = (
@@ -4534,6 +4608,8 @@ class _CanvasLogic:
             self.chapter.modifiers[item] for item in layer.modifier_ids
             if item in self.chapter.modifiers
         ]
+        if getattr(self, "_suppress_outline_for_mask", False):
+            modifiers = [m for m in modifiers if not isinstance(m, OutlineModifier)]
         if (
             world_bounds is None or world_bounds.isEmpty()
             or (not modifiers and layer.opacity_mask is None)
@@ -7275,6 +7351,7 @@ class _CanvasLogic:
                 return
             painter.setClipPath(clip, Qt.ClipOperation.IntersectClip)
         self._rendering_mask_contributor += 1
+        self._suppress_outline_for_mask = True
         try:
             if kind == "object":
                 parent_transform = self.layer_world_transform(
@@ -7313,6 +7390,7 @@ class _CanvasLogic:
             )
         finally:
             self._rendering_mask_contributor -= 1
+            self._suppress_outline_for_mask = False
             painter.restore()
 
     @staticmethod
@@ -7586,6 +7664,8 @@ class _CanvasLogic:
             self.chapter.modifiers[item] for item in obj.modifier_ids
             if item in self.chapter.modifiers
         ]
+        if getattr(self, "_suppress_outline_for_mask", False):
+            modifiers = [m for m in modifiers if not isinstance(m, OutlineModifier)]
         world_bounds = self.object_world_rect(obj.object_id)
         if isinstance(obj, RasterObject):
             preview_bounds = self._raster_selection_preview_world_bounds(obj)
@@ -12297,7 +12377,7 @@ class _CanvasLogic:
             event.accept()
             return
         for child in self.children():
-            if child.objectName() == "exitMaskModeButton" and child.isVisible():
+            if child.objectName() in ("exitMaskModeButton", "removeMaskButton") and child.isVisible():
                 if child.geometry().contains(event.position().toPoint()):
                     if event.type() == QEvent.TabletRelease:
                         try:
@@ -13584,6 +13664,18 @@ class _CanvasLogic:
         self, world: QPointF, widget: QPointF, *,
         test_transform: bool = True,
     ) -> bool:
+        if self.tool == ToolKind.DRAW_SHAPE:
+            self._drawing_selection_operation = self._selection_operation()
+            if self._drawing_selection_operation == "replace" and not self._drawing_selection_path.isEmpty():
+                mods = QApplication.keyboardModifiers()
+                if not (mods & Qt.ShiftModifier or mods & Qt.AltModifier):
+                    before = self._selection_snapshot()
+                    self._drawing_selection_path = QPainterPath()
+                    after = self._selection_snapshot()
+                    self._push_selection_undo(before, after)
+            self._drawing_selection_gesture = [QPointF(world)]
+            self.update()
+            return True
         obj = self._drawing_selection_object()
         if obj is None:
             return False
@@ -13625,6 +13717,13 @@ class _CanvasLogic:
     def _continue_drawing_selection(
         self, world: QPointF, widget: QPointF,
     ) -> bool:
+        if self.tool == ToolKind.DRAW_SHAPE:
+            if not self._drawing_selection_gesture:
+                return False
+            if math.dist(self._drawing_selection_gesture[-1].toTuple(), world.toTuple()) >= 1.0 / max(self.scale, 0.05):
+                self._drawing_selection_gesture.append(QPointF(world))
+                self.update()
+            return True
         obj = self._drawing_selection_object()
         if obj is None:
             return False
@@ -13663,6 +13762,8 @@ class _CanvasLogic:
         return True
 
     def _finish_drawing_selection(self) -> bool:
+        if self.tool == ToolKind.DRAW_SHAPE:
+            return self._finish_draw_shape()
         obj = self._drawing_selection_object()
         if obj is not None and self._selection_transform_mode is not None:
             return self._finish_drawing_selection_transform(obj)
@@ -13745,6 +13846,19 @@ class _CanvasLogic:
         return True
 
     def _draw_drawing_selection(self, painter: QPainter) -> None:
+        if self.tool == ToolKind.DRAW_SHAPE:
+            painter.save()
+            painter.setBrush(QColor(255, 138, 36, 40))
+            painter.setPen(QPen(QColor("#ff8a24"), 1.5 / max(self.scale, 0.05), Qt.SolidLine))
+            if not self._drawing_selection_path.isEmpty():
+                painter.drawPath(self._drawing_selection_path)
+            if self._drawing_selection_gesture:
+                preview = QPainterPath()
+                preview.addPolygon(QPolygonF(self._drawing_selection_gesture))
+                preview.closeSubpath()
+                painter.drawPath(preview)
+            painter.restore()
+            return
         obj = self._drawing_selection_object()
         if obj is None:
             return
@@ -13812,6 +13926,67 @@ class _CanvasLogic:
             painter.setPen(QPen(QColor("#239cff")))
             painter.drawText(marker, "+" if operation == "add" else "−")
         painter.restore()
+
+    def _finish_draw_shape(self) -> bool:
+        gesture = self._drawing_selection_gesture
+        self._drawing_selection_gesture = []
+        if not gesture or len(gesture) < 3:
+            self._clear_drawing_selection()
+            self.update()
+            return True
+        polygon = QPolygonF(gesture)
+        polygon.append(gesture[0])
+        region = QPainterPath()
+        region.addPolygon(polygon)
+        region.closeSubpath()
+        if region.isEmpty():
+            self._clear_drawing_selection()
+            self.update()
+            return True
+        world_rect = region.boundingRect()
+        if self.chapter is None:
+            self._clear_drawing_selection()
+            return False
+        parent_id = self.active_layer_id or self.active_page_id
+        if not parent_id:
+            parent_id = self.chapter.root_page_ids[0] if self.chapter.root_page_ids else ""
+        if not parent_id or parent_id not in self.chapter.layers:
+            self._clear_drawing_selection()
+            return False
+        x, y, w, h = world_rect.x(), world_rect.y(), world_rect.width(), world_rect.height()
+        if w < 5 or h < 5:
+            self._clear_drawing_selection()
+            return False
+        try:
+            simplify_tolerance = float(getattr(self.settings, "draw_shape_simplify", 2.0))
+        except Exception:
+            simplify_tolerance = 2.0
+        nodes = []
+        poly_points = polygon.toList() if hasattr(polygon, "toList") else list(polygon)
+        step = max(1, int(len(poly_points) / 50))
+        sampled = poly_points[::step]
+        # simple Douglas-Peucker style reduction via tolerance
+        for pt in sampled:
+            if not nodes or math.hypot(pt.x() - nodes[-1].x, pt.y() - nodes[-1].y) > simplify_tolerance:
+                nodes.append(PathNode(x=float(pt.x()), y=float(pt.y())))
+        if len(nodes) < 3:
+            nodes = [PathNode(x=float(p.x()), y=float(p.y())) for p in [QPointF(x, y), QPointF(x + w, y), QPointF(x + w, y + h), QPointF(x, y + h)]]
+        before = self.chapter.to_dict()
+        bound = BoundGeometry.path(nodes, closed=True)
+        bound.primitive = "custom"
+        style = ShapeStyle(primary_color="#00000000", outline_thickness=2, outline_color="#FF000000")
+        try:
+            layer = self.chapter.add_layer(parent_id, "Panel", bound, style=style)
+        except Exception:
+            self._clear_drawing_selection()
+            return False
+        after = self.chapter.to_dict()
+        self.push_model_change(before, after, "Create Draw Shape")
+        self._clear_drawing_selection()
+        self.set_selection("layer", layer.layer_id)
+        self._invalidate_scene_cache()
+        self.update()
+        return True
 
     # ---- vector drawing tools -----------------------------------------
     def _selected_vector_drawing(self) -> VectorDrawingObject | None:

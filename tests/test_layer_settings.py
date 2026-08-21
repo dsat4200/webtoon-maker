@@ -198,6 +198,7 @@ def test_rectangle_mode_setting_is_global_and_not_document_undo(
     window = MainWindow()
     chapter, page, layer, raster = _window_document(window)
     window.canvas.set_selection("layer", layer.layer_id, False)
+    window.canvas.command_stack.clear()
     window.layer_settings.refresh()
     before = chapter.to_dict()
     try:
@@ -515,6 +516,7 @@ def test_common_text_visibility_commits_typing_before_property_undo(
     window.show()
     try:
         window.canvas.set_selection("object", text.object_id)
+        window.canvas.command_stack.clear()
         window.canvas._begin_text_session(text)
         window.canvas._text_cursor_position = len(text.text)
         window.canvas._text_selection_anchor = len(text.text)

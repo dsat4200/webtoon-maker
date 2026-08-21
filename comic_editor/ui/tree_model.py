@@ -340,13 +340,17 @@ class HierarchyModel(QAbstractItemModel):
             parent_layer = self.chapter.layers.get(item.entity_id)
             if parent_layer is None:
                 return False
-            return all(
-                kind == "object" and isinstance(
-                    self.chapter.objects.get(entity_id),
-                    (RasterObject, VectorDrawingObject),
-                )
-                for kind, entity_id in entities
-            )
+            for kind, entity_id in entities:
+                if kind == "layer":
+                    layer = self.chapter.layers.get(entity_id)
+                    if layer is None or layer.is_page:
+                        return False
+                elif kind == "object":
+                    if entity_id not in self.chapter.objects:
+                        return False
+                else:
+                    return False
+            return True
         payload = {"kind": entities[0][0], "id": entities[0][1]}
         if item.kind == "object":
             return False
@@ -477,5 +481,75 @@ class EyeVisibilityDelegate(QStyledItemDelegate):
                 current = index.data(Qt.CheckStateRole)
                 new_state = Qt.Unchecked if current == Qt.Checked else Qt.Checked
                 return model.setData(index, new_state, Qt.CheckStateRole)
+            return False
+        return super().editorEvent(event, model, option, index)
+
+
+class MaskOnlyRowDelegate(QStyledItemDelegate):
+    _mask_on = None
+    _mask_off = None
+
+    def _icons(self):
+        if MaskOnlyRowDelegate._mask_on is None:
+            from comic_editor.ui.icons import iconoir, iconoir_tinted
+            MaskOnlyRowDelegate._mask_on = iconoir("mask-square", 16)
+            MaskOnlyRowDelegate._mask_off = iconoir_tinted("mask-square", "#5A5A62", 16)
+        return MaskOnlyRowDelegate._mask_on, MaskOnlyRowDelegate._mask_off
+
+    def paint(self, painter, option, index):
+        if index.column() != 2:
+            super().paint(painter, option, index)
+            return
+        item = index.model().item_for_index(index) if hasattr(index.model(), "item_for_index") else None
+        chapter = getattr(index.model(), "chapter", None)
+        entity = None
+        if item and chapter is not None:
+            entity = chapter.layers.get(item.entity_id) if item.kind == "layer" else chapter.objects.get(item.entity_id)
+        if entity is None or bool(getattr(entity, "is_page", False)):
+            super().paint(painter, option, index)
+            return
+        mask_on, mask_off = self._icons()
+        is_mask = bool(getattr(entity, "mask_only", False))
+        opt = QStyleOptionViewItem(option)
+        self.initStyleOption(opt, index)
+        opt.text = ""
+        opt.icon = QIcon()
+        widget = option.widget
+        style = widget.style() if widget is not None else QApplication.style()
+        style.drawControl(QStyle.ControlElement.CE_ItemViewItem, opt, painter, widget)
+        display = index.data(Qt.DisplayRole) or ""
+        r = option.rect
+        painter.setPen(opt.palette.color(opt.palette.ColorRole.Text) if not (opt.state & QStyle.StateFlag.State_Selected) else opt.palette.color(opt.palette.ColorRole.HighlightedText))
+        text_rect = r.adjusted(4, 0, -22, 0)
+        painter.drawText(text_rect, Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft, str(display))
+        ix = r.right() - 18
+        iy = r.top() + (r.height() - 16) // 2
+        icon = mask_on if is_mask else mask_off
+        pix = icon.pixmap(16, 16)
+        painter.drawPixmap(ix, iy, pix)
+
+    def editorEvent(self, event, model, option, index):
+        if index.column() != 2 or not index.isValid():
+            return super().editorEvent(event, model, option, index)
+        if event.type() in (event.Type.MouseButtonRelease, event.Type.MouseButtonDblClick):
+            item = model.item_for_index(index)
+            chapter = getattr(model, "chapter", None)
+            if chapter is None:
+                return False
+            entity = chapter.layers.get(item.entity_id) if item.kind == "layer" else chapter.objects.get(item.entity_id)
+            if entity is None or bool(getattr(entity, "is_page", False)):
+                return False
+            r = option.rect
+            ix = r.right() - 18
+            iy = r.top() + (r.height() - 16) // 2
+            icon_rect = QRect(ix, iy, 16, 16)
+            pos = event.position().toPoint() if hasattr(event, "position") else event.pos()
+            if icon_rect.contains(pos):
+                before = chapter.to_dict()
+                entity.mask_only = not bool(getattr(entity, "mask_only", False))
+                after = chapter.to_dict()
+                model.dataChanged.emit(index, index, [Qt.DisplayRole])
+                model.mutationCommitted.emit(before, after, "Toggle mask only")
+                return True
             return False
         return super().editorEvent(event, model, option, index)

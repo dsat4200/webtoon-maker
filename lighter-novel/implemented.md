@@ -1,3 +1,61 @@
+tools
+- [x] add an eyedropper icon in the color picker (with hotkey setting). for now, samples from the whole image.
+- [x] new item in the color window besides picker and pallette - color history
+- [x] add the option to hide transform handles while drawing to pencil and eraser tool in tool settings. 
+- [x] add a transform tool for vector/raster that exposes the handles, and click-dragging or pen tap dragging in the bounds translates instead of drawing while in transform mode.
+- [x] add a "reset rotation" tool that only works as a hotkey. it should keep the scale and position navigation the same, but reset rotation of the canvas.
+- [x] line gradients with 2 points shouldn't have the 8 handle transform around them (its redundant)
+- [x] while having point selected in point select mode, pressing delete should delete the points you have selected.
+- [x] the click and drag handle outside a shape to translate it doesn't seem to work.
+- [x] add an export to png button that exports the current chapter to a full size png image. (add a folder where assets and chapters are called exports. the image name should 
+- [x] translating a vector by the handle on the bounds is drawing instead of translating
+	- translating should also be visible live (like raster does)
+	- 
+	- ## more
+- [x] remove the add fill tool. instead, the fill tool and add fill tool should be consolidated into one visibly. the add fill functionality (changing the background fill of a shape) should only happen if the shape is the currently active selected object.
+- [x] add the ability to right click a layer and click "show as mask only". this sets the layer to only appear in masks and not visually in the canvas on its own. however, if currently selected, it should show as normal for the sake of editing. these layers should have opacity say (percent) " - Mask only" 
+	- since opacity of a mask affects its alpha (0 to 1 mask value), if a mask has changes to the opacity slider on itself (or a mask on itself), that should affect its mask output contribution.
+- [x] fill tool in a raster object should let you fill only what's inside the active selection (in a raster layer). if a vector layer is the current active selection, fill shouldnt be visible as an option.
+- [x] vector fills are currently a little bugged. remove the vector fill code and instead, make fills like they are in clip studio paint, where a raster layer has to be the one to store the fill
+- [x] https://help.clip-studio.com/en-us/manual_en/420_fill/Fill_Tool.htm
+	- plan to implement all these features of the fill tool. tool settings should be in tool settings. Make sure to do so with optimal performance
+	- https://help.clip-studio.com/en-us/manual_en/420_fill/Advanced_Fill.htm
+	- implement the advanced fill tools too.
+	- reference layers should have its interface
+- [x] instead of gradients living in the tool settings gradient tools tab, "gradient" should be a tool, and its settings should be in tool settings instead of graident tools. Keep all the features though.
+- [x] add a "show as mask only" button to settings in the top right of objects. gradient should show its own settings in the top right window, instead of parent shape settings. it should also show the name, ignore direct parent mask, and show underlay settings, like raster and vector do.
+
+
+- [x] add a trash button to the left of the hide button in the opacity row. if multiple objects are selected, it can delete multiple. delete should prompt the user if they are sure. 
+- [x] instead of "lock opacity" with a checkmark, make it a lock icon button that is either pressed (on) or non-pressed (off)
+
+
+- [x] add a toggleable mask button with a mask icon to the right of the opacity slider (thats either pressed or not pressed). if pressed, the object is set to view as mask only (the feature that's currently only visible by right click)
+	- instead of "mask only" text, put that show as mask only icon toggle button to the right of the opacity percent value, that's either pressed or unpressed.
+- [x] change the simple checkbox on each object to a toggleable eyeball icon button.
+- [x]  show as mask only button icon should be different from the use mask / toggle mask mode button. use https://iconoir.com mask-square icon.
+- [x] current tool tool settings while a gradient is selected should show the settings,, instead of just showing them below the gradient
+- [x] add a delete operation, where, if delete hotkey is pressed (just as a hotkey for now), if on a vector layer or raster layer, it deletes everything on that layer (without asking for confirmation)
+
+bugs:
+- [x] text move handles 
+- [x] vector edit point preview in a scaled object shows the non-transformed points. also, make the actual point icons about 20 percent smaller, and make their size and transparency settable in tool settings with sliders. also include a toggle to show or hide them, and they should be hidden by default.
+![[Pasted image 20260816003707.png]]
+- ![[Pasted image 20260816190558.png]]
+- the color wheel shows the wrong hue.
+
+later
+- multi object select support
+- lasso fill support
+- MODIFIER STACK?
+	- for instance, smudge tool could have parameters and strokes. the strokes could be manipulated?
+	- params:
+		- insensity
+	- modifers can be moved between objects
+	- a modifier can apply to multiple objects and act as a modifier to any object type (acting as an overlay, perhaps like a shader almost?)
+
+
+
 - [x] modifier strengths and parameters (anything with a slider that has a min and a max pretty much) have a box to the left that let you attach a "mask" to them
 - [x] a mask is a tone map - black and white, 0 and 1 (and everything between, greyscale) that maps to the intensity of said parameter. 
 - [x] masks are a selected list of objects, along with an extra selection of pixels, almost like a raster layer, that are added together. an object's alpha channel is what contributes to the mask, pretty much (an alpha of all its pixels). masks can later be used for other things. 

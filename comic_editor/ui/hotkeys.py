@@ -130,11 +130,6 @@ class ChordCaptureEdit(QLineEdit):
             self.clearFocus()
             event.accept()
             return
-        if key in {int(Qt.Key_Backspace), int(Qt.Key_Delete)}:
-            self.setChord("")
-            self.chordChanged.emit("")
-            event.accept()
-            return
         if not self._capturing:
             self._pressed.clear()
             self._candidate.clear()

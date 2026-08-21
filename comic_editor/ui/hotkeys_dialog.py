@@ -58,6 +58,11 @@ class HotkeysDialog(QDialog):
             row = QWidget()
             row_layout = QHBoxLayout(row)
             row_layout.setContentsMargins(0, 0, 0, 0)
+            clear = QPushButton("×")
+            clear.setFixedSize(20, 20)
+            clear.setToolTip("Clear hotkey")
+            clear.clicked.connect(lambda checked=False, e=editor: (e.setChord(""), e.chordChanged.emit("")))
+            row_layout.addWidget(clear)
             row_layout.addWidget(editor, 1)
             if action_id in self.TOOL_ACTIONS:
                 hold = QCheckBox("Hold")
