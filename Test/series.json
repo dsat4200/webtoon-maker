@@ -12,14 +12,12 @@
       "name": "Chapter 2"
     }
   ],
-  "primary_color": "#FFDE0007",
+  "primary_color": "#FFFFFFFF",
   "secondary_color": "#FFFFFFFF",
   "color_history": [
-    "#FFDE0007",
-    "#FF90DE00",
-    "#FFF4F4F4",
-    "#FFFF0000",
+    "#FFFFFFFF",
     "#FF000000",
+    "#FFFF0000",
     "#FFA3765C",
     "#FF5C63A3",
     "#FF34396B"

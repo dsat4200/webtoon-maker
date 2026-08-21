@@ -733,10 +733,6 @@
         },
         {
           "kind": "object",
-          "id": "9237cfa717f84f3d8ba70a84f408eca8"
-        },
-        {
-          "kind": "object",
           "id": "ed8d7ae8ab1e4fa29307e11f7a9e2c1f"
         }
       ],
@@ -819,7 +815,7 @@
         "end_cap": "round"
       },
       "grid_override": null,
-      "last_raster_id": "ed8d7ae8ab1e4fa29307e11f7a9e2c1f",
+      "last_raster_id": "08762f40621e449d94d0f374cca624de",
       "compound_enabled": false,
       "compound_operation": "add",
       "ignore_parent_mask": false,
@@ -24821,136 +24817,50 @@
               "opacity": 0.10527339857115361
             }
           ]
+        },
+        {
+          "id": "3b460fd4f55843baab54824a76f273d2",
+          "color": "#FFDE0007",
+          "closed": false,
+          "start_cap": "round",
+          "end_cap": "round",
+          "render_revision": 0,
+          "points": [
+            {
+              "id": "21cf399e0d2643309cb5b8f80244fae9",
+              "position": [
+                346.1968664008646,
+                1428.1123897889263
+              ],
+              "incoming": null,
+              "outgoing": [
+                346.4810956816619,
+                1428.1123897889263
+              ],
+              "width": 12.0,
+              "opacity": 0.9999999195337343
+            },
+            {
+              "id": "b600a4a2d37e459a9c28b1cd6af01126",
+              "position": [
+                347.0495542432564,
+                1428.1123897889263
+              ],
+              "incoming": [
+                346.76532496245915,
+                1428.1123897889263
+              ],
+              "outgoing": null,
+              "width": 12.0,
+              "opacity": 0.9999999195337343
+            }
+          ]
         }
       ],
       "fill_child_ids": [],
-      "drawing_revision": 19,
+      "drawing_revision": 20,
       "transform_frame": null,
       "transform_quad": null
-    },
-    {
-      "id": "9237cfa717f84f3d8ba70a84f408eca8",
-      "type": "gradient",
-      "name": "Gradient 1",
-      "custom_name": false,
-      "parent_layer_id": "79da821594e540f89fde54676fe51f6d",
-      "position": [
-        0.0,
-        0.0
-      ],
-      "visible": false,
-      "opacity": 1.0,
-      "opacity_locked": true,
-      "geometry_reference": "direct",
-      "ignore_parent_mask": false,
-      "underlay_opacity": 0.0,
-      "modifier_ids": [],
-      "opacity_mask": null,
-      "gradient_type": "color_fill",
-      "field_type": "line",
-      "line_field": {
-        "geometry": {
-          "type": "path",
-          "closed": false,
-          "primitive": "custom",
-          "nodes": [
-            {
-              "id": "5b818740e89747b49112a4c24081538e",
-              "position": [
-                810.0,
-                2160.0
-              ],
-              "point_type": "vector",
-              "incoming": null,
-              "outgoing": null,
-              "handles_locked": true,
-              "roundness": 0.0,
-              "roundness_enabled": false,
-              "width_multiplier": 1.0
-            },
-            {
-              "id": "fc6298cf330b4664ae96d6857d2ecb17",
-              "position": [
-                420.0,
-                2160.0
-              ],
-              "point_type": "bezier",
-              "incoming": [
-                540.0,
-                2310.0
-              ],
-              "outgoing": [
-                300.0,
-                2010.0
-              ],
-              "handles_locked": true,
-              "roundness": 0.0,
-              "roundness_enabled": false,
-              "width_multiplier": 1.0
-            },
-            {
-              "id": "cde2318f8ab24d0585b12e41e773f4da",
-              "position": [
-                300.0,
-                1890.0
-              ],
-              "point_type": "vector",
-              "incoming": null,
-              "outgoing": null,
-              "handles_locked": true,
-              "roundness": 0.0,
-              "roundness_enabled": false,
-              "width_multiplier": 1.0
-            }
-          ],
-          "additional_contours": []
-        },
-        "direction_mode": "parallel",
-        "reverse_direction": false,
-        "perpendicular_distance": 120.0
-      },
-      "radial_field": {
-        "origin": [
-          540.0,
-          540.0
-        ],
-        "radii": [
-          270.0,
-          270.0
-        ],
-        "rotation": 0.0,
-        "ellipse_enabled": false,
-        "center_auto": true,
-        "manual_center": null,
-        "reverse_direction": false,
-        "uniform": false,
-        "distance": 120.0
-      },
-      "shape_field": {
-        "center_auto": true,
-        "manual_center": null,
-        "reverse_direction": false,
-        "uniform": false,
-        "distance": 120.0
-      },
-      "gradient_revision": 1509,
-      "ramp": {
-        "value_type": "color",
-        "interpolation": "linear",
-        "stops": [
-          {
-            "id": "234590b119bd4324834b8f3b470a15dc",
-            "position": 0.0,
-            "color": "#FF000000"
-          },
-          {
-            "id": "097b57d7aaa14afab624e8beec78783e",
-            "position": 1.0,
-            "color": "#00FFFFFF"
-          }
-        ]
-      },
-      "loaded_preset_id": ""
     },
     {
       "id": "ed8d7ae8ab1e4fa29307e11f7a9e2c1f",
@@ -25036,37 +24946,22 @@
       "id": "be989ab507264fbeb3631382c30bbcd3",
       "name": "gradient",
       "saved": true,
-      "contributors": [
-        {
-          "kind": "object",
-          "id": "9237cfa717f84f3d8ba70a84f408eca8"
-        }
-      ],
-      "revision": 8
+      "contributors": [],
+      "revision": 9
     },
     {
       "id": "ed03c08775154a83813c65717c69d6f4",
       "name": "",
       "saved": false,
-      "contributors": [
-        {
-          "kind": "object",
-          "id": "9237cfa717f84f3d8ba70a84f408eca8"
-        }
-      ],
-      "revision": 3
+      "contributors": [],
+      "revision": 4
     },
     {
       "id": "cea864392ba6444eaa1d44e7bb1f7306",
       "name": "",
       "saved": false,
-      "contributors": [
-        {
-          "kind": "object",
-          "id": "9237cfa717f84f3d8ba70a84f408eca8"
-        }
-      ],
-      "revision": 1
+      "contributors": [],
+      "revision": 2
     }
   ]
 }

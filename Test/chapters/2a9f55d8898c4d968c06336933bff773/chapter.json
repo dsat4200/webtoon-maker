@@ -1,5 +1,5 @@
 {
-  "schema_version": 18,
+  "schema_version": 20,
   "id": "2a9f55d8898c4d968c06336933bff773",
   "name": "Chapter 1",
   "size": [
@@ -53,6 +53,8 @@
       ],
       "visible": true,
       "opacity": 1.0,
+      "mask_only": false,
+      "fill_reference": false,
       "translation": [
         0.0,
         0.0
@@ -157,6 +159,8 @@
       ],
       "visible": false,
       "opacity": 1.0,
+      "mask_only": false,
+      "fill_reference": false,
       "translation": [
         0.0,
         0.0
@@ -275,6 +279,8 @@
       ],
       "visible": false,
       "opacity": 1.0,
+      "mask_only": false,
+      "fill_reference": false,
       "translation": [
         0.0,
         0.0
@@ -384,6 +390,8 @@
       "children": [],
       "visible": true,
       "opacity": 1.0,
+      "mask_only": false,
+      "fill_reference": false,
       "translation": [
         0.0,
         0.0
@@ -483,6 +491,8 @@
       ],
       "visible": true,
       "opacity": 1.0,
+      "mask_only": false,
+      "fill_reference": false,
       "translation": [
         0.0,
         0.0
@@ -595,6 +605,8 @@
       ],
       "visible": true,
       "opacity": 1.0,
+      "mask_only": false,
+      "fill_reference": false,
       "translation": [
         39.22850608790452,
         -62.58128109664176
@@ -692,6 +704,8 @@
       "children": [],
       "visible": true,
       "opacity": 1.0,
+      "mask_only": false,
+      "fill_reference": false,
       "translation": [
         0.0,
         0.0
@@ -771,6 +785,8 @@
       ],
       "visible": false,
       "opacity": 1.0,
+      "mask_only": false,
+      "fill_reference": false,
       "translation": [
         -608.0976744157647,
         -594.9422784527419
@@ -866,6 +882,8 @@
       "children": [],
       "visible": true,
       "opacity": 1.0,
+      "mask_only": false,
+      "fill_reference": false,
       "translation": [
         0.0,
         0.0
@@ -936,6 +954,8 @@
       "children": [],
       "visible": true,
       "opacity": 1.0,
+      "mask_only": false,
+      "fill_reference": false,
       "translation": [
         0.0,
         0.0
@@ -1011,6 +1031,8 @@
       ],
       "visible": true,
       "opacity": 1.0,
+      "mask_only": false,
+      "fill_reference": false,
       "translation": [
         0.0,
         0.0
@@ -1135,6 +1157,8 @@
       ],
       "visible": false,
       "opacity": 1.0,
+      "mask_only": false,
+      "fill_reference": false,
       "opacity_locked": true,
       "geometry_reference": "direct",
       "ignore_parent_mask": false,
@@ -1163,6 +1187,8 @@
       ],
       "visible": true,
       "opacity": 1.0,
+      "mask_only": false,
+      "fill_reference": false,
       "opacity_locked": true,
       "geometry_reference": "direct",
       "ignore_parent_mask": false,
@@ -23574,7 +23600,6 @@
           ]
         }
       ],
-      "fill_child_ids": [],
       "drawing_revision": 423,
       "transform_frame": [
         230.98254511727015,
@@ -23613,6 +23638,8 @@
       ],
       "visible": true,
       "opacity": 1.0,
+      "mask_only": false,
+      "fill_reference": false,
       "opacity_locked": true,
       "geometry_reference": "direct",
       "ignore_parent_mask": false,
@@ -23647,6 +23674,8 @@
       ],
       "visible": true,
       "opacity": 1.0,
+      "mask_only": false,
+      "fill_reference": false,
       "opacity_locked": true,
       "geometry_reference": "direct",
       "ignore_parent_mask": false,
@@ -23654,7 +23683,6 @@
       "modifier_ids": [],
       "opacity_mask": null,
       "strokes": [],
-      "fill_child_ids": [],
       "drawing_revision": 0,
       "transform_frame": null,
       "transform_quad": null
@@ -23671,6 +23699,8 @@
       ],
       "visible": true,
       "opacity": 1.0,
+      "mask_only": false,
+      "fill_reference": false,
       "opacity_locked": true,
       "geometry_reference": "direct",
       "ignore_parent_mask": false,
@@ -23731,6 +23761,8 @@
       ],
       "visible": true,
       "opacity": 0.64,
+      "mask_only": false,
+      "fill_reference": false,
       "opacity_locked": false,
       "geometry_reference": "direct",
       "ignore_parent_mask": false,
@@ -45056,7 +45088,6 @@
           ]
         }
       ],
-      "fill_child_ids": [],
       "drawing_revision": 45,
       "transform_frame": [
         -102.15432694378671,
@@ -45095,6 +45126,8 @@
       ],
       "visible": true,
       "opacity": 1.0,
+      "mask_only": false,
+      "fill_reference": false,
       "opacity_locked": true,
       "geometry_reference": "direct",
       "ignore_parent_mask": false,
@@ -53448,7 +53481,6 @@
           ]
         }
       ],
-      "fill_child_ids": [],
       "drawing_revision": 140,
       "transform_frame": null,
       "transform_quad": null
@@ -53465,6 +53497,8 @@
       ],
       "visible": true,
       "opacity": 1.0,
+      "mask_only": false,
+      "fill_reference": false,
       "opacity_locked": true,
       "geometry_reference": "direct",
       "ignore_parent_mask": false,
@@ -53495,6 +53529,8 @@
       ],
       "visible": true,
       "opacity": 1.0,
+      "mask_only": false,
+      "fill_reference": false,
       "opacity_locked": true,
       "geometry_reference": "direct",
       "ignore_parent_mask": false,
@@ -53546,6 +53582,8 @@
       ],
       "visible": true,
       "opacity": 1.0,
+      "mask_only": false,
+      "fill_reference": false,
       "opacity_locked": true,
       "geometry_reference": "direct",
       "ignore_parent_mask": false,
@@ -53650,6 +53688,8 @@
       ],
       "visible": true,
       "opacity": 1.0,
+      "mask_only": false,
+      "fill_reference": false,
       "opacity_locked": true,
       "geometry_reference": "direct",
       "ignore_parent_mask": false,
@@ -53757,6 +53797,8 @@
       ],
       "visible": true,
       "opacity": 1.0,
+      "mask_only": false,
+      "fill_reference": false,
       "opacity_locked": true,
       "geometry_reference": "direct",
       "ignore_parent_mask": false,
@@ -53791,6 +53833,8 @@
       ],
       "visible": true,
       "opacity": 1.0,
+      "mask_only": false,
+      "fill_reference": false,
       "opacity_locked": true,
       "geometry_reference": "direct",
       "ignore_parent_mask": false,
