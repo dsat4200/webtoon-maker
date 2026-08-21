@@ -66,7 +66,7 @@ from comic_editor.core.vector_geometry import (
     corridor_contains, corridor_hits_path, corridor_path_intervals,
     cubic_derivative, cubic_eval, cubic_subsegment,
     distance_to_polyline, erase_stroke_by_corridor,
-    fit_freehand, flatten_stroke, interpolate_stroke_attribute,
+    fit_cubic_path, fit_freehand, flatten_stroke, interpolate_stroke_attribute,
     nearest_on_path,
     nearest_on_stroke, path_self_intersections, point_in_polygon,
     path_intersections, simplify_cubic_segments,
@@ -14022,46 +14022,77 @@ class _CanvasLogic:
             simplify_tolerance = float(getattr(self.settings, "draw_shape_simplify", 1.0))
         except Exception:
             simplify_tolerance = 1.0
-        pts = [QPointF(p) for p in outline_poly]
-        if len(pts) > 1 and pts[0] == pts[-1]:
-            pts = pts[:-1]
-        def _perp_dist(pt, a, b):
-            if a == b:
-                return math.hypot(pt.x() - a.x(), pt.y() - a.y())
-            dx = b.x() - a.x()
-            dy = b.y() - a.y()
-            t = ((pt.x() - a.x()) * dx + (pt.y() - a.y()) * dy) / (dx * dx + dy * dy)
-            t = max(0.0, min(1.0, t))
-            proj = QPointF(a.x() + t * dx, a.y() + t * dy)
-            return math.hypot(pt.x() - proj.x(), pt.y() - proj.y())
-        def _dp(points, eps):
-            if len(points) <= 2:
-                return points[:]
-            a, b = points[0], points[-1]
-            max_d = -1.0
-            idx = -1
-            for i in range(1, len(points) - 1):
-                d = _perp_dist(points[i], a, b)
-                if d > max_d:
-                    max_d = d
-                    idx = i
-            if max_d > eps:
-                left = _dp(points[: idx + 1], eps)
-                right = _dp(points[idx:], eps)
-                return left[:-1] + right
-            return [a, b]
-        max_pts = 800
-        if len(pts) > max_pts:
-            step = max(1, len(pts) // max_pts)
-            pts = pts[::step]
-        simplified = _dp(pts, simplify_tolerance) if len(pts) > 2 else pts[:]
-        if len(simplified) < 6 and len(pts) >= 6:
-            simplified = pts[:: max(1, len(pts) // 60)]
-        if len(simplified) > 300:
-            simplified = simplified[:: max(1, len(simplified) // 300)]
-        nodes = [PathNode(x=float(p.x()), y=float(p.y())) for p in simplified]
-        if len(nodes) < 3:
-            nodes = [PathNode(x=float(p.x()), y=float(p.y())) for p in [QPointF(x, y), QPointF(x + w, y), QPointF(x + w, y + h), QPointF(x, y + h)]]
+        outline_pts = [(float(p.x()), float(p.y())) for p in outline_poly]
+        if len(outline_pts) > 1 and outline_pts[0] == outline_pts[-1]:
+            outline_pts = outline_pts[:-1]
+        if len(outline_pts) > 800:
+            step = max(1, len(outline_pts) // 800)
+            outline_pts = outline_pts[::step]
+        nodes: list[PathNode] = []
+        try:
+            fitted = fit_cubic_path(outline_pts, error=max(0.5, simplify_tolerance))
+        except Exception:
+            fitted = []
+        if fitted and len(fitted) <= 120:
+            for idx, fc in enumerate(fitted):
+                c = fc.cubic
+                sx, sy = float(c[0][0]), float(c[0][1])
+                ox, oy = float(c[1][0]), float(c[1][1])
+                prev_c = fitted[idx - 1].cubic if idx > 0 else fitted[-1].cubic
+                ix, iy = float(prev_c[2][0]), float(prev_c[2][1])
+                px, py = float(prev_c[3][0]), float(prev_c[3][1])
+                # For closed shape, start point of current cubic should equal end of previous; use c[0] as node pos
+                # Handle duplicate due to floating error: if current start not near previous end, still use c[0]
+                is_out = math.hypot(ox - sx, oy - sy) > 0.5
+                is_in = math.hypot(ix - sx, iy - sy) > 0.5
+                pt_type = "bezier" if (is_out or is_in) else "vector"
+                nodes.append(PathNode(
+                    x=sx, y=sy,
+                    point_type=pt_type,
+                    incoming=(ix, iy) if is_in else None,
+                    outgoing=(ox, oy) if is_out else None,
+                    handles_locked=True,
+                ))
+            if len(nodes) >= 3:
+                for n in nodes:
+                    n.validate()
+            else:
+                nodes = []
+        if not nodes or len(nodes) < 3:
+            pts = [QPointF(x, y) for x, y in outline_pts]
+            def _perp_dist(pt, a, b):
+                if a == b:
+                    return math.hypot(pt.x() - a.x(), pt.y() - a.y())
+                dx = b.x() - a.x()
+                dy = b.y() - a.y()
+                t = ((pt.x() - a.x()) * dx + (pt.y() - a.y()) * dy) / (dx * dx + dy * dy)
+                t = max(0.0, min(1.0, t))
+                proj = QPointF(a.x() + t * dx, a.y() + t * dy)
+                return math.hypot(pt.x() - proj.x(), pt.y() - proj.y())
+            def _dp(points, eps):
+                if len(points) <= 2:
+                    return points[:]
+                a, b = points[0], points[-1]
+                max_d = -1.0
+                idx = -1
+                for i in range(1, len(points) - 1):
+                    d = _perp_dist(points[i], a, b)
+                    if d > max_d:
+                        max_d = d
+                        idx = i
+                if max_d > eps:
+                    left = _dp(points[: idx + 1], eps)
+                    right = _dp(points[idx:], eps)
+                    return left[:-1] + right
+                return [a, b]
+            simplified = _dp(pts, simplify_tolerance) if len(pts) > 2 else pts[:]
+            if len(simplified) < 6 and len(pts) >= 6:
+                simplified = pts[:: max(1, len(pts) // 60)]
+            if len(simplified) > 300:
+                simplified = simplified[:: max(1, len(simplified) // 300)]
+            nodes = [PathNode(x=float(p.x()), y=float(p.y())) for p in simplified]
+            if len(nodes) < 3:
+                nodes = [PathNode(x=float(p.x()), y=float(p.y())) for p in [QPointF(x, y), QPointF(x + w, y), QPointF(x + w, y + h), QPointF(x, y + h)]]
         before = self.chapter.to_dict()
         bound = BoundGeometry.path(nodes, closed=True)
         bound.primitive = "custom"

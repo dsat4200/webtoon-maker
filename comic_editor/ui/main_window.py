@@ -402,7 +402,7 @@ class MainWindow(QMainWindow):
             ("Rectangle", "plus-square-dashed", ToolKind.BOX_BOUND),
             ("Circle", "circle", ToolKind.CIRCLE_BOUND),
             ("Free Shape", "path-arrow", ToolKind.SHAPE_CREATE),
-            ("Draw Shape", "selective-tool", ToolKind.DRAW_SHAPE),
+            ("Draw Shape", "edit-pencil", ToolKind.DRAW_SHAPE),
         ):
             option = self.shapes_category.addTool(label, icon_name)
             option.setCheckable(True)
@@ -418,7 +418,7 @@ class MainWindow(QMainWindow):
         self.drawing_selection_buttons: dict[ToolKind, QToolButton] = {}
         for label, icon_name, tool in (
             ("Rectangle Select", "select-window", ToolKind.DRAW_SELECT_RECT),
-            ("Lasso Select", "selective-tool", ToolKind.DRAW_SELECT_LASSO),
+            ("Lasso Select", "agile", ToolKind.DRAW_SELECT_LASSO),
             ("Stroke Select", "frame-select", ToolKind.DRAW_SELECT_STROKE),
         ):
             option = self.drawing_selection_category.addTool(label, icon_name)
