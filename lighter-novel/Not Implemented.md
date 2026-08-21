@@ -13,6 +13,39 @@
 - [ ] show as mask only button should appear pressed if its enabled on the selected layer, unpressed if not (as in, with the blue outline and pressed background color)
 
 
+## Cage Transform
+- https://help.clip-studio.com/en-us/manual_en/360_transform/Types_of_transformations.htm#1004087
+- just like mesh transformation from clip studio paint. make it a tool, and also make a modifier version with the same parameters
+- the modifier tool, if used on a raster or vector, acts like just clip studio paint. it is a tool that can be used and is destructive (unless you undo.). it does not add a modifier.
+- by contrast, the cage transform modifier can not be added to rasters and vectors (intended for objects that can't be traditionally drawn on, (blender shapes, image layers for now)
+- if the tool is used on a blender shape or image layer, it should switch to the modifier stack, add the modifier to the stack, and select it, exposing the gizmos.
+- if used on a raster/vector, no modifier.
+- both expose the same settings. in the raster/vector objects they are in tool settings, in the other 2 they are in modifier settings.
+	- show a grid of points that can be transformed, with OK and cancel gizmos below. 
+	- additionally, show (with a margin outside) the traditional 8 handles with translate support, rotate handle, and free/uniform toggle that we've come to expect, outside that grid.
+	- also include a pivot point as a gizmo.
+	- include a slider in tool settings/mod. settings that lets the user change the "smoothness" of the cage transformations (interpolation kind of thing? not sure how this works behind the scenes)
+	- horizontal, vertical flip should be gizmos though (align-vertical-centers as the vertical flip icon, align-horizontal-centers for the horizontal flip icon)
+	- in tool/modifier settings, include the flip buttons.)
+	- no need for the center of rotation option since we have a pivot point gizmo.
+	- if used on an image, always keep original image since on an image its a modifier and those are non destructive. don't show this option.
+	- number of horizontal and vertical lattice points should be options with a slider and inputtable with keyboard numbers to the right. vertical and horizontal should have their own rows in the UI.
+	- include interpolation mode.
+	- allow for multi-point selection like csp has.
+	- ignore puppet warp for now (we can add that in a later pass.)
+	- cage transform modifier is incompatible with vector/raster objects (only the operation is supported)
+	- modifiers can now be selected. being selected makes them blueish with a blue outline (like buttons do when toggled). when a modifier is selected, it should expose gizmos. for now, no modifiers have gizmos though except for this cage transform one for now.
+		- modifiers can only be selected in modifier mode. switching tabs out of modifier mode retains the selection but hides the modifier gizmos
+		- deselecting the object also hides the gizmos but remembers the selection.
+	- cage transformation used during a multi selection of rasters/vectors should affect any selected objects.
+		- if all objects are vectors/rasters, dont create a modifier when doing this.
+		- if mixed, error popup
+	- adding a cage transform modifier while multiple objects are selected, if all objects are compatible with mesh transform modifier, should add the modifier to all selected, and link them. (the same should be the case for all modifiers, really - if all in a selection are compatible with the modifier and its added , they should share a linked modifier)
+		- trying to add a modifier that is not compatible in a multi selection should throw an error popup.
+		- trying to use modifier tool on a multi selection with incompatible objects should also throw an error popup. these should tell the user which are not compatible via text in the popup, and also highlighting those objects red in the outliner.
+	- cage transform on a shape should affect the shape and all its children (without needing them to have a linked modifier)
+- implement cage transform while maintaining maximum performance. performance is a top concern for cases like these.
+
 
 ## thought balloons and screaming
 i still need to add border types for shapes, like round bubbly ones for thought balloons or pointy ones for screaming (or just have it be one with a sharpness value and sizing parameters... hmmm
@@ -30,32 +63,6 @@ psd brush support?
 ## review the fill tool
 
 
-## Cage Transform
-- https://help.clip-studio.com/en-us/manual_en/360_transform/Types_of_transformations.htm#1004087
-- just like mesh transformation from clip studio paint. make it a tool, and also make a modifier version with the same parameters
-- these are two different types
-- the modifier tool, if used on a raster or vector, acts like just clip studio paint. it is a tool that can be used and is destructive (unless you undo.)
-- by contrast, the cage transform modifier can not be added to rasters and vectors (intended for objects that can't be traditionally drawn on, (blender shapes, image layers for now)
-- both expose the same settings. in the raster/vector objects they are in tool settings, in the other 2 they are in modifier settings.
-	- show a grid of points that can be transformed, with OK and cancel gizmos below. 
-	- additionally, show (with a margin outside) the traditional 8 handles with translate support, rotate handle, and free/uniform toggle that we've come to expect, outside that grid.
-	- also include a pivot point as a gizmo.
-	- horizontal, vertical flip should be gizmos though (align-vertical-centers as the vertical flip icon, align-horizontal-centers for the horizontal flip icon)
-	- in tool/modifier settings, include the flip buttons.)
-	- no need for the center of rotation option since we have a pivot point gizmo.
-	- if used on an image, always keep original image since on an image its a modifier and those are non destructive. don't show this option.
-	- number of horizontal and vertical lattice points should be options with a slider and inputtable with keyboard numbers to the right. vertical and horizontal should have their own rows in the UI.
-	- include interpolation mode.
-	- allow for multi-point selection like csp has.
-	- ignore puppet warp for now (we can add that in a later pass.)
-	- modifiers can now be selected. being selected makes them blueish with a blue outline (like buttons do when toggled). when a modifier is selected, it should expose gizmos. for now, no modifiers have gizmos though except for this cage transform one for now.
-		- modifiers can only be selected in modifier mode. switching tabs out of modifier mode retains the selection but hides the modifier gizmos
-		- deselecting the object also hides the gizmos but remembers the selection.
-	- mesh transformation used during a multi selection of rasters/vectors should affect any selected objects.
-	- adding a mesh transform modifier while multiple objects are selected, if all objects are compatible with mesh transform modifier, should add the modifier to all selected, and link them. (the same should be the case for all modifiers, really - if all in a selection are compatible with the modifier and its added , they should share a linked modifier)
-		- trying to add a modifier that is not compatible in a multi selection should throw an error popup.
-		- trying to use modifier tool on a multi selection with incompatible objects should also throw an error popup. these should tell the user which are not compatible via text in the popup, and also highlighting those objects red in the outliner.
-- implement cage transform while maintaining maximum performance.
 
 smoothing support for pencil/eraser
 
