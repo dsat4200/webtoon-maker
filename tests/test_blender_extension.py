@@ -32,7 +32,7 @@ def test_extension_manifest_declares_blender_45_windows_and_network_permission()
     )
     assert manifest["schema_version"] == "1.0.0"
     assert manifest["id"] == "webtoon_comic_views"
-    assert manifest["version"] == "0.2.0"
+    assert manifest["version"] == "0.3.0"
     assert manifest["blender_version_min"] == "4.5.0"
     assert manifest["platforms"] == ["windows-x64"]
     assert "network" in manifest["permissions"]
@@ -100,7 +100,7 @@ def test_extension_installs_and_enables_from_restricted_registration_context(
         check=False,
     )
     assert build.returncode == 0, build.stdout + "\n" + build.stderr
-    package = package_dir / "webtoon_comic_views-0.2.0.zip"
+    package = package_dir / "webtoon_comic_views-0.3.0.zip"
     assert package.is_file()
 
     environment = dict(os.environ)

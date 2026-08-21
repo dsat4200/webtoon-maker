@@ -66,7 +66,7 @@ webtoon-maker/
 │   │   ├── blender_manifest.toml
 │   │   ├── build.ps1
 │   │   └── README.md
-│   └── webtoon_comic_views-0.2.0.zip # installable build artifact
+│   └── webtoon_comic_views-0.3.0.zip # installable build artifact
 ├── tests/                           # offscreen Qt and pure-core regression suite
 ├── docs/
 │   ├── llm/                        # this LLM-oriented documentation set
@@ -148,7 +148,7 @@ Docstring-only package markers: "Document, persistence, and raster core", "PySid
 
 The canonical saved-data model and invariant layer (about 3,900 lines).
 
-- Declares chapter schema version 20, series schema version 17, chapter width 1080, default height 3240, growth margin 1080, and chapter/asset document kinds.
+- Declares chapter schema version 21, series schema version 17, chapter width 1080, default height 3240, growth margin 1080, and chapter/asset document kinds.
 - Normalizes colors to canonical ARGB and generates stable UUID IDs.
 - Defines grids, path nodes/contours, shape style, and unified rectangle/ellipse/custom `BoundGeometry`.
 - Defines `ToneMask`, `ParameterMaskBinding`, and the HSL/Blur/Outline `ModifierInstance` records.
@@ -208,7 +208,7 @@ Defines small extensibility registries for object and bound types. It registers 
 
 ### `comic_editor/core/settings.py`
 
-Defines per-user editor settings, version 20, including the loopback Blender bridge endpoint and token.
+Defines per-user editor settings, version 21, including persisted global grid defaults/visibility and the loopback Blender bridge endpoint and token.
 
 - Supplies default hotkeys (including Gradient, Eyedropper, Reset Rotation, and Paste Image) and Hold flags (Eyedropper only).
 - Defines validated formatting-only `TextPreset` values.
@@ -409,27 +409,27 @@ The application-wide dark Qt stylesheet. It styles toolbars, scroll areas, split
 
 ### `blender_extension/webtoon_comic_views/__init__.py`
 
-Add-on registration and UI: property groups, view operators (New/Duplicate/Update/Delete/Revert/Set Stream Frame/Activate/Start-Stop Bridge/Include-Remove Property), sidebar panel, UIList, depsgraph/load handlers, and auto-start timers. Preferences default the loopback port to 47837 with a token.
+Add-on registration and UI: property groups, automatic row activation, explicit Save/Load/Render/Revert operators, New/Duplicate/Delete, camera-only Set Stream Frame, bridge/property operators, the `.blend` overlay toggle, sidebar panel, UIList, depsgraph/load handlers, and auto-start timers. Preferences include the loopback connection and render-only Always Hide Overlays toggle.
 
 ### `bridge.py`
 
-`BridgeServer` socket/read threads bound to 127.0.0.1 that never touch Blender data off the main thread; token and protocol check before authorization. `BridgeRuntime` holds a single connected editor, ticks dirty-state checking, renders committed/preview frames, and publishes triple-buffered shared memory that only overwrites acknowledged slots, with Update-before-switch sequencing.
+`BridgeServer` socket/read threads bound to 127.0.0.1 that never touch Blender data off the main thread; token and protocol check before authorization. `BridgeRuntime` holds a single connected editor, ticks dirty-state checking, transactionally renders only saved committed state, renders temporary working previews, manages one-save Revert history, and publishes triple-buffered shared memory that only overwrites acknowledged slots.
 
 ### `renderer.py`
 
-`RenderFrame` and `GPUOffScreen` viewport capture via bound `RegionView3D` matrices with crop projection; flattens Blender's channel-planar buffer to top-down straight-alpha RGBA8 (fixing the vertical-stripes bug); produces 256-pixel thumbnails and validates 64–4096 px / 16 MP bounds.
+`RenderFrame` and camera-derived `GPUOffScreen` capture with a camera-gate crop projection; can suppress viewport overlays transactionally; flattens Blender's channel-planar buffer to top-down straight-alpha RGBA8; derives thumbnails from successful full renders and validates 64–4096 px / 16 MP bounds.
 
 ### `state.py`
 
-Geometry-free scene state capture/restore, `STATE_VERSION = 2`: camera/view layer, transforms, visibility, collections, lights, shape keys, modifier enable flags, viewport shading, and registered RNA properties; stable `webtoon_comic_uuid` custom IDs with duplicate repair; `state_digest`/`apply_state` round-trips.
+Geometry-free scene state capture/restore, `STATE_VERSION = 3`: camera/view layer, full pose controls, transforms, visibility, active/layer collections, Local View membership, lights, shape keys, modifier enable flags, viewport shading, camera-gate settings, and registered RNA properties; v1/v2 frame migration; stable `webtoon_comic_uuid` IDs with duplicate repair; `state_digest`/`apply_state` round-trips.
 
 ### `viewport.py`
 
-Tracks a bound 3D View, normalizes Stream Frame bounds, updates working resolution, tags redraws, and draws the orange `POST_PIXEL` frame overlay.
+Tracks a bound 3D View, maps unrestricted camera-gate Stream Frame bounds to screen space, derives navigation-independent camera matrices and output resolution, restores contextual Local View, tags redraws, and draws the orange camera-only `POST_PIXEL` overlay.
 
 ### `blender_manifest.toml`, `build.ps1`, `README.md`
 
-Manifest declares id `webtoon_comic_views` version 0.2.0, Blender ≥ 4.5.0, `windows-x64`, GPL-3.0-or-later, and the loopback network permission. `build.ps1` locates Blender and runs `extension validate`/`extension build`. The README covers install, workflow, state-capture scope, and transport.
+Manifest declares id `webtoon_comic_views` version 0.3.0, Blender ≥ 4.5.0, `windows-x64`, GPL-3.0-or-later, and the loopback network permission. `build.ps1` locates Blender and runs `extension validate`/`extension build`. The README covers install, workflow, state-capture scope, and transport.
 
 ## Test scripts, one by one
 
@@ -527,7 +527,7 @@ Covers contextual page visibility/routing, workspace splitter resizing, bottom-l
 
 ### `tests/test_settings.py`
 
-Covers missing/partial/null settings, default hotkey merging, clean-window configuration, migrations through version 20, vector/fill value clamping, splitter normalization, rectangle-mode clamping, font-preview persistence, protected integer-sized text presets, and the Blender bridge endpoint clamp/persist.
+Covers missing/partial/null settings, default hotkey merging, clean-window configuration, migrations through version 21, grid value clamping, vector/fill value clamping, splitter normalization, rectangle-mode clamping, font-preview persistence, protected integer-sized text presets, and the Blender bridge endpoint clamp/persist.
 
 ### `tests/test_shape_paths.py`
 

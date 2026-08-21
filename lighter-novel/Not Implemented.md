@@ -1,14 +1,6 @@
 
 
 
-## filled shape bugs
-- sometimes drawing a shape draws like a line through the middle and doesn't close it fully.
-- tweak create filled shape. straight lines and ends should be vector points. doesn't always fill the shape.
-
-
-## better grids
-- grid view, instead of showing each grid ccell individually, should show grid divisions of 4, like csp
-
 
 
 ## filled shapes point selection:
@@ -96,7 +88,8 @@ handles?
 		- how to handle maps? assets? icon pack? stickers?
 	- angle range - slider that controls
 
-
+brushes
+- airbrush support
 
 if applied to a closed shape, behaves differently from on an open shape / vector object.
 

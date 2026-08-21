@@ -220,8 +220,10 @@ class BlenderSourceClient(QObject):
 
     def resolve_dirty_switch(self, resolution: str) -> None:
         resolution = str(resolution).lower()
-        if resolution not in {"update", "revert", "cancel"}:
-            raise ValueError("Expected update, revert, or cancel")
+        aliases = {"update": "save", "revert": "discard"}
+        resolution = aliases.get(resolution, resolution)
+        if resolution not in {"save", "discard", "cancel"}:
+            raise ValueError("Expected save, discard, or cancel")
         self._send({
             "type": "RESOLVE_DIRTY", "resolution": resolution,
             "request_id": self._next_request(),

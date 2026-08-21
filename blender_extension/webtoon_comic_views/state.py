@@ -12,7 +12,7 @@ import bpy
 from . import viewport
 
 
-STATE_VERSION = 2
+STATE_VERSION = 3
 UUID_KEY = "webtoon_comic_uuid"
 INTERNAL_KEYS = {UUID_KEY, "_RNA_UI"}
 
@@ -499,6 +499,15 @@ def capture_state(
         })
     _window, space, _region = find_view3d()
     shading = _attrs(space.shading, SHADING_FIELDS) if space is not None else {}
+    local_enabled = bool(
+        space is not None and getattr(space, "local_view", None) is not None
+    )
+    local_members = [
+        ensure_uuid(obj) for obj in scene.objects
+        if local_enabled and obj.visible_get(view_layer=view_layer, viewport=space)
+    ]
+    active_collection = getattr(view_layer, "active_layer_collection", None)
+    render = scene.render
     state = {
         "version": STATE_VERSION,
         "scene_uuid": ensure_uuid(scene),
@@ -512,12 +521,26 @@ def capture_state(
         "layer_collections": _capture_layer_collections(
             view_layer.layer_collection
         ),
+        "active_layer_collection_uuid": (
+            ensure_uuid(active_collection.collection)
+            if active_collection is not None else ""
+        ),
+        "local_view": {
+            "enabled": local_enabled,
+            "object_uuids": local_members,
+        },
         "modifiers": modifiers,
         "cameras": cameras,
         "lights": lights,
         "registered": _registered_values(scene),
         "viewport_shading": shading,
-        "viewport": viewport.capture_viewport(),
+        "render_settings": {
+            "resolution_x": int(render.resolution_x),
+            "resolution_y": int(render.resolution_y),
+            "pixel_aspect_x": _finite(render.pixel_aspect_x, 1.0),
+            "pixel_aspect_y": _finite(render.pixel_aspect_y, 1.0),
+        },
+        "stream_frame_space": "camera",
         "stream_frame": list(
             stream_frame if stream_frame is not None else viewport.DEFAULT_FRAME
         ),
@@ -544,8 +567,8 @@ def _validate_presentation(state: dict[str, Any]) -> dict[str, Any]:
         raise ValueError("Comic View stream frame must contain four numbers")
     if len(frame) != 4 or not all(math.isfinite(item) for item in frame):
         raise ValueError("Comic View stream frame must contain four finite numbers")
-    left, right = sorted((max(0.0, min(1.0, frame[0])), max(0.0, min(1.0, frame[2]))))
-    bottom, top = sorted((max(0.0, min(1.0, frame[1])), max(0.0, min(1.0, frame[3]))))
+    left, right = sorted((frame[0], frame[2]))
+    bottom, top = sorted((frame[1], frame[3]))
     if right - left <= 1e-6 or top - bottom <= 1e-6:
         raise ValueError("Comic View stream frame is empty")
     result["stream_frame"] = [left, bottom, right, top]
@@ -560,43 +583,80 @@ def _validate_presentation(state: dict[str, Any]) -> dict[str, Any]:
     ):
         raise ValueError("Comic View output resolution is invalid")
     result["output_resolution"] = resolution
-    raw_viewport = result.get("viewport", {})
-    if not isinstance(raw_viewport, dict):
-        raise ValueError("Comic View viewport state must be an object")
-    values = dict(raw_viewport)
-    perspective = values.get("view_perspective")
-    if perspective is not None and perspective not in {"PERSP", "ORTHO", "CAMERA"}:
-        raise ValueError("Comic View viewport projection is invalid")
-    for name, length in (
-        ("view_location", 3), ("view_rotation", 4),
-        ("view_camera_offset", 2),
-    ):
-        if name not in values:
-            continue
+    frame_space = str(result.get("stream_frame_space", "camera"))
+    if frame_space not in {"camera", "viewport_legacy"}:
+        raise ValueError("Comic View stream frame space is invalid")
+    result["stream_frame_space"] = frame_space
+    local_view = result.get("local_view", {})
+    if not isinstance(local_view, dict):
+        raise ValueError("Comic View Local View state must be an object")
+    members = local_view.get("object_uuids", [])
+    if not isinstance(members, list):
+        raise ValueError("Comic View Local View members must be a list")
+    result["local_view"] = {
+        "enabled": bool(local_view.get("enabled", False)),
+        "object_uuids": [str(item) for item in members if str(item)],
+    }
+    render_settings = result.get("render_settings", {})
+    if not isinstance(render_settings, dict):
+        raise ValueError("Comic View render settings must be an object")
+    normalized_render = {}
+    for name, fallback in (("resolution_x", 1920), ("resolution_y", 1080)):
         try:
-            sequence = [float(item) for item in values[name]]
-        except (TypeError, ValueError):
-            raise ValueError(f"Comic View {name} is invalid")
-        if len(sequence) != length or not all(math.isfinite(item) for item in sequence):
-            raise ValueError(f"Comic View {name} is invalid")
-        if name == "view_rotation":
-            magnitude = math.sqrt(sum(item * item for item in sequence))
-            sequence = (
-                [1.0, 0.0, 0.0, 0.0]
-                if magnitude <= 1e-12 else [item / magnitude for item in sequence]
+            normalized_render[name] = max(
+                1, min(65536, int(render_settings.get(name, fallback)))
             )
-        values[name] = sequence
-    for name, minimum, maximum in (
-        ("view_distance", 1e-6, 1e12),
-        ("view_camera_zoom", -30.0, 600.0),
-        ("lens", 1.0, 250.0),
-    ):
-        if name in values:
-            number = float(values[name])
-            if not math.isfinite(number):
+        except (TypeError, ValueError):
+            normalized_render[name] = fallback
+    for name in ("pixel_aspect_x", "pixel_aspect_y"):
+        number = _finite(render_settings.get(name, 1.0), 1.0)
+        normalized_render[name] = max(0.01, min(100.0, number))
+    result["render_settings"] = normalized_render
+    if "viewport" in result:
+        raw_viewport = result["viewport"]
+        if not isinstance(raw_viewport, dict):
+            raise ValueError("Comic View viewport state must be an object")
+        values = dict(raw_viewport)
+        perspective = values.get("view_perspective")
+        if (
+            perspective is not None
+            and perspective not in {"PERSP", "ORTHO", "CAMERA"}
+        ):
+            raise ValueError("Comic View viewport projection is invalid")
+        for name, length in (
+            ("view_location", 3), ("view_rotation", 4),
+            ("view_camera_offset", 2),
+        ):
+            if name not in values:
+                continue
+            try:
+                sequence = [float(item) for item in values[name]]
+            except (TypeError, ValueError):
                 raise ValueError(f"Comic View {name} is invalid")
-            values[name] = max(minimum, min(maximum, number))
-    result["viewport"] = values
+            if (
+                len(sequence) != length
+                or not all(math.isfinite(item) for item in sequence)
+            ):
+                raise ValueError(f"Comic View {name} is invalid")
+            if name == "view_rotation":
+                magnitude = math.sqrt(sum(item * item for item in sequence))
+                sequence = (
+                    [1.0, 0.0, 0.0, 0.0]
+                    if magnitude <= 1e-12
+                    else [item / magnitude for item in sequence]
+                )
+            values[name] = sequence
+        for name, minimum, maximum in (
+            ("view_distance", 1e-6, 1e12),
+            ("view_camera_zoom", -30.0, 600.0),
+            ("lens", 1.0, 250.0),
+        ):
+            if name in values:
+                number = float(values[name])
+                if not math.isfinite(number):
+                    raise ValueError(f"Comic View {name} is invalid")
+                values[name] = max(minimum, min(maximum, number))
+        result["viewport"] = values
     return result
 
 
@@ -608,10 +668,10 @@ def parse_state(
     if not isinstance(value, dict):
         raise ValueError("Comic View state must be an object")
     version = int(value.get("version", 0))
-    if version == 1:
+    if version in {1, 2}:
         value = dict(value)
         value["version"] = STATE_VERSION
-        value.setdefault("viewport", {})
+        value["stream_frame_space"] = "viewport_legacy"
         value.setdefault("stream_frame", list(
             fallback_stream_frame
             if fallback_stream_frame is not None else viewport.DEFAULT_FRAME
@@ -620,10 +680,80 @@ def parse_state(
             fallback_resolution
             if fallback_resolution is not None else (1920, 1080)
         ))
+        value.setdefault("local_view", {
+            "enabled": False, "object_uuids": [],
+        })
+        value.setdefault("active_layer_collection_uuid", "")
+        value.setdefault("render_settings", {
+            "resolution_x": 1920, "resolution_y": 1080,
+            "pixel_aspect_x": 1.0, "pixel_aspect_y": 1.0,
+        })
         return _validate_presentation(value)
     if version != STATE_VERSION:
         raise ValueError(f"Unsupported Comic View state version: {version}")
     return _validate_presentation(value)
+
+
+def migrate_legacy_presentation(
+    scene: bpy.types.Scene, value: dict[str, Any],
+) -> tuple[dict[str, Any], str | None]:
+    """Map a legacy viewport-relative frame into attached-camera space."""
+    if value.get("stream_frame_space") != "viewport_legacy":
+        return value, None
+    result = dict(value)
+    navigation = viewport.capture_viewport()
+    original_camera = scene.camera
+    wanted_camera_uuid = str(value.get("active_camera_uuid", ""))
+    if wanted_camera_uuid:
+        saved_camera = next(
+            (
+                obj for obj in scene.objects
+                if obj.type == "CAMERA" and ensure_uuid(obj) == wanted_camera_uuid
+            ),
+            None,
+        )
+        if saved_camera is not None:
+            scene.camera = saved_camera
+    warning = None
+    try:
+        legacy_navigation = value.get("viewport", {})
+        if isinstance(legacy_navigation, dict):
+            viewport.apply_viewport(legacy_navigation)
+        _window, _area, _space, region = viewport.find_view3d()
+        old = value.get("stream_frame", viewport.DEFAULT_FRAME)
+        converted = None
+        if region is not None:
+            converted = viewport.screen_to_camera_bounds(scene, (
+                float(old[0]) * region.width,
+                float(old[1]) * region.height,
+                float(old[2]) * region.width,
+                float(old[3]) * region.height,
+            ))
+        if converted is None:
+            converted = viewport.DEFAULT_FRAME
+            warning = (
+                "Legacy Stream Frame could not be mapped; used the full "
+                "camera gate"
+            )
+        result["stream_frame"] = list(converted)
+    except (IndexError, TypeError, ValueError):
+        result["stream_frame"] = list(viewport.DEFAULT_FRAME)
+        warning = (
+            "Legacy Stream Frame was invalid; used the full camera gate"
+        )
+    finally:
+        viewport.apply_viewport(navigation)
+        scene.camera = original_camera
+    render = scene.render
+    result["render_settings"] = {
+        "resolution_x": int(render.resolution_x),
+        "resolution_y": int(render.resolution_y),
+        "pixel_aspect_x": _finite(render.pixel_aspect_x, 1.0),
+        "pixel_aspect_y": _finite(render.pixel_aspect_y, 1.0),
+    }
+    result["stream_frame_space"] = "camera"
+    result.pop("viewport", None)
+    return _validate_presentation(result), warning
 
 
 def _object_lookup(scene: bpy.types.Scene) -> dict[str, bpy.types.Object]:
@@ -731,6 +861,15 @@ def apply_state(
                 setattr(layer, name, bool(item.get(name, False)))
             except (AttributeError, RuntimeError):
                 continue
+    active_collection_uuid = str(
+        state.get("active_layer_collection_uuid", "")
+    )
+    active_collection = layer_collections.get(active_collection_uuid)
+    if active_collection is not None:
+        try:
+            view_layer.active_layer_collection = active_collection
+        except (AttributeError, RuntimeError, TypeError):
+            warnings.append("Could not restore the active collection")
 
     # All visibility and collection membership switches are complete before
     # transforms, controls, modifiers, or data parameters are restored.
@@ -745,7 +884,7 @@ def apply_state(
             if key not in stored_custom:
                 warnings.append(
                     f"New control {obj.name}[{key}] was left unchanged; "
-                    "update this view to capture it"
+                    "save this view to capture it"
                 )
 
     pose_lookup: dict[tuple[str, str], object] = {}
@@ -766,7 +905,7 @@ def apply_state(
     for key, bone in pose_lookup.items():
         if key[0] in stored_objects and key not in stored_pose_keys:
             warnings.append(
-                f"New pose control {bone.name} was left unchanged; update this view"
+                f"New pose control {bone.name} was left unchanged; save this view"
             )
 
     stored_shape_keys: set[tuple[str, str]] = set()
@@ -789,7 +928,7 @@ def apply_state(
         for key in keys.key_blocks if keys is not None else ():
             if (object_uuid, key.name) not in stored_shape_keys:
                 warnings.append(
-                    f"New shape key {key.name} was left unchanged; update this view"
+                    f"New shape key {key.name} was left unchanged; save this view"
                 )
 
     stored_modifiers: set[tuple[str, str]] = set()
@@ -813,7 +952,7 @@ def apply_state(
         for modifier in obj.modifiers:
             if (object_uuid, ensure_uuid(modifier)) not in stored_modifiers:
                 warnings.append(
-                    f"New modifier {modifier.name} was left unchanged; update this view"
+                    f"New modifier {modifier.name} was left unchanged; save this view"
                 )
 
     for group, expected_type in (("cameras", "CAMERA"), ("lights", "LIGHT")):
@@ -843,15 +982,33 @@ def apply_state(
             scene.camera = camera
         else:
             warnings.append("The active camera is missing")
+    render_settings = state.get("render_settings", {})
+    for name in (
+        "resolution_x", "resolution_y", "pixel_aspect_x", "pixel_aspect_y",
+    ):
+        if name not in render_settings:
+            continue
+        try:
+            setattr(scene.render, name, render_settings[name])
+        except (AttributeError, TypeError, ValueError):
+            warnings.append(f"Could not restore render setting {name}")
     _window, space, _region = find_view3d()
     if space is not None:
         _apply_attrs(space.shading, state.get("viewport_shading", {}))
-    viewport.apply_viewport(state.get("viewport", {}))
     window = getattr(bpy.context, "window", None)
     if window is not None and window.scene == scene and window.view_layer != view_layer:
         try:
             window.view_layer = view_layer
         except (AttributeError, RuntimeError, TypeError):
             warnings.append(f"Could not activate view layer {view_layer.name}")
+    local = state.get("local_view", {})
+    warning = viewport.apply_local_view(
+        objects,
+        bool(local.get("enabled", False)),
+        {str(item) for item in local.get("object_uuids", [])},
+    )
+    if warning:
+        warnings.append(warning)
+    viewport.enter_camera_view()
     view_layer.update()
     return warnings

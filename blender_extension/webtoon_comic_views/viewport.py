@@ -8,7 +8,7 @@ import bpy
 from mathutils import Matrix, Vector
 
 
-DEFAULT_FRAME = (0.1, 0.1, 0.9, 0.9)
+DEFAULT_FRAME = (0.0, 0.0, 1.0, 1.0)
 MIN_FRAME_PIXELS = 32
 MAX_AXIS = 4096
 MAX_PIXELS = 16_777_216
@@ -16,6 +16,8 @@ MAX_PIXELS = 16_777_216
 _bound_window = 0
 _bound_area = 0
 _draw_handle: object | None = None
+_frame_edit_active = False
+_resolution_assignment_active = False
 
 
 def bind(context: object) -> None:
@@ -67,6 +69,22 @@ def is_bound_context(context: object) -> bool:
     )
 
 
+def camera_view_active(scene: object | None = None) -> bool:
+    _window, _area, space, region = find_view3d()
+    scene = scene or getattr(bpy.context, "scene", None)
+    return bool(
+        scene is not None and getattr(scene, "camera", None) is not None
+        and space is not None and region is not None
+        and space.region_3d.view_perspective == "CAMERA"
+    )
+
+
+def set_frame_edit_active(active: bool) -> None:
+    global _frame_edit_active
+    _frame_edit_active = bool(active)
+    tag_redraw()
+
+
 def frame_bounds(view: object) -> tuple[float, float, float, float]:
     values = (
         float(getattr(view, "frame_min_x", DEFAULT_FRAME[0])),
@@ -77,8 +95,8 @@ def frame_bounds(view: object) -> tuple[float, float, float, float]:
     left, bottom, right, top = values
     if not all(math.isfinite(item) for item in values):
         return DEFAULT_FRAME
-    left, right = sorted((max(0.0, left), min(1.0, right)))
-    bottom, top = sorted((max(0.0, bottom), min(1.0, top)))
+    left, right = sorted((left, right))
+    bottom, top = sorted((bottom, top))
     if right - left <= 1e-6 or top - bottom <= 1e-6:
         return DEFAULT_FRAME
     return left, bottom, right, top
@@ -89,22 +107,30 @@ def set_frame_bounds(view: object, values: object) -> None:
         left, bottom, right, top = (float(item) for item in values)
     except (TypeError, ValueError):
         left, bottom, right, top = DEFAULT_FRAME
-    left, right = sorted((max(0.0, left), min(1.0, right)))
-    bottom, top = sorted((max(0.0, bottom), min(1.0, top)))
+    left, right = sorted((left, right))
+    bottom, top = sorted((bottom, top))
     if right - left <= 1e-6 or top - bottom <= 1e-6:
         left, bottom, right, top = DEFAULT_FRAME
     view.frame_min_x, view.frame_min_y = left, bottom
     view.frame_max_x, view.frame_max_y = right, top
 
 
+def camera_gate_aspect(scene: object) -> float:
+    render = scene.render
+    width = max(1.0, float(render.resolution_x) * float(render.pixel_aspect_x))
+    height = max(1.0, float(render.resolution_y) * float(render.pixel_aspect_y))
+    return width / height
+
+
 def derive_resolution(
-    width: object, bounds: tuple[float, float, float, float], region: object,
+    width: object, bounds: tuple[float, float, float, float], scene: object,
 ) -> tuple[int, int]:
     width = max(64, min(MAX_AXIS, int(width)))
     left, bottom, right, top = bounds
-    frame_width = max(1.0, (right - left) * max(1, int(region.width)))
-    frame_height = max(1.0, (top - bottom) * max(1, int(region.height)))
-    aspect = frame_width / frame_height
+    aspect = (
+        camera_gate_aspect(scene)
+        * max(right - left, 1e-9) / max(top - bottom, 1e-9)
+    )
     height = max(1, round(width / max(aspect, 1e-9)))
     if height < 64:
         height = 64
@@ -121,12 +147,30 @@ def derive_resolution(
     return width, height
 
 
-def update_working_resolution(view: object) -> tuple[int, int]:
-    _window, _area, _space, region = find_view3d()
-    if region is None:
+def resolution_assignment_active() -> bool:
+    return _resolution_assignment_active
+
+
+def set_working_resolution(view: object, width: int, height: int) -> None:
+    global _resolution_assignment_active
+    _resolution_assignment_active = True
+    try:
+        view.width = int(width)
+        view.height = int(height)
+    finally:
+        _resolution_assignment_active = False
+
+
+def update_working_resolution(
+    view: object, scene: object | None = None,
+) -> tuple[int, int]:
+    scene = scene or getattr(bpy.context, "scene", None)
+    if scene is None:
         return int(view.width), int(view.height)
-    width, height = derive_resolution(view.width, frame_bounds(view), region)
-    view.width, view.height = width, height
+    width, height = derive_resolution(
+        view.width, frame_bounds(view), scene
+    )
+    set_working_resolution(view, width, height)
     return width, height
 
 
@@ -186,11 +230,13 @@ def apply_viewport(values: object) -> None:
         area.tag_redraw()
 
 
-def default_frame(scene: object) -> tuple[float, float, float, float]:
+def camera_region_bounds(
+    scene: object,
+) -> tuple[float, float, float, float] | None:
     _window, _area, space, region = find_view3d()
     camera = getattr(scene, "camera", None)
     if space is None or region is None or camera is None:
-        return DEFAULT_FRAME
+        return None
     try:
         from bpy_extras.view3d_utils import location_3d_to_region_2d
 
@@ -201,19 +247,65 @@ def default_frame(scene: object) -> tuple[float, float, float, float]:
             if point is not None:
                 points.append(point)
         if len(points) != 4:
-            return DEFAULT_FRAME
-        left = max(0.0, min(point.x for point in points) / region.width)
-        right = min(1.0, max(point.x for point in points) / region.width)
-        bottom = max(0.0, min(point.y for point in points) / region.height)
-        top = min(1.0, max(point.y for point in points) / region.height)
+            return None
+        left = min(point.x for point in points)
+        right = max(point.x for point in points)
+        bottom = min(point.y for point in points)
+        top = max(point.y for point in points)
         if (
-            (right - left) * region.width >= MIN_FRAME_PIXELS
-            and (top - bottom) * region.height >= MIN_FRAME_PIXELS
+            right - left >= 1e-6 and top - bottom >= 1e-6
         ):
             return left, bottom, right, top
     except (AttributeError, RuntimeError, TypeError, ValueError):
         pass
+    return None
+
+
+def default_frame(_scene: object) -> tuple[float, float, float, float]:
     return DEFAULT_FRAME
+
+
+def frame_screen_bounds(
+    scene: object, bounds: tuple[float, float, float, float],
+) -> tuple[float, float, float, float] | None:
+    gate = camera_region_bounds(scene)
+    if gate is None:
+        return None
+    gate_left, gate_bottom, gate_right, gate_top = gate
+    gate_width = gate_right - gate_left
+    gate_height = gate_top - gate_bottom
+    left, bottom, right, top = bounds
+    return (
+        gate_left + left * gate_width,
+        gate_bottom + bottom * gate_height,
+        gate_left + right * gate_width,
+        gate_bottom + top * gate_height,
+    )
+
+
+def screen_to_camera_bounds(
+    scene: object, values: object,
+) -> tuple[float, float, float, float] | None:
+    gate = camera_region_bounds(scene)
+    if gate is None:
+        return None
+    try:
+        left, bottom, right, top = (float(item) for item in values)
+    except (TypeError, ValueError):
+        return None
+    gate_left, gate_bottom, gate_right, gate_top = gate
+    gate_width = gate_right - gate_left
+    gate_height = gate_top - gate_bottom
+    if abs(gate_width) <= 1e-9 or abs(gate_height) <= 1e-9:
+        return None
+    left, right = sorted((left, right))
+    bottom, top = sorted((bottom, top))
+    return (
+        (left - gate_left) / gate_width,
+        (bottom - gate_bottom) / gate_height,
+        (right - gate_left) / gate_width,
+        (top - gate_bottom) / gate_height,
+    )
 
 
 def cropped_projection(
@@ -234,16 +326,108 @@ def cropped_projection(
 
 
 def render_matrices(
+    scene: object, view_layer: object,
     bounds: tuple[float, float, float, float],
 ) -> tuple[Matrix, Matrix]:
-    """Snapshot the bound viewport matrices for a later main-thread render."""
-    _window, _area, space, region = find_view3d()
-    if space is None or region is None:
-        raise RuntimeError("Open a 3D View before streaming Comic Views")
-    return (
-        space.region_3d.view_matrix.copy(),
-        cropped_projection(space.region_3d.window_matrix.copy(), bounds),
+    """Build camera matrices independent of viewport navigation."""
+    camera = getattr(scene, "camera", None)
+    if camera is None or getattr(camera, "type", "") != "CAMERA":
+        raise RuntimeError("The Comic View has no active camera")
+    render = scene.render
+    projection = camera.calc_matrix_camera(
+        view_layer.depsgraph,
+        x=max(1, int(render.resolution_x)),
+        y=max(1, int(render.resolution_y)),
+        scale_x=max(1e-9, float(render.pixel_aspect_x)),
+        scale_y=max(1e-9, float(render.pixel_aspect_y)),
     )
+    return (
+        camera.matrix_world.inverted_safe(),
+        cropped_projection(projection, bounds),
+    )
+
+
+def enter_camera_view() -> None:
+    _window, area, space, _region = find_view3d()
+    if space is None or getattr(bpy.context.scene, "camera", None) is None:
+        return
+    try:
+        space.region_3d.view_perspective = "CAMERA"
+    except (AttributeError, TypeError):
+        return
+    if area is not None:
+        area.tag_redraw()
+
+
+def local_view_enabled() -> bool:
+    _window, _area, space, _region = find_view3d()
+    return bool(space is not None and space.local_view is not None)
+
+
+def apply_local_view(
+    objects: dict[str, object], enabled: bool, members: set[str],
+) -> str | None:
+    """Restore the bound viewport's local-view mode and membership."""
+    window, area, space, region = find_view3d()
+    if space is None or area is None or region is None or window is None:
+        return (
+            "Open a 3D View to restore Local View" if enabled else None
+        )
+    current = space.local_view is not None
+    if enabled and not members:
+        enabled = False
+    view_layer = getattr(bpy.context, "view_layer", None)
+    active = getattr(getattr(view_layer, "objects", None), "active", None)
+    selection = {
+        identifier: bool(obj.select_get())
+        for identifier, obj in objects.items()
+    }
+    try:
+        if current:
+            with bpy.context.temp_override(
+                window=window, area=area, region=region, space_data=space,
+            ):
+                bpy.ops.view3d.localview(frame_selected=False)
+            current = space.local_view is not None
+        if enabled:
+            for identifier, obj in objects.items():
+                obj.select_set(identifier in members)
+            first = next(
+                (obj for identifier, obj in objects.items()
+                 if identifier in members), None
+            )
+            if first is None:
+                return "Saved Local View contains no available objects"
+            if view_layer is not None:
+                view_layer.objects.active = first
+            selected_objects = [
+                obj for identifier, obj in objects.items()
+                if identifier in members
+            ]
+            with bpy.context.temp_override(
+                window=window, area=area, region=region,
+                space_data=space, active_object=first, object=first,
+                selected_objects=selected_objects,
+                selected_editable_objects=selected_objects,
+            ):
+                bpy.ops.view3d.localview(frame_selected=False)
+            current = space.local_view is not None
+        if enabled and not current:
+            return "Could not enter the saved Local View"
+    except (AttributeError, RuntimeError, TypeError) as error:
+        return f"Could not restore Local View: {error}"
+    finally:
+        for identifier, obj in objects.items():
+            try:
+                obj.select_set(selection.get(identifier, False))
+            except (AttributeError, RuntimeError):
+                pass
+        if view_layer is not None and active is not None:
+            try:
+                view_layer.objects.active = active
+            except (AttributeError, RuntimeError):
+                pass
+    return None
 
 
 def tag_redraw() -> None:
@@ -262,19 +446,25 @@ def _draw_overlay() -> None:
         return
     scene = context.scene
     settings = getattr(scene, "webtoon_comic_settings", None)
+    if not camera_view_active(scene):
+        return
+    if (
+        not _frame_edit_active
+        and not bool(getattr(settings, "show_stream_frame_overlay", True))
+    ):
+        return
     views = getattr(scene, "webtoon_comic_views", ())
     index = int(getattr(settings, "active_index", -1))
     if not 0 <= index < len(views):
         return
     view = views[index]
-    region = context.region
-    left, bottom, right, top = frame_bounds(view)
+    screen_bounds = frame_screen_bounds(scene, frame_bounds(view))
+    if screen_bounds is None:
+        return
+    left, bottom, right, top = screen_bounds
     points = [
-        (left * region.width, bottom * region.height),
-        (right * region.width, bottom * region.height),
-        (right * region.width, top * region.height),
-        (left * region.width, top * region.height),
-        (left * region.width, bottom * region.height),
+        (left, bottom), (right, bottom), (right, top), (left, top),
+        (left, bottom),
     ]
     tick = 10.0
     x0, y0 = points[0]

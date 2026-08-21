@@ -86,7 +86,7 @@ Series preferences save independently from the current chapter. Color/palette/gr
 - every typed object record;
 - every `ModifierInstance` record;
 - every `ToneMask` record;
-- schema version 20 and `document_kind` (`chapter` or `asset`); and
+- schema version 21 and `document_kind` (`chapter` or `asset`); and
 - runtime-only `legacy_fill_migrations` plans for pending one-time fill materialization.
 
 The default height is 3240. `ensure_height_for()` grows past a layer's bottom by an additional 1080-pixel margin. Other canvas workflows also grow for raster/object/page bounds. `trim_height()` rejects a height above which any root page remains visible; the UI also includes object bounds in its minimum.
@@ -336,11 +336,11 @@ On chapter open, `has_recovery()` compares the recovery manifest modification ti
 
 ## Editor settings data
 
-`EditorSettings` is version 20 and is written to the platform path returned by Qt's `QStandardPaths.AppConfigLocation`, in `settings.json`. It is not stored in the portable series folder.
+`EditorSettings` is version 21 and is written to the platform path returned by Qt's `QStandardPaths.AppConfigLocation`, in `settings.json`. It is not stored in the portable series folder.
 
 It contains:
 
-- tablet navigation, snap-to-grid, legacy page-scope flag, predictive ink, and renderer choice;
+- tablet navigation, snap-to-grid, predictive ink, renderer choice, and global grid visibility/size/divisions/color/opacity defaults;
 - pencil/eraser S/M/L sizes and defaults;
 - pencil presets and active preset;
 - eraser shape;
@@ -355,7 +355,7 @@ It contains:
 - the Blender loopback bridge endpoint and token (host clamped to loopback); and
 - up to 12 recent series paths.
 
-Loading progressively backfills/migrates settings from earlier versions, filters unknown fields, clamps values, protects the default Linear pencil and Default text presets, adds the default Delete Selected binding, and always emits version 20 on save. Text-preset sizes normalize to integers from 6 through 250. Settings save through a temporary file followed by replace.
+Loading progressively backfills/migrates settings from earlier versions, filters unknown fields, clamps values, protects the default Linear pencil and Default text presets, adds the default Delete Selected and Alt+G bindings, and always emits version 21 on save. Text-preset sizes normalize to integers from 6 through 250. Settings save through a temporary file followed by replace.
 
 Primary/secondary colors, palettes, color history, and gradient presets are **series** preferences, not editor settings. `brush_color` remains as a compatibility/current-primary bridge for drawing behavior.
 

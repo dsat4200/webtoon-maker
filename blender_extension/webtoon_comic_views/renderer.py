@@ -77,6 +77,7 @@ def render_active_camera(
     scene: bpy.types.Scene, view_layer: bpy.types.ViewLayer,
     width: int, height: int, stream_frame: object = None,
     view_matrix: object = None, projection_matrix: object = None,
+    *, hide_overlays: bool = False,
 ) -> RenderFrame:
     """Render the bound viewport frame into top-down straight RGBA8."""
     width, height = validate_resolution(width, height)
@@ -87,18 +88,23 @@ def render_active_camera(
         tuple(float(item) for item in stream_frame)
         if stream_frame is not None else viewport.DEFAULT_FRAME
     )
-    view_matrix = (
-        view_matrix.copy() if view_matrix is not None
-        else space.region_3d.view_matrix.copy()
-    )
-    projection_matrix = (
-        projection_matrix.copy() if projection_matrix is not None
-        else viewport.cropped_projection(
-            space.region_3d.window_matrix.copy(), bounds,
+    if view_matrix is None or projection_matrix is None:
+        camera_view, camera_projection = viewport.render_matrices(
+            scene, view_layer, bounds
         )
-    )
+        view_matrix = camera_view if view_matrix is None else view_matrix.copy()
+        projection_matrix = (
+            camera_projection
+            if projection_matrix is None else projection_matrix.copy()
+        )
+    else:
+        view_matrix = view_matrix.copy()
+        projection_matrix = projection_matrix.copy()
     offscreen = gpu.types.GPUOffScreen(width, height, format="RGBA8")
+    overlays = bool(space.overlay.show_overlays)
     try:
+        if hide_overlays:
+            space.overlay.show_overlays = False
         with offscreen.bind():
             offscreen.draw_view3d(
                 scene,
@@ -116,6 +122,8 @@ def render_active_camera(
             )
             raw = _buffer_bytes(buffer, width, height)
     finally:
+        if hide_overlays:
+            space.overlay.show_overlays = overlays
         offscreen.free()
     expected = width * height * 4
     if len(raw) != expected:
@@ -153,6 +161,7 @@ def png_bytes(frame: RenderFrame) -> bytes:
 def render_thumbnail(
     scene: bpy.types.Scene, view_layer: bpy.types.ViewLayer,
     source_width: int, source_height: int, stream_frame: object = None,
+    *, hide_overlays: bool = False,
 ) -> RenderFrame:
     ratio = min(
         THUMBNAIL_LIMIT / max(1, int(source_width)),
@@ -161,8 +170,28 @@ def render_thumbnail(
     width = max(64, round(source_width * ratio))
     height = max(64, round(source_height * ratio))
     return render_active_camera(
-        scene, view_layer, width, height, stream_frame=stream_frame
+        scene, view_layer, width, height, stream_frame=stream_frame,
+        hide_overlays=hide_overlays,
     )
+
+
+def thumbnail_from_frame(frame: RenderFrame) -> RenderFrame:
+    """Create a compact nearest-neighbor preview from an existing render."""
+    ratio = min(
+        THUMBNAIL_LIMIT / max(1, frame.width),
+        THUMBNAIL_LIMIT / max(1, frame.height),
+    )
+    width = max(1, round(frame.width * min(1.0, ratio)))
+    height = max(1, round(frame.height * min(1.0, ratio)))
+    if (width, height) == (frame.width, frame.height):
+        return frame
+    source = np.frombuffer(frame.rgba, dtype=np.uint8).reshape(
+        frame.height, frame.width, 4
+    )
+    rows = np.linspace(0, frame.height - 1, height).round().astype(int)
+    columns = np.linspace(0, frame.width - 1, width).round().astype(int)
+    resized = np.ascontiguousarray(source[rows][:, columns])
+    return RenderFrame(width, height, resized.tobytes())
 
 
 def update_thumbnail_image(view: object, frame: RenderFrame) -> None:

@@ -15,8 +15,8 @@ import bpy
 
 from . import renderer, viewport
 from .state import (
-    apply_state, capture_state, parse_state, state_digest, state_json,
-    view_layer_for_state,
+    apply_state, capture_state, migrate_legacy_presentation, parse_state,
+    state_digest, state_json, view_layer_for_state,
 )
 
 
@@ -255,14 +255,13 @@ class BridgeRuntime:
         self.scene_matches_snapshot = False
         self.active_stream_uuid = ""
         self.pending_switch: dict[str, Any] | None = None
-        self._switch_after_publish: dict[str, Any] | None = None
         self._memory: shared_memory.SharedMemory | None = None
         self._slot_bytes = 0
         self._stream_width = 0
         self._stream_height = 0
         self._outstanding: dict[int, int] = {}
         self._sequence = 0
-        self._render_matrices: tuple[object, object] | None = None
+        self._pending_render: renderer.RenderFrame | None = None
         self.last_error = ""
 
     @property
@@ -302,7 +301,7 @@ class BridgeRuntime:
         self._stream_width = 0
         self._stream_height = 0
         self._outstanding.clear()
-        self._render_matrices = None
+        self._pending_render = None
         if memory is not None:
             try:
                 memory.close()
@@ -334,6 +333,13 @@ class BridgeRuntime:
     def _active_view(self, scene: bpy.types.Scene) -> object | None:
         settings = self._settings(scene)
         views = self._views(scene)
+        loaded_uuid = str(getattr(settings, "loaded_view_uuid", ""))
+        if loaded_uuid:
+            loaded = next(
+                (view for view in views if view.view_uuid == loaded_uuid), None
+            )
+            if loaded is not None:
+                return loaded
         index = int(settings.active_index)
         return views[index] if 0 <= index < len(views) else None
 
@@ -367,33 +373,162 @@ class BridgeRuntime:
             "views": [self._view_payload(scene, view) for view in self._views(scene)],
         })
 
-    def capture_into_view(
-        self, scene: bpy.types.Scene, view: object, *, thumbnail: bool = True,
+    @staticmethod
+    def _hide_overlays() -> bool:
+        preferences = addon_preferences()
+        return bool(
+            preferences is not None
+            and getattr(preferences, "always_hide_overlays", False)
+        )
+
+    def save_view_state(
+        self, scene: bpy.types.Scene, view: object,
     ) -> list[str]:
         bounds = viewport.frame_bounds(view)
-        width, height = renderer.validate_resolution(view.width, view.height)
+        width, height = viewport.derive_resolution(view.width, bounds, scene)
+        viewport.set_working_resolution(view, width, height)
         captured, warnings = capture_state(
             scene, bpy.context.view_layer,
             stream_frame=bounds, output_resolution=(width, height),
         )
-        view.state_json = state_json(captured)
-        view.state_hash = state_digest(captured)
-        view.revision = max(1, int(view.revision) + 1)
-        view.published_width, view.published_height = width, height
+        serialized = state_json(captured)
+        digest = state_digest(captured)
+        if view.state_json and digest != view.state_hash:
+            view.previous_state_json = view.state_json
+            view.previous_state_hash = view.state_hash
+        view.state_json = serialized
+        view.state_hash = digest
         view.is_dirty = False
         view.updated_at = time.time()
         self.scene_matches_snapshot = True
         self.ignore_updates_until = time.monotonic() + 0.3
         self.state_check_due = 0.0
-        if thumbnail:
-            frame = renderer.render_thumbnail(
-                scene, bpy.context.view_layer, width, height,
-                stream_frame=bounds,
+        self.send_views(scene)
+        return warnings
+
+    def capture_into_view(
+        self, scene: bpy.types.Scene, view: object, *, thumbnail: bool = True,
+    ) -> list[str]:
+        """Compatibility alias for the new state-only Save operation."""
+        del thumbnail
+        return self.save_view_state(scene, view)
+
+    def _apply_stored_view(
+        self, scene: bpy.types.Scene, view: object,
+    ) -> tuple[dict[str, Any], list[str]]:
+        stored = parse_state(view.state_json)
+        legacy_render_settings = None
+        if stored.get("stream_frame_space") == "viewport_legacy":
+            legacy_render_settings = {
+                name: getattr(scene.render, name)
+                for name in (
+                    "resolution_x", "resolution_y",
+                    "pixel_aspect_x", "pixel_aspect_y",
+                )
+            }
+        view_layer = view_layer_for_state(
+            scene, stored, getattr(bpy.context, "view_layer", None)
+        )
+        warnings = apply_state(scene, stored, view_layer)
+        if stored.get("stream_frame_space") == "viewport_legacy":
+            for name, value in legacy_render_settings.items():
+                setattr(scene.render, name, value)
+            stored, warning = migrate_legacy_presentation(scene, stored)
+            view.state_json = state_json(stored)
+            view.state_hash = state_digest(stored)
+            if warning:
+                warnings.append(warning)
+        viewport.set_frame_bounds(view, stored.get("stream_frame"))
+        resolution = stored.get("output_resolution", ())
+        if isinstance(resolution, list) and len(resolution) == 2:
+            viewport.set_working_resolution(
+                view, *renderer.validate_resolution(*resolution)
             )
-            renderer.update_thumbnail_image(view, frame)
+        return stored, warnings
+
+    def load_view_state(
+        self, scene: bpy.types.Scene, view: object,
+    ) -> list[str]:
+        if self.active_stream_uuid and self.active_stream_uuid != view.view_uuid:
+            self.stop_stream()
+        self.ignore_updates_until = time.monotonic() + 0.3
+        _stored, warnings = self._apply_stored_view(scene, view)
+        self._settings(scene).loaded_view_uuid = view.view_uuid
+        view.is_dirty = False
+        self.scene_matches_snapshot = True
+        self.frame_dirty = False
+        self.state_check_due = 0.0
+        viewport.tag_redraw()
+        self.send_views(scene)
+        return warnings
+
+    def revert_view_state(
+        self, scene: bpy.types.Scene, view: object,
+    ) -> list[str]:
+        if not view.previous_state_json:
+            raise ValueError("This Comic View has no previous save")
+        current_json, current_hash = view.state_json, view.state_hash
+        view.state_json = view.previous_state_json
+        view.state_hash = view.previous_state_hash
+        view.previous_state_json = current_json
+        view.previous_state_hash = current_hash
+        warnings = self.load_view_state(scene, view)
+        view.updated_at = time.time()
+        return warnings
+
+    def _render_saved_snapshot(
+        self, scene: bpy.types.Scene, view: object,
+    ) -> tuple[renderer.RenderFrame, list[str]]:
+        working_navigation = viewport.capture_viewport()
+        working_bounds = viewport.frame_bounds(view)
+        working_resolution = (int(view.width), int(view.height))
+        working, _working_warnings = capture_state(
+            scene, bpy.context.view_layer, repair_ids=False,
+            stream_frame=working_bounds,
+            output_resolution=working_resolution,
+        )
+        warnings: list[str] = []
+        try:
+            stored, warnings = self._apply_stored_view(scene, view)
+            view_layer = view_layer_for_state(
+                scene, stored, getattr(bpy.context, "view_layer", None)
+            )
+            width, height = renderer.validate_resolution(
+                *stored["output_resolution"]
+            )
+            frame = renderer.render_active_camera(
+                scene, view_layer, width, height,
+                stream_frame=stored["stream_frame"],
+                hide_overlays=self._hide_overlays(),
+            )
+        finally:
+            restore_layer = view_layer_for_state(
+                scene, working, getattr(bpy.context, "view_layer", None)
+            )
+            apply_state(scene, working, restore_layer)
+            viewport.set_frame_bounds(view, working_bounds)
+            viewport.set_working_resolution(view, *working_resolution)
+            viewport.apply_viewport(working_navigation)
+            self.ignore_updates_until = time.monotonic() + 0.3
+        return frame, warnings
+
+    def render_saved_view(
+        self, scene: bpy.types.Scene, view: object,
+    ) -> list[str]:
+        frame, warnings = self._render_saved_snapshot(scene, view)
+        renderer.update_thumbnail_image(
+            view, renderer.thumbnail_from_frame(frame)
+        )
+        view.revision = max(1, int(view.revision) + 1)
+        view.published_width, view.published_height = frame.width, frame.height
+        view.updated_at = time.time()
         self.send_views(scene)
         if self.active_stream_uuid == view.view_uuid:
-            self.request_committed_frame(scene, view)
+            self._open_stream(
+                scene, view, frame.width, frame.height, "committed"
+            )
+            self._pending_render = frame
+            self.frame_dirty = True
         return warnings
 
     def _activate(
@@ -402,16 +537,9 @@ class BridgeRuntime:
     ) -> None:
         self.stop_stream()
         self.ignore_updates_until = time.monotonic() + 0.3
-        stored_state = parse_state(view.state_json)
-        view_layer = view_layer_for_state(
-            scene, stored_state, getattr(bpy.context, "view_layer", None)
-        )
-        warnings = apply_state(scene, stored_state, view_layer)
-        viewport.set_frame_bounds(view, stored_state.get("stream_frame"))
-        resolution = stored_state.get("output_resolution", ())
-        if isinstance(resolution, list) and len(resolution) == 2:
-            view.width, view.height = renderer.validate_resolution(*resolution)
+        _stored_state, warnings = self._apply_stored_view(scene, view)
         self._select_view(scene, view)
+        self._settings(scene).loaded_view_uuid = view.view_uuid
         view.is_dirty = False
         self.scene_matches_snapshot = True
         self.frame_dirty = False
@@ -464,20 +592,16 @@ class BridgeRuntime:
             })
             return
         current = self._active_view(scene)
-        if resolution == "update" and current is not None:
+        if resolution in {"save", "update"} and current is not None:
             try:
-                self.capture_into_view(scene, current)
+                self.save_view_state(scene, current)
             except Exception as error:
-                self._error("UPDATE_FAILED", str(error), pending.get("request_id"))
+                self._error("SAVE_FAILED", str(error), pending.get("request_id"))
                 return
-            if self.streaming and self.active_stream_uuid == current.view_uuid:
-                self._switch_after_publish = {
-                    **pending, "sequence": None,
-                    "deadline": time.monotonic() + 5.0,
-                }
-                return
-        elif resolution != "revert":
-            self._error("BAD_RESOLUTION", "Expected update, revert, or cancel")
+        elif resolution not in {"discard", "revert"}:
+            self._error(
+                "BAD_RESOLUTION", "Expected save, discard, or cancel"
+            )
             return
         destination = self._view(scene, pending["destination_uuid"])
         if destination is None:
@@ -533,8 +657,8 @@ class BridgeRuntime:
         width = int(view.published_width or view.width)
         height = int(view.published_height or view.height)
         self._open_stream(scene, view, width, height, "committed")
-        # Starting a stream displays the saved revision, never unsaved work.
-        self.frame_dirty = bool(self.scene_matches_snapshot)
+        # Starting a stream always displays the saved revision.
+        self.frame_dirty = True
 
     def request_committed_frame(self, scene: bpy.types.Scene, view: object) -> None:
         if self.active_stream_uuid != view.view_uuid:
@@ -543,12 +667,6 @@ class BridgeRuntime:
             scene, view, int(view.published_width or view.width),
             int(view.published_height or view.height), "committed",
         )
-        try:
-            self._render_matrices = viewport.render_matrices(
-                tuple(parse_state(view.state_json)["stream_frame"])
-            )
-        except RuntimeError:
-            self._render_matrices = None
         self.frame_dirty = True
 
     def request_preview_frame(self, scene: bpy.types.Scene) -> None:
@@ -558,12 +676,6 @@ class BridgeRuntime:
             return
         width, height = renderer.validate_resolution(view.width, view.height)
         self._open_stream(scene, view, width, height, "preview")
-        try:
-            self._render_matrices = viewport.render_matrices(
-                viewport.frame_bounds(view)
-            )
-        except RuntimeError:
-            self._render_matrices = None
         self.frame_dirty = True
 
     def _consume_frame(self, message: dict[str, Any]) -> None:
@@ -574,17 +686,6 @@ class BridgeRuntime:
             return
         if self._outstanding.get(slot) == sequence:
             self._outstanding.pop(slot, None)
-            pending = self._switch_after_publish
-            if pending is not None and pending.get("sequence") == sequence:
-                self._switch_after_publish = None
-                scene = self._scene()
-                if scene is None:
-                    return
-                destination = self._view(scene, pending["destination_uuid"])
-                if destination is None:
-                    self._error("VIEW_NOT_FOUND", "The destination Comic View was deleted")
-                    return
-                self._activate(scene, destination, pending.get("request_id"))
 
     def _render_if_needed(self, scene: bpy.types.Scene, now: float) -> None:
         if not self.streaming or not self.frame_dirty:
@@ -601,22 +702,20 @@ class BridgeRuntime:
             self.stop_stream()
             return
         try:
-            stored_state = parse_state(view.state_json)
-            view_layer = view_layer_for_state(
-                scene, stored_state, getattr(bpy.context, "view_layer", None)
-            )
-            if self.frame_kind == "committed":
-                bounds = stored_state.get("stream_frame", viewport.frame_bounds(view))
-                resolution = stored_state.get("output_resolution", [view.width, view.height])
-                width, height = renderer.validate_resolution(*resolution)
+            if self._pending_render is not None:
+                frame, self._pending_render = self._pending_render, None
+                width, height = frame.width, frame.height
+            elif self.frame_kind == "committed":
+                frame, _warnings = self._render_saved_snapshot(scene, view)
+                width, height = frame.width, frame.height
             else:
                 bounds = viewport.frame_bounds(view)
                 width, height = renderer.validate_resolution(view.width, view.height)
-            frame = renderer.render_active_camera(
-                scene, view_layer, width, height, stream_frame=bounds,
-                view_matrix=(self._render_matrices[0] if self._render_matrices else None),
-                projection_matrix=(self._render_matrices[1] if self._render_matrices else None),
-            )
+                frame = renderer.render_active_camera(
+                    scene, bpy.context.view_layer, width, height,
+                    stream_frame=bounds,
+                    hide_overlays=self._hide_overlays(),
+                )
             if len(frame.rgba) != self._slot_bytes:
                 raise RuntimeError("The rendered frame size changed during streaming")
             memory = self._memory
@@ -628,7 +727,6 @@ class BridgeRuntime:
             sequence = self._sequence
             self._outstanding[free_slot] = sequence
             self.frame_dirty = False
-            self._render_matrices = None
             self.send({
                 "type": "FRAME_READY", "frame_kind": self.frame_kind,
                 "project_uuid": settings.project_uuid,
@@ -640,22 +738,13 @@ class BridgeRuntime:
                 "height": frame.height,
                 "stride": frame.width * 4,
             })
-            pending = self._switch_after_publish
-            if self.frame_kind == "committed" and pending is not None:
-                pending["sequence"] = sequence
-                pending["deadline"] = now + 5.0
         except Exception as error:
             self.frame_dirty = False
-            self._render_matrices = None
             self.last_error = str(error)
             self.send({
                 "type": "ERROR", "code": "RENDER_FAILED",
                 "message": str(error),
             })
-            if self._switch_after_publish is not None:
-                self._switch_after_publish = None
-                self.stop_stream()
-                self.send({"type": "STREAM_STATUS", "status": "frozen"})
 
     def _check_snapshot_dirty(self, scene: bpy.types.Scene, now: float) -> None:
         if not self.state_check_due or now < self.state_check_due:
@@ -740,16 +829,6 @@ class BridgeRuntime:
             except Exception as error:
                 self._error("COMMAND_FAILED", str(error), message.get("request_id"))
         now = time.monotonic()
-        pending = self._switch_after_publish
-        if pending is not None and now >= float(pending.get("deadline", now + 1.0)):
-            self._switch_after_publish = None
-            self.stop_stream()
-            self.send({"type": "STREAM_STATUS", "status": "frozen"})
-            self._error(
-                "UPDATE_ACK_TIMEOUT",
-                "The committed outgoing frame was not acknowledged; the destination remains frozen",
-                pending.get("request_id"),
-            )
         self._check_snapshot_dirty(scene, now)
         self._render_if_needed(scene, now)
         return 0.02

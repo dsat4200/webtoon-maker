@@ -74,17 +74,19 @@ To install and connect it:
 
 1. Install Blender 4.5 LTS on Windows.
 2. Run `blender_extension/webtoon_comic_views/build.ps1`, or use the already
-   built `blender_extension/webtoon_comic_views-0.2.0.zip`.
+   built `blender_extension/webtoon_comic_views-0.3.0.zip`.
 3. In Blender, choose **Edit → Preferences → Get Extensions → Install from
    Disk**, select the ZIP, and enable **Webtoon Comic Views**.
-4. In a 3D View, open the **Comic Views** sidebar. Create or update views and
+4. In a 3D View, open the **Comic Views** sidebar. Create, Save, and Render views and
    copy the displayed loopback port and token.
 5. In Webtoon Maker, open the **Blender Views** ribbon page, enter those values,
    connect, select a thumbnail, and choose **Add Selected View to Canvas**.
 
 Only the linked image selected in the active chapter owns the stream. Blender
-scene edits remain working changes until **Update** publishes a committed
-revision, thumbnail, resolution, and full frame. **Render Once** shows a
+scene edits remain working changes until **Save** stores them and **Render**
+publishes that saved revision, thumbnail, resolution, and full frame. **Load**
+restores the latest Save, while **Revert** swaps it with the previous Save
+without rendering. **Render Once** shows a
 temporary preview that is never cached into the comic project. Selecting
 anything else, changing tabs, minimizing, or disconnecting freezes the last
 committed frame. That frame is encoded into the project, so the comic reopens
@@ -97,9 +99,10 @@ detach the cache into a normal embedded image. Rasterize and Copy as Asset also
 freeze the cached image.
 
 The prototype supports one Blender instance, one editor connection, and one
-active stream. It renders the orange, screen-space Stream Frame from the saved
-3D viewport with captured shading and a transparent background; that frame may
-extend beyond the active camera and is not a Cycles/Eevee final render.
+active stream. It renders the camera-relative Stream Frame from the saved
+camera and captured shading with a transparent background; that frame may
+extend beyond the camera gate and is not a Cycles/Eevee final render. Ordinary
+viewport pan, zoom, and rotation do not affect published output.
 Comic Views store panel-variable state and stable references, never mesh,
 curve, texture, or other geometry data.
 

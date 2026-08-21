@@ -20,16 +20,25 @@ stored in the `.blend`; full streamed frames are transient shared memory.
 
 ## Workflow
 
-- **New** captures the active camera, current view layer, object/rig state,
-  visibility, collections, lights, shape keys, modifier enable flags, and the
-  active 3D View shading configuration. It also renders a packed thumbnail.
-- **Set Stream Frame** lets you drag the orange output rectangle anywhere in
-  the bound 3D View, including beyond the camera border. Its width setting is
-  fixed and its height follows the rectangle's screen aspect ratio.
-- **Update** replaces that snapshot, thumbnail, viewport framing, and output
-  resolution, increments its revision, and publishes one durable full frame. **Revert**
-  reapplies the stored snapshot. **Duplicate** creates a new UUID and copied
-  state; **Delete** never deletes scene geometry.
+- **New** performs an initial Save and Render. **Save** captures the active
+  camera and view layer, every object/rig control, visibility, collection and
+  Local View state, lights, shape keys, modifier flags, and 3D View shading,
+  without rendering.
+- **Load** applies the latest Save without rendering. Selecting another Comic
+  View automatically loads it; dirty work prompts for Save, Discard, or Cancel.
+- **Revert** swaps the latest Save with the one previous Save, loads it, and
+  never renders. Press Revert again to swap back. It is disabled until a
+  previous Save exists.
+- **Render** publishes only the latest saved state, regenerates its thumbnail,
+  and advances the revision. Unsaved working changes are restored afterward,
+  even when rendering fails. The legacy `webtoon.update_comic_view` operator
+  remains an alias for Render.
+- **Set Stream Frame** is available in Camera View. It stores the orange crop
+  in camera-gate coordinates, permits crops beyond the gate, and derives
+  height from the camera gate and crop aspect. Viewport pan/zoom/rotation do
+  not change saved output; moving a locked camera remains a scene change.
+- **Duplicate** copies saved/rendered state without Revert history. **Delete**
+  never deletes scene geometry.
 - Set each view's stream width from 64–4096 pixels, up to 16 megapixels after
   the derived height is applied. Blender edits do not publish automatically.
   The editor's **Render Once** requests an immediate, nonpersistent preview.
@@ -42,14 +51,19 @@ data uses a library/path/type/name repair identity and is reported as less
 robust. Missing targets produce warnings while the rest of a view still loads.
 Objects and collections introduced after an older view are hidden when that
 view activates; newly introduced subordinate controls on known objects remain
-unchanged and prompt you to update the view.
+unchanged and prompt you to save the view.
 
 Selecting an already active view is idempotent: view-list, thumbnail, dirty,
 and revision refreshes never reapply its saved scene state. A Comic View is
 marked dirty when its captured panel state hash changes, but no frame is
-published until **Update**. Geometry edits still affect the next Update or
-Render Once without storing geometry in the snapshot.
-Switching away from a dirty view requires Update, Revert, or Cancel.
+published until **Render**. Geometry edits remain shared Blender data and are
+not duplicated or restored by Comic View snapshots. **Render Once** remains a
+temporary preview of working state.
+
+The `.blend`-stored **Hide/Show Stream Frame Overlay** button controls only the
+orange camera-relative frame. The add-on preference **Always Hide Overlays**
+temporarily disables Blender overlays for offscreen output and restores the
+viewport setting after success or failure.
 
 Pixel transport is top-down straight-alpha RGBA8 in a Blender-created,
 triple-buffered shared-memory block. Control messages use a token-authenticated

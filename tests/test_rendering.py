@@ -58,8 +58,24 @@ def test_user_document_and_layer_grids_resolve_for_drawing_and_snapping(
     painter = QPainter(image)
     canvas._draw_grid(painter, QRectF(0, 0, 80, 80))
     painter.end()
-    assert image.pixelColor(20, 10).lightness() < 20
+    major = image.pixelColor(40, 10).lightness()
+    minor = image.pixelColor(20, 10).lightness()
+    assert major <= 2
+    assert abs(minor - round(255 * (1.0 - 0.65))) <= 2
     assert image.pixelColor(10, 10).lightness() > 240
+
+    chapter.grid_override_enabled = True
+    chapter.grid = GridSettings(
+        size=40, divisions=1, color="#000000", opacity=1.0,
+    )
+    divisions_one = QImage(81, 81, QImage.Format_ARGB32_Premultiplied)
+    divisions_one.fill(QColor("white"))
+    painter = QPainter(divisions_one)
+    canvas._draw_grid(painter, QRectF(0, 0, 80, 80))
+    painter.end()
+    assert divisions_one.pixelColor(40, 10).lightness() <= 2
+    assert divisions_one.pixelColor(20, 10).lightness() > 240
+    chapter.grid_override_enabled = False
 
     settings.grid_overlay_visible = False
     hidden = QImage(81, 81, QImage.Format_ARGB32_Premultiplied)

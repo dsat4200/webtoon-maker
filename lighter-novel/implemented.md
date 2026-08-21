@@ -1,3 +1,12 @@
+## filled shape bugs
+- [x] sometimes drawing a shape draws like a line through the middle and doesn't close it fully.
+- [x] tweak create filled shape. straight lines and ends should be vector points. doesn't always fill the shape.
+
+
+## better grids
+- [x] grid view, instead of showing each grid ccell individually, should show grid divisions of 4, like csp
+
+
 - [x] using vector tools and hitting apply while no vector points are selected should make them affect all vector points in the currently active vector object.
 - [x] instead of having different modes for each parameter in vector tools, just show separate "redraw thickness" and "redraw opacity" UI elements stacked.
 - [x] also, vector tools UI element groupings should be collapsable with a down arrow / carat icon thing in the top left.

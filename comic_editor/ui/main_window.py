@@ -4000,7 +4000,7 @@ class MainWindow(QMainWindow):
 
     def _blender_stream_status_changed(self, status: str) -> None:
         labels = {
-            "live": "Ready — Update publishes; Render Once shows a temporary preview",
+            "live": "Ready — Render publishes the saved Comic View; Render Once previews working changes",
             "preview": "Preview — temporary unsaved Blender scene (not cached)",
             "activating": "Activating the selected Comic View in Blender…",
             "connected": "Connected — select a linked image to stream it",
@@ -4008,7 +4008,7 @@ class MainWindow(QMainWindow):
             "frozen": "Frozen — activation was canceled",
             "offline": "Offline — showing the last cached frame",
             "unavailable": "Offline — this Comic View is unavailable; use Relink to choose another",
-            "stale": "Stale — Blender has an older revision; update or relink before streaming",
+            "stale": "Stale — Blender has an older revision; render or relink before streaming",
             "error": "Error — showing the last cached frame",
         }
         self.selection_settings.image_controls.set_source_status(
@@ -4024,15 +4024,15 @@ class MainWindow(QMainWindow):
             f'"{current}" has scene changes that have not been stored. '
             f'Switch to "{destination}"?'
         )
-        update = box.addButton("Update and Switch", QMessageBox.AcceptRole)
-        revert = box.addButton("Revert and Switch", QMessageBox.DestructiveRole)
+        save = box.addButton("Save and Switch", QMessageBox.AcceptRole)
+        discard = box.addButton("Discard and Switch", QMessageBox.DestructiveRole)
         cancel = box.addButton(QMessageBox.Cancel)
-        box.setDefaultButton(update)
+        box.setDefaultButton(save)
         box.exec()
         clicked = box.clickedButton()
         resolution = (
-            "update" if clicked is update else
-            "revert" if clicked is revert else "cancel"
+            "save" if clicked is save else
+            "discard" if clicked is discard else "cancel"
         )
         self.blender_sources.client.resolve_dirty_switch(resolution)
         if clicked is cancel:

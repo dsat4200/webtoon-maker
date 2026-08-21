@@ -1922,7 +1922,6 @@ class _CanvasLogic:
     ) -> None:
         if self.chapter is None:
             return
-        before = None if self._suppress_selection_undo else self._selection_snapshot()
         previous_tool = self.tool
         if (
             self._page_gap_state is not None
@@ -1996,10 +1995,6 @@ class _CanvasLogic:
         self.selectionSetChanged.emit(list(self.selected_entities))
         self._invalidate_scene_cache()
         self.update()
-        if before is not None:
-            after = self._selection_snapshot()
-            if before["kind"] != after["kind"] or before["id"] != after["id"] or before["entities"] != after["entities"] or before["path"] != after["path"]:
-                self._push_selection_undo(before, after)
 
     def set_selection_set(
         self, entities: Iterable[tuple[str, str]],
@@ -2008,7 +2003,6 @@ class _CanvasLogic:
         """Select an outliner-authored raster/vector object set."""
         if self.chapter is None:
             return False
-        before = None if self._suppress_selection_undo else self._selection_snapshot()
         ordered: list[tuple[str, str]] = []
         for kind, entity_id in entities:
             key = (str(kind), str(entity_id))
@@ -2084,16 +2078,12 @@ class _CanvasLogic:
         self.selectionChanged.emit(*primary)
         self._invalidate_scene_cache()
         self.update()
-        if before is not None:
-            after = self._selection_snapshot()
-            self._push_selection_undo(before, after)
         return True
 
     def clear_selection(self) -> None:
         """Clear the current entity and notify every selection consumer."""
         if self.chapter is None:
             return
-        before = None if self._suppress_selection_undo else self._selection_snapshot()
         if self._vector_gesture_mode is not None:
             self._cancel_vector_gesture(restore=True)
         if (
@@ -2121,9 +2111,6 @@ class _CanvasLogic:
         self.selectionSetChanged.emit([])
         self._invalidate_scene_cache()
         self.update()
-        if before is not None:
-            after = self._selection_snapshot()
-            self._push_selection_undo(before, after)
 
     def _selection_snapshot(self):
         return {
@@ -8179,23 +8166,56 @@ class _CanvasLogic:
         else:
             grid = self.resolved_grid()
         step = grid.size / grid.divisions
-        color = QColor(grid.color)
-        color.setAlphaF(grid.opacity)
-        pen = QPen(color, 1)
-        pen.setCosmetic(True)
-        painter.setPen(pen)
-        left = max(0, math.floor((visible.left() - grid.origin_x) / step) * step + grid.origin_x)
+        minor_path = QPainterPath()
+        major_path = QPainterPath()
+        first_x_index = math.floor(
+            (visible.left() - grid.origin_x) / step
+        )
+        left = max(
+            0, first_x_index * step + grid.origin_x
+        )
         right = min(self.chapter.width, visible.right())
-        top = max(0, math.floor((visible.top() - grid.origin_y) / step) * step + grid.origin_y)
+        first_y_index = math.floor(
+            (visible.top() - grid.origin_y) / step
+        )
+        top = max(
+            0, first_y_index * step + grid.origin_y
+        )
         bottom = min(self.chapter.height, visible.bottom())
         x = left
+        x_index = round((x - grid.origin_x) / step)
         while x <= right:
-            painter.drawLine(QPointF(x, max(0, visible.top())), QPointF(x, bottom))
+            path = (
+                major_path
+                if x_index % grid.divisions == 0 else minor_path
+            )
+            path.moveTo(QPointF(x, max(0, visible.top())))
+            path.lineTo(QPointF(x, bottom))
             x += step
+            x_index += 1
         y = top
+        y_index = round((y - grid.origin_y) / step)
         while y <= bottom:
-            painter.drawLine(QPointF(max(0, visible.left()), y), QPointF(right, y))
+            path = (
+                major_path
+                if y_index % grid.divisions == 0 else minor_path
+            )
+            path.moveTo(QPointF(max(0, visible.left()), y))
+            path.lineTo(QPointF(right, y))
             y += step
+            y_index += 1
+        for path, opacity in (
+            (minor_path, grid.opacity * 0.65),
+            (major_path, grid.opacity),
+        ):
+            if path.isEmpty():
+                continue
+            color = QColor(grid.color)
+            color.setAlphaF(opacity)
+            pen = QPen(color, 1)
+            pen.setCosmetic(True)
+            painter.setPen(pen)
+            painter.drawPath(path)
 
     def _draw_predictive_ink(self, painter: QPainter) -> None:
         if not self.settings.predictive_ink or self._predictive is None:

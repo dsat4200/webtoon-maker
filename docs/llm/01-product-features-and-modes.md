@@ -11,7 +11,7 @@ The application intentionally does not implement scheduling, reference libraries
 ## Main workspace
 
 - The top project toolbar starts with an instant-popup File button containing New Series, Open Series, a dynamic Open Recent submenu, Import Images…, Save, Save As, and Export PNG. Save As atomically clones the complete owning series with a new series ID and rebinds its open series/asset tabs to the clone.
-- The same toolbar contains Undo/Redo, Hotkeys…, Tablet Navigation, Reset View, Snap to Grid, chapter switching/creation, Trim Height, Export PNG, and Fullscreen.
+- The same toolbar contains Undo/Redo, Hotkeys…, Settings… immediately beside it, Tablet Navigation, Reset View, Snap to Grid, chapter switching/creation, Trim Height, Export PNG, and Fullscreen. Settings has a tabbed Grid page for persisted user defaults and undoable per-document overrides; resolved layer overrides remain supported.
 - A closable project-tab row keeps multiple series and asset tabs open. Switching tabs restores the document, sparse tiles, images, dirty state, undo/redo, camera, selection, tool, hierarchy expansion, ribbon choice, and render caches without reopening from disk.
 - The left sidebar contains the tool list, expandable Shapes and Drawing Selection groups, add-object actions (Add Page, Add Text, Add Raster, Add Vector Drawing), and navigation/grid toggles.
 - The ribbon above the color tabs contains Tool Settings and contextual Gradient Tools, Vector Tools, Modifiers, Asset Library, and Blender Views pages. Vector Tools appears only while a Vector Drawing is active. Selecting text opens Tool Settings and replaces its ordinary tool group with Object/Presets, Typography, and Layout groups.
@@ -294,3 +294,8 @@ These are not separate `ToolKind` values but materially change behavior.
 - Alt+Return: Fullscreen (installed directly by the main window)
 
 Vector Redraw, Connect, Simplify, the three drawing-selection tools, and Insert Page Gap have no default chord. The hotkey dialog supports single simultaneous chords, modifier-only chords, duplicate validation, clearing, and optional Hold behavior for tools. Delete Selected yields Delete to focused editors, active canvas text editing, and shape/gradient point editing.
+
+The grid uses the resolved user → document → nearest-layer size, divisions,
+color, and opacity for both canvas drawing and snapping. Box boundaries render
+at full configured opacity; subdivision lines render at 65% of that opacity.
+Alt+G persists the user-wide visibility gate without dirtying the document.

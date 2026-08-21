@@ -193,3 +193,25 @@ def test_same_view_activation_does_not_resend_activate_or_restart_stream(qapp):
 
     assert sent == []
     client.deleteLater()
+
+
+def test_dirty_switch_uses_save_discard_cancel_and_accepts_legacy_aliases(qapp):
+    client = BlenderSourceClient()
+    sent = []
+    client._send = lambda message, **_kwargs: sent.append(message) or True
+
+    for requested, expected in (
+        ("save", "save"), ("discard", "discard"), ("cancel", "cancel"),
+        ("update", "save"), ("revert", "discard"),
+    ):
+        client.resolve_dirty_switch(requested)
+        assert sent[-1]["type"] == "RESOLVE_DIRTY"
+        assert sent[-1]["resolution"] == expected
+
+    try:
+        client.resolve_dirty_switch("render")
+    except ValueError as error:
+        assert "save, discard, or cancel" in str(error)
+    else:
+        raise AssertionError("invalid dirty-switch resolution was accepted")
+    client.deleteLater()

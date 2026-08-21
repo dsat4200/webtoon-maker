@@ -20,14 +20,15 @@ ImageStore runtime override → ImageObject → normal canvas compositor
 
 ## Blender state
 
-State format version 2 captures the active camera and view layer, object and
+State format version 3 captures the active camera and view layer, object and
 pose-control transforms, object/collection/layer-collection visibility, numeric
 rig custom properties, shape keys, camera/light values, modifier enable flags,
-viewport shading, explicitly registered RNA properties, the bound viewport
-pose, normalized screen-space Stream Frame, and derived output resolution. It
-contains no mesh, curve, texture, or evaluated geometry. Version-1 snapshots
-migrate using the visible camera rectangle when available, with a centered 80%
-frame as fallback.
+viewport shading, explicitly registered RNA properties, active layer
+collection, Local View membership, camera-gate render aspect, a camera-relative
+Stream Frame, and derived output resolution. It contains no mesh, curve,
+texture, or evaluated geometry. Version-1/2 viewport-relative frames migrate
+through their saved viewport and camera gate when possible, otherwise to the
+full camera gate with a warning.
 
 Local Blender targets receive a `webtoon_comic_uuid` custom property. Capture
 repairs duplicated IDs while preferring a target known by an existing view,
@@ -39,22 +40,29 @@ object transforms, rig controls, shape keys, modifiers/registered values,
 camera/light data, the active camera, viewport shading, and dependency-graph
 evaluation. Missing targets warn without aborting. Objects/collections not in
 an older snapshot are hidden; new subordinate controls on known objects remain
-unchanged and warn that the view should be updated.
+unchanged and warn that the view should be saved.
 
-Dependency-graph changes update only the working-state dirty check. They do not
-publish pixels and never reapply the stored snapshot. **Update** captures the
-working scene, viewport, frame, and resolution; increments the revision;
-regenerates the thumbnail; and emits one committed full frame. `RENDER_ONCE`
-emits a temporary preview without changing saved state, dirty status,
-thumbnail, or revision. Switching away from a dirty view still requires
-Update, Revert, or Cancel, and Update-before-switch waits for the outgoing
-committed frame acknowledgement.
+Dependency-graph changes affect only the working-state dirty check. **Save**
+captures state without rendering and rotates a changed prior Save into one
+backup slot. **Load** applies the current Save. **Render** transactionally
+captures working state, applies and publishes the current Save, then restores
+working state and viewport navigation in `finally`; only success advances the
+revision, thumbnail, and published dimensions. **Revert** swaps current and
+previous Saves and loads the restored state without rendering. `RENDER_ONCE`
+emits a temporary working-state preview without changing saved state,
+thumbnail, or revision. Row selection loads automatically, with Save and
+Switch, Discard and Switch, or Cancel for dirty work.
 
-The active view's orange `POST_PIXEL` overlay marks the exact screen crop.
-**Set Stream Frame** is a clamped modal marquee. `GPUOffScreen` renders from
-the bound `RegionView3D` matrices with a crop projection, so output may extend
-beyond the active camera. Overlay drawing is not included in the framebuffer.
-Width is user-controlled; height follows the frame's on-screen aspect ratio.
+The active view's orange `POST_PIXEL` overlay maps camera-gate coordinates to
+screen coordinates on each draw and is visible/editable only in Camera View.
+Coordinates may extend beyond `0–1`. `GPUOffScreen` uses the saved camera's
+inverse world matrix and camera projection plus the crop projection; ordinary
+viewport navigation is absent from the snapshot and cannot affect output.
+Width is user-controlled; height follows camera-gate and crop aspect. Local
+View is restored in the bound 3D View before rendering. The `.blend` overlay
+toggle controls the orange frame, while **Always Hide Overlays** temporarily
+suppresses Blender overlays during all offscreen output and always restores
+the prior viewport value.
 
 ## Protocol version 2
 
@@ -70,7 +78,9 @@ message types are:
   `ACTIVE_VIEW`, `SWITCH_REQUIRES_DECISION`, `SWITCH_CANCELED`,
   `STREAM_OPEN`, `FRAME_READY`, `STREAM_STATUS`, and `ERROR`.
 
-View and project identities are canonical UUID hex strings. Resolution is
+`RESOLVE_DIRTY` uses `save`, `discard`, or `cancel`; legacy `update` and
+`revert` values remain accepted as aliases. View and project identities are
+canonical UUID hex strings. Resolution is
 64–4096 per axis and no more than 16,777,216 pixels. Revisions and frame
 sequences are monotonic non-negative integers. The editor rejects mismatched,
 stale, duplicate, malformed, or out-of-order data.
