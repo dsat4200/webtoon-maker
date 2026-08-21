@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 from PySide6.QtCore import QItemSelectionModel, QPointF, Qt
+from PySide6.QtWidgets import QDialog
 
+from comic_editor.core import settings as settings_module
 from comic_editor.core.models import BoundGeometry, ChapterDocument, RasterObject, TextObject
 from comic_editor.core.settings import EditorSettings
 from comic_editor.core.tiles import TileStore
 from comic_editor.ui.canvas import CanvasWidget, ToolKind
 from comic_editor.ui.main_window import MainWindow
+from comic_editor.ui.settings_dialog import SettingsDialog
 from comic_editor.ui.tree_model import HierarchyModel
 
 
@@ -23,6 +26,101 @@ def _chapter():
         ),
     )
     return chapter, page, layer, raster, text
+
+
+def test_settings_action_grid_tab_and_global_toggle_do_not_dirty_document(
+    qapp, monkeypatch, tmp_path,
+):
+    monkeypatch.setattr(
+        settings_module, "settings_path", lambda: tmp_path / "settings.json"
+    )
+    window = MainWindow()
+    chapter, _page, _layer, _raster, _text = _chapter()
+    window._set_chapter(chapter, TileStore())
+    try:
+        actions = window.file_toolbar.actions()
+        assert actions.index(window.settings_action) == (
+            actions.index(window.hotkeys_action) + 1
+        )
+        dialog = SettingsDialog(window.settings, chapter, window)
+        assert dialog.tabs.tabText(0) == "Grid"
+        assert dialog.document_override.isEnabled()
+        dialog.reject()
+
+        before = chapter.to_dict()
+        before_commands = len(window.canvas.command_stack._undo)
+        before_visible = window.settings.grid_overlay_visible
+        window._toggle_grid()
+
+        assert window.settings.grid_overlay_visible is not before_visible
+        assert chapter.to_dict() == before
+        assert len(window.canvas.command_stack._undo) == before_commands
+        assert window._dirty is False
+        assert settings_module.load_settings().grid_overlay_visible is (
+            not before_visible
+        )
+    finally:
+        window.deleteLater()
+
+
+def test_settings_dialog_accept_applies_one_document_grid_change(
+    qapp, monkeypatch, tmp_path,
+):
+    monkeypatch.setattr(
+        settings_module, "settings_path", lambda: tmp_path / "settings.json"
+    )
+    window = MainWindow()
+    chapter, _page, _layer, _raster, _text = _chapter()
+    window._set_chapter(chapter, TileStore())
+
+    class _Checked:
+        @staticmethod
+        def isChecked():
+            return True
+
+    class _AcceptedSettingsDialog:
+        def __init__(self, settings, document, parent):
+            del settings, document, parent
+            self.document_override = _Checked()
+
+        @staticmethod
+        def exec():
+            return QDialog.DialogCode.Accepted
+
+        @staticmethod
+        def apply_user_settings(settings):
+            settings.grid_size_px = 72
+            settings.grid_divisions = 3
+            settings.grid_color = "#123456"
+            settings.grid_opacity = 0.4
+            settings.clamp()
+
+        @staticmethod
+        def document_grid():
+            from comic_editor.core.models import GridSettings
+            return GridSettings(
+                size=96, divisions=6, color="#abcdef", opacity=0.6
+            )
+
+    monkeypatch.setattr(
+        "comic_editor.ui.main_window.SettingsDialog", _AcceptedSettingsDialog
+    )
+    before_commands = len(window.canvas.command_stack._undo)
+    try:
+        window._edit_settings()
+        assert window.settings.grid_size_px == 72
+        assert chapter.grid_override_enabled is True
+        assert chapter.grid.size == 96
+        assert chapter.grid.divisions == 6
+        assert len(window.canvas.command_stack._undo) == before_commands + 1
+        assert window._dirty is True
+        window.canvas.command_stack.undo()
+        assert window.canvas.chapter.grid_override_enabled is False
+        window.canvas.command_stack.redo()
+        assert window.canvas.chapter.grid_override_enabled is True
+        assert window.canvas.chapter.grid.size == 96
+    finally:
+        window.deleteLater()
 
 
 def test_contextual_raster_tools(qapp):

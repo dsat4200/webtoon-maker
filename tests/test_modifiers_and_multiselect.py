@@ -68,7 +68,7 @@ def test_modifier_registry_round_trip_validation_and_garbage_collection():
     first.transform_quad = [(30, 25), (285, 35), (275, 290), (25, 270)]
 
     restored = ChapterDocument.from_dict(chapter.to_dict())
-    assert restored.schema_version == 20
+    assert restored.schema_version == 21
     assert restored.objects[text.object_id].modifier_ids == []
     assert orphan.modifier_id not in restored.modifiers
     assert restored.objects[raster.object_id].modifier_ids == [

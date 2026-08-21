@@ -343,7 +343,7 @@ class LayerSettingsPanel(QGroupBox):
             self.point_width.setValue(selected_node.width_multiplier)
             self.point_roundness.setValue(selected_node.roundness)
 
-        effective_grid = chapter.effective_grid(layer.layer_id)
+        effective_grid = self.canvas.resolved_grid(layer.layer_id)
         self.grid_override.setVisible(True)
         self._set_pair_visible(self.grid_size_label, self.grid_size, True)
         self._set_pair_visible(
@@ -410,6 +410,10 @@ class LayerSettingsPanel(QGroupBox):
         if layer is None:
             return
         before = chapter.to_dict()
+        grid_before = (
+            layer.grid_override.to_dict()
+            if layer.grid_override is not None else None
+        )
         layer.name = self.name.text().strip() or layer.name
         layer.visible = self.visible.isChecked()
         if not layer.is_page:
@@ -431,8 +435,8 @@ class LayerSettingsPanel(QGroupBox):
         if self.grid_override.isChecked():
             if layer.grid_override is None:
                 inherited = (
-                    chapter.effective_grid(layer.parent_id)
-                    if layer.parent_id else chapter.grid
+                    self.canvas.resolved_grid(layer.parent_id)
+                    if layer.parent_id else self.canvas.resolved_grid()
                 )
                 layer.grid_override = GridSettings.from_dict(
                     inherited.to_dict()
@@ -442,6 +446,10 @@ class LayerSettingsPanel(QGroupBox):
             layer.grid_override.validate()
         else:
             layer.grid_override = None
+        grid_after = (
+            layer.grid_override.to_dict()
+            if layer.grid_override is not None else None
+        )
         after = chapter.to_dict()
         if before != after:
             if push_undo:
@@ -451,7 +459,10 @@ class LayerSettingsPanel(QGroupBox):
             self.canvas.documentChanged.emit(None)
             self.canvas.hierarchyChanged.emit()
             self.changed.emit()
-        self.canvas.update()
+        if grid_before != grid_after:
+            self.canvas.refresh_grid_settings()
+        else:
+            self.canvas.update()
 
     def _flatten_compound(self) -> None:
         chapter = self.canvas.chapter

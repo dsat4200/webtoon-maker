@@ -42,7 +42,7 @@ workflow.
 - Unified rectangle, circle, and open/closed vector-Bézier Shape paths
 - Per-point width, roundness, linked controls, outlines, and endpoint caps
 - Frontmost-first layer/page selection with Ctrl-click candidate menus
-- Per-layer inherited or overridden grids
+- User grid defaults with optional document and per-layer overrides
 - Pixel-snapped pan, zoom, rotation, and aspect-preserving chapter preview navigation
 - Touch navigation controlled only by Tablet Navigation mode
 - Command-based undo/redo and atomic autosave recovery
@@ -119,6 +119,12 @@ Hotkeys are editable as single simultaneous chords, including modifier-only
 bindings such as `Ctrl` or `Ctrl+Shift`. Tool bindings can enable **Hold**:
 a quick tap selects that tool normally, while holding for at least 200ms
 switches temporarily and restores the previous tool on release.
+
+The Settings button beside Hotkeys opens the Grid preferences. Grid box size,
+subdivisions, color, opacity, and global visibility persist per user; the
+current document and individual layers can override the grid geometry/style.
+`Alt+G` toggles the global canvas overlay by default, and snapping follows the
+same resolved grid. The chapter navigator and exports remain grid-free.
 
 Expand Shapes to choose Rectangle, Circle, or Shape. In Shape creation,
 clicking adds vector points, dragging creates Bézier points, clicking the

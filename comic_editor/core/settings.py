@@ -7,6 +7,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 from PySide6.QtCore import QStandardPaths
+from PySide6.QtGui import QColor
 from comic_editor.core.pressure import BrushPreset, default_pencil_presets
 
 
@@ -167,13 +168,18 @@ def default_fill_profiles() -> dict[str, dict[str, object]]:
 
 @dataclass
 class EditorSettings:
-    settings_version: int = 20
+    settings_version: int = 21
     tablet_mode: bool = False
     brush_size: int = 12
     eraser_size: int = 28
     brush_color: str = "#000000"
     eraser_square: bool = False
     snap_to_grid: bool = True
+    grid_overlay_visible: bool = True
+    grid_size_px: int = 120
+    grid_divisions: int = 4
+    grid_color: str = "#5d7d9c"
+    grid_opacity: float = 0.25
     page_scope_select: bool = True
     canvas_renderer: str = "auto"
     predictive_ink: bool = True
@@ -241,7 +247,7 @@ class EditorSettings:
         self.clamp()
 
     def clamp(self) -> None:
-        self.settings_version = 20
+        self.settings_version = 21
         self.blender_bridge_host = str(
             self.blender_bridge_host or "127.0.0.1"
         ).strip()
@@ -255,6 +261,28 @@ class EditorSettings:
         self.preview_font_names = bool(self.preview_font_names)
         self.brush_size = max(1, min(200, int(self.brush_size)))
         self.eraser_size = max(2, min(400, int(self.eraser_size)))
+        self.grid_overlay_visible = bool(self.grid_overlay_visible)
+        try:
+            self.grid_size_px = max(
+                8, min(1080, int(self.grid_size_px))
+            )
+        except (TypeError, ValueError):
+            self.grid_size_px = 120
+        try:
+            self.grid_divisions = max(
+                1, min(16, int(self.grid_divisions))
+            )
+        except (TypeError, ValueError):
+            self.grid_divisions = 4
+        grid_color = QColor(str(self.grid_color))
+        self.grid_color = (
+            grid_color.name(QColor.NameFormat.HexRgb)
+            if grid_color.isValid() else "#5d7d9c"
+        )
+        try:
+            self.grid_opacity = max(0.0, min(1.0, float(self.grid_opacity)))
+        except (TypeError, ValueError):
+            self.grid_opacity = 0.25
         defaults = {
             "pencil": {"small": 4, "medium": self.brush_size, "large": 22},
             "eraser": {"small": 8, "medium": self.eraser_size, "large": 44},
@@ -490,6 +518,10 @@ class EditorSettings:
         self.mask_pencil_to_alpha = max(
             0.0, min(1.0, float(self.mask_pencil_to_alpha))
         )
+        try:
+            self.draw_shape_simplify = max(0.5, min(5.0, float(self.draw_shape_simplify)))
+        except Exception:
+            self.draw_shape_simplify = 2.0
         self.recent_series = list(dict.fromkeys(self.recent_series or []))[:12]
         if not isinstance(self.last_chapter_by_series, dict):
             self.last_chapter_by_series = {}
@@ -646,13 +678,19 @@ def load_settings() -> EditorSettings:
                             "target_color_mode", "exclude_text",
                         ):
                             profile.pop(obsolete, None)
+            if int(raw.get("settings_version", 1)) < 21:
+                raw.setdefault("grid_overlay_visible", True)
+                raw.setdefault("grid_size_px", 120)
+                raw.setdefault("grid_divisions", 4)
+                raw.setdefault("grid_color", "#5d7d9c")
+                raw.setdefault("grid_opacity", 0.25)
             raw.pop("transform_snap_to_grid", None)
             stored_presets = raw.get("text_presets")
             if isinstance(stored_presets, list):
                 for preset in stored_presets:
                     if isinstance(preset, dict):
                         preset.pop("transform_snap", None)
-            raw["settings_version"] = 20
+            raw["settings_version"] = 21
             valid = {item.name for item in dataclasses.fields(EditorSettings)}
             result = EditorSettings(**{
                 key: value for key, value in raw.items() if key in valid

@@ -225,6 +225,8 @@ class ToolSettingsControls(QWidget):
         self.stack.addWidget(self.eraser_page)
         self.fill_page = self._build_fill_page()
         self.stack.addWidget(self.fill_page)
+        self.draw_shape_page = self._build_draw_shape_page()
+        self.stack.addWidget(self.draw_shape_page)
         self.refresh()
         self.set_context(None, False)
 
@@ -507,6 +509,38 @@ class ToolSettingsControls(QWidget):
         )
         return page
 
+    def _build_draw_shape_page(self) -> QWidget:
+        page = QWidget(self)
+        layout = QHBoxLayout(page)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(6)
+        label = QLabel("Point density", page)
+        label.setMinimumWidth(88)
+        self.draw_shape_density_slider = QSlider(Qt.Orientation.Horizontal, page)
+        self.draw_shape_density_slider.setRange(1, 10)
+        self.draw_shape_density_slider.setMinimumWidth(80)
+        self.draw_shape_density_spin = QSpinBox(page)
+        self.draw_shape_density_spin.setRange(1, 10)
+        self.draw_shape_density_spin.setButtonSymbols(QAbstractSpinBox.ButtonSymbols.NoButtons)
+        self.draw_shape_density_spin.setMinimumWidth(50)
+        self.draw_shape_density_slider.valueChanged.connect(self.draw_shape_density_spin.setValue)
+        self.draw_shape_density_spin.valueChanged.connect(self.draw_shape_density_slider.setValue)
+        self.draw_shape_density_spin.valueChanged.connect(self._draw_shape_density_changed)
+        self.draw_shape_density_slider.valueChanged.connect(self._draw_shape_density_changed)
+        layout.addWidget(label)
+        layout.addWidget(self.draw_shape_density_slider, 1)
+        layout.addWidget(self.draw_shape_density_spin)
+        return page
+
+    def _draw_shape_density_changed(self) -> None:
+        if self._loading:
+            return
+        density = int(self.draw_shape_density_slider.value())
+        tolerance = max(0.5, min(5.0, 5.5 - density * 0.5))
+        self.settings.draw_shape_simplify = float(tolerance)
+        self.settings.clamp()
+        self.settingsChanged.emit()
+
     def set_context(
         self, tool: object, vector_active: bool,
         raster_active: bool = False, mask_active: bool = False,
@@ -534,6 +568,9 @@ class ToolSettingsControls(QWidget):
         } and not vector_active:
             self.context_label.setText("Drawing Selection")
             self.stack.setCurrentWidget(self.empty_page)
+        elif value == "draw_shape":
+            self.context_label.setText("Draw Shape")
+            self.stack.setCurrentWidget(self.draw_shape_page)
         else:
             self.context_label.setText("No settings for the current tool")
             self.stack.setCurrentWidget(self.empty_page)
@@ -639,6 +676,11 @@ class ToolSettingsControls(QWidget):
         self.fill_gap_group.setEnabled(bool(profile["close_gap"]))
         self.fill_area_amount_group.setEnabled(bool(profile["area_scaling"]))
         self.fill_area_mode.setEnabled(bool(profile["area_scaling"]))
+        tolerance = float(getattr(self.settings, "draw_shape_simplify", 2.0))
+        density = int(round((5.5 - max(0.5, min(5.0, tolerance)))/0.5))
+        density = max(1, min(10, density))
+        self.draw_shape_density_slider.setValue(density)
+        self.draw_shape_density_spin.setValue(density)
         self._loading = False
 
     def _drawing_handles_changed(self, *args) -> None:

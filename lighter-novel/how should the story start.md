@@ -10,6 +10,8 @@ phoebe goes to an abandoned library
 AHAHHHHH I CANT WRITE FOR SHIT
 
 
+
+
 phoebe is at work, and has a conversation about animals with a coworker.
 - overworked office worker
 
@@ -19,8 +21,11 @@ hey sadie, do you think humans should have a mating season?
 "we have work to do, stay on task"
 (establishing shot, they're working overtime)
 
-mmm..i am on tashhhhk..
+
+I AM ON TASK!
 (phoebe has a lollipop in her mouth, softcore lol)
+DOUBLE KILL
+
 (anime boy figure on her desk)
 
 phoebe looks at clock
@@ -60,7 +65,7 @@ robot boss
 
 "I dont have feelings, so why do you like insulting me so much?"
 
-"take it up with human resources" *sticks out tongue* *kicks vending machine*
+"take it up with human resources, clanker." *sticks out tongue* *kicks vending machine*
 
 ...
 

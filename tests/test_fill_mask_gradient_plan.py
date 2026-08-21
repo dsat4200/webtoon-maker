@@ -190,7 +190,7 @@ def test_mask_only_drawable_objects_round_trip_and_helpers_are_excluded():
     assert not helper.mask_only
 
     restored = ChapterDocument.from_dict(chapter.to_dict())
-    assert restored.schema_version == 20
+    assert restored.schema_version == 21
     assert all(restored.objects[obj.object_id].mask_only for obj in objects)
     assert not restored.objects[helper.object_id].mask_only
 
@@ -591,7 +591,7 @@ def test_legacy_fill_layer_and_vector_fill_materialize_to_raster_tiles():
     assert tiles.content_bounds(fill_layer_id) is not None
     assert tiles.content_bounds(vector_fill_id) is not None
     saved = migrated.to_dict()
-    assert saved["schema_version"] == 20
+    assert saved["schema_version"] == 21
     assert not any(item.get("layer_kind") == "fill" for item in saved["layers"])
     assert not any(item.get("type") == "vector_fill" for item in saved["objects"])
     assert all("fill_child_ids" not in item for item in saved["objects"])

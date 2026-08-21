@@ -54,7 +54,7 @@ def test_vector_drawing_round_trip_has_no_persistent_fill_children():
 
     restored = ChapterDocument.from_dict(chapter.to_dict())
     restored_drawing = restored.objects[drawing.object_id]
-    assert restored.schema_version == 20
+    assert restored.schema_version == 21
     assert isinstance(restored_drawing, VectorDrawingObject)
     assert "fill_child_ids" not in restored_drawing.to_dict()
     assert restored.to_dict() == chapter.to_dict()

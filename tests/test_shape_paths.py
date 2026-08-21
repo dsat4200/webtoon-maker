@@ -53,6 +53,70 @@ def _send_tablet(
     QCoreApplication.sendEvent(canvas, event)
 
 
+def test_draw_shape_preserves_shift_span_endpoints_as_vector_nodes(qapp):
+    canvas, chapter, _page, _layer = _canvas()
+    canvas.set_tool(ToolKind.DRAW_SHAPE)
+    before_ids = set(chapter.layers)
+    before_commands = len(canvas.command_stack._undo)
+    canvas._drawing_selection_gesture = [
+        QPointF(100, 100), QPointF(260, 100), QPointF(320, 180),
+        QPointF(260, 300), QPointF(100, 260),
+    ]
+    canvas._draw_shape_straight_spans = [(0, 1)]
+    canvas._draw_shape_active_straight_span = (2, 3)
+    canvas._drawing_selection_shift_active = True
+
+    assert canvas._finish_draw_shape()
+
+    created_id = next(iter(set(chapter.layers) - before_ids))
+    created = chapter.layers[created_id]
+    created.bound.validate()
+    endpoints = {
+        (round(node.x), round(node.y)): node for node in created.bound.nodes
+    }
+    for position in ((100, 100), (260, 100), (320, 180), (260, 300)):
+        node = endpoints[position]
+        assert node.point_type == "vector"
+        assert node.incoming is None
+        assert node.outgoing is None
+    assert len(canvas.command_stack._undo) == before_commands + 1
+
+
+def test_draw_shape_uses_vector_fallback_when_curve_fitting_fails(
+    qapp, monkeypatch,
+):
+    canvas, chapter, _page, _layer = _canvas()
+    canvas.set_tool(ToolKind.DRAW_SHAPE)
+    before_ids = set(chapter.layers)
+    monkeypatch.setattr(
+        "comic_editor.ui.canvas.fit_cubic_path",
+        lambda *args, **kwargs: (_ for _ in ()).throw(ValueError("fit failed")),
+    )
+    canvas._drawing_selection_gesture = [
+        QPointF(10, 10), QPointF(11.5, 10), QPointF(11, 11.5),
+    ]
+
+    assert canvas._finish_draw_shape()
+
+    created_id = next(iter(set(chapter.layers) - before_ids))
+    created = chapter.layers[created_id]
+    assert len(created.bound.nodes) == 3
+    assert all(node.point_type == "vector" for node in created.bound.nodes)
+    created.bound.validate()
+
+
+def test_draw_shape_rejects_only_degenerate_zero_area_contour(qapp):
+    canvas, chapter, _page, _layer = _canvas()
+    canvas.set_tool(ToolKind.DRAW_SHAPE)
+    before_ids = set(chapter.layers)
+    canvas._drawing_selection_gesture = [
+        QPointF(10, 10), QPointF(20, 20), QPointF(30, 30),
+    ]
+
+    assert canvas._finish_draw_shape()
+    assert set(chapter.layers) == before_ids
+
+
 def test_shape_creation_finish_and_global_style_gizmos(qapp):
     canvas, chapter, page, _layer = _canvas()
     canvas.show()
@@ -242,7 +306,7 @@ def test_path_node_shape_style_round_trip_and_open_leaf_invariants():
     )
     loaded = ChapterDocument.from_dict(chapter.to_dict())
     result = loaded.layers[line.layer_id]
-    assert loaded.schema_version == 20
+    assert loaded.schema_version == 21
     assert result.layer_kind == "open_shape"
     assert result.bound.closed is False
     assert result.bound.nodes[1].incoming == (70, 30)
@@ -1729,6 +1793,6 @@ def test_bound_edit_hotkey_migrates_to_shape_edit(monkeypatch, tmp_path):
     }), encoding="utf-8")
     monkeypatch.setattr(settings_module, "settings_path", lambda: path)
     loaded = load_settings()
-    assert loaded.settings_version == 20
+    assert loaded.settings_version == 21
     assert loaded.hotkeys["shape_edit"] == "Ctrl+B"
     assert "bound_edit" not in loaded.hotkeys

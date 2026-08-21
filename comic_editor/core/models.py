@@ -8,7 +8,7 @@ from dataclasses import dataclass, field
 from typing import Any, Iterable, Iterator, Literal
 
 
-SCHEMA_VERSION = 20
+SCHEMA_VERSION = 21
 SERIES_SCHEMA_VERSION = 17
 CHAPTER_WIDTH = 1080
 DEFAULT_CHAPTER_HEIGHT = 3240
@@ -2502,6 +2502,7 @@ class ChapterDocument:
     height: int = DEFAULT_CHAPTER_HEIGHT
     background: str = "#ffffff"
     grid: GridSettings = field(default_factory=GridSettings)
+    grid_override_enabled: bool = False
     root_page_ids: list[str] = field(default_factory=list)
     layers: dict[str, LayerNode] = field(default_factory=dict)
     objects: dict[str, ObjectEntity] = field(default_factory=dict)
@@ -2525,6 +2526,7 @@ class ChapterDocument:
         self.width = max(1, int(self.width))
         self.height = max(1, int(self.height))
         self.grid.validate()
+        self.grid_override_enabled = bool(self.grid_override_enabled)
         for mask_id, mask in list(self.masks.items()):
             if mask.mask_id != mask_id:
                 mask.mask_id = mask_id
@@ -3525,6 +3527,7 @@ class ChapterDocument:
             "name": self.name, "size": [self.width, self.height],
             "document_kind": self.document_kind,
             "background": self.background, "grid": self.grid.to_dict(),
+            "grid_override_enabled": self.grid_override_enabled,
             "root_page_ids": list(self.root_page_ids),
             "layers": [layer.to_dict() for layer in self.layers.values()],
             "objects": [obj.to_dict() for obj in self.objects.values()],
@@ -3541,6 +3544,7 @@ class ChapterDocument:
         schema = int(data.get("schema_version", 1))
         if schema > SCHEMA_VERSION:
             raise ValueError(f"Unsupported future chapter schema: {schema}")
+        legacy_grid_override = schema < 21
         has_legacy_fills = any(
             isinstance(item, dict)
             and str(item.get("layer_kind", "")) == "fill"
@@ -3600,6 +3604,10 @@ class ChapterDocument:
             document_kind=str(data.get("document_kind", "chapter")),
             background=str(data.get("background", "#ffffff")),
             grid=GridSettings.from_dict(data.get("grid")),
+            grid_override_enabled=(
+                legacy_grid_override
+                or bool(data.get("grid_override_enabled", False))
+            ),
             root_page_ids=[str(item) for item in data.get("root_page_ids", [])],
             layers={item.layer_id: item for item in layers},
             objects={item.object_id: item for item in objects},

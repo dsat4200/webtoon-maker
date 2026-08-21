@@ -1,3 +1,12 @@
+- [x] using vector tools and hitting apply while no vector points are selected should make them affect all vector points in the currently active vector object.
+- [x] instead of having different modes for each parameter in vector tools, just show separate "redraw thickness" and "redraw opacity" UI elements stacked.
+- [x] also, vector tools UI element groupings should be collapsable with a down arrow / carat icon thing in the top left.
+- [x] holding to switch to eraser should only work while in pencil mode.
+- [x] if a selection in lasso mode has already started (in either draw shape or lasso mode), and you hold shift, instead of continuing to draw the selection with each movement, it should act as though the last place you were before pressing shift was the last place you selected, and the current place you're drawing is the next one, and should act as if there's a straight line between those two (basically, hold shift during a lasso selection to select in a straight line). when releasing shift, selection should go back to normal. this only happens if you hold shift WHILE drawing already. if you hold shift before making another pen canvas press, it should add selection like normal (if applicable). 
+- [x] show as mask only button should appear pressed if its enabled on the selected layer, unpressed if not (as in, with the blue outline and pressed background color)
+
+
+
 - [x] make it possible to select objects of any type for select multiple, for basic functionality support like multi delete, hide, lock, among other object operations
 	- notably, multi selection hides the mask buttons on the object operations row (what i'm naming the row that has the trash, eye, lock, opacity, mask, opacity slider, and show as mask only ui elements)
 - [x] in mask mode, show a "remove mask" button next to the exit mask mode button.

@@ -49,7 +49,7 @@ from comic_editor.core.assets import (
 from comic_editor.core.models import (
     BoundGeometry, ChapterDocument, ChildRef, ColorFillGradientObject,
     ColorGradientRamp, ColorGradientStop, DocumentObject, GradientObject,
-    LineGradientField, LayerNode, RadialGradientField,
+    GridSettings, LineGradientField, LayerNode, RadialGradientField,
     ImageObject, PathContour, PathNode, RasterObject, ShapeStyle, TextObject,
     BlurModifier, OutlineModifier, ToneMask,
     SpeedLineCenterObject, SpeedLinesGradientObject, VectorDrawingObject,
@@ -778,6 +778,8 @@ class _CanvasLogic:
         self._drawing_selection_operation = "replace"
         self._drawing_selection_shift_anchor: QPointF | None = None
         self._drawing_selection_shift_active: bool = False
+        self._draw_shape_straight_spans: list[tuple[int, int]] = []
+        self._draw_shape_active_straight_span: tuple[int, int] | None = None
         self._selection_transform_quad: list[tuple[float, float]] | None = None
         self._selection_transform_start_quad: (
             list[tuple[float, float]] | None
@@ -8131,17 +8133,51 @@ class _CanvasLogic:
         height = line.height() if line.isValid() else QFontMetricsF(document.defaultFont()).height()
         return QRectF(float(x), y, 1.0, height)
 
+    def user_grid_settings(self) -> GridSettings:
+        """Return a detached grid value built from user preferences."""
+        grid = GridSettings(
+            enabled=True,
+            size=self.settings.grid_size_px,
+            divisions=self.settings.grid_divisions,
+            origin_x=0.0,
+            origin_y=0.0,
+            color=self.settings.grid_color,
+            opacity=self.settings.grid_opacity,
+        )
+        grid.validate()
+        return grid
+
+    def resolved_grid(self, layer_id: str | None = None) -> GridSettings:
+        """Resolve user, document, and nearest-layer grid settings."""
+        grid = self.user_grid_settings()
+        if self.chapter is None:
+            return grid
+        if self.chapter.grid_override_enabled:
+            grid = GridSettings.from_dict(self.chapter.grid.to_dict())
+        if layer_id and layer_id in self.chapter.layers:
+            for layer in self.chapter.ancestor_layers(layer_id):
+                if layer.grid_override is not None:
+                    grid = GridSettings.from_dict(
+                        layer.grid_override.to_dict()
+                    )
+        grid.enabled = True
+        return grid
+
+    def refresh_grid_settings(self) -> None:
+        self._invalidate_scene_cache()
+        self.update()
+
     def _draw_grid(self, painter: QPainter, visible: QRectF) -> None:
+        if not self.settings.grid_overlay_visible:
+            return
         if self.selected_kind == "layer" and self.selected_id in self.chapter.layers:
-            grid = self.chapter.effective_grid(self.selected_id)
+            grid = self.resolved_grid(self.selected_id)
         elif self.selected_kind == "object" and self.selected_id in self.chapter.objects:
-            grid = self.chapter.effective_grid(
+            grid = self.resolved_grid(
                 self.chapter.objects[self.selected_id].parent_layer_id
             )
         else:
-            grid = self.chapter.grid
-        if not grid.enabled:
-            return
+            grid = self.resolved_grid()
         step = grid.size / grid.divisions
         color = QColor(grid.color)
         color.setAlphaF(grid.opacity)
@@ -11460,7 +11496,7 @@ class _CanvasLogic:
     def _snap(self, point: QPointF, layer_id: str | None = None) -> QPointF:
         if not self.settings.snap_to_grid or self.chapter is None:
             return QPointF(round(point.x()), round(point.y()))
-        grid = self.chapter.effective_grid(layer_id) if layer_id else self.chapter.grid
+        grid = self.resolved_grid(layer_id)
         x, y = grid.snap(point.x(), point.y())
         return QPointF(x, y)
 
@@ -13064,6 +13100,8 @@ class _CanvasLogic:
         self._drawing_selection_gesture.clear()
         self._drawing_selection_shift_anchor = None
         self._drawing_selection_shift_active = False
+        self._draw_shape_straight_spans.clear()
+        self._draw_shape_active_straight_span = None
         self._transform_gizmo_key = None
         self._transform_gizmo_slot = None
         self._selection_transform_quad = None
@@ -13670,14 +13708,12 @@ class _CanvasLogic:
         test_transform: bool = True,
     ) -> bool:
         if self.tool == ToolKind.DRAW_SHAPE:
-            self._drawing_selection_operation = self._selection_operation()
-            if self._drawing_selection_operation == "replace" and not self._drawing_selection_path.isEmpty():
-                mods = QApplication.keyboardModifiers()
-                if not (mods & Qt.ShiftModifier or mods & Qt.AltModifier):
-                    before = self._selection_snapshot()
-                    self._drawing_selection_path = QPainterPath()
-                    after = self._selection_snapshot()
-                    self._push_selection_undo(before, after)
+            self._drawing_selection_operation = "replace"
+            self._drawing_selection_path = QPainterPath()
+            self._draw_shape_straight_spans.clear()
+            self._draw_shape_active_straight_span = None
+            self._drawing_selection_shift_anchor = None
+            self._drawing_selection_shift_active = False
             self._drawing_selection_gesture = [QPointF(world)]
             self.update()
             return True
@@ -13726,25 +13762,22 @@ class _CanvasLogic:
             if not self._drawing_selection_gesture:
                 return False
             shift = bool(QGuiApplication.keyboardModifiers() & Qt.ShiftModifier)
-            if shift and not self._drawing_selection_shift_active and len(self._drawing_selection_gesture) >= 1:
-                self._drawing_selection_shift_anchor = QPointF(self._drawing_selection_gesture[-1])
+            if shift and not self._drawing_selection_shift_active:
+                anchor_index = len(self._drawing_selection_gesture) - 1
+                self._drawing_selection_shift_anchor = QPointF(
+                    self._drawing_selection_gesture[anchor_index]
+                )
                 self._drawing_selection_shift_active = True
+                self._drawing_selection_gesture.append(QPointF(world))
+                self._draw_shape_active_straight_span = (
+                    anchor_index, len(self._drawing_selection_gesture) - 1,
+                )
             elif not shift and self._drawing_selection_shift_active:
-                self._drawing_selection_shift_active = False
-                self._drawing_selection_shift_anchor = None
+                self._finalize_draw_shape_straight_span()
             if self._drawing_selection_shift_active:
-                if len(self._drawing_selection_gesture) == 1:
-                    self._drawing_selection_gesture.append(QPointF(world))
-                else:
-                    anchor = self._drawing_selection_shift_anchor
-                    if anchor is not None and len(self._drawing_selection_gesture) >= 2:
-                        self._drawing_selection_gesture = self._drawing_selection_gesture[:-1]
-                        if math.dist(anchor.toTuple(), world.toTuple()) >= 1.0 / max(self.scale, 0.05):
-                            self._drawing_selection_gesture.append(QPointF(world))
-                        else:
-                            self._drawing_selection_gesture.append(QPointF(anchor))
-                    else:
-                        self._drawing_selection_gesture[-1] = QPointF(world)
+                span = self._draw_shape_active_straight_span
+                if span is not None:
+                    self._drawing_selection_gesture[span[1]] = QPointF(world)
                 self.update()
                 return True
             if math.dist(self._drawing_selection_gesture[-1].toTuple(), world.toTuple()) >= 1.0 / max(self.scale, 0.05):
@@ -13973,38 +14006,222 @@ class _CanvasLogic:
             painter.drawText(marker, "+" if operation == "add" else "−")
         painter.restore()
 
+    def _finalize_draw_shape_straight_span(self) -> None:
+        span = self._draw_shape_active_straight_span
+        self._draw_shape_active_straight_span = None
+        self._drawing_selection_shift_active = False
+        self._drawing_selection_shift_anchor = None
+        if span is None:
+            return
+        start_index, end_index = span
+        if not (
+            0 <= start_index < len(self._drawing_selection_gesture)
+            and 0 <= end_index < len(self._drawing_selection_gesture)
+        ):
+            return
+        start = self._drawing_selection_gesture[start_index]
+        end = self._drawing_selection_gesture[end_index]
+        if math.dist(start.toTuple(), end.toTuple()) <= 1e-6:
+            if end_index == len(self._drawing_selection_gesture) - 1:
+                self._drawing_selection_gesture.pop()
+            return
+        self._draw_shape_straight_spans.append(span)
+
+    @staticmethod
+    def _draw_shape_vector_node(point: tuple[float, float]) -> PathNode:
+        return PathNode(
+            x=float(point[0]), y=float(point[1]), point_type="vector",
+            incoming=None, outgoing=None, handles_locked=True,
+        )
+
+    @staticmethod
+    def _draw_shape_path_has_area(path: QPainterPath) -> bool:
+        """Return whether Qt's resolved fill contains nonzero polygon area."""
+        for polygon in path.simplified().toFillPolygons():
+            if len(polygon) < 3:
+                continue
+            area = 0.0
+            for index, point in enumerate(polygon):
+                following = polygon[(index + 1) % len(polygon)]
+                area += (
+                    point.x() * following.y()
+                    - following.x() * point.y()
+                )
+            if abs(area) > 1e-8:
+                return True
+        return False
+
+    @staticmethod
+    def _clean_draw_shape_samples(
+        gesture: list[QPointF], spans: list[tuple[int, int]],
+    ) -> tuple[list[tuple[float, float]], set[tuple[int, int]]]:
+        points: list[tuple[float, float]] = []
+        index_map: dict[int, int] = {}
+        for index, point in enumerate(gesture):
+            value = float(point.x()), float(point.y())
+            if not all(math.isfinite(component) for component in value):
+                continue
+            if points and math.dist(points[-1], value) <= 1e-6:
+                index_map[index] = len(points) - 1
+            else:
+                points.append(value)
+                index_map[index] = len(points) - 1
+        if len(points) > 1 and math.dist(points[0], points[-1]) <= 1e-6:
+            removed = len(points) - 1
+            points.pop()
+            for source, mapped in list(index_map.items()):
+                if mapped == removed:
+                    index_map[source] = 0
+        edges: set[tuple[int, int]] = set()
+        for start, end in spans:
+            if start not in index_map or end not in index_map or not points:
+                continue
+            mapped = index_map[start], index_map[end]
+            if mapped[0] != mapped[1]:
+                edges.add(mapped)
+        if len(points) <= 800:
+            return points, edges
+
+        mandatory = {index for edge in edges for index in edge}
+        stride = max(1, math.ceil(len(points) / 800))
+        keep = set(range(0, len(points), stride)) | mandatory | {0}
+        ordered = sorted(keep)
+        remap = {old: new for new, old in enumerate(ordered)}
+        reduced = [points[index] for index in ordered]
+        reduced_edges = {
+            (remap[start], remap[end]) for start, end in edges
+            if start in remap and end in remap
+        }
+        return reduced, reduced_edges
+
+    @classmethod
+    def _vector_draw_shape_fallback(
+        cls,
+        points: list[tuple[float, float]],
+        straight_edges: set[tuple[int, int]],
+    ) -> list[PathNode]:
+        mandatory = {index for edge in straight_edges for index in edge}
+        if len(points) <= 300:
+            selected = list(range(len(points)))
+        else:
+            stride = max(1, math.ceil(len(points) / 300))
+            selected = sorted(
+                set(range(0, len(points), stride)) | mandatory | {0}
+            )
+        return [cls._draw_shape_vector_node(points[index]) for index in selected]
+
+    @classmethod
+    def _closed_fitted_draw_shape_nodes(
+        cls, points: list[tuple[float, float]], tolerance: float,
+    ) -> list[PathNode]:
+        fitted = fit_cubic_path(
+            [*points, points[0]], error=max(0.5, tolerance)
+        )
+        if not (3 <= len(fitted) <= 120):
+            return []
+        nodes: list[PathNode] = []
+        for index, fitted_span in enumerate(fitted):
+            cubic = fitted_span.cubic
+            previous = fitted[index - 1].cubic
+            nodes.append(PathNode(
+                x=float(cubic[0][0]), y=float(cubic[0][1]),
+                point_type="bezier",
+                incoming=(float(previous[2][0]), float(previous[2][1])),
+                outgoing=(float(cubic[1][0]), float(cubic[1][1])),
+                handles_locked=False,
+            ))
+        return nodes
+
+    @classmethod
+    def _annotated_draw_shape_nodes(
+        cls,
+        points: list[tuple[float, float]],
+        straight_edges: set[tuple[int, int]],
+        tolerance: float,
+    ) -> list[PathNode]:
+        count = len(points)
+        straight_edges = {
+            (start, end) for start, end in straight_edges
+            if end == (start + 1) % count
+        }
+        if not straight_edges:
+            return cls._closed_fitted_draw_shape_nodes(points, tolerance)
+
+        start = min(edge[0] for edge in straight_edges)
+        nodes = [cls._draw_shape_vector_node(points[start])]
+        current = start
+        processed = 0
+        while processed < count:
+            following = (current + 1) % count
+            if (current, following) in straight_edges:
+                processed += 1
+                current = following
+                if current != start:
+                    nodes.append(cls._draw_shape_vector_node(points[current]))
+                continue
+
+            run = [points[current]]
+            while processed < count:
+                following = (current + 1) % count
+                if (current, following) in straight_edges:
+                    break
+                current = following
+                run.append(points[current])
+                processed += 1
+                if current == start:
+                    break
+
+            fitted = fit_cubic_path(run, error=max(0.5, tolerance))
+            cubics = [item.cubic for item in fitted]
+            if len(cubics) == 1 and len(run) > 2:
+                cubic = cubics[0]
+                cubics = [
+                    cubic_subsegment(cubic, 0.0, 0.5),
+                    cubic_subsegment(cubic, 0.5, 1.0),
+                ]
+            if not cubics or len(nodes) + len(cubics) > 120:
+                return []
+            for index in range(1, len(cubics)):
+                previous = cubics[index - 1]
+                cubic = cubics[index]
+                nodes.append(PathNode(
+                    x=float(cubic[0][0]), y=float(cubic[0][1]),
+                    point_type="bezier",
+                    incoming=(
+                        float(previous[2][0]), float(previous[2][1])
+                    ),
+                    outgoing=(float(cubic[1][0]), float(cubic[1][1])),
+                    handles_locked=False,
+                ))
+            if current != start:
+                nodes.append(cls._draw_shape_vector_node(points[current]))
+        return nodes
+
     def _finish_draw_shape(self) -> bool:
+        self._finalize_draw_shape_straight_span()
         gesture = self._drawing_selection_gesture
+        straight_spans = list(self._draw_shape_straight_spans)
         self._drawing_selection_gesture = []
-        if not gesture or len(gesture) < 3:
+        points, straight_edges = self._clean_draw_shape_samples(
+            gesture, straight_spans
+        )
+        if len(points) < 3 or len(set(points)) < 3:
             self._clear_drawing_selection()
             self.update()
             return True
-        polygon = QPolygonF(gesture)
-        polygon.append(gesture[0])
+        polygon = QPolygonF([QPointF(*point) for point in points])
         new_path = QPainterPath()
         new_path.addPolygon(polygon)
         new_path.closeSubpath()
-        op = getattr(self, "_drawing_selection_operation", "replace")
-        base = QPainterPath(self._drawing_selection_path)
-        if base.isEmpty() or op == "replace":
-            region = new_path
-        elif op == "add":
-            region = base.united(new_path)
-        else:
-            region = base.subtracted(new_path)
-        region = region.simplified()
-        if region.isEmpty():
+        world_rect = new_path.boundingRect()
+        if (
+            new_path.isEmpty() or world_rect.width() <= 0
+            or world_rect.height() <= 0
+            or not self._draw_shape_path_has_area(new_path)
+        ):
             self._clear_drawing_selection()
             self.update()
             return True
-        polys = region.toFillPolygons()
-        if polys:
-            outline = max(polys, key=lambda p: abs(QPolygonF(p).boundingRect().width() * QPolygonF(p).boundingRect().height()))
-            outline_poly = QPolygonF(outline)
-        else:
-            outline_poly = polygon
-        world_rect = region.boundingRect()
         if self.chapter is None:
             self._clear_drawing_selection()
             return False
@@ -14014,104 +14231,100 @@ class _CanvasLogic:
         if not parent_id or parent_id not in self.chapter.layers:
             self._clear_drawing_selection()
             return False
-        x, y, w, h = world_rect.x(), world_rect.y(), world_rect.width(), world_rect.height()
-        if w < 5 or h < 5:
-            self._clear_drawing_selection()
-            return False
         try:
             simplify_tolerance = float(getattr(self.settings, "draw_shape_simplify", 1.0))
         except Exception:
             simplify_tolerance = 1.0
-        outline_pts = [(float(p.x()), float(p.y())) for p in outline_poly]
-        if len(outline_pts) > 1 and outline_pts[0] == outline_pts[-1]:
-            outline_pts = outline_pts[:-1]
-        if len(outline_pts) > 800:
-            step = max(1, len(outline_pts) // 800)
-            outline_pts = outline_pts[::step]
-        nodes: list[PathNode] = []
         try:
-            fitted = fit_cubic_path(outline_pts, error=max(0.5, simplify_tolerance))
+            nodes = self._annotated_draw_shape_nodes(
+                points, straight_edges, simplify_tolerance
+            )
         except Exception:
-            fitted = []
-        if fitted and len(fitted) <= 120:
-            for idx, fc in enumerate(fitted):
-                c = fc.cubic
-                sx, sy = float(c[0][0]), float(c[0][1])
-                ox, oy = float(c[1][0]), float(c[1][1])
-                prev_c = fitted[idx - 1].cubic if idx > 0 else fitted[-1].cubic
-                ix, iy = float(prev_c[2][0]), float(prev_c[2][1])
-                px, py = float(prev_c[3][0]), float(prev_c[3][1])
-                # For closed shape, start point of current cubic should equal end of previous; use c[0] as node pos
-                # Handle duplicate due to floating error: if current start not near previous end, still use c[0]
-                is_out = math.hypot(ox - sx, oy - sy) > 0.5
-                is_in = math.hypot(ix - sx, iy - sy) > 0.5
-                pt_type = "bezier" if (is_out or is_in) else "vector"
-                nodes.append(PathNode(
-                    x=sx, y=sy,
-                    point_type=pt_type,
-                    incoming=(ix, iy) if is_in else None,
-                    outgoing=(ox, oy) if is_out else None,
-                    handles_locked=True,
-                ))
-            if len(nodes) >= 3:
-                for n in nodes:
-                    n.validate()
-            else:
-                nodes = []
-        if not nodes or len(nodes) < 3:
-            pts = [QPointF(x, y) for x, y in outline_pts]
-            def _perp_dist(pt, a, b):
-                if a == b:
-                    return math.hypot(pt.x() - a.x(), pt.y() - a.y())
-                dx = b.x() - a.x()
-                dy = b.y() - a.y()
-                t = ((pt.x() - a.x()) * dx + (pt.y() - a.y()) * dy) / (dx * dx + dy * dy)
-                t = max(0.0, min(1.0, t))
-                proj = QPointF(a.x() + t * dx, a.y() + t * dy)
-                return math.hypot(pt.x() - proj.x(), pt.y() - proj.y())
-            def _dp(points, eps):
-                if len(points) <= 2:
-                    return points[:]
-                a, b = points[0], points[-1]
-                max_d = -1.0
-                idx = -1
-                for i in range(1, len(points) - 1):
-                    d = _perp_dist(points[i], a, b)
-                    if d > max_d:
-                        max_d = d
-                        idx = i
-                if max_d > eps:
-                    left = _dp(points[: idx + 1], eps)
-                    right = _dp(points[idx:], eps)
-                    return left[:-1] + right
-                return [a, b]
-            simplified = _dp(pts, simplify_tolerance) if len(pts) > 2 else pts[:]
-            if len(simplified) < 6 and len(pts) >= 6:
-                simplified = pts[:: max(1, len(pts) // 60)]
-            if len(simplified) > 300:
-                simplified = simplified[:: max(1, len(simplified) // 300)]
-            nodes = [PathNode(x=float(p.x()), y=float(p.y())) for p in simplified]
-            if len(nodes) < 3:
-                nodes = [PathNode(x=float(p.x()), y=float(p.y())) for p in [QPointF(x, y), QPointF(x + w, y), QPointF(x + w, y + h), QPointF(x, y + h)]]
-        before = self.chapter.to_dict()
-        bound = BoundGeometry.path(nodes, closed=True)
-        bound.primitive = "custom"
-        bound.additional_contours = []
-        bound.normalize_bezier_handles()
-        bound.validate()
+            nodes = []
+        if len(nodes) < 3:
+            nodes = self._vector_draw_shape_fallback(points, straight_edges)
+        def validated_bound(candidate_nodes: list[PathNode]) -> BoundGeometry:
+            candidate = BoundGeometry.path(candidate_nodes, closed=True)
+            candidate.primitive = "custom"
+            candidate.additional_contours = []
+            candidate.normalize_bezier_handles()
+            candidate.validate()
+            if not self._draw_shape_path_has_area(
+                self.bound_path(candidate)
+            ):
+                raise ValueError("Draw Shape contour has no filled area")
+            return candidate
+
+        try:
+            bound = validated_bound(nodes)
+        except Exception:
+            try:
+                nodes = self._vector_draw_shape_fallback(
+                    points, straight_edges
+                )
+                bound = validated_bound(nodes)
+            except Exception:
+                self._clear_drawing_selection()
+                return False
         fill = getattr(self, "secondary_color", None) or getattr(self.settings, "secondary_color", None) or "#FFFFFFFF"
         line = getattr(self, "primary_color", None) or getattr(self.settings, "primary_color", None) or "#FF000000"
         style = ShapeStyle(primary_color=fill, outline_thickness=2, outline_color=line)
-        style.validate()
         try:
-            layer = self.chapter.add_layer(parent_id, "Panel", bound, style=style, layer_kind="bounded")
+            style.validate()
+        except Exception:
+            style = ShapeStyle(primary_color="#FFFFFFFF", outline_thickness=2, outline_color="#FF000000")
+        placement = self._target_placement_for_new_bound()
+        if placement is not None:
+            parent_id, insert_idx = placement
+        else:
+            insert_idx = 0
+        if not parent_id or parent_id not in self.chapter.layers:
+            parent_id = self.chapter.root_page_ids[0] if self.chapter.root_page_ids else ""
+            insert_idx = 0
+        if not parent_id or parent_id not in self.chapter.layers:
+            self._clear_drawing_selection()
+            return False
+        try:
+            parent_inverse, valid = self.layer_world_transform(
+                parent_id
+            ).inverted()
+            if not valid:
+                raise ValueError("Draw Shape parent transform is singular")
+            local_bound = BoundGeometry.from_dict(bound.to_dict())
+            for contour in local_bound.iter_contours():
+                for nd in contour.nodes:
+                    pt = parent_inverse.map(QPointF(nd.x, nd.y))
+                    nd.x, nd.y = float(pt.x()), float(pt.y())
+                    if nd.incoming is not None:
+                        ipt = parent_inverse.map(QPointF(*nd.incoming))
+                        nd.incoming = float(ipt.x()), float(ipt.y())
+                    if nd.outgoing is not None:
+                        opt = parent_inverse.map(QPointF(*nd.outgoing))
+                        nd.outgoing = float(opt.x()), float(opt.y())
+            local_bound.normalize_bezier_handles()
+            local_bound.validate()
+            if not self._draw_shape_path_has_area(
+                self.bound_path(local_bound)
+            ):
+                raise ValueError("Converted Draw Shape has no filled area")
+            bound = local_bound
+        except Exception:
+            self._clear_drawing_selection()
+            return False
+        before = self.chapter.to_dict()
+        try:
+            layer = self.chapter.add_layer(parent_id, "Panel", bound, style=style, layer_kind="bounded", index=insert_idx)
         except Exception:
             self._clear_drawing_selection()
             return False
         after = self.chapter.to_dict()
         self.push_model_change(before, after, "Create Draw Shape")
         self._clear_drawing_selection()
-        self.set_selection("layer", layer.layer_id)
+        self._suppress_selection_undo = True
+        try:
+            self.set_selection("layer", layer.layer_id)
+        finally:
+            self._suppress_selection_undo = False
         self._invalidate_scene_cache()
         self.update()
         return True
@@ -16996,13 +17209,6 @@ class _CanvasLogic:
             ToolKind.DRAW_SHAPE,
         }:
             if self.tool == ToolKind.DRAW_SHAPE:
-                if self._selection_operation() == "replace" and not self._drawing_selection_path.isEmpty():
-                    mods = QApplication.keyboardModifiers()
-                    if not (mods & Qt.ShiftModifier or mods & Qt.AltModifier or mods & Qt.ControlModifier):
-                        before = self._selection_snapshot()
-                        self._drawing_selection_path = QPainterPath()
-                        after = self._selection_snapshot()
-                        self._push_selection_undo(before, after)
                 self._begin_drawing_selection(point, widget_point, test_transform=False)
                 return
             drawing = self._drawing_selection_object()
@@ -20489,7 +20695,7 @@ class _CanvasLogic:
         if not valid:
             return point
         world = transform.map(QPointF(*point))
-        grid = self.chapter.effective_grid(layer_id)
+        grid = self.resolved_grid(layer_id)
         snapped_x, snapped_y = grid.snap(
             world.x(), world.y()
         )

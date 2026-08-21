@@ -57,6 +57,7 @@ from comic_editor.ui.selection_settings import (
 )
 from comic_editor.ui.icons import iconoir
 from comic_editor.ui.hotkeys_dialog import HotkeysDialog
+from comic_editor.ui.settings_dialog import SettingsDialog
 from comic_editor.ui.hotkeys import (
     MODIFIER_LABELS, chord_keys, chord_text,
 )
@@ -334,6 +335,7 @@ class MainWindow(QMainWindow):
         self.redo_action = self.file_toolbar.addAction("Redo")
         self.file_toolbar.addSeparator()
         self.hotkeys_action = self.file_toolbar.addAction("Hotkeys…")
+        self.settings_action = self.file_toolbar.addAction("Settings…")
         self.tablet_mode = QCheckBox("Tablet Navigation", self.file_toolbar)
         self.tablet_mode.setChecked(self.settings.tablet_mode)
         self.reset_view_button = QToolButton(self.file_toolbar)
@@ -942,6 +944,7 @@ class MainWindow(QMainWindow):
         self.trim_action.triggered.connect(self._trim_height)
         self.fullscreen_action.triggered.connect(self._toggle_fullscreen)
         self.hotkeys_action.triggered.connect(self._edit_hotkeys)
+        self.settings_action.triggered.connect(self._edit_settings)
         self.undo_action.triggered.connect(self._undo)
         self.redo_action.triggered.connect(self._redo)
         self.chapter_combo.currentIndexChanged.connect(self._chapter_selected)
@@ -5734,14 +5737,41 @@ class MainWindow(QMainWindow):
         self.canvas.command_stack.redo()
 
     def _toggle_grid(self) -> None:
-        if self.chapter is None:
+        self.settings.grid_overlay_visible = not (
+            self.settings.grid_overlay_visible
+        )
+        save_settings(self.settings)
+        self.canvas.refresh_grid_settings()
+
+    def _edit_settings(self) -> None:
+        dialog = SettingsDialog(self.settings, self.chapter, self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
             return
-        before = self.chapter.to_dict()
-        self.chapter.grid.enabled = not self.chapter.grid.enabled
-        after = self.chapter.to_dict()
-        self.canvas.push_model_change(before, after, "Toggle grid")
-        self.canvas.documentChanged.emit(None)
-        self.canvas.update()
+
+        before = self.chapter.to_dict() if self.chapter is not None else None
+        dialog.apply_user_settings(self.settings)
+        save_settings(self.settings)
+
+        document_changed = False
+        if self.chapter is not None and before is not None:
+            self.chapter.grid_override_enabled = (
+                dialog.document_override.isChecked()
+            )
+            if self.chapter.grid_override_enabled:
+                self.chapter.grid = dialog.document_grid()
+            self.chapter.validate()
+            after = self.chapter.to_dict()
+            document_changed = before != after
+            if document_changed:
+                self.canvas.push_model_change(
+                    before, after, "Edit document grid"
+                )
+                self.canvas.documentChanged.emit(None)
+
+        self.canvas.refresh_grid_settings()
+        self.selection_settings.refresh()
+        if document_changed:
+            self._refresh_actions()
 
     def _edit_hotkeys(self) -> None:
         dialog = HotkeysDialog(

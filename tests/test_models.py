@@ -125,6 +125,20 @@ def test_grid_and_opacity_inheritance():
     assert chapter.effective_object_opacity(raster.object_id) == pytest.approx(0.125)
 
 
+def test_grid_override_inheritance_migrates_legacy_documents():
+    chapter = ChapterDocument()
+    assert chapter.grid_override_enabled is False
+    data = chapter.to_dict()
+    data["schema_version"] = 20
+    data.pop("grid_override_enabled")
+
+    restored = ChapterDocument.from_dict(data)
+
+    assert restored.schema_version == 21
+    assert restored.grid_override_enabled is True
+    assert restored.to_dict()["grid_override_enabled"] is True
+
+
 def test_bound_edit_is_separate_from_translation():
     chapter, page, layer, raster = populated_chapter()
     original = list(page.bound.points)
@@ -208,7 +222,7 @@ def test_legacy_text_migrates_to_editable_free_quad():
         item.pop(key, None)
     loaded = ChapterDocument.from_dict(data)
     migrated = loaded.objects[text.object_id]
-    assert loaded.schema_version == 20
+    assert loaded.schema_version == 21
     assert migrated.layout_mode == "free"
     assert len(migrated.transform_quad) == 4
     assert migrated.text == "Legacy"
@@ -232,7 +246,7 @@ def test_drawing_underlay_migrates_round_trips_and_clamps():
     vector.underlay_opacity = 2.0
 
     loaded = ChapterDocument.from_dict(chapter.to_dict())
-    assert loaded.schema_version == 20
+    assert loaded.schema_version == 21
     assert loaded.objects[raster.object_id].underlay_opacity == pytest.approx(
         0.375
     )

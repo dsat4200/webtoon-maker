@@ -4,12 +4,81 @@ from PySide6.QtCore import QPointF, QRectF
 from PySide6.QtGui import QColor, QImage, QPainter
 
 from comic_editor.core.models import (
-    BoundGeometry, ChapterDocument, RasterObject, VectorDrawingObject,
+    BoundGeometry, ChapterDocument, GridSettings, RasterObject, VectorDrawingObject,
     VectorStroke, VectorStrokePoint,
 )
 from comic_editor.core.settings import EditorSettings
 from comic_editor.core.tiles import TileStore
 from comic_editor.ui.canvas import CanvasWidget
+
+
+def test_user_document_and_layer_grids_resolve_for_drawing_and_snapping(
+    qapp, monkeypatch,
+):
+    settings = EditorSettings(
+        snap_to_grid=True,
+        grid_overlay_visible=True,
+        grid_size_px=40,
+        grid_divisions=2,
+        grid_color="#000000",
+        grid_opacity=1.0,
+    )
+    chapter = ChapterDocument(height=1080)
+    page = chapter.add_page(
+        bound=BoundGeometry.rectangle(0, 0, 1080, 1080)
+    )
+    layer = chapter.add_layer(
+        page.layer_id, "Layer", BoundGeometry.rectangle(0, 0, 500, 500)
+    )
+    canvas = CanvasWidget(settings)
+    canvas.set_document(chapter, TileStore())
+
+    inherited = canvas.resolved_grid(layer.layer_id)
+    assert (inherited.size, inherited.divisions) == (40, 2)
+    assert canvas._snap(QPointF(23, 23), layer.layer_id) == QPointF(20, 20)
+
+    chapter.grid_override_enabled = True
+    chapter.grid = GridSettings(size=60, divisions=2, color="#ff0000", opacity=0.5)
+    document_grid = canvas.resolved_grid(layer.layer_id)
+    assert (document_grid.size, document_grid.divisions) == (60, 2)
+    assert canvas._snap(QPointF(23, 23), layer.layer_id) == QPointF(30, 30)
+
+    layer.grid_override = GridSettings(
+        size=80, divisions=1, color="#00ff00", opacity=0.75
+    )
+    layer_grid = canvas.resolved_grid(layer.layer_id)
+    assert (layer_grid.size, layer_grid.divisions) == (80, 1)
+    assert layer_grid.color == "#00ff00"
+    assert canvas._snap(QPointF(43, 43), layer.layer_id) == QPointF(80, 80)
+
+    chapter.grid_override_enabled = False
+    layer.grid_override = None
+    image = QImage(81, 81, QImage.Format_ARGB32_Premultiplied)
+    image.fill(QColor("white"))
+    painter = QPainter(image)
+    canvas._draw_grid(painter, QRectF(0, 0, 80, 80))
+    painter.end()
+    assert image.pixelColor(20, 10).lightness() < 20
+    assert image.pixelColor(10, 10).lightness() > 240
+
+    settings.grid_overlay_visible = False
+    hidden = QImage(81, 81, QImage.Format_ARGB32_Premultiplied)
+    hidden.fill(QColor("white"))
+    painter = QPainter(hidden)
+    canvas._draw_grid(painter, QRectF(0, 0, 80, 80))
+    painter.end()
+    assert hidden.pixelColor(20, 10).lightness() > 240
+
+    preview_grid_calls = 0
+
+    def counted_grid(*args):
+        nonlocal preview_grid_calls
+        preview_grid_calls += 1
+
+    monkeypatch.setattr(canvas, "_draw_grid", counted_grid)
+    preview = QImage(108, 108, QImage.Format_ARGB32_Premultiplied)
+    canvas.render_preview(preview)
+    assert preview_grid_calls == 0
 
 
 def _scene(bound: BoundGeometry):
