@@ -5,13 +5,16 @@
 - sometimes drawing a shape draws like a line through the middle and doesn't close it fully.
 
 ## more tweaks
-- [ ] using vector tools and hitting apply while no vector points are selected should make them affect all vector points in the currently active vector object.
-- [ ] instead of having different modes for each parameter in vector tools, just show separate "redraw thickness" and "redraw opacity" UI elements stacked.
-- [ ] also, vector tools UI element groupings should be collapsable with a down arrow / carat icon thing in the top left.
-- [ ] holding to switch to eraser should only work while in pencil mode.
-- [ ] if a selection in lasso mode has already started (in either draw shape or lasso mode), and you hold shift, instead of continuing to draw the selection with each movement, it should act as though the last place you were before pressing shift was the last place you selected, and the current place you're drawing is the next one, and should act as if there's a straight line between those two (basically, hold shift during a lasso selection to select in a straight line). when releasing shift, selection should go back to normal. this only happens if you hold shift WHILE drawing already. if you hold shift before making another pen canvas press, it should add selection like normal (if applicable). 
-- [ ] show as mask only button should appear pressed if its enabled on the selected layer, unpressed if not (as in, with the blue outline and pressed background color)
+- [x] using vector tools and hitting apply while no vector points are selected should make them affect all vector points in the currently active vector object.
+- [x] instead of having different modes for each parameter in vector tools, just show separate "redraw thickness" and "redraw opacity" UI elements stacked.
+- [x] also, vector tools UI element groupings should be collapsable with a down arrow / carat icon thing in the top left.
+- [x] holding to switch to eraser should only work while in pencil mode.
+- [x] if a selection in lasso mode has already started (in either draw shape or lasso mode), and you hold shift, instead of continuing to draw the selection with each movement, it should act as though the last place you were before pressing shift was the last place you selected, and the current place you're drawing is the next one, and should act as if there's a straight line between those two (basically, hold shift during a lasso selection to select in a straight line). when releasing shift, selection should go back to normal. this only happens if you hold shift WHILE drawing already. if you hold shift before making another pen canvas press, it should add selection like normal (if applicable). 
+- [x] show as mask only button should appear pressed if its enabled on the selected layer, unpressed if not (as in, with the blue outline and pressed background color)
 
+
+## more tweaks
+- [ ] draw shape tool should be smarter - using bezier points more instead of just vector points, to minimize the amount of needed points.
 
 ## Cage Transform
 - https://help.clip-studio.com/en-us/manual_en/360_transform/Types_of_transformations.htm#1004087
