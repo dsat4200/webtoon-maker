@@ -262,6 +262,7 @@ class BridgeRuntime:
         self._outstanding: dict[int, int] = {}
         self._sequence = 0
         self._pending_render: renderer.RenderFrame | None = None
+        self._resize_failures = 0
         self.last_error = ""
 
     @property
@@ -302,6 +303,7 @@ class BridgeRuntime:
         self._stream_height = 0
         self._outstanding.clear()
         self._pending_render = None
+        self._resize_failures = 0
         if memory is not None:
             try:
                 memory.close()
@@ -387,6 +389,7 @@ class BridgeRuntime:
         bounds = viewport.frame_bounds(view)
         width, height = viewport.derive_resolution(view.width, bounds, scene)
         viewport.set_working_resolution(view, width, height)
+        view.published_width, view.published_height = width, height
         captured, warnings = capture_state(
             scene, bpy.context.view_layer,
             stream_frame=bounds, output_resolution=(width, height),
@@ -611,51 +614,127 @@ class BridgeRuntime:
 
     def _open_stream(
         self, scene: bpy.types.Scene, view: object, width: int, height: int,
-        frame_kind: str,
+        frame_kind: str, *, replace: bool = False,
     ) -> None:
         width, height = renderer.validate_resolution(width, height)
         if (
-            self.streaming and self.active_stream_uuid == view.view_uuid
+            not replace
+            and self.streaming and self.active_stream_uuid == view.view_uuid
             and self._stream_width == width and self._stream_height == height
             and self.frame_kind == frame_kind
         ):
             return
-        self.stop_stream()
         stride = width * 4
-        self._slot_bytes = stride * height
+        slot_bytes = stride * height
+        if replace and self.streaming and self.active_stream_uuid == view.view_uuid:
+            self._replace_stream(
+                scene, view, width, height, stride, slot_bytes, frame_kind
+            )
+            return
+        self.stop_stream()
+        self._slot_bytes = slot_bytes
         self._stream_width, self._stream_height = width, height
-        total = HEADER_SIZE + SLOT_COUNT * self._slot_bytes
+        total = HEADER_SIZE + SLOT_COUNT * slot_bytes
         memory = shared_memory.SharedMemory(create=True, size=total)
         self._memory = memory
         nonce = uuid.uuid4().hex.encode("ascii")
         HEADER.pack_into(
             memory.buf, 0, MAGIC, PROTOCOL_VERSION, width, height, stride,
-            SLOT_COUNT, self._slot_bytes, nonce,
+            SLOT_COUNT, slot_bytes, nonce,
         )
         if HEADER.size < HEADER_SIZE:
             memory.buf[HEADER.size:HEADER_SIZE] = b"\0" * (HEADER_SIZE - HEADER.size)
         self.active_stream_uuid = view.view_uuid
         self.frame_kind = frame_kind
         self._outstanding.clear()
-        self.send({
+        self.send(self._stream_open_payload(
+            scene, view, width, height, stride, slot_bytes, frame_kind,
+            memory.name,
+        ))
+
+    @staticmethod
+    def _stream_open_payload(
+        scene: bpy.types.Scene, view: object, width: int, height: int,
+        stride: int, slot_bytes: int, frame_kind: str, memory_name: str,
+    ) -> dict[str, Any]:
+        return {
             "type": "STREAM_OPEN", "frame_kind": frame_kind,
-            "project_uuid": self._settings(scene).project_uuid,
+            "project_uuid": scene.webtoon_comic_settings.project_uuid,
             "view_uuid": view.view_uuid,
             "revision": int(view.revision),
-            "shared_memory": memory.name,
+            "shared_memory": memory_name,
             "header_size": HEADER_SIZE,
             "width": width, "height": height, "stride": stride,
-            "slot_count": SLOT_COUNT, "slot_bytes": self._slot_bytes,
+            "slot_count": SLOT_COUNT, "slot_bytes": slot_bytes,
             "pixel_format": "RGBA8_TOP_DOWN_STRAIGHT",
-        })
+        }
+
+    def _replace_stream(
+        self, scene: bpy.types.Scene, view: object, width: int, height: int,
+        stride: int, slot_bytes: int, frame_kind: str,
+    ) -> None:
+        """Swap in a replacement buffer without dropping the current stream.
+
+        The new shared-memory block is allocated and fully prepared before the
+        old one is torn down, so a failed allocation leaves the running stream
+        and the editor's cached frame untouched.
+        """
+        total = HEADER_SIZE + SLOT_COUNT * slot_bytes
+        nonce = uuid.uuid4().hex.encode("ascii")
+        memory = shared_memory.SharedMemory(create=True, size=total)
+        try:
+            HEADER.pack_into(
+                memory.buf, 0, MAGIC, PROTOCOL_VERSION, width, height, stride,
+                SLOT_COUNT, slot_bytes, nonce,
+            )
+            if HEADER.size < HEADER_SIZE:
+                memory.buf[HEADER.size:HEADER_SIZE] = b"\0" * (HEADER_SIZE - HEADER.size)
+        except BaseException:
+            try:
+                memory.close()
+            except (BufferError, OSError):
+                pass
+            raise
+        old_memory, self._memory = self._memory, memory
+        self._slot_bytes = slot_bytes
+        self._stream_width, self._stream_height = width, height
+        self.frame_kind = frame_kind
+        self._outstanding.clear()
+        if old_memory is not None:
+            try:
+                old_memory.close()
+            except (BufferError, OSError):
+                pass
+            try:
+                old_memory.unlink()
+            except (FileNotFoundError, OSError):
+                pass
+        self.send(self._stream_open_payload(
+            scene, view, width, height, stride, slot_bytes, frame_kind,
+            memory.name,
+        ))
+
+    def _committed_resolution(self, view: object) -> tuple[int, int]:
+        """The resolution a committed render will produce for this view."""
+        if view.state_json:
+            try:
+                stored = parse_state(view.state_json)
+                resolution = stored.get("output_resolution")
+                if isinstance(resolution, list) and len(resolution) == 2:
+                    return renderer.validate_resolution(*resolution)
+            except (TypeError, ValueError):
+                pass
+        return renderer.validate_resolution(
+            int(view.published_width or view.width),
+            int(view.published_height or view.height),
+        )
 
     def _start_stream(self, scene: bpy.types.Scene, message: dict[str, Any]) -> None:
         view = self._view(scene, str(message.get("view_uuid", "")))
         if view is None or view != self._active_view(scene):
             self._error("VIEW_NOT_ACTIVE", "Activate the Comic View before streaming")
             return
-        width = int(view.published_width or view.width)
-        height = int(view.published_height or view.height)
+        width, height = self._committed_resolution(view)
         self._open_stream(scene, view, width, height, "committed")
         # Starting a stream always displays the saved revision.
         self.frame_dirty = True
@@ -663,10 +742,8 @@ class BridgeRuntime:
     def request_committed_frame(self, scene: bpy.types.Scene, view: object) -> None:
         if self.active_stream_uuid != view.view_uuid:
             return
-        self._open_stream(
-            scene, view, int(view.published_width or view.width),
-            int(view.published_height or view.height), "committed",
-        )
+        width, height = self._committed_resolution(view)
+        self._open_stream(scene, view, width, height, "committed")
         self.frame_dirty = True
 
     def request_preview_frame(self, scene: bpy.types.Scene) -> None:
@@ -717,7 +794,32 @@ class BridgeRuntime:
                     hide_overlays=self._hide_overlays(),
                 )
             if len(frame.rgba) != self._slot_bytes:
-                raise RuntimeError("The rendered frame size changed during streaming")
+                try:
+                    self._open_stream(
+                        scene, view, frame.width, frame.height,
+                        self.frame_kind, replace=True,
+                    )
+                except Exception as realloc_error:
+                    self._pending_render = frame
+                    self.frame_dirty = True
+                    self._resize_failures += 1
+                    if self._resize_failures >= 5:
+                        self.last_error = (
+                            f"The rendered frame size changed during streaming to "
+                            f"{frame.width}x{frame.height} and the stream could not "
+                            f"be reallocated ({realloc_error}); retrying"
+                        )
+                        self.send({
+                            "type": "ERROR", "code": "RESIZE_FAILED",
+                            "message": self.last_error,
+                        })
+                    return
+                self._resize_failures = 0
+                self._pending_render = frame
+                self.frame_dirty = True
+                self.last_error = ""
+                self.send({"type": "STREAM_STATUS", "status": "resizing", "width": frame.width, "height": frame.height})
+                return
             memory = self._memory
             if memory is None:
                 return

@@ -140,11 +140,16 @@ class BlenderImageSourceController(QObject):
                 self.client.stop_stream()
                 self.streamStatusChanged.emit("unavailable")
                 return
-            if view.revision < source.last_revision:
+            size_changed = (view.width, view.height) != (obj.pixel_width, obj.pixel_height)
+            if view.revision < source.last_revision and not size_changed:
                 self.clear_previews()
                 self.client.stop_stream()
                 self.streamStatusChanged.emit("stale")
                 return
+            if view.dirty and not size_changed:
+                # Committed streaming shows the saved revision; the working
+                # Blender scene has changes that will not appear until saved.
+                self.streamStatusChanged.emit("unsaved")
             self.client.activate_view(source.view_uuid)
 
     def stop_for_context_change(self) -> None:
@@ -185,7 +190,10 @@ class BlenderImageSourceController(QObject):
             # been encoded into the project's last-good PNG.
             self.flush_pending_frames()
         dirty = QRectF()
+        size_changed = False
         for obj in objects:
+            if (obj.pixel_width, obj.pixel_height) != (image.width(), image.height()):
+                size_changed = True
             old_quad = self.canvas.object_world_quad(obj.object_id)
             old_bounds = (
                 QPolygonF([QPointF(*point) for point in old_quad]).boundingRect()
@@ -233,6 +241,8 @@ class BlenderImageSourceController(QObject):
                 dirty = bounds if dirty.isEmpty() else dirty.united(bounds)
         if not dirty.isEmpty():
             self.canvas._queue_visual_dirty(dirty)
+        if size_changed:
+            self.streamStatusChanged.emit("preview" if frame_kind == "preview" else "live")
         if frame_kind == "committed":
             self._idle_flush.start()
             if not self._maximum_flush.isActive():

@@ -437,6 +437,86 @@ try:
     runtime.stop_stream()
     renderer.render_active_camera = original_render
 
+    # Saving with a new working resolution keeps the published size in sync,
+    # and a committed stream opens at the saved output resolution even if the
+    # published size was left stale, so the new render replaces the editor's
+    # cached frame instead of failing.
+    viewport.set_working_resolution(view, 128, 128)
+    runtime.save_view_state(scene, view)
+    saved_resolution = tuple(parse_state(view.state_json)["output_resolution"])
+    assert (view.published_width, view.published_height) == saved_resolution
+    view.published_width, view.published_height = 64, 64
+    messages = []
+    runtime.send = lambda message: messages.append(message)
+    runtime.scene_matches_snapshot = True
+    runtime._start_stream(scene, {"view_uuid": view.view_uuid})
+    opens = [m for m in messages if m.get("type") == "STREAM_OPEN"]
+    assert opens and (opens[-1]["width"], opens[-1]["height"]) == saved_resolution
+    assert (runtime._stream_width, runtime._stream_height) == saved_resolution
+
+    def fake_size_render(_scene, _view_layer, width, height, **_kwargs):
+        return renderer.RenderFrame(width, height, bytes(width * height * 4))
+
+    renderer.render_active_camera = fake_size_render
+    errors = []
+    runtime.send = lambda message: (
+        errors.append(message) if message.get("type") == "ERROR"
+        else messages.append(message)
+    )
+    runtime._render_if_needed(scene, 30.0)
+    assert errors == []
+    assert not runtime.frame_dirty
+    assert runtime.last_error == ""
+    runtime.stop_stream()
+
+    # The resize rescue swaps buffers without dropping the live stream, and a
+    # failed allocation leaves the current stream and cached frame intact.
+    runtime.scene_matches_snapshot = True
+    messages = []
+    errors = []
+    runtime.send = lambda message: (
+        errors.append(message) if message.get("type") == "ERROR"
+        else messages.append(message)
+    )
+    runtime._open_stream(scene, view, 64, 64, "committed")
+    old_name = runtime._memory.name
+    runtime._open_stream(scene, view, 96, 96, "committed", replace=True)
+    assert runtime._memory.name != old_name
+    assert (runtime._stream_width, runtime._stream_height) == (96, 96)
+    opens = [m for m in messages if m.get("type") == "STREAM_OPEN"]
+    assert opens[-1]["width"] == 96 and opens[-1]["height"] == 96
+
+    from multiprocessing import shared_memory as shared_memory_module
+
+    original_create = shared_memory_module.SharedMemory
+
+    class FailingMemory:
+        def __init__(self, *args, **kwargs):
+            raise OSError("simulated allocation failure")
+
+    shared_memory_module.SharedMemory = FailingMemory
+    try:
+        before_name = runtime._memory.name
+        try:
+            runtime._open_stream(scene, view, 96, 96, "committed", replace=True)
+        except OSError:
+            pass
+        else:
+            raise AssertionError("failed allocation did not raise")
+        assert runtime._memory.name == before_name
+        assert runtime.streaming
+        runtime._pending_render = renderer.RenderFrame(128, 128, bytes(128 * 128 * 4))
+        runtime.frame_dirty = True
+        runtime._render_if_needed(scene, 31.0)
+        assert runtime.frame_dirty
+        assert runtime._pending_render is not None
+        assert errors == []
+        assert runtime._memory.name == before_name
+    finally:
+        shared_memory_module.SharedMemory = original_create
+    runtime.stop_stream()
+    renderer.render_active_camera = original_render
+
     from multiprocessing import shared_memory
     for memory_name in (first_memory_name, second_memory_name):
         try:

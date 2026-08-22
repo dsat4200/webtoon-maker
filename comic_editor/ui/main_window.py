@@ -4009,8 +4009,17 @@ class MainWindow(QMainWindow):
             "offline": "Offline — showing the last cached frame",
             "unavailable": "Offline — this Comic View is unavailable; use Relink to choose another",
             "stale": "Stale — Blender has an older revision; render or relink before streaming",
+            "resizing": "Resizing — frame size changed, reallocating stream…",
+            "unsaved": "Unsaved — Blender has scene changes; Save or Render in Blender to update this image",
             "error": "Error — showing the last cached frame",
         }
+        if status == "resizing":
+            self.statusBar().showMessage("Resizing stream to new frame size…", 3000)
+        elif status == "unsaved":
+            self.statusBar().showMessage(
+                "Blender has unsaved changes; Save or Render in Blender to update this image",
+                4000,
+            )
         self.selection_settings.image_controls.set_source_status(
             labels.get(status, str(status).title())
         )

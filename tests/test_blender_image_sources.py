@@ -18,7 +18,9 @@ from comic_editor.core.tiles import TileStore
 from comic_editor.integrations.blender_controller import (
     BlenderImageSourceController,
 )
-from comic_editor.integrations.blender_source import ComicViewInfo
+from comic_editor.integrations.blender_source import (
+    BlenderSourceClient, ComicViewInfo,
+)
 from comic_editor.ui.canvas import CanvasWidget
 from comic_editor.ui.main_window import MainWindow
 
@@ -223,6 +225,46 @@ def test_controller_commits_aspect_and_keeps_preview_runtime_only(qapp):
     for obj in objects:
         assert images.runtime_frame(obj.object_id).isNull()
         assert obj.object_id not in canvas._image_runtime_geometry
+    controller.shutdown()
+    controller.deleteLater()
+
+
+def test_controller_hints_unsaved_blender_changes_until_saved(qapp):
+    from unittest.mock import PropertyMock, patch
+
+    chapter, _page, objects, images = _chapter_with_linked_images(1)
+    canvas = CanvasWidget(EditorSettings())
+    canvas.resize(900, 700)
+    canvas.set_document(chapter, TileStore(), images)
+    controller = BlenderImageSourceController(canvas)
+    obj = objects[0]
+    canvas.set_selection("object", obj.object_id)
+    statuses = []
+    controller.streamStatusChanged.connect(statuses.append)
+
+    def info(dirty):
+        return ComicViewInfo(
+            PROJECT_UUID, VIEW_UUID, "Panel 12", 2, 640, 360, dirty, QImage()
+        )
+
+    controller._views[VIEW_UUID] = info(dirty=True)
+    with patch.object(
+        BlenderSourceClient, "connected", new_callable=PropertyMock,
+        return_value=True,
+    ):
+        controller.handle_selection()
+    assert "unsaved" in statuses
+    assert statuses[-1] == "activating"
+
+    # A clean view streams without the unsaved-changes hint.
+    statuses.clear()
+    controller._views[VIEW_UUID] = info(dirty=False)
+    with patch.object(
+        BlenderSourceClient, "connected", new_callable=PropertyMock,
+        return_value=True,
+    ):
+        controller.handle_selection()
+    assert "unsaved" not in statuses
     controller.shutdown()
     controller.deleteLater()
 

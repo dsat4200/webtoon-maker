@@ -181,6 +181,94 @@ def test_stream_descriptor_rejects_unsupported_pixel_layout(qapp):
     client.deleteLater()
 
 
+def test_client_reopens_stream_at_new_size_when_provider_resizes(qapp):
+    def descriptor(memory_name, width):
+        height = width
+        stride = width * 4
+        return {
+            "project_uuid": PROJECT_UUID,
+            "view_uuid": VIEW_UUID,
+            "revision": 7,
+            "shared_memory": memory_name,
+            "header_size": HEADER_SIZE,
+            "width": width,
+            "height": height,
+            "stride": stride,
+            "slot_count": SLOT_COUNT,
+            "slot_bytes": stride * height,
+            "pixel_format": "RGBA8_TOP_DOWN_STRAIGHT",
+            "frame_kind": "committed",
+        }
+
+    first = shared_memory.SharedMemory(
+        create=True, size=HEADER_SIZE + SLOT_COUNT * 64 * 64 * 4
+    )
+    second = shared_memory.SharedMemory(
+        create=True, size=HEADER_SIZE + SLOT_COUNT * 96 * 96 * 4
+    )
+    try:
+        for memory, width in ((first, 64), (second, 96)):
+            stride = width * 4
+            HEADER.pack_into(
+                memory.buf, 0, MAGIC, PROTOCOL_VERSION, width, width, stride,
+                SLOT_COUNT, stride * width, b"test-nonce".ljust(32, b"\0"),
+            )
+        client = BlenderSourceClient()
+        client._active_project_uuid = PROJECT_UUID
+        client._active_view_uuid = VIEW_UUID
+        client._active_revision = 7
+        acknowledgements = []
+        client._send = (
+            lambda message, **_kwargs: acknowledgements.append(message) or True
+        )
+        received = []
+        client.frameReady.connect(
+            lambda project, view, revision, sequence, frame_kind, image:
+            received.append((
+                project, view, revision, sequence, frame_kind, QImage(image)
+            ))
+        )
+
+        client._open_stream(descriptor(first.name, 64))
+        assert client._memory.name == first.name
+        assert client._stream["width"] == 64
+
+        # A provider-driven resize reattaches the new buffer and replaces the
+        # old stream instead of staying pinned to the previous dimensions.
+        client._open_stream(descriptor(second.name, 96))
+        assert client._memory.name == second.name
+        assert client._stream["width"] == 96
+        assert client._stream["slot_bytes"] == 96 * 96 * 4
+
+        raw = bytes((10, 200, 30, 200)) * (96 * 96)
+        second.buf[HEADER_SIZE:HEADER_SIZE + 96 * 96 * 4] = raw
+        client._read_frame({
+            "project_uuid": PROJECT_UUID,
+            "view_uuid": VIEW_UUID,
+            "revision": 7,
+            "sequence": 4,
+            "slot": 0,
+            "width": 96,
+            "height": 96,
+            "stride": 96 * 4,
+            "frame_kind": "committed",
+        })
+
+        assert len(received) == 1
+        assert received[0][:4] == (PROJECT_UUID, VIEW_UUID, 7, 4)
+        assert received[0][5].size() == QImage(96, 96, QImage.Format_RGB32).size()
+        assert acknowledgements[-1] == {
+            "type": "FRAME_CONSUMED", "slot": 0, "sequence": 4,
+        }
+        client._close_memory()
+        client.deleteLater()
+    finally:
+        first.close()
+        first.unlink()
+        second.close()
+        second.unlink()
+
+
 def test_same_view_activation_does_not_resend_activate_or_restart_stream(qapp):
     client = BlenderSourceClient()
     sent = []
