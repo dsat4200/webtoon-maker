@@ -13,12 +13,12 @@
             "state": {
               "type": "markdown",
               "state": {
-                "file": "blender plugin tweaks.md",
+                "file": "Not Implemented.md",
                 "mode": "source",
                 "source": false
               },
               "icon": "lucide-file",
-              "title": "blender plugin tweaks"
+              "title": "Not Implemented"
             }
           },
           {
@@ -285,15 +285,15 @@
   },
   "active": "24235d69bb29ecf1",
   "lastOpenFiles": [
+    "implemented.md",
+    "how should the story start.md",
+    "Chapters/Chapter 1-5.md",
+    "blender plugin tweaks.md",
     "Pasted image 20260821185526.png",
     "Not Implemented.md",
-    "implemented.md",
-    "blender plugin tweaks.md",
     "Basic 3D - blender pipeline.md",
     "planning/lighter novel/what is the lighter novel.md",
     "3d merge 2.md",
-    "how should the story start.md",
-    "Chapters/Chapter 1-5.md",
     "Pasted image 20260821114654.png",
     "Pasted image 20260821114620.png",
     "prompt to start the 3d merge.md",
@@ -319,7 +319,6 @@
     "Pasted image 20260730190248.png",
     "art notes.md",
     "Pasted image 20260730092616.png",
-    "Pasted image 20260729230030.png",
     "Chapters",
     "QA Testing.md"
   ]

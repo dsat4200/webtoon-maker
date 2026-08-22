@@ -69,6 +69,7 @@ class TextPreset:
     bold: bool = False
     italic: bool = False
     kerning: float = 0.0
+    line_spacing: float = 1.0
     layout_mode: str = "strict"
     horizontal_alignment: str = "center"
     vertical_alignment: str = "middle"
@@ -78,6 +79,7 @@ class TextPreset:
         self.name = self.name.strip() or "Preset"
         self.font_size = max(6, min(250, round(float(self.font_size))))
         self.kerning = max(-20.0, min(100.0, float(self.kerning)))
+        self.line_spacing = max(0.5, min(3.0, float(self.line_spacing)))
         if self.layout_mode not in {"free", "strict"}:
             self.layout_mode = "strict"
         if self.horizontal_alignment not in {"left", "center", "right"}:

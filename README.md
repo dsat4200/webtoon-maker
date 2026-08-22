@@ -46,8 +46,8 @@ workflow.
 - Pixel-snapped pan, zoom, rotation, and aspect-preserving chapter preview navigation
 - Touch navigation controlled only by Tablet Navigation mode
 - Command-based undo/redo and atomic autosave recovery
-- Blender 4.5 Comic Views as live, transparent image sources with persistent
-  offline PNG caches
+- Blender 4.5 Comic Views as disk-published transparent image sources with
+  persistent offline PNG caches
 
 ## Run
 
@@ -74,7 +74,7 @@ To install and connect it:
 
 1. Install Blender 4.5 LTS on Windows.
 2. Run `blender_extension/webtoon_comic_views/build.ps1`, or use the already
-   built `blender_extension/webtoon_comic_views-0.3.0.zip`.
+   built `blender_extension/webtoon_comic_views-0.5.1.zip`.
 3. In Blender, choose **Edit → Preferences → Get Extensions → Install from
    Disk**, select the ZIP, and enable **Webtoon Comic Views**.
 4. In a 3D View, open the **Comic Views** sidebar. Create, Save, and Render views and
@@ -82,27 +82,31 @@ To install and connect it:
 5. In Webtoon Maker, open the **Blender Views** ribbon page, enter those values,
    connect, select a thumbnail, and choose **Add Selected View to Canvas**.
 
-Only the linked image selected in the active chapter owns the stream. Blender
-scene edits remain working changes until **Save** stores them and **Render**
-publishes that saved revision, thumbnail, resolution, and full frame. **Load**
-restores the latest Save, while **Revert** swaps it with the previous Save
-without rendering. **Render Once** shows a
-temporary preview that is never cached into the comic project. Selecting
-anything else, changing tabs, minimizing, or disconnecting freezes the last
-committed frame. That frame is encoded into the project, so the comic reopens
-with identical cached pixels when Blender is unavailable. Incoming frames
-preserve placement, transforms, masks, opacity, ordering, and Undo history.
-When a committed stream-frame aspect changes, the image keeps its displayed
-width and center while its height follows the new aspect.
-Use the Image Object inspector to Render Once, reconnect, relink by UUID, or
-detach the cache into a normal embedded image. Rasterize and Copy as Asset also
-freeze the cached image.
+If something fails, click **Copy Logs** in Blender's Comic Views panel. It
+copies a token-redacted diagnostic report with extension events, render errors,
+active-view metadata, and published-file status for easy bug reports.
 
-The prototype supports one Blender instance, one editor connection, and one
-active stream. It renders the camera-relative Stream Frame from the saved
-camera and captured shading with a transparent background; that frame may
-extend beyond the camera gate and is not a Cycles/Eevee final render. Ordinary
-viewport pan, zoom, and rotation do not affect published output.
+Blender scene edits remain working changes until **Save** stores them. Save
+automatically assigns the view a private timeline frame and bakes the camera,
+rig controls, and other changing channels there—manual key insertion is not
+required. **Render** atomically publishes that saved revision, thumbnail,
+resolution, and full PNG. A connected editor imports the finished PNG
+immediately; reconnecting imports the newest existing render without asking
+Blender to render again.
+**Load** restores the latest Save, while **Revert** swaps it with the previous
+Save without rendering. The imported frame is encoded into the comic project,
+so it reopens with identical pixels when Blender or its publication cache is
+unavailable. Updates preserve placement, transforms, masks, opacity, ordering,
+and Undo history. When the published aspect changes, the image keeps its
+displayed width and center while its height follows the new aspect. Use the
+Image Object inspector to reconnect, relink by UUID, or detach the cache into a
+normal embedded image. Rasterize and Copy as Asset also freeze the cached image.
+
+The prototype supports one Blender instance and one editor connection. It
+renders the camera-relative Stream Frame from the saved camera and captured
+shading with a transparent background; that frame may extend beyond the camera
+gate and is not a Cycles/Eevee final render. Ordinary viewport pan, zoom, and
+rotation do not affect published output.
 Comic Views store panel-variable state and stable references, never mesh,
 curve, texture, or other geometry data.
 
@@ -164,11 +168,14 @@ New contributors default to Add. During free-shape creation, an Add/Subtract/
 Ignore gizmo cycles the draft operation and the canvas previews the prospective
 Boolean result before Finish or another confirmation gesture commits it.
 
-Select a text object to enter Text Edit and open its Object/Presets,
-Typography, and Layout groups in Tool Settings. Its UI label is derived from
+Add Text selects the new object, enters an active Text Edit session, and
+selects the complete “Text” placeholder so typing immediately replaces it.
+Selecting an existing text object also enters Text Edit and opens its
+Object/Presets, Typography, and Layout groups in Tool Settings. Its UI label is derived from
 the first 16 normalized characters of its content. The canvas shows selected-
 text size, bold, and italic controls plus right-edge size and kerning scrub
-handles. Strict text wraps to its parent layer with a uniform margin; Free
+handles. Typography includes a persistent 0.5×–3.0× line-spacing multiplier,
+which is also stored in text presets. Strict text wraps to its parent layer with a uniform margin; Free
 text keeps its own projective transform rectangle. Both modes provide 3×3
 alignment, using the free text rectangle as the alignment frame when
 transformed. Drag or Shift-navigate to select text; double-click selects a word
@@ -288,11 +295,15 @@ ribbon to change the canvas/ribbon balance. These sizes are remembered across
 application restarts; the narrow chapter navigator keeps its fixed width.
 
 The Drawing Selection disclosure provides Rectangle and Lasso selection for
-raster pixels or vector points, plus Stroke selection for Vector Drawings.
+raster pixels, vector points, or anchors on any custom-path layer (including
+open paths, pages, and additional contours). Stroke selection remains exclusive
+to Vector Drawings.
 Shift adds, Ctrl removes, and an unmodified gesture replaces the selection;
 the configurable Select All command defaults to `Ctrl+A`. Selected content
 uses eight free/uniform transform handles plus edge translation, rotation, and
-a movable pivot. Those rotate/pivot affordances are shared by normal object
+a movable pivot. Custom-path transforms move anchors and their Bézier controls
+together, and Delete removes the selected anchors only when every contour keeps
+its required minimum topology. Those rotate/pivot affordances are shared by normal object
 transforms, and free text exposes its bounds handles while Text Edit is active.
 
 Raster and Vector Drawing inspectors, and eligible shape layers, can enable

@@ -424,6 +424,10 @@ def test_new_text_and_raster_insert_above_selected_object(qapp):
         )
         window._add_text()
         new_text_id = next(iter(set(chapter.objects) - before_ids))
+        assert window.canvas.selected_id == new_text_id
+        assert window.canvas.tool == ToolKind.TEXT_EDIT
+        assert window.canvas.has_active_text_edit()
+        assert window.canvas._text_selection_range() == [0, 4]
         assert chapter.objects[new_text_id].parent_layer_id == layer.layer_id
         assert layer.children[selected_index].entity_id == new_text_id
         assert layer.children[selected_index + 1].entity_id == text.object_id

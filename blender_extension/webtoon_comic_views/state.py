@@ -128,6 +128,22 @@ def repair_duplicate_uuids(scene: bpy.types.Scene) -> list[str]:
         if obj.pose is not None:
             candidates.extend(bone.bone for bone in obj.pose.bones)
         candidates.extend(obj.modifiers)
+    unique_candidates: list[object] = []
+    seen_candidates: set[tuple[str, int]] = set()
+    for item in candidates:
+        kind = getattr(
+            getattr(item, "bl_rna", None), "identifier", type(item).__name__
+        )
+        try:
+            pointer = int(item.as_pointer())
+        except (AttributeError, ReferenceError):
+            pointer = id(item)
+        identity = kind, pointer
+        if identity in seen_candidates:
+            continue
+        seen_candidates.add(identity)
+        unique_candidates.append(item)
+    candidates = unique_candidates
     known_names: dict[str, set[str]] = {}
     for view in getattr(scene, "webtoon_comic_views", ()):
         try:
@@ -185,14 +201,17 @@ def repair_duplicate_uuids(scene: bpy.types.Scene) -> list[str]:
             replacement = uuid.uuid4().hex
             try:
                 item[UUID_KEY] = replacement
+                if ensure_uuid(item) != replacement:
+                    raise RuntimeError("Comic UUID assignment did not persist")
                 warnings.append(
                     f"Reassigned a duplicated Comic UUID on "
-                    f"{getattr(item, 'name', type(item).__name__)}"
+                    f"{getattr(item, 'name', type(item).__name__)} "
+                    f"({getattr(getattr(item, 'bl_rna', None), 'identifier', type(item).__name__)})"
                 )
-            except (AttributeError, TypeError):
+            except (AttributeError, RuntimeError, TypeError) as error:
                 warnings.append(
                     f"Could not repair a duplicated Comic UUID on "
-                    f"{getattr(item, 'name', type(item).__name__)}"
+                    f"{getattr(item, 'name', type(item).__name__)}: {error}"
                 )
     return warnings
 

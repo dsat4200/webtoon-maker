@@ -11,7 +11,7 @@ The application separates several kinds of state:
 | Raster pixels | `TileStore` | Yes | Portable per-object PNG tile directories |
 | Tone-mask paint pixels | `TileStore` (mask IDs) | Yes | Portable per-mask PNG tile directories |
 | Embedded/cached image pixels | `ImageStore` | Yes | Portable per-object image directories |
-| Live Blender frame overrides | `BlenderImageSourceController` | No | Editor memory; debounced into `ImageStore` as PNG |
+| Blender publication imports | `BlenderImageSourceController` + `ImageStore` | Yes after acceptance | Original atomic publication PNG bytes embedded per linked Image Object |
 | Asset document and metadata | `AssetManifest` | Yes | Portable `assets/<id>/asset.json` and `assets/library.json` |
 | Asset raster/thumbnail | `TileStore`, rendered `QImage` | Yes | Portable `assets/<id>/raster/` and `thumbnail.png` |
 | Editor settings/workspace | `EditorSettings` | Yes, per user | Qt application config `settings.json` |
@@ -171,11 +171,11 @@ An Image Object stores its source descriptor, pixel dimensions, placement mode, 
 
 Schema-16 image records without a nested descriptor load as embedded sources. The migration exists only in memory until the chapter is next saved.
 
-`ImageStore` owns persistent source bytes and decoded premultiplied images. It also accepts runtime frame overrides. `image()` prefers that override; a debounced flush encodes it as `last-frame.png`. Live replacement changes no object geometry or hierarchy and creates no Undo command, but the persistent cache marks the document dirty. Save, autosave, disconnect, tab close, and application exit flush the latest accepted frame. Resolution changes in Blender scale into the Image Object's original local frame instead of resizing or resetting its editor transform.
+`ImageStore` owns persistent source bytes and decoded premultiplied images. For a Blender-linked object, the controller validates the notified absolute PNG path, size, format, revision, and dimensions, then stores the original bytes directly as `last-frame.png`; there is no runtime frame override or re-encode. Replacement changes no hierarchy and creates no Undo command, but it marks the chapter dirty for normal save/autosave persistence. Resolution changes preserve the Image Object's displayed width, center, and editor transform while adjusting its height to the new aspect.
 
 ### TextObject
 
-Adds plain text, logical width/height, font family/size, bold, italic, kerning, layout mode, horizontal/vertical alignment, margin, and an optional four-point transform quad. Its display name is derived at runtime from content.
+Adds plain text, logical width/height, font family/size, bold, italic, kerning, object-wide `line_spacing`, layout mode, horizontal/vertical alignment, margin, and an optional four-point transform quad. `line_spacing` is persisted as a 0.5–3.0 multiplier, defaults to 1.0 for legacy records, and is applied through the shared Qt text document used by rendering and editing. Its display name is derived at runtime from content.
 
 Legacy text alignment is migrated into an explicit free transform quad. Invalid alignment/layout values are corrected or rejected during load/validation.
 
@@ -248,7 +248,7 @@ On disk, tile names are `<x>_<y>.png`, so negative coordinates are represented n
 
 ## Image storage
 
-`ImageStore` keeps immutable original bytes per object ID (`ImageSource(filename, mime_type, data)`), a decoded premultiplied `QImage` cache, runtime frame overrides, and a dirty set. `persist_runtime_frame()` writes `last-frame.png` for linked Blender images. Directory saves write only dirty IDs on incremental saves and delete stale files/directories.
+`ImageStore` keeps immutable original bytes per object ID (`ImageSource(filename, mime_type, data)`), a decoded premultiplied `QImage` cache, and a dirty set. Validated Blender publications enter through `put_decoded()` without another decode. Directory saves write only dirty IDs on incremental saves and delete stale files/directories.
 
 ## Portable on-disk project layout
 

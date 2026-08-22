@@ -867,12 +867,15 @@ def test_outliner_colors_collapsed_add_and_dynamic_tools(qapp):
     layer_index = window.hierarchy_model.index_for_entity("layer", layer.layer_id)
     window.tree.setExpanded(layer_index, False)
     window._add_text()
-    assert window.canvas.selected_kind == "layer"
-    assert window.canvas.selected_id == layer.layer_id
+    object_id = next(iter(chapter.objects))
+    assert window.canvas.selected_kind == "object"
+    assert window.canvas.selected_id == object_id
+    assert window.canvas.tool == ToolKind.TEXT_EDIT
+    assert window.canvas.has_active_text_edit()
+    assert window.canvas._text_selection_range() == [0, 4]
     refreshed = window.hierarchy_model.index_for_entity("layer", layer.layer_id)
     assert not window.tree.isExpanded(refreshed)
     assert window.hierarchy_model.data(refreshed, Qt.BackgroundRole).name() == "#303238"
-    object_id = next(iter(chapter.objects))
     object_index = window.hierarchy_model.index_for_entity("object", object_id)
     assert window.hierarchy_model.data(object_index, Qt.BackgroundRole).name() == "#050505"
     assert window.tool_buttons[ToolKind.RASTER_PENCIL].isHidden()

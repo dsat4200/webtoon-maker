@@ -1335,6 +1335,7 @@ class TextObject(DocumentObject):
     bold: bool = False
     italic: bool = False
     kerning: float = 0.0
+    line_spacing: float = 1.0
     layout_mode: Literal["free", "strict"] = "strict"
     horizontal_alignment: Literal["left", "center", "right"] = "center"
     vertical_alignment: Literal["top", "middle", "bottom"] = "middle"
@@ -1353,6 +1354,7 @@ class TextObject(DocumentObject):
             "text": self.text, "size": [self.width, self.height],
             "font_family": self.font_family, "font_size": self.font_size,
             "bold": self.bold, "italic": self.italic, "kerning": self.kerning,
+            "line_spacing": max(0.5, min(3.0, float(self.line_spacing))),
             "layout_mode": self.layout_mode,
             "horizontal_alignment": self.horizontal_alignment,
             "vertical_alignment": self.vertical_alignment,
@@ -2247,6 +2249,12 @@ def object_from_dict(data: dict[str, Any]) -> ObjectEntity:
         size = data.get("size", [360, 120])
         legacy_alignment = data.get("alignment_mode")
         transform_quad = data.get("transform_quad")
+        try:
+            line_spacing = float(data.get("line_spacing", 1.0))
+        except (TypeError, ValueError):
+            line_spacing = 1.0
+        if not math.isfinite(line_spacing):
+            line_spacing = 1.0
         return TextObject(
             **common, text=str(data.get("text", "Text")),
             width=float(size[0]), height=float(size[1]),
@@ -2254,6 +2262,7 @@ def object_from_dict(data: dict[str, Any]) -> ObjectEntity:
             font_size=float(data.get("font_size", 32)),
             bold=bool(data.get("bold", False)), italic=bool(data.get("italic", False)),
             kerning=float(data.get("kerning", 0)),
+            line_spacing=max(0.5, min(3.0, line_spacing)),
             layout_mode=str(data.get(
                 "layout_mode", "free" if legacy_alignment is not None else "strict"
             )),

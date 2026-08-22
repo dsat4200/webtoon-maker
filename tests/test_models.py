@@ -4,7 +4,7 @@ import pytest
 
 from comic_editor.core.models import (
     BoundGeometry, ChapterDocument, GridSettings, PathNode, RasterObject,
-    SeriesDocument, TextObject, VectorDrawingObject,
+    SeriesDocument, TextObject, VectorDrawingObject, object_from_dict,
 )
 
 
@@ -217,7 +217,7 @@ def test_legacy_text_migrates_to_editable_free_quad():
     item["alignment_mode"] = "layer"
     for key in (
         "layout_mode", "horizontal_alignment", "vertical_alignment",
-        "margin", "transform_quad",
+        "margin", "line_spacing", "transform_quad",
     ):
         item.pop(key, None)
     loaded = ChapterDocument.from_dict(data)
@@ -226,6 +226,22 @@ def test_legacy_text_migrates_to_editable_free_quad():
     assert migrated.layout_mode == "free"
     assert len(migrated.transform_quad) == 4
     assert migrated.text == "Legacy"
+    assert migrated.line_spacing == 1.0
+
+
+@pytest.mark.parametrize(
+    ("stored", "expected"),
+    [(0.1, 0.5), (1.75, 1.75), (9.0, 3.0), ("bad", 1.0)],
+)
+def test_text_line_spacing_round_trips_with_bounds(stored, expected):
+    text = TextObject(text="One\nTwo", line_spacing=1.4)
+    data = text.to_dict()
+    data["line_spacing"] = stored
+
+    loaded = object_from_dict(data)
+
+    assert isinstance(loaded, TextObject)
+    assert loaded.line_spacing == expected
 
 
 def test_ignore_direct_parent_mask_round_trips_for_layers_and_objects():

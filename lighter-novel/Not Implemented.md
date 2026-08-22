@@ -1,4 +1,10 @@
+bug
+ - if i map something to backspace, backspace no longer works in text mode
 
+
+changes
+- if text is added, automatically switch to text edit mode (that way the user can make a text object and then immediately start typing)
+- add a line spacing setting to tool settings of a text object.
 
 
 

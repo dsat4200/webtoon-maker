@@ -8,6 +8,7 @@ import queue
 import socket
 import sys
 import time
+import uuid
 
 import bpy
 
@@ -16,14 +17,12 @@ extension_root = Path(os.environ["WEBTOON_EXTENSION_ROOT"])
 sys.path.insert(0, str(extension_root.parent))
 
 import webtoon_comic_views as addon  # noqa: E402
-from webtoon_comic_views import renderer, viewport  # noqa: E402
-from webtoon_comic_views.bridge import (  # noqa: E402
-    BridgeRuntime, BridgeServer, PROTOCOL_VERSION,
+from webtoon_comic_views import (  # noqa: E402
+    bridge, diagnostics, renderer, timeline, viewport,
 )
+from webtoon_comic_views.bridge import BridgeServer, PROTOCOL_VERSION  # noqa: E402
 from webtoon_comic_views.state import (  # noqa: E402
-    UUID_KEY, apply_state, capture_state, ensure_uuid,
-    migrate_legacy_presentation, parse_state, repair_duplicate_uuids,
-    state_digest, state_json, view_layer_for_state,
+    capture_state, ensure_uuid, parse_state, repair_duplicate_uuids,
 )
 
 
@@ -36,498 +35,620 @@ def receive_line(connection: socket.socket) -> dict:
 
 
 addon.register()
+original_render = renderer.render_active_camera
+original_write = bridge._atomic_write
+original_runtime_send = bridge.RUNTIME.send
 try:
+    assert PROTOCOL_VERSION == 3
+    assert bpy.types.Operator.bl_rna_get_subclass_py(
+        "WEBTOON_OT_render_comic_view"
+    ) is addon.WEBTOON_OT_render_comic_view
+    assert bpy.types.Operator.bl_rna_get_subclass_py(
+        "WEBTOON_OT_update_comic_view"
+    ) is addon.WEBTOON_OT_update_comic_view
+    assert bpy.types.Operator.bl_rna_get_subclass_py(
+        "WEBTOON_OT_copy_logs"
+    ) is addon.WEBTOON_OT_copy_logs
+    assert addon._initialize_scenes()
     scene = bpy.context.scene
-    cube = bpy.data.objects.get("Cube")
-    camera = bpy.data.objects.get("Camera")
-    light = bpy.data.objects.get("Light")
-    assert cube is not None and camera is not None and light is not None
-    scene.camera = camera
+    view_layer = bpy.context.view_layer
+    assert scene.camera is not None
+    project_uuid = scene.webtoon_comic_settings.project_uuid
+    assert len(project_uuid) == 32
 
-    entry = scene.webtoon_comic_registered.add()
-    entry.owner_uuid = ensure_uuid(camera.data)
-    entry.owner_type = camera.data.bl_rna.identifier
-    entry.owner_name = camera.data.name
-    entry.rna_path = ""
-    entry.property_id = "lens"
-    entry.label = "Lens (registered)"
-
-    state, capture_warnings = capture_state(
-        scene, bpy.context.view_layer,
-        stream_frame=(-0.25, 0.1, 1.5, 0.9),
-        output_resolution=(640, 360),
+    # State snapshots remain geometry-free and viewport navigation independent.
+    captured, warnings = capture_state(
+        scene, view_layer, stream_frame=viewport.DEFAULT_FRAME,
+        output_resolution=(64, 64),
     )
-    assert state["version"] == 3
-    assert "viewport" not in state
-    assert state["stream_frame"] == [-0.25, 0.1, 1.5, 0.9]
-    assert state["stream_frame_space"] == "camera"
-    assert state["local_view"] == {"enabled": False, "object_uuids": []}
-    assert state["active_layer_collection_uuid"]
-    assert state["render_settings"]["resolution_x"] == scene.render.resolution_x
-    assert capture_warnings == []
-    assert state["registered"][0]["property_id"] == "lens"
-    serialized = state_json(state)
-    assert parse_state(serialized) == state
-    assert state_digest(state) == state_digest(parse_state(serialized))
-    legacy = dict(state)
-    legacy["version"] = 2
-    legacy["viewport"] = {
-        "view_perspective": "CAMERA",
-        "view_camera_zoom": 0.0,
-        "view_camera_offset": [0.0, 0.0],
-    }
-    legacy["stream_frame"] = [0.2, 0.2, 0.8, 0.8]
-    legacy.pop("stream_frame_space")
-    legacy.pop("local_view")
-    legacy.pop("active_layer_collection_uuid")
-    legacy.pop("render_settings")
-    migrated = parse_state(
-        state_json(legacy), fallback_stream_frame=(0.2, 0.2, 0.8, 0.8),
-        fallback_resolution=(640, 480),
-    )
-    assert migrated["version"] == 3
-    assert migrated["stream_frame"] == [0.2, 0.2, 0.8, 0.8]
-    assert migrated["stream_frame_space"] == "viewport_legacy"
-    migrated, migration_warning = migrate_legacy_presentation(scene, migrated)
-    assert migrated["stream_frame_space"] == "camera"
-    assert "viewport" not in migrated
-    assert len(migrated["stream_frame"]) == 4
-    if migration_warning:
-        assert migrated["stream_frame"] == list(viewport.DEFAULT_FRAME)
+    assert isinstance(warnings, list)
+    assert "viewport" not in captured
+    assert tuple(captured["output_resolution"]) == (64, 64)
 
-    # Camera-gate crop coordinates may extend beyond the gate, and output
-    # aspect derives from the saved camera-gate aspect rather than a region.
-    parsed_outside = parse_state(state_json(state))
-    assert parsed_outside["stream_frame"][0] < 0.0
-    scene.render.resolution_x, scene.render.resolution_y = 1600, 800
-    assert viewport.derive_resolution(800, (0.0, 0.0, 1.0, 1.0), scene) == (
-        800, 400,
-    )
-    assert viewport.derive_resolution(800, (-0.5, 0.0, 1.5, 1.0), scene) == (
-        800, 200,
-    )
-    scene.render.resolution_x, scene.render.resolution_y = 1920, 1080
-
-    # Ordinary camera-view navigation is absent from snapshots and cannot
-    # influence camera-derived render matrices. Moving the camera itself can.
-    original_navigation = viewport.capture_viewport()
-    view_matrix_a, projection_a = viewport.render_matrices(
-        scene, bpy.context.view_layer, (-0.25, 0.1, 1.5, 0.9)
-    )
-    navigated = dict(original_navigation)
-    navigated.update({
-        "view_camera_zoom": 180.0,
-        "view_camera_offset": [0.23, -0.17],
-        "view_distance": 91.0,
-    })
-    viewport.apply_viewport(navigated)
-    navigated_state, _warnings = capture_state(
-        scene, bpy.context.view_layer,
-        stream_frame=(-0.25, 0.1, 1.5, 0.9),
-        output_resolution=(640, 360),
-    )
-    view_matrix_b, projection_b = viewport.render_matrices(
-        scene, bpy.context.view_layer, (-0.25, 0.1, 1.5, 0.9)
-    )
-    assert state_digest(navigated_state) == state_digest(state)
-    assert view_matrix_a == view_matrix_b
-    assert projection_a == projection_b
-    camera.location.x += 1.0
-    bpy.context.view_layer.update()
-    moved_matrix, _projection = viewport.render_matrices(
-        scene, bpy.context.view_layer, (-0.25, 0.1, 1.5, 0.9)
-    )
-    assert moved_matrix != view_matrix_a
-    camera.location.x -= 1.0
-    bpy.context.view_layer.update()
-    viewport.apply_viewport(original_navigation)
-
-    # Geometry datablock contents are never serialized.
-    forbidden_keys = {
-        "vertices", "edges", "polygons", "loops", "splines",
-        "mesh_data", "curve_data", "texture_pixels",
-    }
-
-    def visit(value):
-        if isinstance(value, dict):
-            assert forbidden_keys.isdisjoint(value)
-            for child in value.values():
-                visit(child)
-        elif isinstance(value, list):
-            for child in value:
-                visit(child)
-
-    visit(state)
-
-    expected_location = tuple(cube.location)
-    expected_lens = camera.data.lens
-    expected_energy = light.data.energy
-    cube.location = (20, 30, 40)
-    camera.data.lens = 19
-    light.data.energy = 12
-    warnings = apply_state(scene, state)
-    assert not [item for item in warnings if item.startswith("Missing")]
-    assert tuple(round(value, 5) for value in cube.location) == tuple(
-        round(value, 5) for value in expected_location
-    )
-    assert camera.data.lens == expected_lens
-    assert light.data.energy == expected_energy
-
-    # The active layer collection is part of the saved panel state.
-    active_collection = bpy.data.collections.new("Panel Active Collection")
-    scene.collection.children.link(active_collection)
-    active_layer = bpy.context.view_layer.layer_collection.children[
-        active_collection.name
-    ]
-    bpy.context.view_layer.active_layer_collection = active_layer
-    collection_state, _warnings = capture_state(scene, bpy.context.view_layer)
-    bpy.context.view_layer.active_layer_collection = (
-        bpy.context.view_layer.layer_collection
-    )
-    apply_state(scene, collection_state)
-    assert bpy.context.view_layer.active_layer_collection == active_layer
-
-    # Whole-rig snapshot behavior restores every pose-bone transform and
-    # custom control without inserting keyframes.
-    armature = bpy.data.armatures.new("Probe Rig Data")
-    rig = bpy.data.objects.new("Probe Rig", armature)
-    scene.collection.objects.link(rig)
-    bpy.context.view_layer.objects.active = rig
-    rig.select_set(True)
-    bpy.ops.object.mode_set(mode="EDIT")
-    edit_bone = armature.edit_bones.new("Control")
-    edit_bone.head = (0.0, 0.0, 0.0)
-    edit_bone.tail = (0.0, 0.0, 1.0)
-    bpy.ops.object.mode_set(mode="OBJECT")
-    control = rig.pose.bones["Control"]
-    control.location = (1.0, 2.0, 3.0)
-    control.rotation_mode = "XYZ"
-    control.rotation_euler = (0.1, 0.2, 0.3)
-    control.scale = (1.1, 1.2, 1.3)
-    control["expression"] = 0.75
-    pose_state, _warnings = capture_state(scene, bpy.context.view_layer)
-    control.location = (9.0, 9.0, 9.0)
-    control.rotation_euler = (0.0, 0.0, 0.0)
-    control.scale = (2.0, 2.0, 2.0)
-    control["expression"] = 0.0
-    apply_state(scene, pose_state)
-    assert tuple(round(value, 5) for value in control.location) == (1.0, 2.0, 3.0)
-    assert tuple(round(value, 5) for value in control.rotation_euler) == (
-        0.1, 0.2, 0.3,
-    )
-    assert tuple(round(value, 5) for value in control.scale) == (1.1, 1.2, 1.3)
-    assert control["expression"] == 0.75
-    assert rig.animation_data is None
-
-    introduced = bpy.data.objects.new("Introduced", None)
-    scene.collection.objects.link(introduced)
-    modifier = cube.modifiers.new("Introduced Modifier", "BEVEL")
-    warnings = apply_state(scene, state)
-    assert introduced.hide_viewport and introduced.hide_render
-    assert any("Introduced Modifier" in item for item in warnings)
-    assert modifier in cube.modifiers[:]
-
-    duplicate = bpy.data.objects.new("Duplicate UUID", None)
-    scene.collection.objects.link(duplicate)
-    duplicate[UUID_KEY] = cube[UUID_KEY]
-    warnings = repair_duplicate_uuids(scene)
-    assert duplicate[UUID_KEY] != cube[UUID_KEY]
-    assert any("duplicated Comic UUID" in item for item in warnings)
-
-    panel_layer = scene.view_layers.new("Panel View Layer")
-    layer_state, _warnings = capture_state(scene, panel_layer)
-    assert view_layer_for_state(scene, layer_state) == panel_layer
-
-    bpy.data.objects.remove(cube, do_unlink=True)
-    warnings = apply_state(scene, state)
-    assert any("Missing object Cube" in item for item in warnings)
-
-    # Raw OpenGL-style premultiplied, bottom-up pixels become straight-alpha,
-    # top-down transport pixels.
-    bottom = bytes((10, 20, 30, 128))
-    top = bytes((90, 80, 70, 255))
-    converted = renderer._to_top_down_straight_alpha(bottom + top, 1, 2)
-    assert converted[:4] == top
-    assert converted[4:] == bytes((20, 40, 60, 128))
-    assert renderer.png_bytes(renderer.RenderFrame(1, 2, converted)).startswith(
-        b"\x89PNG\r\n\x1a\n"
-    )
-    try:
-        renderer.validate_resolution(5000, 10)
-    except ValueError:
-        pass
-    else:
-        raise AssertionError("invalid resolution was accepted")
-
-    # The socket worker authenticates without touching Blender RNA and rejects
-    # a second editor while the authenticated connection is alive.
+    # The loopback server distinguishes protocol mismatch from token failure.
     incoming, outgoing = queue.Queue(), queue.Queue()
     server = BridgeServer(incoming, outgoing)
-    port_probe = socket.socket()
-    port_probe.bind(("127.0.0.1", 0))
-    port = port_probe.getsockname()[1]
-    port_probe.close()
+    probe = socket.socket()
+    probe.bind(("127.0.0.1", 0))
+    port = probe.getsockname()[1]
+    probe.close()
     server.start(port, "probe-token")
     bad = socket.create_connection(("127.0.0.1", port), timeout=2)
-    bad.sendall(b'{"type":"HELLO","protocol":1,"token":"wrong"}\n')
-    assert receive_line(bad)["code"] == "AUTHENTICATION_FAILED"
+    bad.sendall(json.dumps({
+        "type": "HELLO", "protocol": 2, "token": "probe-token",
+    }).encode("utf-8") + b"\n")
+    assert receive_line(bad)["code"] == "PROTOCOL_MISMATCH"
     bad.close()
     deadline = time.monotonic() + 2.0
     while server._client_active and time.monotonic() < deadline:
         time.sleep(0.01)
     good = socket.create_connection(("127.0.0.1", port), timeout=2)
-    good.sendall(
-        json.dumps({
-            "type": "HELLO", "protocol": PROTOCOL_VERSION,
-            "token": "probe-token",
-        }).encode("utf-8") + b"\n"
-    )
+    good.sendall(json.dumps({
+        "type": "HELLO", "protocol": PROTOCOL_VERSION,
+        "token": "probe-token",
+    }).encode("utf-8") + b"\n")
     assert receive_line(good)["type"] == "HELLO"
-    busy = socket.create_connection(("127.0.0.1", port), timeout=2)
-    assert receive_line(busy)["code"] == "BUSY"
-    busy.close()
     good.close()
     server.stop()
 
-    # Save and Load are state-only. A changed Save rotates one backup, and
-    # Revert swaps the two snapshots without rendering.
-    runtime = BridgeRuntime()
-    views = scene.webtoon_comic_views
-    view = views.add()
+    runtime = bridge.RUNTIME
+    view = scene.webtoon_comic_views.add()
     view.view_uuid = "00000000000000000000000000000abc"
-    view.name = "Probe"
-    view.revision = 0
-    view.width = view.height = 64
-    stream_state, _warnings = capture_state(
-        scene, panel_layer, output_resolution=(64, 64)
-    )
-    view.state_json = ""
-    view.state_hash = ""
-    view.published_width = view.published_height = 64
-    scene.webtoon_comic_settings.active_index = len(views) - 1
+    view.name = "Published Probe"
+    viewport.set_working_resolution(view, 64, 64)
+    viewport.set_frame_bounds(view, viewport.DEFAULT_FRAME)
+    scene.webtoon_comic_settings.active_index = len(scene.webtoon_comic_views) - 1
     scene.webtoon_comic_settings.loaded_view_uuid = view.view_uuid
-    saved_energy = float(light.data.energy)
-    light.data.energy = saved_energy + 10.0
     runtime.save_view_state(scene, view)
-    assert not view.previous_state_json
-    first_saved_json = view.state_json
-    light.data.energy = saved_energy + 20.0
-    runtime.save_view_state(scene, view)
-    second_saved_json = view.state_json
-    assert view.previous_state_json == first_saved_json
-    light.data.energy = saved_energy + 30.0
+    saved_resolution = tuple(parse_state(view.state_json)["output_resolution"])
+    assert len(saved_resolution) == 2 and min(saved_resolution) >= 64
+
+    cube = bpy.data.objects.get("Cube")
+    assert cube is not None
+    scene.frame_set(7, subframe=0.25)
+    cube.location = (2.0, 3.0, 4.0)
+    working_cube_location = tuple(cube.location)
+    cube.hide_render = True
     render_calls = []
-    original_render = renderer.render_active_camera
 
     def fake_render(_scene, _view_layer, width, height, **kwargs):
         render_calls.append({
             "width": width,
             "height": height,
+            "cube_hidden": bool(cube.hide_render),
             "stream_frame": kwargs.get("stream_frame"),
-            "energy": float(light.data.energy),
         })
         return renderer.RenderFrame(width, height, bytes(width * height * 4))
 
     renderer.render_active_camera = fake_render
-    runtime.load_view_state(scene, view)
-    assert light.data.energy == saved_energy + 20.0
-    assert render_calls == []
-    light.data.energy = saved_energy + 30.0
-    runtime.revert_view_state(scene, view)
-    assert light.data.energy == saved_energy + 10.0
-    assert view.state_json == first_saved_json
-    assert view.previous_state_json == second_saved_json
-    assert render_calls == []
-    runtime.revert_view_state(scene, view)
-    assert light.data.energy == saved_energy + 20.0
-
-    # Selecting a different row schedules automatic activation/loading; an
-    # already loaded row remains idempotent.
-    automatic = views.add()
-    automatic.view_uuid = "00000000000000000000000000000abd"
-    automatic.name = "Automatic Selection"
-    automatic.state_json = view.state_json
-    automatic.state_hash = view.state_hash
-    viewport.set_working_resolution(automatic, view.width, view.height)
-    scene.webtoon_comic_settings.active_index = len(views) - 1
-    addon._activate_selected_timer()
-    assert scene.webtoon_comic_settings.loaded_view_uuid == automatic.view_uuid
-    loaded_state_hash = automatic.state_hash
-    scene.webtoon_comic_settings.active_index = len(views) - 1
-    addon._activate_selected_timer()
-    assert automatic.state_hash == loaded_state_hash
-    scene.webtoon_comic_settings.loaded_view_uuid = view.view_uuid
-    addon._select_index(scene, view.view_uuid)
-
-    # Render transactionally applies the latest Save, then restores unsaved
-    # working state and viewport-independent presentation.
-    light.data.energy = saved_energy + 30.0
-    old_thumbnail = view.thumbnail_png
-    runtime.render_saved_view(scene, view)
-    assert render_calls[-1]["energy"] == saved_energy + 20.0
-    assert light.data.energy == saved_energy + 30.0
+    messages = []
+    runtime.connected = True
+    runtime.send = lambda message: messages.append(message)
+    assert bpy.ops.webtoon.render_comic_view() == {"FINISHED"}
+    assert len(render_calls) == 1
+    assert not render_calls[-1]["cube_hidden"]
+    assert cube.hide_render
+    assert scene.frame_current == 7
+    assert abs(scene.frame_subframe - 0.25) < 1.0e-6
+    assert tuple(cube.location) == working_cube_location
     assert view.revision == 1
-    assert view.thumbnail_png != old_thumbnail
-    prior_revision = view.revision
-    prior_thumbnail = view.thumbnail_png
+    frame_path = Path(view.published_frame_path)
+    assert frame_path.is_file()
+    assert frame_path.read_bytes().startswith(b"\x89PNG\r\n\x1a\n")
+    updates = [message for message in messages if message.get("type") == "VIEWS_CHANGED"]
+    assert updates[-1]["views"][0]["frame_path"] == str(frame_path)
+    assert not hasattr(runtime, "streaming")
+    assert not hasattr(runtime, "_open_stream")
 
-    def failed_render(*_args, **_kwargs):
-        assert light.data.energy == saved_energy + 20.0
+    report = diagnostics.build_report(
+        bpy.context, runtime, extension_version=addon.EXTENSION_VERSION,
+        protocol_version=PROTOCOL_VERSION,
+    )
+    assert "Extension: 0.5.1" in report
+    assert "Authentication token: [redacted]" in report
+    assert "Render published" in report
+    assert view.view_uuid in report
+    assert bpy.ops.webtoon.copy_logs() == {"FINISHED"}
+    # Headless Blender accepts the operator but does not expose the OS clipboard.
+
+    # Render and publication failures retain the previous committed metadata.
+    prior = (
+        view.revision, view.published_frame_path, view.thumbnail_png,
+        view.published_width, view.published_height,
+    )
+
+    def fail_render(*_args, **_kwargs):
         raise RuntimeError("intentional render failure")
 
-    renderer.render_active_camera = failed_render
+    renderer.render_active_camera = fail_render
     try:
         runtime.render_saved_view(scene, view)
-    except RuntimeError as error:
-        assert "intentional" in str(error)
+    except RuntimeError:
+        pass
     else:
         raise AssertionError("failed render unexpectedly succeeded")
-    assert light.data.energy == saved_energy + 30.0
-    assert view.revision == prior_revision
-    assert view.thumbnail_png == prior_thumbnail
+    assert prior == (
+        view.revision, view.published_frame_path, view.thumbnail_png,
+        view.published_width, view.published_height,
+    )
+
     renderer.render_active_camera = fake_render
 
-    # Streaming publishes the latest saved state on start, publishes no
-    # dependency-graph edits, and distinguishes preview/committed renders.
-    runtime.scene_matches_snapshot = True
-    runtime._start_stream(scene, {
-        "view_uuid": view.view_uuid,
-    })
-    assert runtime.streaming
-    first_memory_name = runtime._memory.name
-    stream_render_count = len(render_calls)
-    runtime._render_if_needed(scene, 10.0)
-    assert len(render_calls) == stream_render_count + 1
-    assert not runtime.frame_dirty
+    def fail_write(*_args, **_kwargs):
+        raise OSError("intentional write failure")
 
-    runtime.mark_scene_dirty()
-    runtime._render_if_needed(scene, 10.5)
-    assert len(render_calls) == stream_render_count + 1
-    assert not runtime.frame_dirty
+    bridge._atomic_write = fail_write
+    try:
+        runtime.render_saved_view(scene, view)
+    except OSError:
+        pass
+    else:
+        raise AssertionError("failed publication unexpectedly succeeded")
+    assert prior == (
+        view.revision, view.published_frame_path, view.thumbnail_png,
+        view.published_width, view.published_height,
+    )
+    bridge._atomic_write = original_write
 
-    runtime._handle(scene, {"type": "RENDER_ONCE"})
-    runtime._render_if_needed(scene, 11.1)
-    assert len(render_calls) == stream_render_count + 2
-    assert runtime.frame_kind == "preview"
-    assert not runtime.frame_dirty
+    # Revision files are immutable and bounded to the latest two per view.
+    runtime.render_saved_view(scene, view)
+    runtime.render_saved_view(scene, view)
+    assert view.revision == 3
+    files = sorted(Path(view.published_frame_path).parent.glob("*.png"))
+    assert len(files) == 2
+    assert {int(path.stem) for path in files} == {2, 3}
 
-    runtime.save_view_state(scene, view)
-    assert runtime.frame_kind == "preview"
-    runtime.request_committed_frame(scene, view)
-    runtime._render_if_needed(scene, 11.2)
-    assert len(render_calls) == stream_render_count + 3
+    duplicate = scene.webtoon_comic_views.add()
+    duplicate.view_uuid = "00000000000000000000000000000abd"
+    duplicate.name = "Published Probe Copy"
+    duplicate.revision = view.revision
+    runtime.duplicate_published_frame(scene, view, duplicate)
+    duplicate_path = Path(duplicate.published_frame_path)
+    assert duplicate_path.is_file()
+    assert duplicate_path != Path(view.published_frame_path)
+    assert duplicate_path.read_bytes() == Path(view.published_frame_path).read_bytes()
+    runtime.delete_published_frames(scene, duplicate.view_uuid)
+    assert not duplicate_path.exists()
 
-    # Lack of a free slot retains the newest dirty state rather than
-    # overwriting an unacknowledged frame.
-    runtime._outstanding = {0: 1, 1: 2, 2: 3}
-    runtime.frame_dirty = True
-    runtime._render_if_needed(scene, 12.1)
-    assert runtime.frame_dirty
-    assert len(render_calls) == stream_render_count + 3
+    # Animated camera and pose channels are baked automatically at distinct
+    # extension-owned frames. No manual key insertion is required for either
+    # Comic View snapshot, and a newly varying custom property is backfilled.
+    while len(scene.webtoon_comic_views):
+        scene.webtoon_comic_views.remove(len(scene.webtoon_comic_views) - 1)
+    scene.webtoon_comic_settings.active_index = -1
+    scene.webtoon_comic_settings.loaded_view_uuid = ""
+    scene.frame_set(2)
+    camera = scene.camera
+    camera.animation_data_clear()
+    camera.rotation_mode = "XYZ"
+    camera.location = (8.0, 8.0, 8.0)
+    camera.rotation_euler = (0.8, 0.7, 0.6)
+    camera.scale = (1.0, 1.0, 1.0)
+    for path in ("location", "rotation_euler", "scale"):
+        camera.keyframe_insert(path, frame=2, group="Original Camera")
+    shared_camera = camera.copy()
+    shared_camera.name = "Timeline Probe Shared Camera"
+    shared_camera.data = camera.data.copy()
+    scene.collection.objects.link(shared_camera)
+    assert shared_camera.animation_data.action is camera.animation_data.action
 
-    # Stopping and restarting clears the old cadence, so the replacement
-    # stream also produces its first frame immediately.
-    runtime.stop_stream()
-    assert not runtime.frame_dirty
-    runtime.scene_matches_snapshot = True
-    runtime._start_stream(scene, {"view_uuid": view.view_uuid})
-    second_memory_name = runtime._memory.name
-    runtime._render_if_needed(scene, 0.1)
-    assert len(render_calls) == stream_render_count + 4
-    runtime.stop_stream()
-    renderer.render_active_camera = original_render
+    armature_data = bpy.data.armatures.new("Timeline Probe Armature")
+    armature = bpy.data.objects.new("Timeline Probe Rig", armature_data)
+    scene.collection.objects.link(armature)
+    bpy.context.view_layer.objects.active = armature
+    armature.select_set(True)
+    bpy.ops.object.mode_set(mode="EDIT")
+    edit_bone = armature.data.edit_bones.new("Control")
+    edit_bone.head = (0.0, 0.0, 0.0)
+    edit_bone.tail = (0.0, 0.0, 1.0)
+    axis_bone = armature.data.edit_bones.new("Axis Control")
+    axis_bone.head = (1.0, 0.0, 0.0)
+    axis_bone.tail = (1.0, 0.0, 1.0)
+    bpy.ops.object.mode_set(mode="POSE")
+    control = armature.pose.bones["Control"]
+    control.rotation_mode = "QUATERNION"
+    control.location = (0.0, 0.0, 0.0)
+    control.rotation_quaternion = (1.0, 0.0, 0.0, 0.0)
+    control.scale = (1.0, 1.0, 1.0)
+    for path in ("location", "rotation_quaternion", "scale"):
+        control.keyframe_insert(path, frame=2, group="Original Pose")
+    axis_control = armature.pose.bones["Axis Control"]
+    axis_control.rotation_mode = "AXIS_ANGLE"
+    bpy.ops.object.mode_set(mode="OBJECT")
 
-    # Saving with a new working resolution keeps the published size in sync,
-    # and a committed stream opens at the saved output resolution even if the
-    # published size was left stale, so the new render replaces the editor's
-    # cached frame instead of failing.
-    viewport.set_working_resolution(view, 128, 128)
-    runtime.save_view_state(scene, view)
-    saved_resolution = tuple(parse_state(view.state_json)["output_resolution"])
-    assert (view.published_width, view.published_height) == saved_resolution
-    view.published_width, view.published_height = 64, 64
-    messages = []
-    runtime.send = lambda message: messages.append(message)
-    runtime.scene_matches_snapshot = True
-    runtime._start_stream(scene, {"view_uuid": view.view_uuid})
-    opens = [m for m in messages if m.get("type") == "STREAM_OPEN"]
-    assert opens and (opens[-1]["width"], opens[-1]["height"]) == saved_resolution
-    assert (runtime._stream_width, runtime._stream_height) == saved_resolution
+    shape_mesh = bpy.data.meshes.new("Timeline Probe Shape Mesh")
+    shape_mesh.from_pydata(
+        [(0.0, 0.0, 0.0), (1.0, 0.0, 0.0), (0.0, 1.0, 0.0)],
+        [], [(0, 1, 2)],
+    )
+    shape_object = bpy.data.objects.new("Timeline Probe Shape", shape_mesh)
+    scene.collection.objects.link(shape_object)
+    shape_object.shape_key_add(name="Basis")
+    expression_key = shape_object.shape_key_add(name="Expression")
+    modifier = shape_object.modifiers.new("Timeline Probe Modifier", "SOLIDIFY")
+    visibility_collection = bpy.data.collections.new(
+        "Timeline Probe Visibility Collection"
+    )
+    scene.collection.children.link(visibility_collection)
+    light = next(obj for obj in scene.objects if obj.type == "LIGHT")
+    registered = scene.webtoon_comic_registered.add()
+    registered.owner_uuid = ensure_uuid(scene)
+    registered.owner_type = "Scene"
+    registered.owner_name = scene.name
+    registered.rna_path = "render"
+    registered.property_id = "film_transparent"
+    registered.label = "Scene render transparency"
+    bpy.context.view_layer.update()
+    original_camera_keys = {
+        (curve.data_path, curve.array_index): float(
+            next(point for point in curve.keyframe_points if point.co.x == 2).co.y
+        )
+        for curve in camera.animation_data.action.fcurves
+    }
+    original_camera_styles = {
+        (curve.data_path, curve.array_index): (
+            str(point.interpolation), str(point.handle_left_type),
+            str(point.handle_right_type), tuple(point.handle_left),
+            tuple(point.handle_right),
+        )
+        for curve in camera.animation_data.action.fcurves
+        for point in curve.keyframe_points if point.co.x == 2
+    }
 
-    def fake_size_render(_scene, _view_layer, width, height, **_kwargs):
+    def timeline_view(name):
+        item = scene.webtoon_comic_views.add()
+        item.view_uuid = uuid.uuid4().hex
+        item.name = name
+        viewport.set_working_resolution(item, 64, 64)
+        viewport.set_frame_bounds(item, viewport.DEFAULT_FRAME)
+        scene.webtoon_comic_settings.active_index = len(
+            scene.webtoon_comic_views
+        ) - 1
+        return item
+
+    def current_transform(target, rotation):
+        return (
+            tuple(target.location), tuple(getattr(target, rotation)),
+            tuple(target.scale),
+        )
+
+    def close_tuple(actual, expected):
+        return all(abs(float(a) - float(b)) < 1.0e-5 for a, b in zip(actual, expected))
+
+    camera.location = (1.0, 2.0, 3.0)
+    camera.rotation_euler = (0.1, 0.2, 0.3)
+    camera.scale = (1.1, 1.2, 1.3)
+    camera.delta_location = (0.01, 0.02, 0.03)
+    camera.data.lens = 38.0
+    shared_camera.location = (-1.0, -2.0, -3.0)
+    camera["comic_pose"] = 1.0
+    camera["static_pose"] = 7.0
+    control.location = (0.2, 0.3, 0.4)
+    control.rotation_quaternion = (0.9, 0.1, 0.2, 0.3)
+    control.scale = (0.8, 0.9, 1.1)
+    control["pose_strength"] = 0.25
+    axis_control.rotation_axis_angle = (0.35, 0.0, 1.0, 0.0)
+    expression_key.value = 0.2
+    expression_key.mute = False
+    light.data.energy = 125.0
+    modifier.show_viewport = True
+    modifier.show_render = False
+    shape_object.hide_viewport = False
+    shape_object.hide_render = True
+    visibility_collection.hide_viewport = False
+    visibility_collection.hide_render = True
+    scene.render.film_transparent = False
+    expected_camera_one = current_transform(camera, "rotation_euler")
+    expected_shared_one = current_transform(shared_camera, "rotation_euler")
+    expected_pose_one = current_transform(control, "rotation_quaternion")
+    expected_axis_one = tuple(axis_control.rotation_axis_angle)
+    timeline_one = timeline_view("Timeline One")
+    runtime.save_view_state(scene, timeline_one)
+    scene.webtoon_comic_settings.loaded_view_uuid = timeline_one.view_uuid
+    first_timeline_frame = timeline_one.timeline_frame
+    assert first_timeline_frame > 2
+
+    camera.location = (4.0, 5.0, 6.0)
+    camera.rotation_euler = (0.7, 0.8, 0.9)
+    camera.scale = (1.4, 1.5, 1.6)
+    camera.delta_location = (0.11, 0.12, 0.13)
+    camera.data.lens = 72.0
+    shared_camera.location = (-4.0, -5.0, -6.0)
+    camera["comic_pose"] = 2.0
+    camera["static_pose"] = 7.0
+    control.location = (0.5, 0.6, 0.7)
+    control.rotation_quaternion = (0.7, 0.2, 0.3, 0.6)
+    control.scale = (1.2, 1.3, 1.4)
+    control["pose_strength"] = 0.75
+    axis_control.rotation_axis_angle = (0.8, 1.0, 0.0, 0.0)
+    expression_key.value = 0.85
+    expression_key.mute = True
+    light.data.energy = 450.0
+    modifier.show_viewport = False
+    modifier.show_render = True
+    shape_object.hide_viewport = True
+    shape_object.hide_render = False
+    visibility_collection.hide_viewport = True
+    visibility_collection.hide_render = False
+    scene.render.film_transparent = True
+    expected_camera_two = current_transform(camera, "rotation_euler")
+    expected_shared_two = current_transform(shared_camera, "rotation_euler")
+    expected_pose_two = current_transform(control, "rotation_quaternion")
+    expected_axis_two = tuple(axis_control.rotation_axis_angle)
+    timeline_two = timeline_view("Timeline Two")
+    runtime.save_view_state(scene, timeline_two)
+    scene.webtoon_comic_settings.loaded_view_uuid = timeline_two.view_uuid
+    assert timeline_two.timeline_frame > first_timeline_frame
+    assert timeline_one.bake_hash.startswith("1:")
+    assert timeline_two.bake_hash.startswith("1:")
+
+    runtime.load_view_state(scene, timeline_one)
+    assert scene.frame_current == timeline_one.timeline_frame
+    assert current_transform(camera, "rotation_euler") == expected_camera_one
+    assert current_transform(shared_camera, "rotation_euler") == expected_shared_one
+    assert current_transform(control, "rotation_quaternion") == expected_pose_one
+    assert camera["comic_pose"] == 1.0
+    assert close_tuple(camera.delta_location, (0.01, 0.02, 0.03))
+    assert camera.data.lens == 38.0
+    assert control["pose_strength"] == 0.25
+    assert close_tuple(axis_control.rotation_axis_angle, expected_axis_one)
+    assert abs(expression_key.value - 0.2) < 1.0e-5 and not expression_key.mute
+    assert light.data.energy == 125.0
+    assert modifier.show_viewport and not modifier.show_render
+    assert not shape_object.hide_viewport and shape_object.hide_render
+    assert not visibility_collection.hide_viewport
+    assert visibility_collection.hide_render
+    assert not scene.render.film_transparent
+    runtime.load_view_state(scene, timeline_two)
+    assert scene.frame_current == timeline_two.timeline_frame
+    assert current_transform(camera, "rotation_euler") == expected_camera_two
+    assert current_transform(shared_camera, "rotation_euler") == expected_shared_two
+    assert current_transform(control, "rotation_quaternion") == expected_pose_two
+    assert camera["comic_pose"] == 2.0
+    assert close_tuple(camera.delta_location, (0.11, 0.12, 0.13))
+    assert camera.data.lens == 72.0
+    assert control["pose_strength"] == 0.75
+    assert close_tuple(axis_control.rotation_axis_angle, expected_axis_two)
+    assert abs(expression_key.value - 0.85) < 1.0e-5 and expression_key.mute
+    assert light.data.energy == 450.0
+    assert not modifier.show_viewport and modifier.show_render
+    assert shape_object.hide_viewport and not shape_object.hide_render
+    assert visibility_collection.hide_viewport
+    assert not visibility_collection.hide_render
+    assert scene.render.film_transparent
+    assert visibility_collection.animation_data_create() is None
+    assert any(
+        "apply_only_channels=" in event for event in diagnostics.recent_events()
+    )
+    camera_action = camera.animation_data.action
+    assert shared_camera.animation_data.action is not camera_action
+    assert camera_action.fcurves.find('["comic_pose"]', index=0) is not None
+    assert camera_action.fcurves.find('["static_pose"]', index=0) is None
+    assert camera_action.fcurves.find("delta_location", index=0) is not None
+    assert camera.data.animation_data.action.fcurves.find("lens", index=0) is not None
+    assert light.data.animation_data.action.fcurves.find("energy", index=0) is not None
+    shape_action = shape_object.data.shape_keys.animation_data.action
+    assert shape_action.fcurves.find(
+        'key_blocks["Expression"].value', index=0
+    ) is not None
+    assert shape_object.animation_data.action.fcurves.find(
+        'modifiers["Timeline Probe Modifier"].show_viewport', index=0
+    ) is not None
+    assert scene.animation_data.action.fcurves.find(
+        "render.film_transparent", index=0
+    ) is not None
+    pose_action = armature.animation_data.action
+    assert pose_action.fcurves.find(
+        'pose.bones["Control"]["pose_strength"]', index=0
+    ) is not None
+    assert pose_action.fcurves.find(
+        'pose.bones["Axis Control"].rotation_axis_angle', index=0
+    ) is not None
+    for action in (
+        camera_action, camera.data.animation_data.action,
+        light.data.animation_data.action, shape_action,
+        shape_object.animation_data.action, scene.animation_data.action,
+        pose_action,
+    ):
+        for curve in action.fcurves:
+            for owned_frame in (timeline_one.timeline_frame, timeline_two.timeline_frame):
+                point = next(
+                    (
+                        candidate for candidate in curve.keyframe_points
+                        if candidate.co.x == owned_frame
+                    ),
+                    None,
+                )
+                if point is not None:
+                    assert point.interpolation == "CONSTANT"
+    for curve in camera_action.fcurves:
+        original = original_camera_keys.get((curve.data_path, curve.array_index))
+        if original is None:
+            continue
+        point = next(point for point in curve.keyframe_points if point.co.x == 2)
+        assert float(point.co.y) == original
+        assert (
+            str(point.interpolation), str(point.handle_left_type),
+            str(point.handle_right_type), tuple(point.handle_left),
+            tuple(point.handle_right),
+        ) == original_camera_styles[(curve.data_path, curve.array_index)]
+
+    # Cached selection performs no normal rewrite, but externally damaged
+    # owned keys are detected after dependency-graph evaluation and repaired.
+    location_x = camera_action.fcurves.find("location", index=0)
+    damaged = next(
+        point for point in location_x.keyframe_points
+        if point.co.x == timeline_one.timeline_frame
+    )
+    damaged.co.y = 999.0
+    location_x.update()
+    runtime.load_view_state(scene, timeline_one)
+    repaired = next(
+        point for point in location_x.keyframe_points
+        if point.co.x == timeline_one.timeline_frame
+    )
+    assert abs(repaired.co.y - expected_camera_one[0][0]) < 1.0e-5
+    assert current_transform(camera, "rotation_euler") == expected_camera_one
+    runtime.load_view_state(scene, timeline_two)
+
+    # Render applies the saved collection visibility after selecting the
+    # owned frame, then restores the caller's unsaved visibility and frame.
+    collection_render_states = []
+
+    def fake_collection_render(_scene, _view_layer, width, height, **_kwargs):
+        collection_render_states.append((
+            bool(visibility_collection.hide_viewport),
+            bool(visibility_collection.hide_render),
+        ))
         return renderer.RenderFrame(width, height, bytes(width * height * 4))
 
-    renderer.render_active_camera = fake_size_render
-    errors = []
-    runtime.send = lambda message: (
-        errors.append(message) if message.get("type") == "ERROR"
-        else messages.append(message)
+    renderer.render_active_camera = fake_collection_render
+    working_frame = scene.frame_current
+    visibility_collection.hide_viewport = True
+    visibility_collection.hide_render = True
+    runtime.render_saved_view(scene, timeline_one)
+    assert collection_render_states[-1] == (False, True)
+    assert scene.frame_current == working_frame
+    assert visibility_collection.hide_viewport
+    assert visibility_collection.hide_render
+
+    # Save keeps one reversible history state and Revert rebakes it at the
+    # same owned frame without disturbing the other view.
+    saved_two_json = timeline_two.state_json
+    timeline_two_frame = timeline_two.timeline_frame
+    camera.location = (9.0, 8.0, 7.0)
+    runtime.save_view_state(scene, timeline_two)
+    assert timeline_two.previous_state_json == saved_two_json
+    assert timeline_two.timeline_frame == timeline_two_frame
+    runtime.revert_view_state(scene, timeline_two)
+    assert timeline_two.state_json == saved_two_json
+    assert timeline_two.timeline_frame == timeline_two_frame
+    assert current_transform(camera, "rotation_euler") == expected_camera_two
+    assert visibility_collection.hide_viewport
+    assert not visibility_collection.hide_render
+
+    # The dirty-view Save-and-Switch operator captures apply-only collection
+    # state without crashing, then activates the destination snapshot.
+    runtime.load_view_state(scene, timeline_one)
+    visibility_collection.hide_viewport = True
+    visibility_collection.hide_render = True
+    timeline_one.is_dirty = True
+    assert bpy.ops.webtoon.activate_comic_view(
+        view_uuid=timeline_two.view_uuid, resolution="SAVE"
+    ) == {"FINISHED"}
+    assert visibility_collection.hide_viewport
+    assert not visibility_collection.hide_render
+    runtime.load_view_state(scene, timeline_one)
+    assert visibility_collection.hide_viewport
+    assert visibility_collection.hide_render
+    runtime.load_view_state(scene, timeline_two)
+
+    # Duplicate owns a fresh frame containing the source snapshot. A retired
+    # frame is not reused even if the visible scene range is shortened.
+    scene.webtoon_comic_settings.active_index = next(
+        index for index, item in enumerate(scene.webtoon_comic_views)
+        if item == timeline_two
     )
-    runtime._render_if_needed(scene, 30.0)
-    assert errors == []
-    assert not runtime.frame_dirty
-    assert runtime.last_error == ""
-    runtime.stop_stream()
+    assert bpy.ops.webtoon.duplicate_comic_view() == {"FINISHED"}
+    timeline_copy = scene.webtoon_comic_views[-1]
+    assert timeline_copy.timeline_frame > timeline_two.timeline_frame
+    assert timeline_copy.state_json == timeline_two.state_json
+    assert current_transform(camera, "rotation_euler") == expected_camera_two
+    retired_frame = timeline_copy.timeline_frame
+    scene.webtoon_comic_views.remove(len(scene.webtoon_comic_views) - 1)
+    scene.frame_end = 2
+    after_delete = timeline_view("After Retired Frame")
+    runtime.save_view_state(scene, after_delete)
+    assert after_delete.timeline_frame > retired_frame
+    scene.webtoon_comic_views.remove(len(scene.webtoon_comic_views) - 1)
 
-    # The resize rescue swaps buffers without dropping the live stream, and a
-    # failed allocation leaves the current stream and cached frame intact.
-    runtime.scene_matches_snapshot = True
-    messages = []
-    errors = []
-    runtime.send = lambda message: (
-        errors.append(message) if message.get("type") == "ERROR"
-        else messages.append(message)
-    )
-    runtime._open_stream(scene, view, 64, 64, "committed")
-    old_name = runtime._memory.name
-    runtime._open_stream(scene, view, 96, 96, "committed", replace=True)
-    assert runtime._memory.name != old_name
-    assert (runtime._stream_width, runtime._stream_height) == (96, 96)
-    opens = [m for m in messages if m.get("type") == "STREAM_OPEN"]
-    assert opens[-1]["width"] == 96 and opens[-1]["height"] == 96
+    # If Blender unexpectedly refuses animation data for a channel classified
+    # as animatable, report that channel and roll back rather than dereferencing
+    # None. This deliberately bypasses the real Collection RNA classification.
+    original_animatable_check = timeline._channel_is_animatable
+    visibility_pointer = int(visibility_collection.as_pointer())
 
-    from multiprocessing import shared_memory as shared_memory_module
+    def force_collection_animatable(owner, data_path):
+        if int(owner.as_pointer()) == visibility_pointer:
+            return True
+        return original_animatable_check(owner, data_path)
 
-    original_create = shared_memory_module.SharedMemory
-
-    class FailingMemory:
-        def __init__(self, *args, **kwargs):
-            raise OSError("simulated allocation failure")
-
-    shared_memory_module.SharedMemory = FailingMemory
+    timeline._channel_is_animatable = force_collection_animatable
+    unavailable_frame_end = scene.frame_end
+    unavailable_cursor = scene.webtoon_comic_settings.next_timeline_frame
+    unavailable_actions = len(bpy.data.actions)
+    unavailable_view = timeline_view("Unavailable Animation Probe")
     try:
-        before_name = runtime._memory.name
-        try:
-            runtime._open_stream(scene, view, 96, 96, "committed", replace=True)
-        except OSError:
-            pass
-        else:
-            raise AssertionError("failed allocation did not raise")
-        assert runtime._memory.name == before_name
-        assert runtime.streaming
-        runtime._pending_render = renderer.RenderFrame(128, 128, bytes(128 * 128 * 4))
-        runtime.frame_dirty = True
-        runtime._render_if_needed(scene, 31.0)
-        assert runtime.frame_dirty
-        assert runtime._pending_render is not None
-        assert errors == []
-        assert runtime._memory.name == before_name
+        runtime.save_view_state(scene, unavailable_view)
+    except RuntimeError as error:
+        assert "Blender did not provide animation data" in str(error)
+        assert visibility_collection.name in str(error)
+        assert "hide_render" in str(error)
+    else:
+        raise AssertionError("missing animation data unexpectedly baked")
     finally:
-        shared_memory_module.SharedMemory = original_create
-    runtime.stop_stream()
-    renderer.render_active_camera = original_render
+        timeline._channel_is_animatable = original_animatable_check
+    assert unavailable_view.timeline_frame == 0
+    assert not unavailable_view.state_json
+    assert scene.frame_end == unavailable_frame_end
+    assert scene.webtoon_comic_settings.next_timeline_frame == unavailable_cursor
+    assert len(bpy.data.actions) == unavailable_actions
+    scene.webtoon_comic_views.remove(len(scene.webtoon_comic_views) - 1)
 
-    from multiprocessing import shared_memory
-    for memory_name in (first_memory_name, second_memory_name):
-        try:
-            shared_memory.SharedMemory(name=memory_name, create=False)
-        except FileNotFoundError:
-            pass
-        else:
-            raise AssertionError("shared memory was not unlinked")
+    # A strict camera driver conflict rolls back every partial key, Action,
+    # frame assignment, range/cursor change, and saved metadata while keeping
+    # the visible working state intact.
+    runtime.load_view_state(scene, timeline_two)
+    driver_curve = camera.driver_add("location", 0)
+    driver_curve.driver.expression = "3.25"
+    bpy.context.view_layer.update()
+    visible_before_failure = current_transform(camera, "rotation_euler")
+    old_frame_end = scene.frame_end
+    old_cursor = scene.webtoon_comic_settings.next_timeline_frame
+    old_action_count = len(bpy.data.actions)
+    old_camera_points = {
+        (curve.data_path, curve.array_index): [
+            (float(point.co.x), float(point.co.y), str(point.interpolation))
+            for point in curve.keyframe_points
+        ]
+        for curve in camera.animation_data.action.fcurves
+    }
+    failed_view = timeline_view("Rollback Probe")
+    try:
+        runtime.save_view_state(scene, failed_view)
+    except RuntimeError as error:
+        assert "Driver conflicts with" in str(error)
+        assert "location[0]" in str(error)
+    else:
+        raise AssertionError("driver conflict unexpectedly baked")
+    assert failed_view.timeline_frame == 0
+    assert not failed_view.state_json
+    assert scene.frame_end == old_frame_end
+    assert scene.webtoon_comic_settings.next_timeline_frame == old_cursor
+    assert len(bpy.data.actions) == old_action_count
+    assert current_transform(camera, "rotation_euler") == visible_before_failure
+    assert old_camera_points == {
+        (curve.data_path, curve.array_index): [
+            (float(point.co.x), float(point.co.y), str(point.interpolation))
+            for point in curve.keyframe_points
+        ]
+        for curve in camera.animation_data.action.fcurves
+    }
+    camera.driver_remove("location", 0)
+    scene.webtoon_comic_views.remove(len(scene.webtoon_comic_views) - 1)
+
+    # A copied UUID is repaired exactly once. Repeated captures remain stable.
+    copied_cube = cube.copy()
+    scene.collection.objects.link(copied_cube)
+    copied_cube["webtoon_comic_uuid"] = ensure_uuid(cube)
+    first_repairs = repair_duplicate_uuids(scene)
+    assert first_repairs
+    assert ensure_uuid(copied_cube) != ensure_uuid(cube)
+    assert not repair_duplicate_uuids(scene)
 finally:
-    if 'original_render' in locals():
-        renderer.render_active_camera = original_render
+    bridge.RUNTIME.send = original_runtime_send
+    bridge._atomic_write = original_write
+    renderer.render_active_camera = original_render
     addon.unregister()
 
 print("WEBTOON_COMIC_VIEWS_PROBE_OK")

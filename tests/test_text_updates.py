@@ -9,7 +9,7 @@ from PySide6.QtGui import (
 )
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import (
-    QApplication, QInputDialog, QMessageBox, QSpinBox,
+    QApplication, QDoubleSpinBox, QInputDialog, QMessageBox, QSpinBox,
 )
 
 from comic_editor.core.models import (
@@ -66,6 +66,51 @@ def _type_spin_value(spin: QSpinBox, value: str) -> None:
     QApplication.processEvents()
 
 
+def test_line_spacing_changes_shared_multiline_layout(qapp):
+    canvas, first, _second = _canvas_with_text()
+    try:
+        first.text = "One\nTwo\nThree"
+        first.line_spacing = 1.0
+        normal = canvas._text_document(first, first.width).size().height()
+        first.line_spacing = 2.0
+        loose = canvas._text_document(first, first.width).size().height()
+
+        assert loose > normal
+    finally:
+        canvas.hide()
+        canvas.deleteLater()
+
+
+def test_add_text_enters_edit_and_replaces_placeholder(qapp, monkeypatch):
+    monkeypatch.setattr(main_window_module, "save_settings", lambda _value: None)
+    window = MainWindow()
+    chapter = ChapterDocument()
+    page = chapter.add_page()
+    window._set_chapter(chapter, TileStore())
+    window.canvas.set_selection("layer", page.layer_id)
+    window.settings.text_presets[0]["line_spacing"] = 1.7
+    window.show()
+    try:
+        window._add_text()
+        object_id = window.canvas.selected_id
+        assert window.canvas.tool == ToolKind.TEXT_EDIT
+        assert window.canvas.has_active_text_edit()
+        assert window.canvas._text_selection_range() == [0, 4]
+        assert window.canvas.chapter.objects[object_id].line_spacing == 1.7
+
+        QTest.keyClicks(window.canvas, "Hello")
+        window.canvas.commit_active_text_edit()
+        assert window.canvas.chapter.objects[object_id].text == "Hello"
+
+        window.canvas.command_stack.undo()
+        assert window.canvas.chapter.objects[object_id].text == "Text"
+        window.canvas.command_stack.undo()
+        assert object_id not in window.canvas.chapter.objects
+    finally:
+        window.hide()
+        window.deleteLater()
+
+
 def test_text_ribbon_owns_complete_selected_object_controls(
     qapp, monkeypatch,
 ):
@@ -97,6 +142,10 @@ def test_text_ribbon_owns_complete_selected_object_controls(
         assert controls.font_size.keyboardTracking() is False
         assert controls.kerning.minimum() == -20
         assert controls.kerning.maximum() == 100
+        assert isinstance(controls.line_spacing, QDoubleSpinBox)
+        assert controls.line_spacing.minimum() == 0.5
+        assert controls.line_spacing.maximum() == 3.0
+        assert controls.line_spacing.value() == 1.0
         assert controls.margin.isHidden()
         assert not hasattr(controls, "transform_mode")
         assert controls.geometry_reference.isHidden()
@@ -123,6 +172,10 @@ def test_text_ribbon_owns_complete_selected_object_controls(
         assert window.canvas.chapter.objects[first.object_id].font_size == 32
         window.canvas.command_stack.redo()
         assert window.canvas.chapter.objects[first.object_id].font_size == 250
+
+        controls.line_spacing.setValue(1.8)
+        controls.line_spacing.editingFinished.emit()
+        assert window.canvas.chapter.objects[first.object_id].line_spacing == 1.8
 
         _type_spin_value(controls.font_size, "999")
         assert window.canvas.chapter.objects[first.object_id].font_size == 250
@@ -152,6 +205,17 @@ def test_text_ribbon_owns_complete_selected_object_controls(
         controls._add_preset()
         assert window.settings.active_text_preset == "Comic"
         assert window.settings.text_presets[-1]["font_size"] == 250
+        assert window.settings.text_presets[-1]["line_spacing"] == 1.8
+        controls.line_spacing.setValue(1.0)
+        controls.line_spacing.editingFinished.emit()
+        comic_index = next(
+            index for index, preset in enumerate(window.settings.text_presets)
+            if preset["name"] == "Comic"
+        )
+        controls._apply_preset(comic_index)
+        assert window.canvas.chapter.objects[
+            first.object_id
+        ].line_spacing == 1.8
         controls._rename_preset()
         assert window.settings.active_text_preset == "Lettering"
         controls._remove_preset()
@@ -574,8 +638,19 @@ def test_delete_hotkey_deletes_entities_but_yields_to_text_editing(
     window.show()
     try:
         window.canvas.set_selection("object", first.object_id)
+        window.canvas._text_cursor_position = 0
+        window.canvas._text_selection_anchor = 0
         window.canvas.setFocus()
         qapp.processEvents()
+        QTest.keyClick(window.canvas, Qt.Key.Key_Delete)
+        assert first.object_id in window.canvas.chapter.objects
+        assert window.canvas.chapter.objects[first.object_id].text == "irst"
+        window.canvas.commit_active_text_edit()
+
+        window.canvas.set_selection(
+            "object", first.object_id, activate_default_tool=False
+        )
+        window.canvas.set_tool(ToolKind.OBJECT_SELECT)
         QTest.keyClick(window.canvas, Qt.Key.Key_Delete)
         assert first.object_id not in window.canvas.chapter.objects
         window.canvas.command_stack.undo()

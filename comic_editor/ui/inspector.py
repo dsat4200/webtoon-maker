@@ -502,6 +502,7 @@ class ContextInspector(QFrame):
             name=self.preset_combo.currentText() or "Default",
             font_family=entity.font_family, font_size=entity.font_size,
             bold=entity.bold, italic=entity.italic, kerning=entity.kerning,
+            line_spacing=entity.line_spacing,
             layout_mode=entity.layout_mode,
             horizontal_alignment=entity.horizontal_alignment,
             vertical_alignment=entity.vertical_alignment, margin=entity.margin,
@@ -528,6 +529,7 @@ class ContextInspector(QFrame):
         before = self.canvas.chapter.to_dict()
         for key in (
             "font_family", "font_size", "bold", "italic", "kerning",
+            "line_spacing",
             "layout_mode", "horizontal_alignment", "vertical_alignment", "margin",
         ):
             setattr(entity, key, getattr(preset, key))

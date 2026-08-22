@@ -223,7 +223,19 @@ def test_default_text_preset_is_protected_and_formatting_only():
     assert len(loaded.text_presets) == 1
     assert loaded.text_presets[0]["name"] == "Default"
     assert loaded.text_presets[0]["font_size"] == 48
+    assert loaded.text_presets[0]["line_spacing"] == 1.0
     assert "text" not in loaded.text_presets[0]
+
+
+def test_text_preset_line_spacing_is_normalized():
+    loaded = settings_module.EditorSettings(text_presets=[
+        {"name": "Default", "line_spacing": 0.1},
+        {"name": "Loose", "line_spacing": 9.0},
+    ])
+
+    assert [
+        item["line_spacing"] for item in loaded.text_presets
+    ] == [0.5, 3.0]
 
 
 def test_settings_v16_adds_sampling_transform_and_point_defaults(

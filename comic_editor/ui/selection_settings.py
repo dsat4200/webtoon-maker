@@ -609,7 +609,6 @@ class ImageObjectSettings(QWidget):
     """Embedded-image metadata, masking, and parent-fit behavior."""
 
     changed = Signal()
-    renderOnceRequested = Signal()
     reconnectRequested = Signal()
     relinkRequested = Signal()
     detachRequested = Signal()
@@ -666,11 +665,9 @@ class ImageObjectSettings(QWidget):
         self.source_actions = QWidget(self)
         source_layout = QHBoxLayout(self.source_actions)
         source_layout.setContentsMargins(0, 0, 0, 0)
-        self.render_once = QPushButton("Render Once", self.source_actions)
         self.reconnect = QPushButton("Reconnect", self.source_actions)
         self.relink = QPushButton("Relink", self.source_actions)
         self.detach = QPushButton("Detach", self.source_actions)
-        source_layout.addWidget(self.render_once)
         source_layout.addWidget(self.reconnect)
         source_layout.addWidget(self.relink)
         source_layout.addWidget(self.detach)
@@ -683,7 +680,6 @@ class ImageObjectSettings(QWidget):
         self.underlay.sliderPressed.connect(self._begin_underlay)
         self.underlay.valueChanged.connect(self._underlay_changed)
         self.underlay.sliderReleased.connect(self._finish_underlay)
-        self.render_once.clicked.connect(self.renderOnceRequested)
         self.reconnect.clicked.connect(self.reconnectRequested)
         self.relink.clicked.connect(self.relinkRequested)
         self.detach.clicked.connect(self.detachRequested)
@@ -724,7 +720,6 @@ class ImageObjectSettings(QWidget):
             self.detach.setEnabled(
                 not obj.is_blender_linked
                 or self.canvas.images.source(obj.object_id) is not None
-                or not self.canvas.images.runtime_frame(obj.object_id).isNull()
             )
             if obj.is_blender_linked and not self.source_status.text():
                 self.source_status.setText("Offline — showing the last cached frame")

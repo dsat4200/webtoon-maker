@@ -1,31 +1,101 @@
-"""Authenticated loopback protocol and triple-buffered RGBA transport."""
+"""Authenticated loopback control protocol and atomic PNG publication."""
 from __future__ import annotations
 
 import json
+import os
 import queue
 import socket
-import struct
 import threading
 import time
 import uuid
-from multiprocessing import shared_memory
+from pathlib import Path
 from typing import Any
 
 import bpy
 
-from . import renderer, viewport
+from . import diagnostics, renderer, timeline, viewport
 from .state import (
     apply_state, capture_state, migrate_legacy_presentation, parse_state,
     state_digest, state_json, view_layer_for_state,
 )
 
 
-PROTOCOL_VERSION = 2
-HEADER_SIZE = 256
-SLOT_COUNT = 3
-HEADER = struct.Struct("<8sIIIIII32s")
-MAGIC = b"WCVRGBA\0"
+PROTOCOL_VERSION = 3
 MAX_CONTROL_MESSAGE = 4_194_304
+FRAME_ROOT_PARTS = ("Webtoon Maker", "Comic View Frames")
+FRAME_RETENTION = 2
+
+
+def _canonical_uuid(value: object, label: str) -> str:
+    try:
+        return uuid.UUID(str(value)).hex
+    except (AttributeError, TypeError, ValueError) as error:
+        raise ValueError(f"{label} is not a valid UUID") from error
+
+
+def published_frame_root() -> Path:
+    """Return the stable Windows exchange directory shared with the editor."""
+    override = os.environ.get("WEBTOON_COMIC_VIEW_FRAME_ROOT", "").strip()
+    if override:
+        return Path(override)
+    local = os.environ.get("LOCALAPPDATA", "").strip()
+    if not local:
+        raise RuntimeError("LOCALAPPDATA is unavailable; cannot publish Comic Views")
+    return Path(local).joinpath(*FRAME_ROOT_PARTS)
+
+
+def published_view_directory(project_uuid: object, view_uuid: object) -> Path:
+    return published_frame_root() / _canonical_uuid(
+        project_uuid, "Blender project UUID"
+    ) / _canonical_uuid(view_uuid, "Comic View UUID")
+
+
+def published_frame_path(
+    project_uuid: object, view_uuid: object, revision: int,
+) -> Path:
+    return published_view_directory(project_uuid, view_uuid) / f"{int(revision)}.png"
+
+
+def _atomic_write(path: Path, data: bytes) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    try:
+        with temporary.open("wb") as handle:
+            handle.write(data)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+    finally:
+        try:
+            temporary.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+def _revision_for_path(path: Path) -> int:
+    try:
+        return int(path.stem) if path.suffix.lower() == ".png" else -1
+    except ValueError:
+        return -1
+
+
+def prune_published_frames(directory: Path, *, keep: int = FRAME_RETENTION) -> None:
+    try:
+        candidates = sorted(
+            (
+                path for path in directory.iterdir()
+                if path.is_file() and _revision_for_path(path) >= 0
+            ),
+            key=_revision_for_path,
+            reverse=True,
+        )
+    except OSError:
+        return
+    for stale in candidates[max(1, int(keep)):]:
+        try:
+            stale.unlink(missing_ok=True)
+        except OSError:
+            pass
 
 
 class BridgeServer:
@@ -108,6 +178,9 @@ class BridgeServer:
                 return
             with self._client_lock:
                 if self._client_active:
+                    diagnostics.record(
+                        "WARNING", "Bridge connection rejected because another editor is connected",
+                    )
                     try:
                         connection.sendall(
                             b'{"type":"ERROR","code":"BUSY",'
@@ -184,11 +257,31 @@ class BridgeServer:
                             )
                         except (TypeError, ValueError):
                             valid_protocol = False
-                        if message.get("type") != "HELLO" or not valid_protocol \
-                                or str(message.get("token", "")) != self.token:
+                        if message.get("type") != "HELLO":
                             self._direct_send(connection, {
                                 "type": "ERROR", "code": "AUTHENTICATION_FAILED",
-                                "message": "Invalid protocol or token",
+                                "message": "Expected an authenticated HELLO message",
+                            })
+                            return
+                        if not valid_protocol:
+                            diagnostics.record(
+                                "WARNING", "Bridge protocol mismatch",
+                                expected=PROTOCOL_VERSION,
+                                received=message.get("protocol", "missing"),
+                            )
+                            self._direct_send(connection, {
+                                "type": "ERROR", "code": "PROTOCOL_MISMATCH",
+                                "protocol": PROTOCOL_VERSION,
+                                "message": "Update Webtoon Maker or the Blender extension",
+                            })
+                            return
+                        if str(message.get("token", "")) != self.token:
+                            diagnostics.record(
+                                "WARNING", "Bridge authentication failed",
+                            )
+                            self._direct_send(connection, {
+                                "type": "ERROR", "code": "AUTHENTICATION_FAILED",
+                                "message": "Invalid bridge token",
                             })
                             return
                         while True:
@@ -248,39 +341,26 @@ class BridgeRuntime:
         self.server = BridgeServer(self.incoming, self.outgoing)
         self.connected = False
         self.connection_id = 0
-        self.frame_dirty = False
-        self.frame_kind = "committed"
         self.state_check_due = 0.0
         self.ignore_updates_until = 0.0
         self.scene_matches_snapshot = False
-        self.active_stream_uuid = ""
         self.pending_switch: dict[str, Any] | None = None
-        self._memory: shared_memory.SharedMemory | None = None
-        self._slot_bytes = 0
-        self._stream_width = 0
-        self._stream_height = 0
-        self._outstanding: dict[int, int] = {}
-        self._sequence = 0
-        self._pending_render: renderer.RenderFrame | None = None
-        self._resize_failures = 0
         self.last_error = ""
-
-    @property
-    def streaming(self) -> bool:
-        return self._memory is not None and bool(self.active_stream_uuid)
 
     def start_server(self, port: int, token: str) -> None:
         if not token:
             raise ValueError("A bridge token is required")
-        self.stop_stream()
         self.server.start(port, token)
         self.last_error = ""
+        diagnostics.record("INFO", "Bridge listening", host="127.0.0.1", port=port)
 
     def stop_server(self) -> None:
-        self.stop_stream()
+        was_running = self.server.running
         self.server.stop()
         self.connected = False
         self.connection_id = 0
+        if was_running:
+            diagnostics.record("INFO", "Bridge stopped")
 
     def send(self, message: dict[str, Any]) -> None:
         if self.connected:
@@ -292,27 +372,6 @@ class BridgeRuntime:
             return
         self.scene_matches_snapshot = False
         self.state_check_due = now + 0.18
-
-    def stop_stream(self) -> None:
-        memory, self._memory = self._memory, None
-        self.active_stream_uuid = ""
-        self.frame_dirty = False
-        self.frame_kind = "committed"
-        self._slot_bytes = 0
-        self._stream_width = 0
-        self._stream_height = 0
-        self._outstanding.clear()
-        self._pending_render = None
-        self._resize_failures = 0
-        if memory is not None:
-            try:
-                memory.close()
-            except (BufferError, OSError):
-                pass
-            try:
-                memory.unlink()
-            except (FileNotFoundError, OSError):
-                pass
 
     @staticmethod
     def _scene() -> bpy.types.Scene | None:
@@ -363,6 +422,7 @@ class BridgeRuntime:
             "width": int(view.published_width or view.width),
             "height": int(view.published_height or view.height),
             "dirty": bool(view.is_dirty),
+            "frame_path": str(getattr(view, "published_frame_path", "") or ""),
         }
         if include_thumbnail:
             result["thumbnail_png"] = view.thumbnail_png
@@ -389,20 +449,70 @@ class BridgeRuntime:
         bounds = viewport.frame_bounds(view)
         width, height = viewport.derive_resolution(view.width, bounds, scene)
         viewport.set_working_resolution(view, width, height)
-        view.published_width, view.published_height = width, height
         captured, warnings = capture_state(
             scene, bpy.context.view_layer,
             stream_frame=bounds, output_resolution=(width, height),
         )
-        serialized = state_json(captured)
-        digest = state_digest(captured)
-        if view.state_json and digest != view.state_hash:
-            view.previous_state_json = view.state_json
-            view.previous_state_hash = view.state_hash
-        view.state_json = serialized
-        view.state_hash = digest
-        view.is_dirty = False
-        view.updated_at = time.time()
+        transaction = timeline.prepare_bake(
+            scene, list(self._views(scene)), view, captured
+        )
+        original_frame = int(scene.frame_current)
+        original_subframe = float(scene.frame_subframe)
+        old_metadata = (
+            view.state_json, view.state_hash,
+            view.previous_state_json, view.previous_state_hash,
+            bool(view.is_dirty), float(view.updated_at),
+        )
+        try:
+            scene.frame_set(transaction.target_frame)
+            selected_layer = view_layer_for_state(
+                scene, captured, getattr(bpy.context, "view_layer", None)
+            )
+            apply_warnings = apply_state(scene, captured, selected_layer)
+            failures = timeline.verify_snapshot(scene, captured)
+            if failures and transaction.cached:
+                transaction.rollback()
+                transaction = timeline.prepare_bake(
+                    scene, list(self._views(scene)), view, captured, force=True
+                )
+                scene.frame_set(transaction.target_frame)
+                apply_warnings = apply_state(scene, captured, selected_layer)
+                failures = timeline.verify_snapshot(scene, captured)
+            if failures:
+                raise RuntimeError(
+                    "Timeline bake did not restore: " + ", ".join(failures)
+                )
+            warnings.extend(apply_warnings)
+            serialized = state_json(captured)
+            digest = state_digest(captured)
+            if view.state_json and digest != view.state_hash:
+                view.previous_state_json = view.state_json
+                view.previous_state_hash = view.state_hash
+            view.state_json = serialized
+            view.state_hash = digest
+            view.is_dirty = False
+            view.updated_at = time.time()
+            transaction.commit()
+        except Exception:
+            transaction.rollback()
+            (
+                view.state_json, view.state_hash,
+                view.previous_state_json, view.previous_state_hash,
+                view.is_dirty, view.updated_at,
+            ) = old_metadata
+            try:
+                scene.frame_set(original_frame, subframe=original_subframe)
+                restore_layer = view_layer_for_state(
+                    scene, captured, getattr(bpy.context, "view_layer", None)
+                )
+                apply_state(scene, captured, restore_layer)
+            except Exception as restore_error:
+                diagnostics.record_exception(
+                    "Could not restore working state after Save failure",
+                    restore_error,
+                )
+            raise
+        self._settings(scene).loaded_view_uuid = view.view_uuid
         self.scene_matches_snapshot = True
         self.ignore_updates_until = time.monotonic() + 0.3
         self.state_check_due = 0.0
@@ -420,6 +530,19 @@ class BridgeRuntime:
         self, scene: bpy.types.Scene, view: object,
     ) -> tuple[dict[str, Any], list[str]]:
         stored = parse_state(view.state_json)
+        original_frame = int(scene.frame_current)
+        original_subframe = float(scene.frame_subframe)
+        working_bounds = viewport.frame_bounds(view)
+        working_resolution = (int(view.width), int(view.height))
+        old_state_json, old_state_hash = view.state_json, view.state_hash
+        working, _working_warnings = capture_state(
+            scene, bpy.context.view_layer, repair_ids=False,
+            stream_frame=working_bounds,
+            output_resolution=working_resolution,
+        )
+        transaction = timeline.prepare_bake(
+            scene, list(self._views(scene)), view, stored
+        )
         legacy_render_settings = None
         if stored.get("stream_frame_space") == "viewport_legacy":
             legacy_render_settings = {
@@ -432,34 +555,65 @@ class BridgeRuntime:
         view_layer = view_layer_for_state(
             scene, stored, getattr(bpy.context, "view_layer", None)
         )
-        warnings = apply_state(scene, stored, view_layer)
-        if stored.get("stream_frame_space") == "viewport_legacy":
-            for name, value in legacy_render_settings.items():
-                setattr(scene.render, name, value)
-            stored, warning = migrate_legacy_presentation(scene, stored)
-            view.state_json = state_json(stored)
-            view.state_hash = state_digest(stored)
-            if warning:
-                warnings.append(warning)
-        viewport.set_frame_bounds(view, stored.get("stream_frame"))
-        resolution = stored.get("output_resolution", ())
-        if isinstance(resolution, list) and len(resolution) == 2:
-            viewport.set_working_resolution(
-                view, *renderer.validate_resolution(*resolution)
-            )
+        try:
+            scene.frame_set(transaction.target_frame)
+            warnings = apply_state(scene, stored, view_layer)
+            failures = timeline.verify_snapshot(scene, stored)
+            if failures and transaction.cached:
+                transaction.rollback()
+                transaction = timeline.prepare_bake(
+                    scene, list(self._views(scene)), view, stored, force=True
+                )
+                scene.frame_set(transaction.target_frame)
+                warnings = apply_state(scene, stored, view_layer)
+                failures = timeline.verify_snapshot(scene, stored)
+            if failures:
+                raise RuntimeError(
+                    "Comic View frame did not restore: " + ", ".join(failures)
+                )
+            if stored.get("stream_frame_space") == "viewport_legacy":
+                for name, value in legacy_render_settings.items():
+                    setattr(scene.render, name, value)
+                stored, warning = migrate_legacy_presentation(scene, stored)
+                view.state_json = state_json(stored)
+                view.state_hash = state_digest(stored)
+                transaction.update_bake_marker(view, stored)
+                if warning:
+                    warnings.append(warning)
+            viewport.set_frame_bounds(view, stored.get("stream_frame"))
+            resolution = stored.get("output_resolution", ())
+            if isinstance(resolution, list) and len(resolution) == 2:
+                viewport.set_working_resolution(
+                    view, *renderer.validate_resolution(*resolution)
+                )
+            transaction.commit()
+        except Exception:
+            transaction.rollback()
+            view.state_json, view.state_hash = old_state_json, old_state_hash
+            try:
+                scene.frame_set(original_frame, subframe=original_subframe)
+                restore_layer = view_layer_for_state(
+                    scene, working, getattr(bpy.context, "view_layer", None)
+                )
+                apply_state(scene, working, restore_layer)
+                viewport.set_frame_bounds(view, working_bounds)
+                viewport.set_working_resolution(view, *working_resolution)
+            except Exception as restore_error:
+                diagnostics.record_exception(
+                    "Could not restore working state after Load failure",
+                    restore_error,
+                )
+            raise
         return stored, warnings
 
     def load_view_state(
         self, scene: bpy.types.Scene, view: object,
     ) -> list[str]:
-        if self.active_stream_uuid and self.active_stream_uuid != view.view_uuid:
-            self.stop_stream()
         self.ignore_updates_until = time.monotonic() + 0.3
         _stored, warnings = self._apply_stored_view(scene, view)
         self._settings(scene).loaded_view_uuid = view.view_uuid
         view.is_dirty = False
         self.scene_matches_snapshot = True
-        self.frame_dirty = False
         self.state_check_due = 0.0
         viewport.tag_redraw()
         self.send_views(scene)
@@ -471,18 +625,66 @@ class BridgeRuntime:
         if not view.previous_state_json:
             raise ValueError("This Comic View has no previous save")
         current_json, current_hash = view.state_json, view.state_hash
-        view.state_json = view.previous_state_json
-        view.state_hash = view.previous_state_hash
-        view.previous_state_json = current_json
-        view.previous_state_hash = current_hash
-        warnings = self.load_view_state(scene, view)
-        view.updated_at = time.time()
+        replacement_json = view.previous_state_json
+        replacement_hash = view.previous_state_hash
+        replacement = parse_state(replacement_json)
+        original_frame = int(scene.frame_current)
+        original_subframe = float(scene.frame_subframe)
+        working, _working_warnings = capture_state(
+            scene, bpy.context.view_layer, repair_ids=False,
+            stream_frame=viewport.frame_bounds(view),
+            output_resolution=(int(view.width), int(view.height)),
+        )
+        transaction = timeline.prepare_bake(
+            scene, list(self._views(scene)), view, replacement
+        )
+        try:
+            scene.frame_set(transaction.target_frame)
+            view_layer = view_layer_for_state(
+                scene, replacement, getattr(bpy.context, "view_layer", None)
+            )
+            warnings = apply_state(scene, replacement, view_layer)
+            failures = timeline.verify_snapshot(scene, replacement)
+            if failures:
+                raise RuntimeError(
+                    "Reverted frame did not restore: " + ", ".join(failures)
+                )
+            view.state_json = replacement_json
+            view.state_hash = replacement_hash
+            view.previous_state_json = current_json
+            view.previous_state_hash = current_hash
+            view.updated_at = time.time()
+            transaction.commit()
+        except Exception:
+            transaction.rollback()
+            view.state_json, view.state_hash = current_json, current_hash
+            view.previous_state_json = replacement_json
+            view.previous_state_hash = replacement_hash
+            try:
+                scene.frame_set(original_frame, subframe=original_subframe)
+                restore_layer = view_layer_for_state(
+                    scene, working, getattr(bpy.context, "view_layer", None)
+                )
+                apply_state(scene, working, restore_layer)
+            except Exception as restore_error:
+                diagnostics.record_exception(
+                    "Could not restore working state after Revert failure",
+                    restore_error,
+                )
+            raise
+        self._settings(scene).loaded_view_uuid = view.view_uuid
+        view.is_dirty = False
+        self.scene_matches_snapshot = True
+        self.state_check_due = 0.0
+        self.send_views(scene)
         return warnings
 
     def _render_saved_snapshot(
         self, scene: bpy.types.Scene, view: object,
     ) -> tuple[renderer.RenderFrame, list[str]]:
         working_navigation = viewport.capture_viewport()
+        working_frame = int(scene.frame_current)
+        working_subframe = float(scene.frame_subframe)
         working_bounds = viewport.frame_bounds(view)
         working_resolution = (int(view.width), int(view.height))
         working, _working_warnings = capture_state(
@@ -505,6 +707,7 @@ class BridgeRuntime:
                 hide_overlays=self._hide_overlays(),
             )
         finally:
+            scene.frame_set(working_frame, subframe=working_subframe)
             restore_layer = view_layer_for_state(
                 scene, working, getattr(bpy.context, "view_layer", None)
             )
@@ -518,34 +721,104 @@ class BridgeRuntime:
     def render_saved_view(
         self, scene: bpy.types.Scene, view: object,
     ) -> list[str]:
-        frame, warnings = self._render_saved_snapshot(scene, view)
-        renderer.update_thumbnail_image(
-            view, renderer.thumbnail_from_frame(frame)
+        diagnostics.record(
+            "INFO", "Render started", view=getattr(view, "name", ""),
+            view_uuid=getattr(view, "view_uuid", ""),
+            current_revision=int(getattr(view, "revision", 0)),
         )
-        view.revision = max(1, int(view.revision) + 1)
+        frame, warnings = self._render_saved_snapshot(scene, view)
+        next_revision = max(1, int(view.revision) + 1)
+        project_uuid = self._settings(scene).project_uuid
+        destination = published_frame_path(
+            project_uuid, view.view_uuid, next_revision
+        )
+        encoded = renderer.png_bytes(frame)
+        _atomic_write(destination, encoded)
+        renderer.update_thumbnail_image(view, renderer.thumbnail_from_frame(frame))
+        view.revision = next_revision
         view.published_width, view.published_height = frame.width, frame.height
+        view.published_frame_path = str(destination)
         view.updated_at = time.time()
+        prune_published_frames(destination.parent)
         self.send_views(scene)
-        if self.active_stream_uuid == view.view_uuid:
-            self._open_stream(
-                scene, view, frame.width, frame.height, "committed"
-            )
-            self._pending_render = frame
-            self.frame_dirty = True
+        self.last_error = ""
+        diagnostics.record(
+            "INFO", "Render published", view=getattr(view, "name", ""),
+            revision=next_revision, width=frame.width, height=frame.height,
+            path=destination, png_bytes=len(encoded),
+        )
         return warnings
+
+    def duplicate_published_frame(
+        self, scene: bpy.types.Scene, source: object, target: object,
+    ) -> None:
+        """Copy a duplicate view's last render into its own managed directory."""
+        source_path = Path(str(getattr(source, "published_frame_path", "") or ""))
+        expected_directory = published_view_directory(
+            self._settings(scene).project_uuid, source.view_uuid
+        ).resolve()
+        try:
+            resolved_source = source_path.resolve(strict=True)
+        except OSError:
+            resolved_source = Path()
+        if (
+            not source_path.is_absolute()
+            or resolved_source.parent != expected_directory
+            or resolved_source.suffix.lower() != ".png"
+            or not resolved_source.is_file()
+        ):
+            target.published_frame_path = ""
+            return
+        destination = published_frame_path(
+            self._settings(scene).project_uuid,
+            target.view_uuid,
+            int(target.revision),
+        )
+        _atomic_write(destination, resolved_source.read_bytes())
+        target.published_frame_path = str(destination)
+        prune_published_frames(destination.parent)
+        diagnostics.record(
+            "INFO", "Published frame duplicated",
+            source_view_uuid=getattr(source, "view_uuid", ""),
+            target_view_uuid=getattr(target, "view_uuid", ""),
+            path=destination,
+        )
+
+    def delete_published_frames(
+        self, scene: bpy.types.Scene, view_uuid: str,
+    ) -> None:
+        """Best-effort cleanup constrained to one managed Comic View folder."""
+        try:
+            directory = published_view_directory(
+                self._settings(scene).project_uuid, view_uuid
+            )
+            root = published_frame_root().resolve()
+            resolved = directory.resolve()
+            if resolved.parent.parent != root:
+                return
+            if not resolved.is_dir():
+                return
+            for child in resolved.iterdir():
+                if child.is_file():
+                    child.unlink(missing_ok=True)
+            resolved.rmdir()
+            diagnostics.record(
+                "INFO", "Published frames deleted", view_uuid=view_uuid,
+                directory=resolved,
+            )
+        except (OSError, RuntimeError, ValueError):
+            pass
 
     def _activate(
         self, scene: bpy.types.Scene, view: object,
         request_id: object = None,
     ) -> None:
-        self.stop_stream()
         self.ignore_updates_until = time.monotonic() + 0.3
         _stored_state, warnings = self._apply_stored_view(scene, view)
         self._select_view(scene, view)
         self._settings(scene).loaded_view_uuid = view.view_uuid
         view.is_dirty = False
         self.scene_matches_snapshot = True
-        self.frame_dirty = False
         self.state_check_due = 0.0
         viewport.tag_redraw()
         self.send({
@@ -612,242 +885,6 @@ class BridgeRuntime:
             return
         self._activate(scene, destination, pending.get("request_id"))
 
-    def _open_stream(
-        self, scene: bpy.types.Scene, view: object, width: int, height: int,
-        frame_kind: str, *, replace: bool = False,
-    ) -> None:
-        width, height = renderer.validate_resolution(width, height)
-        if (
-            not replace
-            and self.streaming and self.active_stream_uuid == view.view_uuid
-            and self._stream_width == width and self._stream_height == height
-            and self.frame_kind == frame_kind
-        ):
-            return
-        stride = width * 4
-        slot_bytes = stride * height
-        if replace and self.streaming and self.active_stream_uuid == view.view_uuid:
-            self._replace_stream(
-                scene, view, width, height, stride, slot_bytes, frame_kind
-            )
-            return
-        self.stop_stream()
-        self._slot_bytes = slot_bytes
-        self._stream_width, self._stream_height = width, height
-        total = HEADER_SIZE + SLOT_COUNT * slot_bytes
-        memory = shared_memory.SharedMemory(create=True, size=total)
-        self._memory = memory
-        nonce = uuid.uuid4().hex.encode("ascii")
-        HEADER.pack_into(
-            memory.buf, 0, MAGIC, PROTOCOL_VERSION, width, height, stride,
-            SLOT_COUNT, slot_bytes, nonce,
-        )
-        if HEADER.size < HEADER_SIZE:
-            memory.buf[HEADER.size:HEADER_SIZE] = b"\0" * (HEADER_SIZE - HEADER.size)
-        self.active_stream_uuid = view.view_uuid
-        self.frame_kind = frame_kind
-        self._outstanding.clear()
-        self.send(self._stream_open_payload(
-            scene, view, width, height, stride, slot_bytes, frame_kind,
-            memory.name,
-        ))
-
-    @staticmethod
-    def _stream_open_payload(
-        scene: bpy.types.Scene, view: object, width: int, height: int,
-        stride: int, slot_bytes: int, frame_kind: str, memory_name: str,
-    ) -> dict[str, Any]:
-        return {
-            "type": "STREAM_OPEN", "frame_kind": frame_kind,
-            "project_uuid": scene.webtoon_comic_settings.project_uuid,
-            "view_uuid": view.view_uuid,
-            "revision": int(view.revision),
-            "shared_memory": memory_name,
-            "header_size": HEADER_SIZE,
-            "width": width, "height": height, "stride": stride,
-            "slot_count": SLOT_COUNT, "slot_bytes": slot_bytes,
-            "pixel_format": "RGBA8_TOP_DOWN_STRAIGHT",
-        }
-
-    def _replace_stream(
-        self, scene: bpy.types.Scene, view: object, width: int, height: int,
-        stride: int, slot_bytes: int, frame_kind: str,
-    ) -> None:
-        """Swap in a replacement buffer without dropping the current stream.
-
-        The new shared-memory block is allocated and fully prepared before the
-        old one is torn down, so a failed allocation leaves the running stream
-        and the editor's cached frame untouched.
-        """
-        total = HEADER_SIZE + SLOT_COUNT * slot_bytes
-        nonce = uuid.uuid4().hex.encode("ascii")
-        memory = shared_memory.SharedMemory(create=True, size=total)
-        try:
-            HEADER.pack_into(
-                memory.buf, 0, MAGIC, PROTOCOL_VERSION, width, height, stride,
-                SLOT_COUNT, slot_bytes, nonce,
-            )
-            if HEADER.size < HEADER_SIZE:
-                memory.buf[HEADER.size:HEADER_SIZE] = b"\0" * (HEADER_SIZE - HEADER.size)
-        except BaseException:
-            try:
-                memory.close()
-            except (BufferError, OSError):
-                pass
-            raise
-        old_memory, self._memory = self._memory, memory
-        self._slot_bytes = slot_bytes
-        self._stream_width, self._stream_height = width, height
-        self.frame_kind = frame_kind
-        self._outstanding.clear()
-        if old_memory is not None:
-            try:
-                old_memory.close()
-            except (BufferError, OSError):
-                pass
-            try:
-                old_memory.unlink()
-            except (FileNotFoundError, OSError):
-                pass
-        self.send(self._stream_open_payload(
-            scene, view, width, height, stride, slot_bytes, frame_kind,
-            memory.name,
-        ))
-
-    def _committed_resolution(self, view: object) -> tuple[int, int]:
-        """The resolution a committed render will produce for this view."""
-        if view.state_json:
-            try:
-                stored = parse_state(view.state_json)
-                resolution = stored.get("output_resolution")
-                if isinstance(resolution, list) and len(resolution) == 2:
-                    return renderer.validate_resolution(*resolution)
-            except (TypeError, ValueError):
-                pass
-        return renderer.validate_resolution(
-            int(view.published_width or view.width),
-            int(view.published_height or view.height),
-        )
-
-    def _start_stream(self, scene: bpy.types.Scene, message: dict[str, Any]) -> None:
-        view = self._view(scene, str(message.get("view_uuid", "")))
-        if view is None or view != self._active_view(scene):
-            self._error("VIEW_NOT_ACTIVE", "Activate the Comic View before streaming")
-            return
-        width, height = self._committed_resolution(view)
-        self._open_stream(scene, view, width, height, "committed")
-        # Starting a stream always displays the saved revision.
-        self.frame_dirty = True
-
-    def request_committed_frame(self, scene: bpy.types.Scene, view: object) -> None:
-        if self.active_stream_uuid != view.view_uuid:
-            return
-        width, height = self._committed_resolution(view)
-        self._open_stream(scene, view, width, height, "committed")
-        self.frame_dirty = True
-
-    def request_preview_frame(self, scene: bpy.types.Scene) -> None:
-        view = self._active_view(scene)
-        if view is None or self.active_stream_uuid != view.view_uuid:
-            self._error("VIEW_NOT_STREAMING", "Activate and stream a Comic View first")
-            return
-        width, height = renderer.validate_resolution(view.width, view.height)
-        self._open_stream(scene, view, width, height, "preview")
-        self.frame_dirty = True
-
-    def _consume_frame(self, message: dict[str, Any]) -> None:
-        try:
-            slot = int(message.get("slot", -1))
-            sequence = int(message.get("sequence", -1))
-        except (TypeError, ValueError):
-            return
-        if self._outstanding.get(slot) == sequence:
-            self._outstanding.pop(slot, None)
-
-    def _render_if_needed(self, scene: bpy.types.Scene, now: float) -> None:
-        if not self.streaming or not self.frame_dirty:
-            return
-        settings = self._settings(scene)
-        free_slot = next(
-            (slot for slot in range(SLOT_COUNT) if slot not in self._outstanding),
-            None,
-        )
-        if free_slot is None:
-            return
-        view = self._view(scene, self.active_stream_uuid)
-        if view is None:
-            self.stop_stream()
-            return
-        try:
-            if self._pending_render is not None:
-                frame, self._pending_render = self._pending_render, None
-                width, height = frame.width, frame.height
-            elif self.frame_kind == "committed":
-                frame, _warnings = self._render_saved_snapshot(scene, view)
-                width, height = frame.width, frame.height
-            else:
-                bounds = viewport.frame_bounds(view)
-                width, height = renderer.validate_resolution(view.width, view.height)
-                frame = renderer.render_active_camera(
-                    scene, bpy.context.view_layer, width, height,
-                    stream_frame=bounds,
-                    hide_overlays=self._hide_overlays(),
-                )
-            if len(frame.rgba) != self._slot_bytes:
-                try:
-                    self._open_stream(
-                        scene, view, frame.width, frame.height,
-                        self.frame_kind, replace=True,
-                    )
-                except Exception as realloc_error:
-                    self._pending_render = frame
-                    self.frame_dirty = True
-                    self._resize_failures += 1
-                    if self._resize_failures >= 5:
-                        self.last_error = (
-                            f"The rendered frame size changed during streaming to "
-                            f"{frame.width}x{frame.height} and the stream could not "
-                            f"be reallocated ({realloc_error}); retrying"
-                        )
-                        self.send({
-                            "type": "ERROR", "code": "RESIZE_FAILED",
-                            "message": self.last_error,
-                        })
-                    return
-                self._resize_failures = 0
-                self._pending_render = frame
-                self.frame_dirty = True
-                self.last_error = ""
-                self.send({"type": "STREAM_STATUS", "status": "resizing", "width": frame.width, "height": frame.height})
-                return
-            memory = self._memory
-            if memory is None:
-                return
-            offset = HEADER_SIZE + free_slot * self._slot_bytes
-            memory.buf[offset:offset + self._slot_bytes] = frame.rgba
-            self._sequence += 1
-            sequence = self._sequence
-            self._outstanding[free_slot] = sequence
-            self.frame_dirty = False
-            self.send({
-                "type": "FRAME_READY", "frame_kind": self.frame_kind,
-                "project_uuid": settings.project_uuid,
-                "view_uuid": view.view_uuid,
-                "revision": int(view.revision),
-                "sequence": sequence,
-                "slot": free_slot,
-                "width": frame.width,
-                "height": frame.height,
-                "stride": frame.width * 4,
-            })
-        except Exception as error:
-            self.frame_dirty = False
-            self.last_error = str(error)
-            self.send({
-                "type": "ERROR", "code": "RENDER_FAILED",
-                "message": str(error),
-            })
-
     def _check_snapshot_dirty(self, scene: bpy.types.Scene, now: float) -> None:
         if not self.state_check_due or now < self.state_check_due:
             return
@@ -870,6 +907,7 @@ class BridgeRuntime:
 
     def _error(self, code: str, message: str, request_id: object = None) -> None:
         self.last_error = str(message)
+        diagnostics.record("ERROR", "Bridge command failed", code=code, message=message)
         self.send({
             "type": "ERROR", "code": code, "message": str(message),
             "request_id": request_id,
@@ -880,13 +918,17 @@ class BridgeRuntime:
         if kind == "_CONNECTED":
             self.connected = True
             self.connection_id = int(message.get("connection_id", 0))
+            diagnostics.record(
+                "INFO", "Webtoon Maker connected",
+                connection_id=self.connection_id,
+            )
             self.send_views(scene)
         elif kind == "_DISCONNECTED":
             if int(message.get("connection_id", 0)) != self.connection_id:
                 return
             self.connected = False
             self.connection_id = 0
-            self.stop_stream()
+            diagnostics.record("INFO", "Webtoon Maker disconnected")
         elif kind == "PING":
             self.send({"type": "PONG", "request_id": message.get("request_id")})
         elif kind == "GET_VIEWS":
@@ -905,15 +947,6 @@ class BridgeRuntime:
             self._request_activate(scene, message)
         elif kind == "RESOLVE_DIRTY":
             self._resolve_dirty(scene, message)
-        elif kind == "START_STREAM":
-            self._start_stream(scene, message)
-        elif kind == "STOP_STREAM":
-            self.stop_stream()
-            self.send({"type": "STREAM_STATUS", "status": "stopped"})
-        elif kind == "RENDER_ONCE":
-            self.request_preview_frame(scene)
-        elif kind == "FRAME_CONSUMED":
-            self._consume_frame(message)
         else:
             self._error("UNKNOWN_MESSAGE", f"Unknown message type: {kind}")
 
@@ -929,10 +962,13 @@ class BridgeRuntime:
             try:
                 self._handle(scene, message)
             except Exception as error:
+                diagnostics.record_exception(
+                    "Unhandled bridge command exception", error,
+                    message_type=message.get("type", ""),
+                )
                 self._error("COMMAND_FAILED", str(error), message.get("request_id"))
         now = time.monotonic()
         self._check_snapshot_dirty(scene, now)
-        self._render_if_needed(scene, now)
         return 0.02
 
 

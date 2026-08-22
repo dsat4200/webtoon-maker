@@ -27,8 +27,8 @@ webtoon-maker/
 │   │   ├── tiles.py
 │   │   └── vector_geometry.py
 │   ├── integrations/               # live external image-source adapters
-│   │   ├── blender_source.py       # protocol/shared-memory client
-│   │   └── blender_controller.py   # selection, cache, and repaint lifecycle
+│   │   ├── blender_source.py       # protocol and published-frame metadata client
+│   │   └── blender_controller.py   # PNG validation, import, and repaint lifecycle
 │   └── ui/                         # PySide6 window, canvas, controls, models, theme
 │       ├── __init__.py
 │       ├── main_window.py
@@ -60,13 +60,15 @@ webtoon-maker/
 │   ├── webtoon_comic_views/        # Blender 4.5 manifest extension source
 │   │   ├── __init__.py
 │   │   ├── bridge.py
+│   │   ├── diagnostics.py
 │   │   ├── renderer.py
 │   │   ├── state.py
+│   │   ├── timeline.py
 │   │   ├── viewport.py
 │   │   ├── blender_manifest.toml
 │   │   ├── build.ps1
 │   │   └── README.md
-│   └── webtoon_comic_views-0.3.0.zip # installable build artifact
+│   └── webtoon_comic_views-0.5.1.zip # installable build artifact
 ├── tests/                           # offscreen Qt and pure-core regression suite
 ├── docs/
 │   ├── llm/                        # this LLM-oriented documentation set
@@ -188,7 +190,7 @@ Implements per-series asset libraries: manifest schema 2 and library schema 1, a
 
 ### `comic_editor/core/images.py`
 
-Implements `ImageSource` and `ImageStore`: immutable original bytes per object ID, decoded premultiplied display cache, runtime frame overrides for live Blender previews, `persist_runtime_frame()` writing `last-frame.png`, dirty tracking, safe filenames, and atomic per-object directory save/load with orphan cleanup.
+Implements `ImageSource` and `ImageStore`: immutable original bytes per object ID, a decoded premultiplied display cache, `put_decoded()` for already-validated published PNGs, dirty tracking, safe filenames, and atomic per-object directory save/load with orphan cleanup.
 
 ### `comic_editor/core/fill_migration.py`
 
@@ -249,11 +251,11 @@ Changes here should retain the dependency-light design and be covered by `test_v
 
 ### `comic_editor/integrations/blender_source.py`
 
-Client for the Blender Comic Views bridge, protocol version 2. Defines the `b"WCVRGBA\0"` frame magic, header layout, and capability limits. `ComicViewInfo` validates view metadata including base64 PNG thumbnails. `BlenderSourceClient(QObject)` uses a loopback-only `QTcpSocket` with newline-delimited JSON, token-authenticated `HELLO`, view/thumbnail/activate/dirty/stream/render commands, and attaches `multiprocessing.shared_memory` frame blocks (three slots) decoding RGBA8888 to premultiplied QImages with per-slot sequence acks.
+Client for Blender Comic Views protocol version 3. `ComicViewInfo` validates view metadata, thumbnails, and the published PNG path. `BlenderSourceClient(QObject)` uses a loopback-only `QTcpSocket` with newline-delimited JSON and token-authenticated view, thumbnail, activation, and dirty-switch control messages; pixel data never crosses the socket.
 
 ### `comic_editor/integrations/blender_controller.py`
 
-Application lifecycle for linked images. Only the selected linked Image Object in the active chapter owns the stream; context changes stop or resume it; frames match objects by project/view UUIDs; preview frames never displace unpersisted committed frames; committed frames update model geometry and are debounced (1 s idle / 5 s maximum) into `last-frame.png`; `aspect_adjusted_quad` preserves width/center on resolution changes.
+Application lifecycle for linked images. It validates absolute PNG paths, a 128 MiB input ceiling, PNG format, and published dimensions; imports original bytes once per publication key into every matching active-chapter object; preserves the last-good image on failure; and uses `aspect_adjusted_quad` to preserve width/center on resolution changes.
 
 ## UI scripts, one by one
 
@@ -281,7 +283,7 @@ The largest and most central runtime script (about 21,300 lines).
 - Recursively renders layers, masks, objects, vector strokes, gradients, sparse raster tiles, images, and text; applies tone-mask overlays and the modifier stack.
 - Draws grids, selections, transform/shape/gradient handles, hover indicators, creation previews, mask overlays, and page-gap UI.
 - Implements hit testing and all mouse, tablet, touch, key, wheel, IME, and navigation behavior.
-- Implements page creation/gutters, drawing selections/transforms, vector pencil/eraser/redraw/connect/simplify, raster strokes/fills/transforms, image placement, text editing/word selection, selection-scoped typography gizmos, tone-mask painting, gradient creation/editing, and cached free-text transform previews.
+- Implements page creation/gutters, drawing selections/transforms (including multi-anchor custom-shape selection), vector pencil/eraser/redraw/connect/simplify, raster strokes/fills/transforms, image placement, text editing/word selection and shared line-spaced layout, selection-scoped typography gizmos, tone-mask painting, gradient creation/editing, and cached free-text transform previews.
 - Provides software and OpenGL-backed widget classes plus the OpenGL probe/factory.
 
 ### `comic_editor/ui/sessions.py`
@@ -301,7 +303,7 @@ Permanent right-dock settings for the selected layer or an object's parent layer
 The floating contextual inspector for vector, fill, and eligible shape-linked properties. Its legacy text panel remains available internally for compatibility, but selected text suppresses the popup and uses Tool Settings.
 
 - Edits name where permitted, visibility, opacity lock/value, mask escape, underlay, and direct/compound geometry reference.
-- Retains legacy text font/style/kerning/layout/alignment/margin and preset handlers; the active text UI is `TextObjectControls` in `tool_ribbon_pages.py`.
+- Retains legacy text font/style/kerning/line-spacing/layout/alignment/margin and preset handlers; the active text UI is `TextObjectControls` in `tool_ribbon_pages.py`.
 - Provides transform mode and legacy raster-tool control compatibility.
 - Coalesces underlay slider drag into one undo command.
 - Repositions above or below the current selection in screen space.
@@ -351,7 +353,7 @@ Defines the contextual ribbon control owners.
 - `ToolSettingsControls`: Pencil preset/size, Eraser size/shape/vector mode, Mask Pencil alpha, fill subtool profiles and blend modes, Raster Fill tolerance, and drawing-selection transform mode.
 - `VectorToolsControls`: free/uniform transform mode; thickness/opacity Redraw parameter, interaction, operation, amount and pressure maximum; Connect; and Simplify amount/tool/apply.
 - `RasterObjectControls`: Raster name, visibility, opacity lock/value, mask escape, underlay, geometry reference, and transform mode, with coalesced slider changes.
-- `TextObjectControls`: selected-text preset CRUD, visibility/opacity, font preview mode, integer size, bold/italic, manual kerning, strict/free layout, alignment, margin, geometry reference, and transform mode.
+- `TextObjectControls`: selected-text preset CRUD, visibility/opacity, font preview mode, integer size, bold/italic, manual kerning, 0.5×–3.0× line spacing, strict/free layout, alignment, margin, geometry reference, and transform mode.
 
 ### `comic_editor/ui/ribbon.py`
 
@@ -413,7 +415,11 @@ Add-on registration and UI: property groups, automatic row activation, explicit 
 
 ### `bridge.py`
 
-`BridgeServer` socket/read threads bound to 127.0.0.1 that never touch Blender data off the main thread; token and protocol check before authorization. `BridgeRuntime` holds a single connected editor, ticks dirty-state checking, transactionally renders only saved committed state, renders temporary working previews, manages one-save Revert history, and publishes triple-buffered shared memory that only overwrites acknowledged slots.
+`BridgeServer` socket/read threads bind to 127.0.0.1 and never touch Blender data off the main thread. `BridgeRuntime` checks dirty state, manages one-save Revert history, invokes transactional timeline baking for Save/Load/Revert/Render, renders the saved state exactly once, atomically publishes revisioned PNGs, retains two revisions, and reports their paths through view metadata.
+
+### `diagnostics.py`
+
+Keeps a bounded in-memory extension event/error log and builds the token-redacted Copy Logs report, including Blender/extension versions, active-view timeline bake status, and publication-file state.
 
 ### `renderer.py`
 
@@ -423,13 +429,17 @@ Add-on registration and UI: property groups, automatic row activation, explicit 
 
 Geometry-free scene state capture/restore, `STATE_VERSION = 3`: camera/view layer, full pose controls, transforms, visibility, active/layer collections, Local View membership, lights, shape keys, modifier enable flags, viewport shading, camera-gate settings, and registered RNA properties; v1/v2 frame migration; stable `webtoon_comic_uuid` IDs with duplicate repair; `state_digest`/`apply_state` round-trips.
 
+### `timeline.py`
+
+Flattens saved snapshots into stable channels, classifies Blender RNA properties as bakeable or apply-only, allocates persistent non-reused Comic View frames after existing animation, promotes and backfills changed channels, isolates shared Actions, preserves unrelated keys/handles, skips driver-produced rig outputs, rejects unsafe drivers/NLA/linked Actions, verifies dependency-graph results, and rolls partial baking back transactionally. Non-animatable collection visibility is applied after frame selection without an Action.
+
 ### `viewport.py`
 
 Tracks a bound 3D View, maps unrestricted camera-gate Stream Frame bounds to screen space, derives navigation-independent camera matrices and output resolution, restores contextual Local View, tags redraws, and draws the orange camera-only `POST_PIXEL` overlay.
 
 ### `blender_manifest.toml`, `build.ps1`, `README.md`
 
-Manifest declares id `webtoon_comic_views` version 0.3.0, Blender ≥ 4.5.0, `windows-x64`, GPL-3.0-or-later, and the loopback network permission. `build.ps1` locates Blender and runs `extension validate`/`extension build`. The README covers install, workflow, state-capture scope, and transport.
+Manifest declares id `webtoon_comic_views` version 0.5.1, Blender ≥ 4.5.0, `windows-x64`, GPL-3.0-or-later, and loopback-network plus render-file permissions. `build.ps1` locates Blender and runs `extension validate`/`extension build`. The README covers install, workflow, automatic timeline baking, state-capture scope, publication, and the token-redacted Copy Logs diagnostic report.
 
 ## Test scripts, one by one
 
@@ -451,15 +461,15 @@ Covers asset repository CRUD, subtree extraction with fresh IDs (including modif
 
 ### `tests/test_blender_extension.py`
 
-Probes for a Blender 4.5 executable, asserts the extension manifest (id/version/min version/platforms/network), and runs `_blender_comic_views_probe.py` (and optionally `_blender_live_gpu_probe.py`) in a Blender subprocess.
+Probes for a Blender 4.5 executable, asserts the extension manifest (id/version/min version/platforms/permissions), and runs `_blender_comic_views_probe.py` (and optionally `_blender_live_gpu_probe.py`) in a Blender subprocess.
 
 ### `tests/test_blender_image_sources.py`
 
-Covers ImageObject embedded/Blender source descriptors, round trips, `last-frame.png` persistence, controller selection/cache lifecycle, aspect-adjusted quads, and preview-vs-committed frame handling.
+Covers ImageObject embedded/Blender source descriptors, round trips, direct original-PNG persistence, controller selection/publication lifecycle, rejection of invalid files, and aspect-adjusted quads.
 
 ### `tests/test_blender_source_protocol.py`
 
-Client protocol unit tests: HELLO authorization, view-list/thumbnail message handling, stream descriptor validation, shared-memory frame reads, and acks.
+Client protocol unit tests: protocol-v3 metadata, frame-path and thumbnail preservation, activation/dirty control messages, idempotence, and coordinated-upgrade errors.
 
 ### `tests/test_canvas_input_performance.py`
 

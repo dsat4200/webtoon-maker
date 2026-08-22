@@ -6,14 +6,16 @@ import math
 import pytest
 from PySide6.QtCore import QCoreApplication, QEvent, QPointF, Qt
 from PySide6.QtGui import (
-    QColor, QImage, QPainter, QPainterPath, QPointingDevice, QTabletEvent,
+    QColor, QImage, QPainter, QPainterPath, QPointingDevice, QPolygonF,
+    QTabletEvent,
 )
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication
 
 from comic_editor.core import settings as settings_module
 from comic_editor.core.models import (
-    BoundGeometry, ChapterDocument, PathNode, RasterObject, ShapeStyle,
+    BoundGeometry, ChapterDocument, PathContour, PathNode, RasterObject,
+    ShapeStyle,
 )
 from comic_editor.core.settings import EditorSettings, load_settings
 from comic_editor.core.tiles import TileStore
@@ -51,6 +53,279 @@ def _send_tablet(
         Qt.NoModifier, button, buttons,
     )
     QCoreApplication.sendEvent(canvas, event)
+
+
+def _custom_bound() -> BoundGeometry:
+    return BoundGeometry.path([
+        PathNode(x=100, y=100),
+        PathNode(
+            x=300, y=100, point_type="bezier",
+            incoming=(240, 140), outgoing=(360, 60),
+            handles_locked=False,
+        ),
+        PathNode(x=500, y=220),
+        PathNode(x=300, y=420),
+        PathNode(x=100, y=300),
+    ], closed=True)
+
+
+def test_custom_shape_exposes_box_and_lasso_selection_tools(qapp):
+    window = MainWindow()
+    chapter = ChapterDocument()
+    page = chapter.add_page()
+    layer = chapter.add_layer(page.layer_id, "Custom", _custom_bound())
+    window._set_chapter(chapter, TileStore())
+    try:
+        window.canvas.set_selection("layer", layer.layer_id)
+        window._sync_tool_buttons()
+
+        assert not window.drawing_selection_category.isHidden()
+        assert not window.drawing_selection_buttons[
+            ToolKind.DRAW_SELECT_RECT
+        ].isHidden()
+        assert not window.drawing_selection_buttons[
+            ToolKind.DRAW_SELECT_LASSO
+        ].isHidden()
+        assert window.drawing_selection_buttons[
+            ToolKind.DRAW_SELECT_STROKE
+        ].isHidden()
+        assert window._activate_tool(ToolKind.DRAW_SELECT_RECT)
+        assert window.canvas.tool == ToolKind.DRAW_SELECT_RECT
+
+        page.bound = _custom_bound()
+        window.canvas.set_selection("layer", page.layer_id)
+        window._sync_tool_buttons()
+        assert not window.drawing_selection_category.isHidden()
+
+        layer.bound = BoundGeometry.path([
+            PathNode(x=20, y=20), PathNode(x=220, y=140),
+        ], closed=False)
+        layer.layer_kind = "open_shape"
+        window.canvas.set_selection("layer", layer.layer_id)
+        window._sync_tool_buttons()
+        assert not window.drawing_selection_category.isHidden()
+
+        layer.bound = BoundGeometry.rectangle(20, 20, 200, 150)
+        layer.layer_kind = "bounded"
+        window._sync_tool_buttons()
+        assert window.drawing_selection_category.isHidden()
+        assert not window.canvas.set_tool(ToolKind.DRAW_SELECT_LASSO)
+    finally:
+        window.deleteLater()
+
+
+def test_box_and_lasso_select_custom_shape_points_across_contours(qapp):
+    canvas, _chapter, _page, layer = _canvas()
+    layer.bound = _custom_bound()
+    extra = PathContour(nodes=[
+        PathNode(x=620, y=100),
+        PathNode(x=760, y=100),
+        PathNode(x=690, y=220),
+    ], closed=True)
+    layer.bound.additional_contours = [extra]
+    assert canvas.set_tool(ToolKind.DRAW_SELECT_RECT)
+
+    canvas._drawing_selection_operation = "replace"
+    canvas._drawing_selection_gesture = [
+        QPointF(70, 70), QPointF(330, 130),
+    ]
+    assert canvas._finish_drawing_selection()
+    assert canvas._selected_shape_node_ids == {
+        layer.bound.nodes[0].node_id,
+        layer.bound.nodes[1].node_id,
+    }
+    assert canvas._selected_shape_node_id == layer.bound.nodes[0].node_id
+    assert canvas._selection_transform_quad is not None
+
+    assert canvas.set_tool(ToolKind.DRAW_SELECT_LASSO)
+    canvas._drawing_selection_operation = "add"
+    canvas._drawing_selection_gesture = [
+        QPointF(600, 70), QPointF(790, 70),
+        QPointF(790, 250), QPointF(600, 250),
+    ]
+    assert canvas._finish_drawing_selection()
+    assert canvas._selected_shape_node_ids.issuperset({
+        node.node_id for node in extra.nodes
+    })
+    assert canvas._selected_shape_node_id == layer.bound.nodes[0].node_id
+
+    canvas._drawing_selection_operation = "remove"
+    canvas._drawing_selection_gesture = [
+        QPointF(70, 70), QPointF(330, 70),
+        QPointF(330, 130), QPointF(70, 130),
+    ]
+    assert canvas._finish_drawing_selection()
+    assert canvas._selected_shape_node_ids == {
+        node.node_id for node in extra.nodes
+    }
+    assert canvas._selected_shape_node_id == extra.nodes[0].node_id
+
+
+def test_box_select_shape_points_in_transformed_layer_and_clear(qapp):
+    canvas, _chapter, _page, layer = _canvas()
+    layer.bound = _custom_bound()
+    layer.translate_x = 50
+    layer.translate_y = 35
+    assert canvas.set_tool(ToolKind.DRAW_SELECT_RECT)
+
+    assert canvas._begin_drawing_selection(
+        QPointF(120, 105), QPointF(), test_transform=False
+    )
+    assert canvas._continue_drawing_selection(
+        QPointF(380, 165), QPointF()
+    )
+    assert canvas._finish_drawing_selection()
+    assert canvas._selected_shape_node_ids == {
+        layer.bound.nodes[0].node_id,
+        layer.bound.nodes[1].node_id,
+    }
+
+    assert canvas._begin_drawing_selection(
+        QPointF(850, 835), QPointF(), test_transform=False
+    )
+    assert canvas._continue_drawing_selection(
+        QPointF(900, 885), QPointF()
+    )
+    assert canvas._finish_drawing_selection()
+    assert canvas._selected_shape_node_ids == set()
+    assert canvas._selected_shape_node_id == ""
+    assert canvas._selection_transform_quad is None
+
+
+def test_shape_point_selection_translate_rotate_and_undo(qapp):
+    canvas, _chapter, _page, layer = _canvas()
+    layer.bound = _custom_bound()
+    first, second = layer.bound.nodes[:2]
+    original_first = first.to_dict()
+    original_second = second.to_dict()
+    canvas._set_shape_point_selection(
+        layer, {first.node_id, second.node_id}, preserve_primary=False
+    )
+    assert canvas.set_tool(ToolKind.DRAW_SELECT_RECT)
+    canvas._refresh_drawing_selection_transform()
+    quad = list(canvas._selection_transform_quad)
+    center = QPainterPath()
+    center.addPolygon(QPolygonF([QPointF(*point) for point in quad]))
+    press = center.boundingRect().center() + QPointF(30, 0)
+
+    assert canvas._begin_drawing_selection_transform(layer, press)
+    canvas._update_drawing_selection_transform(
+        layer, press + QPointF(40, -25)
+    )
+    assert canvas._finish_drawing_selection_transform(layer)
+    assert first.position == pytest.approx((140, 75))
+    assert second.position == pytest.approx((340, 75))
+    assert second.incoming == pytest.approx((280, 115))
+    assert second.outgoing == pytest.approx((400, 35))
+
+    canvas.command_stack.undo()
+    restored = canvas.chapter.layers[layer.layer_id]
+    first, second = restored.bound.nodes[:2]
+    assert first.to_dict() == original_first
+    assert second.to_dict() == original_second
+
+    canvas._set_shape_point_selection(
+        restored, {first.node_id, second.node_id}, preserve_primary=False
+    )
+    canvas._refresh_drawing_selection_transform()
+    quad = list(canvas._selection_transform_quad)
+    _handles, rotate, pivot = canvas._transform_control_points(
+        quad, canvas._selection_pivot
+    )
+    delta = rotate - pivot
+    target = pivot + QPointF(-delta.y(), delta.x())
+    assert canvas._begin_drawing_selection_transform(restored, rotate)
+    canvas._update_drawing_selection_transform(restored, target)
+    assert canvas._finish_drawing_selection_transform(restored)
+    vector = QPointF(second.x - first.x, second.y - first.y)
+    assert vector.x() == pytest.approx(0, abs=0.1)
+    assert abs(vector.y()) == pytest.approx(200, abs=0.1)
+
+
+@pytest.mark.parametrize("mode", ["free", "uniform"])
+def test_shape_point_selection_scales_controls_and_moves_pivot(qapp, mode):
+    canvas, _chapter, _page, layer = _canvas()
+    layer.bound = _custom_bound()
+    selected = layer.bound.nodes[:3]
+    bezier = selected[1]
+    original = [node.to_dict() for node in selected]
+    canvas._set_shape_point_selection(
+        layer, {node.node_id for node in selected}, preserve_primary=False
+    )
+    assert canvas.set_tool(ToolKind.DRAW_SELECT_RECT)
+    canvas.settings.transform_mode = mode
+    canvas._refresh_drawing_selection_transform()
+    quad = list(canvas._selection_transform_quad)
+    initial = QPointF(*quad[2])
+    if mode == "uniform":
+        origin = QPointF(*quad[0])
+        target = origin + (initial - origin) * 1.5
+    else:
+        target = initial + QPointF(100, 50)
+
+    assert canvas._begin_drawing_selection_transform(layer, initial)
+    canvas._update_drawing_selection_transform(layer, target)
+    assert canvas._finish_drawing_selection_transform(layer)
+    assert selected[0].position == pytest.approx((100, 100))
+    assert selected[2].position == pytest.approx(target.toTuple())
+    assert bezier.incoming != original[1]["incoming"]
+    assert bezier.outgoing != original[1]["outgoing"]
+    assert bezier.point_type == original[1]["point_type"]
+    assert bezier.handles_locked == original[1]["handles_locked"]
+
+    canvas.command_stack.undo()
+    restored = canvas.chapter.layers[layer.layer_id]
+    assert [node.to_dict() for node in restored.bound.nodes[:3]] == original
+
+    canvas._set_shape_point_selection(
+        restored,
+        {node.node_id for node in restored.bound.nodes[:3]},
+        preserve_primary=False,
+    )
+    canvas._refresh_drawing_selection_transform()
+    _handles, _rotate, pivot = canvas._transform_control_points(
+        canvas._selection_transform_quad, canvas._selection_pivot
+    )
+    geometry = restored.bound.to_dict()
+    assert canvas._begin_drawing_selection_transform(restored, pivot)
+    canvas._update_drawing_selection_transform(
+        restored, pivot + QPointF(45, -30)
+    )
+    assert canvas._finish_drawing_selection_transform(restored)
+    assert restored.bound.to_dict() == geometry
+    assert canvas._selection_pivot == pivot + QPointF(45, -30)
+
+
+@pytest.mark.parametrize(("closed", "count"), [(True, 5), (False, 4)])
+def test_multi_delete_shape_points_is_atomic_and_undoable(
+    qapp, closed, count,
+):
+    canvas, _chapter, _page, layer = _canvas()
+    layer.bound = BoundGeometry.path([
+        PathNode(x=100 + index * 100, y=100 + (index % 2) * 80)
+        for index in range(count)
+    ], closed=closed)
+    layer.layer_kind = "bounded" if closed else "open_shape"
+    selected = {node.node_id for node in layer.bound.nodes[:2]}
+    canvas._set_shape_point_selection(
+        layer, selected, preserve_primary=False
+    )
+    assert canvas.set_tool(ToolKind.DRAW_SELECT_RECT)
+
+    assert canvas._handle_delete_selected_shape_points()
+    minimum = 3 if closed else 2
+    assert len(layer.bound.nodes) == minimum
+    canvas.command_stack.undo()
+    assert len(canvas.chapter.layers[layer.layer_id].bound.nodes) == count
+
+    restored = canvas.chapter.layers[layer.layer_id]
+    invalid = {node.node_id for node in restored.bound.nodes[:-1]}
+    canvas._set_shape_point_selection(
+        restored, invalid, preserve_primary=False
+    )
+    before = restored.bound.to_dict()
+    assert canvas._handle_delete_selected_shape_points()
+    assert restored.bound.to_dict() == before
 
 
 def test_draw_shape_preserves_shift_span_endpoints_as_vector_nodes(qapp):

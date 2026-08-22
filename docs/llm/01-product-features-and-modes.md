@@ -134,12 +134,12 @@ The Fill tool now targets shapes and raster content; owned vector fills no longe
 
 ## Text features
 
-- **Add Text** creates a text object from the active preset. Selecting that object switches to Text Edit; the Add action itself returns to Object Select.
+- **Add Text** creates and selects a text object from the active preset, enters an active Text Edit session, focuses the canvas, and selects the complete `Text` placeholder so immediate typing replaces it. Creation and editing remain separate undo commands.
 - Text selection/caret drawing, drag selection, clipboard operations, keyboard editing, and IME input are implemented on the canvas.
 - One Text Edit session has its own local history and commits as one document-level undo command.
 - The outliner label is derived from the first 16 normalized characters of content and is not separately renamed.
-- Text Tool Settings expose presets, font family, optional per-family dropdown previews, integer pixel size, bold/italic, kerning, visibility, opacity/lock, layout mode, 3×3 alignment, margin, geometry reference, and free/uniform transform mode. Layout- and compound-specific controls appear only when applicable.
-- Text presets store formatting only: font family, integer pixel size, bold, italic, kerning, layout mode, 3×3 alignment, and margin. Preset sizes are normalized to 6–250.
+- Text Tool Settings expose presets, font family, optional per-family dropdown previews, integer pixel size, bold/italic, kerning, an object-wide 0.5×–3.0× line-spacing multiplier, visibility, opacity/lock, layout mode, 3×3 alignment, margin, geometry reference, and free/uniform transform mode. Layout- and compound-specific controls appear only when applicable.
+- Text presets store formatting only: font family, integer pixel size, bold, italic, kerning, line spacing, layout mode, 3×3 alignment, and margin. Preset sizes are normalized to 6–250 and line spacing to 0.5×–3.0×.
 - In Text Edit, the selected text alone receives an on-canvas `− size + B I` strip. Its size field commits on Enter/focus loss and cancels on Escape. Two orange circles on the right edge scrub size (10–100, integer) and kerning (1.0–10.0, tenths) at one step per four screen pixels; a drag becomes one undo command.
 - Text drag-selection updates character highlighting live. Double-click selects a word, triple-click selects the entire box, and the selected box uses an I-beam cursor away from higher-priority controls.
 - **Strict** layout wraps and clips text to the selected direct or compound shape bounds with a uniform margin. Edge-midpoint dragging edits the margin.
@@ -174,7 +174,7 @@ The Fill tool now targets shapes and raster content; owned vector fills no longe
 
 - **Import Images…** and paste (Ctrl+V) create Image Objects from image files, URLs, or the clipboard.
 - An Image Object stores its original bytes in an embedded source descriptor and can be placed free or fitted to its parent (`auto_width`, `auto_height`, `stretch`, `fit_inside`).
-- A **linked** Image Object's source is a Blender Comic View. Live preview frames arrive over the loopback bridge, and the last accepted frame is persisted as `last-frame.png`; resolution changes scale into the object's original local frame.
+- A **linked** Image Object's source is a Blender Comic View. Blender atomically publishes saved Render revisions as PNG files and notifies the editor over the loopback bridge; accepted original bytes are embedded as `last-frame.png`, and resolution changes scale into the object's original local frame.
 - Images share the same transform frame/quad machinery as Raster and Vector Drawing objects and can carry the modifier stack.
 
 ## Hierarchy, selection, and editing infrastructure
@@ -184,7 +184,7 @@ The Fill tool now targets shapes and raster content; owned vector fills no longe
 - Tree rebuilds preserve expanded entities and selection by stable ID.
 - Object Select searches the complete chapter. Shape borders are selectable within a screen-stable tolerance while filled interiors remain click-through so descendants are reachable.
 - Ctrl-click opens an ordered menu for overlapping candidates. Vector strokes are preferred to interiors.
-- Drawing Selection supports replace, Shift-add, and Ctrl-remove. The default Select All chord is Ctrl+A; during active canvas text editing it selects all text instead, while native text/numeric fields keep their native behavior.
+- Drawing Selection supports replace, Shift-add, and Ctrl-remove. Rectangle and Lasso select raster pixels, vector anchors, or anchor positions on selected custom-path layers, including pages, open paths, and additional contours; Stroke Select remains vector-only. A custom-shape point set uses the shared move/free-or-uniform-scale/rotate/pivot cage, transforms Bézier controls with their anchors, and deletes atomically only when all affected contours retain at least three closed or two open anchors. The default Select All chord is Ctrl+A; during active canvas text editing it selects all text instead, while native text/numeric fields keep their native behavior.
 - Undo/redo covers graph changes, text sessions, raster tile/frame patches, vector edits, transforms, page gaps, hierarchy moves, mask paint, and modifier edits. The in-memory stack retains 200 commands.
 
 ## Navigation and input
@@ -225,8 +225,8 @@ The Fill tool now targets shapes and raster content; owned vector fills no longe
 | `vector_redraw` | Vector Tools → Use Redraw | Pressure/manual or point-based thickness/opacity editing. Requires an active Vector Drawing. |
 | `vector_connect` | Vector Tools → Use Connect | Sweeps two endpoints and joins their strokes. Requires an active Vector Drawing. |
 | `vector_simplify` | Vector Tools → Sweep Simplify | Sweeps a local simplification radius over vector anchors. Requires an active Vector Drawing. |
-| `draw_select_rect` | Rectangle Select | Rectangle selection of raster pixels or vector points. |
-| `draw_select_lasso` | Lasso Select | Freeform selection of raster pixels or vector points. |
+| `draw_select_rect` | Rectangle Select | Rectangle selection of raster pixels, vector points, or selected custom-path anchors. |
+| `draw_select_lasso` | Lasso Select | Freeform selection of raster pixels, vector points, or selected custom-path anchors. |
 | `draw_select_stroke` | Stroke Select | Selects whole vector strokes. It is hidden/unavailable for Raster objects. |
 | `insert_page_gap` | Insert Page Gap | Finds a physical gap boundary and stages the editable orange gutter transaction. |
 | `box_bound` | Shapes → Add Rectangle | Drag-creates a rectangular layer; also serves as a page-shape choice during Add Page. |

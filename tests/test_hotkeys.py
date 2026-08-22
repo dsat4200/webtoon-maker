@@ -1,11 +1,11 @@
 from __future__ import annotations
 
 from PySide6.QtCore import QEvent, QTimer, Qt
-from PySide6.QtWidgets import QApplication
+from PySide6.QtWidgets import QApplication, QLineEdit
 from PySide6.QtTest import QTest
 
 from comic_editor.core import settings as settings_module
-from comic_editor.core.models import BoundGeometry, ChapterDocument
+from comic_editor.core.models import BoundGeometry, ChapterDocument, TextObject
 from comic_editor.core.settings import (
     EditorSettings, default_hotkey_hold, load_settings,
 )
@@ -62,6 +62,60 @@ def test_chord_capture_replaces_clears_and_cancels(qapp):
     editor.setChord("")
     assert editor.chord() == ""
     editor.hide()
+
+
+def test_backspace_binding_yields_to_canvas_text_edit(qapp):
+    window = MainWindow()
+    chapter = ChapterDocument()
+    page = chapter.add_page()
+    shape = chapter.add_layer(
+        page.layer_id, "Shape", BoundGeometry.rectangle(0, 0, 200, 200)
+    )
+    text = chapter.add_object(
+        page.layer_id, TextObject(text="abc")
+    )
+    window._set_chapter(chapter, TileStore())
+    window.settings.hotkeys["shape_edit"] = "Backspace"
+    window.settings.hotkeys["clear_canvas"] = ""
+    window._install_shortcuts()
+    window.show()
+    try:
+        window.canvas.set_selection("object", text.object_id)
+        window.canvas._text_cursor_position = len(text.text)
+        window.canvas._text_selection_anchor = len(text.text)
+        window.canvas.setFocus()
+        qapp.processEvents()
+
+        QTest.keyClick(window.canvas, Qt.Key_Backspace)
+        assert window.canvas.chapter.objects[text.object_id].text == "ab"
+        assert window.canvas.tool == ToolKind.TEXT_EDIT
+        assert window.canvas.has_active_text_edit()
+
+        QTest.keyClick(window.canvas, Qt.Key_Backspace)
+        assert window.canvas.chapter.objects[text.object_id].text == "a"
+        assert window.canvas.tool == ToolKind.TEXT_EDIT
+
+        window.canvas.commit_active_text_edit()
+        native_field = QLineEdit(window)
+        native_field.setText("field")
+        native_field.setCursorPosition(len(native_field.text()))
+        native_field.show()
+        native_field.setFocus()
+        qapp.processEvents()
+        QTest.keyClick(native_field, Qt.Key_Backspace)
+        assert native_field.text() == "fiel"
+        assert window.canvas.tool == ToolKind.TEXT_EDIT
+
+        window.canvas.set_selection(
+            "layer", shape.layer_id, activate_default_tool=False
+        )
+        window.canvas.set_tool(ToolKind.OBJECT_SELECT)
+        window.canvas.setFocus()
+        QTest.keyClick(window.canvas, Qt.Key_Backspace)
+        assert window.canvas.tool == ToolKind.SHAPE_EDIT
+    finally:
+        window.hide()
+        window.deleteLater()
 
 
 def test_hotkey_dialog_has_hold_only_for_tools_and_rejects_duplicates(qapp):

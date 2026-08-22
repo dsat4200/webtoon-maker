@@ -911,6 +911,16 @@ class TextObjectControls(QObject):
         self.kerning.setSingleStep(0.1)
         self.kerning.setMaximumWidth(78)
         layout.addWidget(_labeled_control("Kerning", self.kerning, widget))
+        self.line_spacing = QDoubleSpinBox(widget)
+        self.line_spacing.setRange(0.5, 3.0)
+        self.line_spacing.setSingleStep(0.1)
+        self.line_spacing.setDecimals(1)
+        self.line_spacing.setSuffix("×")
+        self.line_spacing.setKeyboardTracking(False)
+        self.line_spacing.setMaximumWidth(78)
+        layout.addWidget(_labeled_control(
+            "Line spacing", self.line_spacing, widget
+        ))
 
         self.font_family.currentTextChanged.connect(
             lambda value: self._apply_field("font_family", value)
@@ -927,6 +937,11 @@ class TextObjectControls(QObject):
         )
         self.kerning.editingFinished.connect(
             lambda: self._apply_field("kerning", float(self.kerning.value()))
+        )
+        self.line_spacing.editingFinished.connect(
+            lambda: self._apply_field(
+                "line_spacing", float(self.line_spacing.value())
+            )
         )
         return widget
 
@@ -1020,7 +1035,8 @@ class TextObjectControls(QObject):
         controls = (
             self.preset_combo, self.opacity_lock,
             self.font_family, self.preview_fonts, self.font_size, self.bold,
-            self.italic, self.kerning, self.layout_mode, self.margin,
+            self.italic, self.kerning, self.line_spacing,
+            self.layout_mode, self.margin,
             self.geometry_reference,
         )
         blockers = [QSignalBlocker(control) for control in controls]
@@ -1034,6 +1050,7 @@ class TextObjectControls(QObject):
             self.bold.setChecked(entity.bold)
             self.italic.setChecked(entity.italic)
             self.kerning.setValue(entity.kerning)
+            self.line_spacing.setValue(entity.line_spacing)
             self.layout_mode.setCurrentIndex(max(
                 0, self.layout_mode.findData(entity.layout_mode)
             ))
@@ -1089,6 +1106,8 @@ class TextObjectControls(QObject):
         before = self.canvas.chapter.to_dict()
         if key == "font_size":
             value = max(6, min(250, int(value)))
+        elif key == "line_spacing":
+            value = max(0.5, min(3.0, float(value)))
         elif key == "geometry_reference" and value not in {"direct", "compound"}:
             value = "direct"
         setattr(entity, key, value)
@@ -1155,6 +1174,7 @@ class TextObjectControls(QObject):
             bold=entity.bold,
             italic=entity.italic,
             kerning=entity.kerning,
+            line_spacing=entity.line_spacing,
             layout_mode=entity.layout_mode,
             horizontal_alignment=entity.horizontal_alignment,
             vertical_alignment=entity.vertical_alignment,
@@ -1173,6 +1193,7 @@ class TextObjectControls(QObject):
         before = self.canvas.chapter.to_dict()
         for key in (
             "font_family", "font_size", "bold", "italic", "kerning",
+            "line_spacing",
             "layout_mode", "horizontal_alignment", "vertical_alignment", "margin",
         ):
             setattr(entity, key, getattr(preset, key))

@@ -1065,13 +1065,13 @@ class MainWindow(QMainWindow):
         self.blender_sources.connectionStateChanged.connect(
             self._blender_connection_changed
         )
-        self.blender_sources.streamStatusChanged.connect(
-            self._blender_stream_status_changed
+        self.blender_sources.statusChanged.connect(
+            self._blender_source_status_changed
         )
         self.blender_sources.switchDecisionRequired.connect(
             self._resolve_blender_dirty_switch
         )
-        self.blender_sources.cachePersisted.connect(
+        self.blender_sources.frameImported.connect(
             lambda: self._mark_dirty(None)
         )
         self.blender_sources.errorOccurred.connect(
@@ -1079,9 +1079,6 @@ class MainWindow(QMainWindow):
         )
         self.canvas.selectionChanged.connect(
             self.blender_sources.handle_selection
-        )
-        self.selection_settings.image_controls.renderOnceRequested.connect(
-            self.blender_sources.render_once
         )
         self.selection_settings.image_controls.reconnectRequested.connect(
             self._reconnect_selected_blender_source
@@ -1346,6 +1343,19 @@ class MainWindow(QMainWindow):
             focus, (QAbstractSpinBox, QLineEdit, QPlainTextEdit, QTextEdit)
         )
 
+    def _hotkey_key_belongs_to_text_input(self, key: int) -> bool:
+        focus = QApplication.focusWidget()
+        native_input = isinstance(
+            focus, (QAbstractSpinBox, QLineEdit, QPlainTextEdit, QTextEdit)
+        )
+        canvas_text = bool(
+            focus is self.canvas
+            and self.canvas.current_text_edit_target() is not None
+        )
+        return key in {int(Qt.Key_Backspace), int(Qt.Key_Delete)} and (
+            native_input or canvas_text
+        )
+
     def _trigger_hotkey(
         self, action_id: str, chord: frozenset[int],
         started: float, tap: bool = False,
@@ -1420,6 +1430,8 @@ class MainWindow(QMainWindow):
             return False
         self._hotkey_pressed.add(key)
         chord = frozenset(self._hotkey_pressed)
+        if self._hotkey_key_belongs_to_text_input(key):
+            return False
         if (
             key == int(Qt.Key_Delete)
             and (
@@ -1482,6 +1494,8 @@ class MainWindow(QMainWindow):
     def _hotkey_release(self, key: int) -> bool:
         chord = frozenset(self._hotkey_pressed)
         consumed = any(key in binding for binding in self._hotkey_bindings.values())
+        if self._hotkey_key_belongs_to_text_input(key):
+            consumed = False
         if (
             key == int(Qt.Key_Delete)
             and (
@@ -1980,7 +1994,6 @@ class MainWindow(QMainWindow):
         session = self.active_session
         if session is None or self.chapter is None:
             return
-        self.blender_sources.flush_pending_frames()
         state = self.canvas.capture_session_state()
         if state is not None:
             session.canvas_state = state
@@ -2828,6 +2841,12 @@ class MainWindow(QMainWindow):
                 4000,
             )
             return
+        parent_index = self.hierarchy_model.index_for_entity(
+            "layer", parent.layer_id
+        )
+        parent_was_expanded = bool(
+            parent_index.isValid() and self.tree.isExpanded(parent_index)
+        )
         before = self.chapter.to_dict()
         left, top, width, height = parent.bound.bbox()
         count = sum(isinstance(item, TextObject) for item in self.chapter.objects.values()) + 1
@@ -2841,6 +2860,7 @@ class MainWindow(QMainWindow):
         )
         for key in (
             "font_family", "font_size", "bold", "italic", "kerning",
+            "line_spacing",
             "layout_mode", "horizontal_alignment", "vertical_alignment", "margin",
         ):
             setattr(obj, key, preset[key])
@@ -2857,8 +2877,14 @@ class MainWindow(QMainWindow):
         )
         after = self.chapter.to_dict()
         self.canvas.push_model_change(before, after, "Add text object")
-        self._after_structure(parent.layer_id, "layer")
-        self.canvas.set_tool(ToolKind.OBJECT_SELECT)
+        self._after_structure(obj.object_id, "object")
+        self.canvas.start_text_edit(select_all=True)
+        if not parent_was_expanded:
+            parent_index = self.hierarchy_model.index_for_entity(
+                "layer", parent.layer_id
+            )
+            if parent_index.isValid():
+                self.tree.setExpanded(parent_index, False)
 
     def _next_layer_name(self) -> str:
         numbers = []
@@ -3127,14 +3153,29 @@ class MainWindow(QMainWindow):
         vector_selected = isinstance(
             selected_object, VectorDrawingObject
         )
-        drawable_selected = raster_selected or vector_selected
-        self.drawing_selection_category.setVisible(drawable_selected)
+        custom_shape_selected = bool(
+            self.chapter is not None
+            and self.canvas.selected_kind == "layer"
+            and (
+                selected_layer := self.chapter.layers.get(
+                    self.canvas.selected_id
+                )
+            ) is not None
+            and selected_layer.bound is not None
+            and selected_layer.bound.primitive == "custom"
+        )
+        drawing_selection_available = (
+            raster_selected or vector_selected or custom_shape_selected
+        )
+        self.drawing_selection_category.setVisible(
+            drawing_selection_available
+        )
         for tool, button in self.drawing_selection_buttons.items():
             button.setVisible(
                 tool != ToolKind.DRAW_SELECT_STROKE or vector_selected
             )
             button.setEnabled(
-                drawable_selected
+                drawing_selection_available
                 and (
                     tool != ToolKind.DRAW_SELECT_STROKE or vector_selected
                 )
@@ -3147,16 +3188,16 @@ class MainWindow(QMainWindow):
             button.setChecked(self.canvas.tool == tool)
             button.blockSignals(False)
         self.tool_buttons[ToolKind.RASTER_PENCIL].setEnabled(
-            drawable_selected
+            raster_selected or vector_selected
         )
         self.tool_buttons[ToolKind.RASTER_ERASER].setEnabled(
-            drawable_selected
+            raster_selected or vector_selected
         )
         self.tool_buttons[ToolKind.RASTER_PENCIL].setVisible(
-            drawable_selected
+            raster_selected or vector_selected
         )
         self.tool_buttons[ToolKind.RASTER_ERASER].setVisible(
-            drawable_selected
+            raster_selected or vector_selected
         )
         shape_selected = isinstance(selected_object, RasterObject) or (
             self.chapter is not None
@@ -3478,7 +3519,6 @@ class MainWindow(QMainWindow):
             isinstance(selected_image, ImageObject)
             and selected_image.is_blender_linked
             and self.canvas.images.source(selected_image.object_id) is None
-            and self.canvas.images.runtime_frame(selected_image.object_id).isNull()
         )
         copy_asset.setEnabled(
             self._current_project_context() is not None and can_freeze
@@ -3515,7 +3555,6 @@ class MainWindow(QMainWindow):
         context = self._current_project_context()
         if context is None or self.chapter is None:
             return
-        self.blender_sources.flush_pending_frames()
         entity = (
             self.chapter.layers.get(entity_id)
             if kind == "layer" else self.chapter.objects.get(entity_id)
@@ -3596,8 +3635,6 @@ class MainWindow(QMainWindow):
         obj = self.chapter.objects.get(object_id)
         if not isinstance(obj, ImageObject):
             return
-        if obj.is_blender_linked:
-            self.blender_sources.flush_pending_frames()
         image = self.canvas.images.image(object_id)
         if image.isNull():
             QMessageBox.warning(
@@ -3994,30 +4031,26 @@ class MainWindow(QMainWindow):
     def _blender_connection_changed(self, state: str) -> None:
         if state == "connected":
             self.statusBar().showMessage("Connected to Blender Comic Views", 3000)
-        self._blender_stream_status_changed(
+        self._blender_source_status_changed(
             "offline" if state != "connected" else "connected"
         )
 
-    def _blender_stream_status_changed(self, status: str) -> None:
+    def _blender_source_status_changed(self, status: str) -> None:
         labels = {
-            "live": "Ready — Render publishes the saved Comic View; Render Once previews working changes",
-            "preview": "Preview — temporary unsaved Blender scene (not cached)",
+            "ready": "Ready — Blender Render publishes this Comic View automatically",
+            "importing": "Importing the latest rendered Comic View…",
             "activating": "Activating the selected Comic View in Blender…",
-            "connected": "Connected — select a linked image to stream it",
-            "stopped": "Frozen — showing the last cached frame",
-            "frozen": "Frozen — activation was canceled",
+            "connected": "Connected — Blender Render updates linked images",
             "offline": "Offline — showing the last cached frame",
             "unavailable": "Offline — this Comic View is unavailable; use Relink to choose another",
-            "stale": "Stale — Blender has an older revision; render or relink before streaming",
-            "resizing": "Resizing — frame size changed, reallocating stream…",
-            "unsaved": "Unsaved — Blender has scene changes; Save or Render in Blender to update this image",
+            "stale": "Stale — Blender has an older revision; render or relink before updating",
+            "needs-render": "No full render yet — press Render in Blender once",
+            "unsaved": "Unsaved — Blender has scene changes; Save then Render to publish them",
             "error": "Error — showing the last cached frame",
         }
-        if status == "resizing":
-            self.statusBar().showMessage("Resizing stream to new frame size…", 3000)
-        elif status == "unsaved":
+        if status == "unsaved":
             self.statusBar().showMessage(
-                "Blender has unsaved changes; Save or Render in Blender to update this image",
+                "Blender has unsaved changes; Save then Render to update this image",
                 4000,
             )
         self.selection_settings.image_controls.set_source_status(
@@ -4045,12 +4078,12 @@ class MainWindow(QMainWindow):
         )
         self.blender_sources.client.resolve_dirty_switch(resolution)
         if clicked is cancel:
-            self._blender_stream_status_changed("frozen")
+            self._blender_source_status_changed("ready")
 
     def _blender_source_error(self, message: str) -> None:
         self.blender_views_widget.set_status_message(message)
         self.statusBar().showMessage(f"Blender source: {message}", 7000)
-        self._blender_stream_status_changed("error")
+        self._blender_source_status_changed("error")
 
     def _reconnect_selected_blender_source(self) -> None:
         if self.blender_sources.client.connected:
@@ -4077,7 +4110,6 @@ class MainWindow(QMainWindow):
         obj = self.blender_sources.selected_linked_object()
         if obj is None or self.chapter is None:
             return
-        self.blender_sources.flush_pending_frames()
         if self.canvas.images.source(obj.object_id) is None:
             QMessageBox.warning(
                 self, "Detach Blender source",
@@ -4093,7 +4125,6 @@ class MainWindow(QMainWindow):
         self.canvas.images.relabel(
             obj.object_id, obj.source_filename, obj.source_mime_type
         )
-        self.canvas.images.clear_runtime_frame(obj.object_id)
         after = self.chapter.to_dict()
         self.canvas.push_model_change(
             before, after, "Detach Blender image source"
@@ -5349,7 +5380,6 @@ class MainWindow(QMainWindow):
             return self._save_editor_session(self.active_session)
         if self.repository is None or self.chapter is None:
             return False
-        self.blender_sources.flush_pending_frames()
         try:
             self.repository.save_chapter(
                 self.chapter, self.canvas.tiles, self.canvas.images
@@ -5543,7 +5573,6 @@ class MainWindow(QMainWindow):
         return True
 
     def _autosave(self) -> None:
-        self.blender_sources.flush_pending_frames()
         if self.sessions:
             now = time.monotonic()
             deferred: list[float] = []

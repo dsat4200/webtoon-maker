@@ -1,6 +1,6 @@
 schema_version = "1.0.0"
 id = "webtoon_comic_views"
-version = "0.3.0"
+version = "0.5.1"
 name = "Webtoon Comic Views"
 tagline = "Publish persistent viewport Comic Views to Webtoon Maker"
 maintainer = "Webtoon Maker"
@@ -12,6 +12,7 @@ license = ["SPDX:GPL-3.0-or-later"]
 
 [permissions]
 network = "Expose a token-authenticated loopback image source"
+files = "Publish Comic View renders for Webtoon Maker"
 
 [build]
 paths_exclude_pattern = [

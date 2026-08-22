@@ -108,6 +108,8 @@ class BlenderViewsWidget(QWidget):
         self.list.clear()
         for view in views:
             suffix = " • modified" if view.dirty else ""
+            if not view.frame_path:
+                suffix += " • needs render"
             item = QListWidgetItem(
                 f"{view.name}\n{view.width}×{view.height} • r{view.revision}{suffix}"
             )
@@ -116,7 +118,11 @@ class BlenderViewsWidget(QWidget):
             item.setData(Qt.UserRole, view.view_uuid)
             item.setToolTip(
                 f"{view.name}\nRevision {view.revision}\n"
-                f"{view.width} × {view.height} pixels"
+                f"{view.width} × {view.height} pixels\n"
+                + (
+                    "Published PNG available"
+                    if view.frame_path else "Press Render in Blender to publish a full PNG"
+                )
             )
             self.list.addItem(item)
             if view.view_uuid == selected:

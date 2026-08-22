@@ -498,9 +498,6 @@ class _CanvasLogic:
         self.chapter: ChapterDocument | None = None
         self.tiles = TileStore()
         self.images = ImageStore()
-        # Runtime-only Blender preview dimensions/quads. These never enter the
-        # chapter model or Undo history.
-        self._image_runtime_geometry: dict[str, dict] = {}
         self.command_stack = CommandStack()
         self.tool = ToolKind.OBJECT_SELECT
         self.selected_kind = ""
@@ -794,6 +791,7 @@ class _CanvasLogic:
         self._selection_vector_points: dict[str, dict] = {}
         self._selection_vector_preview: dict[str, dict] = {}
         self._selection_vector_preview_revision = 0
+        self._selection_shape_nodes: dict[str, dict] = {}
         self._selection_before_tiles: dict[tuple[int, int], QImage] | None = None
         self._selection_before_model: dict | None = None
         self._fill_before: dict[tuple[int, int], QImage | None] = {}
@@ -1325,7 +1323,6 @@ class _CanvasLogic:
         self.chapter = chapter
         self.tiles = tiles
         self.images = images or ImageStore()
-        self._image_runtime_geometry.clear()
         self._compound_path_cache.clear()
         self._gradient_geometry_cache.clear()
         self._gradient_scalar_cache.clear()
@@ -1417,7 +1414,6 @@ class _CanvasLogic:
         self.chapter, self.tiles, self.images = (
             state.chapter, state.tiles, state.images
         )
-        self._image_runtime_geometry.clear()
         self.command_stack = state.command_stack
         self.tool = state.tool
         self.selected_kind, self.selected_id = state.selected_kind, state.selected_id
@@ -1462,7 +1458,6 @@ class _CanvasLogic:
         self.chapter = None
         self.tiles = TileStore()
         self.images = ImageStore()
-        self._image_runtime_geometry.clear()
         self.command_stack = CommandStack()
         self.selected_kind = self.selected_id = ""
         self.active_page_id = self.active_layer_id = ""
@@ -1505,7 +1500,6 @@ class _CanvasLogic:
         self._clear_page_gap_editor()
         self.pageGapConfirmationChanged.emit(False)
         self.chapter = ChapterDocument.from_dict(state)
-        self._image_runtime_geometry.clear()
         self._compound_path_cache.clear()
         self._gradient_geometry_cache.clear()
         self._gradient_scalar_cache.clear()
@@ -2245,7 +2239,16 @@ class _CanvasLogic:
                 self.chapter.objects.get(self.selected_object_id)
                 if self.chapter is not None else None
             )
-            if not isinstance(selected, (RasterObject, VectorDrawingObject)):
+            custom_shape = (
+                self.selected_kind == "layer"
+                and self.chapter is not None
+                and (layer := self.chapter.layers.get(self.selected_id))
+                is not None
+                and layer.bound is not None
+                and layer.bound.primitive == "custom"
+            )
+            if not isinstance(selected, (RasterObject, VectorDrawingObject)) \
+                    and not custom_shape:
                 return False
             if (
                 tool == ToolKind.DRAW_SELECT_STROKE
@@ -7960,6 +7963,11 @@ class _CanvasLogic:
             "center": Qt.AlignHCenter,
             "right": Qt.AlignRight,
         }[obj.horizontal_alignment])
+        spacing = max(0.5, min(3.0, float(obj.line_spacing)))
+        block.setLineHeight(
+            spacing * 100.0,
+            QTextBlockFormat.LineHeightTypes.ProportionalHeight.value,
+        )
         cursor.mergeBlockFormat(block)
         return document
 
@@ -8354,31 +8362,13 @@ class _CanvasLogic:
         ))
 
     def _image_local_quad(self, obj: ImageObject) -> list[tuple[float, float]]:
-        override = self._image_runtime_geometry.get(obj.object_id)
-        if override is not None:
-            return list(override["quad"])
         return self._image_model_local_quad(obj)
-
-    def set_image_runtime_geometry(
-        self, object_id: str, width: int, height: int,
-        quad: list[tuple[float, float]],
-    ) -> None:
-        self._image_runtime_geometry[object_id] = {
-            "width": max(1, int(width)), "height": max(1, int(height)),
-            "quad": [tuple(point) for point in quad],
-        }
-
-    def clear_image_runtime_geometry(self, object_id: str) -> None:
-        self._image_runtime_geometry.pop(object_id, None)
 
     def _render_image_object(self, painter: QPainter, obj: ImageObject) -> None:
         image = self.images.image(obj.object_id)
         if image.isNull() and not obj.is_blender_linked:
             return
-        geometry = self._image_runtime_geometry.get(obj.object_id)
-        source_width = geometry["width"] if geometry else obj.pixel_width
-        source_height = geometry["height"] if geometry else obj.pixel_height
-        source = QRectF(0, 0, source_width, source_height)
+        source = QRectF(0, 0, obj.pixel_width, obj.pixel_height)
         destination = self._image_local_quad(obj)
         if obj.object_id in self._multi_transform_preview_quads:
             destination = list(self._multi_transform_preview_quads[obj.object_id])
@@ -8577,7 +8567,19 @@ class _CanvasLogic:
                             painter, cage[0], self._transform_pivot,
                             use_global_pivot=True,
                         )
-                if self.tool == ToolKind.BOUND_EDIT and layer.bound is not None:
+                if (
+                    layer.bound is not None
+                    and (
+                        self.tool == ToolKind.BOUND_EDIT
+                        or (
+                            layer.bound.primitive == "custom"
+                            and self.tool in {
+                                ToolKind.DRAW_SELECT_RECT,
+                                ToolKind.DRAW_SELECT_LASSO,
+                            }
+                        )
+                    )
+                ):
                     painter.save()
                     painter.setTransform(
                         self.layer_world_transform(layer.layer_id), True
@@ -12339,6 +12341,12 @@ class _CanvasLogic:
         if event.key() == Qt.Key_Delete and self._delete_selected_vector_points():
             event.accept()
             return
+        if (
+            event.key() == Qt.Key_Delete
+            and self._handle_delete_selected_shape_points()
+        ):
+            event.accept()
+            return
         if event.key() == Qt.Key_Escape:
             self.set_tool(ToolKind.OBJECT_SELECT)
         if (
@@ -13131,6 +13139,7 @@ class _CanvasLogic:
         self._hover_vector_stroke_id = ""
         self._selection_vector_preview.clear()
         self._selection_vector_points.clear()
+        self._selection_shape_nodes.clear()
         self._selection_vector_preview_revision += 1
         if reset_pivot:
             self._selection_pivot = None
@@ -13138,9 +13147,17 @@ class _CanvasLogic:
 
     def _drawing_selection_object(
         self,
-    ) -> RasterObject | VectorDrawingObject | None:
+    ) -> RasterObject | VectorDrawingObject | LayerNode | None:
         if self.chapter is None:
             return None
+        if self.selected_kind == "layer":
+            layer = self.chapter.layers.get(self.selected_id)
+            if (
+                layer is not None
+                and layer.bound is not None
+                and layer.bound.primitive == "custom"
+            ):
+                return layer
         candidate = self.chapter.objects.get(self.selected_object_id)
         return (
             candidate
@@ -13149,8 +13166,12 @@ class _CanvasLogic:
         )
 
     def _drawing_local_point(
-        self, obj: RasterObject | VectorDrawingObject, world: QPointF,
+        self, obj: RasterObject | VectorDrawingObject | LayerNode,
+        world: QPointF,
     ) -> QPointF:
+        if isinstance(obj, LayerNode):
+            inverse, valid = self.layer_world_transform(obj.layer_id).inverted()
+            return inverse.map(world) if valid else QPointF(world)
         return (
             self._raster_local_point(obj, world)
             if isinstance(obj, RasterObject)
@@ -13158,8 +13179,12 @@ class _CanvasLogic:
         )
 
     def _point_inside_drawing_bounds(
-        self, obj: RasterObject | VectorDrawingObject, world: QPointF,
+        self, obj: RasterObject | VectorDrawingObject | LayerNode,
+        world: QPointF,
     ) -> bool:
+        if isinstance(obj, LayerNode):
+            local = self._drawing_local_point(obj, world)
+            return QRectF(*obj.bound.bbox()).contains(local)
         if isinstance(obj, RasterObject):
             quad = self.object_world_quad(obj.object_id)
             if not quad:
@@ -13173,6 +13198,39 @@ class _CanvasLogic:
         local = self._drawing_local_point(obj, world)
         bounds = QRectF(*obj.derived_bounds())
         return not bounds.isEmpty() and bounds.contains(local)
+
+    def _drawing_selection_transform(
+        self, obj: RasterObject | VectorDrawingObject | LayerNode,
+    ) -> QTransform:
+        if isinstance(obj, LayerNode):
+            return self.layer_world_transform(obj.layer_id)
+        return self._drawing_local_to_world_transform(obj)
+
+    @staticmethod
+    def _shape_selection_nodes(layer: LayerNode) -> list[PathNode]:
+        if layer.bound is None:
+            return []
+        return [
+            node
+            for contour in layer.bound.iter_contours()
+            for node in contour.nodes
+        ]
+
+    def _set_shape_point_selection(
+        self, layer: LayerNode, point_ids: set[str], *,
+        preserve_primary: bool = True,
+    ) -> None:
+        ordered = self._shape_selection_nodes(layer)
+        live = {node.node_id for node in ordered}
+        selected = set(point_ids) & live
+        primary = self._selected_shape_node_id
+        self._selected_shape_node_ids = selected
+        if not selected:
+            self._selected_shape_node_id = ""
+        elif not preserve_primary or primary not in selected:
+            self._selected_shape_node_id = next(
+                node.node_id for node in ordered if node.node_id in selected
+            )
 
     @staticmethod
     def _selection_operation() -> str:
@@ -13228,7 +13286,8 @@ class _CanvasLogic:
         return result
 
     def _begin_drawing_selection_transform(
-        self, obj: RasterObject | VectorDrawingObject, world: QPointF,
+        self, obj: RasterObject | VectorDrawingObject | LayerNode,
+        world: QPointF,
     ) -> bool:
         quad = self._selection_transform_quad
         if not quad:
@@ -13283,6 +13342,7 @@ class _CanvasLogic:
         self._selection_rotate_quad = list(quad)
         self._selection_before_model = self.chapter.to_dict()
         self._selection_vector_points = {}
+        self._selection_shape_nodes = {}
         self._selection_vector_preview.clear()
         self._selection_vector_preview_revision += 1
         if isinstance(obj, VectorDrawingObject):
@@ -13297,6 +13357,12 @@ class _CanvasLogic:
                 for point in stroke.points
                 if point.point_id in self._selected_vector_point_ids
             }
+        elif isinstance(obj, LayerNode):
+            self._selection_shape_nodes = {
+                node.node_id: node.to_dict()
+                for node in self._shape_selection_nodes(obj)
+                if node.node_id in self._selected_shape_node_ids
+            }
         else:
             self._selection_before_tiles = self.tiles.object_tiles(
                 obj.object_id
@@ -13307,7 +13373,8 @@ class _CanvasLogic:
         return True
 
     def _update_drawing_selection_transform(
-        self, obj: RasterObject | VectorDrawingObject, world: QPointF,
+        self, obj: RasterObject | VectorDrawingObject | LayerNode,
+        world: QPointF,
     ) -> None:
         start = self._selection_transform_start_quad
         if not start:
@@ -13379,37 +13446,65 @@ class _CanvasLogic:
         if not self._quad_is_valid(target):
             return
         self._selection_transform_quad = target
-        if isinstance(obj, VectorDrawingObject):
+        if isinstance(obj, (VectorDrawingObject, LayerNode)):
             world_transform = self._quad_to_quad_transform(start, target)
-            local_to_world = self._drawing_local_to_world_transform(obj)
+            local_to_world = self._drawing_selection_transform(obj)
             world_to_local, valid = local_to_world.inverted()
             if not valid:
                 return
-            width_scale = math.sqrt(abs(world_transform.determinant()))
-            self._selection_vector_preview = {}
-            for point_id, source in self._selection_vector_points.items():
-                mapped = world_to_local.map(world_transform.map(
-                    local_to_world.map(QPointF(*source["position"]))
-                ))
-                incoming = source["incoming"]
-                if incoming is not None:
-                    incoming = world_to_local.map(world_transform.map(
-                        local_to_world.map(QPointF(*incoming))
-                    )).toTuple()
-                outgoing = source["outgoing"]
-                if outgoing is not None:
-                    outgoing = world_to_local.map(world_transform.map(
-                        local_to_world.map(QPointF(*outgoing))
-                    )).toTuple()
-                self._selection_vector_preview[point_id] = {
-                    "position": mapped.toTuple(),
-                    "incoming": incoming,
-                    "outgoing": outgoing,
-                    "width": max(
-                        1.0, min(1000.0, float(source["width"]) * width_scale)
-                    ),
+            if isinstance(obj, VectorDrawingObject):
+                width_scale = math.sqrt(abs(world_transform.determinant()))
+                self._selection_vector_preview = {}
+                for point_id, source in self._selection_vector_points.items():
+                    mapped = world_to_local.map(world_transform.map(
+                        local_to_world.map(QPointF(*source["position"]))
+                    ))
+                    incoming = source["incoming"]
+                    if incoming is not None:
+                        incoming = world_to_local.map(world_transform.map(
+                            local_to_world.map(QPointF(*incoming))
+                        )).toTuple()
+                    outgoing = source["outgoing"]
+                    if outgoing is not None:
+                        outgoing = world_to_local.map(world_transform.map(
+                            local_to_world.map(QPointF(*outgoing))
+                        )).toTuple()
+                    self._selection_vector_preview[point_id] = {
+                        "position": mapped.toTuple(),
+                        "incoming": incoming,
+                        "outgoing": outgoing,
+                        "width": max(
+                            1.0,
+                            min(
+                                1000.0,
+                                float(source["width"]) * width_scale,
+                            ),
+                        ),
+                    }
+                self._selection_vector_preview_revision += 1
+            elif obj.bound is not None:
+                by_id = {
+                    node.node_id: node
+                    for node in self._shape_selection_nodes(obj)
                 }
-            self._selection_vector_preview_revision += 1
+                for node_id, source in self._selection_shape_nodes.items():
+                    node = by_id.get(node_id)
+                    if node is None:
+                        continue
+                    node.position = world_to_local.map(world_transform.map(
+                        local_to_world.map(QPointF(*source["position"]))
+                    )).toTuple()
+                    for key in ("incoming", "outgoing"):
+                        control = source.get(key)
+                        setattr(
+                            node,
+                            key,
+                            world_to_local.map(world_transform.map(
+                                local_to_world.map(QPointF(*control))
+                            )).toTuple()
+                            if control is not None else None,
+                        )
+                obj.bound.normalize_bezier_handles()
         dirty = QPolygonF([
             QPointF(*candidate) for candidate in previous_quad
         ]).boundingRect().united(QPolygonF([
@@ -13419,6 +13514,11 @@ class _CanvasLogic:
             if self._object_is_mask_contributor(obj.object_id):
                 self._invalidate_tone_mask_overlay()
             dirty = self.modifier_expanded_dirty(obj.object_id, dirty)
+        elif isinstance(obj, LayerNode):
+            dirty = self._entity_expanded_dirty(
+                "layer", obj.layer_id, dirty
+            )
+            self.documentChanged.emit(dirty)
         self._mark_scene_dirty_world(dirty)
         self.update()
 
@@ -13428,6 +13528,7 @@ class _CanvasLogic:
     ) -> None:
         self.replace_chapter(model)
         self._selection_vector_preview.clear()
+        self._selection_shape_nodes.clear()
         self._selection_vector_preview_revision += 1
         self._selection_transform_quad = (
             list(quad) if quad is not None else None
@@ -13439,7 +13540,7 @@ class _CanvasLogic:
         self.update()
 
     def _finish_drawing_selection_transform(
-        self, obj: RasterObject | VectorDrawingObject,
+        self, obj: RasterObject | VectorDrawingObject | LayerNode,
     ) -> bool:
         mode = self._selection_transform_mode
         self._selection_transform_mode = None
@@ -13447,6 +13548,7 @@ class _CanvasLogic:
         if mode == "pivot":
             self._selection_before_model = None
             self._selection_before_tiles = None
+            self._selection_shape_nodes.clear()
             self.update()
             return True
         before = self._selection_before_model
@@ -13498,6 +13600,36 @@ class _CanvasLogic:
                         already_done=True,
                     )
             self._vector_changed(changed_stroke_ids=changed_strokes)
+        elif isinstance(obj, LayerNode):
+            self._selection_shape_nodes.clear()
+            if before is not None:
+                after = self.chapter.to_dict()
+                if before != after:
+                    before_quad = list(
+                        self._selection_transform_start_quad or []
+                    ) or None
+                    after_quad = list(
+                        self._selection_transform_quad or []
+                    ) or None
+                    pivot = (
+                        QPointF(self._selection_pivot)
+                        if self._selection_pivot is not None else None
+                    )
+                    pivot_custom = self._selection_pivot_custom
+                    self.command_stack.push(
+                        CallbackCommand(
+                            "Transform shape point selection",
+                            lambda: self._restore_drawing_transform_model(
+                                after, after_quad, pivot, pivot_custom
+                            ),
+                            lambda: self._restore_drawing_transform_model(
+                                before, before_quad, pivot, pivot_custom
+                            ),
+                        ),
+                        already_done=True,
+                    )
+                    self.documentChanged.emit(QRectF())
+                    self.hierarchyChanged.emit()
         elif self._selection_before_tiles is not None:
             self._commit_raster_selection_transform(
                 obj, self._selection_before_tiles
@@ -13662,6 +13794,15 @@ class _CanvasLogic:
                     for point in stroke.points
                 },
             )
+        elif isinstance(obj, LayerNode):
+            self._set_shape_point_selection(
+                obj,
+                {
+                    node.node_id
+                    for node in self._shape_selection_nodes(obj)
+                },
+                preserve_primary=False,
+            )
         else:
             bounds = self.tiles.content_bounds(obj.object_id)
             if bounds is None:
@@ -13676,6 +13817,28 @@ class _CanvasLogic:
     def has_active_text_edit(self) -> bool:
         """Return whether keyboard commands currently belong to canvas text."""
         return bool(self._text_editing and self._editing_text_object() is not None)
+
+    def current_text_edit_target(self) -> TextObject | None:
+        """Return the text object that owns canvas keyboard input, if any."""
+        return self._editing_text_object()
+
+    def start_text_edit(self, *, select_all: bool = False) -> bool:
+        """Focus and begin editing the selected text object."""
+        if self.tool != ToolKind.TEXT_EDIT and not self.set_tool(ToolKind.TEXT_EDIT):
+            return False
+        obj = self._editing_text_object()
+        if obj is None:
+            return False
+        self._begin_text_session(obj)
+        if select_all:
+            self._text_selection_anchor = 0
+            self._text_cursor_position = len(obj.text)
+        else:
+            self._text_cursor_position = len(obj.text)
+            self._text_selection_anchor = self._text_cursor_position
+        self.setFocus(Qt.OtherFocusReason)
+        self.update()
+        return True
 
     def select_all(self) -> bool:
         """Select text in an active editor, otherwise the active drawing."""
@@ -13695,7 +13858,7 @@ class _CanvasLogic:
         bounds = QRectF()
         if isinstance(obj, RasterObject):
             bounds = self._drawing_selection_path.boundingRect()
-        else:
+        elif isinstance(obj, VectorDrawingObject):
             points = [
                 point
                 for stroke in obj.strokes
@@ -13712,10 +13875,26 @@ class _CanvasLogic:
                     bounds.adjust(-0.5, 0, 0.5, 0)
                 if bounds.height() < 1:
                     bounds.adjust(0, -0.5, 0, 0.5)
+        else:
+            points = [
+                node
+                for node in self._shape_selection_nodes(obj)
+                if node.node_id in self._selected_shape_node_ids
+            ]
+            if points:
+                left = min(node.x for node in points)
+                right = max(node.x for node in points)
+                top = min(node.y for node in points)
+                bottom = max(node.y for node in points)
+                bounds = QRectF(left, top, right - left, bottom - top)
+                if bounds.width() < 1:
+                    bounds.adjust(-0.5, 0, 0.5, 0)
+                if bounds.height() < 1:
+                    bounds.adjust(0, -0.5, 0, 0.5)
         if bounds.isNull() or bounds.isEmpty():
             self._selection_transform_quad = None
             return
-        transform = self._drawing_local_to_world_transform(obj)
+        transform = self._drawing_selection_transform(obj)
         self._selection_transform_quad = [
             transform.map(QPointF(*point)).toTuple()
             for point in self._rect_quad(bounds)
@@ -13880,6 +14059,10 @@ class _CanvasLogic:
                     self._clear_drawing_selection()
                     if isinstance(obj, VectorDrawingObject):
                         self._set_vector_selection(obj, set(), set())
+                    elif isinstance(obj, LayerNode):
+                        self._set_shape_point_selection(
+                            obj, set(), preserve_primary=False
+                        )
                 self.update()
                 return True
             polygon = QPolygonF(gesture)
@@ -13931,6 +14114,24 @@ class _CanvasLogic:
                 points = self._selected_vector_point_ids - selected_points
                 strokes = self._stroke_ids_containing_points(obj, points)
             self._set_vector_selection(obj, strokes, points)
+        elif isinstance(obj, LayerNode):
+            selected_points = {
+                node.node_id
+                for node in self._shape_selection_nodes(obj)
+                if region.contains(QPointF(node.x, node.y))
+            }
+            if self._drawing_selection_operation == "replace":
+                points = selected_points
+                preserve_primary = False
+            elif self._drawing_selection_operation == "add":
+                points = self._selected_shape_node_ids | selected_points
+                preserve_primary = True
+            else:
+                points = self._selected_shape_node_ids - selected_points
+                preserve_primary = True
+            self._set_shape_point_selection(
+                obj, points, preserve_primary=preserve_primary
+            )
         else:
             current = self._drawing_selection_path
             if self._drawing_selection_operation == "replace":
@@ -13961,7 +14162,7 @@ class _CanvasLogic:
         obj = self._drawing_selection_object()
         if obj is None:
             return
-        transform = self._drawing_local_to_world_transform(obj)
+        transform = self._drawing_selection_transform(obj)
         painter.save()
         painter.setBrush(Qt.NoBrush)
         painter.setPen(QPen(
@@ -18579,7 +18780,56 @@ class _CanvasLogic:
         contour.nodes.remove(node)
         bound.normalize_bezier_handles()
         self._selected_shape_node_id = ""
+        self._selected_shape_node_ids.clear()
         self._push_immediate_shape_change(before, "Delete shape point")
+        return True
+
+    def _handle_delete_selected_shape_points(self) -> bool:
+        if (
+            self.chapter is None
+            or self.selected_kind != "layer"
+            or self.tool not in {
+                ToolKind.SHAPE_EDIT,
+                ToolKind.DRAW_SELECT_RECT,
+                ToolKind.DRAW_SELECT_LASSO,
+            }
+        ):
+            return False
+        layer = self.chapter.layers.get(self.selected_id)
+        if (
+            layer is None
+            or layer.bound is None
+            or layer.bound.primitive != "custom"
+        ):
+            return False
+        live = {
+            node.node_id for node in self._shape_selection_nodes(layer)
+        }
+        selected = set(self._selected_shape_node_ids) & live
+        if self._selected_shape_node_id in live:
+            selected.add(self._selected_shape_node_id)
+        if not selected:
+            return False
+        for contour in layer.bound.iter_contours():
+            selected_count = sum(
+                node.node_id in selected for node in contour.nodes
+            )
+            minimum = 3 if contour.closed else 2
+            if selected_count and len(contour.nodes) - selected_count < minimum:
+                return True
+        before = self.chapter.to_dict()
+        for contour in layer.bound.iter_contours():
+            contour.nodes[:] = [
+                node for node in contour.nodes
+                if node.node_id not in selected
+            ]
+        layer.bound.normalize_bezier_handles()
+        self._selected_shape_node_id = ""
+        self._selected_shape_node_ids.clear()
+        self._reset_drawing_selection_frame()
+        self._push_immediate_shape_change(
+            before, "Delete shape point selection"
+        )
         return True
 
     def _maximum_shape_roundness(
@@ -21157,6 +21407,13 @@ class _CanvasLogic:
                 self._selected_shape_node_id
                 and self.tool in {ToolKind.SHAPE_EDIT, ToolKind.BOUND_EDIT}
             )
+            or (
+                self._selected_shape_node_ids
+                and self.tool in {
+                    ToolKind.DRAW_SELECT_RECT,
+                    ToolKind.DRAW_SELECT_LASSO,
+                }
+            )
         )
 
     def _delete_selected_vector_points(self) -> bool:
@@ -21644,9 +21901,9 @@ class _CanvasLogic:
         obj = self._editing_text_object()
         if obj is None:
             return
+        start, end = self._text_selection_range()
         self._begin_text_session(obj)
         self._remember_text_state(obj)
-        start, end = self._text_selection_range()
         obj.text = obj.text[:start] + value + obj.text[end:]
         self._text_cursor_position = start + len(value)
         self._text_selection_anchor = self._text_cursor_position

@@ -26,24 +26,26 @@ def _blender_45() -> str | None:
     return None
 
 
-def test_extension_manifest_declares_blender_45_windows_and_network_permission():
+def test_extension_manifest_declares_blender_45_windows_and_io_permissions():
     manifest = tomllib.loads(
         (EXTENSION / "blender_manifest.toml").read_text(encoding="utf-8")
     )
     assert manifest["schema_version"] == "1.0.0"
     assert manifest["id"] == "webtoon_comic_views"
-    assert manifest["version"] == "0.3.0"
+    assert manifest["version"] == "0.5.1"
     assert manifest["blender_version_min"] == "4.5.0"
     assert manifest["platforms"] == ["windows-x64"]
     assert "network" in manifest["permissions"]
+    assert "files" in manifest["permissions"]
 
 
-def test_blender_background_state_bridge_and_transport_probe():
+def test_blender_background_state_bridge_and_publication_probe(tmp_path):
     executable = _blender_45()
     if executable is None:
         pytest.skip("Blender 4.5 LTS is not installed")
     environment = dict(os.environ)
     environment["WEBTOON_EXTENSION_ROOT"] = str(EXTENSION)
+    environment["WEBTOON_COMIC_VIEW_FRAME_ROOT"] = str(tmp_path / "frames")
     result = subprocess.run(
         [
             executable, "--factory-startup", "--background", "--python",
@@ -100,7 +102,7 @@ def test_extension_installs_and_enables_from_restricted_registration_context(
         check=False,
     )
     assert build.returncode == 0, build.stdout + "\n" + build.stderr
-    package = package_dir / "webtoon_comic_views-0.3.0.zip"
+    package = package_dir / "webtoon_comic_views-0.5.1.zip"
     assert package.is_file()
 
     environment = dict(os.environ)

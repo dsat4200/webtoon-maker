@@ -12,10 +12,13 @@ from bpy.props import (
 )
 from bpy.types import AddonPreferences, Operator, Panel, PropertyGroup, UIList
 
-from . import bridge, renderer, viewport
+from . import bridge, diagnostics, renderer, viewport
 from .state import (
     ensure_uuid, migrate_legacy_presentation, parse_state, state_digest, state_json,
 )
+
+
+EXTENSION_VERSION = "0.5.1"
 
 
 def _resolution_changed(item: object, _context: object) -> None:
@@ -119,6 +122,12 @@ class WebtoonComicView(PropertyGroup):
     previous_state_hash: StringProperty(name="Previous State Hash")
     thumbnail_image: StringProperty(name="Thumbnail Image")
     thumbnail_png: StringProperty(name="Thumbnail PNG")
+    published_frame_path: StringProperty(name="Published Frame Path")
+    timeline_frame: IntProperty(
+        name="Timeline Frame", default=0, min=0,
+        description="Extension-managed frame containing this Comic View snapshot",
+    )
+    bake_hash: StringProperty(name="Timeline Bake Hash", options={"HIDDEN"})
     is_dirty: BoolProperty(name="Dirty", default=False)
     created_at: FloatProperty(name="Created", default=0.0)
     updated_at: FloatProperty(name="Updated", default=0.0)
@@ -140,6 +149,10 @@ class WebtoonComicSettings(PropertyGroup):
     )
     registered_index: IntProperty(name="Registered Property", default=-1)
     loaded_view_uuid: StringProperty(name="Loaded Comic View")
+    next_timeline_frame: IntProperty(
+        name="Next Comic View Timeline Frame", default=0, min=0,
+        options={"HIDDEN"},
+    )
     show_stream_frame_overlay: BoolProperty(
         name="Show Stream Frame Overlay", default=True,
         update=_overlay_visibility_changed,
@@ -200,7 +213,18 @@ def _ensure_project_uuid(scene: bpy.types.Scene) -> None:
 
 def _report_warnings(operator: Operator, warnings: list[str]) -> None:
     if warnings:
+        diagnostics.record(
+            "WARNING", "Operation completed with warnings", count=len(warnings),
+            warnings="; ".join(warnings),
+        )
         operator.report({"WARNING"}, f"Applied with {len(warnings)} warning(s)")
+
+
+def _operator_failed(operator: Operator, action: str, error: BaseException) -> None:
+    message = f"{action}: {error}"
+    bridge.RUNTIME.last_error = message
+    diagnostics.record_exception(f"{action} failed", error)
+    operator.report({"ERROR"}, message)
 
 
 def _restore_view_presentation(view: object, stored_state: dict) -> None:
@@ -249,7 +273,7 @@ class WEBTOON_OT_new_comic_view(Operator):
             _settings(scene).loaded_view_uuid = view.view_uuid
         except Exception as error:
             views.remove(len(views) - 1)
-            self.report({"ERROR"}, str(error))
+            _operator_failed(self, "Create Comic View", error)
             return {"CANCELLED"}
         _report_warnings(self, warnings)
         return {"FINISHED"}
@@ -280,6 +304,18 @@ class WEBTOON_OT_duplicate_comic_view(Operator):
         target.created_at = target.updated_at = time.time()
         target.is_dirty = False
         _settings(context.scene).active_index = len(_views(context.scene)) - 1
+        try:
+            bridge.RUNTIME.load_view_state(context.scene, target)
+            bridge.RUNTIME.duplicate_published_frame(
+                context.scene, source, target
+            )
+        except (OSError, RuntimeError, ValueError) as error:
+            if not target.timeline_frame:
+                _views(context.scene).remove(len(_views(context.scene)) - 1)
+                _select_index(context.scene, source.view_uuid)
+                _operator_failed(self, "Duplicate Comic View", error)
+                return {"CANCELLED"}
+            target.published_frame_path = ""
         bridge.RUNTIME.send_views(context.scene)
         return {"FINISHED"}
 
@@ -296,7 +332,7 @@ class WEBTOON_OT_save_comic_view(Operator):
         try:
             warnings = bridge.RUNTIME.save_view_state(context.scene, view)
         except Exception as error:
-            self.report({"ERROR"}, str(error))
+            _operator_failed(self, "Save Comic View", error)
             return {"CANCELLED"}
         _report_warnings(self, warnings)
         return {"FINISHED"}
@@ -314,11 +350,31 @@ class WEBTOON_OT_load_comic_view(Operator):
         try:
             warnings = bridge.RUNTIME.load_view_state(context.scene, view)
         except Exception as error:
-            self.report({"ERROR"}, str(error))
+            _operator_failed(self, "Load Comic View", error)
             return {"CANCELLED"}
         _settings(context.scene).loaded_view_uuid = view.view_uuid
         _report_warnings(self, warnings)
         return {"FINISHED"}
+
+
+def _render_active_view(
+    operator: Operator, context: bpy.types.Context,
+) -> set[str]:
+    view = _active_view(context.scene)
+    if view is None or not view.state_json:
+        diagnostics.record(
+            "WARNING", "Render canceled because the active Comic View has no saved state",
+        )
+        operator.report({"ERROR"}, "Save the Comic View before rendering")
+        return {"CANCELLED"}
+    try:
+        warnings = bridge.RUNTIME.render_saved_view(context.scene, view)
+    except Exception as error:
+        _operator_failed(operator, "Render Comic View", error)
+        return {"CANCELLED"}
+    _report_warnings(operator, warnings)
+    operator.report({"INFO"}, f"Published revision {view.revision}")
+    return {"FINISHED"}
 
 
 class WEBTOON_OT_render_comic_view(Operator):
@@ -326,23 +382,17 @@ class WEBTOON_OT_render_comic_view(Operator):
     bl_label = "Render Saved Comic View"
 
     def execute(self, context: bpy.types.Context) -> set[str]:
-        view = _active_view(context.scene)
-        if view is None or not view.state_json:
-            return {"CANCELLED"}
-        try:
-            warnings = bridge.RUNTIME.render_saved_view(context.scene, view)
-        except Exception as error:
-            self.report({"ERROR"}, str(error))
-            return {"CANCELLED"}
-        _report_warnings(self, warnings)
-        return {"FINISHED"}
+        return _render_active_view(self, context)
 
 
-class WEBTOON_OT_update_comic_view(WEBTOON_OT_render_comic_view):
+class WEBTOON_OT_update_comic_view(Operator):
     """Compatibility alias retained for scripts using the old operator."""
 
     bl_idname = "webtoon.update_comic_view"
     bl_label = "Render Saved Comic View"
+
+    def execute(self, context: bpy.types.Context) -> set[str]:
+        return _render_active_view(self, context)
 
 
 class WEBTOON_OT_delete_comic_view(Operator):
@@ -360,8 +410,7 @@ class WEBTOON_OT_delete_comic_view(Operator):
         view = _active_view(scene)
         if view is None:
             return {"CANCELLED"}
-        if bridge.RUNTIME.active_stream_uuid == view.view_uuid:
-            bridge.RUNTIME.stop_stream()
+        deleted_view_uuid = view.view_uuid
         thumbnail = view.thumbnail_image
         _views(scene).remove(index)
         _settings(scene).active_index = min(index, len(_views(scene)) - 1)
@@ -371,6 +420,7 @@ class WEBTOON_OT_delete_comic_view(Operator):
             image = bpy.data.images.get(thumbnail)
             if image is not None:
                 bpy.data.images.remove(image)
+        bridge.RUNTIME.delete_published_frames(scene, deleted_view_uuid)
         bridge.RUNTIME.send_views(scene)
         return {"FINISHED"}
 
@@ -392,7 +442,7 @@ class WEBTOON_OT_revert_comic_view(Operator):
         try:
             warnings = bridge.RUNTIME.revert_view_state(context.scene, view)
         except Exception as error:
-            self.report({"ERROR"}, str(error))
+            _operator_failed(self, "Revert Comic View", error)
             return {"CANCELLED"}
         _report_warnings(self, warnings)
         return {"FINISHED"}
@@ -528,13 +578,13 @@ class WEBTOON_OT_activate_comic_view(Operator):
                 try:
                     bridge.RUNTIME.save_view_state(context.scene, current)
                 except Exception as error:
-                    self.report({"ERROR"}, str(error))
+                    _operator_failed(self, "Save Comic View before switching", error)
                     _select_index(context.scene, current.view_uuid)
                     return {"CANCELLED"}
         try:
             bridge.RUNTIME._activate(context.scene, destination)
         except Exception as error:
-            self.report({"ERROR"}, str(error))
+            _operator_failed(self, "Activate Comic View", error)
             if current is not None:
                 _select_index(context.scene, current.view_uuid)
             return {"CANCELLED"}
@@ -554,8 +604,7 @@ class WEBTOON_OT_start_bridge(Operator):
         try:
             bridge.RUNTIME.start_server(preferences.port, preferences.token)
         except OSError as error:
-            bridge.RUNTIME.last_error = str(error)
-            self.report({"ERROR"}, str(error))
+            _operator_failed(self, "Start bridge", error)
             return {"CANCELLED"}
         return {"FINISHED"}
 
@@ -566,6 +615,24 @@ class WEBTOON_OT_stop_bridge(Operator):
 
     def execute(self, _context: bpy.types.Context) -> set[str]:
         bridge.RUNTIME.stop_server()
+        return {"FINISHED"}
+
+
+class WEBTOON_OT_copy_logs(Operator):
+    bl_idname = "webtoon.copy_logs"
+    bl_label = "Copy Webtoon Comic Views Logs"
+    bl_description = "Copy extension diagnostics and recent errors to the clipboard"
+
+    def execute(self, context: bpy.types.Context) -> set[str]:
+        report = diagnostics.build_report(
+            context,
+            bridge.RUNTIME,
+            extension_version=EXTENSION_VERSION,
+            protocol_version=bridge.PROTOCOL_VERSION,
+        )
+        context.window_manager.clipboard = report
+        diagnostics.record("INFO", "Diagnostic report copied to clipboard")
+        self.report({"INFO"}, "Webtoon Comic Views logs copied")
         return {"FINISHED"}
 
 
@@ -693,6 +760,7 @@ class WEBTOON_PT_comic_views(Panel):
         row = bridge_box.row(align=True)
         row.operator("webtoon.start_bridge", text="Start / Restart")
         row.operator("webtoon.stop_bridge", text="Stop")
+        bridge_box.operator("webtoon.copy_logs", text="Copy Logs")
         if bridge.RUNTIME.last_error:
             bridge_box.label(text=bridge.RUNTIME.last_error, icon="ERROR")
 
@@ -708,7 +776,8 @@ class WEBTOON_PT_comic_views(Panel):
         if view is not None:
             image = bpy.data.images.get(view.thumbnail_image)
             if image is not None:
-                layout.template_preview(image, show_buttons=False)
+                image.preview_ensure()
+                layout.template_icon(icon_value=image.preview.icon_id, scale=6.0)
             layout.prop(view, "name")
             row = layout.row(align=True)
             row.prop(view, "width")
@@ -733,6 +802,16 @@ class WEBTOON_PT_comic_views(Panel):
             revert_row.operator("webtoon.revert_comic_view", text="Revert")
             layout.operator("webtoon.render_comic_view", text="Render")
             layout.label(text=f"Revision {view.revision}")
+            layout.label(text=(
+                f"Timeline frame {view.timeline_frame}"
+                if view.timeline_frame > 0 else
+                "Timeline frame will be assigned on first use"
+            ))
+            layout.label(text=(
+                "Bake status: Ready"
+                if view.timeline_frame > 0 and view.bake_hash else
+                "Bake status: Pending"
+            ))
             if view.is_dirty:
                 layout.label(text="Stored view has unsaved scene changes", icon="ERROR")
 
@@ -759,8 +838,6 @@ def _depsgraph_updated(_scene: object, _depsgraph: object) -> None:
 @persistent
 def _load_post(_unused: object) -> None:
     _initialize_scenes()
-    bridge.RUNTIME.stop_stream()
-    bridge.RUNTIME.frame_dirty = False
 
 
 CLASSES = (
@@ -780,6 +857,7 @@ CLASSES = (
     WEBTOON_OT_activate_comic_view,
     WEBTOON_OT_start_bridge,
     WEBTOON_OT_stop_bridge,
+    WEBTOON_OT_copy_logs,
     WEBTOON_OT_include_property,
     WEBTOON_OT_remove_registered_property,
     WEBTOON_UL_comic_views,
@@ -827,6 +905,16 @@ def _initialize_scenes() -> bool:
         active is not None and active.state_json and not active.is_dirty
     )
     bridge.RUNTIME.ignore_updates_until = time.monotonic() + 0.3
+    migration_pending = any(
+        view.state_json and (not view.timeline_frame or not view.bake_hash)
+        for view in getattr(active_scene, "webtoon_comic_views", ())
+    ) if active_scene is not None else False
+    if active is not None and active.state_json and migration_pending:
+        try:
+            bridge.RUNTIME.load_view_state(active_scene, active)
+        except Exception as error:
+            bridge.RUNTIME.last_error = f"Timeline migration failed: {error}"
+            diagnostics.record_exception("Timeline migration failed", error)
     return True
 
 
@@ -842,6 +930,7 @@ def _start_after_register() -> float | None:
         bridge.RUNTIME.start_server(preferences.port, preferences.token)
     except OSError as error:
         bridge.RUNTIME.last_error = str(error)
+        diagnostics.record_exception("Automatic bridge start failed", error)
     return None
 
 
@@ -865,10 +954,15 @@ def register() -> None:
     if not bpy.app.timers.is_registered(_start_after_register):
         bpy.app.timers.register(_start_after_register, first_interval=0.2)
     viewport.register_overlay()
+    diagnostics.record(
+        "INFO", "Extension registered", version=EXTENSION_VERSION,
+        protocol=bridge.PROTOCOL_VERSION,
+    )
 
 
 def unregister() -> None:
     global _selection_timer_registered, _pending_selection_uuid
+    diagnostics.record("INFO", "Extension unregistering", version=EXTENSION_VERSION)
     viewport.unregister_overlay()
     bridge.RUNTIME.stop_server()
     if bpy.app.timers.is_registered(_activate_selected_timer):
