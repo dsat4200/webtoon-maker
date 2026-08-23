@@ -210,15 +210,15 @@ Defines small extensibility registries for object and bound types. It registers 
 
 ### `comic_editor/core/settings.py`
 
-Defines per-user editor settings, version 21, including persisted global grid defaults/visibility and the loopback Blender bridge endpoint and token.
+Defines per-user editor settings, version 22, including persisted global grid defaults/visibility and the loopback Blender bridge endpoint and token.
 
-- Supplies default hotkeys (including Gradient, Eyedropper, Reset Rotation, and Paste Image) and Hold flags (Eyedropper only).
+- Supplies default hotkeys (including Gradient, Eyedropper, Reset Rotation, Deselect, unified Paste, and unassigned drawing Cut/Copy/Paste as New) and Hold flags (Eyedropper only).
 - Defines validated formatting-only `TextPreset` values.
 - Defines fill subtool profiles with 36 blend modes, tolerance, gap, scaling, reference mode, stabilization, and exclusion flags.
 - Defines `EditorSettings` for renderer/navigation, brushes, presets, hotkeys, vector/fill/transform modes, mask pencil alpha values, splitter sizes, navigator expansion, and recent projects.
 - Normalizes all ranges and protects default presets.
 - Locates the platform config file with `QStandardPaths`.
-- Loads versions 1–20 with progressive backfills and saves through temp-file replacement.
+- Loads versions 1–21 with progressive backfills, migrates Paste Image to unified Paste, and saves through temp-file replacement.
 
 ### `comic_editor/core/tiles.py`
 
@@ -537,7 +537,7 @@ Covers contextual page visibility/routing, workspace splitter resizing, bottom-l
 
 ### `tests/test_settings.py`
 
-Covers missing/partial/null settings, default hotkey merging, clean-window configuration, migrations through version 21, grid value clamping, vector/fill value clamping, splitter normalization, rectangle-mode clamping, font-preview persistence, protected integer-sized text presets, and the Blender bridge endpoint clamp/persist.
+Covers missing/partial/null settings, default hotkey merging, clean-window configuration, migrations through version 22, grid value clamping, unified Paste migration, vector/fill value clamping, splitter normalization, rectangle-mode clamping, font-preview persistence, protected integer-sized text presets, and the Blender bridge endpoint clamp/persist.
 
 ### `tests/test_shape_paths.py`
 

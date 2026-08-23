@@ -7,7 +7,9 @@ from PySide6.QtGui import QPointingDevice, QTabletEvent
 from PySide6.QtWidgets import QApplication, QMessageBox
 
 from comic_editor.core.models import (
-    BoundGeometry, ChapterDocument, PathNode, RasterObject,
+    BlurModifier, BoundGeometry, ChapterDocument, ImageObject, PathNode,
+    RasterObject, TextObject, VectorDrawingObject, VectorStroke,
+    VectorStrokePoint,
 )
 from comic_editor.core.settings import EditorSettings
 from comic_editor.core.tiles import TileStore
@@ -51,9 +53,7 @@ def test_new_page_outline_defaults_and_page_limit():
     assert page.border_width == 40
 
 
-def test_drawn_page_inserts_after_active_and_shifts_lower_pages(
-    qapp, monkeypatch,
-):
+def test_add_page_starts_shape_creation_without_gap_prompt(qapp, monkeypatch):
     window = MainWindow()
     chapter = ChapterDocument(height=1200)
     active = chapter.add_page(
@@ -65,21 +65,12 @@ def test_drawn_page_inserts_after_active_and_shifts_lower_pages(
     window._set_chapter(chapter, TileStore())
     window.canvas.set_selection("layer", active.layer_id)
     monkeypatch.setattr(window, "_choose_page_shape", lambda: "rectangle")
-    monkeypatch.setattr(
-        window, "_choose_add_page_gap_action", lambda: "insert"
-    )
     try:
         window._add_page()
-        assert window.canvas._page_creation_anchor_id == ""
-        assert (
-            window.canvas.page_gap_transaction()["origin"] == "add_page"
-        )
-        assert not window.page_gap_confirmation.isHidden()
-        assert chapter.layers[lower.layer_id].translate_y == 370
-        assert not window.canvas.command_stack.can_undo
-        window._confirm_page_gap()
-        assert window.page_gap_confirmation.isHidden()
         assert window.canvas._page_creation_anchor_id == active.layer_id
+        assert window.canvas.page_gap_transaction() is None
+        assert window.page_gap_confirmation.isHidden()
+        assert chapter.layers[lower.layer_id].translate_y == 250
         assert window.canvas._finish_pending_page_bound(
             BoundGeometry.rectangle(0, 120, 500, 100)
         )
@@ -88,46 +79,13 @@ def test_drawn_page_inserts_after_active_and_shifts_lower_pages(
         assert chapter.root_page_ids == [
             active.layer_id, new_id, lower.layer_id,
         ]
-        assert chapter.layers[lower.layer_id].translate_y == 370
+        assert chapter.layers[lower.layer_id].translate_y == 250
         assert window.canvas.tool == ToolKind.SHAPE_EDIT
-        assert window.canvas._page_gap_state is None
         window.canvas.command_stack.undo()
         assert window.chapter.root_page_ids == [
             active.layer_id, lower.layer_id,
         ]
         assert window.chapter.layers[lower.layer_id].translate_y == 250
-    finally:
-        window._dirty = False
-        window.close()
-
-
-def test_declining_page_shift_keeps_overlap_and_has_no_gap_editor(
-    qapp, monkeypatch,
-):
-    window = MainWindow()
-    chapter = ChapterDocument(height=1200)
-    active = chapter.add_page(
-        "Page 1", BoundGeometry.rectangle(0, 0, 500, 100)
-    )
-    lower = chapter.add_page(
-        "Page 2", BoundGeometry.rectangle(0, 0, 500, 100), y=180
-    )
-    window._set_chapter(chapter, TileStore())
-    window.canvas.set_selection("layer", active.layer_id)
-    monkeypatch.setattr(
-        window, "_choose_add_page_gap_action", lambda: "continue"
-    )
-    monkeypatch.setattr(window, "_choose_page_shape", lambda: "rectangle")
-    try:
-        window._add_page()
-        assert window.canvas._finish_pending_page_bound(
-            BoundGeometry.rectangle(0, 120, 500, 100)
-        )
-        assert chapter.layers[lower.layer_id].translate_y == 180
-        assert window.canvas._page_gap_state is None
-        assert window.canvas.selected_id not in {
-            active.layer_id, lower.layer_id,
-        }
     finally:
         window._dirty = False
         window.close()
@@ -244,35 +202,6 @@ def test_failed_page_ack_keeps_draft_available_for_retry(qapp):
     assert canvas._page_creation_draft is not None
     assert canvas._page_creation_committing is False
     assert len(canvas._creation_points) == 2
-
-
-def test_confirmed_page_gap_rejects_draft_outside_guides(qapp):
-    chapter = ChapterDocument(height=1400)
-    active = chapter.add_page(
-        bound=BoundGeometry.rectangle(0, 0, 400, 200)
-    )
-    lower = chapter.add_page(
-        bound=BoundGeometry.rectangle(0, 0, 400, 200), y=500
-    )
-    canvas = CanvasWidget(EditorSettings())
-    canvas.set_document(chapter, TileStore())
-    assert canvas.begin_page_gap_transaction(
-        "add_page", active.layer_id, [active.layer_id],
-        [lower.layer_id], 200,
-    )
-    transaction = canvas.confirm_page_gap_transaction()
-    assert canvas.begin_page_creation(
-        active.layer_id, "rectangle",
-        before=transaction["before"], gap_bounds=(200, 320),
-    )
-    messages = []
-    canvas.pageCreationInvalid.connect(messages.append)
-
-    assert not canvas._finish_pending_page_bound(
-        BoundGeometry.rectangle(0, 220, 300, 140)
-    )
-    assert messages[-1].startswith("Keep the complete page")
-    assert canvas._page_creation_anchor_id == active.layer_id
 
 
 def test_main_window_mouse_page_primitives_commit_transactionally(
@@ -456,131 +385,402 @@ def test_entity_selection_searches_other_pages_and_their_contents(qapp):
     assert canvas.active_page_id == second.layer_id
 
 
-def test_insert_page_gap_and_drag_bottom_group(qapp):
+def _start_page_gap(
+    canvas: CanvasWidget, start_y: float, end_y: float,
+) -> dict:
+    assert canvas.set_tool(ToolKind.INSERT_PAGE_GAP)
+    start = canvas.document_to_widget(QPointF(200, start_y))
+    end = canvas.document_to_widget(QPointF(200, end_y))
+    canvas._tool_move(start, 1)
+    assert canvas._page_gap_hover_y is not None
+    canvas._tool_press(start, 1)
+    assert canvas.page_gap_transaction()["phase"] == "creating"
+    canvas._tool_move(end, 1)
+    canvas._tool_release()
+    transaction = canvas.page_gap_transaction()
+    assert transaction is not None
+    assert transaction["phase"] == "active"
+    return transaction
+
+
+def test_page_gap_hover_upward_drag_clamping_and_minimum(qapp):
+    chapter = ChapterDocument(height=700)
+    chapter.add_page(bound=BoundGeometry.rectangle(0, 0, 400, 100))
+    canvas = CanvasWidget(EditorSettings())
+    canvas.resize(800, 600)
+    canvas.set_document(chapter, TileStore())
+    assert canvas.set_tool(ToolKind.INSERT_PAGE_GAP)
+
+    hover = canvas.document_to_widget(QPointF(100, 275))
+    canvas._tool_move(hover, 1)
+    assert canvas._page_gap_hover_y == 275
+
+    transaction = _start_page_gap(canvas, 300, -40)
+    assert transaction["top_y"] == 0
+    assert transaction["bottom_y"] == 300
+    assert canvas.chapter.height == 1000
+    assert canvas._page_gap_hit(QPointF(5, 0)) == "top"
+    assert canvas._page_gap_hit(QPointF(395, 150)) is None
+    canvas.cancel_page_gap_transaction()
+
+    assert canvas.set_tool(ToolKind.INSERT_PAGE_GAP)
+    point = canvas.document_to_widget(QPointF(200, 250))
+    canvas._tool_press(point, 1)
+    canvas._tool_release()
+    assert canvas.page_gap_transaction() is None
+    assert not canvas.command_stack.can_undo
+
+
+def test_page_gap_moves_highest_qualifying_hierarchy_roots(qapp):
     chapter = ChapterDocument(height=1000)
+    crossing_page = chapter.add_page(
+        "Crossing", BoundGeometry.rectangle(0, 0, 500, 500)
+    )
+    crossing = chapter.add_layer(
+        crossing_page.layer_id, "Crossing group",
+        BoundGeometry.rectangle(0, 150, 500, 200),
+    )
+    below_branch = chapter.add_layer(
+        crossing.layer_id, "Below branch",
+        BoundGeometry.rectangle(0, 300, 100, 40),
+    )
+    branch_child = chapter.add_object(
+        below_branch.layer_id,
+        RasterObject(x=5, y=305, interaction_rect=(0, 0, 20, 20)),
+    )
+    crossing_leaf = chapter.add_object(
+        crossing.layer_id,
+        RasterObject(x=10, y=220, interaction_rect=(0, 0, 40, 60)),
+    )
+    below_leaf = chapter.add_object(
+        crossing.layer_id,
+        RasterObject(x=10, y=330, interaction_rect=(0, 0, 30, 30)),
+    )
+    hidden_leaf = chapter.add_object(
+        crossing.layer_id,
+        RasterObject(
+            x=60, y=370, visible=False,
+            interaction_rect=(0, 0, 30, 30),
+        ),
+    )
+    below_page = chapter.add_page(
+        "Below page", BoundGeometry.rectangle(0, 0, 500, 100), y=600
+    )
+    below_page_child = chapter.add_object(
+        below_page.layer_id,
+        RasterObject(x=0, y=20, interaction_rect=(0, 0, 20, 20)),
+    )
+    canvas = CanvasWidget(EditorSettings())
+    canvas.resize(800, 600)
+    canvas.set_document(chapter, TileStore())
+
+    transaction = _start_page_gap(canvas, 250, 330)
+
+    assert transaction["gap_size"] == 80
+    assert set(transaction["move_roots"]) == {
+        ("layer", below_branch.layer_id),
+        ("object", below_leaf.object_id),
+        ("object", hidden_leaf.object_id),
+        ("layer", below_page.layer_id),
+    }
+    assert crossing.translate_y == 0
+    assert below_branch.translate_y == 80
+    assert branch_child.y == 305
+    assert crossing_leaf.y == 220
+    assert below_leaf.y == 410
+    assert hidden_leaf.y == 450
+    assert below_page.translate_y == 680
+    assert below_page_child.y == 20
+    assert chapter.height == 1080
+
+
+def test_page_gap_handle_adjustment_recomputes_from_baseline(qapp):
+    chapter = ChapterDocument(height=800)
     upper = chapter.add_page(
-        bound=BoundGeometry.rectangle(0, 0, 300, 100)
+        bound=BoundGeometry.rectangle(0, 0, 400, 350)
+    )
+    threshold_leaf = chapter.add_object(
+        upper.layer_id,
+        RasterObject(x=20, y=220, interaction_rect=(0, 0, 20, 20)),
     )
     lower = chapter.add_page(
-        bound=BoundGeometry.rectangle(0, 0, 300, 100), y=300
+        bound=BoundGeometry.rectangle(0, 0, 400, 100), y=400
+    )
+    canvas = CanvasWidget(EditorSettings())
+    canvas.resize(800, 600)
+    canvas.set_document(chapter, TileStore())
+    _start_page_gap(canvas, 250, 310)
+    assert lower.translate_y == 460
+    assert threshold_leaf.y == 220
+
+    for target_y, expected in ((200, 510), (250, 460), (200, 510)):
+        top = canvas.page_gap_transaction()["top_y"]
+        canvas._tool_press(
+            canvas.document_to_widget(QPointF(390, top)), 1
+        )
+        canvas._tool_move(
+            canvas.document_to_widget(QPointF(390, target_y)), 1
+        )
+        canvas._tool_release()
+        assert lower.translate_y == expected
+        assert threshold_leaf.y == (330 if target_y == 200 else 220)
+    assert chapter.height == 910
+
+
+def test_page_gap_preserves_transform_frames_and_moves_quads(qapp):
+    chapter = ChapterDocument(height=900)
+    page = chapter.add_page(
+        bound=BoundGeometry.rectangle(0, 0, 500, 700)
+    )
+    transformed = chapter.add_layer(
+        page.layer_id, "Transformed",
+        BoundGeometry.rectangle(0, 0, 100, 100),
+    )
+    transformed.transform_frame = (0, 0, 100, 100)
+    transformed.transform_quad = [
+        (30, 350), (150, 360), (145, 470), (25, 460),
+    ]
+    raster = chapter.add_object(
+        page.layer_id,
+        RasterObject(
+            x=12, y=18,
+            interaction_rect=(0, 0, 80, 60),
+            transform_frame=(0, 0, 80, 60),
+            transform_quad=[
+                (250, 420), (340, 420), (340, 500), (250, 500),
+            ],
+        ),
+    )
+    layer_quad = list(transformed.transform_quad)
+    object_quad = list(raster.transform_quad)
+    focal = BlurModifier(
+        strength=2, mode="focal", focal_center=(295, 455),
+        focal_radius=30,
+    )
+    chapter.add_modifier(focal, [("object", raster.object_id)])
+    canvas = CanvasWidget(EditorSettings())
+    canvas.resize(800, 600)
+    canvas.set_document(chapter, TileStore())
+
+    _start_page_gap(canvas, 300, 375)
+
+    assert transformed.transform_frame == (0, 0, 100, 100)
+    assert transformed.transform_quad == [
+        (x, y + 75) for x, y in layer_quad
+    ]
+    assert raster.transform_frame == (0, 0, 80, 60)
+    assert raster.transform_quad == [
+        (x, y + 75) for x, y in object_quad
+    ]
+    assert (raster.x, raster.y) == (12, 18)
+    assert focal.focal_center == (295, 530)
+
+
+def test_page_gap_effect_extent_can_keep_leaf_in_place(qapp):
+    chapter = ChapterDocument(height=800)
+    page = chapter.add_page(
+        bound=BoundGeometry.rectangle(0, 0, 400, 500)
+    )
+    raster = chapter.add_object(
+        page.layer_id,
+        RasterObject(x=20, y=330, interaction_rect=(0, 0, 30, 30)),
+    )
+    chapter.add_modifier(
+        BlurModifier(strength=20), [("object", raster.object_id)]
+    )
+    canvas = CanvasWidget(EditorSettings())
+    canvas.resize(800, 600)
+    canvas.set_document(chapter, TileStore())
+
+    transaction = _start_page_gap(canvas, 300, 350)
+
+    assert ("object", raster.object_id) not in transaction["move_roots"]
+    assert raster.y == 330
+
+
+def test_page_gap_moves_raster_vector_text_and_image_leaves(qapp):
+    chapter = ChapterDocument(height=800)
+    page = chapter.add_page(
+        bound=BoundGeometry.rectangle(0, 0, 500, 600)
+    )
+    raster = chapter.add_object(
+        page.layer_id,
+        RasterObject(x=20, y=350, interaction_rect=(0, 0, 30, 30)),
+    )
+    vector = chapter.add_object(
+        page.layer_id,
+        VectorDrawingObject(
+            x=80, y=350,
+            strokes=[VectorStroke(points=[
+                VectorStrokePoint(x=0, y=0, width=4),
+                VectorStrokePoint(x=30, y=20, width=4),
+            ])],
+        ),
+    )
+    text = chapter.add_object(
+        page.layer_id,
+        TextObject(
+            text="Below", layout_mode="free",
+            transform_quad=[
+                (150, 350), (250, 350), (250, 390), (150, 390),
+            ],
+        ),
+    )
+    image = chapter.add_object(
+        page.layer_id,
+        ImageObject(x=300, y=350, pixel_width=40, pixel_height=30),
+    )
+    canvas = CanvasWidget(EditorSettings())
+    canvas.resize(800, 600)
+    canvas.set_document(chapter, TileStore())
+
+    transaction = _start_page_gap(canvas, 300, 350)
+
+    assert set(transaction["move_roots"]) == {
+        ("object", raster.object_id),
+        ("object", vector.object_id),
+        ("object", text.object_id),
+        ("object", image.object_id),
+    }
+    assert raster.y == 400
+    assert vector.y == 400
+    assert text.transform_quad == [
+        (150, 400), (250, 400), (250, 440), (150, 440),
+    ]
+    assert image.y == 400
+
+
+def test_page_gap_confirm_is_one_undoable_edit_and_restores_selection(qapp):
+    chapter = ChapterDocument(height=800)
+    upper = chapter.add_page(
+        bound=BoundGeometry.rectangle(0, 0, 400, 160)
+    )
+    lower = chapter.add_page(
+        bound=BoundGeometry.rectangle(0, 0, 400, 100), y=400
     )
     canvas = CanvasWidget(EditorSettings())
     canvas.resize(800, 600)
     canvas.set_document(chapter, TileStore())
     canvas.set_selection("layer", upper.layer_id)
-    assert canvas.set_tool(ToolKind.INSERT_PAGE_GAP)
+    previous_tool = canvas.tool
+    before = chapter.to_dict()
 
-    canvas._tool_move(
-        canvas.document_to_widget(QPointF(150, 200)), 1
+    _start_page_gap(canvas, 250, 325)
+    assert not canvas.command_stack.can_undo
+    assert canvas.confirm_page_gap_transaction() is not None
+    assert canvas.selected_id == upper.layer_id
+    assert canvas.tool == previous_tool
+    assert canvas.command_stack.can_undo
+    assert canvas.command_stack.top_undo_command.label == "Insert page gap"
+    assert canvas.chapter.height == 875
+    assert canvas.chapter.layers[lower.layer_id].translate_y == 475
+
+    canvas.command_stack.undo()
+    assert canvas.chapter.to_dict() == before
+    canvas.command_stack.redo()
+    assert canvas.chapter.height == 875
+    assert canvas.chapter.layers[lower.layer_id].translate_y == 475
+
+
+def test_page_gap_cancel_and_escape_restore_exact_baseline(qapp):
+    chapter = ChapterDocument(height=800)
+    upper = chapter.add_page(
+        bound=BoundGeometry.rectangle(0, 0, 400, 160)
     )
-    assert canvas._page_gap_hover["owner_id"] == lower.layer_id
-    canvas._tool_press(
-        canvas.document_to_widget(QPointF(150, 200)), 1
+    chapter.add_page(
+        bound=BoundGeometry.rectangle(0, 0, 400, 100), y=400
     )
-    assert chapter.layers[lower.layer_id].translate_y == 420
-    assert canvas.page_gap_transaction()["origin"] == "standalone"
+    canvas = CanvasWidget(EditorSettings())
+    canvas.resize(800, 600)
+    canvas.set_document(chapter, TileStore())
+    canvas.set_selection("layer", upper.layer_id)
+    previous_tool = canvas.tool
+    before = chapter.to_dict()
+
+    _start_page_gap(canvas, 250, 325)
+    assert canvas.cancel_page_gap_transaction()
+    assert canvas.chapter.to_dict() == before
+    assert canvas.selected_id == upper.layer_id
+    assert canvas.tool == previous_tool
     assert not canvas.command_stack.can_undo
 
-    canvas._tool_press(
-        canvas.document_to_widget(QPointF(150, 320)), 1
-    )
-    canvas._tool_move(
-        canvas.document_to_widget(QPointF(150, 370)), 1
-    )
-    canvas._tool_release()
-    assert chapter.layers[lower.layer_id].translate_y == 470
-    assert canvas._page_gap_state["bottom_y"] == 370
+    _start_page_gap(canvas, 250, 325)
+    QTest.keyClick(canvas, Qt.Key_Escape)
+    assert canvas.chapter.to_dict() == before
+    assert canvas.tool == previous_tool
     assert not canvas.command_stack.can_undo
+
+
+def test_page_gap_without_qualifying_content_still_increases_height(qapp):
+    chapter = ChapterDocument(height=700)
+    chapter.add_page(bound=BoundGeometry.rectangle(0, 0, 400, 100))
+    canvas = CanvasWidget(EditorSettings())
+    canvas.resize(800, 600)
+    canvas.set_document(chapter, TileStore())
+
+    transaction = _start_page_gap(canvas, 400, 460)
+
+    assert transaction["move_roots"] == []
+    assert chapter.height == 760
     canvas.confirm_page_gap_transaction()
-    assert canvas.selected_id == lower.layer_id
-    assert canvas.tool == ToolKind.SHAPE_EDIT
     assert canvas.command_stack.can_undo
 
 
-def test_page_gap_cancel_restores_staged_layout_and_tool(qapp):
-    chapter = ChapterDocument(height=1000)
-    upper = chapter.add_page(
-        bound=BoundGeometry.rectangle(0, 0, 300, 100)
-    )
-    lower = chapter.add_page(
-        bound=BoundGeometry.rectangle(0, 0, 300, 100), y=300
-    )
-    canvas = CanvasWidget(EditorSettings())
-    canvas.resize(800, 600)
-    canvas.set_document(chapter, TileStore())
-    canvas.set_selection("layer", upper.layer_id)
-    assert canvas.set_tool(ToolKind.INSERT_PAGE_GAP)
-    before = chapter.to_dict()
-    assert canvas.begin_page_gap_transaction(
-        "standalone", lower.layer_id, [upper.layer_id],
-        [lower.layer_id], 200,
-    )
-    assert chapter.layers[lower.layer_id].translate_y == 420
-
-    assert canvas.cancel_page_gap_transaction() == "standalone"
-    assert canvas.chapter.to_dict() == before
-    assert canvas.tool == ToolKind.INSERT_PAGE_GAP
-    assert not canvas.command_stack.can_undo
-
-
-def test_add_page_shape_cancel_restores_pre_gap_layout(
-    qapp, monkeypatch,
-):
+def test_main_window_page_gap_preview_locks_editing_and_persistence(qapp):
     window = MainWindow()
-    chapter = ChapterDocument(height=1000)
-    active = chapter.add_page(
-        bound=BoundGeometry.rectangle(0, 0, 300, 100)
+    chapter = ChapterDocument(height=800)
+    page = chapter.add_page(
+        bound=BoundGeometry.rectangle(0, 0, 400, 160)
     )
-    lower = chapter.add_page(
-        bound=BoundGeometry.rectangle(0, 0, 300, 100), y=300
+    chapter.add_page(
+        bound=BoundGeometry.rectangle(0, 0, 400, 100), y=400
     )
     window._set_chapter(chapter, TileStore())
-    window.canvas.set_selection("layer", active.layer_id)
-    before = chapter.to_dict()
-    monkeypatch.setattr(
-        window, "_choose_add_page_gap_action", lambda: "insert"
-    )
-    monkeypatch.setattr(window, "_choose_page_shape", lambda: None)
+    window.canvas.set_selection("layer", page.layer_id)
+    window._dirty = True
+    window.autosave_timer.stop()
+    window.show()
+    qapp.processEvents()
     try:
-        window._add_page()
-        assert chapter.layers[lower.layer_id].translate_y == 420
-        window._confirm_page_gap()
-        assert window.chapter.to_dict() == before
-        assert window.canvas._page_gap_state is None
-        assert window.canvas.tool == ToolKind.SHAPE_EDIT
-        assert not window.canvas.command_stack.can_undo
+        assert window.canvas.set_tool(ToolKind.INSERT_PAGE_GAP)
+        start = window.canvas.document_to_widget(QPointF(200, 250))
+        window.canvas._tool_press(start, 1)
+        assert not window._page_gap_mode_locked
+        window._autosave()
+        assert window.autosave_timer.isActive()
+        assert not window.save()
+        window.canvas._tool_release()
+        assert window.canvas.page_gap_transaction() is None
+        assert window.autosave_timer.isActive()
+        window.autosave_timer.stop()
+
+        _start_page_gap(window.canvas, 250, 325)
+        qapp.processEvents()
+
+        assert window._page_gap_mode_locked
+        assert not window.menuBar().isEnabled()
+        assert not window.tool_toolbar.isEnabled()
+        assert not window.hierarchy_dock.isEnabled()
+        assert not window.project_tabs.isEnabled()
+        assert not window.undo_action.isEnabled()
+        assert not window.save()
+        assert window._hotkey_is_suppressed("select_all", frozenset())
+        assert not window._activate_tool(ToolKind.RASTER_PENCIL)
+        assert not window.page_gap_confirmation.isHidden()
+        anchor = window.canvas.page_gap_confirmation_anchor()
+        frame = window.page_gap_confirmation.geometry()
+        assert frame.left() >= 0
+        assert frame.top() >= 0
+        assert abs(frame.center().x() - anchor.x()) <= 1
+
+        window._cancel_page_gap()
+        qapp.processEvents()
+        assert not window._page_gap_mode_locked
+        assert window.menuBar().isEnabled()
+        assert window.tool_toolbar.isEnabled()
+        assert window.page_gap_confirmation.isHidden()
+        assert window._dirty
+        assert not window.autosave_timer.isActive()
     finally:
         window._dirty = False
         window.close()
-
-
-def test_page_gap_release_rebases_top_with_margin(qapp):
-    chapter = ChapterDocument(height=700)
-    upper = chapter.add_page(
-        bound=BoundGeometry.rectangle(0, 0, 300, 100)
-    )
-    lower = chapter.add_page(
-        bound=BoundGeometry.rectangle(0, 0, 300, 100), y=300
-    )
-    canvas = CanvasWidget(EditorSettings())
-    canvas.resize(800, 600)
-    canvas.set_document(chapter, TileStore())
-    canvas.set_selection("layer", lower.layer_id, False)
-    canvas.begin_page_gap_editor(
-        lower.layer_id, [upper.layer_id], [lower.layer_id], 100, 220
-    )
-
-    canvas._tool_press(
-        canvas.document_to_widget(QPointF(150, 150)), 1
-    )
-    canvas._tool_move(
-        canvas.document_to_widget(QPointF(150, -150)), 1
-    )
-    canvas._tool_release()
-
-    top = min(
-        canvas.page_world_bounds(page_id).top()
-        for page_id in chapter.root_page_ids
-    )
-    assert top == 120
-    assert chapter.height > 700

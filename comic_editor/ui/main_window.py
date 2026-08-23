@@ -47,7 +47,9 @@ from comic_editor.core.commands import CallbackCommand, CommandStack
 from comic_editor.core.settings import load_settings, save_settings
 from comic_editor.core.tiles import TileStore
 from comic_editor.core.images import ImageStore
-from comic_editor.ui.canvas import ToolKind, create_canvas
+from comic_editor.ui.canvas import (
+    DrawingSelectionClipboard, ToolKind, create_canvas,
+)
 from comic_editor.ui.color_picker import (
     ColorHistoryWidget, PaletteEditorWidget, PrimarySecondaryColorPanel,
     canonical_argb,
@@ -273,7 +275,18 @@ class MainWindow(QMainWindow):
         self._blender_relink_object_id = ""
         self._mask_context: tuple | None = None
         self._mask_original_contributors: list[tuple[str, str]] = []
+        self._drawing_clipboard: DrawingSelectionClipboard | None = None
+        self._clipboard_serial = 0
+        self._drawing_clipboard_serial = 0
+        self._image_clipboard_serial = 0
+        self._page_gap_mode_locked = False
+        self._page_gap_resume_autosave = False
+        self._page_gap_mask_controls_visible = (False, False)
         self._build_ui()
+        QApplication.clipboard().dataChanged.connect(
+            self._clipboard_data_changed
+        )
+        self._clipboard_data_changed()
         self.blender_sources = BlenderImageSourceController(self.canvas, self)
         self._connect()
         self._install_shortcuts()
@@ -843,7 +856,6 @@ class MainWindow(QMainWindow):
         )
         gap_layout = QHBoxLayout(self.page_gap_confirmation)
         gap_layout.setContentsMargins(8, 6, 8, 6)
-        gap_layout.addWidget(QLabel("Adjust the orange page gap"))
         self.confirm_page_gap_button = QPushButton("Confirm Page Gap")
         self.cancel_page_gap_button = QPushButton("Cancel")
         gap_layout.addWidget(self.confirm_page_gap_button)
@@ -989,6 +1001,15 @@ class MainWindow(QMainWindow):
             )
         self.canvas.pageGapConfirmationChanged.connect(
             self._set_page_gap_confirmation_visible
+        )
+        self.canvas.pageGapModeChanged.connect(
+            self._set_page_gap_mode_locked
+        )
+        self.canvas.pageGapGeometryChanged.connect(
+            self._position_page_gap_confirmation
+        )
+        self.canvas.cameraChanged.connect(
+            self._position_page_gap_confirmation
         )
         self.confirm_page_gap_button.clicked.connect(
             self._confirm_page_gap
@@ -1253,9 +1274,13 @@ class MainWindow(QMainWindow):
             "reset_rotation": self.canvas.reset_rotation,
             "toggle_grid": self._toggle_grid,
             "select_all": self.canvas.select_all,
+            "deselect": self.canvas.deselect_drawing,
+            "cut": self._cut_drawing_selection,
+            "copy": self._copy_drawing_selection,
+            "paste": self._paste,
+            "paste_as_new": self._paste_drawing_as_new,
             "delete_selected": self._delete_selected,
             "clear_canvas": self._clear_canvas,
-            "paste_image": self._paste_image,
         }
         self._hotkey_bindings = {
             action_id: chord_keys(value)
@@ -1310,8 +1335,18 @@ class MainWindow(QMainWindow):
     def _hotkey_is_suppressed(
         self, action_id: str, chord: frozenset[int],
     ) -> bool:
-        if action_id == "paste_image" and not self._clipboard_image_sources():
+        if self._page_gap_mode_locked:
             return True
+        if action_id in {"cut", "copy", "paste", "paste_as_new"}:
+            if self._hotkey_text_input_active():
+                return True
+            if action_id == "paste" and not (
+                self._drawing_clipboard is not None
+                or self._clipboard_image_sources()
+            ):
+                return True
+            if action_id == "paste_as_new" and self._drawing_clipboard is None:
+                return True
         if action_id == "delete_selected":
             return (
                 self._hotkey_text_input_active()
@@ -2009,6 +2044,18 @@ class MainWindow(QMainWindow):
     def _project_tab_selected(self, index: int) -> None:
         if self._switching_session:
             return
+        if self._page_gap_mode_locked:
+            if self.active_session is not None:
+                current = self._tab_index_for_key(self.active_session.key)
+                if current >= 0:
+                    self.project_tabs.blockSignals(True)
+                    self.project_tabs.setCurrentIndex(current)
+                    self.project_tabs.blockSignals(False)
+            self.statusBar().showMessage(
+                "Confirm or cancel the page gap before switching projects",
+                4000,
+            )
+            return
         if index < 0:
             self._clear_active_session()
             return
@@ -2103,6 +2150,11 @@ class MainWindow(QMainWindow):
         self._refresh_actions()
 
     def _save_editor_session(self, session: EditorSession) -> bool:
+        if self.canvas.page_gap_mode_active():
+            self.statusBar().showMessage(
+                "Confirm or cancel the page gap before saving", 4000
+            )
+            return False
         if session is self.active_session:
             self._capture_active_session()
         try:
@@ -2160,6 +2212,12 @@ class MainWindow(QMainWindow):
         return True
 
     def _close_project_tab(self, index: int) -> None:
+        if self._page_gap_mode_locked:
+            self.statusBar().showMessage(
+                "Confirm or cancel the page gap before closing a project",
+                4000,
+            )
+            return
         session = self.sessions.get(str(self.project_tabs.tabData(index)))
         if session is None:
             return
@@ -2337,6 +2395,13 @@ class MainWindow(QMainWindow):
             and self.active_session.kind != "series"
         ):
             return
+        if self._page_gap_mode_locked:
+            self._sync_chapter_combo()
+            self.statusBar().showMessage(
+                "Confirm or cancel the page gap before switching chapters",
+                4000,
+            )
+            return
         chapter_id = self.chapter_combo.itemData(index)
         if self.chapter and chapter_id == self.chapter.chapter_id:
             return
@@ -2480,88 +2545,82 @@ class MainWindow(QMainWindow):
             )
             return
         anchor_id = self.canvas.active_page_id
-        anchor_bounds = self.canvas.page_world_bounds(anchor_id)
-        lower_ids = [
-            page_id
-            for page_id in self.canvas.physically_ordered_pages()
-            if (
-                page_id != anchor_id
-                and self.canvas.page_world_bounds(page_id).top()
-                >= anchor_bounds.bottom()
-            )
-        ]
-        if lower_ids:
-            action = self._choose_add_page_gap_action()
-            if action == "cancel":
-                return
-            if action == "insert":
-                top_ids = [
-                    page_id for page_id in self.chapter.root_page_ids
-                    if page_id not in lower_ids
-                ]
-                if self.canvas.begin_page_gap_transaction(
-                    "add_page", anchor_id, top_ids, lower_ids,
-                    anchor_bounds.bottom(),
-                ):
-                    self.statusBar().showMessage(
-                        "Adjust the page gap, then confirm or cancel.", 7000
-                    )
-                return
         self._begin_add_page_shape(anchor_id)
-
-    def _choose_add_page_gap_action(self) -> str:
-        dialog = QMessageBox(self)
-        dialog.setWindowTitle("Add Page")
-        dialog.setText(
-            "A page already exists below the active page. "
-            "Would you like to insert and adjust a page gap first?"
-        )
-        insert = dialog.addButton(
-            "Insert Gap", QMessageBox.AcceptRole
-        )
-        proceed = dialog.addButton(
-            "Continue Without Gap", QMessageBox.DestructiveRole
-        )
-        dialog.addButton(QMessageBox.Cancel)
-        dialog.exec()
-        return (
-            "insert" if dialog.clickedButton() is insert
-            else "continue" if dialog.clickedButton() is proceed
-            else "cancel"
-        )
 
     def _begin_add_page_shape(
         self, anchor_id: str, *, before: dict | None = None,
-        gap_bounds: tuple[float, float] | None = None,
     ) -> None:
         kind = self._choose_page_shape()
         if kind is None:
-            if self.canvas.page_gap_transaction() is not None:
-                self.canvas.cancel_page_gap_transaction()
             return
         if self.canvas.begin_page_creation(
-            anchor_id, kind, before=before, gap_bounds=gap_bounds
+            anchor_id, kind, before=before
         ):
             self.statusBar().showMessage(
                 "Draw the closed page below the active page. Escape cancels.",
                 7000,
             )
-        elif self.canvas.page_gap_transaction() is not None:
-            self.canvas.cancel_page_gap_transaction()
 
     def _set_page_gap_confirmation_visible(self, visible: bool) -> None:
         self.page_gap_confirmation.setVisible(bool(visible))
         if visible:
             self.page_gap_confirmation.adjustSize()
-            self.page_gap_confirmation.move(
-                max(
-                    8,
-                    (self.canvas.width()
-                     - self.page_gap_confirmation.width()) // 2,
-                ),
-                10,
-            )
+            self._position_page_gap_confirmation()
             self.page_gap_confirmation.raise_()
+
+    def _position_page_gap_confirmation(self) -> None:
+        if (
+            not hasattr(self, "page_gap_confirmation")
+            or not self.page_gap_confirmation.isVisible()
+        ):
+            return
+        anchor = self.canvas.page_gap_confirmation_anchor()
+        if anchor is None:
+            return
+        frame = self.page_gap_confirmation
+        x = round(anchor.x() - frame.width() / 2)
+        y = round(anchor.y() - frame.height() - 12)
+        frame.move(
+            max(8, min(self.canvas.width() - frame.width() - 8, x)),
+            max(8, min(self.canvas.height() - frame.height() - 8, y)),
+        )
+        frame.raise_()
+
+    def _set_page_gap_mode_locked(self, locked: bool) -> None:
+        locked = bool(locked)
+        if locked == self._page_gap_mode_locked:
+            return
+        self._page_gap_mode_locked = locked
+        if locked:
+            self._page_gap_resume_autosave = self.autosave_timer.isActive()
+            self.autosave_timer.stop()
+            self._page_gap_mask_controls_visible = (
+                self.exit_mask_mode_button.isVisible(),
+                self.remove_mask_button.isVisible(),
+            )
+            self.exit_mask_mode_button.hide()
+            self.remove_mask_button.hide()
+        controls_enabled = not locked
+        self.menuBar().setEnabled(controls_enabled)
+        self.file_toolbar.setEnabled(controls_enabled)
+        self.tool_toolbar.setEnabled(controls_enabled)
+        self.ribbon.setEnabled(controls_enabled)
+        self.hierarchy_dock.setEnabled(controls_enabled)
+        self.project_tabs.setEnabled(controls_enabled)
+        if not locked and self._page_gap_resume_autosave:
+            self.autosave_timer.start(2000)
+        if not locked:
+            self._page_gap_resume_autosave = False
+            exit_visible, remove_visible = (
+                self._page_gap_mask_controls_visible
+            )
+            if self.canvas.active_tone_mask_id:
+                self.exit_mask_mode_button.setVisible(exit_visible)
+                self.remove_mask_button.setVisible(remove_visible)
+                self.exit_mask_mode_button.raise_()
+                self.remove_mask_button.raise_()
+            self._page_gap_mask_controls_visible = (False, False)
+        self._refresh_actions()
 
     def resizeEvent(self, event) -> None:  # noqa: N802
         super().resizeEvent(event)
@@ -2570,25 +2629,12 @@ class MainWindow(QMainWindow):
             and self.page_gap_confirmation.isVisible()
         ):
             QTimer.singleShot(
-                0, lambda: self._set_page_gap_confirmation_visible(True)
+                0, self._position_page_gap_confirmation
             )
 
     def _confirm_page_gap(self) -> None:
-        transaction = self.canvas.confirm_page_gap_transaction()
-        if transaction is None:
-            self._set_page_gap_confirmation_visible(False)
-            return
-        if transaction["origin"] != "add_page":
-            return
+        self.canvas.confirm_page_gap_transaction()
         self._set_page_gap_confirmation_visible(False)
-        self._begin_add_page_shape(
-            str(transaction["anchor_id"]),
-            before=transaction["before"],
-            gap_bounds=(
-                float(transaction["top_y"]),
-                float(transaction["bottom_y"]),
-            ),
-        )
 
     def _cancel_page_gap(self) -> None:
         self.canvas.cancel_page_gap_transaction()
@@ -2657,7 +2703,6 @@ class MainWindow(QMainWindow):
         # Acknowledge before changing tools: changing away from a creation
         # tool cancels any still-pending draft by design.
         self.canvas.resolve_page_creation(True)
-        self.canvas.finish_page_gap_workflow()
         self.canvas.set_tool(ToolKind.SHAPE_EDIT)
         self.statusBar().showMessage(
             f"Created {page.name}", 3000
@@ -2924,6 +2969,8 @@ class MainWindow(QMainWindow):
     def _clear_canvas(self) -> None:
         if self.chapter is None or self.canvas.chapter is None:
             return
+        if self.canvas.clear_selected_drawing_content():
+            return
         entities = list(self.canvas.selected_entities) if len(self.canvas.selected_entities) > 1 else ([(self.canvas.selected_kind, self.canvas.selected_id)] if self.canvas.selected_id else [])
         if not entities:
             return
@@ -3014,6 +3061,14 @@ class MainWindow(QMainWindow):
         self._mark_dirty(None)
 
     def _activate_tool(self, tool: ToolKind) -> bool:
+        if (
+            self._page_gap_mode_locked
+            and tool != ToolKind.INSERT_PAGE_GAP
+        ):
+            self.statusBar().showMessage(
+                "Confirm or cancel the page gap first", 3000
+            )
+            return False
         selected_object = (
             self.chapter.objects.get(self.canvas.selected_id)
             if (
@@ -3022,6 +3077,10 @@ class MainWindow(QMainWindow):
             )
             else None
         )
+        if tool == ToolKind.INSERT_PAGE_GAP:
+            changed = self.canvas.set_tool(tool)
+            self._sync_tool_buttons()
+            return changed
         if len(self.canvas.selected_entities) > 1:
             primary_raster = isinstance(selected_object, RasterObject)
             if tool not in {ToolKind.TRANSFORM, ToolKind.FILL} or (
@@ -4185,6 +4244,8 @@ class MainWindow(QMainWindow):
 
     def _clipboard_image_sources(self) -> list[tuple[str, str, bytes]]:
         mime = QApplication.clipboard().mimeData()
+        if mime is None:
+            return []
         sources: list[tuple[str, str, bytes]] = []
         for url in mime.urls() if mime.hasUrls() else []:
             if not url.isLocalFile():
@@ -4217,11 +4278,101 @@ class MainWindow(QMainWindow):
             "Clipboard Image.png", "image/png", bytes(payload)
         )] if saved else []
 
-    def _paste_image(self) -> bool:
-        sources = self._clipboard_image_sources()
+    def _next_clipboard_serial(self) -> int:
+        self._clipboard_serial += 1
+        return self._clipboard_serial
+
+    def _clipboard_data_changed(self) -> None:
+        self._image_clipboard_serial = (
+            self._next_clipboard_serial()
+            if self._clipboard_image_sources() else 0
+        )
+
+    def _capture_drawing_selection(self, *, cut: bool) -> bool:
+        payload = self.canvas.drawing_selection_clipboard()
+        if payload is None:
+            self.statusBar().showMessage(
+                "Select raster pixels or vector points first", 4000
+            )
+            return False
+        if cut and not self.canvas.clear_selected_drawing_content():
+            return False
+        self._drawing_clipboard = payload
+        self._drawing_clipboard_serial = self._next_clipboard_serial()
+        self.statusBar().showMessage(
+            "Cut drawing selection" if cut else "Copied drawing selection",
+            2500,
+        )
+        return True
+
+    def _cut_drawing_selection(self) -> bool:
+        return self._capture_drawing_selection(cut=True)
+
+    def _copy_drawing_selection(self) -> bool:
+        return self._capture_drawing_selection(cut=False)
+
+    def _paste_image(
+        self, sources: list[tuple[str, str, bytes]] | None = None,
+    ) -> bool:
+        sources = (
+            sources
+            if sources is not None else self._clipboard_image_sources()
+        )
         return bool(
             sources and self._place_import_sources(sources, "Paste image")
         )
+
+    def _paste(self) -> bool:
+        image_sources = self._clipboard_image_sources()
+        image_serial = self._image_clipboard_serial if image_sources else 0
+        use_drawing = bool(
+            self._drawing_clipboard is not None
+            and self._drawing_clipboard_serial >= image_serial
+        )
+        if use_drawing:
+            if self.canvas.paste_drawing_clipboard(self._drawing_clipboard):
+                self.statusBar().showMessage("Pasted drawing selection", 2500)
+                return True
+            self.statusBar().showMessage(
+                "Select a compatible raster or vector object before pasting",
+                4000,
+            )
+            return False
+        if image_sources:
+            return self._paste_image(image_sources)
+        self.statusBar().showMessage("Nothing available to paste", 3000)
+        return False
+
+    def _paste_drawing_as_new(self) -> bool:
+        payload = self._drawing_clipboard
+        if payload is None:
+            self.statusBar().showMessage(
+                "Copy or cut a drawing selection first", 3500
+            )
+            return False
+        anchor = (
+            self.chapter.objects.get(self.canvas.selected_id)
+            if (
+                self.chapter is not None
+                and self.canvas.selected_kind == "object"
+            )
+            else None
+        )
+        if not isinstance(anchor, (RasterObject, VectorDrawingObject)):
+            self.statusBar().showMessage(
+                "Select a raster or vector object to paste above", 4000
+            )
+            return False
+        created = self.canvas.paste_drawing_clipboard_as_new(
+            payload, anchor.object_id
+        )
+        if not created:
+            self.statusBar().showMessage(
+                "Unable to paste the drawing selection here", 4000
+            )
+            return False
+        self.statusBar().showMessage("Pasted selection as a new object", 2500)
+        return True
 
     # ---- selection and model synchronization --------------------------
     def _parameter_binding(self, context: tuple | None):
@@ -5376,6 +5527,11 @@ class MainWindow(QMainWindow):
         self._refresh_actions()
 
     def save(self) -> bool:
+        if self.canvas.page_gap_mode_active():
+            self.statusBar().showMessage(
+                "Confirm or cancel the page gap before saving", 4000
+            )
+            return False
         if self.active_session is not None:
             return self._save_editor_session(self.active_session)
         if self.repository is None or self.chapter is None:
@@ -5506,6 +5662,11 @@ class MainWindow(QMainWindow):
         self._refresh_actions()
 
     def _save_as(self) -> bool:
+        if self.canvas.page_gap_mode_active():
+            self.statusBar().showMessage(
+                "Confirm or cancel the page gap before saving", 4000
+            )
+            return False
         context = self._current_project_context()
         if context is None:
             return False
@@ -5573,6 +5734,10 @@ class MainWindow(QMainWindow):
         return True
 
     def _autosave(self) -> None:
+        if self.canvas.page_gap_mode_active():
+            if not self._page_gap_mode_locked:
+                self.autosave_timer.start(2000)
+            return
         if self.sessions:
             now = time.monotonic()
             deferred: list[float] = []
@@ -5915,6 +6080,20 @@ class MainWindow(QMainWindow):
 
     def _refresh_actions(self) -> None:
         active = self.chapter is not None
+        if self._page_gap_mode_locked:
+            for action in (
+                self.save_action, self.save_as_action,
+                self.new_chapter_action, self.trim_action,
+                self.export_png_action, self.export_png_toolbar_action,
+                self.undo_action, self.redo_action,
+            ):
+                action.setEnabled(False)
+            for button in (
+                self.add_page_button, self.add_raster_button,
+                self.add_vector_button, self.add_text_button,
+            ):
+                button.setEnabled(False)
+            return
         series_active = active and (
             self.active_session is None or self.active_session.kind == "series"
         )
@@ -5936,6 +6115,8 @@ class MainWindow(QMainWindow):
         self.showNormal() if self.isFullScreen() else self.showFullScreen()
 
     def closeEvent(self, event: QCloseEvent) -> None:  # noqa: N802
+        if self.canvas.page_gap_mode_active():
+            self.canvas.cancel_page_gap_transaction()
         if self.sessions:
             self._capture_active_session()
             for session in list(self.sessions.values()):

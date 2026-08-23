@@ -1,11 +1,15 @@
 from __future__ import annotations
 
-from PySide6.QtCore import QEvent, QTimer, Qt
+from PySide6.QtCore import QEvent, QPointF, QRectF, QTimer, Qt
+from PySide6.QtGui import QColor, QPainterPath
 from PySide6.QtWidgets import QApplication, QLineEdit
 from PySide6.QtTest import QTest
 
 from comic_editor.core import settings as settings_module
-from comic_editor.core.models import BoundGeometry, ChapterDocument, TextObject
+from comic_editor.core.models import (
+    BoundGeometry, ChapterDocument, RasterObject, TextObject,
+    VectorDrawingObject, VectorStroke, VectorStrokePoint,
+)
 from comic_editor.core.settings import (
     EditorSettings, default_hotkey_hold, load_settings,
 )
@@ -38,6 +42,13 @@ def test_single_chord_normalization_supports_standalone_modifiers():
     assert chord_keys("Ctrl+Shift") == frozenset({
         int(Qt.Key_Control), int(Qt.Key_Shift),
     })
+
+
+def test_deselect_default_avoids_existing_ctrl_d_binding():
+    settings = EditorSettings(hotkeys={"shape_edit": "Ctrl+D"})
+
+    assert settings.hotkeys["shape_edit"] == "Ctrl+D"
+    assert settings.hotkeys["deselect"] == ""
 
 
 def test_chord_capture_replaces_clears_and_cancels(qapp):
@@ -123,6 +134,7 @@ def test_hotkey_dialog_has_hold_only_for_tools_and_rejects_duplicates(qapp):
     dialog = HotkeysDialog(settings.hotkeys, settings.hotkey_hold)
     assert set(dialog.hold_checks) == set(default_hotkey_hold())
     assert "save" not in dialog.hold_checks
+    assert dialog.editors["deselect"].chord() == "Ctrl+D"
     dialog.editors["save"].setChord("P")
     dialog.editors["raster_pencil"].setChord("P")
     try:
@@ -131,6 +143,154 @@ def test_hotkey_dialog_has_hold_only_for_tools_and_rejects_duplicates(qapp):
         assert "unique" in str(error)
     else:
         raise AssertionError("duplicate chords must be rejected")
+
+
+def test_hotkey_dialog_resizes_with_actions_always_reachable(qapp):
+    settings = EditorSettings()
+    dialog = HotkeysDialog(settings.hotkeys, settings.hotkey_hold)
+    try:
+        dialog.resize(520, 320)
+        dialog.show()
+        qapp.processEvents()
+
+        assert dialog.size().height() == 320
+        assert dialog.scroll_area.verticalScrollBar().maximum() > 0
+        assert dialog.button_box.isVisible()
+
+        dialog.resize(520, 500)
+        qapp.processEvents()
+        assert dialog.size().height() == 500
+        assert dialog.button_box.isVisible()
+    finally:
+        dialog.close()
+        dialog.deleteLater()
+
+
+def test_deselect_hotkey_clears_drawing_selection_but_keeps_object(qapp):
+    window = MainWindow()
+    chapter = ChapterDocument()
+    page = chapter.add_page()
+    layer = chapter.add_layer(
+        page.layer_id, "Layer", BoundGeometry.rectangle(0, 0, 300, 200)
+    )
+    raster = chapter.add_object(layer.layer_id, RasterObject())
+    window._set_chapter(chapter, TileStore())
+    window.canvas.set_selection("object", raster.object_id)
+    window.canvas.set_tool(ToolKind.DRAW_SELECT_RECT)
+    selection = QPainterPath()
+    selection.addRect(QRectF(20, 20, 80, 80))
+    window.canvas._drawing_selection_path = selection
+    try:
+        assert window.settings.hotkeys["deselect"] == "Ctrl+D"
+        window._command_hotkey_actions["deselect"]()
+
+        assert window.canvas._drawing_selection_path.isEmpty()
+        assert window.canvas.selected_id == raster.object_id
+        assert window.canvas.selected_kind == "object"
+    finally:
+        window.deleteLater()
+
+
+def test_clear_canvas_only_clears_selected_raster_pixels_and_is_undoable(qapp):
+    window = MainWindow()
+    chapter = ChapterDocument()
+    page = chapter.add_page()
+    layer = chapter.add_layer(
+        page.layer_id, "Layer", BoundGeometry.rectangle(0, 0, 300, 200)
+    )
+    raster = chapter.add_object(layer.layer_id, RasterObject())
+    tiles = TileStore()
+    tiles.paint_dab(
+        raster.object_id, QPointF(50, 50), 24,
+        QColor("#ff336699"), square=True, antialias=False,
+    )
+    tiles.paint_dab(
+        raster.object_id, QPointF(180, 50), 24,
+        QColor("#ff336699"), square=True, antialias=False,
+    )
+    window._set_chapter(chapter, tiles)
+    window.canvas.set_selection("object", raster.object_id)
+    window.canvas.set_tool(ToolKind.DRAW_SELECT_RECT)
+    selection = QPainterPath()
+    selection.addRect(QRectF(30, 30, 40, 40))
+    window.canvas._drawing_selection_path = selection
+
+    def alpha_at(x: int, y: int) -> int:
+        key = (x // tiles.tile_size, y // tiles.tile_size)
+        image = tiles.tile(raster.object_id, key)
+        if image is None:
+            return 0
+        return image.pixelColor(
+            x - key[0] * tiles.tile_size,
+            y - key[1] * tiles.tile_size,
+        ).alpha()
+
+    try:
+        window._clear_canvas()
+
+        assert alpha_at(50, 50) == 0
+        assert alpha_at(180, 50) > 0
+        assert not window.canvas._drawing_selection_path.isEmpty()
+
+        window.canvas.command_stack.undo()
+        assert alpha_at(50, 50) > 0
+        assert alpha_at(180, 50) > 0
+
+        window.canvas.command_stack.redo()
+        assert alpha_at(50, 50) == 0
+        assert alpha_at(180, 50) > 0
+    finally:
+        window.deleteLater()
+
+
+def test_clear_canvas_only_clears_selected_vector_points_and_is_undoable(qapp):
+    window = MainWindow()
+    chapter = ChapterDocument()
+    page = chapter.add_page()
+    layer = chapter.add_layer(
+        page.layer_id, "Layer", BoundGeometry.rectangle(0, 0, 300, 200)
+    )
+    selected_stroke = VectorStroke(points=[
+        VectorStrokePoint(x=30, y=40),
+        VectorStrokePoint(x=100, y=40),
+    ])
+    retained_stroke = VectorStroke(points=[
+        VectorStrokePoint(x=160, y=40),
+        VectorStrokePoint(x=240, y=40),
+    ])
+    drawing = chapter.add_object(
+        layer.layer_id,
+        VectorDrawingObject(strokes=[selected_stroke, retained_stroke]),
+    )
+    window._set_chapter(chapter, TileStore())
+    window.canvas.set_selection("object", drawing.object_id)
+    window.canvas.set_tool(ToolKind.DRAW_SELECT_STROKE)
+    window.canvas._set_vector_selection(
+        drawing,
+        {selected_stroke.stroke_id},
+        {point.point_id for point in selected_stroke.points},
+    )
+    try:
+        window._clear_canvas()
+
+        current = chapter.objects[drawing.object_id]
+        assert [stroke.stroke_id for stroke in current.strokes] == [
+            retained_stroke.stroke_id
+        ]
+
+        window.canvas.command_stack.undo()
+        restored = chapter.objects[drawing.object_id]
+        assert {stroke.stroke_id for stroke in restored.strokes} == {
+            selected_stroke.stroke_id, retained_stroke.stroke_id,
+        }
+
+        window.canvas.command_stack.redo()
+        redone = chapter.objects[drawing.object_id]
+        assert [stroke.stroke_id for stroke in redone.strokes] == [
+            retained_stroke.stroke_id
+        ]
+    finally:
+        window.deleteLater()
 
 
 def test_modal_hotkey_accept_saves_reloads_and_reopens(

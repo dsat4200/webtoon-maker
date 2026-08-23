@@ -336,7 +336,7 @@ On chapter open, `has_recovery()` compares the recovery manifest modification ti
 
 ## Editor settings data
 
-`EditorSettings` is version 21 and is written to the platform path returned by Qt's `QStandardPaths.AppConfigLocation`, in `settings.json`. It is not stored in the portable series folder.
+`EditorSettings` is version 22 and is written to the platform path returned by Qt's `QStandardPaths.AppConfigLocation`, in `settings.json`. It is not stored in the portable series folder.
 
 It contains:
 
@@ -355,7 +355,7 @@ It contains:
 - the Blender loopback bridge endpoint and token (host clamped to loopback); and
 - up to 12 recent series paths.
 
-Loading progressively backfills/migrates settings from earlier versions, filters unknown fields, clamps values, protects the default Linear pencil and Default text presets, adds the default Delete Selected and Alt+G bindings, and always emits version 21 on save. Text-preset sizes normalize to integers from 6 through 250. Settings save through a temporary file followed by replace.
+Loading progressively backfills/migrates settings from earlier versions, filters unknown fields, clamps values, protects the default Linear pencil and Default text presets, adds the default Delete Selected and Alt+G bindings, migrates Paste Image to unified Paste, and always emits version 22 on save. Text-preset sizes normalize to integers from 6 through 250. Settings save through a temporary file followed by replace.
 
 Primary/secondary colors, palettes, color history, and gradient presets are **series** preferences, not editor settings. `brush_color` remains as a compatibility/current-primary bridge for drawing behavior.
 

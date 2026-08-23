@@ -30,8 +30,8 @@ The application intentionally does not implement scheduling, reference libraries
 - A new **chapter** gets one 1080×1080 page, one matching drawing layer, and one empty raster object.
 - Pages are root bounded layers. They may be rectangles, ellipses, or closed custom paths and may be freely positioned or overlap.
 - **Add Page** uses the selected page or selected descendant as an anchor, then asks for a rectangle, circle, or custom closed shape below it. The new page is inserted immediately after the anchor page in hierarchy order.
-- If lower pages occupy the requested space, they can be shifted as a group and an editable 120-pixel orange gutter is staged. Dotted edges move one adjacent page group; dragging the shaded band moves both groups. Confirm commits one undoable transaction; cancel restores the pre-operation layout.
-- **Insert Page Gap** finds physically adjacent pages and inserts the same editable 120-pixel gutter without creating a page.
+- **Add Page** never changes the existing spacing and is independent from page-gap insertion.
+- **Insert Page Gap** can start anywhere inside the existing canvas. A drag defines an exact-height translucent orange band between two dotted line handles. The preview grows the canvas and, from an immutable baseline, moves the highest complete hierarchy branches whose modeled bounds start on or below the top line. Crossing leaves are not split. Either line can be adjusted before **Confirm Page Gap** commits one undoable edit; Cancel or Escape restores the exact baseline. Editing, persistence, and project/chapter switching are locked during the preview, while pan, zoom, and rotation remain available.
 - Page motion can grow the chapter and rebase content away from a negative top edge. **Trim Height** refuses to cut through visible page or object bounds.
 - The chapter navigator caches a small preview and offers a draggable viewport handle for scrolling long chapters.
 
@@ -228,7 +228,7 @@ The Fill tool now targets shapes and raster content; owned vector fills no longe
 | `draw_select_rect` | Rectangle Select | Rectangle selection of raster pixels, vector points, or selected custom-path anchors. |
 | `draw_select_lasso` | Lasso Select | Freeform selection of raster pixels, vector points, or selected custom-path anchors. |
 | `draw_select_stroke` | Stroke Select | Selects whole vector strokes. It is hidden/unavailable for Raster objects. |
-| `insert_page_gap` | Insert Page Gap | Finds a physical gap boundary and stages the editable orange gutter transaction. |
+| `insert_page_gap` | Insert Page Gap | Drag-defines freeform blank vertical canvas space, previews hierarchy-aware movement, and offers Confirm/Cancel. |
 | `box_bound` | Shapes → Add Rectangle | Drag-creates a rectangular layer; also serves as a page-shape choice during Add Page. |
 | `circle_bound` | Shapes → Add Circle | Drag-creates an ellipse/circle layer; also serves as a page-shape choice. |
 | `shape_create` | Shapes → Add Shape | Click/drag path construction for closed bounded or open shape layers. `POLYGON_BOUND` is an alias with the same value. Add Page requires this workflow to finish closed. |
@@ -284,16 +284,17 @@ These are not separate `ToolKind` values but materially change behavior.
 - B: Shape Edit
 - Delete: Delete Selected
 - Ctrl+A: Select All
+- Ctrl+D: Deselect
 - Ctrl+S: Save
 - Ctrl+Z: Undo
 - Ctrl+Shift+Z: Redo
 - Ctrl+0: Reset View
 - Ctrl+Shift+0: Reset Rotation
-- Ctrl+V: Paste Image
+- Ctrl+V: Paste (newest internal drawing selection or clipboard image)
 - Alt+G: Toggle Grid
 - Alt+Return: Fullscreen (installed directly by the main window)
 
-Vector Redraw, Connect, Simplify, the three drawing-selection tools, and Insert Page Gap have no default chord. The hotkey dialog supports single simultaneous chords, modifier-only chords, duplicate validation, clearing, and optional Hold behavior for tools. Delete Selected yields Delete to focused editors, active canvas text editing, and shape/gradient point editing.
+Vector Redraw, Connect, Simplify, the three drawing-selection tools, Insert Page Gap, Cut, Copy, and Paste as New Object have no default chord. The hotkey dialog supports single simultaneous chords, modifier-only chords, duplicate validation, clearing, and optional Hold behavior for tools. Deselect clears the current pixel/point selection without dropping the active object. Clear Canvas limits itself to selected pixels or vector points when such a selection exists. Drawing Cut and Copy capture selected raster pixels or vector-point runs in a session-wide internal buffer. Paste merges that content into a compatible active object at its saved world position; Paste as New creates a matching editable sibling immediately above the active raster/vector object. Unified Paste chooses the newer of the internal buffer and a valid OS clipboard image. Delete Selected yields Delete to focused editors, active canvas text editing, and shape/gradient point editing.
 
 The grid uses the resolved user → document → nearest-layer size, divisions,
 color, and opacity for both canvas drawing and snapping. Box boundaries render

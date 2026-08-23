@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import gc
 import base64
+import copy
 import html as html_lib
 import math
 import time
@@ -53,7 +54,7 @@ from comic_editor.core.models import (
     ImageObject, PathContour, PathNode, RasterObject, ShapeStyle, TextObject,
     BlurModifier, OutlineModifier, ToneMask,
     SpeedLineCenterObject, SpeedLinesGradientObject, VectorDrawingObject,
-    VectorStroke, VectorStrokePoint,
+    VectorStroke, VectorStrokePoint, new_id,
     ImageSourceDescriptor, canonical_argb, image_source_from_dict,
     object_from_dict,
 )
@@ -278,6 +279,53 @@ class _FillReplayState:
     reference_tiles: dict[tuple[int, int], QImage]
     current_signature: tuple
     dirty_world: QRectF
+
+
+@dataclass
+class RasterSelectionClipboard:
+    tiles: dict[tuple[int, int], QImage]
+    selection_path: QPainterPath
+    source_to_world: QTransform
+    source_name: str
+    tile_size: int
+
+
+@dataclass
+class VectorSelectionClipboard:
+    strokes: list[VectorStroke]
+    source_to_world: QTransform
+    source_name: str
+
+
+DrawingSelectionClipboard = (
+    RasterSelectionClipboard | VectorSelectionClipboard
+)
+
+
+@dataclass
+class _RasterPasteOverlayState:
+    object_id: str
+    base_tiles: dict[tuple[int, int], QImage]
+    overlay_tiles: dict[tuple[int, int], QImage]
+    selection_path: QPainterPath
+
+
+@dataclass
+class _PageGapDraft:
+    baseline: dict
+    baseline_document: ChapterDocument
+    previous_selection: dict
+    original_height: int
+    anchor_y: float
+    top_y: float
+    bottom_y: float
+    bounds: dict[tuple[str, str], QRectF]
+    linked_speed_centers: set[str]
+    move_roots: list[tuple[str, str]]
+    phase: str = "creating"
+    drag_mode: str = "create"
+
+
 VECTOR_RENDER_INDEX_CELL = 256.0
 WHEEL_ZOOM_SETTLE_MS = 120
 
@@ -486,6 +534,8 @@ class _CanvasLogic:
     pageCreationFinished = Signal(object, object, str)
     pageCreationInvalid = Signal(str)
     pageGapConfirmationChanged = Signal(bool)
+    pageGapModeChanged = Signal(bool)
+    pageGapGeometryChanged = Signal()
     transformModeChanged = Signal(str)
     importStatusMessage = Signal(str)
     colorSampled = Signal(str)
@@ -793,6 +843,10 @@ class _CanvasLogic:
         self._selection_vector_preview_revision = 0
         self._selection_shape_nodes: dict[str, dict] = {}
         self._selection_before_tiles: dict[tuple[int, int], QImage] | None = None
+        self._selection_overlay_tiles: (
+            dict[tuple[int, int], QImage] | None
+        ) = None
+        self._raster_paste_overlay: _RasterPasteOverlayState | None = None
         self._selection_before_model: dict | None = None
         self._fill_before: dict[tuple[int, int], QImage | None] = {}
         self._fill_dirty_world = QRectF()
@@ -830,22 +884,14 @@ class _CanvasLogic:
         self._page_creation_kind = ""
         self._page_creation_draft: BoundGeometry | None = None
         self._page_creation_committing = False
-        self._page_creation_gap_bounds: tuple[float, float] | None = None
         self._page_creation_base_height = 0
         self._gradient_creation_parent_id = ""
         self._gradient_creation_type = ""
         self._gradient_creation_family = "color_fill"
         self._gradient_creation_before = None
-        self._page_gap_prompt_y: float | None = None
-        self._page_gap_state: dict | None = None
-        self._page_gap_transaction: dict | None = None
-        self._page_gap_hover: dict | None = None
-        self._page_gap_drag_mode: str | None = None
-        self._page_gap_drag_before: dict | None = None
-        self._page_gap_drag_start_y = 0.0
-        self._page_gap_drag_start_top = 0.0
-        self._page_gap_drag_start_bottom = 0.0
-        self._page_gap_drag_translations: dict[str, float] = {}
+        self._page_gap_hover_y: float | None = None
+        self._page_gap_draft: _PageGapDraft | None = None
+        self._page_gap_return_selection: dict | None = None
         self.asset_repository: AssetRepository | None = None
         self._asset_drag_manifest: AssetManifest | None = None
         self._asset_drag_tiles: TileStore | None = None
@@ -1305,7 +1351,6 @@ class _CanvasLogic:
         self._page_creation_kind = ""
         self._page_creation_draft = None
         self._page_creation_committing = False
-        self._page_creation_gap_bounds = None
         self._page_creation_base_height = 0
         self._gradient_creation_parent_id = ""
         self._gradient_creation_type = ""
@@ -1317,6 +1362,8 @@ class _CanvasLogic:
         self, chapter: ChapterDocument, tiles: TileStore,
         images: ImageStore | None = None, reset_view: bool = True,
     ) -> None:
+        if self._page_gap_draft is not None:
+            self.cancel_page_gap_transaction()
         self._cancel_fill_job()
         self._clear_fill_replay()
         self._clear_detached_input_state()
@@ -1344,6 +1391,8 @@ class _CanvasLogic:
         self.active_layer_id = ""
         self.selected_object_id = ""
         self.selected_entities = []
+        self._raster_paste_overlay = None
+        self._selection_overlay_tiles = None
         self._selected_vector_stroke_ids.clear()
         self._selected_vector_point_ids.clear()
         self._clear_vector_render_cache()
@@ -1360,10 +1409,9 @@ class _CanvasLogic:
         self._page_creation_kind = ""
         self._page_creation_draft = None
         self._page_creation_committing = False
-        self._page_creation_gap_bounds = None
         self._page_creation_base_height = 0
-        self._page_gap_transaction = None
         self._clear_page_gap_editor()
+        self._page_gap_return_selection = None
         if reset_view:
             self.reset_view()
         self.update()
@@ -1450,11 +1498,15 @@ class _CanvasLogic:
         self.toolChanged.emit(self.tool)
 
     def clear_document(self) -> None:
+        if self._page_gap_draft is not None:
+            self.cancel_page_gap_transaction()
         if self.chapter is not None and self._page_creation_anchor_id:
             self._cancel_page_creation()
         if self._gradient_creation_parent_id:
             self._cancel_gradient_creation()
         self._clear_detached_input_state()
+        self._clear_page_gap_editor()
+        self._page_gap_return_selection = None
         self.chapter = None
         self.tiles = TileStore()
         self.images = ImageStore()
@@ -1496,9 +1548,9 @@ class _CanvasLogic:
     def replace_chapter(self, state: dict) -> None:
         self._commit_text_edit()
         self._clear_transform_preview()
-        self._page_gap_transaction = None
         self._clear_page_gap_editor()
         self.pageGapConfirmationChanged.emit(False)
+        self.pageGapModeChanged.emit(False)
         self.chapter = ChapterDocument.from_dict(state)
         self._compound_path_cache.clear()
         self._gradient_geometry_cache.clear()
@@ -1916,16 +1968,9 @@ class _CanvasLogic:
     ) -> None:
         if self.chapter is None:
             return
+        if self._page_gap_draft is not None:
+            return
         previous_tool = self.tool
-        if (
-            self._page_gap_state is not None
-            and self._page_gap_transaction is None
-            and not (
-                kind == "layer"
-                and entity_id == self._page_gap_state.get("owner_id")
-            )
-        ):
-            self._clear_page_gap_editor()
         if entity_id != self.selected_object_id:
             self._clear_fill_replay()
             if self._vector_gesture_mode is not None:
@@ -1996,6 +2041,8 @@ class _CanvasLogic:
     ) -> bool:
         """Select an outliner-authored raster/vector object set."""
         if self.chapter is None:
+            return False
+        if self._page_gap_draft is not None:
             return False
         ordered: list[tuple[str, str]] = []
         for kind, entity_id in entities:
@@ -2078,13 +2125,10 @@ class _CanvasLogic:
         """Clear the current entity and notify every selection consumer."""
         if self.chapter is None:
             return
+        if self._page_gap_draft is not None:
+            return
         if self._vector_gesture_mode is not None:
             self._cancel_vector_gesture(restore=True)
-        if (
-            self._page_gap_state is not None
-            and self._page_gap_transaction is None
-        ):
-            self._clear_page_gap_editor()
         self._commit_text_edit()
         self._cancel_text_property_drag()
         self._clear_transform_preview()
@@ -2115,6 +2159,11 @@ class _CanvasLogic:
             "page_id": self.active_page_id,
             "entities": list(self.selected_entities),
             "path": QPainterPath(self._drawing_selection_path),
+            "vector_strokes": set(self._selected_vector_stroke_ids),
+            "vector_points": set(self._selected_vector_point_ids),
+            "shape_primary": self._selected_shape_node_id,
+            "shape_points": set(self._selected_shape_node_ids),
+            "tool": self.tool,
         }
 
     def _restore_selection_snapshot(self, snap) -> None:
@@ -2127,6 +2176,23 @@ class _CanvasLogic:
             self.active_page_id = snap["page_id"]
             self.selected_entities = list(snap["entities"])
             self._drawing_selection_path = QPainterPath(snap["path"])
+            self._selected_vector_stroke_ids = set(
+                snap.get("vector_strokes", set())
+            )
+            self._selected_vector_point_ids = set(
+                snap.get("vector_points", set())
+            )
+            self._selected_shape_node_id = str(
+                snap.get("shape_primary", "")
+            )
+            self._selected_shape_node_ids = set(
+                snap.get("shape_points", set())
+            )
+            restored_tool = snap.get("tool", self.tool)
+            if restored_tool != self.tool:
+                self.tool = restored_tool
+                self.toolChanged.emit(self.tool)
+            self._refresh_drawing_selection_transform()
             self._invalidate_scene_cache()
             self.selectionChanged.emit(self.selected_kind, self.selected_id)
             self.selectionSetChanged.emit(list(self.selected_entities))
@@ -2148,6 +2214,20 @@ class _CanvasLogic:
         ), already_done=True)
 
     def set_tool(self, tool: ToolKind) -> bool:
+        if (
+            self._page_gap_draft is not None
+            and tool != ToolKind.INSERT_PAGE_GAP
+        ):
+            return False
+        if tool == ToolKind.INSERT_PAGE_GAP and self.tool != tool:
+            self._page_gap_return_selection = self._selection_snapshot()
+        elif (
+            self.tool == ToolKind.INSERT_PAGE_GAP
+            and tool != ToolKind.INSERT_PAGE_GAP
+            and self._page_gap_draft is None
+        ):
+            self._page_gap_return_selection = None
+            self._page_gap_hover_y = None
         selected_object = (
             self.chapter.objects.get(self.selected_object_id)
             if self.chapter is not None else None
@@ -4299,15 +4379,17 @@ class _CanvasLogic:
             Qt.RoundCap, Qt.RoundJoin,
         )
         painter.setPen(pen)
-        if self._page_gap_prompt_y is not None:
-            y = self._page_gap_prompt_y
+        if (
+            self.tool == ToolKind.INSERT_PAGE_GAP
+            and self._page_gap_hover_y is not None
+            and self._page_gap_draft is None
+        ):
+            y = self._page_gap_hover_y
             painter.drawLine(QPointF(0, y), QPointF(self.chapter.width, y))
-        if self.tool == ToolKind.INSERT_PAGE_GAP and self._page_gap_hover:
-            y = float(self._page_gap_hover["y"])
-            painter.drawLine(QPointF(0, y), QPointF(self.chapter.width, y))
-        if self._page_gap_editor_visible():
-            top = float(self._page_gap_state["top_y"])
-            bottom = float(self._page_gap_state["bottom_y"])
+        draft = self._page_gap_draft
+        if draft is not None:
+            top = draft.top_y
+            bottom = draft.bottom_y
             painter.fillRect(
                 QRectF(0, top, self.chapter.width, bottom - top),
                 QColor(255, 159, 34, 38),
@@ -4318,6 +4400,17 @@ class _CanvasLogic:
             painter.drawLine(
                 QPointF(0, bottom), QPointF(self.chapter.width, bottom)
             )
+            handle_radius = 6 / scale
+            handle_center_x = self.chapter.width / 2
+            painter.setPen(QPen(
+                QColor("#fff4df"), 1.5 / scale, Qt.SolidLine
+            ))
+            painter.setBrush(QColor("#ff9f22"))
+            for y in (top, bottom):
+                painter.drawEllipse(
+                    QPointF(handle_center_x, y),
+                    handle_radius, handle_radius,
+                )
         painter.restore()
 
     def _render_entity_crop(
@@ -7834,7 +7927,8 @@ class _CanvasLogic:
     def _raster_selection_preview_state(
         self, obj: RasterObject,
     ) -> tuple[
-        dict[tuple[int, int], QImage], QPainterPath, QTransform,
+        dict[tuple[int, int], QImage], dict[tuple[int, int], QImage],
+        QPainterPath, QTransform, bool,
     ] | None:
         before_tiles = self._selection_before_tiles
         source_quad = self._selection_transform_start_quad
@@ -7864,7 +7958,11 @@ class _CanvasLogic:
         )
         if not transform.isInvertible():
             return None
-        return before_tiles, QPainterPath(self._drawing_selection_path), transform
+        moving = self._selection_overlay_tiles or before_tiles
+        return (
+            before_tiles, moving, QPainterPath(self._drawing_selection_path),
+            transform, self._selection_overlay_tiles is not None,
+        )
 
     @staticmethod
     def _tile_mapping_bounds(
@@ -7902,18 +8000,21 @@ class _CanvasLogic:
         state = self._raster_selection_preview_state(obj)
         if state is None:
             return False
-        before_tiles, source_path, transform = state
-        tile_bounds = self._tile_mapping_bounds(before_tiles, obj.tile_size)
+        background_tiles, moving_tiles, source_path, transform, copied = state
+        tile_bounds = self._tile_mapping_bounds(
+            {**background_tiles, **moving_tiles}, obj.tile_size
+        )
         if tile_bounds.isEmpty():
             return True
 
-        unselected = QPainterPath()
-        unselected.addRect(tile_bounds)
-        unselected = unselected.subtracted(source_path)
         painter.save()
-        painter.setClipPath(unselected, Qt.ClipOperation.IntersectClip)
+        if not copied:
+            unselected = QPainterPath()
+            unselected.addRect(tile_bounds)
+            unselected = unselected.subtracted(source_path)
+            painter.setClipPath(unselected, Qt.ClipOperation.IntersectClip)
         self._draw_tile_mapping(
-            painter, before_tiles, obj.tile_size, local_visible
+            painter, background_tiles, obj.tile_size, local_visible
         )
         painter.restore()
 
@@ -7927,7 +8028,7 @@ class _CanvasLogic:
         painter.setTransform(transform, True)
         painter.setClipPath(source_path, Qt.ClipOperation.IntersectClip)
         self._draw_tile_mapping(
-            painter, before_tiles, obj.tile_size, source_visible
+            painter, moving_tiles, obj.tile_size, source_visible
         )
         painter.restore()
         return True
@@ -7938,7 +8039,7 @@ class _CanvasLogic:
         state = self._raster_selection_preview_state(obj)
         if state is None:
             return None
-        _tiles, source_path, transform = state
+        _background, _moving, source_path, transform, _copied = state
         target_path = transform.map(source_path)
         return self._drawing_local_to_world_transform(obj).map(
             target_path
@@ -9936,6 +10037,8 @@ class _CanvasLogic:
             modifier.focal_angle = math.atan2(delta.y(), delta.x())
 
     def _draw_focal_modifier_handles(self, painter: QPainter) -> None:
+        if self._page_gap_draft is not None:
+            return
         modifier = self._active_focal_modifier()
         if modifier is None:
             return
@@ -11555,7 +11658,6 @@ class _CanvasLogic:
     def begin_page_creation(
         self, anchor_page_id: str, kind: str, *,
         before: dict | None = None,
-        gap_bounds: tuple[float, float] | None = None,
     ) -> bool:
         if (
             self.chapter is None
@@ -11563,14 +11665,11 @@ class _CanvasLogic:
             or kind not in {"rectangle", "circle", "custom"}
         ):
             return False
-        if gap_bounds is None:
-            self._clear_page_gap_editor()
         self._page_creation_anchor_id = anchor_page_id
         self._page_creation_before = before or self.chapter.to_dict()
         self._page_creation_kind = kind
         self._page_creation_draft = None
         self._page_creation_committing = False
-        self._page_creation_gap_bounds = gap_bounds
         self._page_creation_base_height = self.chapter.height
         anchor = self.page_world_bounds(anchor_page_id)
         self.chapter.height = max(
@@ -11597,12 +11696,8 @@ class _CanvasLogic:
         self._page_creation_kind = ""
         self._page_creation_draft = None
         self._page_creation_committing = False
-        self._page_creation_gap_bounds = None
         self._page_creation_base_height = 0
         self._clear_creation_gesture()
-        self._page_gap_transaction = None
-        self._clear_page_gap_editor()
-        self.pageGapConfirmationChanged.emit(False)
         if before is not None:
             self.replace_chapter(before)
         if (
@@ -11634,14 +11729,6 @@ class _CanvasLogic:
             )
             self.update()
             return False
-        if self._page_creation_gap_bounds is not None:
-            gap_top, gap_bottom = self._page_creation_gap_bounds
-            if top < gap_top - 1e-6 or top + height > gap_bottom + 1e-6:
-                self.pageCreationInvalid.emit(
-                    "Keep the complete page inside the confirmed page gap."
-                )
-                self.update()
-                return False
         before = self._page_creation_before or self.chapter.to_dict()
         self._page_creation_draft = BoundGeometry.from_dict(bound.to_dict())
         self._page_creation_committing = True
@@ -11669,7 +11756,6 @@ class _CanvasLogic:
         self._page_creation_before = None
         self._page_creation_kind = ""
         self._page_creation_draft = None
-        self._page_creation_gap_bounds = None
         self._page_creation_base_height = 0
         self._clear_creation_gesture()
         self.update()
@@ -11679,188 +11765,358 @@ class _CanvasLogic:
             self.chapter.height if self.chapter is not None else 0
         ))
 
-    def set_page_gap_prompt_line(self, y: float | None) -> None:
-        self._page_gap_prompt_y = None if y is None else float(y)
-        self.update()
+    def page_gap_mode_active(self) -> bool:
+        return self._page_gap_draft is not None
 
-    def begin_page_gap_editor(
-        self, owner_id: str, top_ids: list[str], bottom_ids: list[str],
-        top_y: float, bottom_y: float,
-    ) -> None:
-        self._page_gap_prompt_y = None
-        self._page_gap_state = {
-            "owner_id": owner_id,
-            "top_ids": list(top_ids),
-            "bottom_ids": list(bottom_ids),
-            "top_y": float(top_y),
-            "bottom_y": max(float(top_y), float(bottom_y)),
-        }
-        self._page_gap_hover = None
-        self.update()
-
-    def begin_page_gap_transaction(
-        self, origin: str, anchor_id: str, top_ids: list[str],
-        bottom_ids: list[str], top_y: float,
-    ) -> bool:
+    def page_gap_confirmation_anchor(self) -> QPointF | None:
+        draft = self._page_gap_draft
         if (
-            self.chapter is None
-            or origin not in {"add_page", "standalone"}
-            or anchor_id not in self.chapter.root_page_ids
-            or not bottom_ids
+            self.chapter is None or draft is None
+            or draft.phase != "active"
+        ):
+            return None
+        return self.document_to_widget(QPointF(
+            self.chapter.width / 2, draft.top_y
+        ))
+
+    @staticmethod
+    def _page_gap_object_has_data(
+        obj: DocumentObject, tiles: TileStore,
+    ) -> bool:
+        if isinstance(obj, RasterObject):
+            return bool(
+                tiles.object_tiles(obj.object_id)
+                or obj.interaction_rect[2] > 0
+                or obj.interaction_rect[3] > 0
+            )
+        if isinstance(obj, VectorDrawingObject):
+            return any(stroke.points for stroke in obj.strokes)
+        if isinstance(obj, TextObject):
+            return bool(
+                obj.text or obj.width > 0 or obj.height > 0
+                or obj.transform_quad
+            )
+        return True
+
+    def _page_gap_modeled_bounds(
+        self, document: ChapterDocument,
+    ) -> tuple[
+        dict[tuple[str, str], QRectF], set[str],
+    ]:
+        has_data: dict[tuple[str, str], bool] = {}
+        linked_centers = {
+            obj.center_shape_id
+            for obj in document.objects.values()
+            if (
+                isinstance(obj, SpeedLinesGradientObject)
+                and obj.center_shape_id
+            )
+        }
+
+        def entity_has_data(kind: str, entity_id: str) -> bool:
+            key = kind, entity_id
+            if key in has_data:
+                return has_data[key]
+            if kind == "object":
+                obj = document.objects.get(entity_id)
+                result = bool(
+                    obj is not None
+                    and self._page_gap_object_has_data(obj, self.tiles)
+                )
+            else:
+                layer = document.layers.get(entity_id)
+                result = bool(layer is not None and layer.bound is not None)
+                if layer is not None:
+                    result = result or any(
+                        entity_has_data(child.kind, child.entity_id)
+                        for child in layer.children
+                    )
+            has_data[key] = result
+            return result
+
+        def direct_padding(kind: str, entity_id: str) -> float:
+            target = (
+                document.layers.get(entity_id)
+                if kind == "layer" else document.objects.get(entity_id)
+            )
+            if target is None:
+                return 0.0
+            padding = 0.0
+            for modifier_id in target.modifier_ids:
+                modifier = document.modifiers.get(modifier_id)
+                if modifier is None or modifier.intensity <= 0:
+                    continue
+                if isinstance(modifier, BlurModifier):
+                    padding += self._modifier_maximum(
+                        modifier, "strength", modifier.strength
+                    ) * 3.0
+                elif isinstance(modifier, OutlineModifier):
+                    padding += self._modifier_maximum(
+                        modifier, "thickness", modifier.thickness
+                    )
+            return padding
+
+        def ancestor_padding(kind: str, entity_id: str) -> float:
+            if kind == "layer":
+                parent_id = document.layers[entity_id].parent_id
+            else:
+                parent_id = document.objects[entity_id].parent_layer_id
+            padding = 0.0
+            while parent_id:
+                padding += direct_padding("layer", parent_id)
+                parent_id = document.layers[parent_id].parent_id
+            return padding
+
+        def layer_geometry_bounds(layer_id: str) -> QRectF | None:
+            layer = document.layers[layer_id]
+            if layer.bound is None:
+                return None
+            left, top, width, height = layer.bound.bbox()
+            padding = layer.shape_style.outline_thickness
+            if layer.layer_kind == "open_shape":
+                maximum = max((
+                    node.width_multiplier
+                    for node in layer.bound.nodes
+                ), default=1.0)
+                padding += layer.shape_style.base_thickness * maximum / 2
+            local = QRectF(
+                left - padding, top - padding,
+                max(1.0, width + padding * 2),
+                max(1.0, height + padding * 2),
+            )
+            return self._document_layer_world_transform(
+                document, layer_id
+            ).mapRect(local)
+
+        def object_geometry_bounds(object_id: str) -> QRectF:
+            current = self.chapter.objects.get(object_id)
+            world = self.object_world_rect(object_id)
+            result = QRectF(world) if world is not None else QRectF()
+            if isinstance(current, RasterObject):
+                content = self.tiles.content_bounds(object_id)
+                if content is not None:
+                    content_world = self._drawing_local_rect_to_world(
+                        current, content
+                    )
+                    result = (
+                        QRectF(content_world) if result.isEmpty()
+                        else result.united(content_world)
+                    )
+            elif (
+                isinstance(current, VectorDrawingObject)
+                and current.transform_quad is None
+            ):
+                left, top, width, height = current.derived_bounds()
+                stroke_padding = max((
+                    point.width
+                    for stroke in current.strokes
+                    for point in stroke.points
+                ), default=1.0) / 2
+                local = QRectF(
+                    current.x + left - stroke_padding,
+                    current.y + top - stroke_padding,
+                    max(1.0, width + stroke_padding * 2),
+                    max(1.0, height + stroke_padding * 2),
+                )
+                vector_world = self.layer_world_transform(
+                    current.parent_layer_id
+                ).mapRect(local)
+                result = (
+                    QRectF(vector_world) if result.isEmpty()
+                    else result.united(vector_world)
+                )
+            return result
+
+        direct_bounds: dict[tuple[str, str], QRectF] = {}
+
+        def subtree_with_direct_effects(
+            kind: str, entity_id: str,
+        ) -> QRectF:
+            key = kind, entity_id
+            cached = direct_bounds.get(key)
+            if cached is not None:
+                return QRectF(cached)
+            found = False
+            result = QRectF()
+            if kind == "object":
+                result = object_geometry_bounds(entity_id)
+                found = not result.isEmpty()
+            else:
+                own = layer_geometry_bounds(entity_id)
+                if own is not None:
+                    result = own
+                    found = True
+                layer = document.layers[entity_id]
+                for child in layer.children:
+                    if not entity_has_data(child.kind, child.entity_id):
+                        continue
+                    child_bounds = subtree_with_direct_effects(
+                        child.kind, child.entity_id
+                    )
+                    if child_bounds.isEmpty():
+                        continue
+                    result = (
+                        child_bounds if not found
+                        else result.united(child_bounds)
+                    )
+                    found = True
+            if not found:
+                result = QRectF()
+            padding = direct_padding(kind, entity_id)
+            if padding and not result.isEmpty():
+                result = result.adjusted(
+                    -padding, -padding, padding, padding
+                )
+            direct_bounds[key] = QRectF(result)
+            return result
+
+        bounds: dict[tuple[str, str], QRectF] = {}
+        entities = [
+            *(("layer", layer_id) for layer_id in document.layers),
+            *(("object", object_id) for object_id in document.objects),
+        ]
+        for kind, entity_id in entities:
+            if not entity_has_data(kind, entity_id):
+                continue
+            world = subtree_with_direct_effects(kind, entity_id)
+            padding = ancestor_padding(kind, entity_id)
+            if padding and not world.isEmpty():
+                world = world.adjusted(
+                    -padding, -padding, padding, padding
+                )
+            bounds[(kind, entity_id)] = QRectF(world)
+        return bounds, linked_centers
+
+    def _begin_page_gap_draft(self, world: QPointF) -> bool:
+        if (
+            self.chapter is None or self._page_gap_draft is not None
+            or not 0 <= world.y() <= self.chapter.height
         ):
             return False
-        before = self.chapter.to_dict()
-        for page_id in bottom_ids:
-            if page_id in self.chapter.layers:
-                self.chapter.layers[page_id].translate_y += 120
-        self._page_gap_transaction = {
-            "origin": origin,
-            "anchor_id": anchor_id,
-            "before": before,
-            "confirmed": False,
-        }
-        self.begin_page_gap_editor(
-            anchor_id, top_ids, bottom_ids, top_y, top_y + 120
+        anchor = float(max(
+            0, min(self.chapter.height, round(world.y()))
+        ))
+        baseline = self.chapter.to_dict()
+        baseline_document = ChapterDocument.from_dict(baseline)
+        bounds, linked_centers = self._page_gap_modeled_bounds(
+            baseline_document
         )
-        self._ensure_page_height_safety()
-        self.pageGapConfirmationChanged.emit(True)
-        self.hierarchyChanged.emit()
-        self.documentChanged.emit(QRectF())
+        previous_selection = (
+            self._page_gap_return_selection
+            or self._selection_snapshot()
+        )
+        self._page_gap_draft = _PageGapDraft(
+            baseline=baseline,
+            baseline_document=baseline_document,
+            previous_selection=previous_selection,
+            original_height=int(self.chapter.height),
+            anchor_y=anchor,
+            top_y=anchor,
+            bottom_y=anchor,
+            bounds=bounds,
+            linked_speed_centers=linked_centers,
+            move_roots=[],
+        )
+        self._page_gap_hover_y = None
+        self.pageGapGeometryChanged.emit()
         self.update()
         return True
 
     def page_gap_transaction(self) -> dict | None:
-        if self._page_gap_transaction is None or self._page_gap_state is None:
+        draft = self._page_gap_draft
+        if draft is None:
             return None
         return {
-            **self._page_gap_transaction,
-            "top_ids": list(self._page_gap_state["top_ids"]),
-            "bottom_ids": list(self._page_gap_state["bottom_ids"]),
-            "top_y": float(self._page_gap_state["top_y"]),
-            "bottom_y": float(self._page_gap_state["bottom_y"]),
+            "before": draft.baseline,
+            "top_y": draft.top_y,
+            "bottom_y": draft.bottom_y,
+            "gap_size": draft.bottom_y - draft.top_y,
+            "move_roots": list(draft.move_roots),
+            "phase": draft.phase,
         }
 
     def confirm_page_gap_transaction(self) -> dict | None:
-        if self.chapter is None or self._page_gap_transaction is None:
+        draft = self._page_gap_draft
+        if (
+            self.chapter is None or draft is None
+            or draft.phase != "active"
+        ):
             return None
-        self._ensure_page_height_safety()
         transaction = self.page_gap_transaction()
-        if transaction is None:
-            return None
-        origin = transaction["origin"]
-        if origin == "standalone":
-            before = transaction["before"]
-            owner_id = transaction["anchor_id"]
-            after = self.chapter.to_dict()
-            self._page_gap_transaction = None
-            self._clear_page_gap_editor()
-            self.pageGapConfirmationChanged.emit(False)
-            if before != after:
-                self.push_model_change(
-                    before, after, "Insert page gap"
-                )
-            if owner_id in self.chapter.layers:
-                self.set_selection(
-                    "layer", owner_id, activate_default_tool=False
-                )
-            self.tool = ToolKind.SHAPE_EDIT
-            self.toolChanged.emit(self.tool)
-            self.hierarchyChanged.emit()
-            self.documentChanged.emit(QRectF())
-            self.interactionFinished.emit()
-            self.update()
-        else:
-            self._page_gap_transaction["confirmed"] = True
-        return transaction
-
-    def cancel_page_gap_transaction(self) -> str:
-        transaction = self._page_gap_transaction
-        if transaction is None:
-            self._clear_page_gap_editor()
-            self.pageGapConfirmationChanged.emit(False)
-            return ""
-        origin = str(transaction["origin"])
-        before = transaction["before"]
-        anchor_id = str(transaction["anchor_id"])
-        self._page_gap_transaction = None
+        after = self.chapter.to_dict()
+        previous_selection = draft.previous_selection
+        before = draft.baseline
         self._clear_page_gap_editor()
-        self.pageGapConfirmationChanged.emit(False)
-        self.replace_chapter(before)
-        if anchor_id in self.chapter.layers:
-            self.set_selection(
-                "layer", anchor_id, activate_default_tool=False
-            )
-        if origin == "standalone":
-            self.tool = ToolKind.INSERT_PAGE_GAP
-            self.toolChanged.emit(self.tool)
-        else:
-            self.tool = ToolKind.SHAPE_EDIT
-            self.toolChanged.emit(self.tool)
+        self._page_gap_return_selection = None
+        self._restore_selection_snapshot(previous_selection)
+        if before != after:
+            self.push_model_change(before, after, "Insert page gap")
+        self.hierarchyChanged.emit()
+        self.documentChanged.emit(QRectF())
         self.interactionFinished.emit()
         self.update()
-        return origin
+        return transaction
 
-    def finish_page_gap_workflow(self) -> None:
-        self._page_gap_transaction = None
+    def cancel_page_gap_transaction(self) -> bool:
+        draft = self._page_gap_draft
+        if draft is None:
+            self._clear_page_gap_editor()
+            return False
+        previous_selection = draft.previous_selection
+        self._restore_page_gap_baseline(draft)
         self._clear_page_gap_editor()
-        self.pageGapConfirmationChanged.emit(False)
+        self._page_gap_return_selection = None
+        self._restore_selection_snapshot(previous_selection)
+        self.interactionFinished.emit()
+        self.update()
+        return True
 
     def _clear_page_gap_editor(self) -> None:
-        self._page_gap_prompt_y = None
-        self._page_gap_state = None
-        self._page_gap_hover = None
-        self._page_gap_drag_mode = None
-        self._page_gap_drag_before = None
-        self._page_gap_drag_translations.clear()
+        had_draft = self._page_gap_draft is not None
+        self._page_gap_draft = None
+        self._page_gap_hover_y = None
         self.unsetCursor()
+        self.pageGapConfirmationChanged.emit(False)
+        if had_draft:
+            self.pageGapModeChanged.emit(False)
+        self.pageGapGeometryChanged.emit()
         self.update()
 
     def _page_gap_editor_visible(self) -> bool:
         return bool(
-            self._page_gap_state
-            and (
-                self._page_gap_transaction is not None
-                or (
-                    self.selected_kind == "layer"
-                    and self.selected_id == self._page_gap_state.get("owner_id")
-                )
-            )
+            self._page_gap_draft is not None
+            and self._page_gap_draft.phase == "active"
         )
 
     def _page_gap_hit(self, world: QPointF) -> str | None:
         if not self._page_gap_editor_visible():
             return None
-        top = float(self._page_gap_state["top_y"])
-        bottom = float(self._page_gap_state["bottom_y"])
+        draft = self._page_gap_draft
+        top = draft.top_y
+        bottom = draft.bottom_y
         tolerance = 12 / max(self.scale, 0.05)
-        if abs(world.y() - top) <= tolerance:
-            return "top"
-        if abs(world.y() - bottom) <= tolerance:
-            return "bottom"
-        if top < world.y() < bottom:
-            return "band"
-        return None
+        distances = {
+            "top": abs(world.y() - top),
+            "bottom": abs(world.y() - bottom),
+        }
+        mode = min(distances, key=distances.get)
+        return mode if distances[mode] <= tolerance else None
 
     def _update_page_gap_hover(self, world: QPointF) -> None:
-        if self.tool != ToolKind.INSERT_PAGE_GAP or self.chapter is None:
-            self._page_gap_hover = None
+        if (
+            self.tool != ToolKind.INSERT_PAGE_GAP
+            or self.chapter is None
+            or self._page_gap_draft is not None
+        ):
+            self._page_gap_hover_y = None
             return
-        ordered = self.physically_ordered_pages()
-        hover = None
-        for index in range(len(ordered) - 1):
-            upper = self.page_world_bounds(ordered[index])
-            lower = self.page_world_bounds(ordered[index + 1])
-            if upper.bottom() <= world.y() <= lower.top():
-                hover = {
-                    "y": world.y(),
-                    "top_ids": ordered[:index + 1],
-                    "bottom_ids": ordered[index + 1:],
-                    "owner_id": ordered[index + 1],
-                }
-                break
-        self._page_gap_hover = hover
+        self._page_gap_hover_y = (
+            float(max(0, min(self.chapter.height, world.y())))
+            if 0 <= world.y() <= self.chapter.height else None
+        )
         self.setCursor(
-            Qt.PointingHandCursor if hover else Qt.ForbiddenCursor
+            Qt.SizeVerCursor
+            if self._page_gap_hover_y is not None else Qt.ForbiddenCursor
         )
         self.update()
 
@@ -11868,69 +12124,200 @@ class _CanvasLogic:
         mode = self._page_gap_hit(world)
         if mode is None:
             return False
-        state = self._page_gap_state
-        self._page_gap_drag_mode = mode
-        self._page_gap_drag_before = self.chapter.to_dict()
-        self._page_gap_drag_start_y = world.y()
-        self._page_gap_drag_start_top = float(state["top_y"])
-        self._page_gap_drag_start_bottom = float(state["bottom_y"])
-        ids = set(state["top_ids"]) | set(state["bottom_ids"])
-        self._page_gap_drag_translations = {
-            page_id: self.chapter.layers[page_id].translate_y
-            for page_id in ids if page_id in self.chapter.layers
-        }
-        self.setCursor(
-            Qt.ClosedHandCursor
-            if mode == "band" else Qt.PointingHandCursor
-        )
+        self._page_gap_draft.drag_mode = mode
+        self.setCursor(Qt.SizeVerCursor)
         return True
 
     def _move_page_gap_interaction(self, world: QPointF) -> None:
-        if not self._page_gap_drag_mode or not self._page_gap_state:
+        draft = self._page_gap_draft
+        if draft is None or not draft.drag_mode:
             return
-        delta = world.y() - self._page_gap_drag_start_y
-        mode = self._page_gap_drag_mode
-        if mode == "top":
-            delta = min(
-                delta,
-                self._page_gap_drag_start_bottom
-                - self._page_gap_drag_start_top,
-            )
-            moving = self._page_gap_state["top_ids"]
-            self._page_gap_state["top_y"] = (
-                self._page_gap_drag_start_top + delta
-            )
-        elif mode == "bottom":
-            delta = max(
-                delta,
-                self._page_gap_drag_start_top
-                - self._page_gap_drag_start_bottom,
-            )
-            moving = self._page_gap_state["bottom_ids"]
-            self._page_gap_state["bottom_y"] = (
-                self._page_gap_drag_start_bottom + delta
-            )
+        y = float(max(0, min(draft.original_height, round(world.y()))))
+        if draft.drag_mode == "create":
+            draft.top_y = min(draft.anchor_y, y)
+            draft.bottom_y = max(draft.anchor_y, y)
+        elif draft.drag_mode == "top":
+            draft.top_y = min(y, draft.bottom_y - 1)
         else:
-            moving = (
-                self._page_gap_state["top_ids"]
-                + self._page_gap_state["bottom_ids"]
-            )
-            self._page_gap_state["top_y"] = (
-                self._page_gap_drag_start_top + delta
-            )
-            self._page_gap_state["bottom_y"] = (
-                self._page_gap_drag_start_bottom + delta
-            )
-        for page_id in moving:
-            if (
-                page_id in self.chapter.layers
-                and page_id in self._page_gap_drag_translations
-            ):
-                self.chapter.layers[page_id].translate_y = (
-                    self._page_gap_drag_translations[page_id] + delta
-                )
-        self.documentChanged.emit(QRectF())
+            draft.bottom_y = max(y, draft.top_y + 1)
+        self._apply_page_gap_preview(draft)
+        self.pageGapGeometryChanged.emit()
         self.update()
+
+    def _restore_page_gap_baseline(self, draft: _PageGapDraft) -> None:
+        if self.chapter is None:
+            return
+        baseline = draft.baseline_document
+        for layer_id, source in baseline.layers.items():
+            current = self.chapter.layers.get(layer_id)
+            if current is None:
+                continue
+            current.__dict__.clear()
+            current.__dict__.update(copy.deepcopy(source.__dict__))
+        for object_id, source in baseline.objects.items():
+            current = self.chapter.objects.get(object_id)
+            if current is None:
+                continue
+            current.__dict__.clear()
+            current.__dict__.update(copy.deepcopy(source.__dict__))
+        for modifier_id, source in baseline.modifiers.items():
+            current = self.chapter.modifiers.get(modifier_id)
+            if current is None:
+                continue
+            current.__dict__.clear()
+            current.__dict__.update(copy.deepcopy(source.__dict__))
+        self.chapter.height = draft.original_height
+        self._compound_path_cache.clear()
+        self._gradient_geometry_cache.clear()
+        self._gradient_scalar_cache.clear()
+        self._clear_vector_render_cache()
+        self._invalidate_scene_cache()
+
+    def _page_gap_move_roots(
+        self, draft: _PageGapDraft,
+    ) -> list[tuple[str, str]]:
+        result: list[tuple[str, str]] = []
+
+        def scan(kind: str, entity_id: str) -> None:
+            if kind == "object" and entity_id in draft.linked_speed_centers:
+                return
+            bounds = draft.bounds.get((kind, entity_id))
+            if bounds is None:
+                return
+            if bounds.top() >= draft.top_y - 1e-6:
+                result.append((kind, entity_id))
+                return
+            if kind != "layer" or bounds.bottom() < draft.top_y:
+                return
+            layer = draft.baseline_document.layers.get(entity_id)
+            if layer is None:
+                return
+            for child in layer.children:
+                scan(child.kind, child.entity_id)
+
+        for page_id in draft.baseline_document.root_page_ids:
+            scan("layer", page_id)
+        return result
+
+    def _page_gap_local_delta(
+        self, parent_id: str | None, anchor: QPointF, dy: float,
+    ) -> QPointF:
+        if not parent_id:
+            return QPointF(0, dy)
+        inverse, valid = self.layer_world_transform(parent_id).inverted()
+        if not valid:
+            return QPointF()
+        return inverse.map(anchor + QPointF(0, dy)) - inverse.map(anchor)
+
+    def _translate_page_gap_layer(
+        self, layer_id: str, bounds: QRectF, dy: float,
+    ) -> None:
+        layer = self.chapter.layers[layer_id]
+        delta = self._page_gap_local_delta(
+            layer.parent_id, bounds.center(), dy
+        )
+        if layer.transform_frame is not None and layer.transform_quad is not None:
+            layer.transform_quad = [
+                (x + delta.x(), y + delta.y())
+                for x, y in layer.transform_quad
+            ]
+        else:
+            layer.translate_x += delta.x()
+            layer.translate_y += delta.y()
+        world_translation = QTransform()
+        world_translation.translate(0, dy)
+        self._transform_single_target_focal_modifiers(
+            "layer", layer_id, world_translation
+        )
+
+    def _translate_page_gap_object(
+        self, object_id: str, bounds: QRectF, dy: float,
+    ) -> None:
+        obj = self.chapter.objects[object_id]
+        delta = self._page_gap_local_delta(
+            obj.parent_layer_id, bounds.center(), dy
+        )
+        dx, local_dy = delta.x(), delta.y()
+        moved_by_quad = False
+        if isinstance(obj, TextObject) and obj.transform_quad is not None:
+            obj.transform_quad = [
+                (x + dx, y + local_dy) for x, y in obj.transform_quad
+            ]
+            moved_by_quad = True
+        if isinstance(obj, (RasterObject, VectorDrawingObject, ImageObject)):
+            if obj.transform_quad is not None:
+                obj.transform_quad = [
+                    (x + dx, y + local_dy) for x, y in obj.transform_quad
+                ]
+                moved_by_quad = True
+        if not moved_by_quad:
+            obj.x += dx
+            obj.y += local_dy
+        if isinstance(obj, GradientObject):
+            for contour in obj.line_field.geometry.iter_contours():
+                for node in contour.nodes:
+                    node.x += dx
+                    node.y += local_dy
+                    if node.incoming is not None:
+                        node.incoming = (
+                            node.incoming[0] + dx,
+                            node.incoming[1] + local_dy,
+                        )
+                    if node.outgoing is not None:
+                        node.outgoing = (
+                            node.outgoing[0] + dx,
+                            node.outgoing[1] + local_dy,
+                        )
+            radial = obj.radial_field
+            radial.origin_x += dx
+            radial.origin_y += local_dy
+            if radial.manual_center is not None:
+                radial.manual_center = (
+                    radial.manual_center[0] + dx,
+                    radial.manual_center[1] + local_dy,
+                )
+            if obj.shape_field.manual_center is not None:
+                obj.shape_field.manual_center = (
+                    obj.shape_field.manual_center[0] + dx,
+                    obj.shape_field.manual_center[1] + local_dy,
+                )
+            if isinstance(obj, SpeedLinesGradientObject):
+                center = self.chapter.objects.get(obj.center_shape_id)
+                if isinstance(center, SpeedLineCenterObject):
+                    for contour in center.geometry.iter_contours():
+                        for node in contour.nodes:
+                            node.x += dx
+                            node.y += local_dy
+                            if node.incoming is not None:
+                                node.incoming = (
+                                    node.incoming[0] + dx,
+                                    node.incoming[1] + local_dy,
+                                )
+                            if node.outgoing is not None:
+                                node.outgoing = (
+                                    node.outgoing[0] + dx,
+                                    node.outgoing[1] + local_dy,
+                                )
+            obj.touch_revision()
+        world_translation = QTransform()
+        world_translation.translate(0, dy)
+        self._transform_single_target_focal_modifiers(
+            "object", object_id, world_translation
+        )
+
+    def _apply_page_gap_preview(self, draft: _PageGapDraft) -> None:
+        if self.chapter is None:
+            return
+        self._restore_page_gap_baseline(draft)
+        gap_size = max(0.0, draft.bottom_y - draft.top_y)
+        draft.move_roots = self._page_gap_move_roots(draft)
+        for kind, entity_id in draft.move_roots:
+            bounds = draft.bounds[(kind, entity_id)]
+            if kind == "layer":
+                self._translate_page_gap_layer(entity_id, bounds, gap_size)
+            else:
+                self._translate_page_gap_object(entity_id, bounds, gap_size)
+        self.chapter.height = draft.original_height + round(gap_size)
 
     def _ensure_page_height_safety(self) -> None:
         if self.chapter is None or not self.chapter.root_page_ids:
@@ -11944,9 +12331,6 @@ class _CanvasLogic:
             correction = 120 - minimum_top
             for page_id in self.chapter.root_page_ids:
                 self.chapter.layers[page_id].translate_y += correction
-            if self._page_gap_state:
-                self._page_gap_state["top_y"] += correction
-                self._page_gap_state["bottom_y"] += correction
             self.chapter.height += math.ceil(correction)
             bounds = [
                 self.page_world_bounds(page_id)
@@ -11957,34 +12341,25 @@ class _CanvasLogic:
             self.chapter.height = math.ceil(maximum_bottom + 120)
 
     def _finish_page_gap_interaction(self) -> bool:
-        if not self._page_gap_drag_mode:
+        draft = self._page_gap_draft
+        if draft is None or not draft.drag_mode:
             return False
-        before = self._page_gap_drag_before
-        self._page_gap_drag_mode = None
-        self._page_gap_drag_before = None
-        self._page_gap_drag_translations.clear()
-        self._ensure_page_height_safety()
-        after = self.chapter.to_dict()
-        if (
-            self._page_gap_transaction is None
-            and before is not None and before != after
-        ):
-            self.push_model_change(before, after, "Adjust page gap")
-            self.hierarchyChanged.emit()
-            self.documentChanged.emit(QRectF())
-        self.setCursor(Qt.OpenHandCursor)
+        mode = draft.drag_mode
+        draft.drag_mode = ""
+        if mode == "create":
+            if draft.bottom_y - draft.top_y < 1:
+                self._restore_page_gap_baseline(draft)
+                self._clear_page_gap_editor()
+                self.interactionFinished.emit()
+                return True
+            draft.phase = "active"
+            self.pageGapModeChanged.emit(True)
+            self.pageGapConfirmationChanged.emit(True)
+        self.setCursor(Qt.SizeVerCursor)
+        self.pageGapGeometryChanged.emit()
         self.interactionFinished.emit()
         self.update()
         return True
-
-    def _insert_hovered_page_gap(self) -> bool:
-        hover = self._page_gap_hover
-        if self.chapter is None or hover is None:
-            return False
-        return self.begin_page_gap_transaction(
-            "standalone", hover["owner_id"],
-            hover["top_ids"], hover["bottom_ids"], hover["y"],
-        )
 
     # ---- input ---------------------------------------------------------
     def _navigation_mode(self) -> str | None:
@@ -12059,7 +12434,6 @@ class _CanvasLogic:
             or self._selection_transform_mode == "translate"
             or self._active_shape_control == "translate"
             or self._pending_raster_transform_press is not None
-            or self._page_gap_drag_mode == "band"
         )
         transform_precision_active = bool(
             (
@@ -12078,16 +12452,18 @@ class _CanvasLogic:
 
         if translation_active:
             self.setCursor(Qt.ClosedHandCursor)
-        elif self._page_gap_drag_mode in {"top", "bottom"}:
-            self.setCursor(Qt.PointingHandCursor)
-        elif page_gap_hit == "band":
-            self.setCursor(Qt.OpenHandCursor)
+        elif (
+            self._page_gap_draft is not None
+            and self._page_gap_draft.drag_mode
+        ):
+            self.setCursor(Qt.SizeVerCursor)
         elif page_gap_hit in {"top", "bottom"}:
-            self.setCursor(Qt.PointingHandCursor)
+            self.setCursor(Qt.SizeVerCursor)
         elif self.tool == ToolKind.INSERT_PAGE_GAP:
             self.setCursor(
-                Qt.PointingHandCursor
-                if self._page_gap_hover else Qt.ForbiddenCursor
+                Qt.SizeVerCursor
+                if self._page_gap_hover_y is not None
+                else Qt.ForbiddenCursor
             )
         elif self._shape_property_drag is not None:
             self.setCursor(Qt.CursorShape.SizeHorCursor)
@@ -12183,6 +12559,9 @@ class _CanvasLogic:
             self._update_interaction_cursor(event.position())
 
     def mouseDoubleClickEvent(self, event: QMouseEvent) -> None:  # noqa: N802
+        if self._page_gap_draft is not None:
+            event.accept()
+            return
         if (
             self.chapter is not None
             and self._reset_transform_pivot_at(
@@ -12275,11 +12654,11 @@ class _CanvasLogic:
             self._clear_asset_drag_preview()
             event.accept()
             return
-        if event.key() == Qt.Key_Escape and self._page_gap_state is not None:
-            if self._page_gap_transaction is not None:
-                self.cancel_page_gap_transaction()
-            else:
-                self._clear_page_gap_editor()
+        if event.key() == Qt.Key_Escape and self._page_gap_draft is not None:
+            self.cancel_page_gap_transaction()
+            event.accept()
+            return
+        if self._page_gap_draft is not None:
             event.accept()
             return
         if event.key() == Qt.Key_Escape and self._page_creation_anchor_id:
@@ -13124,6 +13503,8 @@ class _CanvasLogic:
 
     # ---- drawing selections -------------------------------------------
     def _clear_drawing_selection(self, *, reset_pivot: bool = True) -> None:
+        self._raster_paste_overlay = None
+        self._selection_overlay_tiles = None
         self._drawing_selection_path = QPainterPath()
         self._drawing_selection_gesture.clear()
         self._drawing_selection_shift_anchor = None
@@ -13364,9 +13745,21 @@ class _CanvasLogic:
                 if node.node_id in self._selected_shape_node_ids
             }
         else:
-            self._selection_before_tiles = self.tiles.object_tiles(
-                obj.object_id
-            )
+            pasted = self._raster_paste_overlay
+            if pasted is not None and pasted.object_id == obj.object_id:
+                self._selection_before_tiles = {
+                    key: QImage(image)
+                    for key, image in pasted.base_tiles.items()
+                }
+                self._selection_overlay_tiles = {
+                    key: QImage(image)
+                    for key, image in pasted.overlay_tiles.items()
+                }
+            else:
+                self._selection_before_tiles = self.tiles.object_tiles(
+                    obj.object_id
+                )
+                self._selection_overlay_tiles = None
         self._selection_rotate_start = math.atan2(
             world.y() - pivot.y(), world.x() - pivot.x()
         )
@@ -13548,6 +13941,7 @@ class _CanvasLogic:
         if mode == "pivot":
             self._selection_before_model = None
             self._selection_before_tiles = None
+            self._selection_overlay_tiles = None
             self._selection_shape_nodes.clear()
             self.update()
             return True
@@ -13632,9 +14026,11 @@ class _CanvasLogic:
                     self.hierarchyChanged.emit()
         elif self._selection_before_tiles is not None:
             self._commit_raster_selection_transform(
-                obj, self._selection_before_tiles
+                obj, self._selection_before_tiles,
+                self._selection_overlay_tiles,
             )
             self._selection_before_tiles = None
+            self._selection_overlay_tiles = None
         self.interactionFinished.emit()
         self.update()
         return True
@@ -13642,6 +14038,7 @@ class _CanvasLogic:
     def _commit_raster_selection_transform(
         self, obj: RasterObject,
         before_tiles: dict[tuple[int, int], QImage],
+        overlay_tiles: dict[tuple[int, int], QImage] | None = None,
     ) -> None:
         start = self._selection_transform_start_quad
         destination = self._selection_transform_quad
@@ -13668,48 +14065,56 @@ class _CanvasLogic:
             return
         source_path = QPainterPath(self._drawing_selection_path)
         target_path = transform.map(source_path)
+        current_tiles = self.tiles.object_tiles(obj.object_id)
         result = {
             key: QImage(image) for key, image in before_tiles.items()
         }
-        source_keys = self.tiles.keys_for_rect(source_path.boundingRect())
-        for key in source_keys:
-            image = result.get(key)
-            if image is None:
-                continue
-            painter = QPainter(image)
-            painter.setCompositionMode(QPainter.CompositionMode_Clear)
-            painter.translate(
-                -key[0] * obj.tile_size, -key[1] * obj.tile_size
-            )
-            painter.fillPath(source_path, Qt.black)
-            painter.end()
-            if self.tiles.is_empty(image):
-                result.pop(key, None)
+        moving_tiles = overlay_tiles or before_tiles
+        if overlay_tiles is None:
+            source_keys = self.tiles.keys_for_rect(source_path.boundingRect())
+            for key in source_keys:
+                image = result.get(key)
+                if image is None:
+                    continue
+                painter = QPainter(image)
+                painter.setCompositionMode(QPainter.CompositionMode_Clear)
+                painter.translate(
+                    -key[0] * obj.tile_size, -key[1] * obj.tile_size
+                )
+                painter.fillPath(source_path, Qt.black)
+                painter.end()
+                if self.tiles.is_empty(image):
+                    result.pop(key, None)
         target_keys = self.tiles.keys_for_rect(
             target_path.boundingRect().adjusted(-2, -2, 2, 2)
         )
+        transformed_overlay: dict[tuple[int, int], QImage] = {}
         for key in target_keys:
-            image = result.get(key)
-            if image is None:
-                image = self.tiles._empty(obj.tile_size)
-            painter = QPainter(image)
+            layer = self.tiles._empty(obj.tile_size)
+            painter = QPainter(layer)
             painter.setRenderHint(QPainter.SmoothPixmapTransform, True)
             painter.translate(
                 -key[0] * obj.tile_size, -key[1] * obj.tile_size
             )
             painter.setClipPath(target_path, Qt.IntersectClip)
             painter.setTransform(transform, True)
-            for (source_x, source_y), source_image in before_tiles.items():
+            for (source_x, source_y), source_image in moving_tiles.items():
                 painter.drawImage(
                     source_x * obj.tile_size,
                     source_y * obj.tile_size,
                     source_image,
                 )
             painter.end()
-            if self.tiles.is_empty(image):
-                result.pop(key, None)
-            else:
-                result[key] = image
+            if self.tiles.is_empty(layer):
+                continue
+            transformed_overlay[key] = layer
+            image = QImage(
+                result.get(key, self.tiles._empty(obj.tile_size))
+            )
+            painter = QPainter(image)
+            painter.drawImage(0, 0, layer)
+            painter.end()
+            result[key] = image
         before_frame = tuple(obj.interaction_rect)
         before_state = {
             "frame": before_frame,
@@ -13720,6 +14125,9 @@ class _CanvasLogic:
                 if self._selection_pivot is not None else None
             ),
             "pivot_custom": self._selection_pivot_custom,
+            "overlay": self._clone_raster_overlay(
+                self._raster_paste_overlay
+            ),
         }
         self.tiles.replace_object_tiles(obj.object_id, result)
         content = self.tiles.content_bounds(obj.object_id)
@@ -13741,10 +14149,22 @@ class _CanvasLogic:
                 if self._selection_pivot is not None else None
             ),
             "pivot_custom": self._selection_pivot_custom,
+            "overlay": (
+                _RasterPasteOverlayState(
+                    obj.object_id,
+                    {key: QImage(image) for key, image in before_tiles.items()},
+                    {
+                        key: QImage(image)
+                        for key, image in transformed_overlay.items()
+                    },
+                    QPainterPath(target_path),
+                )
+                if overlay_tiles is not None else None
+            ),
         }
-        all_keys = set(before_tiles) | set(result)
+        all_keys = set(current_tiles) | set(result)
         before_patch = {
-            key: before_tiles.get(key) for key in all_keys
+            key: current_tiles.get(key) for key in all_keys
         }
         after_patch = {key: result.get(key) for key in all_keys}
         self.command_stack.push(
@@ -13763,6 +14183,9 @@ class _CanvasLogic:
             already_done=True,
         )
         self._drawing_selection_path = target_path
+        self._raster_paste_overlay = self._clone_raster_overlay(
+            after_state["overlay"]
+        )
         self.documentChanged.emit(QRectF())
 
     def _restore_raster_selection_transform_state(
@@ -13777,6 +14200,9 @@ class _CanvasLogic:
         )
         self._selection_pivot_custom = bool(
             state.get("pivot_custom", False)
+        )
+        self._raster_paste_overlay = self._clone_raster_overlay(
+            state.get("overlay")
         )
 
     def select_all_drawing(self) -> bool:
@@ -13849,6 +14275,679 @@ class _CanvasLogic:
             self.update()
             return True
         return self.select_all_drawing()
+
+    def deselect_drawing(self) -> bool:
+        """Clear a drawing selection without dropping the active entity."""
+        obj = self._drawing_selection_object()
+        had_selection = bool(
+            not self._drawing_selection_path.isEmpty()
+            or self._drawing_selection_gesture
+            or self._selected_vector_stroke_ids
+            or self._selected_vector_point_ids
+            or self._selected_shape_node_id
+            or self._selected_shape_node_ids
+        )
+        self._clear_drawing_selection()
+        if isinstance(obj, VectorDrawingObject):
+            self._set_vector_selection(obj, set(), set())
+        elif isinstance(obj, LayerNode):
+            self._set_shape_point_selection(
+                obj, set(), preserve_primary=False
+            )
+        self.update()
+        return had_selection
+
+    def clear_selected_drawing_content(self) -> bool:
+        """Clear only selected raster pixels or vector points, if present.
+
+        The return value means a drawing selection handled the command.  It
+        remains true when the selected raster area was already transparent so
+        callers never fall through and clear the complete object.
+        """
+        obj = self._drawing_selection_object()
+        if isinstance(obj, RasterObject):
+            selection = QPainterPath(self._drawing_selection_path)
+            if selection.isEmpty():
+                return False
+            pasted = self._raster_paste_overlay
+            if pasted is not None and pasted.object_id == obj.object_id:
+                current = self.tiles.object_tiles(obj.object_id)
+                result = {
+                    key: QImage(image)
+                    for key, image in pasted.base_tiles.items()
+                }
+                keys = set(current) | set(result)
+                before_patch = {key: current.get(key) for key in keys}
+                after_patch = {key: result.get(key) for key in keys}
+                frame_before = tuple(obj.interaction_rect)
+                selection_before = self._selection_snapshot()
+                overlay_before = self._clone_raster_overlay(pasted)
+                self.tiles.replace_object_tiles(obj.object_id, result)
+                content = self.tiles.content_bounds(obj.object_id)
+                if content is not None:
+                    frame = content.adjusted(
+                        -RASTER_FRAME_MARGIN, -RASTER_FRAME_MARGIN,
+                        RASTER_FRAME_MARGIN, RASTER_FRAME_MARGIN,
+                    )
+                    obj.interaction_rect = (
+                        frame.left(), frame.top(),
+                        max(1.0, frame.width()), max(1.0, frame.height()),
+                    )
+                frame_after = tuple(obj.interaction_rect)
+                self._raster_paste_overlay = None
+                selection_after = self._selection_snapshot()
+
+                def restore_pasted_clear(state: dict) -> None:
+                    self._restore_raster_frame(obj.object_id, state["frame"])
+                    self._restore_selection_snapshot(state["selection"])
+                    self._raster_paste_overlay = self._clone_raster_overlay(
+                        state["overlay"]
+                    )
+
+                def pasted_changed() -> None:
+                    self._invalidate_scene_cache()
+                    self.documentChanged.emit(QRectF())
+                    self.update()
+
+                self.command_stack.push(TilePatchCommand(
+                    "Clear raster selection", self.tiles, obj.object_id,
+                    before_patch, after_patch, pasted_changed,
+                    {
+                        "frame": frame_before,
+                        "selection": selection_before,
+                        "overlay": overlay_before,
+                    },
+                    {
+                        "frame": frame_after,
+                        "selection": selection_after,
+                        "overlay": None,
+                    },
+                    restore_pasted_clear,
+                ), already_done=True)
+                pasted_changed()
+                return True
+            keys = (
+                self.tiles.keys_for_rect(selection.boundingRect())
+                & set(self.tiles.object_tiles(obj.object_id))
+            )
+            selection_before = self._selection_snapshot()
+            before = self.tiles.snapshot(obj.object_id, keys)
+            changed: set[tuple[int, int]] = set()
+            for key, source in before.items():
+                if source is None:
+                    continue
+                image = QImage(source)
+                painter = QPainter(image)
+                painter.setCompositionMode(QPainter.CompositionMode_Clear)
+                painter.translate(
+                    -key[0] * obj.tile_size,
+                    -key[1] * obj.tile_size,
+                )
+                painter.fillPath(selection, Qt.black)
+                painter.end()
+                if image != source:
+                    changed.add(key)
+                    self.tiles.set_tile(obj.object_id, key, image)
+            if not changed:
+                return True
+            before = {key: before[key] for key in changed}
+            after = self.tiles.snapshot(obj.object_id, changed)
+            frame_before = tuple(obj.interaction_rect)
+            content = self.tiles.content_bounds(obj.object_id)
+            if content is not None:
+                frame = content.adjusted(
+                    -RASTER_FRAME_MARGIN, -RASTER_FRAME_MARGIN,
+                    RASTER_FRAME_MARGIN, RASTER_FRAME_MARGIN,
+                )
+                obj.interaction_rect = (
+                    frame.left(), frame.top(),
+                    max(1.0, frame.width()), max(1.0, frame.height()),
+                )
+            frame_after = tuple(obj.interaction_rect)
+            selection_after = self._selection_snapshot()
+
+            def changed_callback() -> None:
+                self._invalidate_scene_cache()
+                self.documentChanged.emit(QRectF())
+                self.update()
+
+            self.command_stack.push(
+                TilePatchCommand(
+                    "Clear raster selection", self.tiles, obj.object_id,
+                    before, after, changed_callback,
+                    {
+                        "frame": frame_before,
+                        "selection": selection_before,
+                    },
+                    {
+                        "frame": frame_after,
+                        "selection": selection_after,
+                    },
+                    lambda state, object_id=obj.object_id: (
+                        self._restore_raster_frame(
+                            object_id, state["frame"]
+                        ),
+                        self._restore_selection_snapshot(
+                            state["selection"]
+                        ),
+                    ),
+                ),
+                already_done=True,
+            )
+            changed_callback()
+            return True
+
+        if isinstance(obj, VectorDrawingObject):
+            selected_points = set(self._selected_vector_point_ids)
+            if not selected_points and self._selected_vector_stroke_ids:
+                selected_points = {
+                    point.point_id
+                    for stroke in obj.strokes
+                    if stroke.stroke_id in self._selected_vector_stroke_ids
+                    for point in stroke.points
+                }
+            if not selected_points:
+                return False
+            before_object = copy.deepcopy(obj)
+            before_selection = self._selection_snapshot()
+            changed = False
+            remaining: list[VectorStroke] = []
+            for stroke in obj.strokes:
+                points = [
+                    point for point in stroke.points
+                    if point.point_id not in selected_points
+                ]
+                if len(points) != len(stroke.points):
+                    changed = True
+                    stroke.points = points
+                    stroke.closed = stroke.closed and len(points) > 1
+                    stroke.touch_render_revision()
+                if stroke.points:
+                    remaining.append(stroke)
+            self._clear_drawing_selection()
+            self._set_vector_selection(obj, set(), set())
+            if changed:
+                obj.strokes = remaining
+                obj.touch_revision()
+                after_object = copy.deepcopy(obj)
+                after_selection = self._selection_snapshot()
+                self.command_stack.push(CallbackCommand(
+                    "Clear vector selection",
+                    lambda: self._restore_vector_object_selection(
+                        obj.object_id, after_object, after_selection
+                    ),
+                    lambda: self._restore_vector_object_selection(
+                        obj.object_id, before_object, before_selection
+                    ),
+                ), already_done=True)
+                self._vector_changed()
+            return True
+        return False
+
+    @staticmethod
+    def _clone_raster_overlay(
+        state: _RasterPasteOverlayState | None,
+    ) -> _RasterPasteOverlayState | None:
+        if state is None:
+            return None
+        return _RasterPasteOverlayState(
+            state.object_id,
+            {key: QImage(image) for key, image in state.base_tiles.items()},
+            {key: QImage(image) for key, image in state.overlay_tiles.items()},
+            QPainterPath(state.selection_path),
+        )
+
+    @staticmethod
+    def _selected_vector_fragments(
+        drawing: VectorDrawingObject, selected: set[str],
+    ) -> list[VectorStroke]:
+        fragments: list[VectorStroke] = []
+        for stroke in drawing.strokes:
+            if not stroke.points:
+                continue
+            chosen = [point.point_id in selected for point in stroke.points]
+            if not any(chosen):
+                continue
+            if all(chosen):
+                fragment = copy.deepcopy(stroke)
+                fragments.append(fragment)
+                continue
+            order = list(range(len(stroke.points)))
+            if stroke.closed:
+                first_unselected = chosen.index(False)
+                order = [
+                    (first_unselected + 1 + offset) % len(stroke.points)
+                    for offset in range(len(stroke.points))
+                ]
+            runs: list[list[VectorStrokePoint]] = []
+            current: list[VectorStrokePoint] = []
+            for index in order:
+                if chosen[index]:
+                    current.append(copy.deepcopy(stroke.points[index]))
+                elif current:
+                    runs.append(current)
+                    current = []
+            if current:
+                runs.append(current)
+            for points in runs:
+                fragments.append(VectorStroke(
+                    color=stroke.color,
+                    closed=False,
+                    start_cap=stroke.start_cap,
+                    end_cap=stroke.end_cap,
+                    points=points,
+                ))
+        return fragments
+
+    def drawing_selection_clipboard(
+        self,
+    ) -> DrawingSelectionClipboard | None:
+        """Capture the current raster pixels or vector point selection."""
+        obj = self._drawing_selection_object()
+        if isinstance(obj, RasterObject):
+            path = QPainterPath(self._drawing_selection_path)
+            if path.isEmpty():
+                return None
+            source_tiles = (
+                self._raster_paste_overlay.overlay_tiles
+                if (
+                    self._raster_paste_overlay is not None
+                    and self._raster_paste_overlay.object_id == obj.object_id
+                )
+                else self.tiles.object_tiles(obj.object_id)
+            )
+            result: dict[tuple[int, int], QImage] = {}
+            for key in self.tiles.keys_for_rect(path.boundingRect()):
+                source = source_tiles.get(key)
+                if source is None:
+                    continue
+                image = self.tiles._empty(obj.tile_size)
+                painter = QPainter(image)
+                painter.translate(
+                    -key[0] * obj.tile_size, -key[1] * obj.tile_size
+                )
+                painter.setClipPath(path, Qt.ClipOperation.IntersectClip)
+                painter.drawImage(
+                    key[0] * obj.tile_size,
+                    key[1] * obj.tile_size,
+                    source,
+                )
+                painter.end()
+                if not self.tiles.is_empty(image):
+                    result[key] = image
+            if not result:
+                return None
+            return RasterSelectionClipboard(
+                result, path,
+                QTransform(self._drawing_local_to_world_transform(obj)),
+                obj.name, obj.tile_size,
+            )
+        if isinstance(obj, VectorDrawingObject):
+            selected = set(self._selected_vector_point_ids)
+            if not selected and self._selected_vector_stroke_ids:
+                selected = self._point_ids_for_strokes(
+                    obj, self._selected_vector_stroke_ids
+                )
+            strokes = self._selected_vector_fragments(obj, selected)
+            if not strokes:
+                return None
+            return VectorSelectionClipboard(
+                strokes,
+                QTransform(self._drawing_local_to_world_transform(obj)),
+                obj.name,
+            )
+        return None
+
+    def _render_raster_clipboard(
+        self, payload: RasterSelectionClipboard,
+        world_to_target: QTransform, tile_size: int,
+    ) -> tuple[
+        dict[tuple[int, int], QImage], QPainterPath, QTransform,
+    ] | None:
+        source_bounds = payload.selection_path.boundingRect()
+        if source_bounds.isEmpty():
+            return None
+        destination = [
+            world_to_target.map(payload.source_to_world.map(QPointF(*point)))
+            for point in self._rect_quad(source_bounds)
+        ]
+        transform = self._quad_transform(
+            source_bounds, [point.toTuple() for point in destination]
+        )
+        if not transform.isInvertible():
+            return None
+        target_path = transform.map(payload.selection_path)
+        result: dict[tuple[int, int], QImage] = {}
+        for key in self.tiles.keys_for_rect(
+            target_path.boundingRect().adjusted(-2, -2, 2, 2)
+        ):
+            image = self.tiles._empty(tile_size)
+            painter = QPainter(image)
+            painter.setRenderHint(QPainter.SmoothPixmapTransform, True)
+            painter.translate(-key[0] * tile_size, -key[1] * tile_size)
+            painter.setClipPath(target_path, Qt.ClipOperation.IntersectClip)
+            painter.setTransform(transform, True)
+            for (source_x, source_y), source in payload.tiles.items():
+                painter.drawImage(
+                    source_x * payload.tile_size,
+                    source_y * payload.tile_size,
+                    source,
+                )
+            painter.end()
+            if not self.tiles.is_empty(image):
+                result[key] = image
+        return (result, target_path, transform) if result else None
+
+    def _mapped_vector_clipboard_strokes(
+        self, payload: VectorSelectionClipboard,
+        world_to_target: QTransform,
+    ) -> list[VectorStroke]:
+        def mapped(point: tuple[float, float]) -> QPointF:
+            return world_to_target.map(
+                payload.source_to_world.map(QPointF(*point))
+            )
+
+        result: list[VectorStroke] = []
+        for source_stroke in payload.strokes:
+            stroke = copy.deepcopy(source_stroke)
+            stroke.stroke_id = new_id()
+            for point in stroke.points:
+                source_position = point.position
+                origin = mapped(source_position)
+                unit_x = mapped((source_position[0] + 1.0, source_position[1]))
+                unit_y = mapped((source_position[0], source_position[1] + 1.0))
+                cross = abs(
+                    (unit_x.x() - origin.x()) * (unit_y.y() - origin.y())
+                    - (unit_x.y() - origin.y()) * (unit_y.x() - origin.x())
+                )
+                point.point_id = new_id()
+                point.position = origin.toTuple()
+                if point.incoming is not None:
+                    point.incoming = mapped(point.incoming).toTuple()
+                if point.outgoing is not None:
+                    point.outgoing = mapped(point.outgoing).toTuple()
+                point.width = max(1.0, min(1000.0, point.width * math.sqrt(cross)))
+            result.append(stroke)
+        return result
+
+    @staticmethod
+    def _merge_raster_tiles(
+        base: dict[tuple[int, int], QImage],
+        overlay: dict[tuple[int, int], QImage], tile_size: int,
+    ) -> dict[tuple[int, int], QImage]:
+        result = {key: QImage(image) for key, image in base.items()}
+        for key, source in overlay.items():
+            image = result.get(key, TileStore._empty(tile_size))
+            image = QImage(image)
+            painter = QPainter(image)
+            painter.drawImage(0, 0, source)
+            painter.end()
+            if TileStore.is_empty(image):
+                result.pop(key, None)
+            else:
+                result[key] = image
+        return result
+
+    def _restore_vector_object_selection(
+        self, object_id: str, payload: VectorDrawingObject, selection: dict,
+    ) -> None:
+        if self.chapter is None or object_id not in self.chapter.objects:
+            return
+        current = self.chapter.objects[object_id]
+        if not isinstance(current, VectorDrawingObject):
+            return
+        current.__dict__.clear()
+        current.__dict__.update(copy.deepcopy(payload.__dict__))
+        self._restore_selection_snapshot(selection)
+        self._vector_changed()
+
+    def paste_drawing_clipboard(
+        self, payload: DrawingSelectionClipboard,
+    ) -> bool:
+        """Merge clipboard content into the active compatible drawing."""
+        obj = self._drawing_selection_object()
+        if isinstance(payload, RasterSelectionClipboard):
+            if not isinstance(obj, RasterObject):
+                return False
+            target_to_world = self._drawing_local_to_world_transform(obj)
+            world_to_target, valid = target_to_world.inverted()
+            if not valid:
+                return False
+            rendered = self._render_raster_clipboard(
+                payload, world_to_target, obj.tile_size
+            )
+            if rendered is None:
+                return False
+            overlay_tiles, target_path, _transform = rendered
+            base_tiles = self.tiles.object_tiles(obj.object_id)
+            merged = self._merge_raster_tiles(
+                base_tiles, overlay_tiles, obj.tile_size
+            )
+            keys = set(base_tiles) | set(merged)
+            before_patch = {key: base_tiles.get(key) for key in keys}
+            after_patch = {key: merged.get(key) for key in keys}
+            before_selection = self._selection_snapshot()
+            before_overlay = self._clone_raster_overlay(
+                self._raster_paste_overlay
+            )
+            frame_before = tuple(obj.interaction_rect)
+            self.tiles.replace_object_tiles(obj.object_id, merged)
+            content = self.tiles.content_bounds(obj.object_id)
+            if content is not None:
+                frame = content.adjusted(
+                    -RASTER_FRAME_MARGIN, -RASTER_FRAME_MARGIN,
+                    RASTER_FRAME_MARGIN, RASTER_FRAME_MARGIN,
+                )
+                obj.interaction_rect = (
+                    frame.left(), frame.top(),
+                    max(1.0, frame.width()), max(1.0, frame.height()),
+                )
+            frame_after = tuple(obj.interaction_rect)
+            self._clear_drawing_selection()
+            self._drawing_selection_path = QPainterPath(target_path)
+            self.set_tool(ToolKind.DRAW_SELECT_RECT)
+            self._refresh_drawing_selection_transform()
+            self._raster_paste_overlay = _RasterPasteOverlayState(
+                obj.object_id,
+                {key: QImage(image) for key, image in base_tiles.items()},
+                {key: QImage(image) for key, image in overlay_tiles.items()},
+                QPainterPath(target_path),
+            )
+            after_selection = self._selection_snapshot()
+            after_overlay = self._clone_raster_overlay(
+                self._raster_paste_overlay
+            )
+
+            def restore_state(state: dict) -> None:
+                self._restore_raster_frame(obj.object_id, state["frame"])
+                self._restore_selection_snapshot(state["selection"])
+                self._raster_paste_overlay = self._clone_raster_overlay(
+                    state["overlay"]
+                )
+
+            def changed() -> None:
+                self._invalidate_scene_cache()
+                self.documentChanged.emit(QRectF())
+                self.update()
+
+            self.command_stack.push(TilePatchCommand(
+                "Paste raster selection", self.tiles, obj.object_id,
+                before_patch, after_patch, changed,
+                {
+                    "frame": frame_before, "selection": before_selection,
+                    "overlay": before_overlay,
+                },
+                {
+                    "frame": frame_after, "selection": after_selection,
+                    "overlay": after_overlay,
+                },
+                restore_state,
+            ), already_done=True)
+            changed()
+            return True
+
+        if not isinstance(obj, VectorDrawingObject):
+            return False
+        target_to_world = self._drawing_local_to_world_transform(obj)
+        world_to_target, valid = target_to_world.inverted()
+        if not valid:
+            return False
+        pasted = self._mapped_vector_clipboard_strokes(
+            payload, world_to_target
+        )
+        if not pasted:
+            return False
+        before_object = copy.deepcopy(obj)
+        before_selection = self._selection_snapshot()
+        obj.strokes.extend(pasted)
+        obj.touch_revision()
+        self._clear_drawing_selection()
+        self._set_vector_selection(
+            obj,
+            {stroke.stroke_id for stroke in pasted},
+            {
+                point.point_id
+                for stroke in pasted for point in stroke.points
+            },
+        )
+        self.set_tool(ToolKind.DRAW_SELECT_RECT)
+        self._refresh_drawing_selection_transform()
+        after_object = copy.deepcopy(obj)
+        after_selection = self._selection_snapshot()
+        self.command_stack.push(CallbackCommand(
+            "Paste vector selection",
+            lambda: self._restore_vector_object_selection(
+                obj.object_id, after_object, after_selection
+            ),
+            lambda: self._restore_vector_object_selection(
+                obj.object_id, before_object, before_selection
+            ),
+        ), already_done=True)
+        self._vector_changed()
+        return True
+
+    def paste_drawing_clipboard_as_new(
+        self, payload: DrawingSelectionClipboard, anchor_id: str,
+    ) -> str:
+        """Create a clipboard-backed sibling immediately above the anchor."""
+        if (
+            self.chapter is None
+            or anchor_id not in self.chapter.objects
+            or not isinstance(
+                self.chapter.objects[anchor_id],
+                (RasterObject, VectorDrawingObject),
+            )
+        ):
+            return ""
+        anchor = self.chapter.objects[anchor_id]
+        parent_id = anchor.parent_layer_id
+        parent_to_world = self.layer_world_transform(parent_id)
+        world_to_parent, valid = parent_to_world.inverted()
+        if not valid:
+            return ""
+        siblings = self.chapter.layers[parent_id].children
+        insertion_index = next((
+            index for index, reference in enumerate(siblings)
+            if reference.kind == "object" and reference.entity_id == anchor_id
+        ), None)
+        if insertion_index is None:
+            return ""
+        before_model = self.chapter.to_dict()
+        before_selection = self._selection_snapshot()
+        before_overlay = self._clone_raster_overlay(
+            self._raster_paste_overlay
+        )
+        created_tiles: dict[tuple[int, int], QImage] = {}
+        if isinstance(payload, RasterSelectionClipboard):
+            rendered = self._render_raster_clipboard(
+                payload, world_to_parent, self.tiles.tile_size
+            )
+            if rendered is None:
+                return ""
+            created_tiles, target_path, _transform = rendered
+            obj = RasterObject(
+                name=f"{payload.source_name} Copy",
+                tile_size=self.tiles.tile_size,
+            )
+            self.chapter.add_object(parent_id, obj, index=insertion_index)
+            self.tiles.replace_object_tiles(obj.object_id, created_tiles)
+            bounds = self.tiles.content_bounds(obj.object_id)
+            if bounds is not None:
+                frame = bounds.adjusted(
+                    -RASTER_FRAME_MARGIN, -RASTER_FRAME_MARGIN,
+                    RASTER_FRAME_MARGIN, RASTER_FRAME_MARGIN,
+                )
+                obj.interaction_rect = (
+                    frame.left(), frame.top(),
+                    max(1.0, frame.width()), max(1.0, frame.height()),
+                )
+            self.set_selection("object", obj.object_id)
+            self.set_tool(ToolKind.DRAW_SELECT_RECT)
+            self._drawing_selection_path = QPainterPath(target_path)
+            self._refresh_drawing_selection_transform()
+            self._raster_paste_overlay = _RasterPasteOverlayState(
+                obj.object_id, {},
+                {key: QImage(image) for key, image in created_tiles.items()},
+                QPainterPath(target_path),
+            )
+        else:
+            strokes = self._mapped_vector_clipboard_strokes(
+                payload, world_to_parent
+            )
+            if not strokes:
+                return ""
+            obj = VectorDrawingObject(
+                name=f"{payload.source_name} Copy", strokes=strokes
+            )
+            self.chapter.add_object(parent_id, obj, index=insertion_index)
+            self.set_selection("object", obj.object_id)
+            self.set_tool(ToolKind.DRAW_SELECT_RECT)
+            self._set_vector_selection(
+                obj,
+                {stroke.stroke_id for stroke in strokes},
+                {
+                    point.point_id
+                    for stroke in strokes for point in stroke.points
+                },
+            )
+            self._refresh_drawing_selection_transform()
+        after_model = self.chapter.to_dict()
+        after_selection = self._selection_snapshot()
+        after_overlay = self._clone_raster_overlay(
+            self._raster_paste_overlay
+        )
+        object_id = obj.object_id
+
+        def restore(
+            model: dict, selection: dict, with_resources: bool,
+            overlay: _RasterPasteOverlayState | None,
+        ) -> None:
+            self.replace_chapter(model)
+            if created_tiles:
+                if with_resources:
+                    self.tiles.replace_object_tiles(object_id, created_tiles)
+                else:
+                    self.tiles.remove_object(object_id)
+            self._restore_selection_snapshot(selection)
+            self._raster_paste_overlay = self._clone_raster_overlay(overlay)
+            self.hierarchyChanged.emit()
+            self.documentChanged.emit(QRectF())
+            self.update()
+
+        self.command_stack.push(CallbackCommand(
+            "Paste selection as new object",
+            lambda: restore(
+                after_model, after_selection, True, after_overlay
+            ),
+            lambda: restore(
+                before_model, before_selection, False, before_overlay
+            ),
+        ), already_done=True)
+        self.hierarchyChanged.emit()
+        self.documentChanged.emit(QRectF())
+        self.interactionFinished.emit()
+        self.update()
+        return object_id
 
     def _refresh_drawing_selection_transform(self) -> None:
         obj = self._drawing_selection_object()
@@ -16041,6 +17140,7 @@ class _CanvasLogic:
     ) -> None:
         if self.chapter is None or object_id not in self.chapter.objects:
             return
+        self._finalize_raster_paste_overlay(object_id)
         self._modifier_source_cache.clear()
         self._modifier_source_cache_bytes = 0
         self._outline_distance_cache.clear()
@@ -17364,6 +18464,13 @@ class _CanvasLogic:
         point = self.widget_to_document(widget_point)
         self._press_widget_point = QPointF(widget_point)
         self._press_document_point = QPointF(point)
+        if self._page_gap_draft is not None:
+            self._begin_page_gap_interaction(point)
+            return
+        if self.tool == ToolKind.INSERT_PAGE_GAP:
+            self._update_page_gap_hover(point)
+            self._begin_page_gap_draft(point)
+            return
         if (
             self.active_tone_mask_id
             and self.tool in {ToolKind.RASTER_PENCIL, ToolKind.RASTER_ERASER}
@@ -17387,12 +18494,6 @@ class _CanvasLogic:
             and self.selected_kind == "layer"
             and self._begin_geometry_transform(point)
         ):
-            return
-        if self._begin_page_gap_interaction(point):
-            return
-        if self.tool == ToolKind.INSERT_PAGE_GAP:
-            self._update_page_gap_hover(point)
-            self._insert_hovered_page_gap()
             return
         if (
             self.tool == ToolKind.SHAPE_CREATE and self._creation_nodes
@@ -17814,6 +18915,15 @@ class _CanvasLogic:
             self._clear_detached_input_state()
             return
         point = self.widget_to_document(widget_point)
+        if (
+            self._page_gap_draft is not None
+            and self._page_gap_draft.drag_mode
+        ):
+            self._move_page_gap_interaction(point)
+            return
+        if self.tool == ToolKind.INSERT_PAGE_GAP:
+            self._update_page_gap_hover(point)
+            return
         if self.active_tone_mask_id and self._drawing:
             self._continue_mask_stroke(point, pressure)
             return
@@ -17841,12 +18951,6 @@ class _CanvasLogic:
         if self._text_property_drag is not None:
             self._update_text_property_drag(widget_point)
             return
-        if self._page_gap_drag_mode is not None:
-            self._move_page_gap_interaction(point)
-            return
-        if self.tool == ToolKind.INSERT_PAGE_GAP:
-            self._update_page_gap_hover(point)
-            return
         if (
             self._geometry_transform_target is not None
             and self._transform_start_quad is not None
@@ -17865,12 +18969,7 @@ class _CanvasLogic:
             self._update_transform_preview(point)
             self.update()
             return
-        gap_hit = self._page_gap_hit(point)
-        if gap_hit == "band":
-            self.setCursor(Qt.OpenHandCursor)
-        elif gap_hit in {"top", "bottom"}:
-            self.setCursor(Qt.PointingHandCursor)
-        elif self._model_before is None:
+        if self._model_before is None:
             selected_raster = self.chapter.objects.get(
                 self.selected_object_id
             )
@@ -18092,6 +19191,9 @@ class _CanvasLogic:
             self._update_shape_hover(point)
 
     def _tool_release(self) -> None:
+        if self._page_gap_draft is not None:
+            self._finish_page_gap_interaction()
+            return
         if self.active_tone_mask_id and self._drawing:
             self._end_mask_stroke()
             return
@@ -18113,8 +19215,6 @@ class _CanvasLogic:
             return
         if self.chapter is None:
             self._clear_detached_input_state()
-            return
-        if self._finish_page_gap_interaction():
             return
         if self.tool == ToolKind.INSERT_PAGE_GAP:
             return
@@ -20089,6 +21189,7 @@ class _CanvasLogic:
         obj = self.chapter.objects.get(self.selected_id)
         if not isinstance(obj, RasterObject):
             return
+        self._finalize_raster_paste_overlay(obj.object_id)
         local = self._raster_local_point(obj, point)
         self._suspend_gc_for_stroke()
         self._drawing = True
@@ -20232,8 +21333,10 @@ class _CanvasLogic:
             self._stroke_before, after,
             lambda: (self.update(), self.documentChanged.emit(QRectF())),
             frame_before, frame_after,
-            lambda frame, object_id=obj.object_id:
-            self._restore_raster_frame(object_id, frame),
+            lambda frame, object_id=obj.object_id: (
+                self._restore_raster_frame(object_id, frame),
+                self._finalize_raster_paste_overlay(object_id),
+            ),
         )
         self.command_stack.push(command, already_done=True)
         self._stroke_before = {}
@@ -20316,6 +21419,12 @@ class _CanvasLogic:
         obj = self.chapter.objects[object_id]
         if isinstance(obj, RasterObject):
             obj.interaction_rect = tuple(frame)
+
+    def _finalize_raster_paste_overlay(self, object_id: str) -> None:
+        state = self._raster_paste_overlay
+        if state is not None and state.object_id == object_id:
+            self._raster_paste_overlay = None
+            self._selection_overlay_tiles = None
 
     @staticmethod
     def _edge_midpoints(

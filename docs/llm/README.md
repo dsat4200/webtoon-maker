@@ -17,7 +17,7 @@ This folder is a source-verified guide to the current `webtoon-maker` codebase. 
 - `arst/` and `Test/` are user series data folders produced by running the editor; they are not code.
 - `paint/handles.png` is an unreferenced image asset in the current source.
 - `program-map.txt` is a useful historical generated map, but it is not authoritative. Its line counts, schema versions, and file lists lag the current source. These documents follow the current code.
-- The current chapter schema is version 21, the series schema is version 17, asset manifests are schema 2, editor settings are version 21, the Blender bridge protocol is version 3, and the Blender extension is version `0.5.1`.
+- The current chapter schema is version 21, the series schema is version 17, asset manifests are schema 2, editor settings are version 22, the Blender bridge protocol is version 3, and the Blender extension is version `0.5.1`.
 
 ## One-paragraph architecture
 

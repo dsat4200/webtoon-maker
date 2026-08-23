@@ -119,6 +119,8 @@ Navigation defaults:
 - `Ctrl` + mouse wheel: zoom
 - `P`, `E`, `F`, `S`, `T`, `B`: Pencil, Eraser, Fill, Object Select,
   Transform, Shape Edit
+- `Ctrl+D`: deselect the active drawing selection
+- `Ctrl+V`: paste the newest drawing-selection buffer or clipboard image
 - `Delete`: delete the selected layer or object when no field or canvas
   sub-editor owns the key
 
@@ -126,6 +128,10 @@ Hotkeys are editable as single simultaneous chords, including modifier-only
 bindings such as `Ctrl` or `Ctrl+Shift`. Tool bindings can enable **Hold**:
 a quick tap selects that tool normally, while holding for at least 200ms
 switches temporarily and restores the previous tool on release.
+Cut, Copy, and Paste as New Object are also available as unassigned hotkey
+actions. Drawing Cut/Copy work on selected raster pixels or vector points;
+Paste merges into a compatible active object, while Paste as New creates a
+matching editable object immediately above the active raster/vector object.
 
 The Settings button beside Hotkeys opens the Grid preferences. Grid box size,
 subdivisions, color, opacity, and global visibility persist per user; the
@@ -203,13 +209,14 @@ pages/layers and the current selection, including across hierarchy undo/redo.
 
 Use **Add Page** after selecting a page or one of its descendants, then draw
 the new page as a rectangle, circle, or closed custom shape below the active
-page. It is inserted immediately after that page in the outliner. When lower
-pages already occupy the space, the editor can move them together and expose
-an orange 120px gutter: drag either dotted edge to move its page group, or
-drag the shaded band to move both groups. **Insert Page Gap** adds the same
-editable 120px gutter in empty space between two physically adjacent pages.
-Page-gap edits and page insertion are undoable, and the chapter grows with a
-120px safety margin when a page group crosses its current top or bottom.
+page. It is inserted immediately after that page in the outliner without
+changing existing page spacing. **Insert Page Gap** works anywhere in the
+existing canvas: drag between two orange dotted lines to choose the exact
+amount of blank vertical space, adjust either line, then confirm or cancel.
+The live preview grows the canvas and moves complete layers or objects that
+begin below the insertion line; content crossing the line is left intact.
+Confirm commits the entire preview as one undoable edit, while Cancel or
+Escape restores the exact original document.
 
 With Tablet navigation enabled, one finger pans in the finger's direction.
 Two fingers pan, pinch-zoom, and twist-rotate around their centroid without

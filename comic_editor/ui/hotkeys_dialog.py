@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from PySide6.QtWidgets import (
     QCheckBox, QDialog, QDialogButtonBox, QFormLayout, QHBoxLayout,
-    QMessageBox, QPushButton, QVBoxLayout, QWidget,
+    QMessageBox, QPushButton, QScrollArea, QVBoxLayout, QWidget,
 )
 
 from comic_editor.core.settings import default_hotkey_hold, default_hotkeys
@@ -33,9 +33,13 @@ LABELS = {
     "reset_rotation": "Reset Rotation",
     "toggle_grid": "Toggle Grid",
     "select_all": "Select All",
+    "deselect": "Deselect",
+    "cut": "Cut",
+    "copy": "Copy",
+    "paste": "Paste",
+    "paste_as_new": "Paste as New Object",
     "delete_selected": "Delete Selected",
     "clear_canvas": "Clear Canvas",
-    "paste_image": "Paste Image",
 }
 
 
@@ -49,7 +53,8 @@ class HotkeysDialog(QDialog):
         super().__init__(parent)
         self.setWindowTitle("Hotkeys")
         layout = QVBoxLayout(self)
-        form = QFormLayout()
+        form_widget = QWidget()
+        form = QFormLayout(form_widget)
         self.editors: dict[str, ChordCaptureEdit] = {}
         self.hold_checks: dict[str, QCheckBox] = {}
         hold_bindings = hold_bindings or {}
@@ -71,14 +76,25 @@ class HotkeysDialog(QDialog):
                 self.hold_checks[action_id] = hold
                 row_layout.addWidget(hold)
             form.addRow(label, row)
-        layout.addLayout(form)
+        self.scroll_area = QScrollArea()
+        self.scroll_area.setWidgetResizable(True)
+        self.scroll_area.setWidget(form_widget)
+        layout.addWidget(self.scroll_area, 1)
         reset = QPushButton("Reset defaults")
         reset.clicked.connect(self._reset)
         layout.addWidget(reset)
-        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
-        buttons.accepted.connect(self.accept)
-        buttons.rejected.connect(self.reject)
-        layout.addWidget(buttons)
+        self.button_box = QDialogButtonBox(
+            QDialogButtonBox.Ok | QDialogButtonBox.Cancel
+        )
+        self.button_box.accepted.connect(self.accept)
+        self.button_box.rejected.connect(self.reject)
+        layout.addWidget(self.button_box)
+
+        available = self.screen().availableGeometry()
+        self.resize(
+            min(560, max(1, available.width() - 80)),
+            min(650, max(360, available.height() - 160)),
+        )
 
     def bindings(self) -> dict[str, str]:
         result = {

@@ -29,6 +29,11 @@ def default_hotkeys() -> dict[str, str]:
         "draw_select_stroke": "",
         "insert_page_gap": "",
         "select_all": "Ctrl+A",
+        "deselect": "Ctrl+D",
+        "cut": "",
+        "copy": "",
+        "paste": "Ctrl+V",
+        "paste_as_new": "",
         "save": "Ctrl+S",
         "undo": "Ctrl+Z",
         "redo": "Ctrl+Shift+Z",
@@ -37,7 +42,6 @@ def default_hotkeys() -> dict[str, str]:
         "toggle_grid": "Alt+G",
         "delete_selected": "Delete",
         "clear_canvas": "Backspace",
-        "paste_image": "Ctrl+V",
     }
 
 
@@ -170,7 +174,7 @@ def default_fill_profiles() -> dict[str, dict[str, object]]:
 
 @dataclass
 class EditorSettings:
-    settings_version: int = 21
+    settings_version: int = 22
     tablet_mode: bool = False
     brush_size: int = 12
     eraser_size: int = 28
@@ -249,7 +253,7 @@ class EditorSettings:
         self.clamp()
 
     def clamp(self) -> None:
-        self.settings_version = 21
+        self.settings_version = 22
         self.blender_bridge_host = str(
             self.blender_bridge_host or "127.0.0.1"
         ).strip()
@@ -393,6 +397,19 @@ class EditorSettings:
         if self.active_text_preset not in available:
             self.active_text_preset = "Default"
         supplied = self.hotkeys or {}
+        if "paste" not in supplied and "paste_image" in supplied:
+            supplied = {
+                **supplied,
+                "paste": str(supplied.get("paste_image", "Ctrl+V")),
+            }
+        if "deselect" not in supplied and any(
+            action_id != "deselect"
+            and str(sequence).replace(" ", "").casefold() == "ctrl+d"
+            for action_id, sequence in supplied.items()
+        ):
+            # Do not introduce a duplicate when upgrading settings where the
+            # new default chord was already assigned to another action.
+            supplied = {**supplied, "deselect": ""}
         self.hotkeys = {
             key: str(supplied.get(key, sequence))
             for key, sequence in default_hotkeys().items()
@@ -686,13 +703,22 @@ def load_settings() -> EditorSettings:
                 raw.setdefault("grid_divisions", 4)
                 raw.setdefault("grid_color", "#5d7d9c")
                 raw.setdefault("grid_opacity", 0.25)
+            if int(raw.get("settings_version", 1)) < 22:
+                hotkeys = raw.setdefault("hotkeys", {})
+                hotkeys.setdefault(
+                    "paste", hotkeys.get("paste_image", "Ctrl+V")
+                )
+                hotkeys.setdefault("cut", "")
+                hotkeys.setdefault("copy", "")
+                hotkeys.setdefault("paste_as_new", "")
+                hotkeys.pop("paste_image", None)
             raw.pop("transform_snap_to_grid", None)
             stored_presets = raw.get("text_presets")
             if isinstance(stored_presets, list):
                 for preset in stored_presets:
                     if isinstance(preset, dict):
                         preset.pop("transform_snap", None)
-            raw["settings_version"] = 21
+            raw["settings_version"] = 22
             valid = {item.name for item in dataclasses.fields(EditorSettings)}
             result = EditorSettings(**{
                 key: value for key, value in raw.items() if key in valid
