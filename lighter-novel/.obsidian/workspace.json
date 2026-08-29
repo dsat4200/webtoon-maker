@@ -13,12 +13,12 @@
             "state": {
               "type": "markdown",
               "state": {
-                "file": "Chapters/Chapter 1-5.md",
+                "file": "Not Implemented.md",
                 "mode": "source",
                 "source": false
               },
               "icon": "lucide-file",
-              "title": "Chapter 1-5"
+              "title": "Not Implemented"
             }
           },
           {
@@ -285,10 +285,10 @@
   },
   "active": "24235d69bb29ecf1",
   "lastOpenFiles": [
+    "Chapters/Chapter 1-5.md",
     "Not Implemented.md",
     "implemented.md",
     "how should the story start.md",
-    "Chapters/Chapter 1-5.md",
     "blender plugin tweaks.md",
     "Pasted image 20260821185526.png",
     "Basic 3D - blender pipeline.md",

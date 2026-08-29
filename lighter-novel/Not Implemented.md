@@ -1,10 +1,14 @@
 bug
  - if i map something to backspace, backspace no longer works in text mode
+ - convert to shape button only works with mouse, doesn't with stylus
 
 
 changes
 - if text is added, automatically switch to text edit mode (that way the user can make a text object and then immediately start typing)
 - add a line spacing setting to tool settings of a text object.
+- add a "mute" button for all modifiers (which should speed up rendering by letting me mute mods if i want drawing to be responsive again)
+- if an outline modifier is added to a shape, it should allow the outline to go outside the shape bounds (otherwise it would just be hidden)
+- transformation via the 8 handles/rotation/scale/translation, etc should be "nearest" and not use anti aliasing in raster mode.
 
 
 
