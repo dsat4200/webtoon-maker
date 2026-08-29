@@ -134,7 +134,7 @@ A `ParameterMaskBinding` stores `mask_id`, `black_value`, and `white_value`. It 
 
 ## Modifier records
 
-`ModifierInstance = HueSaturationLightnessModifier | BlurModifier | OutlineModifier`. All share `modifier_id`, `modifier_type`, `name`, `intensity` (0–100), `expanded`, and `parameter_masks`.
+`ModifierInstance = HueSaturationLightnessModifier | BlurModifier | OutlineModifier`. All share `modifier_id`, `modifier_type`, `name`, `intensity` (0–100), `expanded`, persistent `muted`, and `parameter_masks`. Legacy records without `muted` load as `false`; muting preserves every other field and requires no schema-version bump.
 
 - **HSL**: `hue` (−180…180), `saturation` (−100…100), `lightness` (−100…100).
 - **Blur**: `strength` (0–100 px), `mode` (`full` | `focal`), `focal_center`, `focal_radius`, `focal_ramp` (0–1), `focal_angle`.

@@ -85,6 +85,8 @@ The application intentionally does not implement scheduling, reference libraries
 - **Blur** applies a strength in pixels, either **Full** or **Focal** (center, radius, ramp, and angle define a smooth falloff).
 - **Outline** draws an outside halo with thickness, opacity, and a canonical color. It reserves up to a 100-document-pixel halo.
 - Each modifier has an intensity (0–100) that blends its effect into the stack. Intensity and per-type parameters can each bind a parameter mask.
+- Every modifier card has a persistent eye/mute control. A muted modifier keeps its stack position, settings, masks, and links, but is omitted from canvas, preview, save/export rendering, effect bounds, and focal controls; a completely muted stack bypasses modifier isolation unless an opacity mask still needs it.
+- An active Outline on a shape can render outside that shape's own boundary. The result remains clipped by ancestor shapes and page/document limits.
 - The stack applies in card order, and the rendered result is isolated from the rest of the scene so modifiers never disturb sibling content.
 
 ## Raster drawing features
@@ -99,7 +101,7 @@ The application intentionally does not implement scheduling, reference libraries
 - Predictive ink shows the extrapolated end of an active raster stroke without committing it.
 - Stylus hover shows the active brush/eraser radius and a center crosshair.
 - Raster opacity may be locked to its parent layer or independently set. The object can ignore its direct parent mask, reference a compound mask, show an editing underlay, and carry modifiers.
-- Raster translation moves sparse data without resampling. Projective scale/rotation transforms bake through quad-to-quad mapping into a new sparse tile set.
+- Raster translation moves sparse data without resampling. Handle transforms, projective quads, raster-selection transforms, paste overlays, previews, and committed Raster pixels use nearest-neighbor sampling with non-antialiased clipping, while imported Image objects retain smooth sampling.
 - Transform previews use a cached static background and spatially query only relevant source tiles.
 - The **Fill** tool flood-fills the raster inside the interaction frame using a tolerance (default 16), with optional gap closing, narrow-area handling, area scaling, and profile-based reference modes.
 - A press outside a raster frame is deferred until movement exceeds a small threshold, preventing an edge pencil stroke from being mistaken for translation.
@@ -203,7 +205,7 @@ The Fill tool now targets shapes and raster content; owned vector fills no longe
 - **Tablet navigation** enables touch navigation. One finger pans with the finger; two fingers pan, pinch, and twist around a stable centroid.
 - Touch input is coalesced to one application per event-loop turn and live-renders the document under the updated camera transform.
 - On Windows, native touch is registered with palm rejection and simultaneous pen/touch data so touch navigation works while the stylus hovers.
-- Stylus events are handled separately from synthesized mouse events. Popup and outliner forwarding allow buttonless stylus taps.
+- Stylus events are handled separately from synthesized mouse events. Popup, modal-dialog, and outliner forwarding allow buttonless stylus taps, including confirmation actions such as **Convert to Shape**.
 - The narrow preview provides whole-chapter navigation independently of camera rotation.
 
 ## Canonical canvas tools

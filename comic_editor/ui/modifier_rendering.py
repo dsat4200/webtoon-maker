@@ -372,12 +372,13 @@ def apply_modifier_stack(
     *, outline_distance_cache: OutlineDistanceCache | None = None,
     blur_pyramid_cache: BlurPyramidCache | None = None,
 ) -> QImage:
-    if image.isNull() or not modifiers:
+    active_modifiers = [modifier for modifier in modifiers if not modifier.muted]
+    if image.isNull() or not active_modifiers:
         return image
     current = _qimage_premultiplied(image)
     height, width = current.shape[:2]
     mask_fields = mask_fields or {}
-    for modifier in modifiers:
+    for modifier in active_modifiers:
         modifier.validate()
         amount = _parameter_field(
             modifier, "intensity", modifier.intensity,

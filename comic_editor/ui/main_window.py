@@ -1601,6 +1601,7 @@ class MainWindow(QMainWindow):
         if not (
             isinstance(popup, QMenu)
             or popup.windowType() == Qt.Popup
+            or (isinstance(popup, QDialog) and popup.isModal())
         ):
             return False
         local = QPointF(target.mapFromGlobal(global_position.toPoint()))

@@ -1086,15 +1086,35 @@ class _CanvasLogic:
         return bool(
             obj is not None and (
                 self._object_is_mask_contributor(object_id)
-                or obj.modifier_ids or obj.opacity_mask is not None
+                or self._has_active_modifiers(obj.modifier_ids)
+                or obj.opacity_mask is not None
                 or any(
-                    layer.modifier_ids or layer.opacity_mask is not None
+                    self._has_active_modifiers(layer.modifier_ids)
+                    or layer.opacity_mask is not None
                     for layer in self.chapter.ancestor_layers(
                         obj.parent_layer_id
                     )
                 )
             )
         )
+
+    def _active_modifier_instances(
+        self, modifier_ids: Iterable[str], *, suppress_outline: bool = False,
+    ) -> list:
+        if self.chapter is None:
+            return []
+        result = []
+        for modifier_id in modifier_ids:
+            modifier = self.chapter.modifiers.get(modifier_id)
+            if modifier is None or modifier.muted:
+                continue
+            if suppress_outline and isinstance(modifier, OutlineModifier):
+                continue
+            result.append(modifier)
+        return result
+
+    def _has_active_modifiers(self, modifier_ids: Iterable[str]) -> bool:
+        return bool(self._active_modifier_instances(modifier_ids))
 
     def _object_is_mask_contributor(self, object_id: str) -> bool:
         obj = self.chapter.objects.get(object_id) if self.chapter else None
@@ -1139,7 +1159,7 @@ class _CanvasLogic:
             else 0.0
             for modifier_id in modifier_ids
             if (modifier := self.chapter.modifiers.get(modifier_id)) is not None
-            and modifier.intensity > 0
+            and not modifier.muted and modifier.intensity > 0
         ), default=0.0)
         return QRectF(world).adjusted(-padding, -padding, padding, padding)
 
@@ -1209,7 +1229,7 @@ class _CanvasLogic:
             else 0.0
             for modifier_id in modifier_ids
             if (modifier := self.chapter.modifiers.get(modifier_id)) is not None
-            and modifier.intensity > 0
+            and not modifier.muted and modifier.intensity > 0
         ), default=0.0)
         return QRectF(world).adjusted(-padding, -padding, padding, padding)
 
@@ -4556,7 +4576,10 @@ class _CanvasLogic:
         ):
             return
         if (
-            (layer.modifier_ids or layer.opacity_mask is not None)
+            (
+                self._has_active_modifiers(layer.modifier_ids)
+                or layer.opacity_mask is not None
+            )
             and not self._render_base_alpha
             and ("layer", layer.layer_id) not in self._render_modifier_sources
         ):
@@ -4691,12 +4714,12 @@ class _CanvasLogic:
         visible_world: QRectF,
     ) -> None:
         world_bounds = self.entity_world_rect("layer", layer.layer_id)
-        modifiers = [
-            self.chapter.modifiers[item] for item in layer.modifier_ids
-            if item in self.chapter.modifiers
-        ]
-        if getattr(self, "_suppress_outline_for_mask", False):
-            modifiers = [m for m in modifiers if not isinstance(m, OutlineModifier)]
+        modifiers = self._active_modifier_instances(
+            layer.modifier_ids,
+            suppress_outline=getattr(
+                self, "_suppress_outline_for_mask", False
+            ),
+        )
         if (
             world_bounds is None or world_bounds.isEmpty()
             or (not modifiers and layer.opacity_mask is None)
@@ -4774,12 +4797,17 @@ class _CanvasLogic:
                             for candidate in self.chapter.ancestor_layers(
                                 drawing.parent_layer_id
                             )
-                            if candidate.modifier_ids
+                            if self._has_active_modifiers(
+                                candidate.modifier_ids
+                            )
                         ]
                         if drawing is not None else []
                     )
                     if (
-                        drawing is not None and not drawing.modifier_ids
+                        drawing is not None
+                        and not self._has_active_modifiers(
+                            drawing.modifier_ids
+                        )
                         and modified_ancestors
                         and modified_ancestors[-1] == layer.layer_id
                     ):
@@ -4818,11 +4846,16 @@ class _CanvasLogic:
             self._modifier_cache_put(cache_key, processed)
         painter.save()
         painter.setOpacity(parent_opacity * layer.opacity)
-        transform = self._layer_parent_transform(layer)
-        painter.setClipPath(
-            transform.map(self.layer_effective_path(layer.layer_id)),
-            Qt.ClipOperation.IntersectClip,
+        outline_overflows = any(
+            isinstance(modifier, OutlineModifier)
+            for modifier in modifiers
         )
+        if not outline_overflows:
+            transform = self._layer_parent_transform(layer)
+            painter.setClipPath(
+                transform.map(self.layer_effective_path(layer.layer_id)),
+                Qt.ClipOperation.IntersectClip,
+            )
         painter.drawImage(bounds.topLeft(), processed)
         painter.restore()
 
@@ -7225,7 +7258,10 @@ class _CanvasLogic:
         ):
             return
         if (
-            (obj.modifier_ids or obj.opacity_mask is not None)
+            (
+                self._has_active_modifiers(obj.modifier_ids)
+                or obj.opacity_mask is not None
+            )
             and not self._render_base_alpha
             and ("object", obj.object_id) not in self._render_modifier_sources
         ):
@@ -7273,7 +7309,7 @@ class _CanvasLogic:
         mask_ids: set[str] = set()
         for item in ids:
             modifier = self.chapter.modifiers.get(item)
-            if modifier is None:
+            if modifier is None or modifier.muted:
                 continue
             result.append(json.dumps(
                 modifier.to_dict(), sort_keys=True, separators=(",", ":"),
@@ -7340,22 +7376,41 @@ class _CanvasLogic:
                     entity.parent_layer_id
                 )
             ancestors = tuple(
-                json.dumps(layer.to_dict(), sort_keys=True)
+                (
+                    json.dumps(layer.to_dict(), sort_keys=True),
+                    tuple(
+                        json.dumps(
+                            modifier.to_dict(), sort_keys=True,
+                            separators=(",", ":"),
+                        )
+                        for modifier in self._active_modifier_instances(
+                            layer.modifier_ids
+                        )
+                    ),
+                )
                 for layer in ancestor_layers
             )
             dependent_mask_ids: set[str] = set()
             if entity.opacity_mask is not None:
                 dependent_mask_ids.add(entity.opacity_mask.mask_id)
-            for modifier_id in entity.modifier_ids:
-                modifier = self.chapter.modifiers.get(modifier_id)
-                if modifier is not None:
-                    dependent_mask_ids.update(
-                        binding.mask_id
-                        for binding in modifier.parameter_masks.values()
-                    )
+            entity_modifiers = self._active_modifier_instances(
+                entity.modifier_ids
+            )
+            for modifier in entity_modifiers:
+                dependent_mask_ids.update(
+                    binding.mask_id
+                    for binding in modifier.parameter_masks.values()
+                )
             return (
                 kind, entity_id,
                 json.dumps(entity.to_dict(), sort_keys=True),
+                tuple(
+                    json.dumps(
+                        modifier.to_dict(), sort_keys=True,
+                        separators=(",", ":"),
+                    )
+                    for modifier in entity_modifiers
+                ),
                 pixels, children, ancestors,
                 tuple(
                     self._tone_mask_signature(dependent, stack)
@@ -7595,6 +7650,8 @@ class _CanvasLogic:
         result: dict[tuple[str, str], np.ndarray] = {}
         rendered: dict[str, np.ndarray] = {}
         for modifier in modifiers:
+            if modifier.muted:
+                continue
             for attribute, binding in modifier.parameter_masks.items():
                 field = rendered.get(binding.mask_id)
                 if field is None:
@@ -7747,12 +7804,12 @@ class _CanvasLogic:
         self, painter: QPainter, obj: DocumentObject,
         parent_opacity: float, local_visible: QRectF,
     ) -> None:
-        modifiers = [
-            self.chapter.modifiers[item] for item in obj.modifier_ids
-            if item in self.chapter.modifiers
-        ]
-        if getattr(self, "_suppress_outline_for_mask", False):
-            modifiers = [m for m in modifiers if not isinstance(m, OutlineModifier)]
+        modifiers = self._active_modifier_instances(
+            obj.modifier_ids,
+            suppress_outline=getattr(
+                self, "_suppress_outline_for_mask", False
+            ),
+        )
         world_bounds = self.object_world_rect(obj.object_id)
         if isinstance(obj, RasterObject):
             preview_bounds = self._raster_selection_preview_world_bounds(obj)
@@ -7886,7 +7943,7 @@ class _CanvasLogic:
         if destination is not None:
             transform = self._drawing_object_transform(obj, destination)
             painter.save()
-            painter.setRenderHint(QPainter.SmoothPixmapTransform, True)
+            self._set_crisp_raster_transform(painter)
             painter.setTransform(transform, True)
             object_visible = self._drawing_local_visible_rect(
                 obj, local_visible, destination
@@ -7911,11 +7968,14 @@ class _CanvasLogic:
                 )
             painter.restore()
             return
+        painter.save()
+        self._set_crisp_raster_transform(painter)
         painter.translate(obj.x, obj.y)
         object_visible = local_visible.translated(-obj.x, -obj.y)
         if self._render_raster_selection_preview(
             painter, obj, object_visible
         ):
+            painter.restore()
             return
         for (tile_x, tile_y), image in self.tiles.iter_tiles(
             obj.object_id, object_visible
@@ -7923,6 +7983,7 @@ class _CanvasLogic:
             painter.drawImage(
                 tile_x * obj.tile_size, tile_y * obj.tile_size, image
             )
+        painter.restore()
 
     def _raster_selection_preview_state(
         self, obj: RasterObject,
@@ -7993,6 +8054,13 @@ class _CanvasLogic:
                 continue
             painter.drawImage(target.topLeft(), image)
 
+    @staticmethod
+    def _set_crisp_raster_transform(painter: QPainter) -> None:
+        painter.setRenderHint(
+            QPainter.RenderHint.SmoothPixmapTransform, False
+        )
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, False)
+
     def _render_raster_selection_preview(
         self, painter: QPainter, obj: RasterObject,
         local_visible: QRectF | None,
@@ -8008,6 +8076,7 @@ class _CanvasLogic:
             return True
 
         painter.save()
+        self._set_crisp_raster_transform(painter)
         if not copied:
             unselected = QPainterPath()
             unselected.addRect(tile_bounds)
@@ -8024,7 +8093,7 @@ class _CanvasLogic:
             if valid:
                 source_visible = inverse.mapRect(local_visible)
         painter.save()
-        painter.setRenderHint(QPainter.SmoothPixmapTransform, True)
+        self._set_crisp_raster_transform(painter)
         painter.setTransform(transform, True)
         painter.setClipPath(source_path, Qt.ClipOperation.IntersectClip)
         self._draw_tile_mapping(
@@ -8394,8 +8463,9 @@ class _CanvasLogic:
         ):
             return
         drawing = self._active_vector_drawing()
-        if drawing.modifier_ids or any(
-            layer.modifier_ids for layer in self.chapter.ancestor_layers(
+        if self._has_active_modifiers(drawing.modifier_ids) or any(
+            self._has_active_modifiers(layer.modifier_ids)
+            for layer in self.chapter.ancestor_layers(
                 drawing.parent_layer_id
             )
         ):
@@ -9989,7 +10059,10 @@ class _CanvasLogic:
         if self.chapter is None or not self.active_modifier_id:
             return None
         modifier = self.chapter.modifiers.get(self.active_modifier_id)
-        if not isinstance(modifier, BlurModifier) or modifier.mode != "focal":
+        if (
+            not isinstance(modifier, BlurModifier)
+            or modifier.muted or modifier.mode != "focal"
+        ):
             return None
         if not any(
             target in self.chapter.modifier_target_ids(modifier.modifier_id)
@@ -11844,7 +11917,10 @@ class _CanvasLogic:
             padding = 0.0
             for modifier_id in target.modifier_ids:
                 modifier = document.modifiers.get(modifier_id)
-                if modifier is None or modifier.intensity <= 0:
+                if (
+                    modifier is None or modifier.muted
+                    or modifier.intensity <= 0
+                ):
                     continue
                 if isinstance(modifier, BlurModifier):
                     padding += self._modifier_maximum(
@@ -14077,6 +14153,7 @@ class _CanvasLogic:
                 if image is None:
                     continue
                 painter = QPainter(image)
+                self._set_crisp_raster_transform(painter)
                 painter.setCompositionMode(QPainter.CompositionMode_Clear)
                 painter.translate(
                     -key[0] * obj.tile_size, -key[1] * obj.tile_size
@@ -14092,7 +14169,7 @@ class _CanvasLogic:
         for key in target_keys:
             layer = self.tiles._empty(obj.tile_size)
             painter = QPainter(layer)
-            painter.setRenderHint(QPainter.SmoothPixmapTransform, True)
+            self._set_crisp_raster_transform(painter)
             painter.translate(
                 -key[0] * obj.tile_size, -key[1] * obj.tile_size
             )
@@ -14623,7 +14700,7 @@ class _CanvasLogic:
         ):
             image = self.tiles._empty(tile_size)
             painter = QPainter(image)
-            painter.setRenderHint(QPainter.SmoothPixmapTransform, True)
+            self._set_crisp_raster_transform(painter)
             painter.translate(-key[0] * tile_size, -key[1] * tile_size)
             painter.setClipPath(target_path, Qt.ClipOperation.IntersectClip)
             painter.setTransform(transform, True)

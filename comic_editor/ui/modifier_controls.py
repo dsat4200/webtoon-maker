@@ -93,6 +93,16 @@ class ModifierCard(QFrame):
             ),
         )
         title.layout().insertWidget(0, collapse)
+        self.mute_button = self._title_button(
+            "eye-closed" if modifier.muted else "eye",
+            "Unmute modifier" if modifier.muted else "Mute modifier",
+            lambda: owner.set_parameter(
+                modifier.modifier_id, "muted", not modifier.muted, True
+            ),
+        )
+        self.mute_button.setCheckable(True)
+        self.mute_button.setChecked(modifier.muted)
+        title.layout().addWidget(self.mute_button)
         self.link_button = self._title_button(
             "link-square", "Edit linked targets",
             lambda: self.linkRequested.emit(modifier.modifier_id),
@@ -455,10 +465,11 @@ class ModifierControls(QWidget):
         setattr(modifier, attribute, value)
         modifier.validate()
         self.activate_modifier(modifier_id)
-        self._changed()
+        if attribute == "muted" or not modifier.muted:
+            self._changed()
         if commit and before is not None:
             self._push(before, "Edit modifier")
-        if attribute == "expanded":
+        if attribute in {"expanded", "muted"}:
             self.refresh()
 
     def finish_parameter_drag(self) -> None:
@@ -499,7 +510,8 @@ class ModifierControls(QWidget):
         binding.black_value = float(black)
         binding.white_value = float(white)
         modifier.validate()
-        self._changed()
+        if not modifier.muted:
+            self._changed()
         if commit:
             self.finish_parameter_drag()
 

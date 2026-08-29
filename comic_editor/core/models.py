@@ -763,6 +763,7 @@ class HueSaturationLightnessModifier:
     name: str = "Hue / Saturation / Lightness"
     intensity: float = 100.0
     expanded: bool = True
+    muted: bool = False
     hue: float = 0.0
     saturation: float = 0.0
     lightness: float = 0.0
@@ -771,6 +772,7 @@ class HueSaturationLightnessModifier:
     def validate(self) -> None:
         self.name = str(self.name or "Hue / Saturation / Lightness")
         self.expanded = bool(self.expanded)
+        self.muted = bool(self.muted)
         values = tuple(float(value) for value in (
             self.intensity, self.hue, self.saturation, self.lightness
         ))
@@ -795,6 +797,7 @@ class HueSaturationLightnessModifier:
             "name": self.name,
             "intensity": self.intensity,
             "expanded": self.expanded,
+            "muted": self.muted,
             "hue": self.hue,
             "saturation": self.saturation,
             "lightness": self.lightness,
@@ -811,6 +814,7 @@ class BlurModifier:
     name: str = "Blur"
     intensity: float = 100.0
     expanded: bool = True
+    muted: bool = False
     strength: float = 8.0
     mode: Literal["full", "focal"] = "full"
     focal_center: tuple[float, float] = (0.0, 0.0)
@@ -822,6 +826,7 @@ class BlurModifier:
     def validate(self) -> None:
         self.name = str(self.name or "Blur")
         self.expanded = bool(self.expanded)
+        self.muted = bool(self.muted)
         if self.mode not in {"full", "focal"}:
             raise ValueError("Unknown blur mode")
         values = tuple(float(value) for value in (
@@ -849,6 +854,7 @@ class BlurModifier:
             "name": self.name,
             "intensity": self.intensity,
             "expanded": self.expanded,
+            "muted": self.muted,
             "strength": self.strength,
             "mode": self.mode,
             "focal_center": list(self.focal_center),
@@ -868,6 +874,7 @@ class OutlineModifier:
     name: str = "Outline"
     intensity: float = 100.0
     expanded: bool = True
+    muted: bool = False
     thickness: float = 8.0
     opacity: float = 100.0
     color: str = "#FF000000"
@@ -876,6 +883,7 @@ class OutlineModifier:
     def validate(self) -> None:
         self.name = str(self.name or "Outline")
         self.expanded = bool(self.expanded)
+        self.muted = bool(self.muted)
         values = tuple(float(value) for value in (
             self.intensity, self.thickness, self.opacity,
         ))
@@ -899,6 +907,7 @@ class OutlineModifier:
             "name": self.name,
             "intensity": self.intensity,
             "expanded": self.expanded,
+            "muted": self.muted,
             "thickness": self.thickness,
             "opacity": self.opacity,
             "color": self.color,
@@ -918,6 +927,7 @@ def modifier_from_dict(data: dict[str, Any]) -> ModifierInstance:
         "name": str(data.get("name", "")),
         "intensity": float(data.get("intensity", 100.0)),
         "expanded": bool(data.get("expanded", True)),
+        "muted": bool(data.get("muted", False)),
         "parameter_masks": _parameter_masks_from_dict(
             data.get("parameter_masks")
         ),

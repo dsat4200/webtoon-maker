@@ -7,6 +7,7 @@ from PySide6.QtCore import (
     QUrl,
 )
 from PySide6.QtGui import QColor, QImage, QMouseEvent, QPainter
+from PySide6.QtGui import QPainterPath, QTransform
 from PySide6.QtNetwork import QNetworkReply
 import pytest
 
@@ -19,7 +20,9 @@ from comic_editor.core.models import (
 from comic_editor.core.persistence import SeriesRepository
 from comic_editor.core.settings import EditorSettings
 from comic_editor.core.tiles import TileStore
-from comic_editor.ui.canvas import CanvasWidget, ToolKind
+from comic_editor.ui.canvas import (
+    CanvasWidget, RasterSelectionClipboard, ToolKind,
+)
 from comic_editor.ui.main_window import MainWindow
 
 
@@ -32,6 +35,32 @@ def _png_bytes(width: int = 80, height: int = 40) -> bytes:
     assert image.save(buffer, "PNG")
     buffer.close()
     return bytes(payload)
+
+
+def _four_color_tile(tile_size: int = 256) -> QImage:
+    image = QImage(
+        tile_size, tile_size, QImage.Format.Format_ARGB32_Premultiplied
+    )
+    image.fill(Qt.transparent)
+    image.setPixelColor(0, 0, QColor("red"))
+    image.setPixelColor(1, 0, QColor("blue"))
+    image.setPixelColor(0, 1, QColor("green"))
+    image.setPixelColor(1, 1, QColor("white"))
+    return image
+
+
+def _nontransparent_rgba(images) -> set[tuple[int, int, int, int]]:
+    result = set()
+    for image in images:
+        for y in range(image.height()):
+            for x in range(image.width()):
+                color = image.pixelColor(x, y)
+                if color.alpha():
+                    result.add((
+                        color.red(), color.green(), color.blue(),
+                        color.alpha(),
+                    ))
+    return result
 
 
 def _document():
@@ -204,6 +233,139 @@ def test_persistent_raster_transform_keeps_tiles_and_quad(qapp):
     } == before_tiles
     canvas.command_stack.undo()
     assert canvas.chapter.objects[raster.object_id].transform_quad is None
+
+
+def test_raster_projective_transform_is_crisp_while_image_stays_smooth(qapp):
+    chapter, _page, shape = _document()
+    quad = [
+        (20.25, 20.25), (50.25, 22.25),
+        (48.25, 52.25), (18.25, 50.25),
+    ]
+    raster = chapter.add_object(shape.layer_id, RasterObject(
+        interaction_rect=(0, 0, 2, 2),
+        transform_frame=(0, 0, 2, 2), transform_quad=list(quad),
+    ))
+    image_obj = chapter.add_object(shape.layer_id, ImageObject(
+        source_filename="pixels.png", source_mime_type="image/png",
+        pixel_width=2, pixel_height=2,
+        transform_frame=(0, 0, 2, 2), transform_quad=list(quad),
+    ))
+    tiles = TileStore()
+    tiles.replace_object_tiles(
+        raster.object_id, {(0, 0): _four_color_tile()}
+    )
+    images = ImageStore()
+    images.put_decoded(
+        image_obj.object_id, "pixels.png", b"test",
+        _four_color_tile(2), "image/png",
+    )
+    canvas = CanvasWidget(EditorSettings())
+    canvas.set_document(chapter, tiles, images)
+
+    raster_render = QImage(
+        80, 80, QImage.Format.Format_ARGB32_Premultiplied
+    )
+    raster_render.fill(Qt.transparent)
+    painter = QPainter(raster_render)
+    painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+    painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
+    canvas._render_raster_content(
+        painter, raster, QRectF(0, 0, 80, 80),
+        use_transform_preview=True,
+    )
+    painter.end()
+    palette = {
+        (255, 0, 0, 255), (0, 0, 255, 255),
+        (0, 128, 0, 255), (255, 255, 255, 255),
+    }
+    raster_values = _nontransparent_rgba([raster_render])
+    assert raster_values
+    assert raster_values <= palette
+
+    raster.transform_frame = None
+    raster.transform_quad = None
+    raster.x = 20.25
+    raster.y = 20.25
+    translated_render = QImage(
+        80, 80, QImage.Format.Format_ARGB32_Premultiplied
+    )
+    translated_render.fill(Qt.transparent)
+    painter = QPainter(translated_render)
+    painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+    painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
+    canvas._render_raster_content(
+        painter, raster, QRectF(0, 0, 80, 80),
+        use_transform_preview=True,
+    )
+    painter.end()
+    translated_values = _nontransparent_rgba([translated_render])
+    assert translated_values
+    assert translated_values <= palette
+
+    image_render = QImage(
+        80, 80, QImage.Format.Format_ARGB32_Premultiplied
+    )
+    image_render.fill(Qt.transparent)
+    painter = QPainter(image_render)
+    canvas._render_image_object(painter, image_obj)
+    painter.end()
+    image_values = _nontransparent_rgba([image_render])
+    assert any(
+        value[3] == 255 and value not in palette
+        for value in image_values
+    )
+
+
+def test_raster_selection_commit_and_clipboard_transform_are_crisp(qapp):
+    chapter, _page, shape = _document()
+    raster = chapter.add_object(
+        shape.layer_id, RasterObject(interaction_rect=(0, 0, 2, 2))
+    )
+    source = _four_color_tile()
+    tiles = TileStore()
+    tiles.replace_object_tiles(raster.object_id, {(0, 0): source})
+    canvas = CanvasWidget(EditorSettings())
+    canvas.set_document(chapter, tiles, ImageStore())
+    path = QPainterPath()
+    path.addRect(QRectF(0, 0, 2, 2))
+    canvas._drawing_selection_path = QPainterPath(path)
+    canvas._selection_transform_start_quad = [
+        (0, 0), (2, 0), (2, 2), (0, 2)
+    ]
+    canvas._selection_transform_quad = [
+        (12.25, 10.25), (34.25, 12.25),
+        (32.25, 34.25), (10.25, 32.25),
+    ]
+
+    canvas._commit_raster_selection_transform(
+        raster, {(0, 0): QImage(source)}
+    )
+
+    palette = {
+        (255, 0, 0, 255), (0, 0, 255, 255),
+        (0, 128, 0, 255), (255, 255, 255, 255),
+    }
+    committed = _nontransparent_rgba(
+        canvas.tiles.object_tiles(raster.object_id).values()
+    )
+    assert committed
+    assert committed <= palette
+
+    source_to_world = QTransform()
+    source_to_world.translate(40.25, 30.25)
+    source_to_world.rotate(17)
+    source_to_world.scale(8, 8)
+    payload = RasterSelectionClipboard(
+        {(0, 0): QImage(source)}, QPainterPath(path),
+        source_to_world, "Pixels", raster.tile_size,
+    )
+    rendered = canvas._render_raster_clipboard(
+        payload, QTransform(), raster.tile_size
+    )
+    assert rendered is not None
+    clipboard_values = _nontransparent_rgba(rendered[0].values())
+    assert clipboard_values
+    assert clipboard_values <= palette
 
 
 def test_image_and_vector_handle_drags_commit_through_normal_pointer_release(qapp):

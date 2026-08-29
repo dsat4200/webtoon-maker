@@ -13,7 +13,7 @@ from comic_editor.core.models import (
     BlurModifier, BoundGeometry, ChapterDocument,
     HueSaturationLightnessModifier, OutlineModifier,
     ParameterMaskBinding, RasterObject, TextObject, ToneMask,
-    VectorDrawingObject,
+    VectorDrawingObject, modifier_from_dict,
 )
 from comic_editor.core.settings import EditorSettings
 from comic_editor.core.tiles import TileStore
@@ -85,6 +85,22 @@ def test_modifier_registry_round_trip_validation_and_garbage_collection():
     )
 
 
+@pytest.mark.parametrize("modifier", [
+    HueSaturationLightnessModifier(muted=True, hue=37),
+    BlurModifier(muted=True, strength=19),
+    OutlineModifier(muted=True, thickness=11),
+])
+def test_modifier_mute_round_trip_and_legacy_default(modifier):
+    serialized = modifier.to_dict()
+    assert serialized["muted"] is True
+    restored = modifier_from_dict(serialized)
+    assert restored.muted is True
+
+    serialized.pop("muted")
+    legacy = modifier_from_dict(serialized)
+    assert legacy.muted is False
+
+
 def test_multi_move_is_atomic_and_preserves_supplied_front_to_back_order():
     chapter, _page, first, second, raster, vector = _document()
     stationary = chapter.add_object(
@@ -111,7 +127,7 @@ def test_multi_move_is_atomic_and_preserves_supplied_front_to_back_order():
 
 def test_assets_clone_modifier_identity_and_preserve_only_internal_sharing():
     chapter, page, first, _second, raster, vector = _document()
-    shared = HueSaturationLightnessModifier(hue=25)
+    shared = HueSaturationLightnessModifier(hue=25, muted=True)
     chapter.add_modifier(shared, [
         ("layer", first.layer_id),
         ("object", raster.object_id),
@@ -124,6 +140,7 @@ def test_assets_clone_modifier_identity_and_preserve_only_internal_sharing():
     assert len(asset_ids) == 1
     asset_modifier_id = next(iter(asset_ids))
     assert asset_modifier_id != shared.modifier_id
+    assert manifest.document.modifiers[asset_modifier_id].muted is True
     assert manifest.document.layers[first.layer_id].modifier_ids == [
         asset_modifier_id
     ]
@@ -147,6 +164,7 @@ def test_assets_clone_modifier_identity_and_preserve_only_internal_sharing():
     assert len(cloned_ids) == 1
     cloned_modifier_id = next(iter(cloned_ids))
     assert cloned_modifier_id not in {shared.modifier_id, asset_modifier_id}
+    assert target.modifiers[cloned_modifier_id].muted is True
     assert target.layers[cloned_root].modifier_ids == [cloned_modifier_id]
     assert all(
         target.objects[object_id].modifier_ids == [cloned_modifier_id]
@@ -195,6 +213,16 @@ def test_hsl_intensity_and_premultiplied_blur_pixels():
     )
     assert 0 < blurred.pixelColor(3, 4).alpha() < 255
     assert blurred.pixelColor(4, 4).red() > 0
+
+
+def test_apply_modifier_stack_ignores_muted_modifiers():
+    image = QImage(3, 3, QImage.Format.Format_ARGB32_Premultiplied)
+    image.fill(QColor("red"))
+    modifier = HueSaturationLightnessModifier(hue=120, muted=True)
+
+    result = apply_modifier_stack(image, [modifier], (0, 0))
+
+    assert result == image
 
 
 def test_parameter_masks_round_trip_share_contents_but_keep_endpoints():
@@ -797,3 +825,150 @@ def test_modifier_link_mode_toggles_shape_and_is_one_undoable_change(qapp):
         ) == [("object", raster.object_id)]
     finally:
         window.deleteLater()
+
+
+def test_modifier_mute_button_is_shared_and_undoable(qapp):
+    chapter, _page, _first, _second, raster, vector = _document()
+    modifier = HueSaturationLightnessModifier(hue=48, saturation=17)
+    chapter.add_modifier(modifier, [
+        ("object", raster.object_id),
+        ("object", vector.object_id),
+    ])
+    window = MainWindow()
+    window._set_chapter(chapter, TileStore())
+    try:
+        window.canvas.set_selection("object", raster.object_id)
+        controls = window.modifier_controls
+        controls.refresh()
+        card = controls._cards[modifier.modifier_id]
+        assert not card.mute_button.isChecked()
+        assert card.mute_button.toolTip() == "Mute modifier"
+
+        card.mute_button.click()
+
+        current = window.canvas.chapter.modifiers[modifier.modifier_id]
+        assert current.muted is True
+        assert (current.hue, current.saturation) == (48, 17)
+        assert set(window.canvas.chapter.modifier_target_ids(
+            modifier.modifier_id
+        )) == {
+            ("object", raster.object_id),
+            ("object", vector.object_id),
+        }
+        assert controls._cards[modifier.modifier_id].mute_button.isChecked()
+        assert controls._cards[modifier.modifier_id].mute_button.toolTip() == (
+            "Unmute modifier"
+        )
+
+        window.canvas.command_stack.undo()
+        assert not window.canvas.chapter.modifiers[modifier.modifier_id].muted
+        window.canvas.command_stack.redo()
+        assert window.canvas.chapter.modifiers[modifier.modifier_id].muted
+    finally:
+        window.deleteLater()
+
+
+def test_muted_modifier_bypasses_isolation_masks_bounds_and_focal_handles(
+    qapp, monkeypatch,
+):
+    chapter, _page, _first, _second, raster, _vector = _document()
+    raster.interaction_rect = (0, 0, 80, 80)
+    mask = ToneMask()
+    chapter.masks[mask.mask_id] = mask
+    modifier = BlurModifier(
+        muted=True, mode="focal", strength=20,
+        focal_center=(80, 90), focal_radius=50,
+    )
+    modifier.parameter_masks["strength"] = ParameterMaskBinding(
+        mask.mask_id, 2, 20
+    )
+    chapter.add_modifier(modifier, [("object", raster.object_id)])
+    tiles = TileStore()
+    tiles.paint_dab(
+        raster.object_id, QPointF(20, 20), 12, QColor("white")
+    )
+    canvas = CanvasWidget(EditorSettings())
+    canvas.set_document(chapter, tiles)
+    canvas.set_selection("object", raster.object_id)
+    canvas.active_modifier_id = modifier.modifier_id
+    applied = 0
+    masks = 0
+    original_apply = canvas_module.apply_modifier_stack
+
+    def counted_apply(*args, **kwargs):
+        nonlocal applied
+        applied += 1
+        return original_apply(*args, **kwargs)
+
+    def counted_mask(_mask_id, width, height, *_args, **_kwargs):
+        nonlocal masks
+        masks += 1
+        return np.zeros((height, width), dtype=np.float32)
+
+    monkeypatch.setattr(canvas_module, "apply_modifier_stack", counted_apply)
+    monkeypatch.setattr(canvas, "render_tone_mask_field", counted_mask)
+    dirty = QRectF(40, 50, 8, 9)
+    assert canvas.modifier_expanded_dirty(
+        raster.object_id, dirty
+    ) == dirty
+    assert canvas._active_focal_modifier() is None
+
+    image = QImage(600, 600, QImage.Format.Format_ARGB32_Premultiplied)
+    image.fill(Qt.transparent)
+    canvas.render_preview(image)
+    assert applied == 0
+    assert masks == 0
+
+    modifier.muted = False
+    canvas.render_preview(image)
+    assert applied == 1
+    assert masks > 0
+    assert canvas._active_focal_modifier() is modifier
+
+
+def test_shape_outline_overflows_own_path_but_respects_ancestor_clip(qapp):
+    chapter = ChapterDocument(name="Shape outline", height=180)
+    page = chapter.add_page(
+        "Page", BoundGeometry.rectangle(0, 0, 1080, 180)
+    )
+    parent = chapter.add_layer(
+        page.layer_id, "Parent", BoundGeometry.rectangle(30, 30, 100, 100)
+    )
+    shape = chapter.add_layer(
+        parent.layer_id, "Shape", BoundGeometry.rectangle(25, 50, 30, 30)
+    )
+    shape.fill_color = "#FFFF0000"
+    modifier = OutlineModifier(thickness=8, color="#FF0000FF")
+    chapter.add_modifier(modifier, [("layer", shape.layer_id)])
+    canvas = CanvasWidget(EditorSettings())
+    canvas.set_document(chapter, TileStore())
+
+    direct = QImage(180, 180, QImage.Format.Format_ARGB32_Premultiplied)
+    direct.fill(Qt.transparent)
+    painter = QPainter(direct)
+    canvas._render_layer(
+        painter, shape, 1.0, QRectF(0, 0, 180, 180)
+    )
+    painter.end()
+    assert direct.pixelColor(22, 60).blue() > 200
+    assert direct.pixelColor(22, 60).alpha() > 0
+
+    nested = QImage(180, 180, QImage.Format.Format_ARGB32_Premultiplied)
+    nested.fill(Qt.transparent)
+    painter = QPainter(nested)
+    canvas._render_layer(
+        painter, parent, 1.0, QRectF(0, 0, 180, 180)
+    )
+    painter.end()
+    assert nested.pixelColor(28, 60).alpha() == 0
+    assert nested.pixelColor(30, 47).blue() > 200
+
+    modifier.muted = True
+    muted = QImage(180, 180, QImage.Format.Format_ARGB32_Premultiplied)
+    muted.fill(Qt.transparent)
+    painter = QPainter(muted)
+    canvas._render_layer(
+        painter, parent, 1.0, QRectF(0, 0, 180, 180)
+    )
+    painter.end()
+    assert muted.pixelColor(30, 47).alpha() == 0

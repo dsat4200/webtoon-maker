@@ -1,10 +1,12 @@
 from __future__ import annotations
 
-from PySide6.QtCore import QCoreApplication, QEvent, QPointF, Qt
+from PySide6.QtCore import QCoreApplication, QEvent, QPointF, QTimer, Qt
 from PySide6.QtGui import (
     QGuiApplication, QImage, QPainter, QPointingDevice, QTabletEvent,
 )
-from PySide6.QtWidgets import QAbstractSpinBox, QApplication, QMenu
+from PySide6.QtWidgets import (
+    QAbstractSpinBox, QApplication, QMenu, QMessageBox,
+)
 
 from comic_editor.core.models import (
     BoundGeometry, ChapterDocument, RasterObject,
@@ -55,6 +57,49 @@ def test_stylus_click_triggers_popup_action_once(qapp):
         assert triggered == [True]
     finally:
         menu.close()
+        window.close()
+
+
+def test_stylus_click_confirms_primitive_conversion_once(qapp, monkeypatch):
+    window = MainWindow()
+    resolved: list[bool] = []
+    monkeypatch.setattr(
+        window.canvas, "resolve_primitive_conversion",
+        lambda accepted: resolved.append(bool(accepted)),
+    )
+
+    def activate_convert_button() -> None:
+        dialog = QApplication.activeModalWidget()
+        assert isinstance(dialog, QMessageBox)
+        button = next(
+            item for item in dialog.buttons()
+            if item.text() == "Convert to Shape"
+        )
+        center = button.rect().center()
+        local = QPointF(center)
+        global_position = QPointF(button.mapToGlobal(center))
+        monkeypatch.setattr(
+            QApplication, "widgetAt", lambda _position: button
+        )
+        assert window._forward_popup_tablet_event(
+            button, _tablet_event(
+                QEvent.TabletPress, local, global_position,
+                1.0, Qt.LeftButton,
+            ),
+        )
+        assert window._forward_popup_tablet_event(
+            button, _tablet_event(
+                QEvent.TabletRelease, local, global_position,
+                0.0, Qt.NoButton,
+            ),
+        )
+
+    try:
+        window.show()
+        QTimer.singleShot(0, activate_convert_button)
+        window._confirm_primitive_conversion("rectangle")
+        assert resolved == [True]
+    finally:
         window.close()
 
 
