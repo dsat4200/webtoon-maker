@@ -2425,6 +2425,7 @@ class MainWindow(QMainWindow):
                 chapter_id, recover=recover, include_images=True
             )
         except (OSError, ValueError) as error:
+            self._sync_chapter_combo()
             QMessageBox.critical(self, "Unable to open chapter", str(error))
             return
         load_warnings = list(self.repository.last_load_warnings)

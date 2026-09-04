@@ -456,6 +456,19 @@ class _TextGizmoOverlay(QWidget):
 
 
 @dataclass
+class _DrawingSelectionSessionState:
+    path: QPainterPath
+    vector_strokes: set[str]
+    vector_points: set[str]
+    shape_primary: str
+    shape_points: set[str]
+    quad: list[tuple[float, float]] | None
+    pivot: QPointF | None
+    pivot_custom: bool
+    paste_overlay: _RasterPasteOverlayState | None
+
+
+@dataclass
 class CanvasSessionState:
     chapter: ChapterDocument
     tiles: TileStore
@@ -485,6 +498,7 @@ class CanvasSessionState:
     modifier_source_cache_bytes: int
     outline_distance_cache: OutlineDistanceCache
     blur_pyramid_cache: BlurPyramidCache
+    drawing_selection: _DrawingSelectionSessionState | None = None
 
 
 class CanvasPerformanceMonitor:
@@ -1333,6 +1347,14 @@ class _CanvasLogic:
     def _clear_detached_input_state(self) -> None:
         """Reset transient pointer state that cannot survive without a document."""
         self._clear_creation_gesture()
+        self._clear_drawing_selection()
+        self._selected_vector_stroke_ids.clear()
+        self._selected_vector_point_ids.clear()
+        self._selected_shape_node_id = ""
+        self._selected_shape_node_ids.clear()
+        self._selection_before_model = None
+        self._selection_before_tiles = None
+        self._selection_rotate_quad = None
         self._pending_raster_press = None
         self._pending_vector_press = None
         self._pending_raster_transform_press = None
@@ -1451,6 +1473,7 @@ class _CanvasLogic:
         self._clear_creation_gesture()
         self._clear_transform_preview()
         self._clear_asset_drag_preview()
+        drawing_selection = self._capture_drawing_selection_state()
         return CanvasSessionState(
             chapter=self.chapter, tiles=self.tiles, images=self.images,
             command_stack=self.command_stack, tool=self.tool,
@@ -1474,10 +1497,77 @@ class _CanvasLogic:
             modifier_source_cache_bytes=self._modifier_source_cache_bytes,
             outline_distance_cache=self._outline_distance_cache,
             blur_pyramid_cache=self._blur_pyramid_cache,
+            drawing_selection=drawing_selection,
         )
+
+    def _capture_drawing_selection_state(self) -> _DrawingSelectionSessionState:
+        if self._selection_transform_mode is not None:
+            # Discard a pointer preview before detaching the tab. Shape-node
+            # previews edit their geometry in place; raster/vector previews do not.
+            obj = self._drawing_selection_object()
+            if isinstance(obj, LayerNode):
+                for node in self._shape_selection_nodes(obj):
+                    source = self._selection_shape_nodes.get(node.node_id)
+                    if source is not None:
+                        node.position = tuple(source["position"])
+                        for key in ("incoming", "outgoing"):
+                            value = source.get(key)
+                            setattr(
+                                node, key,
+                                tuple(value) if value is not None else None,
+                            )
+            if self._selection_transform_start_quad is not None:
+                self._selection_transform_quad = list(
+                    self._selection_transform_start_quad
+                )
+            self._selection_transform_mode = None
+            self._selection_transform_handle = None
+            self._selection_transform_start_quad = None
+            self._selection_before_model = None
+            self._selection_before_tiles = None
+            self._selection_overlay_tiles = None
+            self._selection_vector_preview.clear()
+            self._selection_vector_preview_revision += 1
+            self._selection_vector_points.clear()
+            self._selection_shape_nodes.clear()
+            self._invalidate_scene_cache()
+        return _DrawingSelectionSessionState(
+            path=QPainterPath(self._drawing_selection_path),
+            vector_strokes=set(self._selected_vector_stroke_ids),
+            vector_points=set(self._selected_vector_point_ids),
+            shape_primary=self._selected_shape_node_id,
+            shape_points=set(self._selected_shape_node_ids),
+            quad=list(self._selection_transform_quad)
+            if self._selection_transform_quad is not None else None,
+            pivot=QPointF(self._selection_pivot)
+            if self._selection_pivot is not None else None,
+            pivot_custom=self._selection_pivot_custom,
+            paste_overlay=self._clone_raster_overlay(self._raster_paste_overlay),
+        )
+
+    def _restore_drawing_selection_state(
+        self, state: _DrawingSelectionSessionState | None,
+    ) -> None:
+        if state is None:
+            return
+        self._drawing_selection_path = QPainterPath(state.path)
+        self._selected_vector_stroke_ids = set(state.vector_strokes)
+        self._selected_vector_point_ids = set(state.vector_points)
+        self._selected_shape_node_id = state.shape_primary
+        self._selected_shape_node_ids = set(state.shape_points)
+        self._selection_transform_quad = (
+            list(state.quad) if state.quad is not None else None
+        )
+        self._selection_pivot = (
+            QPointF(state.pivot) if state.pivot is not None else None
+        )
+        self._selection_pivot_custom = state.pivot_custom
+        self._raster_paste_overlay = self._clone_raster_overlay(state.paste_overlay)
 
     def restore_session_state(self, state: CanvasSessionState) -> None:
         """Activate a previously captured tab without loading it again."""
+        self._cancel_fill_job()
+        self._clear_fill_replay()
         self._clear_detached_input_state()
         self.chapter, self.tiles, self.images = (
             state.chapter, state.tiles, state.images
@@ -1490,6 +1580,7 @@ class _CanvasLogic:
         )
         self.selected_object_id = state.selected_object_id
         self.selected_entities = list(state.selected_entities)
+        self._restore_drawing_selection_state(state.drawing_selection)
         self.center_x, self.center_y = state.center_x, state.center_y
         self.scale, self.rotation = state.scale, state.rotation
         self._compound_path_cache = state.compound_cache
@@ -1515,6 +1606,10 @@ class _CanvasLogic:
         self.hierarchyChanged.emit()
         self.selectionChanged.emit(self.selected_kind, self.selected_id)
         self.selectionSetChanged.emit(list(self.selected_entities))
+        self.vectorSelectionChanged.emit(
+            set(self._selected_vector_stroke_ids),
+            set(self._selected_vector_point_ids),
+        )
         self.toolChanged.emit(self.tool)
 
     def clear_document(self) -> None:
@@ -1524,6 +1619,8 @@ class _CanvasLogic:
             self._cancel_page_creation()
         if self._gradient_creation_parent_id:
             self._cancel_gradient_creation()
+        self._cancel_fill_job()
+        self._clear_fill_replay()
         self._clear_detached_input_state()
         self._clear_page_gap_editor()
         self._page_gap_return_selection = None

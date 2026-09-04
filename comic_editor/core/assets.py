@@ -21,7 +21,10 @@ from .models import (
     object_from_dict,
 )
 from .images import ImageStore
-from .persistence import atomic_json
+from .persistence import (
+    atomic_json, completed_revision_manifest, prepare_revision_save,
+    recover_saved_revision,
+)
 from .fill_migration import materialize_legacy_fills
 from .tiles import TileStore
 
@@ -1112,9 +1115,8 @@ class AssetRepository:
         AssetManifest, TileStore, ImageStore
     ]:
         root = self.asset_root(asset_id)
-        if not recover:
-            self._recover_interrupted_save(root)
         source = root / "autosave" if recover else root
+        self._recover_interrupted_save(source)
         self.last_load_warnings = []
         manifest = AssetManifest.from_dict(json.loads(
             (source / ASSET_FILE).read_text(encoding="utf-8")
@@ -1154,47 +1156,34 @@ class AssetRepository:
             if isinstance(obj, ImageObject)
         }
         mask_ids = set(manifest.document.masks)
-        root = self.asset_root(manifest.asset_id)
-        if autosave:
-            destination = root / "autosave"
-            tiles.save_directory(destination / "raster", raster_ids, complete=True)
-            tiles.save_directory(destination / "masks", mask_ids, complete=True)
-            images.save_directory(destination / "images", image_ids, complete=True)
-            atomic_json(destination / ASSET_FILE, manifest.to_dict())
-            atomic_json(destination / "recovery.json", {"saved_at": time.time()})
-            return
-        root.mkdir(parents=True, exist_ok=True)
+        asset_root = self.asset_root(manifest.asset_id)
+        root = asset_root / "autosave" if autosave else asset_root
         manifest_path = root / ASSET_FILE
-        backup = root / LAST_GOOD_DIR
-        if manifest_path.is_file():
-            if backup.exists():
-                shutil.rmtree(backup)
-            backup.mkdir(parents=True)
-            shutil.copy2(manifest_path, backup / ASSET_FILE)
-            if (root / "raster").is_dir():
-                shutil.copytree(root / "raster", backup / "raster")
-            if (root / "images").is_dir():
-                shutil.copytree(root / "images", backup / "images")
-            if (root / "masks").is_dir():
-                shutil.copytree(root / "masks", backup / "masks")
-            if (root / THUMBNAIL_FILE).is_file():
-                shutil.copy2(root / THUMBNAIL_FILE, backup / THUMBNAIL_FILE)
-        atomic_json(root / PENDING_FILE, {"started_at": time.time()})
+        prepare_revision_save(
+            root, ASSET_FILE, extra_files=(THUMBNAIL_FILE, "recovery.json"),
+        )
+        image_dirty = set(images.dirty)
         try:
             tiles.save_directory(root / "raster", raster_ids, complete=True)
             tiles.save_directory(root / "masks", mask_ids, complete=True)
             images.save_directory(root / "images", image_ids, complete=True)
-            if thumbnail is not None:
+            if thumbnail is not None and not autosave:
                 temporary = root / f".{THUMBNAIL_FILE}.tmp"
                 if not thumbnail.save(str(temporary), "PNG"):
                     raise OSError("Unable to save asset thumbnail")
                 temporary.replace(root / THUMBNAIL_FILE)
+            if autosave:
+                atomic_json(root / "recovery.json", {"saved_at": time.time()})
             atomic_json(manifest_path, manifest.to_dict())
             (root / PENDING_FILE).unlink(missing_ok=True)
-            tiles.dirty.clear()
-            images.dirty.clear()
         except Exception:
+            images.dirty.update(image_dirty)
             raise
+        if autosave:
+            images.dirty.update(image_dirty)
+            return
+        tiles.dirty.clear()
+        images.dirty.clear()
         autosave_root = root / "autosave"
         if autosave_root.exists():
             shutil.rmtree(autosave_root)
@@ -1208,27 +1197,14 @@ class AssetRepository:
 
     def has_recovery(self, asset_id: str) -> bool:
         root = self.asset_root(asset_id)
-        manual = root / ASSET_FILE
-        recovery = root / "autosave" / ASSET_FILE
+        manual = completed_revision_manifest(root, ASSET_FILE)
+        recovery = completed_revision_manifest(root / "autosave", ASSET_FILE)
         return recovery.is_file() and (
             not manual.is_file() or recovery.stat().st_mtime > manual.stat().st_mtime
         )
 
     @staticmethod
     def _recover_interrupted_save(root: Path) -> None:
-        pending = root / PENDING_FILE
-        if not pending.exists():
-            return
-        backup = root / LAST_GOOD_DIR
-        if not (backup / ASSET_FILE).is_file():
-            raise OSError("The first asset save was interrupted and has no recoverable revision")
-        for name in ("raster", "images", "masks"):
-            target = root / name
-            if target.exists():
-                shutil.rmtree(target)
-            if (backup / name).is_dir():
-                shutil.copytree(backup / name, target)
-        for name in (ASSET_FILE, THUMBNAIL_FILE):
-            if (backup / name).is_file():
-                shutil.copy2(backup / name, root / name)
-        pending.unlink(missing_ok=True)
+        recover_saved_revision(
+            root, ASSET_FILE, extra_files=(THUMBNAIL_FILE, "recovery.json"),
+        )

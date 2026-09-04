@@ -33,6 +33,75 @@ def atomic_json(path: Path, payload: dict) -> None:
     temporary.replace(path)
 
 
+def completed_revision_manifest(root: Path, manifest_name: str) -> Path:
+    """Locate committed metadata without offering a partial write as recovery."""
+    if (root / PENDING_FILE).exists():
+        return root / LAST_GOOD_DIR / manifest_name
+    return root / manifest_name
+
+
+def recover_saved_revision(
+    root: Path, manifest_name: str, *, extra_files: tuple[str, ...] = (),
+    allow_first_save_retry: bool = False,
+) -> None:
+    pending = root / PENDING_FILE
+    if not pending.exists():
+        return
+    backup = root / LAST_GOOD_DIR
+    backup_manifest = backup / manifest_name
+    if not backup_manifest.is_file():
+        if not allow_first_save_retry:
+            raise OSError(
+                f"The first {Path(manifest_name).stem} save was interrupted "
+                "and has no recoverable revision"
+            )
+        # A retry has the complete in-memory document. Never promote files
+        # from its incomplete first write into a last-good snapshot.
+        (root / manifest_name).unlink(missing_ok=True)
+        for name in extra_files:
+            (root / name).unlink(missing_ok=True)
+        return
+    for name in ("raster", "masks", "images"):
+        target = root / name
+        if target.exists():
+            shutil.rmtree(target)
+        if (backup / name).is_dir():
+            shutil.copytree(backup / name, target)
+    for name in extra_files:
+        if (backup / name).is_file():
+            shutil.copy2(backup / name, root / name)
+        else:
+            (root / name).unlink(missing_ok=True)
+    shutil.copy2(backup_manifest, root / manifest_name)
+    pending.unlink(missing_ok=True)
+
+
+def prepare_revision_save(
+    root: Path, manifest_name: str, *, extra_files: tuple[str, ...] = (),
+) -> None:
+    """Protect the last complete disk revision before any resource writes."""
+    root.mkdir(parents=True, exist_ok=True)
+    recover_saved_revision(
+        root, manifest_name, extra_files=extra_files,
+        allow_first_save_retry=True,
+    )
+    backup = root / LAST_GOOD_DIR
+    if backup.exists():
+        shutil.rmtree(backup)
+    manifest = root / manifest_name
+    if manifest.is_file():
+        backup.mkdir()
+        for name in ("raster", "masks", "images"):
+            if (root / name).is_dir():
+                shutil.copytree(root / name, backup / name)
+        for name in extra_files:
+            if (root / name).is_file():
+                shutil.copy2(root / name, backup / name)
+        # The backup manifest is published last so it denotes a complete copy.
+        shutil.copy2(manifest, backup / manifest_name)
+    atomic_json(root / PENDING_FILE, {"started_at": time.time()})
+
+
 class SeriesRepository:
     def __init__(self, root: str | Path):
         self.root = Path(root).expanduser().resolve()
@@ -183,37 +252,16 @@ class SeriesRepository:
         }
         mask_ids = set(chapter.masks)
         chapter_root = self.chapter_root(chapter.chapter_id)
-        if autosave:
-            destination = chapter_root / "autosave"
-            tile_root = destination / "raster"
-            mask_root = destination / "masks"
-            image_root = destination / "images"
-            tiles.save_directory(tile_root, raster_object_ids, complete=True)
-            tiles.save_directory(mask_root, mask_ids, complete=True)
-            images.save_directory(image_root, image_object_ids, complete=True)
-            atomic_json(destination / CHAPTER_FILE, chapter.to_dict())
-            atomic_json(destination / "recovery.json", {"saved_at": time.time()})
-            return
-        destination = chapter_root
+        destination = chapter_root / "autosave" if autosave else chapter_root
         tile_root = destination / "raster"
         mask_root = destination / "masks"
         image_root = destination / "images"
-        destination.mkdir(parents=True, exist_ok=True)
         manifest = destination / CHAPTER_FILE
         pending = destination / PENDING_FILE
-        backup = destination / LAST_GOOD_DIR
-        if manifest.is_file():
-            if backup.exists():
-                shutil.rmtree(backup)
-            backup.mkdir(parents=True)
-            shutil.copy2(manifest, backup / CHAPTER_FILE)
-            if tile_root.is_dir():
-                shutil.copytree(tile_root, backup / "raster")
-            if image_root.is_dir():
-                shutil.copytree(image_root, backup / "images")
-            if mask_root.is_dir():
-                shutil.copytree(mask_root, backup / "masks")
-        atomic_json(pending, {"started_at": time.time()})
+        prepare_revision_save(
+            destination, CHAPTER_FILE, extra_files=("recovery.json",),
+        )
+        image_dirty = set(images.dirty)
         try:
             # Tile files are published before the manifest. If the process is
             # interrupted, PENDING_FILE causes the previous complete revision
@@ -221,13 +269,19 @@ class SeriesRepository:
             tiles.save_directory(tile_root, raster_object_ids, complete=True)
             tiles.save_directory(mask_root, mask_ids, complete=True)
             images.save_directory(image_root, image_object_ids, complete=True)
+            if autosave:
+                atomic_json(destination / "recovery.json", {"saved_at": time.time()})
             atomic_json(manifest, chapter.to_dict())
             pending.unlink(missing_ok=True)
-            tiles.dirty.clear()
-            images.dirty.clear()
         except Exception:
             # Leave the pending marker and last-good data intact for recovery.
+            images.dirty.update(image_dirty)
             raise
+        if autosave:
+            images.dirty.update(image_dirty)
+            return
+        tiles.dirty.clear()
+        images.dirty.clear()
         autosave_root = destination / "autosave"
         if autosave_root.exists():
             shutil.rmtree(autosave_root)
@@ -239,9 +293,8 @@ class SeriesRepository:
         ChapterDocument, TileStore, ImageStore
     ]:
         root = self.chapter_root(chapter_id)
-        if not recover:
-            self._recover_interrupted_save(root)
         source = root / "autosave" if recover else root
+        self._recover_interrupted_save(source)
         data = json.loads((source / CHAPTER_FILE).read_text(encoding="utf-8"))
         self.last_load_warnings = []
         chapter = ChapterDocument.from_dict(data, warnings=self.last_load_warnings)
@@ -265,38 +318,12 @@ class SeriesRepository:
 
     def has_recovery(self, chapter_id: str) -> bool:
         root = self.chapter_root(chapter_id)
-        manual = root / CHAPTER_FILE
-        recovery = root / "autosave" / CHAPTER_FILE
+        manual = completed_revision_manifest(root, CHAPTER_FILE)
+        recovery = completed_revision_manifest(root / "autosave", CHAPTER_FILE)
         return recovery.is_file() and (
             not manual.is_file() or recovery.stat().st_mtime > manual.stat().st_mtime
         )
 
     @staticmethod
     def _recover_interrupted_save(root: Path) -> None:
-        pending = root / PENDING_FILE
-        if not pending.exists():
-            return
-        backup = root / LAST_GOOD_DIR
-        backup_manifest = backup / CHAPTER_FILE
-        if not backup_manifest.is_file():
-            raise OSError("The first chapter save was interrupted and has no recoverable revision")
-        raster = root / "raster"
-        if raster.exists():
-            shutil.rmtree(raster)
-        backup_raster = backup / "raster"
-        if backup_raster.is_dir():
-            shutil.copytree(backup_raster, raster)
-        masks = root / "masks"
-        if masks.exists():
-            shutil.rmtree(masks)
-        backup_masks = backup / "masks"
-        if backup_masks.is_dir():
-            shutil.copytree(backup_masks, masks)
-        images = root / "images"
-        if images.exists():
-            shutil.rmtree(images)
-        backup_images = backup / "images"
-        if backup_images.is_dir():
-            shutil.copytree(backup_images, images)
-        shutil.copy2(backup_manifest, root / CHAPTER_FILE)
-        pending.unlink(missing_ok=True)
+        recover_saved_revision(root, CHAPTER_FILE, extra_files=("recovery.json",))

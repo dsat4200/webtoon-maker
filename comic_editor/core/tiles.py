@@ -1263,6 +1263,18 @@ class TileStore:
                 for key in tiles
                 if object_id in object_ids
             }
+            # Complete saves must mirror the current sparse store, including
+            # deletions whose dirty flags may have been consumed elsewhere.
+            for object_id in object_ids:
+                directory = root / object_id
+                if not directory.is_dir():
+                    continue
+                names = {
+                    f"{x}_{y}.png" for x, y in self._tiles.get(object_id, {})
+                }
+                for saved in directory.glob("*.png"):
+                    if saved.name not in names:
+                        saved.unlink()
         for object_id, x, y in targets:
             if object_id not in object_ids:
                 continue

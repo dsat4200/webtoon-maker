@@ -273,10 +273,12 @@ On disk, tile names are `<x>_<y>.png`, so negative coordinates are represented n
 │       │   ├── raster/...        # previous complete manual revision
 │       │   ├── masks/...
 │       │   └── images/...
-│       ├── .save_pending         # exists only across an interrupted manual save
+│       ├── .save_pending         # marks an unfinished manual save
 │       └── autosave/
 │           ├── chapter.json
 │           ├── recovery.json     # saved_at timestamp
+│           ├── last_good/...     # previous complete autosave, when present
+│           ├── .save_pending     # marks an unfinished autosave
 │           ├── raster/...
 │           ├── masks/...
 │           └── images/...
@@ -311,7 +313,7 @@ Asset folders use stable UUIDs, so a rename changes only the manifest. Asset man
 ### Manual chapter save
 
 1. Validate the complete chapter graph.
-2. If a current manifest exists, replace `last_good/` with a copy of the current manifest plus raster, masks, and image directories.
+2. Recover any pending disk revision before rotating `last_good/`. Copy the current raster, masks, and images into the backup, publishing its manifest last.
 3. Atomically create `.save_pending` with a start time.
 4. Publish raster tiles, mask tiles, and images first.
 5. Atomically publish `chapter.json` last.
@@ -322,13 +324,13 @@ Publishing the manifest last prevents a new graph from pointing at partially pub
 
 ### Interrupted save recovery
 
-When loading the normal chapter, `_recover_interrupted_save()` first checks `.save_pending`. If present, it requires `last_good/chapter.json`, replaces the current raster/mask/image directories and manifest with that complete revision, and removes the marker. An interrupted first-ever save without a previous revision is reported as unrecoverable.
+When loading either a manual chapter or its autosave, `_recover_interrupted_save()` first checks `.save_pending` in that snapshot's directory. If present, it requires `last_good/chapter.json`, replaces the current raster/mask/image directories and manifest with that complete revision, and removes the marker. The same shared protocol covers asset manifests and thumbnails. Retrying a save recovers disk state before replacing the backup, without changing the current in-memory edits. An interrupted first-ever save without a previous revision is reported as unrecoverable when loading; a save retry can rebuild it from memory without promoting partial files into a backup.
 
 ### Recovery autosave
 
-Any document change marks the current chapter dirty and starts a two-second single-shot timer. Autosave is rate-limited to once per 30 seconds. It writes a complete, independent chapter/tile/mask/image snapshot beneath `autosave/` and does not clear the manual-save dirty state.
+Any document change marks the current chapter dirty and starts a two-second single-shot timer. Autosave is rate-limited to once per 30 seconds. It writes a complete, independent chapter/tile/mask/image snapshot beneath `autosave/`, protected by its own pending marker and last-good backup, and does not clear the manual-save dirty state. Complete tile saves remove obsolete tile PNGs even when their deletion is no longer in the dirty set.
 
-On chapter open, `has_recovery()` compares the recovery manifest modification time to the manual manifest. The UI can load the recovery snapshot instead. A successful manual save clears recovery data.
+On chapter open, `has_recovery()` compares the complete recovery manifest modification time to the complete manual manifest, looking in `last_good/` when a pending marker exists. An interrupted first autosave without a backup is not offered. The UI can load the recovery snapshot instead. A successful manual save clears recovery data.
 
 ### Save As
 
@@ -385,7 +387,7 @@ The canvas holds:
 - the active tone mask, mask paint state, and mask overlay caches; and
 - compound/vector/gradient/modifier/navigation/transform render caches, including the vector cache's byte count and lazy per-drawing spatial indexes.
 
-Selection, camera position, command history, active tool, gesture state, local text undo, and render caches are not written into project JSON or recovery autosaves. Switching project tabs retains the committed state in memory; switching chapters inside a series still binds a new chapter/tile/image store and resets chapter-local transient state.
+Selection, camera position, command history, active tool, gesture state, local text undo, and render caches are not written into project JSON or recovery autosaves. Switching project tabs retains committed state in memory, including copied raster regions, vector and shape point selections, selection frames/pivots, and pasted raster overlays. Unfinished drawing-selection transforms are canceled before capture. Switching chapters inside a series binds a new chapter/tile/image store and clears drawing selections; a failed load preserves the current canvas and restores its chapter dropdown label.
 
 ## Undo/redo data
 

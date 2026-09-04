@@ -313,6 +313,10 @@ together, and Delete removes the selected anchors only when every contour keeps
 its required minimum topology. Those rotate/pivot affordances are shared by normal object
 transforms, and free text exposes its bounds handles while Text Edit is active.
 
+Each project tab remembers its own drawing selection, transform frame, pivot,
+and pasted content. Returning to a tab restores that selection; switching to a
+different chapter starts with no drawing selection.
+
 Raster and Vector Drawing inspectors, and eligible shape layers, can enable
 **Ignore direct parent mask**. The complete subtree may then draw beyond that
 one shape and is composited above its fill and outline while still respecting
