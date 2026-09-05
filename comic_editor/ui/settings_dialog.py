@@ -4,7 +4,7 @@ from __future__ import annotations
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (
-    QCheckBox, QColorDialog, QDialog, QDialogButtonBox, QFormLayout,
+    QCheckBox, QDialog, QDialogButtonBox, QFormLayout,
     QGroupBox, QHBoxLayout, QPushButton, QSlider, QSpinBox, QTabWidget,
     QVBoxLayout, QWidget,
 )
@@ -146,11 +146,8 @@ class SettingsDialog(QDialog):
         )
 
     def _choose_color(self, button: QPushButton) -> None:
-        selected = QColorDialog.getColor(
-            QColor(str(button.property("color"))), self, "Choose grid color"
-        )
-        if selected.isValid():
-            self._set_button_color(button, selected.name())
+        from comic_editor.ui.color_picker import choose_color
+        self._color_popup = choose_color(self, str(button.property("color")), lambda color: self._set_button_color(button, color), "Choose grid color")
 
     @staticmethod
     def _opacity_control(

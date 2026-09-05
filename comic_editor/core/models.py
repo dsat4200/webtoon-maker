@@ -8,7 +8,7 @@ from dataclasses import dataclass, field
 from typing import Any, Iterable, Iterator, Literal
 
 
-SCHEMA_VERSION = 21
+SCHEMA_VERSION = 22
 SERIES_SCHEMA_VERSION = 17
 CHAPTER_WIDTH = 1080
 DEFAULT_CHAPTER_HEIGHT = 3240
@@ -105,6 +105,8 @@ class PathNode:
     roundness: float = 0.0
     roundness_enabled: bool | None = None
     width_multiplier: float = 1.0
+    outline_multiplier: float = 1.0
+    outline_enabled: bool = True
 
     def __post_init__(self) -> None:
         if self.roundness_enabled is None:
@@ -139,6 +141,11 @@ class PathNode:
         self.width_multiplier = round(max(
             0.1, min(10.0, float(self.width_multiplier))
         ) * 10) / 10
+        self.outline_multiplier = float(self.outline_multiplier)
+        if not math.isfinite(self.outline_multiplier):
+            raise ValueError("Outline multiplier must be finite")
+        self.outline_multiplier = max(0.0, min(10.0, self.outline_multiplier))
+        self.outline_enabled = bool(self.outline_enabled)
 
     def to_dict(self) -> dict[str, Any]:
         self.validate()
@@ -151,6 +158,8 @@ class PathNode:
             "roundness": self.roundness,
             "roundness_enabled": self.roundness_enabled,
             "width_multiplier": self.width_multiplier,
+            "outline_multiplier": self.outline_multiplier,
+            "outline_enabled": self.outline_enabled,
         }
 
     @classmethod
@@ -175,6 +184,8 @@ class PathNode:
                 data.get("roundness_enabled", roundness > 0)
             ),
             width_multiplier=float(data.get("width_multiplier", 1.0)),
+            outline_multiplier=float(data.get("outline_multiplier", 1.0)),
+            outline_enabled=bool(data.get("outline_enabled", True)),
         )
         result.validate()
         return result
@@ -915,9 +926,44 @@ class OutlineModifier:
         }
 
 
-ModifierInstance = (
-    HueSaturationLightnessModifier | BlurModifier | OutlineModifier
-)
+@dataclass
+class MirrorModifier:
+    modifier_id: str = field(default_factory=new_id)
+    modifier_type: Literal["mirror"] = "mirror"
+    name: str = "Mirror"
+    intensity: float = 100.0
+    expanded: bool = True
+    muted: bool = False
+    axis_start: tuple[float, float] = (0.0, -100.0)
+    axis_end: tuple[float, float] = (0.0, 100.0)
+    compound_operation: Literal["ignore", "add", "subtract"] = "ignore"
+    parameter_masks: dict[str, ParameterMaskBinding] = field(default_factory=dict)
+
+    def validate(self) -> None:
+        self.name = str(self.name or "Mirror")
+        self.expanded, self.muted = bool(self.expanded), bool(self.muted)
+        self.axis_start, self.axis_end = _point(self.axis_start), _point(self.axis_end)
+        if not all(math.isfinite(v) for v in (*self.axis_start, *self.axis_end, self.intensity)):
+            raise ValueError("Mirror values must be finite")
+        if math.dist(self.axis_start, self.axis_end) < 1e-6:
+            raise ValueError("Mirror axis endpoints must be distinct")
+        self.intensity = max(0.0, min(100.0, float(self.intensity)))
+        if self.compound_operation not in {"ignore", "add", "subtract"}:
+            raise ValueError("Unknown mirror compound operation")
+        _validate_parameter_masks(self.parameter_masks, {"intensity": (0.0, 100.0)})
+
+    def to_dict(self) -> dict[str, Any]:
+        self.validate()
+        return {
+            "id": self.modifier_id, "type": "mirror", "name": self.name,
+            "intensity": self.intensity, "expanded": self.expanded, "muted": self.muted,
+            "axis_start": list(self.axis_start), "axis_end": list(self.axis_end),
+            "compound_operation": self.compound_operation,
+            "parameter_masks": _parameter_masks_to_dict(self.parameter_masks),
+        }
+
+
+ModifierInstance = HueSaturationLightnessModifier | BlurModifier | OutlineModifier | MirrorModifier
 
 
 def modifier_from_dict(data: dict[str, Any]) -> ModifierInstance:
@@ -949,6 +995,12 @@ def modifier_from_dict(data: dict[str, Any]) -> ModifierInstance:
             focal_radius=float(data.get("focal_radius", 100.0)),
             focal_ramp=float(data.get("focal_ramp", 0.5)),
             focal_angle=float(data.get("focal_angle", 0.0)),
+        )
+    elif modifier_type == "mirror":
+        result = MirrorModifier(
+            **common, axis_start=_point(data.get("axis_start", [0, -100])),
+            axis_end=_point(data.get("axis_end", [0, 100])),
+            compound_operation=str(data.get("compound_operation", "ignore")),
         )
     elif modifier_type == "outline":
         result = OutlineModifier(
@@ -2519,7 +2571,7 @@ class ChapterDocument:
     name: str = "Chapter 1"
     width: int = CHAPTER_WIDTH
     height: int = DEFAULT_CHAPTER_HEIGHT
-    background: str = "#ffffff"
+    background: str = "#00000000"
     grid: GridSettings = field(default_factory=GridSettings)
     grid_override_enabled: bool = False
     root_page_ids: list[str] = field(default_factory=list)
@@ -3561,6 +3613,7 @@ class ChapterDocument:
         cls, data: dict[str, Any], warnings: list[str] | None = None,
     ) -> "ChapterDocument":
         schema = int(data.get("schema_version", 1))
+        legacy_background = schema < 22
         if schema > SCHEMA_VERSION:
             raise ValueError(f"Unsupported future chapter schema: {schema}")
         legacy_grid_override = schema < 21
@@ -3621,7 +3674,12 @@ class ChapterDocument:
             chapter_id=str(data["id"]), name=str(data.get("name", "Chapter")),
             width=int(size[0]), height=int(size[1]),
             document_kind=str(data.get("document_kind", "chapter")),
-            background=str(data.get("background", "#ffffff")),
+            background=(
+                "#00000000" if legacy_background
+                and data.get("document_kind", "chapter") == "chapter"
+                and canonical_argb(data.get("background", "#ffffff")) == "#FFFFFFFF"
+                else str(data.get("background", "#00000000"))
+            ),
             grid=GridSettings.from_dict(data.get("grid")),
             grid_override_enabled=(
                 legacy_grid_override

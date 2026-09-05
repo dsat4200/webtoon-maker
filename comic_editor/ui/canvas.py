@@ -52,7 +52,7 @@ from comic_editor.core.models import (
     ColorGradientRamp, ColorGradientStop, DocumentObject, GradientObject,
     GridSettings, LineGradientField, LayerNode, RadialGradientField,
     ImageObject, PathContour, PathNode, RasterObject, ShapeStyle, TextObject,
-    BlurModifier, OutlineModifier, ToneMask,
+    BlurModifier, OutlineModifier, MirrorModifier, ToneMask,
     SpeedLineCenterObject, SpeedLinesGradientObject, VectorDrawingObject,
     VectorStroke, VectorStrokePoint, new_id,
     ImageSourceDescriptor, canonical_argb, image_source_from_dict,
@@ -78,6 +78,9 @@ from comic_editor.ui.modifier_rendering import (
     BlurPyramidCache, OutlineDistanceCache, apply_modifier_stack,
     apply_opacity_mask,
 )
+from comic_editor.core.effect_geometry import effect_bounds, reflection_transform
+from comic_editor.ui.effect_pipeline import render_stages, empty_image, aligned
+from comic_editor.ui.shape_outline import customized as customized_outline, outline_mesh, remove_nodes
 
 
 class ToolKind(Enum):
@@ -1159,8 +1162,10 @@ class _CanvasLogic:
                 0, 0, self.chapter.width, self.chapter.height
             )
         modifier_ids = list(obj.modifier_ids)
-        for layer in self.chapter.ancestor_layers(obj.parent_layer_id):
+        for layer in reversed(self.chapter.ancestor_layers(obj.parent_layer_id)):
             modifier_ids.extend(layer.modifier_ids)
+        if any(isinstance(self.chapter.modifiers.get(mid), MirrorModifier) for mid in modifier_ids):
+            return effect_bounds(world, self._active_modifier_instances(modifier_ids))
         padding = max((
             self._modifier_maximum(
                 modifier, "strength", modifier.strength
@@ -1231,6 +1236,8 @@ class _CanvasLogic:
             parent = self.chapter.layers[parent_id]
             modifier_ids.extend(parent.modifier_ids)
             parent_id = parent.parent_id
+        if any(isinstance(self.chapter.modifiers.get(mid), MirrorModifier) for mid in modifier_ids):
+            return effect_bounds(world, self._active_modifier_instances(modifier_ids))
         padding = max((
             self._modifier_maximum(
                 modifier, "strength", modifier.strength
@@ -1433,6 +1440,7 @@ class _CanvasLogic:
         self.active_layer_id = ""
         self.selected_object_id = ""
         self.selected_entities = []
+        self.active_modifier_id = ""
         self._raster_paste_overlay = None
         self._selection_overlay_tiles = None
         self._selected_vector_stroke_ids.clear()
@@ -1663,6 +1671,7 @@ class _CanvasLogic:
         self.active_color_slot = slot
 
     def replace_chapter(self, state: dict) -> None:
+        self.active_modifier_id = ""
         self._commit_text_edit()
         self._clear_transform_preview()
         self._clear_page_gap_editor()
@@ -2096,7 +2105,10 @@ class _CanvasLogic:
             self._clear_transform_preview()
             self._transform_pivot = None
             self._transform_pivot_custom = False
+        if set(self.selected_entities) != {(kind, entity_id)}:
+            self.active_modifier_id = ""
         if entity_id != self.selected_id:
+            self.active_modifier_id = ""
             self._pending_drawing_selection_press = None
             self._pending_raster_transform_press = None
             self._gradient_preview_active = False
@@ -2186,6 +2198,8 @@ class _CanvasLogic:
             else:
                 return False
         ordered = filtered
+        if set(ordered) != set(self.selected_entities):
+            self.active_modifier_id = ""
         primary = primary if primary in ordered else ordered[-1]
         primary_kind, primary_id = primary
         if primary_id != self.selected_object_id:
@@ -2239,6 +2253,7 @@ class _CanvasLogic:
         return True
 
     def clear_selection(self) -> None:
+        self.active_modifier_id = ""
         """Clear the current entity and notify every selection consumer."""
         if self.chapter is None:
             return
@@ -3333,7 +3348,7 @@ class _CanvasLogic:
                 if reference.kind != "layer":
                     continue
                 child = document.layers[reference.entity_id]
-                if not child.visible or child.compound_operation == "ignore":
+                if not child.visible:
                     continue
                 operand = (
                     self._document_layer_effective_path(
@@ -3345,15 +3360,22 @@ class _CanvasLogic:
                     if child.compound_enabled
                     else self._layer_operand_path(child)
                 )
-                operand = root_inverse.map(
-                    self._document_layer_world_transform(
-                        document, child.layer_id
-                    ).map(operand)
-                )
+                world_operand = self._document_layer_world_transform(document, child.layer_id).map(operand)
+                operand = root_inverse.map(world_operand)
                 if child.compound_operation == "subtract":
                     subtractions = combine(subtractions, operand)
-                else:
+                elif child.compound_operation == "add":
                     additions = combine(additions, operand)
+                incoming = world_operand
+                for modifier_id in child.modifier_ids:
+                    modifier = document.modifiers.get(modifier_id)
+                    if isinstance(modifier, MirrorModifier) and not modifier.muted and modifier.intensity > 0:
+                        reflected = reflection_transform(modifier).map(incoming)
+                        if modifier.compound_operation == "add":
+                            additions = combine(additions, root_inverse.map(reflected))
+                        elif modifier.compound_operation == "subtract":
+                            subtractions = combine(subtractions, root_inverse.map(reflected))
+                        incoming = incoming.united(reflected)
                 if not child.compound_enabled:
                     collect(child)
 
@@ -4640,11 +4662,13 @@ class _CanvasLogic:
         if self.chapter is None or image.isNull():
             return
         painter = QPainter(image)
+        painter.setCompositionMode(QPainter.CompositionMode_Source)
         if clip is not None:
             painter.setClipRect(clip)
             painter.fillRect(clip, QColor(self.chapter.background))
         else:
             painter.fillRect(image.rect(), QColor(self.chapter.background))
+        painter.setCompositionMode(QPainter.CompositionMode_SourceOver)
         transform = QTransform()
         transform.scale(image.width() / self.chapter.width, image.height() / self.chapter.height)
         painter.setTransform(transform)
@@ -4738,7 +4762,12 @@ class _CanvasLogic:
                     )
             painter.restore()
             if style.outline_thickness > 0:
-                ring = clip_path.subtracted(core)
+                ring = (
+                    outline_mesh(layer.bound, style.outline_thickness, clip_path, core=core, base_width=style.base_thickness)
+                    if customized_outline(layer.bound) else clip_path.subtracted(core)
+                )
+                if all(node.outline_multiplier == 1 for contour in layer.bound.iter_contours() for node in contour.nodes):
+                    ring = ring.intersected(clip_path)
                 painter.fillPath(ring, QColor(style.outline_color))
             for child in reversed(layer.children):
                 if not self._child_ignores_parent_mask(child):
@@ -4787,7 +4816,10 @@ class _CanvasLogic:
             )
             painter.setPen(pen)
             painter.setBrush(Qt.NoBrush)
-            painter.drawPath(layer_path)
+            if customized_outline(layer.bound):
+                painter.fillPath(outline_mesh(layer.bound, layer.border_width, layer_path), QColor(layer.border_color))
+            else:
+                painter.drawPath(layer_path)
             painter.restore()
         painter.restore()
         for child in reversed(layer.children):
@@ -4810,6 +4842,9 @@ class _CanvasLogic:
         self, painter: QPainter, layer: LayerNode, parent_opacity: float,
         visible_world: QRectF,
     ) -> None:
+        if any(isinstance(m, MirrorModifier) for m in self._active_modifier_instances(layer.modifier_ids)):
+            self._render_mirror_target(painter, layer, parent_opacity, visible_world)
+            return
         world_bounds = self.entity_world_rect("layer", layer.layer_id)
         modifiers = self._active_modifier_instances(
             layer.modifier_ids,
@@ -4956,6 +4991,47 @@ class _CanvasLogic:
         painter.drawImage(bounds.topLeft(), processed)
         painter.restore()
 
+    def _compound_outline_mesh(self, layer, path):
+        """Retain attributed source-edge widths on surviving boolean boundaries."""
+        sources = []
+        root_inverse, valid = self.layer_world_transform(layer.layer_id).inverted()
+        if not valid:
+            return None
+        def collect(item):
+            if item.bound is not None:
+                sources.append(item)
+            for ref in item.children:
+                if ref.kind == "layer":
+                    child = self.chapter.layers[ref.entity_id]
+                    if child.visible and child.compound_operation != "ignore":
+                        collect(child)
+        collect(layer)
+        if not any(customized_outline(item.bound) for item in sources):
+            return None
+        stroker = QPainterPathStroker()
+        stroker.setWidth(layer.border_width * 2)
+        stroker.setJoinStyle(Qt.RoundJoin)
+        stroker.setCapStyle(Qt.RoundCap)
+        default = stroker.createStroke(path)
+        stroker.setWidth(1.5)
+        boundary = stroker.createStroke(path)
+        attributed, widths = QPainterPath(), QPainterPath()
+        for item in sources:
+            mapping = self.layer_world_transform(item.layer_id) * root_inverse
+            baseline = item.border_width
+            maximum = max(layer.border_width, baseline * max((n.outline_multiplier for c in item.bound.iter_contours() for n in c.nodes), default=1))
+            # A uniform attribution envelope removes the fallback even for hidden edges.
+            envelope = BoundGeometry.from_dict(item.bound.to_dict())
+            for contour in envelope.iter_contours():
+                for node in contour.nodes:
+                    node.outline_enabled, node.outline_multiplier = True, 1
+            accepts = lambda point, transform=mapping: boundary.contains(transform.map(point))
+            coverage = outline_mesh(envelope, maximum + 1, path, clip=False, boundary_filter=accepts)
+            mesh = outline_mesh(item.bound, baseline, path, clip=False, boundary_filter=accepts)
+            attributed = attributed.united(mapping.map(coverage))
+            widths = widths.united(mapping.map(mesh))
+        return default.subtracted(attributed).united(widths)
+
     def _render_compound_layer_contents(
         self, painter: QPainter, layer: LayerNode, parent_opacity: float,
         visible_world: QRectF,
@@ -5006,7 +5082,11 @@ class _CanvasLogic:
             )
             painter.setPen(pen)
             painter.setBrush(Qt.NoBrush)
-            painter.drawPath(layer_path)
+            customized = self._compound_outline_mesh(layer, layer_path)
+            if customized is None:
+                painter.drawPath(layer_path)
+            else:
+                painter.fillPath(customized, QColor(layer.border_color))
             painter.restore()
         for child in reversed(layer.children):
             if not self._child_ignores_parent_mask(child):
@@ -5027,6 +5107,9 @@ class _CanvasLogic:
         visible_world: QRectF,
     ) -> None:
         if not layer.visible:
+            return
+        if ("layer", layer.layer_id) not in self._render_modifier_sources and any(isinstance(modifier, MirrorModifier) for modifier in self._active_modifier_instances(layer.modifier_ids)):
+            self._render_mirror_target(painter, layer, parent_opacity, visible_world)
             return
         painter.save()
         painter.setTransform(self._layer_parent_transform(layer), True)
@@ -7901,6 +7984,9 @@ class _CanvasLogic:
         self, painter: QPainter, obj: DocumentObject,
         parent_opacity: float, local_visible: QRectF,
     ) -> None:
+        if any(isinstance(m, MirrorModifier) for m in self._active_modifier_instances(obj.modifier_ids)):
+            self._render_mirror_target(painter, obj, parent_opacity, local_visible)
+            return
         modifiers = self._active_modifier_instances(
             obj.modifier_ids,
             suppress_outline=getattr(
@@ -8019,6 +8105,86 @@ class _CanvasLogic:
         painter.save()
         painter.setOpacity(opacity)
         painter.drawImage(bounds.topLeft(), processed)
+        painter.restore()
+
+    def _render_mirror_target(self, painter, target, parent_opacity, visible):
+        layer = isinstance(target, LayerNode)
+        kind, identifier = ("layer", target.layer_id) if layer else ("object", target.object_id)
+        parent_id = target.parent_id if layer else target.parent_layer_id
+        mapping = self.layer_world_transform(parent_id) if parent_id else QTransform()
+        inverse, valid = mapping.inverted()
+        if not valid:
+            return
+        world = entity_visual_bounds(self.chapter, self.tiles, kind, identifier)
+        if layer:
+            from comic_editor.ui.baking import visual_bounds
+            for child in target.children:
+                world = world.united(visual_bounds(self, child.kind, child.entity_id))
+        drawing = self._active_vector_drawing()
+        preview_bounds = self._vector_preview_tiles.content_bounds(self._vector_preview_id)
+        includes_preview = drawing is not None and (
+            not layer and drawing.object_id == identifier or layer and
+            any(item.layer_id == identifier for item in self.chapter.ancestor_layers(drawing.parent_layer_id))
+        )
+        if includes_preview and preview_bounds is not None:
+            world = world.united(self._drawing_local_to_world_transform(drawing).mapRect(preview_bounds))
+        bounds = aligned(inverse.mapRect(world))
+        signature = self._modifier_layer_signature(identifier) if layer else self._modifier_object_signature(target)
+        key = ("mirror-source", kind, identifier, signature[0], signature[3], signature[4], self._rect_signature(bounds), tuple(self._transform_preview_quad or ()), self._render_exclude_text)
+        image = self._modifier_source_cache_get(key)
+        if image is None:
+            image = empty_image(bounds)
+            source = QPainter(image)
+            source.setRenderHint(QPainter.Antialiasing, True)
+            source.translate(-bounds.left(), -bounds.top())
+            self._render_modifier_sources.add((kind, identifier))
+            try:
+                if layer:
+                    if self.chapter.contributing_compound_ancestor(identifier) is not None:
+                        self._render_compound_contributor(source, target, 1.0, mapping.mapRect(bounds))
+                    else:
+                        self._render_layer(source, target, 1.0, mapping.mapRect(bounds))
+                else:
+                    self._render_object_content(source, target, bounds)
+                if includes_preview and not layer:
+                    self._render_modified_vector_pencil_preview(source, parent_id)
+                elif includes_preview and not self._has_active_modifiers(drawing.modifier_ids):
+                    modified_ancestors = [item.layer_id for item in self.chapter.ancestor_layers(drawing.parent_layer_id) if self._has_active_modifiers(item.modifier_ids)]
+                    if modified_ancestors and modified_ancestors[-1] == identifier:
+                        self._render_modified_vector_pencil_preview(source, parent_id or "")
+            finally:
+                self._render_modifier_sources.discard((kind, identifier))
+                source.end()
+            self._modifier_source_cache_put(key, image)
+        modifiers = self._active_modifier_instances(target.modifier_ids, suppress_outline=self._suppress_outline_for_mask)
+        opacity = target.opacity if layer or not target.opacity_locked else 1.0
+        if modifiers and isinstance(modifiers[-1], MirrorModifier) and not modifiers[-1].parameter_masks and target.opacity_mask is None and parent_opacity * opacity == 1:
+            # Axis dragging reuses the source stages without allocating the gap.
+            image, bounds = render_stages(self, image, bounds, modifiers[:-1], mapping, nearest=isinstance(target, RasterObject))
+            mirror = modifiers[-1]
+            painter.save()
+            painter.setRenderHint(QPainter.SmoothPixmapTransform, not isinstance(target, RasterObject))
+            painter.setRenderHint(QPainter.Antialiasing, not isinstance(target, RasterObject))
+            painter.setOpacity(mirror.intensity / 100)
+            painter.setTransform(mapping * reflection_transform(mirror) * inverse, True)
+            painter.drawImage(bounds.topLeft(), image)
+            painter.restore()
+            painter.save()
+            painter.setOpacity(1)
+            painter.drawImage(bounds.topLeft(), image)
+            painter.restore()
+            return
+        image, bounds = render_stages(self, image, bounds, modifiers, mapping, nearest=isinstance(target, RasterObject), required=inverse.mapRect(visible) if layer else visible)
+        if target.opacity_mask is not None:
+            binding = target.opacity_mask
+            field = self.render_tone_mask_field(binding.mask_id, image.width(), image.height(), self._world_to_image_transform(mapping, bounds, image.width(), image.height()), mapping.mapRect(bounds))
+            image = apply_opacity_mask(image, field, binding.black_value, binding.white_value)
+        opacity = target.opacity if layer or not target.opacity_locked else 1.0
+        painter.save()
+        painter.setOpacity(parent_opacity * opacity)
+        if isinstance(target, RasterObject):
+            self._set_crisp_raster_transform(painter)
+        painter.drawImage(bounds.topLeft(), image)
         painter.restore()
 
     def _render_raster_content(
@@ -10168,6 +10334,15 @@ class _CanvasLogic:
             return None
         return modifier
 
+    def _active_mirror_modifier(self):
+        modifier = self.chapter.modifiers.get(self.active_modifier_id) if self.chapter else None
+        if isinstance(modifier, MirrorModifier) and not modifier.muted and any(
+            target in self.chapter.modifier_target_ids(modifier.modifier_id)
+            for target in self.selected_entities
+        ):
+            return modifier
+        return None
+
     @staticmethod
     def _focal_points(
         modifier: BlurModifier,
@@ -10187,11 +10362,18 @@ class _CanvasLogic:
         self, kind: str, entity_id: str, transform: QTransform,
     ) -> None:
         """Keep a sole target's document-space focal rig attached to it."""
+        if kind == "layer" and entity_id in self.chapter.layers:
+            for child in self.chapter.layers[entity_id].children:
+                self._transform_single_target_focal_modifiers(child.kind, child.entity_id, transform)
         target = self.chapter.modifier_target(kind, entity_id)
         if target is None:
             return
         for modifier_id in target.modifier_ids:
             modifier = self.chapter.modifiers.get(modifier_id)
+            if isinstance(modifier, MirrorModifier) and len(self.chapter.modifier_target_ids(modifier_id)) == 1:
+                modifier.axis_start = transform.map(QPointF(*modifier.axis_start)).toTuple()
+                modifier.axis_end = transform.map(QPointF(*modifier.axis_end)).toTuple()
+                continue
             if not isinstance(modifier, BlurModifier) or len(
                 self.chapter.modifier_target_ids(modifier_id)
             ) != 1:
@@ -10207,6 +10389,23 @@ class _CanvasLogic:
             modifier.focal_angle = math.atan2(delta.y(), delta.x())
 
     def _draw_focal_modifier_handles(self, painter: QPainter) -> None:
+        if self._page_gap_draft is not None:
+            return
+        mirror = self._active_mirror_modifier()
+        if mirror is not None:
+            start, end = QPointF(*mirror.axis_start), QPointF(*mirror.axis_end)
+            midpoint = (start + end) / 2
+            direction = end - start
+            direction /= max(1e-6, math.hypot(direction.x(), direction.y()))
+            extent = self.visible_document_rect().width() + self.visible_document_rect().height() + math.hypot(midpoint.x() - self.visible_document_rect().center().x(), midpoint.y() - self.visible_document_rect().center().y())
+            painter.save()
+            painter.setPen(QPen(QColor("#ff8b26"), 1.5 / self.scale, Qt.DotLine))
+            painter.drawLine(midpoint - direction * extent, midpoint + direction * extent)
+            painter.setBrush(Qt.NoBrush)
+            for point in (start, end, midpoint):
+                painter.drawEllipse(point, 7 / self.scale, 7 / self.scale)
+            painter.restore()
+            return
         if self._page_gap_draft is not None:
             return
         modifier = self._active_focal_modifier()
@@ -10312,6 +10511,8 @@ class _CanvasLogic:
         )}
         if not bound.closed and not geometry_only:
             result["thickness"] = position + side
+        if not geometry_only:
+            result["outline_width"] = position + normal * ((60 + node.outline_multiplier * 10) / scale)
         if self._can_delete_shape_node(bound, node):
             result["delete"] = position + QPointF(
                 -44 * SHAPE_CONTROL_SCALE / scale,
@@ -10740,7 +10941,11 @@ class _CanvasLogic:
         for name, point in positions.items():
             painter.drawLine(QPointF(node.x, node.y), point)
             radius = 4.5 * SHAPE_CONTROL_SCALE / scale
-            if name == "delete":
+            if name == "outline_width":
+                painter.setBrush(Qt.NoBrush)
+                painter.drawEllipse(point, radius + 2 / scale, radius + 2 / scale)
+                painter.setBrush(QColor("#ffffff"))
+            elif name == "delete":
                 painter.drawEllipse(
                     point,
                     radius + SHAPE_CONTROL_SCALE / scale,
@@ -12732,6 +12937,21 @@ class _CanvasLogic:
             self._update_interaction_cursor(event.position())
 
     def mouseDoubleClickEvent(self, event: QMouseEvent) -> None:  # noqa: N802
+        if self.tool == ToolKind.SHAPE_EDIT and self.chapter is not None:
+            target = self._shape_edit_target()
+            if target is not None:
+                bound, transform, style = target
+                node = self._selected_shape_node(bound)
+                if node is not None and style is not None:
+                    point = self._shape_gizmo_positions(bound, node).get("outline_width")
+                    if point is not None and math.dist(self.camera_transform().map(transform.map(point)).toTuple(), event.position().toTuple()) <= 12:
+                        before = self._model_before or self.chapter.to_dict()
+                        node.outline_multiplier = 1.0
+                        self._model_before = None
+                        self._active_shape_control = None
+                        self._push_immediate_shape_change(before, "Reset point outline thickness")
+                        event.accept()
+                        return
         if self._page_gap_draft is not None:
             event.accept()
             return
@@ -18551,6 +18771,19 @@ class _CanvasLogic:
 
     # ---- tool actions --------------------------------------------------
     def _begin_modifier_handle(self, widget_point: QPointF) -> bool:
+        mirror = self._active_mirror_modifier()
+        if mirror is not None:
+            start, end = QPointF(*mirror.axis_start), QPointF(*mirror.axis_end)
+            points = [start, end, (start + end) / 2]
+            hit = next((i for i, p in enumerate(points) if math.dist(self.camera_transform().map(p).toTuple(), widget_point.toTuple()) <= 12), None)
+            if hit is None:
+                return False
+            self._modifier_handle_drag = {
+                "mirror": mirror.modifier_id, "handle": hit,
+                "before": self.chapter.to_dict(), "start": start, "end": end,
+                "press": self.widget_to_document(widget_point),
+            }
+            return True
         modifier = self._active_focal_modifier()
         if modifier is None:
             return False
@@ -18575,6 +18808,28 @@ class _CanvasLogic:
 
     def _move_modifier_handle(self, widget_point: QPointF) -> bool:
         state = self._modifier_handle_drag
+        if state is not None and "mirror" in state:
+            mirror = self.chapter.modifiers.get(state["mirror"])
+            if not isinstance(mirror, MirrorModifier):
+                return False
+            point = self.widget_to_document(widget_point)
+            start, end = state["start"], state["end"]
+            if state["handle"] == 2:
+                midpoint = (start + end) / 2
+                delta = self._snap(midpoint + point - state["press"], self.active_layer_id) - midpoint
+                start, end = start + delta, end + delta
+            elif state["handle"] == 0:
+                start = self._snap(point, self.active_layer_id)
+            else:
+                end = self._snap(point, self.active_layer_id)
+            if math.dist(start.toTuple(), end.toTuple()) < 1e-6:
+                return True
+            mirror.axis_start, mirror.axis_end = start.toTuple(), end.toTuple()
+            self._clear_compound_path_cache()
+            self._invalidate_scene_cache()
+            self.documentChanged.emit(None)
+            self.update()
+            return True
         modifier = self._active_focal_modifier()
         if state is None or modifier is None:
             return False
@@ -18613,7 +18868,7 @@ class _CanvasLogic:
         after = self.chapter.to_dict()
         if state["before"] != after:
             self.push_model_change(
-                state["before"], after, "Edit focal blur"
+                state["before"], after, "Edit mirror" if "mirror" in state else "Edit focal blur"
             )
         self.interactionFinished.emit()
         return True
@@ -20051,7 +20306,7 @@ class _CanvasLogic:
         before = self.chapter.to_dict()
         bound.primitive = "custom"
         contour = bound.contour_for_node(node.node_id)
-        contour.nodes.remove(node)
+        remove_nodes(contour, {node.node_id})
         bound.normalize_bezier_handles()
         self._selected_shape_node_id = ""
         self._selected_shape_node_ids.clear()
@@ -20093,10 +20348,7 @@ class _CanvasLogic:
                 return True
         before = self.chapter.to_dict()
         for contour in layer.bound.iter_contours():
-            contour.nodes[:] = [
-                node for node in contour.nodes
-                if node.node_id not in selected
-            ]
+            remove_nodes(contour, selected)
         layer.bound.normalize_bezier_handles()
         self._selected_shape_node_id = ""
         self._selected_shape_node_ids.clear()
@@ -20162,6 +20414,11 @@ class _CanvasLogic:
         hit = self._shape_hit_test(
             bound, local, geometry_only=style is None
         )
+        pressed = QGuiApplication.keyboardModifiers() if modifiers is None else modifiers
+        if style is not None and pressed & Qt.ShiftModifier and bound.primitive in {"rectangle", "ellipse"}:
+            insertion = self._nearest_shape_insert(bound, local)
+            if insertion is not None and (hit is None or hit["kind"] not in {"node", "control", "gizmo", "rectangle_point", "radius"}):
+                hit = {"kind": "insert", "insert": insertion}
         self._shape_hover_target = hit
         self._shape_hover_insert = (
             hit["insert"] if hit and hit["kind"] == "insert" else None
@@ -20279,6 +20536,17 @@ class _CanvasLogic:
             return True
         if kind == "insert":
             index, percent, insert_point = hit["insert"]
+            pressed_modifiers = QGuiApplication.keyboardModifiers() if modifiers is None else modifiers
+            if pressed_modifiers & Qt.ShiftModifier:
+                if bound.primitive in {"rectangle", "ellipse"}:
+                    self._pending_outline_toggle = (self.selected_id, index)
+                    self.primitiveConversionRequested.emit(bound.primitive)
+                    return True
+                before = self.chapter.to_dict()
+                contour = list(bound.iter_contours())[int(hit.get("contour_index", 0))]
+                contour.nodes[index].outline_enabled = not contour.nodes[index].outline_enabled
+                self._push_immediate_shape_change(before, "Toggle segment outline")
+                return True
             if bound.primitive in {"rectangle", "ellipse"}:
                 insert_layer_id = (
                     self.chapter.objects[
@@ -20321,10 +20589,15 @@ class _CanvasLogic:
         start = bound.nodes[index]
         end = bound.nodes[(index + 1) % len(bound.nodes)]
         percent = max(0.001, min(0.999, percent))
+        attributes = dict(
+            outline_multiplier=start.outline_multiplier * (1 - percent) + end.outline_multiplier * percent,
+            outline_enabled=start.outline_enabled,
+            width_multiplier=start.width_multiplier * (1 - percent) + end.width_multiplier * percent,
+        )
         if start.outgoing is None and end.incoming is None:
             x = start.x * (1 - percent) + end.x * percent
             y = start.y * (1 - percent) + end.y * percent
-            return PathNode(x=x, y=y)
+            return PathNode(x=x, y=y, **attributes)
 
         def interpolate(
             first: tuple[float, float], second: tuple[float, float],
@@ -20356,6 +20629,7 @@ class _CanvasLogic:
         return PathNode(
             x=point[0], y=point[1], point_type="bezier",
             incoming=r0, outgoing=r1, handles_locked=False,
+            **attributes,
         )
 
     def _insert_shape_node(
@@ -20387,6 +20661,17 @@ class _CanvasLogic:
         self.update()
 
     def resolve_primitive_conversion(self, accepted: bool) -> None:
+        toggle = getattr(self, "_pending_outline_toggle", None)
+        if toggle is not None:
+            self._pending_outline_toggle = None
+            if accepted:
+                layer = self.chapter.layers.get(toggle[0])
+                if layer is not None:
+                    before = self.chapter.to_dict()
+                    layer.bound.primitive = "custom"
+                    layer.bound.nodes[toggle[1]].outline_enabled = not layer.bound.nodes[toggle[1]].outline_enabled
+                    self._push_immediate_shape_change(before, "Toggle segment outline")
+            return
         pending, self._pending_primitive_insert = (
             self._pending_primitive_insert, None
         )
@@ -20561,6 +20846,11 @@ class _CanvasLogic:
             self._move_shape_bezier_handle(
                 bound, selected, control, target
             )
+        elif control == "outline_width" and selected is not None:
+            direction = self._shape_gizmo_positions(bound, selected)["outline_width"] - QPointF(*selected.position)
+            direction /= max(1e-6, math.hypot(direction.x(), direction.y()))
+            distance = QPointF.dotProduct(local - QPointF(*selected.position), direction) * self.scale
+            selected.outline_multiplier = max(0.0, min(10.0, (distance - 60) / 10))
         elif control == "thickness" and selected is not None:
             positions = self._shape_gizmo_positions(bound, selected)
             origin = QPointF(selected.x, selected.y)

@@ -174,6 +174,7 @@ def default_fill_profiles() -> dict[str, dict[str, object]]:
 
 @dataclass
 class EditorSettings:
+    export_destinations: dict[str, str] = field(default_factory=dict)
     settings_version: int = 22
     tablet_mode: bool = False
     brush_size: int = 12
@@ -254,6 +255,10 @@ class EditorSettings:
 
     def clamp(self) -> None:
         self.settings_version = 22
+        self.export_destinations = {
+            str(key): str(value) for key, value in self.export_destinations.items()
+            if isinstance(key, str) and isinstance(value, str) and value
+        } if isinstance(self.export_destinations, dict) else {}
         self.blender_bridge_host = str(
             self.blender_bridge_host or "127.0.0.1"
         ).strip()

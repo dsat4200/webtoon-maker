@@ -158,7 +158,7 @@ def test_parent_shape_gradient_reaches_center_and_is_parent_masked(qapp):
     )
     canvas.render_preview(image)
     assert image.pixelColor(200, 150).blue() > 210
-    assert image.pixelColor(200, 400).name() == "#ffffff"
+    assert image.pixelColor(200, 400).alpha() == 0
 
 
 def test_gradient_creation_is_bottommost_and_selects_gradient_tool(qapp):
@@ -437,7 +437,7 @@ def test_reversed_shape_gradient_renders_outside_below_parent(qapp):
     outside = image.pixelColor(90, 200)
     inside = image.pixelColor(150, 200)
     assert outside.red() > outside.blue()
-    assert inside.name() == "#ffffff"
+    assert inside.alpha() == 0
 
 
 def test_uniform_parent_gradient_uses_physical_inward_distance(qapp):

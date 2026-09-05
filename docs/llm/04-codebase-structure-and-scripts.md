@@ -150,7 +150,7 @@ Docstring-only package markers: "Document, persistence, and raster core", "PySid
 
 The canonical saved-data model and invariant layer (about 3,900 lines).
 
-- Declares chapter schema version 21, series schema version 17, chapter width 1080, default height 3240, growth margin 1080, and chapter/asset document kinds.
+- Declares chapter schema version 22, series schema version 17, chapter width 1080, default height 3240, growth margin 1080, and chapter/asset document kinds.
 - Normalizes colors to canonical ARGB and generates stable UUID IDs.
 - Defines grids, path nodes/contours, shape style, and unified rectangle/ellipse/custom `BoundGeometry`.
 - Defines `ToneMask`, `ParameterMaskBinding`, and the HSL/Blur/Outline `ModifierInstance` records.

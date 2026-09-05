@@ -262,8 +262,8 @@ vector fills intentionally remain unchanged after line edits until Fill
 touches that region again.
 
 The ribbon contains Tool Settings plus a contextual Vector Tools page. The
-resizable color window below the left tool list has separate Picker and
-Palette tabs. Primary and secondary colors are saved per series in canonical
+resizable color window below the left tool list has Picker, Palette, and
+History tabs. Primary and secondary colors are saved per series in canonical
 ARGB form. The color wheel edits either slot, and its hex row accepts, copies,
 and pastes `#RRGGBB` or `#AARRGGBB`; new strokes and fills use
 primary, while new shapes use primary for their enabled 4px outline and
@@ -284,11 +284,48 @@ value when pressure is disabled. It replaces existing mask alpha so light
 pressure can lower coverage; Eraser still removes it. Both use queued tile
 strokes and one Undo command per gesture.
 
-HSL, Blur, and Outline modifiers remain attached to their objects rather than
+HSL, Blur, Outline, and Mirror modifiers remain attached to their objects rather than
 appearing in the outliner. Their processed results are cached separately from
 their isolated source images. Outline color, thickness, opacity, intensity,
 and parameter-mask edits therefore reuse the same exact alpha distance field;
 only source-alpha changes rebuild it.
+
+**Export As…** chooses a PNG filename; **Export Again** overwrites the last
+successful destination for that chapter, remembered across restarts. Without
+a remembered destination it opens Export As. The timestamped **Export PNG**
+action remains available. All three export current content at full chapter
+size. Chapter backgrounds now default to transparent; page fills retain their
+own alpha. Legacy white chapter backgrounds migrate to transparent, while
+white page fills and nonwhite backgrounds remain unchanged.
+
+All color dialogs use the complete Picker / Palette / History controls,
+including alpha, hex, copy/paste, primary/secondary wells, and canvas
+eyedropper. **Apply** commits the pending field and shared-color changes;
+**Cancel** discards them. Eyedropper temporarily hides the dialog and returns
+to it after sampling (Escape cancels sampling and restores the previous tool).
+
+In Shape Edit, selected custom-path points have a hollow circular outline
+width handle. Drag to adjust 0–10 times the layer's **Outline px** baseline;
+double-click resets to 1×. Shift-click an edge to toggle its outline without
+changing the fill or inserting a point. Zero baseline hides all outlines but
+retains point widths. Splitting edges interpolates widths and preserves hidden
+edges; deletion joins an edge only when both replaced edges were enabled.
+
+Click a modifier card's background/title to select it (blue border), and click
+again to deselect. Only its unmuted Mirror or focal Blur gizmos are shown.
+Mirror retains the original above its reflection. Its orange dotted axis has
+two endpoint handles and a midpoint handle; grid snapping applies to both.
+Shape mirrors can independently Add/Subtract into the nearest compound, or
+Ignore it. A linked Mirror shares one document-space axis across its targets.
+
+Right-click an object or non-page shape and choose **Rasterize** to bake its
+subtree and active effects into one embedded Image. Undo restores the graph
+and resources. Contributing compound children must be baked at their containing
+compound; unavailable image sources or externally required descendants block
+baking. **Convert to Raster** remains the Image-to-editable-Raster action.
+For Raster-only selections, each unmuted modifier card also offers **Apply**:
+it bakes that stage and earlier active stages into sparse pixels, retaining
+earlier muted stages, later stages, and links to other targets.
 
 Blur stages use a session-local 64 MiB premultiplied multiresolution pyramid
 with effective radii 0, 1, 3, 7, 15, 31, 63, and 127. Strength, focal,

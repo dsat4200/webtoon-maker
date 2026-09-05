@@ -48,7 +48,7 @@ def test_layer_fill_border_and_radius_affect_actual_rendering(qapp):
     assert image.pixelColor(300, 300).red() > 200
     assert image.pixelColor(110, 300).blue() > 180
     # The rounded corner is outside the actual clipping path.
-    assert image.pixelColor(101, 101).lightness() > 200
+    assert image.pixelColor(101, 101).alpha() == 0
 
 
 def test_first_outliner_row_is_frontmost_for_hit_testing(qapp):

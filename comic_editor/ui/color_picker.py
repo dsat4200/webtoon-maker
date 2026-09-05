@@ -7,6 +7,7 @@ which keeps them straightforward to use with both dataclasses and dictionaries.
 from __future__ import annotations
 
 import math
+import uuid
 from typing import Any
 
 from PySide6.QtCore import QPointF, QRectF, QSize, Qt, QTimer, Signal
@@ -34,6 +35,7 @@ from PySide6.QtWidgets import (
     QSizePolicy,
     QStyle,
     QToolButton,
+    QTabWidget,
     QVBoxLayout,
     QWidget,
 )
@@ -803,7 +805,7 @@ class ColorHistoryWidget(QWidget):
 
 
 class ColorPickerPopup(QDialog):
-    """Small Apply/Cancel wrapper around :class:`HsvAlphaPicker`."""
+    """Transactional Picker/Palette/History dialog with canvas sampling."""
 
     colorApplied = Signal(str)
 
@@ -815,6 +817,7 @@ class ColorPickerPopup(QDialog):
         super().__init__(parent)
         self.setObjectName("colorPickerPopup")
         self.setWindowTitle("Choose color")
+        self.setMinimumWidth(380)
         layout = QVBoxLayout(self)
         self.picker = HsvAlphaPicker(color, self)
         layout.addWidget(self.picker)
@@ -847,6 +850,93 @@ class ColorPickerPopup(QDialog):
         ).clicked.connect(self.accept)
         self.buttons.rejected.connect(self.reject)
         layout.addWidget(self.buttons)
+        self.workspace = None
+        self._sampling = False
+
+    def _host(self):
+        current = self.parentWidget()
+        while current is not None:
+            if isinstance(current, ColorPickerPopup) and current.workspace is not None:
+                return current
+            if hasattr(current, "color_panel") and hasattr(current, "canvas"):
+                return current
+            current = current.parentWidget()
+        return None
+
+    def showEvent(self, event):
+        if self.workspace is None:
+            initial = self.picker.color_argb()
+            self.picker.hide()
+            self.quick_colors.hide()
+            self.workspace = ColorWorkspace(self)
+            self.layout().insertWidget(0, self.workspace)
+            self.picker = self.workspace.panel.picker
+            self.workspace.panel.eyedropperRequested.connect(self._sample)
+            self.workspace.enable_draft_palette_edits()
+            self._initial_color = initial
+        if not self._sampling:
+            host = self._host()
+            if isinstance(host, ColorPickerPopup):
+                source = host.workspace
+                self.workspace.panel.set_colors(source.panel.primary_color(), source.panel.secondary_color())
+                self.workspace.panel.set_active_slot(source.panel.active_slot())
+                self.workspace.palettes.set_palettes(source.palettes.palettes(), source.palettes.active_palette_id())
+                self.workspace.history.set_colors(source.history.colors())
+            elif host is not None:
+                self.workspace.panel.set_colors(host.color_panel.primary_color(), host.color_panel.secondary_color())
+                self.workspace.panel.set_active_slot(host.color_panel.active_slot())
+                self.workspace.palettes.set_palettes(host.palette_editor.palettes(), host.palette_editor.active_palette_id())
+                self.workspace.history.set_colors(host.color_history.colors())
+            self.workspace.panel.apply_color(getattr(self, "_initial_color", self.picker.color_argb()))
+        self._sampling = False
+        super().showEvent(event)
+
+    def _sample(self):
+        host = self._host()
+        while isinstance(host, ColorPickerPopup):
+            host = host._host()
+        if host is None or host.chapter is None:
+            return
+        from comic_editor.ui.canvas import ToolKind
+        self._sampling = True
+        self._sample_host = host
+        self._sample_tool = host.canvas.tool
+        self._sample_color = self.color_argb()
+        self._sample_modality = self.windowModality()
+        self._sample_parents = []
+        parent = self.parentWidget()
+        while parent is not None and parent is not host:
+            if isinstance(parent, QDialog) and parent.isVisible():
+                self._sample_parents.append((parent, parent.windowModality()))
+                parent.setModal(False)
+                parent.hide()
+            parent = parent.parentWidget()
+        host._color_dialog_sample = self
+        self.setModal(False)
+        self.hide()
+        host.canvas.set_tool(ToolKind.EYEDROPPER)
+        host.canvas.setFocus()
+
+    def finish_sample(self, color=None):
+        if not hasattr(self, "_sample_host"):
+            return
+        host = self._sample_host
+        host._color_dialog_sample = None
+        host.canvas.set_tool(self._sample_tool)
+        self.workspace.panel.apply_color(color if color is not None else self._sample_color)
+        for parent, modality in reversed(self._sample_parents):
+            parent.setWindowModality(modality)
+            if isinstance(parent, ColorPickerPopup):
+                parent._sampling = True
+            parent.show()
+        self.setWindowModality(self._sample_modality)
+        self.show()
+        self.raise_()
+
+    def reject(self):
+        if self._sampling:
+            self.finish_sample()
+        super().reject()
 
     def color(self) -> QColor:
         return self.picker.color()
@@ -855,14 +945,17 @@ class ColorPickerPopup(QDialog):
         return self.picker.color_argb()
 
     def setColor(self, color: str | QColor) -> None:  # noqa: N802
+        self._initial_color = canonical_argb(color)
         self.picker.setColor(color)
+        if self.workspace is not None:
+            self.workspace.panel.apply_color(color)
 
     def setQuickColors(
         self, primary: str | QColor, secondary: str | QColor,
     ) -> None:  # noqa: N802
         self._primary_quick_color = canonical_argb(primary)
         self._secondary_quick_color = canonical_argb(secondary)
-        self.quick_colors.show()
+        self.quick_colors.setVisible(self.workspace is None)
         self.primary_quick.setStyleSheet(
             f"background-color: {QColor(self._primary_quick_color).name()};"
         )
@@ -871,8 +964,81 @@ class ColorPickerPopup(QDialog):
         )
 
     def accept(self) -> None:
+        if self.workspace is not None:
+            host = self._host()
+            workspace = self.workspace
+            if isinstance(host, ColorPickerPopup):
+                host.workspace.panel.set_colors(workspace.panel.primary_color(), workspace.panel.secondary_color())
+                host.workspace.palettes.set_palettes(workspace.palettes.palettes(), workspace.palettes.active_palette_id())
+            elif host is not None:
+                host.color_panel.set_colors(workspace.panel.primary_color(), workspace.panel.secondary_color(), emit=True)
+                if host.series is not None:
+                    from comic_editor.core.models import ColorPalette, PaletteSwatch
+                    host.series.palettes = [ColorPalette(
+                        palette_id=p["palette_id"], name=p["name"],
+                        swatches=[PaletteSwatch(swatch_id=s["swatch_id"], color=s["color"]) for s in p["swatches"]],
+                    ) for p in workspace.palettes.palettes()]
+                    host.series.active_palette_id = workspace.palettes.active_palette_id() or ""
+                    host.palette_editor.set_palettes(host.series.palettes, host.series.active_palette_id)
+                    host._record_color_history(self.color_argb())
+                    host._schedule_series_preferences_save(immediate=True)
         self.colorApplied.emit(self.color_argb())
         super().accept()
+
+
+class ColorWorkspace(QTabWidget):
+    """The same complete color controls for dock and transactional dialogs."""
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.panel = PrimarySecondaryColorPanel(parent=self)
+        self.palettes = PaletteEditorWidget(self)
+        self.history = ColorHistoryWidget(self)
+        self.addTab(self.panel, "Picker")
+        self.addTab(self.palettes, "Palette")
+        self.addTab(self.history, "History")
+
+    def enable_draft_palette_edits(self):
+        self.history.colorActivated.connect(self.panel.apply_color)
+        self.palettes.swatchActivated.connect(lambda _p, _s, color: self.panel.apply_color(color))
+        self.panel.colorChanged.connect(lambda _slot, color: self.palettes.set_new_swatch_color(color))
+        self.palettes.addPaletteRequested.connect(lambda: self._edit("add_palette"))
+        self.palettes.removePaletteRequested.connect(lambda p: self._edit("remove_palette", p))
+        self.palettes.paletteNameChanged.connect(lambda p, name: self._edit("rename", p, name))
+        self.palettes.addSwatchRequested.connect(lambda p, color: self._edit("add_swatch", p, color))
+        self.palettes.removeSwatchRequested.connect(lambda p, s: self._edit("remove_swatch", p, s))
+        self.palettes.swatchColorChangeRequested.connect(lambda p, s, c: self._edit("color", p, (s, c)))
+
+    def _edit(self, action, identifier=None, value=None):
+        palettes = self.palettes.palettes()
+        active = self.palettes.active_palette_id()
+        if action == "add_palette":
+            active = uuid.uuid4().hex
+            palettes.append({"palette_id": active, "name": "Palette", "swatches": []})
+        elif action == "remove_palette" and len(palettes) > 1:
+            palettes = [p for p in palettes if p["palette_id"] != identifier]
+        for palette in palettes:
+            if palette["palette_id"] != identifier:
+                continue
+            if action == "rename":
+                palette["name"] = value
+            elif action == "add_swatch":
+                palette["swatches"].append({"swatch_id": uuid.uuid4().hex, "color": value})
+            elif action == "remove_swatch":
+                palette["swatches"] = [s for s in palette["swatches"] if s["swatch_id"] != value]
+            elif action == "color":
+                for swatch in palette["swatches"]:
+                    if swatch["swatch_id"] == value[0]:
+                        swatch["color"] = value[1]
+        self.palettes.set_palettes(palettes, active)
+
+
+def choose_color(parent, color, callback, title="Choose color"):
+    popup = ColorPickerPopup(color, parent)
+    popup.setWindowTitle(title)
+    popup.colorApplied.connect(callback)
+    popup.setAttribute(Qt.WA_DeleteOnClose)
+    popup.open()
+    return popup
 
 
 def _field(record: Any, *names: str, default: Any = None) -> Any:

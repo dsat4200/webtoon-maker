@@ -4,13 +4,13 @@ from __future__ import annotations
 from PySide6.QtCore import QPoint, Qt, Signal
 from PySide6.QtGui import QColor, QMouseEvent
 from PySide6.QtWidgets import (
-    QColorDialog, QComboBox, QFrame, QHBoxLayout, QLabel, QMenu, QPushButton,
+    QComboBox, QFrame, QHBoxLayout, QLabel, QMenu, QPushButton,
     QSlider, QSpinBox, QToolButton, QVBoxLayout, QWidget,
 )
 
 from comic_editor.core.models import (
     BlurModifier, HueSaturationLightnessModifier, ModifierInstance,
-    OutlineModifier,
+    OutlineModifier, MirrorModifier, RasterObject, LayerNode,
     canonical_argb,
 )
 from comic_editor.ui.icons import iconoir
@@ -27,6 +27,7 @@ class ModifierTitleBar(QFrame):
         super().__init__(parent)
         self.modifier_id = modifier_id
         self._press = None
+        self._dragged = False
         self.setObjectName("modifierTitleBar")
         row = QHBoxLayout(self)
         row.setContentsMargins(5, 3, 3, 3)
@@ -37,7 +38,7 @@ class ModifierTitleBar(QFrame):
     def mousePressEvent(self, event: QMouseEvent) -> None:  # noqa: N802
         if event.button() == Qt.MouseButton.LeftButton:
             self._press = QPoint(event.position().toPoint())
-            self.activated.emit(self.modifier_id)
+            self._dragged = False
             event.accept()
             return
         super().mousePressEvent(event)
@@ -45,6 +46,7 @@ class ModifierTitleBar(QFrame):
     def mouseMoveEvent(self, event: QMouseEvent) -> None:  # noqa: N802
         if self._press is not None and event.buttons() & Qt.MouseButton.LeftButton:
             if (event.position().toPoint() - self._press).manhattanLength() >= 4:
+                self._dragged = True
                 self.dragStarted.emit(self.modifier_id)
                 self.dragMoved.emit(
                     self.modifier_id, int(event.globalPosition().y())
@@ -56,7 +58,10 @@ class ModifierTitleBar(QFrame):
     def mouseReleaseEvent(self, event: QMouseEvent) -> None:  # noqa: N802
         if self._press is not None:
             self._press = None
-            self.dragFinished.emit(self.modifier_id)
+            if self._dragged:
+                self.dragFinished.emit(self.modifier_id)
+            else:
+                self.activated.emit(self.modifier_id)
             event.accept()
             return
         super().mouseReleaseEvent(event)
@@ -75,6 +80,7 @@ class ModifierCard(QFrame):
         self.modifier = modifier
         self.owner = owner
         self.setObjectName("modifierCard")
+        self.setStyleSheet("#modifierCard { border: 2px solid " + ("#0097D7" if owner.canvas.active_modifier_id == modifier.modifier_id else "transparent") + "; }")
         outer = QVBoxLayout(self)
         outer.setContentsMargins(1, 1, 1, 5)
         outer.setSpacing(4)
@@ -179,6 +185,27 @@ class ModifierCard(QFrame):
             form.addWidget(color_row)
         outer.addWidget(body)
         body.setVisible(modifier.expanded)
+        if isinstance(modifier, MirrorModifier) and any(isinstance(owner.canvas.chapter.modifier_target(*t), LayerNode) for t in owner.targets()):
+            operation = QComboBox(body)
+            for value in ("ignore", "add", "subtract"):
+                operation.addItem(value.title(), value)
+            operation.setCurrentIndex(operation.findData(modifier.compound_operation))
+            operation.setToolTip("Reflected shape contribution to the nearest compound parent")
+            operation.currentIndexChanged.connect(lambda _i: owner.set_parameter(modifier.modifier_id, "compound_operation", operation.currentData(), True))
+            form.addWidget(operation)
+        if owner.targets() and all(isinstance(owner.canvas.chapter.modifier_target(*t), RasterObject) for t in owner.targets()):
+            self.apply_button = QPushButton("Apply", self)
+            self.apply_button.setEnabled(not modifier.muted)
+            self.apply_button.setToolTip("Bake this modifier and all earlier unmuted modifiers into the selected Raster pixels")
+            self.apply_button.clicked.connect(lambda: owner.apply_modifier(modifier.modifier_id))
+            outer.addWidget(self.apply_button)
+
+    def mouseReleaseEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            self.activated.emit(self.modifier.modifier_id)
+            event.accept()
+            return
+        super().mouseReleaseEvent(event)
 
     def _title_button(self, icon, tooltip, callback):
         button = QToolButton(self)
@@ -265,12 +292,8 @@ class ModifierCard(QFrame):
         return row
 
     def _choose_color(self, button: QPushButton) -> None:
-        color = QColorDialog.getColor(
-            QColor(self.modifier.color), self, "Outline Color",
-            QColorDialog.ColorDialogOption.ShowAlphaChannel,
-        )
-        if color.isValid():
-            value = canonical_argb(color.name(QColor.NameFormat.HexArgb))
+        from comic_editor.ui.color_picker import choose_color
+        def apply(value):
             button.setText(value)
             button.setStyleSheet(
                 f"QPushButton {{ background: {QColor(value).name()}; }}"
@@ -279,6 +302,7 @@ class ModifierCard(QFrame):
                 self.modifier.modifier_id, "color", value,
                 True,
             )
+        self._color_popup = choose_color(self, self.modifier.color, apply, "Outline color")
 
 
 class ModifierControls(QWidget):
@@ -314,6 +338,7 @@ class ModifierControls(QWidget):
         menu.addAction("Outline").triggered.connect(
             lambda: self.add_modifier("outline")
         )
+        menu.addAction("Mirror").triggered.connect(lambda: self.add_modifier("mirror"))
         self.add_button.setMenu(menu)
         layout.addWidget(self.add_button)
         self.stack = QWidget(self)
@@ -333,6 +358,23 @@ class ModifierControls(QWidget):
             target for target in self.canvas.selected_entities
             if self.canvas.chapter.modifier_target(*target) is not None
         ]
+
+    @property
+    def active_modifier_id(self):
+        return self.canvas.active_modifier_id
+
+    @active_modifier_id.setter
+    def active_modifier_id(self, value):
+        self.canvas.active_modifier_id = value
+
+    def apply_modifier(self, modifier_id):
+        from comic_editor.ui.baking import apply_raster_modifiers
+        from PySide6.QtWidgets import QMessageBox
+        try:
+            apply_raster_modifiers(self.canvas, modifier_id)
+        except (ValueError, MemoryError, OSError) as error:
+            QMessageBox.warning(self, "Apply modifier", str(error))
+        self.refresh()
 
     def common_ids(self) -> list[str]:
         chapter = self.canvas.chapter
@@ -373,7 +415,7 @@ class ModifierControls(QWidget):
             card = ModifierCard(modifier, self, self.stack)
             card.removeRequested.connect(self.remove_modifier)
             card.linkRequested.connect(self.toggle_link_mode)
-            card.activated.connect(self.activate_modifier)
+            card.activated.connect(self.toggle_modifier)
             card.dragStarted.connect(self.begin_reorder)
             card.dragMoved.connect(self.move_reorder)
             card.dragFinished.connect(self.finish_reorder)
@@ -381,15 +423,11 @@ class ModifierControls(QWidget):
             self.stack_layout.insertWidget(self.stack_layout.count() - 1, card)
 
     def _changed(self) -> None:
-        bounds = self._default_bounds()
-        if bounds is None or bounds.isEmpty():
-            self.canvas._invalidate_scene_cache()
-            self.canvas.update()
-            return
-        dirty = bounds.adjusted(-320.0, -320.0, 320.0, 320.0)
-        self.canvas._queue_visual_dirty(
-            dirty, scene=True, notify_preview=False
-        )
+        # Shared effects can extend far beyond the selected target.
+        self.canvas._compound_path_cache.clear()
+        self.canvas._invalidate_scene_cache()
+        self.canvas.update()
+        self.canvas.documentChanged.emit(None)
 
     def _push(self, before, label: str) -> None:
         after = self.canvas.chapter.to_dict()
@@ -424,6 +462,11 @@ class ModifierControls(QWidget):
                     if bounds is not None else 100.0,
                 ),
             )
+        elif modifier_type == "mirror":
+            bounds = self._default_bounds()
+            center = bounds.center()
+            radius = max(25.0, bounds.height() / 2)
+            modifier = MirrorModifier(axis_start=(center.x(), center.y() - radius), axis_end=(center.x(), center.y() + radius))
         else:
             modifier = OutlineModifier()
         chapter.add_modifier(modifier, targets)
@@ -450,6 +493,10 @@ class ModifierControls(QWidget):
         self.canvas.active_modifier_id = modifier_id
         self.canvas.update()
 
+    def toggle_modifier(self, modifier_id):
+        self.activate_modifier("" if self.active_modifier_id == modifier_id else modifier_id)
+        self.refresh()
+
     def begin_parameter_drag(self) -> None:
         if self._parameter_before is None and self.canvas.chapter is not None:
             self._parameter_before = self.canvas.chapter.to_dict()
@@ -464,7 +511,6 @@ class ModifierControls(QWidget):
         before = chapter.to_dict() if commit and self._parameter_before is None else None
         setattr(modifier, attribute, value)
         modifier.validate()
-        self.activate_modifier(modifier_id)
         if attribute == "muted" or not modifier.muted:
             self._changed()
         if commit and before is not None:

@@ -4,7 +4,7 @@ from __future__ import annotations
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (
-    QCheckBox, QColorDialog, QComboBox, QDoubleSpinBox, QFormLayout,
+    QCheckBox, QComboBox, QDoubleSpinBox, QFormLayout,
     QGroupBox, QHBoxLayout, QLabel, QLineEdit, QMessageBox, QPushButton, QSlider,
     QSpinBox, QWidget,
 )
@@ -200,12 +200,11 @@ class LayerSettingsPanel(QGroupBox):
         )
 
     def _choose_color(self, button: QPushButton) -> None:
-        color = QColorDialog.getColor(
-            QColor(str(button.property("color"))), self
-        )
-        if color.isValid():
-            self._set_color_button(button, color.name())
+        from comic_editor.ui.color_picker import choose_color
+        def apply(color):
+            self._set_color_button(button, color)
             self._apply()
+        self._color_popup = choose_color(self, str(button.property("color")), apply)
 
     @staticmethod
     def _set_pair_visible(label: QWidget, field: QWidget, visible: bool) -> None:

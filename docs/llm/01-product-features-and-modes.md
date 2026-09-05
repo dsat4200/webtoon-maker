@@ -80,7 +80,13 @@ The application intentionally does not implement scheduling, reference libraries
 
 ## Modifier stack
 
-- Non-page bounded layers and Raster, Vector Drawing, and Image objects can carry an ordered list of non-destructive modifiers, edited in the **Modifiers** ribbon page as reorderable cards. Text and gradient objects, pages, and open/fill layers are not eligible.
+- Non-page shapes (including open paths) and Raster, Vector Drawing, and Image objects can carry ordered non-destructive modifier cards. Text, gradient objects, and pages are not modifier targets.
+- Mirror retains the incoming image plus its reflection, original on top. Axis endpoints and midpoint are draggable with the active grid. Shape reflections independently Ignore/Add/Subtract into their nearest compound parent. Sole-target transforms carry the axis; shared links keep one document-space axis.
+- Card background/title clicks toggle the canvas-owned selected modifier ID and blue border. Controls and reordering do not select. Mirror and focal Blur handles are shown only for that selected, unmuted modifier. Changing targets/documents clears selection.
+- Raster-only selections expose per-stage **Apply**, baking the active prefix while retaining muted/later stages and other targets' links. **Rasterize** replaces an object/non-page subtree with one Image, including its own effects, masks, and opacity but retaining inherited clipping/opacity separately. Both operations are undoable with resources.
+- Export As chooses a named full-resolution PNG; Export Again overwrites the remembered per-chapter destination or opens Export As. Local settings retain destinations across restarts only after successful atomic export. Timestamped Export PNG is unchanged.
+- Chapters default to transparent, with alpha-preserving page fills. All color dialogs share the full Picker/Palette/History interface with transactional Apply/Cancel and a temporary canvas eyedropper.
+- Custom-path anchors carry a 0–10 outline multiplier and outgoing-edge visibility. Hollow circle handles edit/reset width relative to Outline px; Shift-edge clicks toggle outlines only. These edits support open/closed shapes, pages, and additional contours.
 - **HSL** shifts hue (−180…180), saturation (−100…100), and lightness (−100…100).
 - **Blur** applies a strength in pixels, either **Full** or **Focal** (center, radius, ramp, and angle define a smooth falloff).
 - **Outline** draws an outside halo with thickness, opacity, and a canonical color. It reserves up to a 100-document-pixel halo.

@@ -15,7 +15,7 @@ from PySide6.QtGui import QImage, QPolygonF, QTransform
 from .models import (
     BoundGeometry, ChapterDocument, ChildRef, ColorFillGradientObject,
     DocumentObject, EmbeddedImageSourceDescriptor, GradientObject, ImageObject,
-    LayerNode, RasterObject, ShapeStyle,
+    LayerNode, RasterObject, ShapeStyle, MirrorModifier,
     SpeedLineCenterObject, SpeedLinesGradientObject, TextObject,
     ToneMask, VectorDrawingObject, modifier_from_dict, new_id,
     object_from_dict,
@@ -27,6 +27,7 @@ from .persistence import (
 )
 from .fill_migration import materialize_legacy_fills
 from .tiles import TileStore
+from .effect_geometry import effect_bounds
 
 
 ASSET_SCHEMA_VERSION = 2
@@ -395,15 +396,23 @@ def _object_local_bounds(obj: DocumentObject, document: ChapterDocument,
 
 
 def entity_visual_bounds(document: ChapterDocument, tiles: TileStore,
-                         kind: str, entity_id: str) -> QRectF:
+                         kind: str, entity_id: str, *, include_effects=False) -> QRectF:
     """Return a conservative world-space bound for an entity subtree."""
+    def expanded(rect, target, parent_id):
+        if not include_effects:
+            return rect
+        mapping = _layer_world_transform(document, parent_id) if parent_id else QTransform()
+        inverse, valid = mapping.inverted()
+        if not valid:
+            return rect
+        return mapping.mapRect(effect_bounds(inverse.mapRect(rect), [document.modifiers[mid] for mid in target.modifier_ids if mid in document.modifiers], mapping))
     if kind == "object":
         obj = document.objects[entity_id]
         result = _mapped_rect(
             _layer_world_transform(document, obj.parent_layer_id),
             _object_local_bounds(obj, document, tiles),
         )
-        return result
+        return expanded(result, obj, obj.parent_layer_id)
 
     layer = document.layers[entity_id]
     world_transform = _layer_world_transform(document, entity_id)
@@ -411,7 +420,9 @@ def entity_visual_bounds(document: ChapterDocument, tiles: TileStore,
     found = False
     if layer.bound is not None:
         left, top, width, height = layer.bound.bbox()
-        padding = layer.shape_style.outline_thickness
+        padding = layer.shape_style.outline_thickness * max(
+            (node.outline_multiplier for contour in layer.bound.iter_contours() for node in contour.nodes), default=1.0
+        )
         if layer.layer_kind == "open_shape":
             maximum = max(
                 (node.width_multiplier for node in layer.bound.nodes),
@@ -425,14 +436,14 @@ def entity_visual_bounds(document: ChapterDocument, tiles: TileStore,
         found = True
     for child in layer.children:
         child_bounds = entity_visual_bounds(
-            document, tiles, child.kind, child.entity_id
+            document, tiles, child.kind, child.entity_id, include_effects=include_effects
         )
         result = child_bounds if not found else result.united(child_bounds)
         found = True
-    return (
+    return expanded((
         result if found
         else _mapped_rect(world_transform, QRectF(0, 0, 1.0, 1.0))
-    )
+    ), layer, layer.parent_id)
 
 
 def _collect_subtree(document: ChapterDocument, kind: str,
@@ -642,8 +653,12 @@ def extract_asset(
                 image_object.source_mime_type,
             )
 
-    bounds = entity_visual_bounds(asset, asset_tiles, kind, entity_id)
+    bounds = entity_visual_bounds(asset, asset_tiles, kind, entity_id, include_effects=True)
     dx, dy = ASSET_PADDING - bounds.left(), ASSET_PADDING - bounds.top()
+    for modifier in asset.modifiers.values():
+        if isinstance(modifier, MirrorModifier):
+            modifier.axis_start = (modifier.axis_start[0] + dx, modifier.axis_start[1] + dy)
+            modifier.axis_end = (modifier.axis_end[0] + dx, modifier.axis_end[1] + dy)
     if kind == "layer":
         _translate_layer(asset.layers[entity_id], dx, dy)
     else:
@@ -652,7 +667,7 @@ def extract_asset(
     height = max(256, int(math.ceil(bounds.height() + ASSET_PADDING * 2)))
     asset.width, asset.height = width, height
     container.bound = BoundGeometry.rectangle(0, 0, width, height)
-    fitted = entity_visual_bounds(asset, asset_tiles, kind, entity_id)
+    fitted = entity_visual_bounds(asset, asset_tiles, kind, entity_id, include_effects=True)
     manifest = AssetManifest(
         name=name, root_kind=kind, root_id=entity_id, document=asset,
         visual_bounds=(fitted.x(), fitted.y(), fitted.width(), fitted.height()),
@@ -772,6 +787,11 @@ def instantiate_asset(
     bx, by, bw, bh = manifest.visual_bounds
     dx = world_x - (bx + bw / 2)
     dy = world_y - (by + bh / 2)
+    for modifier_id in cloned_modifier_ids.values():
+        modifier = target.modifiers[modifier_id]
+        if isinstance(modifier, MirrorModifier):
+            modifier.axis_start = (modifier.axis_start[0] + dx, modifier.axis_start[1] + dy)
+            modifier.axis_end = (modifier.axis_end[0] + dx, modifier.axis_end[1] + dy)
 
     def place_parent_point(point: QPointF) -> QPointF:
         return parent_inverse.map(point + QPointF(dx, dy))

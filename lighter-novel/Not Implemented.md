@@ -1,26 +1,62 @@
-bug
- - if i map something to backspace, backspace no longer works in text mode
- - convert to shape button only works with mouse, doesn't with stylus
 
 
-changes
-- if text is added, automatically switch to text edit mode (that way the user can make a text object and then immediately start typing)
-- add a line spacing setting to tool settings of a text object.
-- add a "mute" button for all modifiers (which should speed up rendering by letting me mute mods if i want drawing to be responsive again)
-- if an outline modifier is added to a shape, it should allow the outline to go outside the shape bounds (otherwise it would just be hidden)
-- transformation via the 8 handles/rotation/scale/translation, etc should be "nearest" and not use anti aliasing in raster mode.
+add:
+- [ ] ability to export as (to a specific path/name like save as but for png exports)
+- [ ] add an "export again" option that exports png to the same export as that you did before. if the user hasn't exported that chapter as yet, it should bring up the export as dialogue.
+- [ ] add an outline thickness handle to shape points (make it open circle shaped)
+	- double clicking the thickness handle reverts to the default thickness
+	- outline px in layer settings is treated as the default / baseline
+- [ ] if the user holds shift while clicking a line between points, instead of adding a point, it should toggle the outline of that line (between points) on and off. 
+- [ ] a "rasterize" button to the right click menu of any object. this applies modifiers and flattens into one image object.
+- [ ] "apply" button to modifier stack that applies changes the modifier made. should only be visible on raster objects though.
+
+change:
+- [ ] fill and outline color pickers should use the picker we made in the bottom left (including tabs for pallette and history, and the hex, copy paste, eyedropper, primary and secondary colors)
+	- [ ] all color fields that use a color picker dialogue should use this picker.
+- [ ] page fills should support transparency. if a page fill is transparent, the image export should respect that transparency.
+	- as such, treat the "chapter" background itself as transparent by default.
+- [ ] add a "mirror" modifier
+	- allows the user to mirror by a line. mirror modifier should have gizmos that allow the user to modify the line's 2 points. line point transformation should respect grid snapping if its on. Line edit should allow the user to transform these 2 points by dragging, but also provide a handle that drags both. orange dotted lines should extend through the 2 lines to show the full mirror axis.
+	- if the mirror modifier is on a shape, add a dropdown to give it compound shape options (ignore, add, subtract) in case the user wants the shape mirror to contribute.
+	- should work in vector and raster too
+	- should be optimized and high-performance
+- [ ] modifier selection
+	- a modifier can now be "selected" if the user clicks it in the modifier stack.
+	- of course, deselecting the object clears that selection. so does clicking the modifier again.
+	- while a modifier is selected, its gizmos should be visible. for now, that's just the mirror modifier
+	- while selected, show a blue border around the modifier.
+	- only one modifier can be selected at a time.
 
 
+later
+free text object
+- a text object that contains multiple text objects that are not linked to any particular shape, instead being free floating
+- gizmo that lets you toggle between transforming the text bounds and transforming the text pixel-wise (actually stretching/changing vs modifying the bounds the text wraps in)
+	- speaking of which, fix the unintended issue where if a strict to parent text object is switched to free, the text becomes stretched by default.
+	- ![[Pasted image 20260905113414.png]]
+	- ![[Pasted image 20260905113436.png]]
+- select mode should prioritize text if it's below the cursor.
 
 
-## filled shapes point selection:
-- allow for box, lasso select tools to exist if a custom shape is selected. these would allow the user to select and manipulate multiple points at once. (should work like it does in the vector object point selection mode)
+blur bug:
+- blur when there is transparency on an object causes a strange distortion / discoloration effect (especially when there are objects underneath). this is a bug, but the distortion does look kind of cool. what is causing this distortion? 
+	- add sub-menus to the add modifier dropdown (dropdown elements that have dropdown elements themselves, to the right of the main one)
+	- fix the blur bug, but make "blurs" a sub-menu with "blur legacy (the current, cool distorted one)" and "blur" (the fixed, normal one). also, add a radial blur. 
+	- radial blur
+		- gizmos let the user change the position of the center and the angle
+		- tool settings let the user change the angle too, and the expected modifier stuff (hiding, masking, deleting, intensity, etc)
+	- ![[Pasted image 20260905112108.png]]
+- ![[Pasted image 20260905112137.png]]
+
+optimize:
+
+
 
 ## Cage Transform
 - https://help.clip-studio.com/en-us/manual_en/360_transform/Types_of_transformations.htm#1004087
 - just like mesh transformation from clip studio paint. make it a tool, and also make a modifier version with the same parameters
 - the modifier tool, if used on a raster or vector, acts like just clip studio paint. it is a tool that can be used and is destructive (unless you undo.). it does not add a modifier.
-- by contrast, the cage transform modifier can not be added to rasters and vectors (intended for objects that can't be traditionally drawn on, (blender shapes, image layers for now)
+	- by contrast, the cage transform modifier can not be added to rasters and vectors (intended for objects that can't be traditionally drawn on, (blender shapes, image layers for now)
 - if the tool is used on a blender shape or image layer, it should switch to the modifier stack, add the modifier to the stack, and select it, exposing the gizmos.
 - if used on a raster/vector, no modifier.
 - both expose the same settings. in the raster/vector objects they are in tool settings, in the other 2 they are in modifier settings.

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import copy
+import json
 from datetime import datetime
 import re
 import time
@@ -51,7 +52,7 @@ from comic_editor.ui.canvas import (
     DrawingSelectionClipboard, ToolKind, create_canvas,
 )
 from comic_editor.ui.color_picker import (
-    ColorHistoryWidget, PaletteEditorWidget, PrimarySecondaryColorPanel,
+    ColorHistoryWidget, PaletteEditorWidget, PrimarySecondaryColorPanel, ColorWorkspace,
     canonical_argb,
 )
 from comic_editor.ui.selection_settings import (
@@ -333,6 +334,10 @@ class MainWindow(QMainWindow):
         self.save_action = self.file_menu.addAction("Save")
         self.save_as_action = self.file_menu.addAction("Save As")
         self.export_png_action = self.file_menu.addAction("Export PNG")
+        self.export_as_action = self.file_menu.addAction("Export As…")
+        self.export_again_action = self.file_menu.addAction("Export Again")
+        self.export_as_action.triggered.connect(self._export_as)
+        self.export_again_action.triggered.connect(self._export_again)
         self._rebuild_recent_menu()
 
         self.file_toolbar = QToolBar("Project", self)
@@ -369,6 +374,13 @@ class MainWindow(QMainWindow):
         self.new_chapter_action = self.file_toolbar.addAction("New Chapter")
         self.trim_action = self.file_toolbar.addAction("Trim Height")
         self.export_png_toolbar_action = self.file_toolbar.addAction("Export PNG")
+        export_menu = QMenu(self.file_toolbar)
+        export_menu.addActions([
+            self.export_png_action, self.export_as_action, self.export_again_action,
+        ])
+        export_button = self.file_toolbar.widgetForAction(self.export_png_toolbar_action)
+        export_button.setMenu(export_menu)
+        export_button.setPopupMode(QToolButton.MenuButtonPopup)
         self.fullscreen_action = self.file_toolbar.addAction("Fullscreen")
 
         self.tool_toolbar = ScrollableToolPanel(self)
@@ -461,40 +473,21 @@ class MainWindow(QMainWindow):
         # Kept as an attribute for compatibility with older integrations;
         # entity selection now always searches the complete chapter.
         self.page_scope.hide()
-        self.color_tabs = QTabWidget(self)
+        self.color_tabs = ColorWorkspace(self)
         self.color_tabs.setObjectName("colorTabs")
         # Preserve a usable wheel even when a tall contextual ribbon page is
         # present in the sibling splitter.
         self.color_tabs.setMinimumHeight(280)
-        picker_page = QWidget(self.color_tabs)
-        picker_layout = QVBoxLayout(picker_page)
-        picker_layout.setContentsMargins(4, 4, 4, 4)
-        self.color_panel = PrimarySecondaryColorPanel(
-            "#FF000000", "#FFFFFFFF", picker_page
-        )
+        self.color_panel = self.color_tabs.panel
         self.color_panel.setSizePolicy(
             QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding
         )
         self.color_panel.picker.setSizePolicy(
             QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding
         )
-        picker_layout.addWidget(self.color_panel)
-        self.color_tabs.addTab(picker_page, "Picker")
-
-        palette_page = QWidget(self.color_tabs)
-        palette_layout = QVBoxLayout(palette_page)
-        palette_layout.setContentsMargins(4, 4, 4, 4)
-        self.palette_editor = PaletteEditorWidget(palette_page)
+        self.palette_editor = self.color_tabs.palettes
         self.palette_editor.setMinimumWidth(0)
-        palette_layout.addWidget(self.palette_editor)
-        self.color_tabs.addTab(palette_page, "Palette")
-
-        history_page = QWidget(self.color_tabs)
-        history_layout = QVBoxLayout(history_page)
-        history_layout.setContentsMargins(4, 4, 4, 4)
-        self.color_history = ColorHistoryWidget(history_page)
-        history_layout.addWidget(self.color_history)
-        self.color_tabs.addTab(history_page, "History")
+        self.color_history = self.color_tabs.history
 
         self.ribbon = RibbonWidget(
             self, orientation=Qt.Orientation.Vertical
@@ -1945,6 +1938,10 @@ class MainWindow(QMainWindow):
             event.accept()
             return True
         if self._forward_popup_tablet_event(watched, event):
+            return True
+        if event.type() == QEvent.KeyPress and event.key() == Qt.Key_Escape and getattr(self, "_color_dialog_sample", None) is not None:
+            self._color_dialog_sample.finish_sample()
+            event.accept()
             return True
         if self._forward_outliner_tablet_event(watched, event):
             return True
@@ -3567,7 +3564,7 @@ class MainWindow(QMainWindow):
                 entity.fill_reference for entity in reference_targets
             ))
         rasterize = (
-            menu.addAction("Rasterize Image")
+            menu.addAction("Convert to Raster")
             if item.kind == "object" and isinstance(
                 self.chapter.objects.get(item.entity_id), ImageObject
             ) else None
@@ -3586,6 +3583,14 @@ class MainWindow(QMainWindow):
         )
         if rasterize is not None:
             rasterize.setEnabled(can_freeze)
+        from comic_editor.ui.baking import rasterize_reason
+        flatten = None
+        if item.kind == "object" or item.kind == "layer" and not self.chapter.layers[item.entity_id].is_page:
+            flatten = menu.addAction("Rasterize")
+            reason = rasterize_reason(self.canvas, item.kind, item.entity_id)
+            flatten.setEnabled(not reason)
+            flatten.setToolTip(reason or "Bake visible content and modifiers into one Image; undo restores the original.")
+            menu.setToolTipsVisible(True)
         selected = menu.exec(self.tree.viewport().mapToGlobal(point))
         if selected is rename:
             self.tree.edit(index)
@@ -3611,6 +3616,12 @@ class MainWindow(QMainWindow):
             self.canvas.documentChanged.emit(None)
         elif rasterize is not None and selected is rasterize:
             self._rasterize_image(item.entity_id)
+        elif flatten is not None and selected is flatten:
+            from comic_editor.ui.baking import rasterize
+            try:
+                rasterize(self.canvas, item.kind, item.entity_id)
+            except (ValueError, MemoryError, OSError) as error:
+                QMessageBox.warning(self, "Rasterize", str(error))
 
     def _copy_selected_as_asset(self, kind: str, entity_id: str) -> None:
         context = self._current_project_context()
@@ -3711,6 +3722,8 @@ class MainWindow(QMainWindow):
             custom_name=obj.custom_name,
             parent_layer_id=obj.parent_layer_id,
             visible=obj.visible, opacity=obj.opacity,
+            mask_only=obj.mask_only, fill_reference=obj.fill_reference,
+            modifier_ids=list(obj.modifier_ids), opacity_mask=obj.opacity_mask,
             opacity_locked=obj.opacity_locked,
             geometry_reference=obj.geometry_reference,
             ignore_parent_mask=obj.ignore_parent_mask,
@@ -5429,9 +5442,15 @@ class MainWindow(QMainWindow):
         self._record_color_history(color)
 
     def _eyedropper_preview(self, color: str) -> None:
+        if getattr(self, "_color_dialog_sample", None) is not None:
+            self._color_dialog_sample.workspace.panel.apply_color(color)
+            return
         self.color_panel.apply_color(color, emit=True)
 
     def _eyedropper_commit(self, color: str) -> None:
+        if getattr(self, "_color_dialog_sample", None) is not None:
+            self._color_dialog_sample.finish_sample(color)
+            return
         self.color_panel.apply_color(color, emit=True)
         self._record_color_history(color)
 
@@ -6037,6 +6056,57 @@ class MainWindow(QMainWindow):
             return False
         return self.save() if answer == QMessageBox.Save else True
 
+    def _export_destination_key(self) -> str:
+        return json.dumps([str(self.repository.root.resolve()).casefold(), self.chapter.chapter_id])
+
+    def _export_as(self) -> None:
+        if self.chapter is None or self.repository is None:
+            return
+        key = self._export_destination_key()
+        name = re.sub(r'[<>:"/\\|?*\x00-\x1f]+', "-", self.chapter.name).strip(" .-") or "Chapter"
+        previous = self.settings.export_destinations.get(key)
+        filename, _ = QFileDialog.getSaveFileName(
+            self, "Export As PNG", previous or str(self.repository.root / "exports" / f"{name}.png"),
+            "PNG image (*.png)",
+        )
+        if not filename:
+            return
+        destination = Path(filename)
+        if destination.suffix.lower() != ".png":
+            destination = destination.with_suffix(".png")
+        if self._write_export_png(destination):
+            self.settings.export_destinations[key] = str(destination.resolve())
+            save_settings(self.settings)
+
+    def _export_again(self) -> None:
+        if self.chapter is None or self.repository is None:
+            return
+        destination = self.settings.export_destinations.get(self._export_destination_key())
+        if destination:
+            self._write_export_png(Path(destination))
+        else:
+            self._export_as()
+
+    def _write_export_png(self, destination: Path) -> bool:
+        try:
+            self.canvas.commit_active_text_edit()
+            image = QImage(self.chapter.width, self.chapter.height, QImage.Format_ARGB32_Premultiplied)
+            if image.isNull():
+                raise MemoryError("Could not allocate the chapter image")
+            self.canvas.render_preview(image)
+            temporary = destination.with_name(f".{destination.name}.{new_id()}.tmp.png")
+            try:
+                if not image.save(str(temporary), "PNG"):
+                    raise OSError("Qt could not encode the PNG")
+                temporary.replace(destination)
+            finally:
+                temporary.unlink(missing_ok=True)
+        except (MemoryError, OSError, ValueError) as error:
+            QMessageBox.critical(self, "Export PNG", f"Unable to export the chapter:\n{error}")
+            return False
+        self.statusBar().showMessage(f"Exported {destination}", 7000)
+        return True
+
     def _export_png(self) -> None:
         if (
             self.chapter is None or self.repository is None
@@ -6087,6 +6157,7 @@ class MainWindow(QMainWindow):
                 self.save_action, self.save_as_action,
                 self.new_chapter_action, self.trim_action,
                 self.export_png_action, self.export_png_toolbar_action,
+                self.export_as_action, self.export_again_action,
                 self.undo_action, self.redo_action,
             ):
                 action.setEnabled(False)
@@ -6104,6 +6175,8 @@ class MainWindow(QMainWindow):
         self.new_chapter_action.setEnabled(series_active and self.series is not None)
         self.trim_action.setEnabled(series_active)
         self.export_png_action.setEnabled(series_active)
+        self.export_as_action.setEnabled(series_active)
+        self.export_again_action.setEnabled(series_active)
         self.export_png_toolbar_action.setEnabled(series_active)
         self.add_page_button.setEnabled(series_active)
         self.undo_action.setEnabled(self.canvas.command_stack.can_undo)

@@ -204,8 +204,9 @@ def test_vector_drawing_renders_through_object_pipeline(qapp):
     assert overlap.red() > overlap.blue()
     translucent = image.pixelColor(100, 170)
     assert translucent.green() > translucent.red()
-    assert 170 <= translucent.red() <= 225
-    assert image.pixelColor(300, 100).getRgb()[:3] == (255, 255, 255)
+    assert translucent.red() == 0
+    assert 62 <= translucent.alpha() <= 66
+    assert image.pixelColor(300, 100).alpha() == 0
 
 
 def test_vector_edit_clears_render_cache(qapp):

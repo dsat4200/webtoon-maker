@@ -419,6 +419,8 @@ def test_vector_eraser_first_press_paints_complete_live_result(
         snap_to_grid=False, vector_eraser_mode=mode,
     )
     canvas, chapter, layer = _document_canvas(settings)
+    # This contrast assertion explicitly uses white paper, not chapter alpha.
+    chapter.background = "#FFFFFFFF"
     target = VectorStroke(color="#FF111111", points=[
         VectorStrokePoint(x=50, y=150, width=18),
         VectorStrokePoint(x=350, y=150, width=18),

@@ -113,7 +113,7 @@ def test_rectangle_mask_is_non_destructive_and_reveals_data(qapp):
     canvas.set_document(chapter, tiles)
     preview = QImage(108, 108, QImage.Format_ARGB32_Premultiplied)
     canvas.render_preview(preview)
-    assert preview.pixelColor(50, 50).lightness() > 200
+    assert preview.pixelColor(50, 50).alpha() == 0
     layer.bound = BoundGeometry.rectangle(0, 0, 800, 800)
     canvas.render_preview(preview)
     assert preview.pixelColor(50, 50).lightness() < 80
@@ -137,7 +137,7 @@ def test_circle_and_nested_masks_intersect(qapp):
     preview = QImage(108, 108, QImage.Format_ARGB32_Premultiplied)
     canvas.render_preview(preview)
     assert preview.pixelColor(54, 54).lightness() < 80
-    assert preview.pixelColor(75, 54).lightness() > 200
+    assert preview.pixelColor(75, 54).alpha() == 0
 
 
 def test_preview_image_is_display_resolution_not_chapter_resolution(qapp):
@@ -180,7 +180,7 @@ def test_ignore_direct_parent_renders_subtree_above_parent_and_keeps_page_mask(
 
     assert image.pixelColor(245, 100).lightness() < 40
     assert image.pixelColor(280, 100).lightness() < 40
-    assert image.pixelColor(320, 100).lightness() > 200
+    assert image.pixelColor(320, 100).alpha() == 0
     assert canvas._shape_border_contains(
         child.layer_id, QPointF(280, 80)
     )
@@ -243,7 +243,7 @@ def test_selected_raster_underlay_is_live_only_and_bypasses_shape_mask(qapp):
         chapter.width, chapter.height, QImage.Format_ARGB32_Premultiplied
     )
     canvas.render_preview(preview)
-    assert preview.pixelColor(225, 100).lightness() > 220
+    assert preview.pixelColor(225, 100).alpha() == 0
 
     live = QImage(
         chapter.width, chapter.height, QImage.Format_ARGB32_Premultiplied
@@ -260,13 +260,14 @@ def test_selected_raster_underlay_is_live_only_and_bypasses_shape_mask(qapp):
     canvas._clear_live_underlay_context()
     painter.end()
 
-    assert 70 < live.pixelColor(225, 100).lightness() < 210
+    assert live.pixelColor(225, 100).lightness() == 0
+    assert 120 <= live.pixelColor(225, 100).alpha() <= 130
     assert live.pixelColor(75, 100).lightness() < 100
     exported = QImage(
         chapter.width, chapter.height, QImage.Format_ARGB32_Premultiplied
     )
     canvas.render_preview(exported)
-    assert exported.pixelColor(225, 100).lightness() > 220
+    assert exported.pixelColor(225, 100).alpha() == 0
 
 
 def test_vector_underlay_shows_selected_strokes_outside_parent_mask(qapp):
@@ -315,4 +316,4 @@ def test_vector_underlay_shows_selected_strokes_outside_parent_mask(qapp):
         chapter.width, chapter.height, QImage.Format_ARGB32_Premultiplied
     )
     canvas.render_preview(preview)
-    assert preview.pixelColor(210, 100).lightness() > 220
+    assert preview.pixelColor(210, 100).alpha() == 0

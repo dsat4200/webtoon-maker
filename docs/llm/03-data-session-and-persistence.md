@@ -75,6 +75,23 @@ Series preferences save independently from the current chapter. Color/palette/gr
 
 ## Chapter data
 
+Chapter schema **22** adds `MirrorModifier` and shape-node outline metadata.
+Mirror records common modifier fields plus `axis_start`, `axis_end` (distinct,
+finite document-space points), and `compound_operation` (default `ignore`).
+Nodes record `outline_multiplier` (finite, clamped 0–10, default 1) independently
+from open-path core width, and `outline_enabled` (default true) for the outgoing
+edge. Chapter/asset cloning and model undo retain these fields.
+
+On loading a pre-22 chapter only, an opaque-white background is migrated to
+`#00000000`. Page fills and nonwhite backgrounds are preserved. Schema-22 white
+backgrounds are intentional and are not migrated again.
+
+`EditorSettings.export_destinations` maps a JSON-encoded pair of normalized
+absolute series location and chapter ID to the last successful named PNG path.
+This local preference is outside portable chapter data. Export writes to a
+unique sibling temporary PNG and replaces the destination only after encoding
+succeeds; cancellation and failure do not change the remembered path.
+
 `ChapterDocument` stores:
 
 - ID and name;
@@ -86,7 +103,7 @@ Series preferences save independently from the current chapter. Color/palette/gr
 - every typed object record;
 - every `ModifierInstance` record;
 - every `ToneMask` record;
-- schema version 21 and `document_kind` (`chapter` or `asset`); and
+- schema version 22 and `document_kind` (`chapter` or `asset`); and
 - runtime-only `legacy_fill_migrations` plans for pending one-time fill materialization.
 
 The default height is 3240. `ensure_height_for()` grows past a layer's bottom by an additional 1080-pixel margin. Other canvas workflows also grow for raster/object/page bounds. `trim_height()` rejects a height above which any root page remains visible; the UI also includes object bounds in its minimum.
@@ -405,8 +422,8 @@ Undo history itself is never saved. Recovery autosave represents only the latest
 
 ## Migration behavior
 
-- Chapter schema 20 and series schema 17 are current; anything newer is rejected without rewrite.
-- Chapter load accepts older schemas, rebuilds typed objects, migrates legacy text alignment into free quads, normalizes current invariants, validates, and sets the in-memory schema to 20.
+- Chapter schema 22 and series schema 17 are current; anything newer is rejected without rewrite.
+- Chapter load accepts older schemas, rebuilds typed objects, migrates legacy text alignment into free quads and legacy white chapter backgrounds to transparency, normalizes invariants, validates, and sets the in-memory schema to 22.
 - Legacy fill layers and owned vector fills are converted into pending tile materialization plans and rasterized after tile loading.
 - Legacy speed-line records and centers are dropped with warnings; references are repaired.
 - `LayerNode.from_dict()` accepts legacy fill/border/radius fields and converts them into `ShapeStyle`/node roundness.

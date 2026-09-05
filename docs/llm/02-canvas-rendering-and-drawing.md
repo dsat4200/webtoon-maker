@@ -112,6 +112,27 @@ A tone mask is a chapter-level grayscale field. `render_tone_mask_field()` sums 
 
 Canvas-side caches (`_modifier_render_cache`, `_modifier_source_cache`, 64 MiB each) key by layer/object signatures that include pixel cache keys, selection transform preview quads, and eraser previews. Parameter, focal-rig, intensity, and mask edits reuse the isolated source render.
 
+Mirror uses `effect_geometry.py` for document-space reflection and stage-wise
+bounds, and `effect_pipeline.py` for reusable sources, output-stage caches,
+parameter masks, and baking. A trailing unmasked Mirror at full target opacity
+draws the two source placements directly rather than allocating the empty gap.
+Other stages propagate required output regions backward; reflection samples
+the retained incoming source even when it lies outside the output region.
+Raster sources use nearest sampling. Both cache families remain bounded.
+Individual effect images have a 64-megapixel allocation guard.
+
+`shape_outline.py` generates interpolated outline strips for edited paths;
+unmodified paths preserve the existing cap/join rendering. Outgoing visibility
+does not alter fill/hit geometry. Edited compound boundary strips retain
+source-edge attributes and use baseline fallback on unattributed portions.
+
+`baking.py` prepares images/tiles before replacing graph data. Rasterize renders
+one pixel per document pixel, then embeds a positioned Image. Apply keeps
+Raster-local tiles and the existing mapping, removes only active prefix links,
+and extends interaction bounds. Undo callbacks restore model, images, and the
+affected tile sets. Preview full/partial clears use Source composition before
+returning to SourceOver, so transparent pages remove stale buffer pixels.
+
 ## Raster drawing and rendering
 
 ### Storage and rasterization

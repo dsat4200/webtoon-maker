@@ -7,13 +7,15 @@ import zlib
 
 import numpy as np
 from PIL import Image
-from PySide6.QtGui import QImage
+from PySide6.QtGui import QImage, QPainter, QTransform
+from PySide6.QtCore import Qt
 from scipy.ndimage import distance_transform_edt
 
 from comic_editor.core.models import (
     BlurModifier, HueSaturationLightnessModifier, ModifierInstance,
-    OutlineModifier,
+    OutlineModifier, MirrorModifier,
 )
+from comic_editor.core.effect_geometry import reflection_transform
 
 
 def _qimage_premultiplied(image: QImage) -> np.ndarray:
@@ -371,6 +373,8 @@ def apply_modifier_stack(
     mask_fields: dict[tuple[str, str], np.ndarray] | None = None,
     *, outline_distance_cache: OutlineDistanceCache | None = None,
     blur_pyramid_cache: BlurPyramidCache | None = None,
+    world_to_image: QTransform | None = None,
+    nearest: bool = False,
 ) -> QImage:
     active_modifiers = [modifier for modifier in modifiers if not modifier.muted]
     if image.isNull() or not active_modifiers:
@@ -427,6 +431,23 @@ def apply_modifier_stack(
                 mask = mask[..., None] * amount
             else:
                 mask = amount
+        elif isinstance(modifier, MirrorModifier):
+            mapping = world_to_image or QTransform.fromTranslate(-world_origin[0], -world_origin[1])
+            inverse, valid = mapping.inverted()
+            if not valid:
+                continue
+            source = _premultiplied_qimage(current)
+            reflected = QImage(source.size(), source.format())
+            reflected.fill(Qt.transparent)
+            painter = QPainter(reflected)
+            painter.setRenderHint(QPainter.SmoothPixmapTransform, not nearest)
+            painter.setRenderHint(QPainter.Antialiasing, not nearest)
+            painter.setTransform(inverse * reflection_transform(modifier) * mapping)
+            painter.drawImage(0, 0, source)
+            painter.end()
+            reflection = _qimage_premultiplied(reflected)
+            effect = current + reflection * (1.0 - current[..., 3:4])
+            mask = amount
         elif isinstance(modifier, OutlineModifier):
             effect = _outline_effect(
                 current,
