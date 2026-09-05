@@ -80,7 +80,14 @@ from comic_editor.ui.modifier_rendering import (
 )
 from comic_editor.core.effect_geometry import effect_bounds, reflection_transform
 from comic_editor.ui.effect_pipeline import render_stages, empty_image, aligned
-from comic_editor.ui.shape_outline import customized as customized_outline, outline_mesh, remove_nodes
+from comic_editor.ui.shape_contours import (
+    compile_contour, bound_path as compiled_bound_path, geometry_key, transform_stretch,
+    make_custom, outline_fraction_at, raw_edge_cubics,
+)
+from comic_editor.ui.shape_outline import (
+    OutlineCache, core_mesh, outline_mesh, remove_nodes,
+)
+from comic_editor.ui.shape_outline_compound import OutlineSource, compound_outline, ribbon_source
 
 
 class ToolKind(Enum):
@@ -739,6 +746,13 @@ class _CanvasLogic:
         self._selected_shape_node_ids: set[str] = set()
         self._shape_drag_nodes: dict[str, dict] = {}
         self._active_shape_control: str | None = None
+        self._outline_drag_axis = QPointF()
+        self._outline_drag_start_width = 1.0
+        self._outline_pending_point = None
+        self._last_outline_tablet_tap = None
+        self._outline_edit_timer = QTimer(self)
+        self._outline_edit_timer.setSingleShot(True)
+        self._outline_edit_timer.timeout.connect(self._flush_outline_edit)
         self._rectangle_roundness_linked = False
         self._input_press_modifiers = None
         self._active_gradient_control: tuple[str, str] | None = None
@@ -787,6 +801,8 @@ class _CanvasLogic:
         self.active_color_slot = "primary"
         self._predictive: tuple[QPointF, QPointF, float, QColor] | None = None
         self._compound_path_cache: dict[str, QPainterPath] = {}
+        self._outline_cache = OutlineCache()
+        self._compound_geometry_signature = None
         # Stroke images are deliberately cached independently.  A drawing can
         # contain thousands of strokes, so editing one must not evict every
         # unrelated image.  The tuple key is intentionally permissive because
@@ -1354,6 +1370,9 @@ class _CanvasLogic:
     def _clear_detached_input_state(self) -> None:
         """Reset transient pointer state that cannot survive without a document."""
         self._clear_creation_gesture()
+        self._outline_edit_timer.stop()
+        self._outline_pending_point = None
+        self._last_outline_tablet_tap = None
         self._clear_drawing_selection()
         self._selected_vector_stroke_ids.clear()
         self._selected_vector_point_ids.clear()
@@ -1420,6 +1439,7 @@ class _CanvasLogic:
         self.tiles = tiles
         self.images = images or ImageStore()
         self._compound_path_cache.clear()
+        self._outline_cache.clear()
         self._gradient_geometry_cache.clear()
         self._gradient_scalar_cache.clear()
         self._gradient_render_cache.clear()
@@ -1574,6 +1594,7 @@ class _CanvasLogic:
 
     def restore_session_state(self, state: CanvasSessionState) -> None:
         """Activate a previously captured tab without loading it again."""
+        self._outline_cache.clear()
         self._cancel_fill_job()
         self._clear_fill_replay()
         self._clear_detached_input_state()
@@ -1621,6 +1642,7 @@ class _CanvasLogic:
         self.toolChanged.emit(self.tool)
 
     def clear_document(self) -> None:
+        self._outline_cache.clear()
         if self._page_gap_draft is not None:
             self.cancel_page_gap_transaction()
         if self.chapter is not None and self._page_creation_anchor_id:
@@ -1671,6 +1693,9 @@ class _CanvasLogic:
         self.active_color_slot = slot
 
     def replace_chapter(self, state: dict) -> None:
+        self._outline_edit_timer.stop()
+        self._outline_pending_point = None
+        self._outline_cache.clear()
         self.active_modifier_id = ""
         self._commit_text_edit()
         self._clear_transform_preview()
@@ -2096,6 +2121,10 @@ class _CanvasLogic:
             return
         if self._page_gap_draft is not None:
             return
+        if (kind, entity_id) != (self.selected_kind, self.selected_id):
+            if self._active_shape_control == "outline_width":
+                self._tool_release()
+            self._last_outline_tablet_tap = None
         previous_tool = self.tool
         if entity_id != self.selected_object_id:
             self._clear_fill_replay()
@@ -2644,6 +2673,11 @@ class _CanvasLogic:
         layer = self.chapter.layers.get(entity_id)
         if layer is None or layer.bound is None:
             return None
+        if layer.layer_kind == "open_shape" and not layer.compound_enabled:
+            # The interaction/masking frame deliberately ignores per-edge
+            # outline edits; effect isolation must include their visual overflow.
+            return entity_visual_bounds(self.chapter, self.tiles, kind, entity_id,
+                                        geometry_cache=self._outline_cache)
         return self.layer_world_transform(entity_id).map(
             self.layer_effective_path(entity_id)
         ).boundingRect()
@@ -2683,613 +2717,29 @@ class _CanvasLogic:
 
     # ---- rendering -----------------------------------------------------
     @staticmethod
-    def _single_bound_path(
-        bound: BoundGeometry, vertex_radius: float = 0.0,
-    ) -> QPainterPath:
-        path = QPainterPath()
-        path.setFillRule(Qt.WindingFill)
-        if bound.primitive == "ellipse":
-            x, y, width, height = bound.bbox()
-            path.addEllipse(QRectF(x, y, width, height))
-            return path
-        nodes = bound.nodes
-        if not nodes:
-            return path
+    def _outline_tolerance(painter, bounds=None):
+        transform = painter.combinedTransform()
+        stretch = transform_stretch(transform, bounds)
+        # Stable power-of-two precision buckets avoid cache churn under zoom.
+        return math.ldexp(.125, -math.ceil(math.log2(max(1., stretch))))
 
-        def segment_points(index: int) -> tuple[QPointF, QPointF, QPointF, QPointF]:
-            start = nodes[index]
-            end = nodes[(index + 1) % len(nodes)]
-            p0 = QPointF(start.x, start.y)
-            p3 = QPointF(end.x, end.y)
-            return (
-                p0,
-                QPointF(*(start.outgoing or start.position)),
-                QPointF(*(end.incoming or end.position)),
-                p3,
-            )
+    @staticmethod
+    def _single_bound_path(bound: BoundGeometry, vertex_radius: float = 0.0) -> QPainterPath:
+        return compile_contour(bound, vertex_radius).path
 
-        def split_cubic(
-            points: tuple[QPointF, QPointF, QPointF, QPointF], percent: float,
-        ) -> tuple[
-            tuple[QPointF, QPointF, QPointF, QPointF],
-            tuple[QPointF, QPointF, QPointF, QPointF],
-        ]:
-            p0, p1, p2, p3 = points
-            a = p0 * (1 - percent) + p1 * percent
-            b = p1 * (1 - percent) + p2 * percent
-            c = p2 * (1 - percent) + p3 * percent
-            d = a * (1 - percent) + b * percent
-            e = b * (1 - percent) + c * percent
-            point = d * (1 - percent) + e * percent
-            return (p0, a, d, point), (point, e, c, p3)
-
-        def sub_cubic(
-            points: tuple[QPointF, QPointF, QPointF, QPointF],
-            start: float,
-            end: float,
-        ) -> tuple[QPointF, QPointF, QPointF, QPointF]:
-            if end < 1:
-                points = split_cubic(points, end)[0]
-            if start > 0:
-                relative = start / max(end, 1e-9)
-                points = split_cubic(points, relative)[1]
-            return points
-
-        def cubic_point(
-            points: tuple[QPointF, QPointF, QPointF, QPointF], percent: float,
-        ) -> QPointF:
-            inverse = 1 - percent
-            p0, p1, p2, p3 = points
-            return (
-                p0 * (inverse ** 3)
-                + p1 * (3 * inverse * inverse * percent)
-                + p2 * (3 * inverse * percent * percent)
-                + p3 * (percent ** 3)
-            )
-
-        def cubic_tangent(
-            points: tuple[QPointF, QPointF, QPointF, QPointF], percent: float,
-        ) -> QPointF:
-            inverse = 1 - percent
-            p0, p1, p2, p3 = points
-            return (
-                (p1 - p0) * (3 * inverse * inverse)
-                + (p2 - p1) * (6 * inverse * percent)
-                + (p3 - p2) * (3 * percent * percent)
-            )
-
-        def length_table(
-            points: tuple[QPointF, QPointF, QPointF, QPointF],
-        ) -> list[tuple[float, float]]:
-            result = [(0.0, 0.0)]
-            previous = points[0]
-            total = 0.0
-            for step in range(1, 49):
-                percent = step / 48
-                current = cubic_point(points, percent)
-                total += math.dist(
-                    (previous.x(), previous.y()),
-                    (current.x(), current.y()),
-                )
-                result.append((percent, total))
-                previous = current
-            return result
-
-        def parameter_at_length(
-            table: list[tuple[float, float]], target: float,
-        ) -> float:
-            target = max(0.0, min(table[-1][1], target))
-            for index in range(1, len(table)):
-                percent, distance = table[index]
-                if distance < target:
-                    continue
-                previous_percent, previous_distance = table[index - 1]
-                span = max(distance - previous_distance, 1e-9)
-                ratio = (target - previous_distance) / span
-                return previous_percent + (percent - previous_percent) * ratio
-            return 1.0
-
-        curve_rounding: dict[int, dict[str, object]] = {}
-        segment_count = len(nodes) if bound.closed else len(nodes) - 1
-        for index, node in enumerate(nodes):
-            if not (
-                node.roundness_enabled
-                and node.roundness > 0
-                and node.point_type == "bezier"
-                and not node.handles_locked
-                and node.incoming is not None
-                and node.outgoing is not None
-                and (bound.closed or 0 < index < len(nodes) - 1)
-            ):
-                continue
-            incoming_index = index - 1 if index else len(nodes) - 1
-            outgoing_index = index
-            if not (0 <= incoming_index < segment_count and 0 <= outgoing_index < segment_count):
-                continue
-            incoming_curve = segment_points(incoming_index)
-            outgoing_curve = segment_points(outgoing_index)
-            incoming_table = length_table(incoming_curve)
-            outgoing_table = length_table(outgoing_curve)
-            incoming_length = incoming_table[-1][1]
-            outgoing_length = outgoing_table[-1][1]
-            radius = min(
-                node.roundness, incoming_length / 2, outgoing_length / 2
-            )
-            if radius <= 1e-6:
-                continue
-            entry_t = parameter_at_length(
-                incoming_table, incoming_length - radius
-            )
-            exit_t = parameter_at_length(outgoing_table, radius)
-            curve_rounding[index] = {
-                "entry": cubic_point(incoming_curve, entry_t),
-                "exit": cubic_point(outgoing_curve, exit_t),
-                "entry_t": entry_t,
-                "exit_t": exit_t,
-                "incoming_tangent": cubic_tangent(incoming_curve, entry_t),
-                "outgoing_tangent": cubic_tangent(outgoing_curve, exit_t),
-                "anchor_incoming_tangent": cubic_tangent(incoming_curve, 1.0),
-                "anchor_outgoing_tangent": cubic_tangent(outgoing_curve, 0.0),
-            }
-
-        def segment_is_cubic(index: int) -> bool:
-            start = nodes[index]
-            end = nodes[(index + 1) % len(nodes)]
-            return start.outgoing is not None or end.incoming is not None
-
-        vector_curve_rounding: dict[int, dict[str, object]] = {}
-        for index, node in enumerate(nodes):
-            if not (
-                node.point_type == "vector"
-                and node.roundness_enabled
-                and node.roundness > 0
-                and (bound.closed or 0 < index < len(nodes) - 1)
-            ):
-                continue
-            incoming_index = index - 1 if index else len(nodes) - 1
-            outgoing_index = index
-            if not (
-                0 <= incoming_index < segment_count
-                and 0 <= outgoing_index < segment_count
-                and (
-                    segment_is_cubic(incoming_index)
-                    or segment_is_cubic(outgoing_index)
-                )
-            ):
-                continue
-            incoming_curve = segment_points(incoming_index)
-            outgoing_curve = segment_points(outgoing_index)
-            incoming_table = length_table(incoming_curve)
-            outgoing_table = length_table(outgoing_curve)
-            incoming_length = incoming_table[-1][1]
-            outgoing_length = outgoing_table[-1][1]
-            radius = min(
-                node.roundness, incoming_length / 2, outgoing_length / 2
-            )
-            if radius <= 1e-6:
-                continue
-            entry_t = parameter_at_length(
-                incoming_table, incoming_length - radius
-            )
-            exit_t = parameter_at_length(outgoing_table, radius)
-            vector_curve_rounding[index] = {
-                "entry": cubic_point(incoming_curve, entry_t),
-                "exit": cubic_point(outgoing_curve, exit_t),
-                "entry_t": entry_t,
-                "exit_t": exit_t,
-                "incoming_tangent": cubic_tangent(incoming_curve, entry_t),
-                "outgoing_tangent": cubic_tangent(outgoing_curve, exit_t),
-            }
-
-        trim_rounding = {
-            **vector_curve_rounding,
-            **curve_rounding,
-        }
-
-        def rounding(index: int) -> tuple[QPointF, QPointF]:
-            if index in curve_rounding:
-                corner = curve_rounding[index]
-                return corner["entry"], corner["exit"]
-            if index in vector_curve_rounding:
-                corner = vector_curve_rounding[index]
-                return corner["entry"], corner["exit"]
-            node = nodes[index]
-            position = QPointF(node.x, node.y)
-            may_round = (
-                node.roundness_enabled
-                and node.roundness > 0
-                and node.point_type == "vector"
-                and (bound.closed or 0 < index < len(nodes) - 1)
-            )
-            if not may_round:
-                return position, position
-            previous = nodes[index - 1 if index else len(nodes) - 1]
-            following = nodes[(index + 1) % len(nodes)]
-            before = QPointF(previous.x - node.x, previous.y - node.y)
-            after = QPointF(following.x - node.x, following.y - node.y)
-            before_length = max(1e-6, math.hypot(before.x(), before.y()))
-            after_length = max(1e-6, math.hypot(after.x(), after.y()))
-            distance = min(
-                node.roundness, before_length / 2, after_length / 2
-            )
-            return (
-                position + before * (distance / before_length),
-                position + after * (distance / after_length),
-            )
-
-        rounded = [rounding(index) for index in range(len(nodes))]
-
-        def segment(start_index: int, end_index: int) -> None:
-            start_node, end_node = nodes[start_index], nodes[end_index]
-            target = rounded[end_index][0]
-            if start_index in trim_rounding or end_index in trim_rounding:
-                points = segment_points(start_index)
-                start_t = float(
-                    trim_rounding.get(start_index, {}).get("exit_t", 0.0)
-                )
-                end_t = float(
-                    trim_rounding.get(end_index, {}).get("entry_t", 1.0)
-                )
-                if start_t > end_t:
-                    start_t = end_t = (start_t + end_t) / 2
-                p0, p1, p2, p3 = sub_cubic(points, start_t, end_t)
-                actual_start = rounded[start_index][1]
-                p1 += actual_start - p0
-                p2 += target - p3
-                path.cubicTo(p1, p2, target)
-            elif start_node.outgoing is not None or end_node.incoming is not None:
-                control_a = (
-                    QPointF(*start_node.outgoing)
-                    if start_node.outgoing is not None
-                    else QPointF(rounded[start_index][1])
-                )
-                control_b = (
-                    QPointF(*end_node.incoming)
-                    if end_node.incoming is not None else QPointF(target)
-                )
-                path.cubicTo(control_a, control_b, target)
-            else:
-                path.lineTo(target)
-            if end_index in curve_rounding:
-                corner = curve_rounding[end_index]
-                entry = corner["entry"]
-                exit_point = corner["exit"]
-                incoming_tangent = corner["incoming_tangent"]
-                outgoing_tangent = corner["outgoing_tangent"]
-                anchor = QPointF(end_node.x, end_node.y)
-
-                def unit(vector: QPointF) -> QPointF:
-                    length = math.hypot(vector.x(), vector.y())
-                    return (
-                        vector / length
-                        if length > 1e-9 else QPointF()
-                    )
-
-                incoming_unit = unit(incoming_tangent)
-                outgoing_unit = unit(outgoing_tangent)
-                incoming_chord = unit(anchor - entry)
-                outgoing_chord = unit(exit_point - anchor)
-                # The chord bisector is the stable tangent through the point.
-                # It follows the actual trimmed curves without inheriting a
-                # backwards-facing raw handle that would create a loop.
-                shared = incoming_chord + outgoing_chord
-                if math.hypot(shared.x(), shared.y()) <= 1e-6:
-                    shared = exit_point - entry
-                if math.hypot(shared.x(), shared.y()) <= 1e-6:
-                    shared = (
-                        unit(corner["anchor_incoming_tangent"])
-                        + unit(corner["anchor_outgoing_tangent"])
-                    )
-                shared = unit(shared)
-                if math.hypot(shared.x(), shared.y()) <= 1e-6:
-                    shared = unit(anchor - entry)
-
-                incoming_span = math.dist(
-                    (entry.x(), entry.y()), (anchor.x(), anchor.y())
-                )
-                outgoing_span = math.dist(
-                    (anchor.x(), anchor.y()),
-                    (exit_point.x(), exit_point.y()),
-                )
-                shared_handle = min(incoming_span, outgoing_span) / 2
-
-                def safe_outer_handle(
-                    tangent: QPointF, chord: QPointF, span: float,
-                ) -> float:
-                    projection = QPointF.dotProduct(unit(tangent), unit(chord))
-                    return span / 3 * max(0.0, min(1.0, projection))
-
-                incoming_handle = safe_outer_handle(
-                    incoming_tangent, anchor - entry, incoming_span
-                )
-                outgoing_handle = safe_outer_handle(
-                    outgoing_tangent, exit_point - anchor, outgoing_span
-                )
-
-                # Two local Hermite spans meet at the original point. Equal
-                # handles along the shared tangent make that join C1 while
-                # the outer handles retain the incident cubic tangents.
-                path.cubicTo(
-                    entry + incoming_unit * incoming_handle,
-                    anchor - shared * shared_handle,
-                    anchor,
-                )
-                path.cubicTo(
-                    anchor + shared * shared_handle,
-                    exit_point - outgoing_unit * outgoing_handle,
-                    exit_point,
-                )
-            elif end_index in vector_curve_rounding:
-                corner = vector_curve_rounding[end_index]
-                entry = corner["entry"]
-                exit_point = corner["exit"]
-                anchor = QPointF(end_node.x, end_node.y)
-
-                def unit(vector: QPointF) -> QPointF:
-                    length = math.hypot(vector.x(), vector.y())
-                    return vector / length if length > 1e-9 else QPointF()
-
-                incoming_unit = unit(corner["incoming_tangent"])
-                outgoing_unit = unit(corner["outgoing_tangent"])
-                chord = exit_point - entry
-                chord_length = math.hypot(chord.x(), chord.y())
-                if math.hypot(incoming_unit.x(), incoming_unit.y()) <= 1e-9:
-                    incoming_unit = unit(anchor - entry)
-                if math.hypot(outgoing_unit.x(), outgoing_unit.y()) <= 1e-9:
-                    outgoing_unit = unit(exit_point - anchor)
-                incoming_span = math.dist(
-                    (entry.x(), entry.y()), (anchor.x(), anchor.y())
-                )
-                outgoing_span = math.dist(
-                    (anchor.x(), anchor.y()),
-                    (exit_point.x(), exit_point.y()),
-                )
-                maximum_incoming = min(
-                    incoming_span * 2 / 3, chord_length * 2 / 3
-                )
-                maximum_outgoing = min(
-                    outgoing_span * 2 / 3, chord_length * 2 / 3
-                )
-
-                # Intersect the forward incoming tangent with the reverse
-                # outgoing tangent. For ordinary vector corners this is the
-                # acute-side corner; curved incidents use the same construction
-                # while retaining their actual endpoint derivatives.
-                reverse_outgoing = QPointF(
-                    -outgoing_unit.x(), -outgoing_unit.y()
-                )
-                denominator = (
-                    incoming_unit.x() * reverse_outgoing.y()
-                    - incoming_unit.y() * reverse_outgoing.x()
-                )
-                incoming_length = outgoing_length = -1.0
-                if abs(denominator) > 1e-7:
-                    delta = exit_point - entry
-                    incoming_ray = (
-                        delta.x() * reverse_outgoing.y()
-                        - delta.y() * reverse_outgoing.x()
-                    ) / denominator
-                    outgoing_ray = (
-                        delta.x() * incoming_unit.y()
-                        - delta.y() * incoming_unit.x()
-                    ) / denominator
-                    if incoming_ray >= 0 and outgoing_ray >= 0:
-                        incoming_length = incoming_ray * 2 / 3
-                        outgoing_length = outgoing_ray * 2 / 3
-                if incoming_length <= 1e-6 or outgoing_length <= 1e-6:
-                    fallback = chord_length / 3
-                    incoming_length = min(fallback, incoming_span / 2)
-                    outgoing_length = min(fallback, outgoing_span / 2)
-                incoming_length = max(
-                    0.0, min(maximum_incoming, incoming_length)
-                )
-                outgoing_length = max(
-                    0.0, min(maximum_outgoing, outgoing_length)
-                )
-                path.cubicTo(
-                    entry + incoming_unit * incoming_length,
-                    exit_point - outgoing_unit * outgoing_length,
-                    exit_point,
-                )
-            elif rounded[end_index][0] != rounded[end_index][1]:
-                path.quadTo(
-                    QPointF(end_node.x, end_node.y), rounded[end_index][1]
-                )
-
-        path.moveTo(rounded[0][1])
-        for index in range(1, len(nodes)):
-            segment(index - 1, index)
-        if bound.closed:
-            segment(len(nodes) - 1, 0)
-            path.closeSubpath()
-        return path
-
-    @classmethod
-    def bound_path(
-        cls, bound: BoundGeometry, vertex_radius: float = 0.0,
-    ) -> QPainterPath:
-        path = cls._single_bound_path(bound, vertex_radius)
-        if not bound.additional_contours:
-            return path
-        path.setFillRule(Qt.OddEvenFill)
-        for contour in bound.additional_contours:
-            extra = BoundGeometry(
-                nodes=contour.nodes, closed=contour.closed,
-                primitive="custom",
-            )
-            path.addPath(cls._single_bound_path(extra))
-        return path
+    @staticmethod
+    def bound_path(bound: BoundGeometry, vertex_radius: float = 0.0) -> QPainterPath:
+        return compiled_bound_path(bound, vertex_radius)
 
     @classmethod
     def open_shape_mesh(
         cls, bound: BoundGeometry, base_width: float,
         extra_width: float = 0.0,
         start_cap: str = "round", end_cap: str = "round",
+        *, cache=None, tolerance=.125,
     ) -> QPainterPath:
-        """Build a filled, variable-width ribbon for an open path."""
-        if base_width <= 0 and extra_width <= 0:
-            return QPainterPath()
-        curve = cls.bound_path(bound)
-        if curve.isEmpty():
-            return QPainterPath()
-        samples: list[tuple[QPointF, float]] = []
-        approximate_length = 0.0
-        for first, second in zip(bound.nodes, bound.nodes[1:]):
-            chain = [
-                first.position,
-                first.outgoing or first.position,
-                second.incoming or second.position,
-                second.position,
-            ]
-            approximate_length += sum(
-                math.dist(a, b) for a, b in zip(chain, chain[1:])
-            )
-        steps = max(16, min(
-            1024, max(len(bound.nodes) * 16, math.ceil(approximate_length / 6))
-        ))
-        for index in range(steps + 1):
-            percent = index / steps
-            point = curve.pointAtPercent(percent)
-            node_position = percent * max(1, len(bound.nodes) - 1)
-            segment = min(len(bound.nodes) - 2, int(node_position))
-            fraction = node_position - segment
-            smooth = fraction * fraction * (3 - 2 * fraction)
-            first = bound.nodes[segment].width_multiplier
-            second = bound.nodes[segment + 1].width_multiplier
-            multiplier = first + (second - first) * smooth
-            samples.append((
-                point, max(0.1, base_width * multiplier + extra_width)
-            ))
-        left: list[QPointF] = []
-        right: list[QPointF] = []
-        for index, (point, width) in enumerate(samples):
-            previous = samples[max(0, index - 1)][0]
-            following = samples[min(len(samples) - 1, index + 1)][0]
-            dx, dy = following.x() - previous.x(), following.y() - previous.y()
-            length = math.hypot(dx, dy)
-            if length <= 1e-6:
-                if index == 0:
-                    dx = bound.nodes[1].x - bound.nodes[0].x
-                    dy = bound.nodes[1].y - bound.nodes[0].y
-                elif index == len(samples) - 1:
-                    dx = bound.nodes[-1].x - bound.nodes[-2].x
-                    dy = bound.nodes[-1].y - bound.nodes[-2].y
-                length = math.hypot(dx, dy)
-            if length <= 1e-6:
-                dx, dy, length = 1.0, 0.0, 1.0
-            normal = QPointF(-dy / length, dx / length) * (width / 2)
-            left.append(point + normal)
-            right.append(point - normal)
-        def endpoint_tangent(start: bool) -> QPointF:
-            endpoint = samples[0 if start else -1][0]
-            candidates = (
-                samples[1:] if start else reversed(samples[:-1])
-            )
-            for candidate, _width in candidates:
-                tangent = (
-                    candidate - endpoint if start
-                    else endpoint - candidate
-                )
-                if math.hypot(tangent.x(), tangent.y()) > 1e-6:
-                    return tangent
-            first, second = (
-                (bound.nodes[0], bound.nodes[1])
-                if start else (bound.nodes[-2], bound.nodes[-1])
-            )
-            fallback = QPointF(second.x - first.x, second.y - first.y)
-            return (
-                fallback
-                if math.hypot(fallback.x(), fallback.y()) > 1e-6
-                else QPointF(1, 0)
-            )
-
-        start_tangent = endpoint_tangent(True)
-        end_tangent = endpoint_tangent(False)
-        for points, tangent, cap, direction in (
-            ((left, right), start_tangent, start_cap, -1),
-            ((left, right), end_tangent, end_cap, 1),
-        ):
-            length = max(1e-6, math.hypot(tangent.x(), tangent.y()))
-            unit = QPointF(tangent.x() / length, tangent.y() / length)
-            target_index = 0 if direction < 0 else -1
-            width = samples[target_index][1]
-            if cap == "square":
-                offset = unit * (direction * width / 2)
-                left[target_index] += offset
-                right[target_index] += offset
-        # Shared by both endpoint branches.  A round start must not depend on
-        # the end cap also being round.
-        round_cap_kappa = 0.5522847498307936
-        mesh = QPainterPath()
-        mesh.setFillRule(Qt.WindingFill)
-        if start_cap == "point":
-            tangent = start_tangent
-            length = max(1e-6, math.hypot(tangent.x(), tangent.y()))
-            tip = samples[0][0] - tangent * (
-                samples[0][1] / 2 / length
-            )
-            mesh.moveTo(tip)
-        else:
-            mesh.moveTo(left[0])
-        for point in left:
-            mesh.lineTo(point)
-        if end_cap == "point":
-            tangent = end_tangent
-            length = max(1e-6, math.hypot(tangent.x(), tangent.y()))
-            mesh.lineTo(samples[-1][0] + tangent * (
-                samples[-1][1] / 2 / length
-            ))
-        elif end_cap == "round":
-            center = samples[-1][0]
-            radius = samples[-1][1] / 2
-            length = max(
-                1e-6, math.hypot(end_tangent.x(), end_tangent.y())
-            )
-            tangent = end_tangent / length
-            normal = left[-1] - center
-            normal_length = max(
-                1e-6, math.hypot(normal.x(), normal.y())
-            )
-            normal = normal / normal_length
-            outward = center + tangent * radius
-            mesh.cubicTo(
-                left[-1] + tangent * (round_cap_kappa * radius),
-                outward + normal * (round_cap_kappa * radius),
-                outward,
-            )
-            mesh.cubicTo(
-                outward - normal * (round_cap_kappa * radius),
-                right[-1] + tangent * (round_cap_kappa * radius),
-                right[-1],
-            )
-        for point in reversed(right):
-            mesh.lineTo(point)
-        if start_cap == "round":
-            center = samples[0][0]
-            radius = samples[0][1] / 2
-            length = max(
-                1e-6, math.hypot(start_tangent.x(), start_tangent.y())
-            )
-            tangent = start_tangent / length
-            normal = left[0] - center
-            normal_length = max(
-                1e-6, math.hypot(normal.x(), normal.y())
-            )
-            normal = normal / normal_length
-            outward_tangent = tangent * -1
-            outward = center + outward_tangent * radius
-            mesh.cubicTo(
-                right[0] + outward_tangent * (round_cap_kappa * radius),
-                outward - normal * (round_cap_kappa * radius),
-                outward,
-            )
-            mesh.cubicTo(
-                outward + normal * (round_cap_kappa * radius),
-                left[0] + outward_tangent * (round_cap_kappa * radius),
-                left[0],
-            )
-        mesh.closeSubpath()
-        return mesh
+        return core_mesh(bound, base_width, extra_width, start_cap, end_cap,
+                         cache=cache, tolerance=tolerance)
 
     @classmethod
     def layer_shape_path(cls, layer: LayerNode) -> QPainterPath:
@@ -3302,7 +2752,27 @@ class _CanvasLogic:
         return cls.bound_path(layer.bound, layer.vertex_radius)
 
     def _clear_compound_path_cache(self, *args) -> None:
-        self._compound_path_cache.clear()
+        # Styling is deliberately absent: width/color/visibility edits do not
+        # change the compound fill, its intersections, or its attribution.
+        signature = None if self.chapter is None else tuple(
+            (layer.layer_id, layer.parent_id, layer.visible,
+             layer.compound_enabled, layer.compound_operation,
+             tuple((r.kind, r.entity_id) for r in layer.children),
+             geometry_key(layer.bound) if layer.bound is not None else None,
+             layer.translate_x, layer.translate_y, layer.transform_frame,
+             tuple(layer.transform_quad or ()),
+             (layer.shape_style.base_thickness, layer.shape_style.start_cap,
+              layer.shape_style.end_cap,
+              tuple(n.width_multiplier for c in layer.bound.iter_contours() for n in c.nodes))
+             if layer.layer_kind == "open_shape" and layer.bound is not None else None,
+             tuple((m.axis_start, m.axis_end, m.muted, m.intensity > 0,
+                    m.compound_operation) for mid in layer.modifier_ids
+                   if isinstance(m := self.chapter.modifiers.get(mid), MirrorModifier)))
+            for layer in self.chapter.layers.values()
+        )
+        if signature != self._compound_geometry_signature:
+            self._compound_path_cache.clear()
+            self._compound_geometry_signature = signature
         self._asset_drag_clip_cache.clear()
 
     def _layer_operand_path(self, layer: LayerNode) -> QPainterPath:
@@ -3312,8 +2782,12 @@ class _CanvasLogic:
             return self.open_shape_mesh(
                 layer.bound, layer.shape_style.base_thickness, 0,
                 layer.shape_style.start_cap, layer.shape_style.end_cap,
+                cache=self._outline_cache,
             )
-        return self.bound_path(layer.bound, layer.vertex_radius)
+        return self._outline_cache.get(
+            ("fill", geometry_key(layer.bound)),
+            lambda: self.bound_path(layer.bound, layer.vertex_radius),
+        )
 
     def _document_layer_effective_path(
         self, document: ChapterDocument, layer_id: str,
@@ -4662,6 +4136,9 @@ class _CanvasLogic:
         if self.chapter is None or image.isNull():
             return
         painter = QPainter(image)
+        # Match canvas/bake shape coverage. Raster objects explicitly disable
+        # antialiasing in their own rendering branch and remain nearest-sampled.
+        painter.setRenderHint(QPainter.Antialiasing, True)
         painter.setCompositionMode(QPainter.CompositionMode_Source)
         if clip is not None:
             painter.setClipRect(clip)
@@ -4736,6 +4213,8 @@ class _CanvasLogic:
             core = self.open_shape_mesh(
                 layer.bound, style.base_thickness, 0,
                 style.start_cap, style.end_cap,
+                cache=self._outline_cache,
+                tolerance=self._outline_tolerance(painter, QRectF(*layer.bound.bbox())),
             )
             painter.fillPath(
                 core, QColor(style.primary_color or "#111111"),
@@ -4744,6 +4223,8 @@ class _CanvasLogic:
                 layer.bound, style.base_thickness,
                 style.outline_thickness * 2,
                 style.start_cap, style.end_cap,
+                cache=self._outline_cache,
+                tolerance=self._outline_tolerance(painter, QRectF(*layer.bound.bbox())),
             )
             painter.save()
             painter.setClipPath(clip_path, Qt.IntersectClip)
@@ -4762,12 +4243,13 @@ class _CanvasLogic:
                     )
             painter.restore()
             if style.outline_thickness > 0:
-                ring = (
-                    outline_mesh(layer.bound, style.outline_thickness, clip_path, core=core, base_width=style.base_thickness)
-                    if customized_outline(layer.bound) else clip_path.subtracted(core)
+                ring = outline_mesh(
+                    layer.bound, style.outline_thickness, clip_path,
+                    core=core, base_width=style.base_thickness,
+                    cache=self._outline_cache,
+                    tolerance=self._outline_tolerance(painter, QRectF(*layer.bound.bbox())),
+                    start_cap=style.start_cap, end_cap=style.end_cap,
                 )
-                if all(node.outline_multiplier == 1 for contour in layer.bound.iter_contours() for node in contour.nodes):
-                    ring = ring.intersected(clip_path)
                 painter.fillPath(ring, QColor(style.outline_color))
             for child in reversed(layer.children):
                 if not self._child_ignores_parent_mask(child):
@@ -4784,7 +4266,10 @@ class _CanvasLogic:
                     )
             painter.restore()
             return
-        layer_path = self.bound_path(layer.bound, layer.vertex_radius)
+        layer_path = self._outline_cache.get(
+            ("fill", geometry_key(layer.bound)),
+            lambda: self.bound_path(layer.bound, layer.vertex_radius),
+        )
         opacity = parent_opacity * layer_opacity
         if layer.fill_color:
             painter.save()
@@ -4816,10 +4301,11 @@ class _CanvasLogic:
             )
             painter.setPen(pen)
             painter.setBrush(Qt.NoBrush)
-            if customized_outline(layer.bound):
-                painter.fillPath(outline_mesh(layer.bound, layer.border_width, layer_path), QColor(layer.border_color))
-            else:
-                painter.drawPath(layer_path)
+            painter.fillPath(outline_mesh(
+                layer.bound, layer.border_width, layer_path,
+                cache=self._outline_cache,
+                tolerance=self._outline_tolerance(painter, layer_path.controlPointRect()),
+            ), QColor(layer.border_color))
             painter.restore()
         painter.restore()
         for child in reversed(layer.children):
@@ -4991,46 +4477,56 @@ class _CanvasLogic:
         painter.drawImage(bounds.topLeft(), processed)
         painter.restore()
 
-    def _compound_outline_mesh(self, layer, path):
-        """Retain attributed source-edge widths on surviving boolean boundaries."""
-        sources = []
+    def _compound_outline_mesh(self, layer, path, tolerance=.125):
+        """Attribute surviving compound boundaries, including reflected edges."""
         root_inverse, valid = self.layer_world_transform(layer.layer_id).inverted()
         if not valid:
-            return None
-        def collect(item):
+            return QPainterPath()
+
+        def operand_sources(item, post):
+            result = []
             if item.bound is not None:
-                sources.append(item)
-            for ref in item.children:
-                if ref.kind == "layer":
-                    child = self.chapter.layers[ref.entity_id]
-                    if child.visible and child.compound_operation != "ignore":
-                        collect(child)
-        collect(layer)
-        if not any(customized_outline(item.bound) for item in sources):
-            return None
-        stroker = QPainterPathStroker()
-        stroker.setWidth(layer.border_width * 2)
-        stroker.setJoinStyle(Qt.RoundJoin)
-        stroker.setCapStyle(Qt.RoundCap)
-        default = stroker.createStroke(path)
-        stroker.setWidth(1.5)
-        boundary = stroker.createStroke(path)
-        attributed, widths = QPainterPath(), QPainterPath()
-        for item in sources:
-            mapping = self.layer_world_transform(item.layer_id) * root_inverse
-            baseline = item.border_width
-            maximum = max(layer.border_width, baseline * max((n.outline_multiplier for c in item.bound.iter_contours() for n in c.nodes), default=1))
-            # A uniform attribution envelope removes the fallback even for hidden edges.
-            envelope = BoundGeometry.from_dict(item.bound.to_dict())
-            for contour in envelope.iter_contours():
-                for node in contour.nodes:
-                    node.outline_enabled, node.outline_multiplier = True, 1
-            accepts = lambda point, transform=mapping: boundary.contains(transform.map(point))
-            coverage = outline_mesh(envelope, maximum + 1, path, clip=False, boundary_filter=accepts)
-            mesh = outline_mesh(item.bound, baseline, path, clip=False, boundary_filter=accepts)
-            attributed = attributed.united(mapping.map(coverage))
-            widths = widths.united(mapping.map(mesh))
-        return default.subtracted(attributed).united(widths)
+                mapping = self.layer_world_transform(item.layer_id) * post * root_inverse
+                if item.layer_kind == "open_shape":
+                    source = ribbon_source(item.bound, item.border_width, mapping,
+                        item.shape_style.base_thickness, item.shape_style.start_cap,
+                        item.shape_style.end_cap, self._outline_cache)
+                    if source is not None:
+                        result.append(source)
+                else:
+                    result.append(OutlineSource(item.bound, item.border_width, mapping))
+            if item.compound_enabled:
+                result.extend(contributions(item, post))
+            return result
+
+        def contributions(parent, post):
+            result = []
+            for ref in parent.children:
+                if ref.kind != "layer":
+                    continue
+                child = self.chapter.layers[ref.entity_id]
+                if not child.visible:
+                    continue
+                if child.compound_operation != "ignore":
+                    result.extend(operand_sources(child, post))
+                # Mirror operates on incoming coverage, including earlier copies.
+                incoming = [QTransform()]
+                for mid in child.modifier_ids:
+                    modifier = self.chapter.modifiers.get(mid)
+                    if not isinstance(modifier, MirrorModifier) or modifier.muted or modifier.intensity <= 0:
+                        continue
+                    reflected = [t * reflection_transform(modifier) for t in incoming]
+                    if modifier.compound_operation != "ignore":
+                        for transform in reflected:
+                            result.extend(operand_sources(child, transform * post))
+                    incoming += reflected
+                if not child.compound_enabled:
+                    result.extend(contributions(child, post))
+            return result
+
+        sources = operand_sources(layer, QTransform())
+        return compound_outline(path, layer.border_width, sources,
+                                self._outline_cache, tolerance)
 
     def _render_compound_layer_contents(
         self, painter: QPainter, layer: LayerNode, parent_opacity: float,
@@ -5082,11 +4578,10 @@ class _CanvasLogic:
             )
             painter.setPen(pen)
             painter.setBrush(Qt.NoBrush)
-            customized = self._compound_outline_mesh(layer, layer_path)
-            if customized is None:
-                painter.drawPath(layer_path)
-            else:
-                painter.fillPath(customized, QColor(layer.border_color))
+            coverage = self._compound_outline_mesh(
+                layer, layer_path, self._outline_tolerance(painter, layer_path.controlPointRect()),
+            )
+            painter.fillPath(coverage, QColor(layer.border_color))
             painter.restore()
         for child in reversed(layer.children):
             if not self._child_ignores_parent_mask(child):
@@ -10483,6 +9978,15 @@ class _CanvasLogic:
             ]))
         painter.restore()
 
+    def _shape_handle_display_transform(self, node):
+        target = self._shape_edit_target()
+        transform = QTransform()
+        if target is not None and any(
+            candidate is node for c in target[0].iter_contours() for candidate in c.nodes
+        ):
+            transform = target[1]
+        return transform * self.camera_transform()
+
     def _shape_gizmo_positions(
         self, bound: BoundGeometry, node: PathNode,
         *, geometry_only: bool = False,
@@ -10490,7 +9994,7 @@ class _CanvasLogic:
         bound = self._contour_bound_for_node(bound, node)
         scale = max(self.scale, 0.05)
         index = bound.nodes.index(node)
-        previous = bound.nodes[index - 1] if index else bound.nodes[0]
+        previous = bound.nodes[index - 1] if index or bound.closed else bound.nodes[0]
         following = (
             bound.nodes[(index + 1) % len(bound.nodes)]
             if bound.closed or index + 1 < len(bound.nodes) else bound.nodes[-1]
@@ -10512,7 +10016,17 @@ class _CanvasLogic:
         if not bound.closed and not geometry_only:
             result["thickness"] = position + side
         if not geometry_only:
-            result["outline_width"] = position + normal * ((60 + node.outline_multiplier * 10) / scale)
+            display = self._shape_handle_display_transform(node)
+            inverse, valid = display.inverted()
+            origin = display.map(position)
+            direction = display.map(position + normal) - origin
+            length = math.hypot(direction.x(), direction.y())
+            if length <= 1e-9:
+                direction, length = QPointF(0, -1), 1.
+            result["outline_width"] = (
+                inverse.map(origin + direction / length * (60 + node.outline_multiplier * 10))
+                if valid else position
+            )
         if self._can_delete_shape_node(bound, node):
             result["delete"] = position + QPointF(
                 -44 * SHAPE_CONTROL_SCALE / scale,
@@ -10619,25 +10133,19 @@ class _CanvasLogic:
     def _nearest_shape_insert(
         self, bound: BoundGeometry, local: QPointF,
     ) -> tuple[int, float, QPointF] | None:
-        best: tuple[float, int, float, QPointF] | None = None
-        segment_count = (
-            len(bound.nodes) if bound.closed else len(bound.nodes) - 1
-        )
-        for segment in range(max(0, segment_count)):
-            for step in range(33):
-                percent = step / 32
-                point = self._shape_segment_point(bound, segment, percent)
-                distance = math.dist(
-                    (local.x(), local.y()), (point.x(), point.y())
-                )
-                if best is None or distance < best[0]:
-                    best = distance, segment, percent, point
-        if best is None or best[0] > (
-            10 * SHAPE_CONTROL_SCALE / max(self.scale, 0.05)
-        ):
+        cubics = raw_edge_cubics(bound)
+        hit = nearest_on_path(cubics, local, tolerance=.125 / max(self.scale, .05))
+        if hit is None:
             return None
-        _distance, segment, percent, point = best
-        return segment, percent, point
+        # Measure the hit in screen space, including the selected layer's
+        # projective mapping. Source paths stay hittable when their ink is hidden.
+        selected = self._shape_edit_target()
+        transform = selected[1] if selected is not None else QTransform()
+        display = transform * self.camera_transform()
+        delta = display.map(local) - display.map(QPointF(*hit.point))
+        if math.hypot(delta.x(), delta.y()) > 10 * SHAPE_CONTROL_SCALE:
+            return None
+        return hit.segment_index, hit.t, QPointF(*hit.point)
 
     @staticmethod
     def _shape_segment_point(
@@ -10734,6 +10242,10 @@ class _CanvasLogic:
                         (local.x(), local.y()),
                         (position.x(), position.y()),
                     ) <= hit_tolerance
+                    if name == "outline_width":
+                        display = self._shape_handle_display_transform(selected)
+                        delta = display.map(local) - display.map(position)
+                        hit = math.hypot(delta.x(), delta.y()) <= 12 * SHAPE_CONTROL_SCALE
                 if hit:
                     return {
                         "kind": "gizmo", "name": name,
@@ -10942,9 +10454,14 @@ class _CanvasLogic:
             painter.drawLine(QPointF(node.x, node.y), point)
             radius = 4.5 * SHAPE_CONTROL_SCALE / scale
             if name == "outline_width":
+                painter.save()
+                display_point = painter.combinedTransform().map(point)
+                painter.resetTransform()
+                painter.setPen(QPen(QColor("#FFBE00"), 2 * SHAPE_CONTROL_SCALE))
                 painter.setBrush(Qt.NoBrush)
-                painter.drawEllipse(point, radius + 2 / scale, radius + 2 / scale)
-                painter.setBrush(QColor("#ffffff"))
+                painter.drawEllipse(display_point, 4.5 * SHAPE_CONTROL_SCALE + 2,
+                                    4.5 * SHAPE_CONTROL_SCALE + 2)
+                painter.restore()
             elif name == "delete":
                 painter.drawEllipse(
                     point,
@@ -11869,12 +11386,31 @@ class _CanvasLogic:
             self.layer_shape_path(layer)
             if raw else self.layer_effective_path(layer_id)
         )
+        visual_coverage = False
+        if not raw and layer.border_width > 0:
+            if layer.compound_enabled:
+                path = self._compound_outline_mesh(layer, path)
+            elif layer.layer_kind == "open_shape":
+                style = layer.shape_style
+                core = core_mesh(layer.bound, style.base_thickness, 0,
+                                 style.start_cap, style.end_cap, cache=self._outline_cache)
+                path = QPainterPath(core)
+                path.addPath(outline_mesh(
+                    layer.bound, style.outline_thickness, core,
+                    core=core, base_width=style.base_thickness,
+                    start_cap=style.start_cap, end_cap=style.end_cap,
+                    cache=self._outline_cache))
+                path.setFillRule(Qt.WindingFill)
+            else:
+                path = outline_mesh(layer.bound, layer.border_width, path,
+                                    cache=self._outline_cache)
+            visual_coverage = True
         world_path = self.layer_world_transform(layer_id).map(path)
         stroker = QPainterPathStroker()
         stroker.setWidth(24.0 / max(self.scale, 0.05))
         border = stroker.createStroke(world_path)
         return border.contains(point) or (
-            layer.layer_kind == "open_shape" and world_path.contains(point)
+            (visual_coverage or layer.layer_kind == "open_shape") and world_path.contains(point)
         )
 
     def hit_test_shape_edit_layers(
@@ -12766,6 +12302,9 @@ class _CanvasLogic:
 
     def _update_interaction_cursor(self, widget_point: QPointF) -> None:
         """Resolve the canvas cursor identically for mouse and pen input."""
+        if self._active_shape_control == "outline_width":
+            self.setCursor(Qt.CrossCursor)
+            return
         if self.chapter is None:
             self.unsetCursor()
             return
@@ -12911,7 +12450,7 @@ class _CanvasLogic:
         world = self.widget_to_document(event.position())
         if self.tool == ToolKind.SHAPE_CREATE and self._creation_nodes:
             self._update_creation_hover(world)
-        elif self.tool == ToolKind.SHAPE_EDIT:
+        elif self.tool == ToolKind.SHAPE_EDIT and self._active_shape_control is None:
             self._update_shape_hover(world)
         input_started = time.perf_counter_ns()
         self._tool_move(event.position(), 1.0)
@@ -12933,10 +12472,12 @@ class _CanvasLogic:
             self._end_navigation(event.position())
             return
         if event.button() == Qt.LeftButton:
+            if self._active_shape_control == "outline_width":
+                self._outline_pending_point = self.widget_to_document(event.position())
             self._tool_release()
             self._update_interaction_cursor(event.position())
 
-    def mouseDoubleClickEvent(self, event: QMouseEvent) -> None:  # noqa: N802
+    def _reset_outline_width_at(self, widget_point):
         if self.tool == ToolKind.SHAPE_EDIT and self.chapter is not None:
             target = self._shape_edit_target()
             if target is not None:
@@ -12944,14 +12485,21 @@ class _CanvasLogic:
                 node = self._selected_shape_node(bound)
                 if node is not None and style is not None:
                     point = self._shape_gizmo_positions(bound, node).get("outline_width")
-                    if point is not None and math.dist(self.camera_transform().map(transform.map(point)).toTuple(), event.position().toTuple()) <= 12:
+                    if point is not None and math.dist(self.camera_transform().map(transform.map(point)).toTuple(), widget_point.toTuple()) <= 12:
+                        self._outline_edit_timer.stop()
+                        self._outline_pending_point = None
                         before = self._model_before or self.chapter.to_dict()
                         node.outline_multiplier = 1.0
                         self._model_before = None
                         self._active_shape_control = None
                         self._push_immediate_shape_change(before, "Reset point outline thickness")
-                        event.accept()
-                        return
+                        return True
+        return False
+
+    def mouseDoubleClickEvent(self, event: QMouseEvent) -> None:  # noqa: N802
+        if self._reset_outline_width_at(event.position()):
+            event.accept()
+            return
         if self._page_gap_draft is not None:
             event.accept()
             return
@@ -13229,7 +12777,7 @@ class _CanvasLogic:
         hover_world = self.widget_to_document(event.position())
         if self.tool == ToolKind.SHAPE_CREATE and self._creation_nodes:
             self._update_creation_hover(hover_world)
-        elif self.tool == ToolKind.SHAPE_EDIT:
+        elif self.tool == ToolKind.SHAPE_EDIT and self._active_shape_control is None:
             self._update_shape_hover(hover_world)
         nav = self._navigation_mode()
         if event.type() == QEvent.TabletPress:
@@ -13276,10 +12824,25 @@ class _CanvasLogic:
                     self._last_gradient_tablet_tap = None
                 self._pen_contact_active = True
                 self._tablet_tool_active = True
+                now = time.monotonic()
+                previous = self._last_outline_tablet_tap
+                if (self.tool == ToolKind.SHAPE_EDIT and previous is not None
+                        and now-previous[0] <= .45
+                        and math.dist(event.position().toTuple(), previous[1].toTuple()) <= 12
+                        and self._reset_outline_width_at(event.position())):
+                    self._last_outline_tablet_tap = None
+                    self._pen_contact_active = self._tablet_tool_active = False
+                    event.accept()
+                    return
+                self._last_outline_tablet_tap = (now, QPointF(event.position()))
                 self._dispatch_tool_press(
                     event.position(), event.pressure(), event.modifiers()
                 )
         elif event.type() == QEvent.TabletMove:
+            if (self._last_outline_tablet_tap is not None and math.dist(
+                event.position().toTuple(), self._last_outline_tablet_tap[1].toTuple()
+            ) > 3):
+                self._last_outline_tablet_tap = None
             if self._nav_mode:
                 self._queue_navigation_update(event.position())
             elif self._pen_contact_active:
@@ -13305,6 +12868,8 @@ class _CanvasLogic:
             elif self._pen_contact_active:
                 self._pen_contact_active = False
                 self._tablet_tool_active = False
+                if self._active_shape_control == "outline_width":
+                    self._outline_pending_point = self.widget_to_document(event.position())
                 self._tool_release()
         if self._nav_mode is None:
             self._update_interaction_cursor(event.position())
@@ -19573,7 +19138,12 @@ class _CanvasLogic:
             and self.selected_kind == "layer"
             and self._active_shape_control is not None
         ):
-            self._update_shape_edit(point)
+            if self._active_shape_control == "outline_width":
+                self._outline_pending_point = QPointF(point)
+                if not self._outline_edit_timer.isActive():
+                    self._outline_edit_timer.start(16)
+            else:
+                self._update_shape_edit(point)
             return
         if (
             self.tool == ToolKind.BOUND_EDIT
@@ -19620,6 +19190,7 @@ class _CanvasLogic:
             self._update_shape_hover(point)
 
     def _tool_release(self) -> None:
+        self._flush_outline_edit()
         if self._page_gap_draft is not None:
             self._finish_page_gap_interaction()
             return
@@ -20454,6 +20025,12 @@ class _CanvasLogic:
                 self._active_shape_control = name
                 self._drag_start_doc = QPointF(world_point)
                 self._shape_control_dragged = False
+                if name == "outline_width":
+                    display = self._shape_handle_display_transform(selected)
+                    handle = self._shape_gizmo_positions(bound, selected)["outline_width"]
+                    direction = display.map(handle) - display.map(QPointF(*selected.position))
+                    self._outline_drag_axis = direction / max(1e-9, math.hypot(direction.x(), direction.y()))
+                    self._outline_drag_start_width = selected.outline_multiplier
                 if name == "translate" and self.selected_kind == "layer":
                     layer = self.chapter.layers[self.selected_id]
                     self._drag_start_value = {
@@ -20589,8 +20166,9 @@ class _CanvasLogic:
         start = bound.nodes[index]
         end = bound.nodes[(index + 1) % len(bound.nodes)]
         percent = max(0.001, min(0.999, percent))
+        outline_fraction = outline_fraction_at(bound, index, percent)
         attributes = dict(
-            outline_multiplier=start.outline_multiplier * (1 - percent) + end.outline_multiplier * percent,
+            outline_multiplier=start.outline_multiplier * (1 - outline_fraction) + end.outline_multiplier * outline_fraction,
             outline_enabled=start.outline_enabled,
             width_multiplier=start.width_multiplier * (1 - percent) + end.width_multiplier * percent,
         )
@@ -20639,7 +20217,7 @@ class _CanvasLogic:
         layer = self.chapter.layers[self.selected_id]
         bound = layer.bound
         before = self.chapter.to_dict()
-        bound.primitive = "custom"
+        make_custom(bound)
         contour = (
             PathContour(bound.nodes, bound.closed)
             if contour_index == 0
@@ -20668,7 +20246,7 @@ class _CanvasLogic:
                 layer = self.chapter.layers.get(toggle[0])
                 if layer is not None:
                     before = self.chapter.to_dict()
-                    layer.bound.primitive = "custom"
+                    make_custom(layer.bound)
                     layer.bound.nodes[toggle[1]].outline_enabled = not layer.bound.nodes[toggle[1]].outline_enabled
                     self._push_immediate_shape_change(before, "Toggle segment outline")
             return
@@ -20686,12 +20264,19 @@ class _CanvasLogic:
             index, percent, insert_point, world_point
         )
 
+    def _flush_outline_edit(self):
+        self._outline_edit_timer.stop()
+        point, self._outline_pending_point = self._outline_pending_point, None
+        if point is not None and self._active_shape_control == "outline_width":
+            self._update_shape_edit(point)
+
     def _update_shape_edit(self, world_point: QPointF) -> None:
         target = self._shape_edit_target()
         if target is None:
             return
         dirty_before = entity_visual_bounds(
-            self.chapter, self.tiles, self.selected_kind, self.selected_id
+            self.chapter, self.tiles, self.selected_kind, self.selected_id,
+            geometry_cache=self._outline_cache,
         )
         bound, transform, _style = target
         inverse, valid = transform.inverted()
@@ -20847,10 +20432,9 @@ class _CanvasLogic:
                 bound, selected, control, target
             )
         elif control == "outline_width" and selected is not None:
-            direction = self._shape_gizmo_positions(bound, selected)["outline_width"] - QPointF(*selected.position)
-            direction /= max(1e-6, math.hypot(direction.x(), direction.y()))
-            distance = QPointF.dotProduct(local - QPointF(*selected.position), direction) * self.scale
-            selected.outline_multiplier = max(0.0, min(10.0, (distance - 60) / 10))
+            delta = self.document_to_widget(world_point) - self.document_to_widget(self._drag_start_doc)
+            distance = QPointF.dotProduct(delta, self._outline_drag_axis)
+            selected.outline_multiplier = max(0., min(10., self._outline_drag_start_width + distance / 10))
         elif control == "thickness" and selected is not None:
             positions = self._shape_gizmo_positions(bound, selected)
             origin = QPointF(selected.x, selected.y)
@@ -20925,9 +20509,11 @@ class _CanvasLogic:
                                 node.outgoing[0] + dx,
                                 node.outgoing[1] + dy,
                             )
-        bound.normalize_bezier_handles()
+        if control != "outline_width":
+            bound.normalize_bezier_handles()
         dirty_after = entity_visual_bounds(
-            self.chapter, self.tiles, self.selected_kind, self.selected_id
+            self.chapter, self.tiles, self.selected_kind, self.selected_id,
+            geometry_cache=self._outline_cache,
         )
         dirty = self._entity_expanded_dirty(
             self.selected_kind, self.selected_id,

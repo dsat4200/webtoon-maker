@@ -82,6 +82,14 @@ Nodes record `outline_multiplier` (finite, clamped 0–10, default 1) independen
 from open-path core width, and `outline_enabled` (default true) for the outgoing
 edge. Chapter/asset cloning and model undo retain these fields.
 
+The real-time outline renderer does not change schema 22. Compiled contours,
+stroke meshes, boundary attribution, and precision/cache keys are transient and
+are never persisted. Existing multipliers/flags continue to load unchanged.
+Splitting an edge interpolates its outline width by arc distance and copies its
+enabled state to both halves; deleting an anchor enables the joined edge only
+when both replaced edges were enabled. Baseline-zero and double-click/tap reset
+do not remove any other node attributes.
+
 On loading a pre-22 chapter only, an opaque-white background is migrated to
 `#00000000`. Page fills and nonwhite backgrounds are preserved. Schema-22 white
 backgrounds are intentional and are not migrated again.

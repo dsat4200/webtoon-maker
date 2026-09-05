@@ -396,7 +396,8 @@ def _object_local_bounds(obj: DocumentObject, document: ChapterDocument,
 
 
 def entity_visual_bounds(document: ChapterDocument, tiles: TileStore,
-                         kind: str, entity_id: str, *, include_effects=False) -> QRectF:
+                         kind: str, entity_id: str, *, include_effects=False,
+                         geometry_cache=None) -> QRectF:
     """Return a conservative world-space bound for an entity subtree."""
     def expanded(rect, target, parent_id):
         if not include_effects:
@@ -419,24 +420,31 @@ def entity_visual_bounds(document: ChapterDocument, tiles: TileStore,
     result = QRectF()
     found = False
     if layer.bound is not None:
-        left, top, width, height = layer.bound.bbox()
-        padding = layer.shape_style.outline_thickness * max(
-            (node.outline_multiplier for contour in layer.bound.iter_contours() for node in contour.nodes), default=1.0
-        )
+        # Import lazily: these geometry-only helpers do not depend on Canvas.
+        from comic_editor.ui.shape_contours import bound_path, geometry_key
+        from comic_editor.ui.shape_outline import core_mesh, outline_result
         if layer.layer_kind == "open_shape":
-            maximum = max(
-                (node.width_multiplier for node in layer.bound.nodes),
-                default=1.0,
+            style = layer.shape_style
+            core = core_mesh(layer.bound, style.base_thickness, 0,
+                             style.start_cap, style.end_cap, cache=geometry_cache)
+            outline = outline_result(
+                layer.bound, style.outline_thickness, core,
+                core=core, base_width=style.base_thickness,
+                start_cap=style.start_cap, end_cap=style.end_cap,
+                cache=geometry_cache,
             )
-            padding += layer.shape_style.base_thickness * maximum / 2
-        result = _mapped_rect(world_transform, QRectF(
-            left - padding, top - padding,
-            max(1.0, width + padding * 2), max(1.0, height + padding * 2),
-        ))
+            local = core.boundingRect().united(outline.bounds)
+        else:
+            fill = (geometry_cache.get(("fill", geometry_key(layer.bound)),
+                    lambda: bound_path(layer.bound)) if geometry_cache is not None
+                    else bound_path(layer.bound))
+            local = fill.boundingRect()
+        result = _mapped_rect(world_transform, local)
         found = True
     for child in layer.children:
         child_bounds = entity_visual_bounds(
-            document, tiles, child.kind, child.entity_id, include_effects=include_effects
+            document, tiles, child.kind, child.entity_id, include_effects=include_effects,
+            geometry_cache=geometry_cache,
         )
         result = child_bounds if not found else result.united(child_bounds)
         found = True

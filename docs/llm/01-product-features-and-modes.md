@@ -61,7 +61,7 @@ The application intentionally does not implement scheduling, reference libraries
 - Child rendering is clipped without modifying the child data. Nested masks intersect naturally through recursive painter clipping.
 - A child may **Ignore direct parent mask**. It is then rendered after the parent's fill/outline, outside that immediate mask, while still remaining inside higher ancestors.
 - A layer can enable **Compound shape**. Its own path and descendant construction paths are combined using **Add**, **Subtract**, or **Ignore** operations.
-- A compound parent supplies the visible fill, outline, visibility, and opacity. Contributor styling is construction-only.
+- A compound parent supplies the visible fill, outline color, visibility, and opacity. Surviving source edges retain their own baseline-relative outline widths and enabled/hidden state, including reflected contributors; unattributed boundaries use the compound baseline.
 - Open shapes contribute their core stroke silhouette to a compound.
 - An ignored branch is isolated from the compound and renders normally.
 - New contributors default to Add. A selected or drafted active contributor receives an Add/Subtract/Ignore cycle button; a free-shape draft is treated as open and previews its prospective Boolean result before commit.
@@ -86,7 +86,10 @@ The application intentionally does not implement scheduling, reference libraries
 - Raster-only selections expose per-stage **Apply**, baking the active prefix while retaining muted/later stages and other targets' links. **Rasterize** replaces an object/non-page subtree with one Image, including its own effects, masks, and opacity but retaining inherited clipping/opacity separately. Both operations are undoable with resources.
 - Export As chooses a named full-resolution PNG; Export Again overwrites the remembered per-chapter destination or opens Export As. Local settings retain destinations across restarts only after successful atomic export. Timestamped Export PNG is unchanged.
 - Chapters default to transparent, with alpha-preserving page fills. All color dialogs share the full Picker/Palette/History interface with transactional Apply/Cancel and a temporary canvas eyedropper.
-- Custom-path anchors carry a 0–10 outline multiplier and outgoing-edge visibility. Hollow circle handles edit/reset width relative to Outline px; Shift-edge clicks toggle outlines only. These edits support open/closed shapes, pages, and additional contours.
+- Custom-path anchors carry a continuous 0–10 outline multiplier and outgoing-edge visibility. The hollow circular handle changes width relative to **Outline px**; double-click or double-tap resets it to 1×. A zero layer baseline hides the entire outline without erasing point settings.
+- Shift-clicking an edge toggles only that edge's outline. Hidden edges remain editable, and exposed breaks have **rounded ends**. Closed outlines, including compound outlines, stay inside the fill. Open shapes keep their independent core widths and point/square/round outer endpoint caps.
+- Width varies by distance along each edge, including Bézier curves and rounded corners. A rounded corner is shared equally between its two adjacent logical edges; hiding an edge removes its corner halves. Open/closed shapes, pages, holes, and additional contours use the same outline engine.
+- Rectangle/ellipse edits first request conversion to a custom path; ellipse conversion preserves the curve. Outline handles and hit areas stay screen-sized through layer transforms. Width drags coalesce pointer packets per frame, flush the final release position, and create one undo command without changing quality at release.
 - **HSL** shifts hue (−180…180), saturation (−100…100), and lightness (−100…100).
 - **Blur** applies a strength in pixels, either **Full** or **Focal** (center, radius, ramp, and angle define a smooth falloff).
 - **Outline** draws an outside halo with thickness, opacity, and a canonical color. It reserves up to a 100-document-pixel halo.

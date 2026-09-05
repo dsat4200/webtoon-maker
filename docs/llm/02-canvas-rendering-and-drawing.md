@@ -68,7 +68,7 @@ Layer opacity is multiplied through recursion. An object's `opacity_locked` dete
 
 ## Shape path construction
 
-`BoundGeometry` is converted to `QPainterPath` by `bound_path()` and `_single_bound_path()`.
+`shape_contours.py` compiles `BoundGeometry` into shared fill paths and source-attributed logical edges. The canvas `bound_path()` and `_single_bound_path()` entry points delegate to this builder; rounded geometry is no longer independently reconstructed for outlines.
 
 - Ellipses have a primitive fast path based on four cubic nodes.
 - Straight and cubic segments are supported in the same path.
@@ -77,7 +77,7 @@ Layer opacity is multiplied through recursion. An object's `opacity_locked` dete
 - Unlocked Bezier rounding uses shared tangent construction for a smooth C1 join.
 - De Casteljau subdivision is used when inserting/splitting curve segments.
 
-Open shapes use `open_shape_mesh()` rather than a fixed-width QPen. The centerline is sampled (up to 1024 steps), width multipliers are interpolated between nodes, normals generate left/right ribbon edges, and explicit point/square/round cap geometry closes the mesh. A zero-width core is empty, though extra outline width can still form a visible ribbon. That same core silhouette can be used as a compound operand.
+Open shapes use `core_mesh()` through the canvas `open_shape_mesh()` adapter. Core widths preserve their eased interpolation, now measured by arc distance on each logical edge, and retain point/square/round endpoint caps. Independent contours never connect to each other. The core, expanded child mask, outline subtraction, visual bounds, and compound operands share the same centerline. A zero-width core is empty; outline width can still form a visible ribbon.
 
 ### Compound paths
 
@@ -121,10 +121,35 @@ the retained incoming source even when it lies outside the output region.
 Raster sources use nearest sampling. Both cache families remain bounded.
 Individual effect images have a 64-megapixel allocation guard.
 
-`shape_outline.py` generates interpolated outline strips for edited paths;
-unmodified paths preserve the existing cap/join rendering. Outgoing visibility
-does not alter fill/hit geometry. Edited compound boundary strips retain
-source-edge attributes and use baseline fallback on unattributed portions.
+`shape_outline.py` renders both default and edited outlines:
+
+- Constant-width connected runs use native round stroking (a closed run has no end caps). Long uniform line runs receive bounded-error simplification for rendering only; source anchors remain unchanged.
+- Variable-width edges use adaptive strips, analytical curve normals, and arc-distance width interpolation. Rounded-corner halves belong to adjacent edges. Joins/caps are generated at real boundaries, not at every tessellation sample.
+- Positive winding batches all pieces. Binary-exact subpixel coordinate snapping makes shared arc/strip vertices identical, then a single normalization before clipping avoids Qt's overlapping-path intersection failure; incremental boolean unions are forbidden. Coverage is painted once, so overlap cannot double alpha. Connected variable widths get outer round-join sectors, not full endpoint disks that would create width bulges.
+- Closed coverage clips inside the fill. Open coverage subtracts the core and preserves its configured outer endpoint caps; hidden-edge breaks are round. Fill/mask topology never depends on outline visibility.
+- Precision follows output scale, including projective stretch, in stable power-of-two buckets. Boolean normalization/clipping runs in scaled coordinates. Regression tests compare variable-curve boundaries to a finer reference with a 0.25-output-pixel limit through 16× zoom.
+- Raw source-edge hit testing is separate from painted coverage. Continuous closest-point projection replaces the old 33-sample hit test, so long or transformed hidden edges remain hittable.
+
+`shape_outline_compound.py` splits final boundaries into attributed source spans using adaptive segment overlap/intersection endpoints and a spatial index. Adjacent spans are rejoined before stroking. Source widths/visibility survive subtraction and independent Mirror contributions; unmatched spans use the compound baseline. Attribution is cached independently of styling; it no longer uses a fixed 1.5-unit envelope.
+
+Open compound contributors attribute their normalized core ribbon surface to its originating edge strips and half-join sectors, rather than matching the final boundary to a distant centerline. The cached surface keeps independent endpoint arc weights and outgoing-edge ownership, so hidden edges and changing outline widths propagate to both sides without rebuilding the core.
+
+Each canvas owns one 64 MiB `OutlineCache`, with conservative key/path accounting and LRU eviction. It separately caches compiled contours, fill/core geometry, constant runs/variable edges, compound attribution, and outline results/bounds. Width edits reuse unchanged contours and nonincident stroke geometry; colors are absent from geometry keys. Width-only notifications preserve compound fill caches. Document replacement clears outline caches. Pointer packets during width drags coalesce at 16 ms; release applies its exact final position synchronously. Dirty bounds include old/new geometry, effects, ancestors, and mask dependants.
+
+Canvas, preview/PNG, rendered-alpha masks, rasterization, and asset bounds consume this shared geometry. Preview shape antialiasing matches canvas/baking; Raster objects still explicitly disable antialiasing and retain nearest sampling.
+
+Local offscreen Qt 6.11.1 measurements (2026-09-05; warmed medians, not CI assertions):
+
+| Scene | Measured edit/render time | Retained outline cache after benchmark |
+| --- | --- | --- |
+| Reported seven-point shape, outline rebuild | 0.71 ms (previous renderer: 224–250 ms with missing edges) | 1.34 MiB |
+| 100-anchor shape, full 1080×600 preview | 3.67 ms | 2.89 MiB |
+| 1,000-anchor shape, full preview | 19.10 ms; above a strict 60 Hz budget | 27.22 MiB |
+| Compound with 20 cutouts, full preview | 8.95 ms warm / 19.99 ms cold | 2.05 MiB |
+
+The seven-point benchmark compiled one contour and rebuilt two incident edge strokes per edit (160 edge builds for 80 distinct widths). The 20-cutout benchmark built boundary attribution once across all style edits. Cache-budget tests exercise eviction and explicit clearing, not just a small-scene peak.
+
+Run `python -m pytest -o addopts='' -q -s tests/test_realtime_shape_outlines.py -k benchmark` to reproduce timings, cache bytes, and rebuild counts. These figures exclude hardware/display latency and are not a guarantee for arbitrarily complex documents.
 
 `baking.py` prepares images/tiles before replacing graph data. Rasterize renders
 one pixel per document pixel, then embeds a positioned Image. Apply keeps
