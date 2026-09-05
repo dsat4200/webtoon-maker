@@ -1,3 +1,32 @@
+
+add:
+- [x] ability to export as (to a specific path/name like save as but for png exports)
+- [x] add an "export again" option that exports png to the same export as that you did before. if the user hasn't exported that chapter as yet, it should bring up the export as dialogue.
+- [x] add an outline thickness handle to shape points (make it open circle shaped)
+	- double clicking the thickness handle reverts to the default thickness
+	- outline px in layer settings is treated as the default / baseline
+- [x] if the user holds shift while clicking a line between points, instead of adding a point, it should toggle the outline of that line (between points) on and off. 
+- [x] a "rasterize" button to the right click menu of any object. this applies modifiers and flattens into one image object.
+- [x] "apply" button to modifier stack that applies changes the modifier made. should only be visible on raster objects though.
+
+change:
+- [x] fill and outline color pickers should use the picker we made in the bottom left (including tabs for pallette and history, and the hex, copy paste, eyedropper, primary and secondary colors)
+	- [x] all color fields that use a color picker dialogue should use this picker.
+- [x] page fills should support transparency. if a page fill is transparent, the image export should respect that transparency.
+	- as such, treat the "chapter" background itself as transparent by default.
+- [x] add a "mirror" modifier
+	- allows the user to mirror by a line. mirror modifier should have gizmos that allow the user to modify the line's 2 points. line point transformation should respect grid snapping if its on. Line edit should allow the user to transform these 2 points by dragging, but also provide a handle that drags both. orange dotted lines should extend through the 2 lines to show the full mirror axis.
+	- if the mirror modifier is on a shape, add a dropdown to give it compound shape options (ignore, add, subtract) in case the user wants the shape mirror to contribute.
+	- should work in vector and raster too
+	- should be optimized and high-performance
+- [x] modifier selection
+	- a modifier can now be "selected" if the user clicks it in the modifier stack.
+	- of course, deselecting the object clears that selection. so does clicking the modifier again.
+	- while a modifier is selected, its gizmos should be visible. for now, that's just the mirror modifier
+	- while selected, show a blue border around the modifier.
+	- only one modifier can be selected at a time.
+
+
 bug
  - [x] if i map something to backspace, backspace no longer works in text mode
  - [x] convert to shape button only works with mouse, doesn't with stylus
