@@ -80,14 +80,14 @@ class ChapterPreview(QWidget):
                 max(1, preview_rect.width()), max(1, preview_rect.height()),
                 QImage.Format_ARGB32_Premultiplied,
             )
-            self.canvas.render_preview(self._cache)
+            self._render_live_preview(self._cache)
             self._dirty_full = False
             self._dirty_bands.clear()
         elif self._dirty_bands:
             dirty = self._dirty_bands.pop()
             while self._dirty_bands:
                 dirty = dirty.united(self._dirty_bands.pop())
-            self.canvas.render_preview(self._cache, dirty)
+            self._render_live_preview(self._cache, dirty)
         painter.drawImage(preview_rect, self._cache)
         top_fraction, height_fraction = self.canvas.viewport_fraction()
         handle_height = min(
@@ -104,6 +104,17 @@ class ChapterPreview(QWidget):
         painter.setPen(QPen(QColor("#80c8ff"), 2))
         painter.setBrush(QColor(128, 200, 255, 35))
         painter.drawRect(handle)
+
+    def _render_live_preview(self, image, clip=None):
+        previous = self.canvas._interactive_render
+        channel = getattr(self.canvas, "_effect_preview_channel", "canvas")
+        self.canvas._interactive_render = True
+        self.canvas._effect_preview_channel = "navigator"
+        try:
+            self.canvas.render_preview(image, clip)
+        finally:
+            self.canvas._interactive_render = previous
+            self.canvas._effect_preview_channel = channel
 
     def mousePressEvent(self, event: QMouseEvent) -> None:  # noqa: N802
         if event.button() == Qt.LeftButton:

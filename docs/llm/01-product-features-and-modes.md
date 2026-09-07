@@ -84,19 +84,35 @@ The application intentionally does not implement scheduling, reference libraries
 - Mirror retains the incoming image plus its reflection, original on top. Axis endpoints and midpoint are draggable with the active grid. Shape reflections independently Ignore/Add/Subtract into their nearest compound parent. Sole-target transforms carry the axis; shared links keep one document-space axis.
 - Card background/title clicks toggle the canvas-owned selected modifier ID and blue border. Controls and reordering do not select. Mirror and focal Blur handles are shown only for that selected, unmuted modifier. Changing targets/documents clears selection.
 - Raster-only selections expose per-stage **Apply**, baking the active prefix while retaining muted/later stages and other targets' links. **Rasterize** replaces an object/non-page subtree with one Image, including its own effects, masks, and opacity but retaining inherited clipping/opacity separately. Both operations are undoable with resources.
-- Export As chooses a named full-resolution PNG; Export Again overwrites the remembered per-chapter destination or opens Export As. Local settings retain destinations across restarts only after successful atomic export. Timestamped Export PNG is unchanged.
+- Export As chooses a named full-resolution PNG; Export Again overwrites the remembered per-chapter destination or opens Export As. Opening an external image creates a same-stem project beside it and immediately remembers the source filename; Export Again preserves its format. Image documents keep native dimensions and transparent backgrounds. Later launches reopen the existing tab/project without replacing edits. The Windows executable supports Blender's built-in Edit Externally command. Timestamped Export PNG is unchanged.
 - Chapters default to transparent, with alpha-preserving page fills. All color dialogs share the full Picker/Palette/History interface with transactional Apply/Cancel and a temporary canvas eyedropper.
 - Custom-path anchors carry a continuous 0–10 outline multiplier and outgoing-edge visibility. The hollow circular handle changes width relative to **Outline px**; double-click or double-tap resets it to 1×. A zero layer baseline hides the entire outline without erasing point settings.
 - Shift-clicking an edge toggles only that edge's outline. Hidden edges remain editable, and exposed breaks have **rounded ends**. Closed outlines, including compound outlines, stay inside the fill. Open shapes keep their independent core widths and point/square/round outer endpoint caps.
 - Width varies by distance along each edge, including Bézier curves and rounded corners. A rounded corner is shared equally between its two adjacent logical edges; hiding an edge removes its corner halves. Open/closed shapes, pages, holes, and additional contours use the same outline engine.
 - Rectangle/ellipse edits first request conversion to a custom path; ellipse conversion preserves the curve. Outline handles and hit areas stay screen-sized through layer transforms. Width drags coalesce pointer packets per frame, flush the final release position, and create one undo command without changing quality at release.
 - **HSL** shifts hue (−180…180), saturation (−100…100), and lightness (−100…100).
-- **Blur** applies a strength in pixels, either **Full** or **Focal** (center, radius, ramp, and angle define a smooth falloff).
+- **Blurs** is a native cascading submenu (mouse, keyboard, and stylus): **Blur**, **Blur Legacy**, and **Radial Blur**. Blur applies a strength in pixels, either **Full** or **Focal** (center, radius, ramp, and angle define a smooth falloff). Legacy preserves the original distorted transparency effect; normal Blur keeps colors and alpha correctly premultiplied.
+- **Radial Blur** averages circular rotation symmetrically around a document-space center. Angle is 0–360° (default 15°, zero is identity), adjustable in the card or with the selected modifier's angle handle. The center handle snaps to the grid. Angle and intensity support masks; linking, mute, removal, Raster Apply, and Rasterize use the standard modifier workflow. Only the selected unmuted modifier shows its center/angle handles and sweep arc. Moving a sole target carries the center; shared targets keep one common center.
 - **Outline** draws an outside halo with thickness, opacity, and a canonical color. It reserves up to a 100-document-pixel halo.
 - Each modifier has an intensity (0–100) that blends its effect into the stack. Intensity and per-type parameters can each bind a parameter mask.
 - Every modifier card has a persistent eye/mute control. A muted modifier keeps its stack position, settings, masks, and links, but is omitted from canvas, preview, save/export rendering, effect bounds, and focal controls; a completely muted stack bypasses modifier isolation unless an opacity mask still needs it.
 - An active Outline on a shape can render outside that shape's own boundary. The result remains clipped by ancestor shapes and page/document limits.
 - The stack applies in card order, and the rendered result is isolated from the rest of the scene so modifiers never disturb sibling content.
+
+## Cage Transform
+
+- **Cage Transform** directly edits selected raster/vector drawings in one
+  undoable operation. For images/Blender images/shapes it opens Modifiers and
+  adds a shared non-destructive cage. Shape cages include all descendants;
+  original image bytes are retained. Mixed incompatible selections fail atomically
+  with named errors and red outliner highlights, as do other modifier additions
+  and link edits with unsupported targets.
+- Tool and modifier share lattice counts, smoothness, interpolation, flip
+  buttons, multi-point selection, outer free/uniform handles, translation,
+  rotation, pivot, and OK/Cancel. Modifier cards can be selected only in
+  Modifiers mode; blue selection and handles hide outside that mode while
+  remembered selection survives object deselection and project tab changes.
+- [Feature details and hardware measurements](../cage-transform.md).
 
 ## Raster drawing features
 
@@ -146,6 +162,9 @@ The Fill tool now targets shapes and raster content; owned vector fills no longe
 ## Text features
 
 - **Add Text** creates and selects a text object from the active preset, enters an active Text Edit session, focuses the canvas, and selects the complete `Text` placeholder so immediate typing replaces it. Creation and editing remain separate undo commands.
+- **Free Text Container** enters placement: click for a 360×120 text box or drag its bounds. The container and first box are one undo step; Escape before placement changes nothing. Add Text while the container or one of its boxes is selected places another independently editable box. Containers have no shape geometry or own clipping boundary, but inherit ancestor transforms, clipping, and opacity. They support visibility, modifiers/masks, hierarchy moves, assets, duplication, deletion, and Rasterize. Rasterize the container as a whole; its children must remain Text objects.
+- **Bounds / Stretch** is a screen-sized toggle on free boxes and containers, also available in Tool Settings. Bounds resizes the wrapping rectangle along its existing local axes without scaling the font. Resizing a container proportionally repositions and resizes its child layouts independently. Stretch deforms the rendered text with the existing projective cage. Both allow rotation and translation; switching modes changes no pixels and is undoable. New boxes and strict-to-free conversions default to Bounds; legacy free boxes retain Stretch.
+- Strict-to-free conversion resolves the current layout into both its logical dimensions and placement, discarding stale free quads. Select prioritizes text anywhere inside its visible box (including whitespace), preserving front-to-back text ordering and Ctrl overlap selection; explicit gizmos still win.
 - Text selection/caret drawing, drag selection, clipboard operations, keyboard editing, and IME input are implemented on the canvas.
 - One Text Edit session has its own local history and commits as one document-level undo command.
 - The outliner label is derived from the first 16 normalized characters of content and is not separately renamed.
@@ -155,7 +174,7 @@ The Fill tool now targets shapes and raster content; owned vector fills no longe
 - Text drag-selection updates character highlighting live. Double-click selects a word, triple-click selects the entire box, and the selected box uses an I-beam cursor away from higher-priority controls.
 - **Strict** layout wraps and clips text to the selected direct or compound shape bounds with a uniform margin. Edge-midpoint dragging edits the margin.
 - **Free** layout uses a four-point projective quad. It supports the shared eight-handle transform, rotation, pivot, and 3×3 alignment within its local transformed rectangle. Dragging the dotted boundary translates the object while the interior remains available for text selection.
-- A free-text drag caches the scene without the selection and rasterizes the selected text once at device-aware resolution (capped at 8192 pixels on a side). Pointer moves reproject that image through the live quad; commit/cancel returns to normal high-quality text layout.
+- Bounds drags re-layout the text live; they never stretch a cached image. Stretch/translation/rotation can reuse a device-aware text image when there are no ancestor effects or opacity masks; otherwise the shared scene renderer updates the effects too. Pointer updates coalesce per frame and release synchronously applies the final position. Each gesture is one undo step, separate from typing.
 - Double-clicking a transformed free text object re-enters Text Edit at the clicked position.
 
 ## Gradient features
@@ -219,7 +238,7 @@ The Fill tool now targets shapes and raster content; owned vector fills no longe
 
 ## Canonical canvas tools
 
-`ToolKind` has 23 distinct names. Two are aliases, not additional tools, so there are 21 distinct tool values.
+`ToolKind` has 25 distinct names. Two are aliases, not additional tools, so there are 23 distinct tool values.
 
 | Tool value | UI/context | Behavior and availability |
 | --- | --- | --- |
@@ -231,6 +250,7 @@ The Fill tool now targets shapes and raster content; owned vector fills no longe
 | `gradient` | Gradient; G | Drag-creates a color-fill gradient child on the selected or hovered bounded layer, or edits a selected gradient's field geometry. |
 | `text_edit` | Text Edit | Selects and edits existing text on the active page; text creation is the separate Add Text action. Selecting non-text while activating it promotes selection to the active page. |
 | `transform` | Transform; T | Shared free/uniform quad transformation for free text. Raster/Image/Vector transformation is exposed through on-canvas affordances and transform modes rather than allowing `set_tool(TRANSFORM)` on those objects. |
+| `cage_transform` | Cage Transform, grid icon | Destructive preview/OK/Cancel for one or more raster/vector drawings; routes compatible images/Blender images/shapes to a shared cage modifier. |
 | `shape_edit` | Shape Edit; B | Edits layer paths and gradient field geometry. `BOUND_EDIT` is an alias with the same value. On a Vector Drawing, activation is remapped to `vector_edit`. |
 | `vector_edit` | Contextual Shape Edit | Selects vector strokes/anchors and drags anchors. Requires an active Vector Drawing. |
 | `vector_redraw` | Vector Tools → Use Redraw | Pressure/manual or point-based thickness/opacity editing. Requires an active Vector Drawing. |
@@ -239,6 +259,7 @@ The Fill tool now targets shapes and raster content; owned vector fills no longe
 | `draw_select_rect` | Rectangle Select | Rectangle selection of raster pixels, vector points, or selected custom-path anchors. |
 | `draw_select_lasso` | Lasso Select | Freeform selection of raster pixels, vector points, or selected custom-path anchors. |
 | `draw_select_stroke` | Stroke Select | Selects whole vector strokes. It is hidden/unavailable for Raster objects. |
+| `draw_shape` | Draw Shape | Freehand creation of a closed shape, with fitted curves and straight spans. |
 | `insert_page_gap` | Insert Page Gap | Drag-defines freeform blank vertical canvas space, previews hierarchy-aware movement, and offers Confirm/Cancel. |
 | `box_bound` | Shapes → Add Rectangle | Drag-creates a rectangular layer; also serves as a page-shape choice during Add Page. |
 | `circle_bound` | Shapes → Add Circle | Drag-creates an ellipse/circle layer; also serves as a page-shape choice. |

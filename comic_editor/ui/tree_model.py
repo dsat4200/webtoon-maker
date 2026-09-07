@@ -51,10 +51,12 @@ class HierarchyModel(QAbstractItemModel):
     def __init__(self, chapter: ChapterDocument | None = None, parent=None):
         super().__init__(parent)
         self.chapter = chapter
+        self.prepare_text_move = None
         self.root = TreeItem("root", "")
         self._items: dict[tuple[str, str], TreeItem] = {}
         self.link_highlights: set[tuple[str, str]] = set()
         self.mask_highlights: set[tuple[str, str]] = set()
+        self.error_highlights: set[tuple[str, str]] = set()
         self.rebuild()
 
     def set_chapter(self, chapter: ChapterDocument | None) -> None:
@@ -167,6 +169,8 @@ class HierarchyModel(QAbstractItemModel):
                 return entity.name
             if index.column() == 1:
                 if item.kind == "layer":
+                    if entity.layer_kind == "text_container":
+                        return "Free Text"
                     if entity.layer_kind == "open_shape":
                         return "Open Shape"
                     primitive = {
@@ -202,6 +206,8 @@ class HierarchyModel(QAbstractItemModel):
                 return "Editable vector strokes."
             return "Drag objects between page or container layers."
         if role == Qt.BackgroundRole:
+            if (item.kind, item.entity_id) in self.error_highlights:
+                return QColor("#913a40")
             if (item.kind, item.entity_id) in self.mask_highlights:
                 return QColor("#5f9f72")
             if (item.kind, item.entity_id) in self.link_highlights:
@@ -334,6 +340,12 @@ class HierarchyModel(QAbstractItemModel):
         if not entities:
             return False
         item = self.item_for_index(parent)
+        destination = self.chapter.layers.get(item.entity_id) if item.kind == "layer" else None
+        if destination is not None and destination.layer_kind == "text_container" and any(
+            kind != "object" or not isinstance(self.chapter.objects.get(identifier), TextObject)
+            for kind, identifier in entities
+        ):
+            return False
         if len(entities) > 1:
             if item.kind != "layer":
                 return False
@@ -383,6 +395,8 @@ class HierarchyModel(QAbstractItemModel):
             row = len(parent_item.children)
         before = self.chapter.to_dict()
         try:
+            if self.prepare_text_move is not None:
+                self.prepare_text_move(entities, new_parent)
             if len(entities) > 1:
                 self.chapter.move_entities(entities, new_parent, row)
             else:
@@ -397,6 +411,14 @@ class HierarchyModel(QAbstractItemModel):
         self.rebuild()
         self.mutationCommitted.emit(before, after, "Reorder hierarchy")
         return True
+
+    def set_error_highlights(self, targets):
+        previous = self.error_highlights
+        self.error_highlights = {tuple(ref) for ref in targets}
+        for kind, identifier in previous | self.error_highlights:
+            index = self.index_for_entity(kind, identifier)
+            if index.isValid():
+                self.dataChanged.emit(index, index.siblingAtColumn(2), [Qt.BackgroundRole])
 
     def set_link_highlights(
         self, targets: set[tuple[str, str]] | None,

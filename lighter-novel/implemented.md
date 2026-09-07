@@ -1,3 +1,57 @@
+## Cage Transform
+- https://help.clip-studio.com/en-us/manual_en/360_transform/Types_of_transformations.htm#1004087
+- just like mesh transformation from clip studio paint. make it a tool, and also make a modifier version with the same parameters
+- the modifier tool, if used on a raster or vector, acts like just clip studio paint. it is a tool that can be used and is destructive (unless you undo.). it does not add a modifier.
+	- by contrast, the cage transform modifier can not be added to rasters and vectors (intended for objects that can't be traditionally drawn on, (blender shapes, image layers for now)
+- if the tool is used on a blender shape or image layer, it should switch to the modifier stack, add the modifier to the stack, and select it, exposing the gizmos.
+- if used on a raster/vector, no modifier.
+- both expose the same settings. in the raster/vector objects they are in tool settings, in the other 2 they are in modifier settings.
+	- show a grid of points that can be transformed, with OK and cancel gizmos below. 
+	- additionally, show (with a margin outside) the traditional 8 handles with translate support, rotate handle, and free/uniform toggle that we've come to expect, outside that grid.
+	- also include a pivot point as a gizmo.
+	- include a slider in tool settings/mod. settings that lets the user change the "smoothness" of the cage transformations (interpolation kind of thing? not sure how this works behind the scenes)
+	- horizontal, vertical flip should be gizmos though (align-vertical-centers as the vertical flip icon, align-horizontal-centers for the horizontal flip icon)
+	- in tool/modifier settings, include the flip buttons.)
+	- no need for the center of rotation option since we have a pivot point gizmo.
+	- if used on an image, always keep original image since on an image its a modifier and those are non destructive. don't show this option.
+	- number of horizontal and vertical lattice points should be options with a slider and inputtable with keyboard numbers to the right. vertical and horizontal should have their own rows in the UI.
+	- include interpolation mode.
+	- allow for multi-point selection like csp has.
+	- ignore puppet warp for now (we can add that in a later pass.)
+	- cage transform modifier is incompatible with vector/raster objects (only the operation is supported)
+	- modifiers can now be selected. being selected makes them blueish with a blue outline (like buttons do when toggled). when a modifier is selected, it should expose gizmos. for now, no modifiers have gizmos though except for this cage transform one for now.
+		- modifiers can only be selected in modifier mode. switching tabs out of modifier mode retains the selection but hides the modifier gizmos
+		- deselecting the object also hides the gizmos but remembers the selection.
+	- cage transformation used during a multi selection of rasters/vectors should affect any selected objects.
+		- if all objects are vectors/rasters, dont create a modifier when doing this.
+		- if mixed, error popup
+	- adding a cage transform modifier while multiple objects are selected, if all objects are compatible with mesh transform modifier, should add the modifier to all selected, and link them. (the same should be the case for all modifiers, really - if all in a selection are compatible with the modifier and its added , they should share a linked modifier)
+		- trying to add a modifier that is not compatible in a multi selection should throw an error popup.
+		- trying to use modifier tool on a multi selection with incompatible objects should also throw an error popup. these should tell the user which are not compatible via text in the popup, and also highlighting those objects red in the outliner.
+	- cage transform on a shape should affect the shape and all its children (without needing them to have a linked modifier)
+- implement cage transform while maintaining maximum performance. performance is a top concern for cases like these.
+- 
+later
+free text object
+- a text object that contains multiple text objects that are not linked to any particular shape, instead being free floating
+- gizmo that lets you toggle between transforming the text bounds and transforming the text pixel-wise (actually stretching/changing vs modifying the bounds the text wraps in)
+	- speaking of which, fix the unintended issue where if a strict to parent text object is switched to free, the text becomes stretched by default.
+	- ![[Pasted image 20260905113414.png]]
+	- ![[Pasted image 20260905113436.png]]
+- select mode should prioritize text if it's below the cursor.
+
+
+blur bug:
+- blur when there is transparency on an object causes a strange distortion / discoloration effect (especially when there are objects underneath). this is a bug, but the distortion does look kind of cool. what is causing this distortion? 
+	- add sub-menus to the add modifier dropdown (dropdown elements that have dropdown elements themselves, to the right of the main one)
+	- fix the blur bug, but make "blurs" a sub-menu with "blur legacy (the current, cool distorted one)" and "blur" (the fixed, normal one). also, add a radial blur. 
+	- radial blur
+		- gizmos let the user change the position of the center and the angle
+		- tool settings let the user change the angle too, and the expected modifier stuff (hiding, masking, deleting, intensity, etc)
+	- ![[Pasted image 20260905112108.png]]
+- ![[Pasted image 20260905112137.png]]
+
+
 
 add:
 - [x] ability to export as (to a specific path/name like save as but for png exports)

@@ -65,6 +65,12 @@ class LayerSettingsPanel(QGroupBox):
         )
         self.flatten_compound = QPushButton("Flatten Compound")
         self.form.addRow(self.flatten_compound)
+        self.text_behavior = QComboBox()
+        self.text_behavior.addItem("Resize bounds", "bounds")
+        self.text_behavior.addItem("Stretch text", "stretch")
+        self.text_behavior_label = QLabel("Text transform")
+        self.form.addRow(self.text_behavior_label, self.text_behavior)
+        self.text_behavior.currentIndexChanged.connect(self._text_behavior_changed)
 
         self.rectangle_mode = QComboBox()
         self.rectangle_mode.addItem("Normal transform", "normal")
@@ -221,6 +227,8 @@ class LayerSettingsPanel(QGroupBox):
 
     @staticmethod
     def _layer_title(layer) -> str:
+        if layer.layer_kind == "text_container":
+            return "Free Text Container"
         if layer.is_page:
             return "Page"
         if layer.layer_kind == "open_shape":
@@ -239,6 +247,7 @@ class LayerSettingsPanel(QGroupBox):
         )
         self._updating = True
         if layer is None:
+            self.text_behavior.setEnabled(False)
             self.type_label.setText("No active layer")
             for widget in (
                 self.name, self.visible, self.opacity, self.rectangle_mode,
@@ -269,7 +278,12 @@ class LayerSettingsPanel(QGroupBox):
         self.ignore_parent_mask.setChecked(layer.ignore_parent_mask)
 
         is_open = layer.layer_kind == "open_shape"
-        compound_capable = not layer.is_page
+        is_text = layer.layer_kind == "text_container"
+        self.text_behavior.setEnabled(is_text)
+        self._set_pair_visible(self.text_behavior_label, self.text_behavior, is_text)
+        self.text_behavior.setCurrentIndex(max(0, self.text_behavior.findData(layer.text_transform_behavior)))
+        self.fill_row.setVisible(not is_text)
+        compound_capable = not layer.is_page and not is_text
         self.compound_enabled.setVisible(compound_capable)
         self.compound_enabled.setChecked(layer.compound_enabled)
         compound_parent = (
@@ -278,7 +292,7 @@ class LayerSettingsPanel(QGroupBox):
         )
         self._set_pair_visible(
             self.compound_operation_label, self.compound_operation,
-            compound_parent is not None,
+            compound_parent is not None and not is_text,
         )
         self.compound_operation.setCurrentIndex(max(
             0, self.compound_operation.findData(layer.compound_operation)
@@ -314,9 +328,9 @@ class LayerSettingsPanel(QGroupBox):
         self.base_thickness_slider.setValue(base_thickness)
         self._set_thickness_visible(
             self.border_width_label, self.border_width_row,
-            self.border_width_slider, self.border_width, True,
+            self.border_width_slider, self.border_width, not is_text,
         )
-        self._set_pair_visible(self.border_color_label, self.border_color, True)
+        self._set_pair_visible(self.border_color_label, self.border_color, not is_text)
         border_maximum = 40 if layer.is_page else 500
         self.border_width_slider.setRange(0, border_maximum)
         self.border_width.setRange(0, border_maximum)
@@ -354,6 +368,22 @@ class LayerSettingsPanel(QGroupBox):
         self.grid_size.setEnabled(layer.grid_override is not None)
         self.grid_divisions.setEnabled(layer.grid_override is not None)
         self._updating = False
+
+    def _text_behavior_changed(self):
+        if self._updating or self.canvas.chapter is None:
+            return
+        layer = self.canvas.chapter.layers.get(self.canvas.active_layer_id)
+        if layer is None or layer.layer_kind != "text_container":
+            return
+        self.canvas.commit_active_text_edit()
+        before = self.canvas.chapter.to_dict()
+        layer.text_transform_behavior = self.text_behavior.currentData()
+        after = self.canvas.chapter.to_dict()
+        if before != after:
+            self.canvas.push_model_change(before, after, "Change text container transform behavior")
+            self.canvas.documentChanged.emit(None)
+            self.changed.emit()
+            self.canvas.update()
 
     def _rectangle_mode_changed(self, *args) -> None:
         if self._updating:

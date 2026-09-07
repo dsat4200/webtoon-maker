@@ -15,7 +15,7 @@ from PySide6.QtGui import QImage, QPolygonF, QTransform
 from .models import (
     BoundGeometry, ChapterDocument, ChildRef, ColorFillGradientObject,
     DocumentObject, EmbeddedImageSourceDescriptor, GradientObject, ImageObject,
-    LayerNode, RasterObject, ShapeStyle, MirrorModifier,
+    LayerNode, RasterObject, ShapeStyle, MirrorModifier, RadialBlurModifier, CageTransformModifier,
     SpeedLineCenterObject, SpeedLinesGradientObject, TextObject,
     ToneMask, VectorDrawingObject, modifier_from_dict, new_id,
     object_from_dict,
@@ -38,6 +38,15 @@ THUMBNAIL_FILE = "thumbnail.png"
 PENDING_FILE = ".save_pending"
 LAST_GOOD_DIR = "last_good"
 ASSET_PADDING = 64.0
+
+
+def _translate_cage(modifier, dx, dy):
+    x, y, w, h = modifier.frame
+    modifier.frame = (x+dx, y+dy, w, h)
+    modifier.points = [(x+dx, y+dy) for x, y in modifier.points]
+    modifier.pivot = (modifier.pivot[0]+dx, modifier.pivot[1]+dy)
+    if modifier.source_quad is not None:
+        modifier.source_quad = [(x+dx, y+dy) for x, y in modifier.source_quad]
 
 
 def _rect_quad(rect: QRectF) -> list[tuple[float, float]]:
@@ -293,12 +302,9 @@ def _set_layer_mapping(
     layer: LayerNode, mapper: Callable[[QPointF], QPointF],
 ) -> None:
     if layer.bound is None:
-        origin = mapper(QPointF())
-        layer.translate_x, layer.translate_y = origin.toTuple()
-        layer.transform_frame = None
-        layer.transform_quad = None
-        return
-    left, top, width, height = layer.bound.bbox()
+        left, top, width, height = 0., 0., 1., 1.
+    else:
+        left, top, width, height = layer.bound.bbox()
     frame = (left, top, max(1.0, width), max(1.0, height))
     layer.transform_frame = frame
     layer.transform_quad = [
@@ -664,6 +670,10 @@ def extract_asset(
     bounds = entity_visual_bounds(asset, asset_tiles, kind, entity_id, include_effects=True)
     dx, dy = ASSET_PADDING - bounds.left(), ASSET_PADDING - bounds.top()
     for modifier in asset.modifiers.values():
+        if isinstance(modifier, CageTransformModifier):
+            _translate_cage(modifier, dx, dy)
+        if isinstance(modifier, RadialBlurModifier):
+            modifier.center = (modifier.center[0]+dx, modifier.center[1]+dy)
         if isinstance(modifier, MirrorModifier):
             modifier.axis_start = (modifier.axis_start[0] + dx, modifier.axis_start[1] + dy)
             modifier.axis_end = (modifier.axis_end[0] + dx, modifier.axis_end[1] + dy)
@@ -729,6 +739,8 @@ def instantiate_asset(
     parent = target.layers.get(parent_id)
     if parent is None:
         raise ValueError("Asset destination must be a container layer")
+    if parent.layer_kind == "text_container" and not isinstance(root_entity, TextObject):
+        raise ValueError("Free Text containers accept Text assets only")
     source = manifest.document
     layer_ids, object_ids = _collect_subtree(source, manifest.root_kind, manifest.root_id)
     layer_map = {old: new_id() for old in layer_ids}
@@ -797,6 +809,10 @@ def instantiate_asset(
     dy = world_y - (by + bh / 2)
     for modifier_id in cloned_modifier_ids.values():
         modifier = target.modifiers[modifier_id]
+        if isinstance(modifier, CageTransformModifier):
+            _translate_cage(modifier, dx, dy)
+        if isinstance(modifier, RadialBlurModifier):
+            modifier.center = (modifier.center[0]+dx, modifier.center[1]+dy)
         if isinstance(modifier, MirrorModifier):
             modifier.axis_start = (modifier.axis_start[0] + dx, modifier.axis_start[1] + dy)
             modifier.axis_end = (modifier.axis_end[0] + dx, modifier.axis_end[1] + dy)

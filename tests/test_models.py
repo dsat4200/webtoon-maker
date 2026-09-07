@@ -134,7 +134,7 @@ def test_grid_override_inheritance_migrates_legacy_documents():
 
     restored = ChapterDocument.from_dict(data)
 
-    assert restored.schema_version == 22
+    assert restored.schema_version == 24
     assert restored.grid_override_enabled is True
     assert restored.to_dict()["grid_override_enabled"] is True
 
@@ -222,7 +222,7 @@ def test_legacy_text_migrates_to_editable_free_quad():
         item.pop(key, None)
     loaded = ChapterDocument.from_dict(data)
     migrated = loaded.objects[text.object_id]
-    assert loaded.schema_version == 22
+    assert loaded.schema_version == 24
     assert migrated.layout_mode == "free"
     assert len(migrated.transform_quad) == 4
     assert migrated.text == "Legacy"
@@ -262,7 +262,7 @@ def test_drawing_underlay_migrates_round_trips_and_clamps():
     vector.underlay_opacity = 2.0
 
     loaded = ChapterDocument.from_dict(chapter.to_dict())
-    assert loaded.schema_version == 22
+    assert loaded.schema_version == 24
     assert loaded.objects[raster.object_id].underlay_opacity == pytest.approx(
         0.375
     )

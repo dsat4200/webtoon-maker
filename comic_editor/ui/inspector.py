@@ -474,7 +474,6 @@ class ContextInspector(QFrame):
             entity.bold = self.bold.isChecked()
             entity.italic = self.italic.isChecked()
             entity.kerning = self.kerning.value()
-            entity.layout_mode = self.layout_mode.currentData()
             entity.margin = self.margin.value()
             checked = next(
                 (key for key, button in self._alignment_buttons.items()
@@ -482,10 +481,7 @@ class ContextInspector(QFrame):
                 (entity.horizontal_alignment, entity.vertical_alignment),
             )
             entity.horizontal_alignment, entity.vertical_alignment = checked
-            if entity.layout_mode == "free" and entity.transform_quad is None:
-                entity.transform_quad = self.canvas._rect_quad(
-                    self.canvas._strict_text_rect(entity)
-                )
+            self.canvas.set_text_layout_mode(entity, self.layout_mode.currentData())
         after = chapter.to_dict()
         if before != after:
             self.canvas.push_model_change(before, after, "Edit properties")
@@ -527,12 +523,12 @@ class ContextInspector(QFrame):
             return
         preset = TextPreset.from_dict(self.settings.text_presets[index])
         before = self.canvas.chapter.to_dict()
-        for key in (
+        properties = {key: getattr(preset, key) for key in (
             "font_family", "font_size", "bold", "italic", "kerning",
             "line_spacing",
             "layout_mode", "horizontal_alignment", "vertical_alignment", "margin",
-        ):
-            setattr(entity, key, getattr(preset, key))
+        )}
+        self.canvas.apply_text_properties(entity, properties)
         self.settings.active_text_preset = preset.name
         self._save_settings(self.settings)
         after = self.canvas.chapter.to_dict()

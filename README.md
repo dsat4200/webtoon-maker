@@ -62,6 +62,48 @@ python -m pip install -r requirements.txt
 python main.py
 ```
 
+## Use as Blender's external image editor
+
+Run `build-launcher.ps1` once after installing `requirements.txt`. It creates
+`WebtoonMaker.exe` beside `main.py`, using the installed Python environment.
+In Blender **Edit → Preferences → File Paths → Applications → Image Editor**,
+choose that executable. Keep it in this folder; rebuild the launcher if Python
+is moved. Launches do not reinstall packages or open a console.
+
+In Blender's Image Editor, choose **Image → Edit Externally** on an image saved
+to disk. For `C:\Art\texture.png`, Webtoon Maker opens the image at its original
+pixel size, creates `C:\Art\texture\` as a portable project, and immediately
+sets **Export Again** to `C:\Art\texture.png`. The embedded source retains its
+original bytes; the page and document background are transparent. Image canvases
+keep their dimensions instead of growing like comic chapters.
+
+Use **Save** to retain editable layers in the project. Use **Export Again** to
+write the composite back to the original image, then **Image → Reload** (`Alt+R`)
+in Blender to see it. Export preserves the filename's format (PNG, JPEG, BMP,
+TIFF, TGA, or WebP); JPEG flattens transparency onto white. The editor composites
+in 8-bit RGBA, so this workflow is not a lossless HDR/16-bit editor. **Export As…**
+can choose a different PNG destination for subsequent exports.
+
+Opening the same image again returns to its existing project and keeps saved
+layers or in-memory edits. A different image opens another project tab in the
+running editor. An unrelated folder with the same name is left untouched and
+reported as a conflict; images such as `texture.png` and `texture.jpg` therefore
+need distinct stems or separate directories. Missing, unsupported, or corrupt
+images produce an error without overwriting the source.
+
+**File → Open Image…** uses the same workflow. You can also drop an image onto
+`WebtoonMaker.exe` or pass files directly:
+
+```powershell
+.\WebtoonMaker.exe "C:\Art\texture.png"
+python main.py "C:\Art\texture.png"
+python main.py "C:\Art\texture\series.json"
+```
+
+The ordinary batch launchers also forward file arguments. Packed or unsaved
+Blender images must first be unpacked or saved to disk before Blender can hand
+them to an external editor. See the [Blender image editing manual](https://docs.blender.org/manual/en/5.2/editors/image/editing.html).
+
 ## Blender Comic Views prototype
 
 The Blender integration keeps the 3D scene wholly inside Blender. A linked
@@ -284,11 +326,30 @@ value when pressure is disabled. It replaces existing mask alpha so light
 pressure can lower coverage; Eraser still removes it. Both use queued tile
 strokes and one Undo command per gesture.
 
-HSL, Blur, Outline, and Mirror modifiers remain attached to their objects rather than
+HSL, Blur, Radial Blur, Outline, and Mirror modifiers remain attached to their objects rather than
 appearing in the outliner. Their processed results are cached separately from
 their isolated source images. Outline color, thickness, opacity, intensity,
 and parameter-mask edits therefore reuse the same exact alpha distance field;
 only source-alpha changes rebuild it.
+
+**Free Text Container** holds independent text boxes without adding a shape or
+clipping boundary. Click to place its first box or drag its wrapping bounds;
+Escape cancels placement. **Add Text** within the container places another box,
+then enters Text Edit with the placeholder selected. The on-canvas
+**Bounds / Stretch** toggle (also in Tool Settings) chooses reflow versus
+pixel-wise deformation. Container Bounds resizing reflows each box independently.
+Strict-to-free conversion preserves the resolved layout instead of stretching
+it through stale dimensions. Select prioritizes visible text boxes, including
+their whitespace, while explicit gizmos retain priority.
+
+The **Blurs** submenu contains **Blur**, **Blur Legacy**, and **Radial Blur**.
+Normal Blur fixes the premultiplied-alpha resampling error that caused colorful
+distortion around transparent content. Legacy deliberately preserves that look,
+and old saved Blur modifiers load as Legacy. Radial Blur averages a circular
+spin around a draggable, grid-snapped center, with a 0–360° angle control and
+selected-only gizmos. Angle/intensity masks, shared links, mute, undo, export,
+Rasterize, and Raster Apply are supported. Radial previews run asynchronously;
+large angles can take appreciably longer than a frame to finish.
 
 **Export As…** chooses a PNG filename; **Export Again** overwrites the last
 successful destination for that chapter, remembered across restarts. Without
@@ -312,7 +373,7 @@ retains point widths. Splitting edges interpolates widths and preserves hidden
 edges; deletion joins an edge only when both replaced edges were enabled.
 
 Click a modifier card's background/title to select it (blue border), and click
-again to deselect. Only its unmuted Mirror or focal Blur gizmos are shown.
+again to deselect. Only its unmuted Mirror, focal Blur, or Radial Blur gizmos are shown.
 Mirror retains the original above its reflection. Its orange dotted axis has
 two endpoint handles and a midpoint handle; grid snapping applies to both.
 Shape mirrors can independently Add/Subtract into the nearest compound, or
@@ -396,6 +457,29 @@ wells exchanges the active primary and secondary colors. Gradient geometry,
 scalar distance fields, and ramp colors are cached independently so moving a
 center or editing ramp colors updates interactively without rebuilding the
 parent boundary.
+
+## Cage Transform
+
+Choose the grid icon for **Cage Transform**. On raster/vector drawings it
+previews a destructive edit; **OK** applies one undoable operation and
+**Cancel** restores the original. Vector strokes remain editable. On images,
+Blender images, or shapes, it opens Modifiers and adds a non-destructive cage;
+a shape's cage affects its children as well. Compatible multi-selections
+share one cage. Mixed drawing/image selections show an error naming and
+highlighting incompatible items without changing them.
+
+Both workflows offer horizontal/vertical lattice counts, smoothness,
+nearest/bilinear/bicubic image interpolation, flip buttons, and free/uniform
+transforms. Shift/Ctrl-click adds points; Shift-drag selects a box. The outer
+handles resize the selected points, the rotation handle rotates around the
+movable gold pivot, and the outer frame translates them. Modifier cards
+show a blue selection outline in **Modifiers** mode; selection is remembered
+when leaving that mode or reselecting an object, with handles hidden meanwhile.
+
+Auto/GPU rendering uses a dedicated OpenGL cage shader when
+available, with a CPU fallback and bounded caches. See
+[the feature and performance notes](docs/cage-transform.md)
+for controls and measurements.
 
 ## Test
 

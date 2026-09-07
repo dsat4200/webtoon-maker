@@ -557,13 +557,13 @@ def test_transform_handle_uses_global_grid_snap(qapp):
     canvas._tool_press(_widget(canvas, 80, 80), 1)
     canvas._tool_move(_widget(canvas, 61, 67), 1)
     canvas._tool_release()
-    assert canvas.chapter.objects[text.object_id].transform_quad[0] == (60, 60)
+    assert canvas.chapter.objects[text.object_id].transform_quad[0] == pytest.approx((60, 60))
     canvas.command_stack.undo()
     canvas.settings.snap_to_grid = False
     canvas._tool_press(_widget(canvas, 80, 80), 1)
     canvas._tool_move(_widget(canvas, 61, 67), 1)
     canvas._tool_release()
-    assert canvas.chapter.objects[text.object_id].transform_quad[0] == (61, 67)
+    assert canvas.chapter.objects[text.object_id].transform_quad[0] == pytest.approx((61, 67))
 
 
 def test_uniform_transform_preserves_quad_proportions(qapp):

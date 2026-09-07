@@ -278,8 +278,9 @@ def test_shape_border_precedes_its_descendants_in_both_scopes(qapp):
     assert hits[1] == {"kind": "object", "id": raster.object_id}
     canvas.set_tool(ToolKind.OBJECT_SELECT)
     canvas._tool_press(canvas.document_to_widget(border), 1)
-    assert canvas.selected_id == shape.layer_id
-    assert canvas.tool == ToolKind.SHAPE_EDIT
+    # Select prioritizes text while raw hit order remains available to Shape Edit.
+    assert canvas.selected_id == text.object_id
+    assert canvas.tool == ToolKind.TEXT_EDIT
 
 
 def test_shape_selection_from_outliner_uses_shape_edit(qapp):
@@ -375,7 +376,7 @@ def test_text_labels_are_content_derived_until_custom_rename(qapp):
     assert model.data(text_index, Qt.DisplayRole) == "Renamed"
 
 
-def test_text_settings_ribbon_layout_visibility_and_quad_restore(qapp):
+def test_text_settings_ribbon_layout_visibility_and_resolved_free_quad(qapp):
     window = MainWindow()
     chapter, page, layer, raster, text = _chapter()
     text.text = "Inspector label content"
@@ -402,10 +403,12 @@ def test_text_settings_ribbon_layout_visibility_and_quad_restore(qapp):
         assert (text.horizontal_alignment, text.vertical_alignment) == (
             "right", "bottom"
         )
+        resolved = window.canvas._strict_text_rect(text)
         controls.layout_mode.setCurrentIndex(
             controls.layout_mode.findData("free")
         )
-        assert text.transform_quad == original_quad
+        assert text.transform_quad == window.canvas._rect_quad(resolved)
+        assert (text.width, text.height) == (resolved.width(), resolved.height())
         assert controls.margin.isHidden()
     finally:
         window.deleteLater()

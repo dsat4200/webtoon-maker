@@ -8,7 +8,7 @@ Almost all canvas behavior lives in `comic_editor/ui/canvas.py` (about 21,000 li
 - `RasterCanvasWidget` combines that mixin with `QWidget`.
 - `GpuCanvasWidget` combines it with `QOpenGLWidget` and requests partial updates.
 - `create_canvas(settings)` probes an offscreen OpenGL 3.3 context unless the renderer is forced to `raster`. If the probe fails, or Qt is using `offscreen`/`minimal`, it creates the raster widget.
-- The GPU widget is not a separate shader renderer. Both backends run the same QPainter/QImage pipeline; OpenGL accelerates presentation/compositing through the widget surface.
+- Both backends use the shared QPainter/QImage scene pipeline. In Auto/GPU mode, cages additionally use an OpenGL 3.3 shader through `gpu_textures.py`; a private context retains its latest source texture/output framebuffer and restores the caller's context. Unsupported contexts or oversized outputs fall back to CPU sampling.
 - `_CanvasPerformanceMonitor` records per-frame and per-input timing used by the latency smoke gate.
 
 The entry point asks Qt for a core-profile OpenGL 3.3 surface, no multisampling, and swap interval zero. QPainter antialiasing and explicit offscreen masks/images supply the actual 2D rendering.
@@ -91,6 +91,22 @@ Open shapes use `core_mesh()` through the canvas `open_shape_mesh()` adapter. Co
 
 The cache is cleared on document/hierarchy changes. Flattening converts QPainterPath elements back into a custom `BoundGeometry` with additional contours.
 
+## Cage sampling
+
+`core/cage.py` evaluates document-space displacement over a 2–16 point lattice,
+blending bilinear and Catmull–Rom interpolation. `cage_rendering.py` builds a
+shared triangle mesh and inverse-samples premultiplied pixels in bounded strips.
+GPU sampling uses the same nearest/bilinear/Catmull–Rom filters. Cropped cage
+outputs retain the complete incoming source, including pixels displaced from
+outside the viewport. Intensity and masks blend the transformed stage with its
+incoming image. CPU live work uses small drafts and the bounded latest-job queue.
+
+`cage_features.py` manages transactions, remembered modifier selection, and
+16 ms pointer coalescing with a release flush. Raster baking prepares all
+targets before mutation; `cage_vectors.py` adaptively transports and refits
+editable vector curves, adding anchors where necessary. Shape cages also warp
+compound contributor geometry. See [limits and measured timings](../cage-transform.md).
+
 ## Tone masks
 
 A tone mask is a chapter-level grayscale field. `render_tone_mask_field()` sums per-contributor coverage (each contributor's base render, respecting ancestor visibility, clipping, and opacity) plus optional sparse mask paint tiles, clamped to 0–1 in a float32 field. Contributor images are cached in an LRU with a 64 MiB byte budget keyed by entity state, and the whole field is cached keyed by `(mask_id, size, transform, contributor signature, mask revision)`.
@@ -105,12 +121,17 @@ A tone mask is a chapter-level grayscale field. `render_tone_mask_field()` sums 
 `comic_editor/ui/modifier_rendering.py` is the pixel engine for the non-destructive stack.
 
 - **HSL** performs a NumPy hue/saturation/lightness round-trip with per-parameter masks.
-- **Blur** evaluates a per-pixel radius from the strength parameter and a focal ramp mask when in focal mode. A session `BlurPyramidCache` (64 MiB budget) stores premultiplied RGBA8 pyramid levels at effective radii `(0, 1, 3, 7, 15, 31, 63, 127)`, keyed by a BLAKE2b digest of the source pixels; each pixel's radius interpolates between the two neighboring levels. Scalar blur reuses the same pyramid.
+- **Blur** evaluates a per-pixel radius from strength and the optional focal ramp. `BlurPyramidCache` (64 MiB) stores levels at radii `(0, 1, 3, 7, 15, 31, 63, 127)`, keyed by algorithm and a BLAKE2b source digest. Normal Blur keeps Pillow images in premultiplied `RGBa` through every reduction, enlargement, and blend. Legacy retains the old `RGBA` branch exactly: feeding it premultiplied data causes a second premultiplication/unpremultiplication during resizing and can produce RGB greater than alpha, explaining the colorful distortion on transparent composites.
+- **Radial Blur** uses `radial_blur.py`: symmetric midpoint angular integration with premultiplied bilinear sampling, transparent out-of-source samples, and adaptive sample counts based on pixel arc length. Integration uses 96×96 tiles; zero-angle mask regions are exact identities. The complete incoming stage remains available when rendering a cropped output, so displaced centers do not lose offscreen source pixels. `effect_geometry.radial_sweep_bounds` includes angular extrema and mask endpoint angles; the pipeline adds bilinear support and preserves ancestor clipping.
+- Raster stacks containing an active Radial Blur use the same tile-coordinate stage renderer as Raster Apply and transform the processed result once with nearest sampling. Prefix baking records its output frame (including transparent padding) for later stages, avoiding both a transform/resampling-order mismatch and a blur-pyramid alignment change after Apply. Legacy Raster stacks without radial baking are unchanged.
+- Interactive canvas/navigator radial work uses a single-worker, 64 MiB-budgeted latest-request queue (`effect_jobs.py`), separate request scopes for the canvas/navigator, immutable inputs, cancellation checkpoints, and main-thread result publication. New requests replace superseded jobs; document replacement cancels them. Pending stages display the incoming source without caching it as a finished effect. Exports, rendered masks, Rasterize, and Raster Apply run synchronously at the same integration quality. Source/output caches retain their existing independent 64 MiB budgets. Large jobs exceeding the preview queue budget use synchronous rendering with the existing allocation guard.
 - **Outline** computes the exact outside distance field with `scipy.ndimage.distance_transform_edt` (foreground = transparent pixels), cached in a 64 MiB `OutlineDistanceCache` keyed by a zlib CRC of the float32 alpha. Coverage is `clip(thickness_field + 0.5 - distance)` multiplied by `1 - alpha` and the outline opacity, then tinted by the outline color.
 - `apply_modifier_stack()` skips muted modifiers and applies active modifiers in card order; each effect is blended by its intensity through `current × (1 - mask) + effect × mask`, where the intensity mask is the intensity value modulated by any bound parameter mask.
 - `apply_opacity_mask()` applies a bound opacity mask to an isolated render.
 
 Canvas-side caches (`_modifier_render_cache`, `_modifier_source_cache`, 64 MiB each) key by layer/object signatures that include pixel cache keys, selection transform preview quads, and eraser previews. Parameter, focal-rig, intensity, and mask edits reuse the isolated source render.
+
+Blur measurements on this machine (September 5, 2026; `python tests/benchmark_free_text_blurs.py`): warmed 128×128 normal Blur edits had a 0.43 ms median, one pyramid build, and 0.08 MiB cached. A 50×40 target's radial angle edits had a 25.28 ms median with one reused source stage (0.01 MiB source / 0.08 MiB results). The 128×128 radial integration measured 69.34 / 774.25 / 1596.72 ms for 15° / 180° / 360°, respectively, with a 1.45 MiB traced peak. These are full-quality computation times, not UI frame times: larger/full-circle radial jobs are asynchronous and are not claimed to fit a 16.7 ms frame budget.
 
 Mirror uses `effect_geometry.py` for document-space reflection and stage-wise
 bounds, and `effect_pipeline.py` for reusable sources, output-stage caches,
@@ -300,7 +321,8 @@ Text is laid out by `QTextDocument` with a pixel-size `QFont`, absolute letter s
 - Keyboard, clipboard, and IME changes update the live object. A local text history handles in-session undo; the entire session becomes one chapter command on commit.
 - Text-only canvas controls are derived from the current selection and exist only in Text Edit. A floating overlay edits integer size and bold/italic; two screen-space right-edge handles scrub snapped size and kerning from their drag-start values and coalesce each drag into one chapter command.
 - Before any ribbon, gizmo, or transform edit, an active typing transaction is committed so document undo order matches user action order.
-- A free-text transform captures a static viewport without the selected object and rasterizes that object once into a device/zoom-aware transparent image (capped at 8192 pixels on a side). Each move projectively maps the cached image into the preview quad and derives selection controls from that quad; release or Escape clears both caches and restores normal `QTextDocument` rendering.
+- `text_features.py` owns free-box placement, strict/free conversion, container frames, and Bounds resizing. Bounds previews update logical dimensions and placement together, preserving the glyph mapping and using the same `QTextDocument` as caret/selection/hit testing. Container bounds derive from child quads, and container rendering adds no path/clip. Text layout clips intersect (never replace) ancestor clips.
+- Stretch, translation, and rotation may cache an unmodified box's device/zoom-aware image (8192-pixel side cap). Boxes below active ancestor effects/masks use live scene rendering instead. Bounds never uses stretched image previews. A 16 ms timer coalesces layout gestures and release flushes the last pointer position into one undo command.
 - In Text Edit, only a screen-space band around the dotted free-transform boundary begins translation. Transform handles keep priority and the quad interior remains an I-beam text target.
 
 ## Hit testing and tool input

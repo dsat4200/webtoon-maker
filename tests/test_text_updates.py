@@ -747,6 +747,7 @@ def test_delete_hotkey_yields_to_shape_and_gradient_point_editors(
 
 def test_free_text_transform_reuses_cached_render_until_commit(qapp, monkeypatch):
     canvas, first, _second = _canvas_with_text()
+    first.transform_behavior = "stretch"
     canvas.set_tool(ToolKind.TRANSFORM)
     calls = 0
     grid_calls = 0

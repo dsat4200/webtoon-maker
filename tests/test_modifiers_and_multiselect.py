@@ -68,7 +68,7 @@ def test_modifier_registry_round_trip_validation_and_garbage_collection():
     first.transform_quad = [(30, 25), (285, 35), (275, 290), (25, 270)]
 
     restored = ChapterDocument.from_dict(chapter.to_dict())
-    assert restored.schema_version == 22
+    assert restored.schema_version == 24
     assert restored.objects[text.object_id].modifier_ids == []
     assert orphan.modifier_id not in restored.modifiers
     assert restored.objects[raster.object_id].modifier_ids == [
@@ -890,6 +890,7 @@ def test_muted_modifier_bypasses_isolation_masks_bounds_and_focal_handles(
     canvas = CanvasWidget(EditorSettings())
     canvas.set_document(chapter, tiles)
     canvas.set_selection("object", raster.object_id)
+    canvas.modifier_mode = True
     canvas.active_modifier_id = modifier.modifier_id
     applied = 0
     masks = 0

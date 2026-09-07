@@ -17,7 +17,7 @@ This folder is a source-verified guide to the current `webtoon-maker` codebase. 
 - `arst/` and `Test/` are user series data folders produced by running the editor; they are not code.
 - `paint/handles.png` is an unreferenced image asset in the current source.
 - `program-map.txt` is a useful historical generated map, but it is not authoritative. Its line counts, schema versions, and file lists lag the current source. These documents follow the current code.
-- The current chapter schema is version 21, the series schema is version 17, asset manifests are schema 2, editor settings are version 22, the Blender bridge protocol is version 3, and the Blender extension is version `0.5.1`.
+- The current chapter schema is version 24, the series schema is version 17, asset manifests are schema 2, editor settings are version 22, the Blender bridge protocol is version 3, and the Blender extension is version `0.5.1`.
 
 ## One-paragraph architecture
 
@@ -32,7 +32,8 @@ Webtoon Maker is a native PySide6 desktop editor for fixed-width, vertically gro
 - **Object**: raster, image, text, vector drawing, or gradient data attached to a container layer.
 - **Tone mask**: a chapter-level grayscale field built from contributor entities plus optional raster paint, used to drive parameter masks and the blue mask-mode overlay.
 - **Parameter mask**: a binding that maps a tone mask through black/white endpoint values onto a target parameter, e.g. a layer/object opacity or a modifier attribute.
-- **Modifier**: a non-destructive HSL, blur, or outline stage in a layer/object's modifier stack, blended by an intensity that can itself be masked.
+- **Modifier**: a non-destructive HSL, blur, outline, mirror, or cage stage in a layer/object's modifier stack, blended by an intensity that can itself be masked.
+- **Cage Transform**: an undoable destructive raster/vector tool or a non-destructive shared image/shape modifier. See [the feature and performance notes](../cage-transform.md).
 - **Mask-only entity**: a layer or object hidden from normal scene rendering that contributes only to tone masks.
 - **Comic View**: a geometry-free Blender scene-state snapshot identified by project and view UUIDs.
 - **Linked Image**: an Image Object whose replaceable source is a Comic View and whose last accepted frame is persisted as an offline PNG.

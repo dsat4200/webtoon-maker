@@ -277,6 +277,7 @@ def test_mirror_handle_selection_snapping_and_dirty(scene):
     obj = raster(scene)
     mirror = MirrorModifier(axis_start=(60, 0), axis_end=(60, 100))
     chapter.add_modifier(mirror, [("object", obj.object_id)])
+    canvas.modifier_mode = True
     canvas.active_modifier_id = mirror.modifier_id
     canvas.settings.snap_to_grid = True
     page.grid_override = GridSettings(size=40, divisions=4)
@@ -290,6 +291,7 @@ def test_mirror_handle_selection_snapping_and_dirty(scene):
     assert expanded.contains(QPointF(115, 25))
     canvas.command_stack.undo()
     assert canvas.chapter.modifiers[mirror.modifier_id].axis_start == (60, 0)
+    canvas.modifier_mode = True
     canvas.active_modifier_id = mirror.modifier_id
     canvas.clear_selection()
     assert canvas.active_modifier_id == ""
@@ -336,12 +338,13 @@ def test_modifier_card_selection_controls_and_apply_visibility(scene, qapp):
     from comic_editor.ui.modifier_controls import ModifierControls, ModifierTitleBar
     canvas, chapter, page = scene
     obj = raster(scene)
+    canvas.modifier_mode = True
     controls = ModifierControls(canvas)
     controls.add_modifier("mirror")
     mid = canvas.active_modifier_id
     assert isinstance(chapter.modifiers[mid], MirrorModifier)
     card = controls._cards[mid]
-    assert "#0097D7" in card.styleSheet()
+    assert "#65bcff" in card.styleSheet()
     assert card.apply_button.isEnabled()
     controls.show()
     qapp.processEvents()

@@ -13,7 +13,7 @@ from scipy.ndimage import distance_transform_edt
 
 from comic_editor.core.models import (
     BlurModifier, HueSaturationLightnessModifier, ModifierInstance,
-    OutlineModifier, MirrorModifier,
+    OutlineModifier, MirrorModifier, RadialBlurModifier,
 )
 from comic_editor.core.effect_geometry import reflection_transform
 
@@ -148,9 +148,9 @@ class BlurPyramidCache:
         return pixels.shape, digest
 
     @staticmethod
-    def _build(pixels: np.ndarray) -> tuple[np.ndarray, ...]:
+    def _build(pixels: np.ndarray, algorithm="normal") -> tuple[np.ndarray, ...]:
         levels = [pixels]
-        current = Image.fromarray(pixels, "RGBA")
+        current = Image.fromarray(pixels, "RGBA" if algorithm == "legacy" else "RGBa")
         for _radius in BLUR_PYRAMID_RADII[1:]:
             width = max(1, (current.width + 1) // 2)
             height = max(1, (current.height + 1) // 2)
@@ -160,14 +160,14 @@ class BlurPyramidCache:
             levels.append(np.asarray(current, dtype=np.uint8).copy())
         return tuple(levels)
 
-    def pyramid(self, original: np.ndarray) -> tuple[np.ndarray, ...]:
+    def pyramid(self, original: np.ndarray, algorithm="normal") -> tuple[np.ndarray, ...]:
         pixels = self._pixels(original)
-        key = self._key(pixels)
+        key = (algorithm, *self._key(pixels))
         cached = self._values.pop(key, None)
         if cached is not None:
             self._values[key] = cached
             return cached
-        result = self._build(pixels)
+        result = self._build(pixels, algorithm)
         self.builds += 1
         size = sum(int(level.nbytes) for level in result)
         if 0 < size <= self.budget:
@@ -186,9 +186,10 @@ class BlurPyramidCache:
 def _upscaled_blur_image(
     levels: tuple[np.ndarray, ...], index: int,
     shape: tuple[int, int],
+    algorithm="normal",
 ) -> Image.Image:
     height, width = shape
-    image = Image.fromarray(levels[index], "RGBA")
+    image = Image.fromarray(levels[index], "RGBA" if algorithm == "legacy" else "RGBa")
     if image.size != (width, height):
         image = image.resize((width, height), Image.Resampling.BILINEAR)
     return image
@@ -214,6 +215,7 @@ def _parameter_field(
 def _variable_blur(
     original: np.ndarray, strength,
     cache: BlurPyramidCache | None = None,
+    algorithm="normal",
 ) -> np.ndarray:
     radii = np.clip(
         np.broadcast_to(
@@ -224,7 +226,7 @@ def _variable_blur(
     if float(np.max(radii)) <= 1e-6:
         return original.copy()
     cache = cache or BlurPyramidCache(0)
-    levels = cache.pyramid(original)
+    levels = cache.pyramid(original, algorithm)
     lower = np.searchsorted(
         BLUR_PYRAMID_RADII, radii, side="right"
     ) - 1
@@ -238,12 +240,12 @@ def _variable_blur(
             1e-6, high_radius - low_radius
         )
         low_image = _upscaled_blur_image(
-            levels, index, original.shape[:2]
+            levels, index, original.shape[:2], algorithm
         )
         if blend <= 1e-6:
             return np.asarray(low_image, dtype=np.float32) / 255.0
         high_image = _upscaled_blur_image(
-            levels, index + 1, original.shape[:2]
+            levels, index + 1, original.shape[:2], algorithm
         )
         return np.asarray(
             Image.blend(low_image, high_image, blend), dtype=np.float32
@@ -256,7 +258,7 @@ def _variable_blur(
         0.0, 1.0,
     )
     height, width = original.shape[:2]
-    result = Image.new("RGBA", (width, height))
+    result = Image.new("RGBA" if algorithm == "legacy" else "RGBa", (width, height))
     prior_index = -1
     prior_high: Image.Image | None = None
     for raw_index in np.unique(lower):
@@ -266,10 +268,10 @@ def _variable_blur(
             low_image = prior_high
         else:
             low_image = _upscaled_blur_image(
-                levels, index, original.shape[:2]
+                levels, index, original.shape[:2], algorithm
             )
         high_image = _upscaled_blur_image(
-            levels, index + 1, original.shape[:2]
+            levels, index + 1, original.shape[:2], algorithm
         )
         alpha = np.zeros(radii.shape, dtype=np.uint8)
         alpha[selected] = np.rint(blend[selected] * 255.0).astype(np.uint8)
@@ -416,6 +418,7 @@ def apply_modifier_stack(
                     (height, width), mask_fields,
                 ),
                 blur_pyramid_cache,
+                modifier.algorithm,
             )
             if modifier.mode == "focal":
                 x = np.arange(width, dtype=np.float32) + world_origin[0] + 0.5
@@ -431,6 +434,12 @@ def apply_modifier_stack(
                 mask = mask[..., None] * amount
             else:
                 mask = amount
+        elif isinstance(modifier, RadialBlurModifier):
+            from comic_editor.ui.radial_blur import radial_blur
+            effect = radial_blur(current, modifier.center,
+                _parameter_field(modifier, "angle", modifier.angle, (height, width), mask_fields),
+                world_to_image or QTransform.fromTranslate(-world_origin[0], -world_origin[1]))
+            mask = amount
         elif isinstance(modifier, MirrorModifier):
             mapping = world_to_image or QTransform.fromTranslate(-world_origin[0], -world_origin[1])
             inverse, valid = mapping.inverted()

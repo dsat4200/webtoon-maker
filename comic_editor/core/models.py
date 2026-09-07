@@ -6,9 +6,10 @@ import math
 import uuid
 from dataclasses import dataclass, field
 from typing import Any, Iterable, Iterator, Literal
+from comic_editor.core.cage import CageGrid
 
 
-SCHEMA_VERSION = 22
+SCHEMA_VERSION = 24
 SERIES_SCHEMA_VERSION = 17
 CHAPTER_WIDTH = 1080
 DEFAULT_CHAPTER_HEIGHT = 3240
@@ -827,6 +828,7 @@ class BlurModifier:
     expanded: bool = True
     muted: bool = False
     strength: float = 8.0
+    algorithm: Literal["normal", "legacy"] = "normal"
     mode: Literal["full", "focal"] = "full"
     focal_center: tuple[float, float] = (0.0, 0.0)
     focal_radius: float = 100.0
@@ -835,7 +837,9 @@ class BlurModifier:
     parameter_masks: dict[str, ParameterMaskBinding] = field(default_factory=dict)
 
     def validate(self) -> None:
-        self.name = str(self.name or "Blur")
+        if self.algorithm not in {"normal", "legacy"}:
+            raise ValueError("Unknown blur algorithm")
+        self.name = str(self.name or ("Blur Legacy" if self.algorithm == "legacy" else "Blur"))
         self.expanded = bool(self.expanded)
         self.muted = bool(self.muted)
         if self.mode not in {"full", "focal"}:
@@ -867,6 +871,7 @@ class BlurModifier:
             "expanded": self.expanded,
             "muted": self.muted,
             "strength": self.strength,
+            "algorithm": self.algorithm,
             "mode": self.mode,
             "focal_center": list(self.focal_center),
             "focal_radius": self.focal_radius,
@@ -963,7 +968,69 @@ class MirrorModifier:
         }
 
 
-ModifierInstance = HueSaturationLightnessModifier | BlurModifier | OutlineModifier | MirrorModifier
+@dataclass
+class RadialBlurModifier:
+    """Transparency-aware circular spin in document coordinates."""
+
+    modifier_id: str = field(default_factory=new_id)
+    modifier_type: Literal["radial_blur"] = "radial_blur"
+    name: str = "Radial Blur"
+    intensity: float = 100.0
+    expanded: bool = True
+    muted: bool = False
+    center: tuple[float, float] = (0.0, 0.0)
+    angle: float = 15.0
+    parameter_masks: dict[str, ParameterMaskBinding] = field(default_factory=dict)
+
+    def validate(self) -> None:
+        values = tuple(float(v) for v in (*self.center, self.angle, self.intensity))
+        if len(values) != 4 or not all(math.isfinite(v) for v in values):
+            raise ValueError("Radial blur values must be finite")
+        self.center = values[:2]
+        self.angle = max(0.0, min(360.0, values[2]))
+        self.intensity = max(0.0, min(100.0, values[3]))
+        self.name = str(self.name or "Radial Blur")
+        self.expanded, self.muted = bool(self.expanded), bool(self.muted)
+        _validate_parameter_masks(self.parameter_masks, {
+            "intensity": (0.0, 100.0), "angle": (0.0, 360.0),
+        })
+
+    def to_dict(self) -> dict[str, Any]:
+        self.validate()
+        return {"id": self.modifier_id, "type": self.modifier_type,
+                "name": self.name, "intensity": self.intensity,
+                "expanded": self.expanded, "muted": self.muted,
+                "center": list(self.center), "angle": self.angle,
+                "parameter_masks": _parameter_masks_to_dict(self.parameter_masks)}
+
+
+@dataclass
+class CageTransformModifier(CageGrid):
+    modifier_id: str = field(default_factory=new_id)
+    modifier_type: str = "cage_transform"
+    name: str = "Cage Transform"
+    intensity: float = 100.0
+    expanded: bool = True
+    muted: bool = False
+    parameter_masks: dict[str, ParameterMaskBinding] = field(default_factory=dict)
+
+    def validate(self):
+        self.validate_grid()
+        if not math.isfinite(float(self.intensity)):
+            raise ValueError("Cage intensity must be finite")
+        self.intensity = max(0., min(100., float(self.intensity)))
+        self.name = str(self.name or "Cage Transform")
+        self.expanded, self.muted = bool(self.expanded), bool(self.muted)
+        _validate_parameter_masks(self.parameter_masks, {"intensity": (0., 100.)})
+
+    def to_dict(self):
+        self.validate()
+        return {**self.grid_dict(), "id": self.modifier_id, "type": self.modifier_type,
+                "name": self.name, "intensity": self.intensity, "expanded": self.expanded,
+                "muted": self.muted, "parameter_masks": _parameter_masks_to_dict(self.parameter_masks)}
+
+
+ModifierInstance = HueSaturationLightnessModifier | BlurModifier | OutlineModifier | MirrorModifier | RadialBlurModifier | CageTransformModifier
 
 
 def modifier_from_dict(data: dict[str, Any]) -> ModifierInstance:
@@ -978,7 +1045,9 @@ def modifier_from_dict(data: dict[str, Any]) -> ModifierInstance:
             data.get("parameter_masks")
         ),
     }
-    if modifier_type == "hsl":
+    if modifier_type == "cage_transform":
+        result = CageTransformModifier(**common, **CageGrid.grid_kwargs(data))
+    elif modifier_type == "hsl":
         result: ModifierInstance = HueSaturationLightnessModifier(
             **common,
             hue=float(data.get("hue", 0.0)),
@@ -987,8 +1056,12 @@ def modifier_from_dict(data: dict[str, Any]) -> ModifierInstance:
         )
     elif modifier_type == "blur":
         center = data.get("focal_center", [0.0, 0.0])
+        algorithm = str(data.get("algorithm", "legacy"))
+        if algorithm == "legacy" and common["name"] in {"", "Blur"}:
+            common["name"] = "Blur Legacy"
         result = BlurModifier(
             **common,
+            algorithm=algorithm,
             strength=float(data.get("strength", 8.0)),
             mode=str(data.get("mode", "full")),
             focal_center=(float(center[0]), float(center[1])),
@@ -996,6 +1069,9 @@ def modifier_from_dict(data: dict[str, Any]) -> ModifierInstance:
             focal_ramp=float(data.get("focal_ramp", 0.5)),
             focal_angle=float(data.get("focal_angle", 0.0)),
         )
+    elif modifier_type == "radial_blur":
+        result = RadialBlurModifier(**common, center=_point(data.get("center", [0, 0])),
+                                    angle=float(data.get("angle", 15.0)))
     elif modifier_type == "mirror":
         result = MirrorModifier(
             **common, axis_start=_point(data.get("axis_start", [0, -100])),
@@ -1020,7 +1096,8 @@ class LayerNode:
     layer_id: str = field(default_factory=new_id)
     name: str = "Layer"
     is_page: bool = False
-    layer_kind: Literal["bounded", "open_shape"] = "bounded"
+    layer_kind: Literal["bounded", "open_shape", "text_container"] = "bounded"
+    text_transform_behavior: Literal["bounds", "stretch"] = "bounds"
     parent_id: str | None = None
     children: list[ChildRef] = field(default_factory=list)
     visible: bool = True
@@ -1045,6 +1122,7 @@ class LayerNode:
         return {
             "id": self.layer_id, "name": self.name, "is_page": self.is_page,
             "layer_kind": self.layer_kind,
+            "text_transform_behavior": self.text_transform_behavior,
             "parent_id": self.parent_id,
             "children": [item.to_dict() for item in self.children],
             "visible": self.visible, "opacity": self.opacity,
@@ -1082,6 +1160,7 @@ class LayerNode:
             layer_id=str(data["id"]), name=str(data.get("name", "Layer")),
             is_page=bool(data.get("is_page", False)), parent_id=data.get("parent_id"),
             layer_kind=str(data.get("layer_kind", "bounded")),
+            text_transform_behavior=str(data.get("text_transform_behavior", "bounds")),
             children=[ChildRef.from_dict(item) for item in data.get("children", [])],
             visible=bool(data.get("visible", True)),
             opacity=float(data.get("opacity", 1.0)),
@@ -1302,6 +1381,9 @@ class RasterObject(DocumentObject):
     object_type: str = "raster"
     name: str = "Raster"
     tile_size: int = 256
+    # A radial prefix is baked in the editable tile grid. Keep subsequent
+    # modifiers on that same grid after the radial stage itself is removed.
+    modifier_source_frame: tuple[float, float, float, float] | None = None
     interaction_rect: tuple[float, float, float, float] = (0.0, 0.0, 120.0, 120.0)
     transform_frame: tuple[float, float, float, float] | None = None
     transform_quad: list[tuple[float, float]] | None = None
@@ -1309,6 +1391,7 @@ class RasterObject(DocumentObject):
     def to_dict(self) -> dict[str, Any]:
         result = self.common_dict()
         result["tile_size"] = self.tile_size
+        result["modifier_source_frame"] = list(self.modifier_source_frame) if self.modifier_source_frame is not None else None
         result["interaction_rect"] = list(self.interaction_rect)
         result["transform_frame"] = (
             list(self.transform_frame) if self.transform_frame is not None else None
@@ -1399,6 +1482,7 @@ class TextObject(DocumentObject):
     kerning: float = 0.0
     line_spacing: float = 1.0
     layout_mode: Literal["free", "strict"] = "strict"
+    transform_behavior: Literal["bounds", "stretch"] = "bounds"
     horizontal_alignment: Literal["left", "center", "right"] = "center"
     vertical_alignment: Literal["top", "middle", "bottom"] = "middle"
     margin: float = 24.0
@@ -1418,6 +1502,7 @@ class TextObject(DocumentObject):
             "bold": self.bold, "italic": self.italic, "kerning": self.kerning,
             "line_spacing": max(0.5, min(3.0, float(self.line_spacing))),
             "layout_mode": self.layout_mode,
+            "transform_behavior": self.transform_behavior,
             "horizontal_alignment": self.horizontal_alignment,
             "vertical_alignment": self.vertical_alignment,
             "margin": self.margin,
@@ -2263,6 +2348,8 @@ def object_from_dict(data: dict[str, Any]) -> ObjectEntity:
         raw_quad = data.get("transform_quad")
         return RasterObject(
             **common, tile_size=int(data.get("tile_size", 256)),
+            modifier_source_frame=tuple(float(v) for v in data["modifier_source_frame"])
+            if data.get("modifier_source_frame") is not None else None,
             interaction_rect=(
                 float(raw_rect[0]), float(raw_rect[1]),
                 max(1.0, float(raw_rect[2])), max(1.0, float(raw_rect[3])),
@@ -2328,6 +2415,7 @@ def object_from_dict(data: dict[str, Any]) -> ObjectEntity:
             layout_mode=str(data.get(
                 "layout_mode", "free" if legacy_alignment is not None else "strict"
             )),
+            transform_behavior=str(data.get("transform_behavior", "stretch")),
             horizontal_alignment=str(data.get("horizontal_alignment", "center")),
             vertical_alignment=str(data.get("vertical_alignment", "middle")),
             margin=float(data.get("margin", 24.0)),
@@ -2579,7 +2667,8 @@ class ChapterDocument:
     objects: dict[str, ObjectEntity] = field(default_factory=dict)
     modifiers: dict[str, ModifierInstance] = field(default_factory=dict)
     masks: dict[str, ToneMask] = field(default_factory=dict)
-    document_kind: Literal["chapter", "asset"] = "chapter"
+    document_kind: Literal["chapter", "asset", "image"] = "chapter"
+    external_image_path: str = ""
     schema_version: int = SCHEMA_VERSION
     legacy_fill_migrations: list[dict[str, Any]] = field(
         default_factory=list, repr=False, compare=False
@@ -2590,7 +2679,7 @@ class ChapterDocument:
             raise ValueError(
                 f"Chapter schema {self.schema_version} is newer than supported {SCHEMA_VERSION}"
             )
-        if self.document_kind not in {"chapter", "asset"}:
+        if self.document_kind not in {"chapter", "asset", "image"}:
             raise ValueError(f"Unknown document kind: {self.document_kind}")
         if self.document_kind == "chapter" and self.width != CHAPTER_WIDTH:
             raise ValueError(f"Chapter width must be {CHAPTER_WIDTH}")
@@ -2620,11 +2709,18 @@ class ChapterDocument:
                 str(item) for item in layer.modifier_ids
                 if str(item) in self.modifiers
             ))
-            if layer.layer_kind not in {"bounded", "open_shape"}:
+            if layer.layer_kind not in {"bounded", "open_shape", "text_container"}:
                 raise ValueError("Unknown layer kind")
             if layer.compound_operation not in {"add", "subtract", "ignore"}:
                 raise ValueError("Unknown compound operation")
-            if layer.bound is None:
+            if layer.layer_kind == "text_container":
+                if layer.is_page or layer.bound is not None:
+                    raise ValueError("Text containers have no shape geometry")
+                if layer.text_transform_behavior not in {"bounds", "stretch"}:
+                    raise ValueError("Unknown text transform behavior")
+                layer.compound_enabled, layer.compound_operation = False, "ignore"
+                layer.fill_color, layer.border_width = None, 0
+            elif layer.bound is None:
                 raise ValueError("Bounded layers require geometry")
             else:
                 layer.bound.validate()
@@ -2691,6 +2787,10 @@ class ChapterDocument:
             if layer.parent_id and self.layers[layer.parent_id].is_page is False:
                 pass
             for child in layer.children:
+                if layer.layer_kind == "text_container" and (
+                    child.kind != "object" or not isinstance(self.objects.get(child.entity_id), TextObject)
+                ):
+                    raise ValueError("Text containers accept only text boxes")
                 key = (child.kind, child.entity_id)
                 if key in referenced:
                     raise ValueError(f"Entity appears more than once: {child.entity_id}")
@@ -2771,6 +2871,11 @@ class ChapterDocument:
             if obj.geometry_reference not in {"direct", "compound"}:
                 obj.geometry_reference = "direct"
             if isinstance(obj, RasterObject):
+                source_frame = obj.modifier_source_frame
+                if source_frame is not None:
+                    if len(source_frame) != 4 or not all(math.isfinite(float(v)) for v in source_frame) or min(source_frame[2:]) <= 0:
+                        raise ValueError("Raster modifier source frame is invalid")
+                    obj.modifier_source_frame = tuple(float(v) for v in source_frame)
                 left, top, width, height = obj.interaction_rect
                 obj.interaction_rect = (
                     float(left), float(top), max(1.0, float(width)),
@@ -2805,6 +2910,10 @@ class ChapterDocument:
             if isinstance(obj, TextObject):
                 if obj.layout_mode not in {"free", "strict"}:
                     raise ValueError("Unknown text layout mode")
+                if obj.transform_behavior not in {"bounds", "stretch"}:
+                    raise ValueError("Unknown text transform behavior")
+                if self.layers[obj.parent_layer_id].layer_kind == "text_container" and obj.layout_mode != "free":
+                    raise ValueError("Text container boxes must use free layout")
                 if obj.horizontal_alignment not in {"left", "center", "right"}:
                     raise ValueError("Unknown horizontal text alignment")
                 if obj.vertical_alignment not in {"top", "middle", "bottom"}:
@@ -2831,6 +2940,10 @@ class ChapterDocument:
             if modifier.modifier_id != modifier_id:
                 modifier.modifier_id = modifier_id
             modifier.validate()
+            if isinstance(modifier, CageTransformModifier):
+                incompatible = self.incompatible_modifier_targets(modifier, self.modifier_target_ids(modifier_id))
+                if incompatible:
+                    raise ValueError(self.modifier_compatibility_message(modifier, incompatible))
             modifier.parameter_masks = {
                 name: binding
                 for name, binding in modifier.parameter_masks.items()
@@ -2995,7 +3108,7 @@ class ChapterDocument:
             layer = self.layers.get(entity_id)
             if (
                 layer is not None and not layer.is_page
-                and layer.bound is not None
+                and (layer.bound is not None or layer.layer_kind == "text_container")
             ):
                 return layer
             return None
@@ -3010,9 +3123,11 @@ class ChapterDocument:
     ) -> None:
         if modifier.modifier_id in self.modifiers:
             raise ValueError("Duplicate modifier ID")
+        targets = list(targets)
+        incompatible = self.incompatible_modifier_targets(modifier, targets)
         resolved = [self.modifier_target(*target) for target in targets]
-        if not resolved or any(target is None for target in resolved):
-            raise ValueError("Modifier targets must be eligible")
+        if not resolved or incompatible:
+            raise ValueError(self.modifier_compatibility_message(modifier, incompatible))
         modifier.validate()
         self.modifiers[modifier.modifier_id] = modifier
         for target in resolved:
@@ -3025,8 +3140,9 @@ class ChapterDocument:
         if modifier_id not in self.modifiers:
             raise ValueError("Unknown modifier")
         desired = set(targets)
-        if any(self.modifier_target(*target) is None for target in desired):
-            raise ValueError("Modifier targets must be eligible")
+        incompatible = self.incompatible_modifier_targets(self.modifiers[modifier_id], desired)
+        if incompatible:
+            raise ValueError(self.modifier_compatibility_message(self.modifiers[modifier_id], incompatible))
         for layer in self.layers.values():
             if ("layer", layer.layer_id) not in desired:
                 layer.modifier_ids = [
@@ -3043,6 +3159,28 @@ class ChapterDocument:
                 target.modifier_ids.append(modifier_id)
         if not desired:
             self.modifiers.pop(modifier_id, None)
+
+    def incompatible_modifier_targets(self, modifier, targets):
+        result = []
+        for ref in targets:
+            target = self.modifier_target(*ref)
+            compatible = target is not None
+            if isinstance(modifier, CageTransformModifier):
+                compatible = isinstance(target, ImageObject) or (
+                    isinstance(target, LayerNode) and target.layer_kind != "text_container")
+            if not compatible:
+                result.append(ref)
+        return result
+
+    def modifier_compatibility_message(self, modifier, targets):
+        names = []
+        for kind, identifier in targets:
+            entity = (self.layers if kind == "layer" else self.objects).get(identifier)
+            names.append(entity.name if entity else identifier)
+        message = f"{modifier.name} is not compatible with: " + (", ".join(names) or "this selection") + "."
+        if isinstance(modifier, CageTransformModifier):
+            message += " Use the Cage Transform tool to transform raster and vector drawings. Select only drawings, or only images and shapes."
+        return message
 
     def remove_modifier(self, modifier_id: str) -> None:
         for layer in self.layers.values():
@@ -3102,14 +3240,18 @@ class ChapterDocument:
     def add_layer(
         self, parent_id: str, name: str = "Layer", bound: BoundGeometry | None = None,
         index: int | None = None,
-        layer_kind: Literal["bounded", "open_shape"] = "bounded",
+        layer_kind: Literal["bounded", "open_shape", "text_container"] = "bounded",
         style: ShapeStyle | None = None,
     ) -> LayerNode:
         parent = self.layers[parent_id]
+        if parent.layer_kind == "text_container":
+            raise ValueError("Text containers accept only text boxes")
         layer = LayerNode(
             name=name, parent_id=parent_id, layer_kind=layer_kind,
-            bound=bound or BoundGeometry.rectangle(0, 0, 720, 720),
-            shape_style=style or ShapeStyle(),
+            bound=None if layer_kind == "text_container" else bound or BoundGeometry.rectangle(0, 0, 720, 720),
+            compound_operation="ignore" if layer_kind == "text_container" else "add",
+            shape_style=ShapeStyle(primary_color=None, outline_thickness=0)
+            if layer_kind == "text_container" else style or ShapeStyle(),
         )
         self.layers[layer.layer_id] = layer
         reference = ChildRef("layer", layer.layer_id)
@@ -3129,6 +3271,10 @@ class ChapterDocument:
         if isinstance(obj, SpeedLineCenterObject):
             return self.add_speed_center(parent_id, obj)
         parent = self.layers[parent_id]
+        if parent.layer_kind == "text_container":
+            if not isinstance(obj, TextObject):
+                raise ValueError("Text containers accept only text boxes")
+            obj.layout_mode = "free"
         if isinstance(obj, GradientObject):
             family = (
                 "speed_lines"
@@ -3235,6 +3381,37 @@ class ChapterDocument:
         )
         return self.layers[parent_id].children if parent_id else None
 
+    def _text_reparent_geometry(self, kind, entity_id, new_parent_id):
+        """Capture free text placement before changing its coordinate system."""
+        from PySide6.QtCore import QPointF
+        from comic_editor.core.assets import _layer_world_transform
+
+        entity = self.layers[entity_id] if kind == "layer" else self.objects[entity_id]
+        parent = self.layers[new_parent_id]
+        if parent.layer_kind == "text_container" and not isinstance(entity, TextObject):
+            raise ValueError("Free Text containers accept Text objects only")
+        if isinstance(entity, TextObject):
+            if parent.layer_kind == "text_container" and entity.layout_mode != "free":
+                raise ValueError("Resolve the text layout before moving into Free Text")
+            if entity.layout_mode != "free" or entity.parent_layer_id == new_parent_id:
+                return None
+            inverse, valid = _layer_world_transform(self, new_parent_id).inverted()
+            if not valid:
+                raise ValueError("The destination transform is singular")
+            mapping = _layer_world_transform(self, entity.parent_layer_id) * inverse
+            quad = entity.transform_quad or [
+                (entity.x, entity.y), (entity.x + entity.width, entity.y),
+                (entity.x + entity.width, entity.y + entity.height),
+                (entity.x, entity.y + entity.height),
+            ]
+            return [mapping.map(QPointF(*point)).toTuple() for point in quad]
+        if kind == "layer" and entity.layer_kind == "text_container" and entity.parent_id != new_parent_id:
+            inverse, valid = _layer_world_transform(self, new_parent_id).inverted()
+            if not valid:
+                raise ValueError("The destination transform is singular")
+            return _layer_world_transform(self, entity_id) * inverse
+        return None
+
     def move_entity(
         self, kind: Literal["layer", "object"], entity_id: str,
         new_parent_id: str | None, index: int,
@@ -3255,6 +3432,7 @@ class ChapterDocument:
         if new_parent_id is None:
             raise ValueError("Only page layers can be roots")
         new_parent = self.layers[new_parent_id]
+        text_geometry = self._text_reparent_geometry(kind, entity_id, new_parent_id)
         if kind == "layer":
             cursor: str | None = new_parent_id
             while cursor:
@@ -3296,8 +3474,14 @@ class ChapterDocument:
         new_parent.children.insert(max(0, min(index, len(new_parent.children))), old_ref)
         if kind == "layer":
             entity.parent_id = new_parent_id
+            if text_geometry is not None:
+                from comic_editor.core.assets import _set_layer_mapping
+                _set_layer_mapping(entity, text_geometry.map)
         else:
             entity.parent_layer_id = new_parent_id
+            if text_geometry is not None:
+                entity.transform_quad = text_geometry
+                entity.x, entity.y = text_geometry[0]
             if isinstance(entity, GradientObject):
                 dx = old_world[0] - new_world[0]
                 dy = old_world[1] - new_world[1]
@@ -3379,6 +3563,10 @@ class ChapterDocument:
             moving.append(obj)
 
         moving_ids = {obj.object_id for obj in moving}
+        text_geometry = {
+            obj.object_id: self._text_reparent_geometry("object", obj.object_id, new_parent_id)
+            for obj in moving
+        }
         destination_before = list(parent.children)
         index = max(0, min(int(index), len(destination_before)))
         removed_before_index = sum(
@@ -3399,6 +3587,10 @@ class ChapterDocument:
         parent.children[insertion:insertion] = refs
         for obj in moving:
             obj.parent_layer_id = new_parent_id
+            quad = text_geometry[obj.object_id]
+            if quad is not None:
+                obj.transform_quad = quad
+                obj.x, obj.y = quad[0]
 
     def delete_entity(self, kind: str, entity_id: str) -> set[str]:
         deleted_objects: set[str] = set()
@@ -3539,6 +3731,8 @@ class ChapterDocument:
                     obj.opacity = layer.opacity
 
     def ensure_height_for(self, layer_id: str) -> bool:
+        if self.document_kind == "image":
+            return False
         layer = self.layers[layer_id]
         if layer.bound is None:
             return False
@@ -3597,6 +3791,7 @@ class ChapterDocument:
             "schema_version": self.schema_version, "id": self.chapter_id,
             "name": self.name, "size": [self.width, self.height],
             "document_kind": self.document_kind,
+            "external_image_path": self.external_image_path,
             "background": self.background, "grid": self.grid.to_dict(),
             "grid_override_enabled": self.grid_override_enabled,
             "root_page_ids": list(self.root_page_ids),
@@ -3674,6 +3869,7 @@ class ChapterDocument:
             chapter_id=str(data["id"]), name=str(data.get("name", "Chapter")),
             width=int(size[0]), height=int(size[1]),
             document_kind=str(data.get("document_kind", "chapter")),
+            external_image_path=str(data.get("external_image_path", "")),
             background=(
                 "#00000000" if legacy_background
                 and data.get("document_kind", "chapter") == "chapter"

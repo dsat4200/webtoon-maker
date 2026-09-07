@@ -5,13 +5,14 @@ from PySide6.QtCore import QPoint, Qt, Signal
 from PySide6.QtGui import QColor, QMouseEvent
 from PySide6.QtWidgets import (
     QComboBox, QFrame, QHBoxLayout, QLabel, QMenu, QPushButton,
-    QSlider, QSpinBox, QToolButton, QVBoxLayout, QWidget,
+    QSlider, QSpinBox, QToolButton, QVBoxLayout, QWidget, QSizePolicy,
 )
 
 from comic_editor.core.models import (
     BlurModifier, HueSaturationLightnessModifier, ModifierInstance,
-    OutlineModifier, MirrorModifier, RasterObject, LayerNode,
+    OutlineModifier, MirrorModifier, RadialBlurModifier, RasterObject, LayerNode,
     canonical_argb,
+    CageTransformModifier,
 )
 from comic_editor.ui.icons import iconoir
 from comic_editor.ui.mask_controls import DualEndpointSlider, MaskButton
@@ -31,7 +32,10 @@ class ModifierTitleBar(QFrame):
         self.setObjectName("modifierTitleBar")
         row = QHBoxLayout(self)
         row.setContentsMargins(5, 3, 3, 3)
+        row.setSpacing(3)
         self.label = QLabel(title, self)
+        self.label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+        self.label.setToolTip(title)
         self.label.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
         row.addWidget(self.label, 1)
 
@@ -80,7 +84,8 @@ class ModifierCard(QFrame):
         self.modifier = modifier
         self.owner = owner
         self.setObjectName("modifierCard")
-        self.setStyleSheet("#modifierCard { border: 2px solid " + ("#0097D7" if owner.canvas.active_modifier_id == modifier.modifier_id else "transparent") + "; }")
+        selected = owner.canvas.modifier_mode and owner.canvas.active_modifier_id == modifier.modifier_id
+        self.setStyleSheet("#modifierCard { border: 2px solid " + ("#65bcff; background-color: #203f59" if selected else "transparent") + "; border-radius: 4px; }")
         outer = QVBoxLayout(self)
         outer.setContentsMargins(1, 1, 1, 5)
         outer.setSpacing(4)
@@ -131,7 +136,10 @@ class ModifierCard(QFrame):
             "Intensity", 0, 100, round(modifier.intensity),
             "intensity", "%",
         ))
-        if isinstance(modifier, HueSaturationLightnessModifier):
+        if isinstance(modifier, CageTransformModifier):
+            from comic_editor.ui.cage_controls import CageSettingsControls
+            form.addWidget(CageSettingsControls(owner.canvas, body, modifier.modifier_id))
+        elif isinstance(modifier, HueSaturationLightnessModifier):
             form.addWidget(self._slider_row(
                 "Hue", -180, 180, round(modifier.hue), "hue", "°"
             ))
@@ -163,6 +171,8 @@ class ModifierCard(QFrame):
             )
             mode_layout.addWidget(mode, 1)
             form.addWidget(mode_row)
+        elif isinstance(modifier, RadialBlurModifier):
+            form.addWidget(self._slider_row("Angle", 0, 360, round(modifier.angle), "angle", "°"))
         elif isinstance(modifier, OutlineModifier):
             form.addWidget(self._slider_row(
                 "Thickness", 0, 25, round(modifier.thickness),
@@ -185,7 +195,11 @@ class ModifierCard(QFrame):
             form.addWidget(color_row)
         outer.addWidget(body)
         body.setVisible(modifier.expanded)
-        if isinstance(modifier, MirrorModifier) and any(isinstance(owner.canvas.chapter.modifier_target(*t), LayerNode) for t in owner.targets()):
+        if isinstance(modifier, MirrorModifier) and any(
+            isinstance(owner.canvas.chapter.modifier_target(*t), LayerNode)
+            and owner.canvas.chapter.modifier_target(*t).layer_kind != "text_container"
+            for t in owner.targets()
+        ):
             operation = QComboBox(body)
             for value in ("ignore", "add", "subtract"):
                 operation.addItem(value.title(), value)
@@ -209,6 +223,7 @@ class ModifierCard(QFrame):
 
     def _title_button(self, icon, tooltip, callback):
         button = QToolButton(self)
+        button.setFixedSize(28, 28)
         button.setIcon(iconoir(icon))
         button.setToolTip(tooltip)
         button.setAutoRaise(True)
@@ -272,6 +287,8 @@ class ModifierCard(QFrame):
         value_box.setRange(minimum, maximum)
         value_box.setSuffix(suffix)
         value_box.setValue(value)
+        value_box.setKeyboardTracking(False)
+        value_box.valueChanged.connect(lambda _value: self.owner.begin_parameter_drag())
         slider.valueChanged.connect(value_box.setValue)
         value_box.valueChanged.connect(slider.setValue)
         slider.sliderPressed.connect(self.owner.begin_parameter_drag)
@@ -282,10 +299,7 @@ class ModifierCard(QFrame):
         )
         slider.sliderReleased.connect(self.owner.finish_parameter_drag)
         value_box.editingFinished.connect(
-            lambda: self.owner.set_parameter(
-                self.modifier.modifier_id, attribute,
-                float(value_box.value()), True,
-            )
+            self.owner.finish_parameter_drag
         )
         layout.addWidget(slider, 1)
         layout.addWidget(value_box)
@@ -332,13 +346,19 @@ class ModifierControls(QWidget):
         menu.addAction("Hue / Saturation / Lightness").triggered.connect(
             lambda: self.add_modifier("hsl")
         )
-        menu.addAction("Blur").triggered.connect(
+        self.blurs_menu = QMenu("Blurs", menu)
+        menu.addMenu(self.blurs_menu)
+        blurs = self.blurs_menu
+        blurs.addAction("Blur").triggered.connect(
             lambda: self.add_modifier("blur")
         )
+        blurs.addAction("Blur Legacy").triggered.connect(lambda: self.add_modifier("blur_legacy"))
+        blurs.addAction("Radial Blur").triggered.connect(lambda: self.add_modifier("radial_blur"))
         menu.addAction("Outline").triggered.connect(
             lambda: self.add_modifier("outline")
         )
         menu.addAction("Mirror").triggered.connect(lambda: self.add_modifier("mirror"))
+        menu.addAction("Cage Transform").triggered.connect(lambda: self.add_modifier("cage_transform"))
         self.add_button.setMenu(menu)
         layout.addWidget(self.add_button)
         self.stack = QWidget(self)
@@ -350,6 +370,13 @@ class ModifierControls(QWidget):
         self.canvas.selectionChanged.connect(lambda *_: self.refresh())
         self.canvas.selectionSetChanged.connect(lambda *_: self.refresh())
         self.canvas.chapterReplaced.connect(lambda *_: self.refresh())
+        self.canvas.modifierSelectionChanged.connect(self._refresh_selection_style)
+
+    def _refresh_selection_style(self, _identifier=""):
+        for identifier, card in self._cards.items():
+            selected = self.canvas.modifier_mode and self.canvas.active_modifier_id == identifier
+            card.setStyleSheet("#modifierCard { border: 2px solid " +
+                ("#65bcff; background-color: #203f59" if selected else "transparent") + "; border-radius: 4px; }")
 
     def targets(self) -> list[tuple[str, str]]:
         if self.canvas.chapter is None:
@@ -400,7 +427,7 @@ class ModifierControls(QWidget):
         eligible = bool(targets) and len(targets) == len(
             self.canvas.selected_entities
         )
-        self.add_button.setEnabled(eligible)
+        self.add_button.setEnabled(bool(self.canvas.selected_entities))
         if not eligible:
             self.summary.setText("Select a drawing, image, or bounded shape.")
             return
@@ -445,16 +472,23 @@ class ModifierControls(QWidget):
 
     def add_modifier(self, modifier_type: str) -> None:
         chapter = self.canvas.chapter
-        targets = self.targets()
+        if self.canvas._cage_edit_before is not None:
+            self.canvas.finish_cage(True)
+        targets = list(self.canvas.selected_entities)
         if chapter is None or not targets:
             return
         before = chapter.to_dict()
-        if modifier_type == "hsl":
+        if modifier_type == "cage_transform":
+            bounds = self._default_bounds()
+            modifier = CageTransformModifier(frame=self.canvas._rect_signature(bounds) if bounds is not None and not bounds.isEmpty() else (0., 0., 100., 100.))
+        elif modifier_type == "hsl":
             modifier: ModifierInstance = HueSaturationLightnessModifier()
-        elif modifier_type == "blur":
+        elif modifier_type in {"blur", "blur_legacy"}:
             bounds = self._default_bounds()
             center = bounds.center() if bounds is not None else QPoint()
             modifier = BlurModifier(
+                name="Blur Legacy" if modifier_type == "blur_legacy" else "Blur",
+                algorithm="legacy" if modifier_type == "blur_legacy" else "normal",
                 focal_center=(float(center.x()), float(center.y())),
                 focal_radius=max(
                     1.0,
@@ -462,14 +496,24 @@ class ModifierControls(QWidget):
                     if bounds is not None else 100.0,
                 ),
             )
+        elif modifier_type == "radial_blur":
+            bounds = self._default_bounds()
+            center = bounds.center() if bounds is not None else QPoint()
+            modifier = RadialBlurModifier(center=(float(center.x()), float(center.y())))
         elif modifier_type == "mirror":
             bounds = self._default_bounds()
-            center = bounds.center()
-            radius = max(25.0, bounds.height() / 2)
+            center = bounds.center() if bounds is not None else QPoint()
+            radius = max(25.0, bounds.height() / 2) if bounds is not None else 100.0
             modifier = MirrorModifier(axis_start=(center.x(), center.y() - radius), axis_end=(center.x(), center.y() + radius))
         else:
             modifier = OutlineModifier()
+        incompatible = chapter.incompatible_modifier_targets(modifier, targets)
+        if incompatible:
+            self.canvas.report_incompatible("Add modifier", chapter.modifier_compatibility_message(modifier, incompatible), incompatible)
+            return
         chapter.add_modifier(modifier, targets)
+        self.canvas.incompatibleSelection.emit([])
+        self.canvas._remember_modifier(modifier.modifier_id)
         self.active_modifier_id = modifier.modifier_id
         self.canvas.active_modifier_id = modifier.modifier_id
         self._changed()
@@ -477,6 +521,8 @@ class ModifierControls(QWidget):
         self.refresh()
 
     def remove_modifier(self, modifier_id: str) -> None:
+        if self.canvas._cage_edit_before is not None:
+            self.canvas.finish_cage(True)
         chapter = self.canvas.chapter
         if chapter is None or modifier_id not in chapter.modifiers:
             return
@@ -489,6 +535,11 @@ class ModifierControls(QWidget):
         self.refresh()
 
     def activate_modifier(self, modifier_id: str) -> None:
+        if not self.canvas.modifier_mode and modifier_id:
+            return
+        if modifier_id != self.active_modifier_id and self.canvas._cage_edit_before is not None:
+            self.canvas.finish_cage(True)
+        self.canvas._remember_modifier(modifier_id)
         self.active_modifier_id = modifier_id
         self.canvas.active_modifier_id = modifier_id
         self.canvas.update()
@@ -498,12 +549,16 @@ class ModifierControls(QWidget):
         self.refresh()
 
     def begin_parameter_drag(self) -> None:
+        if self.canvas._cage_edit_before is not None:
+            self.canvas.finish_cage(True)
         if self._parameter_before is None and self.canvas.chapter is not None:
             self._parameter_before = self.canvas.chapter.to_dict()
 
     def set_parameter(
         self, modifier_id: str, attribute: str, value, commit: bool,
     ) -> None:
+        if self.canvas._cage_edit_before is not None:
+            self.canvas.finish_cage(True)
         chapter = self.canvas.chapter
         modifier = chapter.modifiers.get(modifier_id) if chapter else None
         if modifier is None or not hasattr(modifier, attribute):
@@ -619,7 +674,12 @@ class ModifierControls(QWidget):
     def toggle_link_target(self, kind: str, entity_id: str) -> bool:
         chapter = self.canvas.chapter
         target = (kind, entity_id)
-        if not self.link_modifier_id or chapter.modifier_target(*target) is None:
+        if not self.link_modifier_id or chapter is None:
+            return False
+        modifier = chapter.modifiers[self.link_modifier_id]
+        incompatible = chapter.incompatible_modifier_targets(modifier, [target])
+        if incompatible:
+            self.canvas.report_incompatible("Link modifier", chapter.modifier_compatibility_message(modifier, incompatible), incompatible)
             return False
         if target in self.link_working:
             self.link_working.remove(target)
@@ -633,9 +693,12 @@ class ModifierControls(QWidget):
         if not self.link_modifier_id or chapter is None:
             return
         before = chapter.to_dict()
-        chapter.set_modifier_targets(
-            self.link_modifier_id, self.link_working
-        )
+        modifier = chapter.modifiers[self.link_modifier_id]
+        incompatible = chapter.incompatible_modifier_targets(modifier, self.link_working)
+        if incompatible:
+            self.canvas.report_incompatible("Link modifier", chapter.modifier_compatibility_message(modifier, incompatible), incompatible)
+            return
+        chapter.set_modifier_targets(self.link_modifier_id, self.link_working)
         self.link_modifier_id = ""
         self.link_original.clear()
         self.link_working.clear()

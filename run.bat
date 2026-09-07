@@ -1,3 +1,3 @@
 @echo off
-call "%~dp0start.bat"
+call "%~dp0start.bat" %*
 

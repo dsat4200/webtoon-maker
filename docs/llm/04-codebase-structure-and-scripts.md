@@ -16,6 +16,7 @@ webtoon-maker/
 │   ├── core/                       # Qt-light document, geometry, storage, persistence
 │   │   ├── __init__.py
 │   │   ├── models.py
+│   │   ├── cage.py                 # serializable lattice and displacement math
 │   │   ├── commands.py
 │   │   ├── persistence.py
 │   │   ├── assets.py
@@ -33,6 +34,11 @@ webtoon-maker/
 │       ├── __init__.py
 │       ├── main_window.py
 │       ├── canvas.py
+│       ├── cage_features.py        # direct/modifier transactions and gizmos
+│       ├── cage_controls.py        # shared tool/modifier settings
+│       ├── cage_rendering.py       # inverse triangle rasterizer and path transport
+│       ├── cage_vectors.py         # adaptive editable vector baking
+│       ├── gpu_textures.py        # OpenGL cage shader and texture sampling
 │       ├── sessions.py
 │       ├── selection_settings.py
 │       ├── layer_settings.py
@@ -45,6 +51,10 @@ webtoon-maker/
 │       ├── ribbon.py
 │       ├── modifier_rendering.py
 │       ├── modifier_controls.py
+│       ├── effect_jobs.py          # cancelable, bounded live effect work
+│       ├── radial_blur.py          # tiled premultiplied angular integration
+│       ├── spatial_modifier_features.py # radial center/angle gizmos
+│       ├── text_features.py        # containers, placement, Bounds/Stretch
 │       ├── mask_controls.py
 │       ├── asset_library.py
 │       ├── blender_views.py
@@ -112,7 +122,21 @@ The executable Python entry point. Before creating `QApplication`, it disables Q
 
 ### `run.bat` and `start.bat`
 
-`run.bat` is a one-line launcher delegating to `start.bat`. `start.bat` changes to the batch file's directory, runs `python -m pip install -r requirements.txt` (pausing on failure), then invokes `python main.py`.
+`run.bat` delegates to `start.bat`; both forward file arguments. `start.bat`
+installs dependencies before invoking `python main.py`. `build-launcher.ps1`
+compiles `launcher/WebtoonMaker.cs` into a console-free `WebtoonMaker.exe` and
+writes the selected Python path to `WebtoonMaker.python.txt` (both generated
+outputs are ignored by Git). The executable resolves relative image arguments
+against the caller's working directory and quotes them without invoking a shell.
+
+`main.py` accepts image paths, series folders, and `series.json` files.
+`comic_editor/launch.py` uses a per-user/per-installation QLockFile and QLocalServer
+to forward later file launches into the existing window. MainWindow opens files
+in project tabs through `open_path()`; `core/external_images.py` creates or locates
+their companion projects. Export Again selects a matching encoder and publishes
+the completed image atomically. `tests/test_external_editor.py` covers project
+creation, reopening, dimensions, formats, failures, and cross-process handoff;
+`tests/_blender_external_editor_probe.py` is an opt-in installed-Blender check.
 
 ### `requirements.txt`
 
@@ -150,10 +174,10 @@ Docstring-only package markers: "Document, persistence, and raster core", "PySid
 
 The canonical saved-data model and invariant layer (about 3,900 lines).
 
-- Declares chapter schema version 22, series schema version 17, chapter width 1080, default height 3240, growth margin 1080, and chapter/asset document kinds.
+- Declares chapter schema version 24, series schema version 17, chapter width 1080, default height 3240, growth margin 1080, and chapter/asset/image document kinds.
 - Normalizes colors to canonical ARGB and generates stable UUID IDs.
 - Defines grids, path nodes/contours, shape style, and unified rectangle/ellipse/custom `BoundGeometry`.
-- Defines `ToneMask`, `ParameterMaskBinding`, and the HSL/Blur/Outline `ModifierInstance` records.
+- Defines `ToneMask`, `ParameterMaskBinding`, HSL/Blur/Outline/Mirror/Radial Blur modifier records, and geometry-free text-container layers. Blur carries a normal/legacy selector; free text persists Bounds/Stretch behavior.
 - Defines mixed layer/object child references and `LayerNode` with shape, page, mask, mask-only, grid, compound, modifier, and opacity-mask fields. Runtime layer kinds are `bounded` and `open_shape` only.
 - Defines the object hierarchy: base object, Raster, Image with typed embedded/Blender source descriptors, Text, Gradient, color gradient, and Vector Drawing. Owned vector fills and speed lines exist only as legacy migration records.
 - Defines vector stroke points/strokes and gradient field/ramp/preset value objects.
@@ -276,7 +300,7 @@ The application shell and workflow coordinator (about 5,800 lines).
 
 The largest and most central runtime script (about 21,300 lines).
 
-- Declares `ToolKind`, including 21 distinct tool values (with Eyedropper and Gradient) and two aliases.
+- Declares `ToolKind`, including 23 distinct tool values (with Eyedropper, Gradient, Draw Shape, and Cage Transform) and two aliases.
 - Defines threaded fill workers, the text gizmo overlay, `CanvasSessionState`, and `CanvasPerformanceMonitor`.
 - `_CanvasLogic` owns chapter/tile/image binding, selection, camera, every gesture state, command creation, signals, and all render caches.
 - Builds QPainter paths/variable-width meshes and compound Boolean masks.
@@ -365,7 +389,13 @@ Pixel engine for the non-destructive modifier stack: NumPy HSL round-trips, vari
 
 ### `comic_editor/ui/modifier_controls.py`
 
-Modifier ribbon UI: reorderable `ModifierCard` rows for HSL/Blur/Outline with intensity and parameter sliders, drag reordering of the stack, link mode for editing a shared target set, maskable dual-endpoint parameter controls, and coalesced undo per gesture.
+Modifier ribbon UI: reorderable/selectable cards with intensity and parameter sliders, mute/apply buttons, shared links, parameter masks, and coalesced undo. The native Blurs submenu exposes normal, legacy, and radial variants. `radial_blur.py` provides tiled integration; `effect_jobs.py` queues latest-only live work; `spatial_modifier_features.py` owns radial gizmos. `text_features.py` centralizes placement, strict/free transitions, and text/container Bounds versus Stretch manipulation.
+
+`tests/test_free_text_blurs.py` covers schema compatibility, container placement,
+reflow/stretch, transformed mouse/stylus release, text-first selection, hierarchy
+and assets, submenu activation, premultiplied/legacy blur regressions, radial
+reference comparisons, masks/baking, and worker cancellation. Run
+`python tests/benchmark_free_text_blurs.py` for opt-in latency/cache/memory measurements.
 
 ### `comic_editor/ui/mask_controls.py`
 
@@ -442,6 +472,19 @@ Tracks a bound 3D View, maps unrestricted camera-gate Stream Frame bounds to scr
 Manifest declares id `webtoon_comic_views` version 0.5.1, Blender ≥ 4.5.0, `windows-x64`, GPL-3.0-or-later, and loopback-network plus render-file permissions. `build.ps1` locates Blender and runs `extension validate`/`extension build`. The README covers install, workflow, automatic timeline baking, state-capture scope, publication, and the token-redacted Copy Logs diagnostic report.
 
 ## Test scripts, one by one
+
+### `tests/test_cage_transform.py`
+
+Behavioral coverage for cage geometry, image sampling, editable
+vector baking, multi-target undo/cancel, compatibility errors, linked modifiers,
+original image retention, cropped outputs, worker cancellation, contextual
+ribbon controls, export acceptance, and remembered modifier selection.
+
+### `tests/benchmark_cage.py`
+
+Optional native OpenGL check for CPU/GPU interpolation agreement and warmed
+512/1080-pixel cage timings. Writes sample cage images;
+reports an unavailable GPU without opening a window.
 
 ### `tests/smoke_canvas_latency.py`
 

@@ -7,3 +7,5 @@ build/
 *.egg-info/
 .venv/
 .artifacts/
+WebtoonMaker.exe
+WebtoonMaker.python.txt

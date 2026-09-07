@@ -954,6 +954,12 @@ class TextObjectControls(QObject):
         self.layout_mode.addItem("Strict to parent", "strict")
         self.layout_mode.addItem("Free transform", "free")
         layout.addWidget(_labeled_control("Layout", self.layout_mode, widget))
+        self.text_transform_behavior = QComboBox(widget)
+        self.text_transform_behavior.addItem("Resize bounds", "bounds")
+        self.text_transform_behavior.addItem("Stretch text", "stretch")
+        self.text_transform_behavior.currentIndexChanged.connect(
+            lambda: self._apply_field("transform_behavior", self.text_transform_behavior.currentData()))
+        layout.addWidget(_labeled_control("Transform", self.text_transform_behavior, widget))
         self.align_button = QToolButton(widget)
         self.align_button.setText("Align")
         self.align_button.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
@@ -1054,6 +1060,9 @@ class TextObjectControls(QObject):
             self.layout_mode.setCurrentIndex(max(
                 0, self.layout_mode.findData(entity.layout_mode)
             ))
+            self.layout_mode.setEnabled(self.canvas.chapter.layers[entity.parent_layer_id].layer_kind != "text_container")
+            self.text_transform_behavior.setCurrentIndex(max(0, self.text_transform_behavior.findData(entity.transform_behavior)))
+            self.text_transform_behavior.setEnabled(entity.layout_mode == "free")
             self.margin.setValue(entity.margin)
             self.geometry_reference.setCurrentIndex(max(
                 0, self.geometry_reference.findData(entity.geometry_reference)
@@ -1110,11 +1119,7 @@ class TextObjectControls(QObject):
             value = max(0.5, min(3.0, float(value)))
         elif key == "geometry_reference" and value not in {"direct", "compound"}:
             value = "direct"
-        setattr(entity, key, value)
-        if key == "layout_mode" and value == "free" and entity.transform_quad is None:
-            entity.transform_quad = self.canvas._rect_quad(
-                self.canvas._strict_text_rect(entity)
-            )
+        self.canvas.apply_text_properties(entity, {key: value})
         self._push_change(before, "Edit text properties")
         self.refresh()
 
@@ -1191,16 +1196,12 @@ class TextObjectControls(QObject):
             return
         preset = TextPreset.from_dict(self.settings.text_presets[index])
         before = self.canvas.chapter.to_dict()
-        for key in (
+        properties = {key: getattr(preset, key) for key in (
             "font_family", "font_size", "bold", "italic", "kerning",
             "line_spacing",
             "layout_mode", "horizontal_alignment", "vertical_alignment", "margin",
-        ):
-            setattr(entity, key, getattr(preset, key))
-        if entity.layout_mode == "free" and entity.transform_quad is None:
-            entity.transform_quad = self.canvas._rect_quad(
-                self.canvas._strict_text_rect(entity)
-            )
+        )}
+        self.canvas.apply_text_properties(entity, properties)
         self.settings.active_text_preset = preset.name
         self.settingsChanged.emit()
         self._push_change(before, "Apply text preset")

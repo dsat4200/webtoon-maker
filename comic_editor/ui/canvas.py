@@ -14,7 +14,7 @@ import re
 import threading
 import urllib.parse
 from collections import OrderedDict, deque
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
 from typing import Iterable
@@ -52,7 +52,7 @@ from comic_editor.core.models import (
     ColorGradientRamp, ColorGradientStop, DocumentObject, GradientObject,
     GridSettings, LineGradientField, LayerNode, RadialGradientField,
     ImageObject, PathContour, PathNode, RasterObject, ShapeStyle, TextObject,
-    BlurModifier, OutlineModifier, MirrorModifier, ToneMask,
+    BlurModifier, OutlineModifier, MirrorModifier, RadialBlurModifier, ToneMask,
     SpeedLineCenterObject, SpeedLinesGradientObject, VectorDrawingObject,
     VectorStroke, VectorStrokePoint, new_id,
     ImageSourceDescriptor, canonical_argb, image_source_from_dict,
@@ -88,6 +88,10 @@ from comic_editor.ui.shape_outline import (
     OutlineCache, core_mesh, outline_mesh, remove_nodes,
 )
 from comic_editor.ui.shape_outline_compound import OutlineSource, compound_outline, ribbon_source
+from comic_editor.ui.spatial_modifier_features import SpatialModifierFeatures
+from comic_editor.ui.text_features import TextFeatures
+from comic_editor.ui.cage_features import CageFeatures
+from comic_editor.core.models import CageTransformModifier
 
 
 class ToolKind(Enum):
@@ -99,6 +103,7 @@ class ToolKind(Enum):
     GRADIENT = "gradient"
     TEXT_EDIT = "text_edit"
     TRANSFORM = "transform"
+    CAGE_TRANSFORM = "cage_transform"
     SHAPE_EDIT = "shape_edit"
     BOUND_EDIT = "shape_edit"
     VECTOR_EDIT = "vector_edit"
@@ -509,6 +514,7 @@ class CanvasSessionState:
     outline_distance_cache: OutlineDistanceCache
     blur_pyramid_cache: BlurPyramidCache
     drawing_selection: _DrawingSelectionSessionState | None = None
+    modifier_selection: dict = field(default_factory=dict)
 
 
 class CanvasPerformanceMonitor:
@@ -541,7 +547,7 @@ class CanvasPerformanceMonitor:
         }
 
 
-class _CanvasLogic:
+class _CanvasLogic(CageFeatures, SpatialModifierFeatures, TextFeatures):
     documentChanged = Signal(object)
     visualChanged = Signal(object)
     selectionChanged = Signal(str, str)
@@ -565,6 +571,11 @@ class _CanvasLogic:
     colorSampled = Signal(str)
     colorSampleCommitted = Signal(str)
     eyedropperGestureChanged = Signal(bool)
+    cageChanged = Signal()
+    cageModifierRequested = Signal()
+    incompatibleSelection = Signal(object)
+    operationError = Signal(str, str)
+    modifierSelectionChanged = Signal(str)
 
     def __init__(self, settings: EditorSettings, parent=None):
         super().__init__(parent)
@@ -602,6 +613,9 @@ class _CanvasLogic:
         self._tone_mask_contributor_cache_budget = 64 * 1024 * 1024
         self._preserve_tone_mask_contributors_once = False
         self._modifier_handle_drag: dict | None = None
+        self._init_spatial_features()
+        self._init_text_features()
+        self._init_cage_features()
         self.center_x = 540.0
         self.center_y = 540.0
         self.scale = 0.6
@@ -1141,6 +1155,12 @@ class _CanvasLogic:
             modifier = self.chapter.modifiers.get(modifier_id)
             if modifier is None or modifier.muted:
                 continue
+            if isinstance(modifier, RadialBlurModifier):
+                def maximum(attribute):
+                    binding = modifier.parameter_masks.get(attribute)
+                    return max(binding.black_value, binding.white_value) if binding else getattr(modifier, attribute)
+                if maximum("angle") <= 0 or maximum("intensity") <= 0:
+                    continue
             if suppress_outline and isinstance(modifier, OutlineModifier):
                 continue
             result.append(modifier)
@@ -1180,7 +1200,7 @@ class _CanvasLogic:
         modifier_ids = list(obj.modifier_ids)
         for layer in reversed(self.chapter.ancestor_layers(obj.parent_layer_id)):
             modifier_ids.extend(layer.modifier_ids)
-        if any(isinstance(self.chapter.modifiers.get(mid), MirrorModifier) for mid in modifier_ids):
+        if any(isinstance(self.chapter.modifiers.get(mid), (MirrorModifier, RadialBlurModifier, CageTransformModifier)) for mid in modifier_ids):
             return effect_bounds(world, self._active_modifier_instances(modifier_ids))
         padding = max((
             self._modifier_maximum(
@@ -1252,7 +1272,7 @@ class _CanvasLogic:
             parent = self.chapter.layers[parent_id]
             modifier_ids.extend(parent.modifier_ids)
             parent_id = parent.parent_id
-        if any(isinstance(self.chapter.modifiers.get(mid), MirrorModifier) for mid in modifier_ids):
+        if any(isinstance(self.chapter.modifiers.get(mid), (MirrorModifier, RadialBlurModifier, CageTransformModifier)) for mid in modifier_ids):
             return effect_bounds(world, self._active_modifier_instances(modifier_ids))
         padding = max((
             self._modifier_maximum(
@@ -1369,7 +1389,12 @@ class _CanvasLogic:
 
     def _clear_detached_input_state(self) -> None:
         """Reset transient pointer state that cannot survive without a document."""
+        self._effect_jobs.cancel()
         self._clear_creation_gesture()
+        self._cancel_text_features()
+        self._radial_handle_timer.stop()
+        self._radial_handle_pending = None
+        self._modifier_handle_drag = None
         self._outline_edit_timer.stop()
         self._outline_pending_point = None
         self._last_outline_tablet_tap = None
@@ -1430,6 +1455,9 @@ class _CanvasLogic:
         self, chapter: ChapterDocument, tiles: TileStore,
         images: ImageStore | None = None, reset_view: bool = True,
     ) -> None:
+        self._cage_timer.stop()
+        self._cage_session = self._cage_edit_before = self._cage_drag = self._cage_pending = None
+        self._modifier_selection.clear()
         if self._page_gap_draft is not None:
             self.cancel_page_gap_transaction()
         self._cancel_fill_job()
@@ -1491,6 +1519,10 @@ class _CanvasLogic:
         """Detach the committed document state without discarding warm caches."""
         if self.chapter is None:
             return None
+        if self._cage_session is not None:
+            self.finish_cage(False)
+        elif self._cage_edit_before is not None:
+            self.finish_cage(True)
         self._commit_text_edit()
         if self._vector_gesture_mode is not None or self._vector_before:
             self._cancel_vector_gesture(restore=True)
@@ -1526,6 +1558,7 @@ class _CanvasLogic:
             outline_distance_cache=self._outline_distance_cache,
             blur_pyramid_cache=self._blur_pyramid_cache,
             drawing_selection=drawing_selection,
+            modifier_selection=dict(self._modifier_selection),
         )
 
     def _capture_drawing_selection_state(self) -> _DrawingSelectionSessionState:
@@ -1609,6 +1642,8 @@ class _CanvasLogic:
         )
         self.selected_object_id = state.selected_object_id
         self.selected_entities = list(state.selected_entities)
+        self._modifier_selection = dict(state.modifier_selection)
+        self._restore_modifier_selection()
         self._restore_drawing_selection_state(state.drawing_selection)
         self.center_x, self.center_y = state.center_x, state.center_y
         self.scale, self.rotation = state.scale, state.rotation
@@ -1693,6 +1728,13 @@ class _CanvasLogic:
         self.active_color_slot = slot
 
     def replace_chapter(self, state: dict) -> None:
+        self._cage_timer.stop()
+        self._cage_session = self._cage_edit_before = self._cage_drag = self._cage_pending = None
+        self._effect_jobs.cancel()
+        self._radial_handle_timer.stop()
+        self._radial_handle_pending = None
+        self._modifier_handle_drag = None
+        self._cancel_text_features()
         self._outline_edit_timer.stop()
         self._outline_pending_point = None
         self._outline_cache.clear()
@@ -1729,14 +1771,12 @@ class _CanvasLogic:
         else:
             restored: list[tuple[str, str]] = []
             for kind, entity_id in self.selected_entities:
-                if kind != "object":
-                    continue
-                obj = self.chapter.objects.get(entity_id)
-                if isinstance(obj, (RasterObject, VectorDrawingObject)):
+                if entity_id in (self.chapter.layers if kind == "layer" else self.chapter.objects):
                     restored.append((kind, entity_id))
             if len(restored) < 2:
                 restored = [(self.selected_kind, self.selected_id)]
             self.selected_entities = restored
+        self._restore_modifier_selection()
         self._sync_selection_levels()
         self.chapterReplaced.emit(self.chapter)
         self.hierarchyChanged.emit()
@@ -2119,9 +2159,15 @@ class _CanvasLogic:
     ) -> None:
         if self.chapter is None:
             return
+        if (kind, entity_id) != (self.selected_kind, self.selected_id):
+            if self._cage_session is not None:
+                self.finish_cage(False)
+            elif self._cage_edit_before is not None:
+                self.finish_cage(True)
         if self._page_gap_draft is not None:
             return
         if (kind, entity_id) != (self.selected_kind, self.selected_id):
+            self._finish_free_text_drag()
             if self._active_shape_control == "outline_width":
                 self._tool_release()
             self._last_outline_tablet_tap = None
@@ -2181,6 +2227,8 @@ class _CanvasLogic:
             self.active_layer_id = entity_id
             self.active_page_id = self.chapter.page_for_layer(entity_id).layer_id
             layer = self.chapter.layers[entity_id]
+            if activate_default_tool and layer.layer_kind == "text_container":
+                self.tool = ToolKind.TRANSFORM
             if (
                 activate_default_tool
                 and layer.bound is not None
@@ -2188,6 +2236,7 @@ class _CanvasLogic:
                 self.tool = ToolKind.SHAPE_EDIT
         if self.tool != previous_tool:
             self.toolChanged.emit(self.tool)
+        self._restore_modifier_selection()
         self.selectionChanged.emit(kind, entity_id)
         self.selectionSetChanged.emit(list(self.selected_entities))
         self._invalidate_scene_cache()
@@ -2200,6 +2249,10 @@ class _CanvasLogic:
         """Select an outliner-authored raster/vector object set."""
         if self.chapter is None:
             return False
+        if self._cage_session is not None:
+            self.finish_cage(False)
+        elif self._cage_edit_before is not None:
+            self.finish_cage(True)
         if self._page_gap_draft is not None:
             return False
         ordered: list[tuple[str, str]] = []
@@ -2272,6 +2325,7 @@ class _CanvasLogic:
         if self.tool != ToolKind.TRANSFORM:
             self.tool = ToolKind.TRANSFORM
             self.toolChanged.emit(self.tool)
+        self._restore_modifier_selection()
         self.selectionSetChanged.emit(list(self.selected_entities))
         # Compatibility consumers still key off the primary-selection signal.
         # Re-emit after installing the complete set so tree synchronization
@@ -2286,6 +2340,10 @@ class _CanvasLogic:
         """Clear the current entity and notify every selection consumer."""
         if self.chapter is None:
             return
+        if self._cage_session is not None:
+            self.finish_cage(False)
+        elif self._cage_edit_before is not None:
+            self.finish_cage(True)
         if self._page_gap_draft is not None:
             return
         if self._vector_gesture_mode is not None:
@@ -2375,6 +2433,13 @@ class _CanvasLogic:
         ), already_done=True)
 
     def set_tool(self, tool: ToolKind) -> bool:
+        if tool == ToolKind.CAGE_TRANSFORM:
+            if not self.begin_cage_tool():
+                return False
+        elif self._cage_session is not None:
+            self.finish_cage(False)
+        if tool != self.tool and self._text_placement is not None:
+            self._cancel_text_features()
         if (
             self._page_gap_draft is not None
             and tool != ToolKind.INSERT_PAGE_GAP
@@ -2671,6 +2736,8 @@ class _CanvasLogic:
         if kind == "object":
             return self.object_world_rect(entity_id)
         layer = self.chapter.layers.get(entity_id)
+        if layer is not None and layer.layer_kind == "text_container":
+            return self.layer_world_transform(entity_id).mapRect(self._text_container_bounds(layer))
         if layer is None or layer.bound is None:
             return None
         if layer.layer_kind == "open_shape" and not layer.compound_enabled:
@@ -2767,7 +2834,10 @@ class _CanvasLogic:
              if layer.layer_kind == "open_shape" and layer.bound is not None else None,
              tuple((m.axis_start, m.axis_end, m.muted, m.intensity > 0,
                     m.compound_operation) for mid in layer.modifier_ids
-                   if isinstance(m := self.chapter.modifiers.get(mid), MirrorModifier)))
+                   if isinstance(m := self.chapter.modifiers.get(mid), MirrorModifier)),
+             tuple((repr(m.grid_dict()), m.muted, m.intensity)
+                   for mid in layer.modifier_ids
+                   if isinstance(m := self.chapter.modifiers.get(mid), CageTransformModifier)))
             for layer in self.chapter.layers.values()
         )
         if signature != self._compound_geometry_signature:
@@ -2816,7 +2886,7 @@ class _CanvasLogic:
         def combine(target: QPainterPath, operand: QPainterPath) -> QPainterPath:
             return QPainterPath(operand) if target.isEmpty() else target.united(operand)
 
-        def collect(parent: LayerNode) -> None:
+        def collect(parent: LayerNode, ancestor_cages=()) -> None:
             nonlocal additions, subtractions
             for reference in parent.children:
                 if reference.kind != "layer":
@@ -2835,6 +2905,13 @@ class _CanvasLogic:
                     else self._layer_operand_path(child)
                 )
                 world_operand = self._document_layer_world_transform(document, child.layer_id).map(operand)
+                cages = tuple(m for mid in child.modifier_ids
+                    if isinstance(m := document.modifiers.get(mid), CageTransformModifier) and not m.muted and m.intensity > 0)
+                if cages or ancestor_cages:
+                    from comic_editor.ui.cage_rendering import warp_path
+                    for cage in (*cages, *ancestor_cages):
+                        warped = warp_path(world_operand, cage)
+                        world_operand = warped if cage.intensity >= 100 else world_operand.united(warped)
                 operand = root_inverse.map(world_operand)
                 if child.compound_operation == "subtract":
                     subtractions = combine(subtractions, operand)
@@ -2851,7 +2928,7 @@ class _CanvasLogic:
                             subtractions = combine(subtractions, root_inverse.map(reflected))
                         incoming = incoming.united(reflected)
                 if not child.compound_enabled:
-                    collect(child)
+                    collect(child, (*cages, *ancestor_cages))
 
             if (
                 parent.layer_id == virtual_parent_id
@@ -4200,6 +4277,12 @@ class _CanvasLogic:
         self._render_outward_gradient_children(
             painter, layer, parent_opacity * layer_opacity, local_visible
         )
+        if layer.layer_kind == "text_container":
+            for child in reversed(layer.children):
+                self._render_object(painter, self.chapter.objects[child.entity_id],
+                                    parent_opacity*layer_opacity, local_visible)
+            painter.restore()
+            return
         if layer.compound_enabled:
             self._render_compound_layer_contents(
                 painter, layer, parent_opacity, visible_world
@@ -4328,7 +4411,7 @@ class _CanvasLogic:
         self, painter: QPainter, layer: LayerNode, parent_opacity: float,
         visible_world: QRectF,
     ) -> None:
-        if any(isinstance(m, MirrorModifier) for m in self._active_modifier_instances(layer.modifier_ids)):
+        if layer.layer_kind == "text_container" or any(isinstance(m, (MirrorModifier, RadialBlurModifier, CageTransformModifier)) for m in self._active_modifier_instances(layer.modifier_ids)):
             self._render_mirror_target(painter, layer, parent_opacity, visible_world)
             return
         world_bounds = self.entity_world_rect("layer", layer.layer_id)
@@ -4603,7 +4686,7 @@ class _CanvasLogic:
     ) -> None:
         if not layer.visible:
             return
-        if ("layer", layer.layer_id) not in self._render_modifier_sources and any(isinstance(modifier, MirrorModifier) for modifier in self._active_modifier_instances(layer.modifier_ids)):
+        if ("layer", layer.layer_id) not in self._render_modifier_sources and any(isinstance(modifier, (MirrorModifier, RadialBlurModifier, CageTransformModifier)) for modifier in self._active_modifier_instances(layer.modifier_ids)):
             self._render_mirror_target(painter, layer, parent_opacity, visible_world)
             return
         painter.save()
@@ -6959,6 +7042,8 @@ class _CanvasLogic:
         self, painter: QPainter, obj: DocumentObject,
         local_visible: QRectF,
     ) -> None:
+        if not self._render_cage_source and self._cage_object_preview(painter, obj, 1., local_visible):
+            return
         if isinstance(obj, VectorDrawingObject):
             self._render_vector_drawing(painter, obj, local_visible)
         elif isinstance(obj, GradientObject):
@@ -7388,6 +7473,8 @@ class _CanvasLogic:
                 )),
                 selection_preview,
             )
+        if self._cage_session is not None and ("object", obj.object_id) in self._cage_session["targets"]:
+            live = (*live, repr(self._cage_session["grid"].grid_dict()))
         return (
             json.dumps(
                 obj.to_dict(), sort_keys=True, separators=(",", ":")
@@ -7479,7 +7566,13 @@ class _CanvasLogic:
         self, painter: QPainter, obj: DocumentObject,
         parent_opacity: float, local_visible: QRectF,
     ) -> None:
-        if any(isinstance(m, MirrorModifier) for m in self._active_modifier_instances(obj.modifier_ids)):
+        if self._cage_session is not None and ("object", obj.object_id) in self._cage_session["targets"]:
+            self._render_mirror_target(painter, obj, parent_opacity, local_visible)
+            return
+        if isinstance(obj, RasterObject) and (obj.modifier_source_frame is not None or any(isinstance(m, RadialBlurModifier) for m in self._active_modifier_instances(obj.modifier_ids))):
+            self._render_radial_raster(painter, obj, parent_opacity, local_visible)
+            return
+        if any(isinstance(m, (MirrorModifier, RadialBlurModifier, CageTransformModifier)) for m in self._active_modifier_instances(obj.modifier_ids)):
             self._render_mirror_target(painter, obj, parent_opacity, local_visible)
             return
         modifiers = self._active_modifier_instances(
@@ -7605,6 +7698,7 @@ class _CanvasLogic:
     def _render_mirror_target(self, painter, target, parent_opacity, visible):
         layer = isinstance(target, LayerNode)
         kind, identifier = ("layer", target.layer_id) if layer else ("object", target.object_id)
+        request_scope = (kind, identifier, getattr(self, "_effect_preview_channel", "canvas"))
         parent_id = target.parent_id if layer else target.parent_layer_id
         mapping = self.layer_world_transform(parent_id) if parent_id else QTransform()
         inverse, valid = mapping.inverted()
@@ -7615,6 +7709,13 @@ class _CanvasLogic:
             from comic_editor.ui.baking import visual_bounds
             for child in target.children:
                 world = world.united(visual_bounds(self, child.kind, child.entity_id))
+        if self._cage_session is not None:
+            affected = (kind, identifier) in self._cage_session["targets"] or layer and any(
+                any(parent.layer_id == identifier for parent in self.chapter.ancestor_layers(self.chapter.objects[ref[1]].parent_layer_id))
+                for ref in self._cage_session["targets"])
+            if affected:
+                from comic_editor.core.cage import deformed_bounds
+                world = world.united(QRectF(*deformed_bounds(self._cage_session["grid"])))
         drawing = self._active_vector_drawing()
         preview_bounds = self._vector_preview_tiles.content_bounds(self._vector_preview_id)
         includes_preview = drawing is not None and (
@@ -7655,7 +7756,7 @@ class _CanvasLogic:
         opacity = target.opacity if layer or not target.opacity_locked else 1.0
         if modifiers and isinstance(modifiers[-1], MirrorModifier) and not modifiers[-1].parameter_masks and target.opacity_mask is None and parent_opacity * opacity == 1:
             # Axis dragging reuses the source stages without allocating the gap.
-            image, bounds = render_stages(self, image, bounds, modifiers[:-1], mapping, nearest=isinstance(target, RasterObject))
+            image, bounds = render_stages(self, image, bounds, modifiers[:-1], mapping, nearest=isinstance(target, RasterObject), request_scope=request_scope)
             mirror = modifiers[-1]
             painter.save()
             painter.setRenderHint(QPainter.SmoothPixmapTransform, not isinstance(target, RasterObject))
@@ -7669,7 +7770,7 @@ class _CanvasLogic:
             painter.drawImage(bounds.topLeft(), image)
             painter.restore()
             return
-        image, bounds = render_stages(self, image, bounds, modifiers, mapping, nearest=isinstance(target, RasterObject), required=inverse.mapRect(visible) if layer else visible)
+        image, bounds = render_stages(self, image, bounds, modifiers, mapping, nearest=isinstance(target, RasterObject), required=inverse.mapRect(visible) if layer else visible, request_scope=request_scope)
         if target.opacity_mask is not None:
             binding = target.opacity_mask
             field = self.render_tone_mask_field(binding.mask_id, image.width(), image.height(), self._world_to_image_transform(mapping, bounds, image.width(), image.height()), mapping.mapRect(bounds))
@@ -7988,7 +8089,7 @@ class _CanvasLogic:
             document = self._text_document(obj, rect.width())
             offset = self._text_vertical_offset(obj, document, rect.height())
             painter.save()
-            painter.setClipRect(rect)
+            painter.setClipRect(rect, Qt.IntersectClip)
             painter.translate(rect.left(), rect.top() + offset)
             self._draw_text_document(painter, obj, document)
             painter.restore()
@@ -7999,7 +8100,7 @@ class _CanvasLogic:
         transform = self._quad_transform(source, self._text_quad(obj))
         painter.save()
         painter.setTransform(transform, True)
-        painter.setClipRect(source)
+        painter.setClipRect(source, Qt.IntersectClip)
         painter.translate(0, offset)
         self._draw_text_document(painter, obj, document)
         painter.restore()
@@ -8421,6 +8522,8 @@ class _CanvasLogic:
         painter.restore()
 
     def _draw_selection(self, painter: QPainter) -> None:
+        if self._active_cage() is not None:
+            return
         if self.tool in {
             ToolKind.DRAW_SELECT_RECT,
             ToolKind.DRAW_SELECT_LASSO,
@@ -8646,6 +8749,7 @@ class _CanvasLogic:
                     self._draw_text_property_handles(painter)
         painter.restore()
         self._draw_transform_mode_gizmo(painter)
+        self._draw_text_feature_overlays(painter)
 
     def _draw_text_property_handles(self, painter: QPainter) -> None:
         positions = self._text_property_handle_positions()
@@ -9346,6 +9450,10 @@ class _CanvasLogic:
         self,
     ) -> tuple[list[tuple[float, float]], str] | None:
         """Return the visible eight-handle cage in world coordinates."""
+        text_target = self._text_frame_target()
+        if text_target is not None and self.selected_kind == "layer":
+            _, frame, mapping, _ = text_target
+            return [mapping.map(QPointF(*p)).toTuple() for p in self._rect_quad(frame)], "object"
         if self.chapter is None:
             return None
         if self.tool in {
@@ -9814,7 +9922,7 @@ class _CanvasLogic:
         painter.restore()
 
     def _active_focal_modifier(self) -> BlurModifier | None:
-        if self.chapter is None or not self.active_modifier_id:
+        if not self.modifier_mode or self.chapter is None or not self.active_modifier_id:
             return None
         modifier = self.chapter.modifiers.get(self.active_modifier_id)
         if (
@@ -9830,6 +9938,8 @@ class _CanvasLogic:
         return modifier
 
     def _active_mirror_modifier(self):
+        if not self.modifier_mode:
+            return None
         modifier = self.chapter.modifiers.get(self.active_modifier_id) if self.chapter else None
         if isinstance(modifier, MirrorModifier) and not modifier.muted and any(
             target in self.chapter.modifier_target_ids(modifier.modifier_id)
@@ -9865,6 +9975,16 @@ class _CanvasLogic:
             return
         for modifier_id in target.modifier_ids:
             modifier = self.chapter.modifiers.get(modifier_id)
+            if isinstance(modifier, CageTransformModifier) and len(self.chapter.modifier_target_ids(modifier_id)) == 1:
+                rest = modifier.rest_points().reshape(modifier.rows, modifier.columns, 2)
+                corners = [rest[0, 0], rest[0, -1], rest[-1, -1], rest[-1, 0]]
+                modifier.source_quad = [transform.map(QPointF(*p)).toTuple() for p in corners]
+                modifier.points = [transform.map(QPointF(*p)).toTuple() for p in modifier.points]
+                modifier.pivot = transform.map(QPointF(*modifier.pivot)).toTuple()
+                continue
+            if isinstance(modifier, RadialBlurModifier) and len(self.chapter.modifier_target_ids(modifier_id)) == 1:
+                modifier.center = transform.map(QPointF(*modifier.center)).toTuple()
+                continue
             if isinstance(modifier, MirrorModifier) and len(self.chapter.modifier_target_ids(modifier_id)) == 1:
                 modifier.axis_start = transform.map(QPointF(*modifier.axis_start)).toTuple()
                 modifier.axis_end = transform.map(QPointF(*modifier.axis_end)).toTuple()
@@ -9884,7 +10004,11 @@ class _CanvasLogic:
             modifier.focal_angle = math.atan2(delta.y(), delta.x())
 
     def _draw_focal_modifier_handles(self, painter: QPainter) -> None:
+        if self._draw_cage_handles(painter):
+            return
         if self._page_gap_draft is not None:
+            return
+        if self._draw_radial_modifier_handles(painter):
             return
         mirror = self._active_mirror_modifier()
         if mirror is not None:
@@ -11267,6 +11391,8 @@ class _CanvasLogic:
     ) -> bool:
         if not obj.visible:
             return False
+        if isinstance(obj, TextObject) and not obj.opacity_locked and obj.opacity <= 0:
+            return False
         if isinstance(obj, SpeedLineCenterObject):
             return False
         if isinstance(obj, VectorDrawingObject):
@@ -12472,6 +12598,10 @@ class _CanvasLogic:
             self._end_navigation(event.position())
             return
         if event.button() == Qt.LeftButton:
+            self._queue_radial_handle(event.position())
+            world = self.widget_to_document(event.position())
+            self._queue_free_text_drag(world)
+            self._text_placement_move(world)
             if self._active_shape_control == "outline_width":
                 self._outline_pending_point = self.widget_to_document(event.position())
             self._tool_release()
@@ -12567,8 +12697,15 @@ class _CanvasLogic:
         super().mouseDoubleClickEvent(event)
 
     def keyPressEvent(self, event) -> None:  # noqa: N802
+        if self._active_cage() is not None and event.key() in {Qt.Key_Escape, Qt.Key_Return, Qt.Key_Enter}:
+            self.finish_cage(event.key() != Qt.Key_Escape)
+            event.accept()
+            return
         if event.key() in {Qt.Key_Shift, Qt.Key_Control}:
             self.update()
+        if event.key() == Qt.Key_Escape and self._cancel_text_features(restore=True):
+            event.accept()
+            return
         if event.key() == Qt.Key_Escape and self._cancel_shape_property_drag():
             event.accept()
             return
@@ -12868,6 +13005,10 @@ class _CanvasLogic:
             elif self._pen_contact_active:
                 self._pen_contact_active = False
                 self._tablet_tool_active = False
+                self._queue_radial_handle(event.position())
+                world = self.widget_to_document(event.position())
+                self._queue_free_text_drag(world)
+                self._text_placement_move(world)
                 if self._active_shape_control == "outline_width":
                     self._outline_pending_point = self.widget_to_document(event.position())
                 self._tool_release()
@@ -18336,6 +18477,8 @@ class _CanvasLogic:
 
     # ---- tool actions --------------------------------------------------
     def _begin_modifier_handle(self, widget_point: QPointF) -> bool:
+        if self._begin_radial_handle(widget_point):
+            return True
         mirror = self._active_mirror_modifier()
         if mirror is not None:
             start, end = QPointF(*mirror.axis_start), QPointF(*mirror.axis_end)
@@ -18372,6 +18515,8 @@ class _CanvasLogic:
         return True
 
     def _move_modifier_handle(self, widget_point: QPointF) -> bool:
+        if self._queue_radial_handle(widget_point):
+            return True
         state = self._modifier_handle_drag
         if state is not None and "mirror" in state:
             mirror = self.chapter.modifiers.get(state["mirror"])
@@ -18427,13 +18572,14 @@ class _CanvasLogic:
         return True
 
     def _finish_modifier_handle(self) -> bool:
+        self._flush_radial_handle()
         state, self._modifier_handle_drag = self._modifier_handle_drag, None
         if state is None or self.chapter is None:
             return False
         after = self.chapter.to_dict()
         if state["before"] != after:
             self.push_model_change(
-                state["before"], after, "Edit mirror" if "mirror" in state else "Edit focal blur"
+                state["before"], after, "Edit radial blur" if "radial" in state else "Edit mirror" if "mirror" in state else "Edit focal blur"
             )
         self.interactionFinished.emit()
         return True
@@ -18458,6 +18604,8 @@ class _CanvasLogic:
         point = self.widget_to_document(widget_point)
         self._press_widget_point = QPointF(widget_point)
         self._press_document_point = QPointF(point)
+        if self._text_placement_press(point):
+            return
         if self._page_gap_draft is not None:
             self._begin_page_gap_interaction(point)
             return
@@ -18478,6 +18626,8 @@ class _CanvasLogic:
             if self._sample_eyedropper(point):
                 self._eyedropper_sampling = True
                 self.eyedropperGestureChanged.emit(True)
+            return
+        if self._begin_cage_handle(widget_point, modifiers):
             return
         if self._begin_modifier_handle(widget_point):
             return
@@ -18513,6 +18663,10 @@ class _CanvasLogic:
         if self._begin_shape_overlay_interaction(widget_point):
             return
         if self._begin_text_property_drag(widget_point):
+            return
+        if self._text_behavior_hit(widget_point):
+            return
+        if self._begin_free_text_transform(point):
             return
         if self._begin_selected_text_transform(point):
             return
@@ -18909,6 +19063,8 @@ class _CanvasLogic:
             self._clear_detached_input_state()
             return
         point = self.widget_to_document(widget_point)
+        if self._text_placement_move(point) or self._queue_free_text_drag(point):
+            return
         if (
             self._page_gap_draft is not None
             and self._page_gap_draft.drag_mode
@@ -18925,6 +19081,8 @@ class _CanvasLogic:
             self._eyedropper_widget_point = QPointF(widget_point)
             self._sample_eyedropper(point)
             self.update()
+            return
+        if self._move_cage_handle(widget_point):
             return
         if self._move_modifier_handle(widget_point):
             return
@@ -19190,6 +19348,8 @@ class _CanvasLogic:
             self._update_shape_hover(point)
 
     def _tool_release(self) -> None:
+        if self._finish_text_placement() or self._finish_free_text_drag():
+            return
         self._flush_outline_edit()
         if self._page_gap_draft is not None:
             self._finish_page_gap_interaction()
@@ -19206,6 +19366,8 @@ class _CanvasLogic:
                 self.colorSampleCommitted.emit(color)
             self.eyedropperGestureChanged.emit(False)
             self.interactionFinished.emit()
+            return
+        if self._finish_cage_handle():
             return
         if self._finish_modifier_handle():
             return
@@ -19776,6 +19938,8 @@ class _CanvasLogic:
         self, point: QPointF, widget_point: QPointF,
     ) -> None:
         hits = self.hit_test_entities(point)
+        hits.sort(key=lambda hit: not (
+            hit["kind"] == "object" and isinstance(self.chapter.objects.get(hit["id"]), TextObject)))
         if (
             len(hits) > 1
             and QGuiApplication.keyboardModifiers() & Qt.ControlModifier
@@ -20903,6 +21067,8 @@ class _CanvasLogic:
                     and obj.geometry_reference == "direct"
                 ):
                     rect = self._strict_text_rect(obj)
+                    obj.width, obj.height = rect.width(), rect.height()
+                    obj.transform_behavior = "bounds"
                     obj.transform_quad = [
                         old_parent_to_root(
                             old_parent_id, QPointF(*point)
@@ -22086,6 +22252,8 @@ class _CanvasLogic:
             return False
         mode, _handle = self._selected_object_transform_hit(obj, quad, point)
         if mode == "translate":
+            if self.tool == ToolKind.OBJECT_SELECT and self.hit_test_objects(point, text_only=True):
+                return False
             self._pending_raster_transform_press = (
                 QPointF(widget_point), QPointF(point)
             )
@@ -22531,13 +22699,11 @@ class _CanvasLogic:
         try:
             opacity = 1.0
             for layer in self.chapter.ancestor_layers(obj.parent_layer_id):
-                if not layer.visible or layer.opacity <= 0 or layer.bound is None:
+                if not layer.visible or layer.opacity <= 0:
                     return
-                painter.translate(layer.translate_x, layer.translate_y)
-                painter.setClipPath(
-                    self.layer_effective_path(layer.layer_id),
-                    Qt.ClipOperation.IntersectClip,
-                )
+                painter.setTransform(self._layer_parent_transform(layer), True)
+                if layer.bound is not None:
+                    painter.setClipPath(self.layer_effective_path(layer.layer_id), Qt.ClipOperation.IntersectClip)
                 opacity *= layer.opacity
             painter.setOpacity(
                 opacity if obj.opacity_locked else opacity * obj.opacity

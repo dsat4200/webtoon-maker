@@ -6,7 +6,7 @@ from PySide6.QtGui import QPainter, QTransform
 
 from comic_editor.core.assets import entity_visual_bounds
 from comic_editor.core.commands import CallbackCommand
-from comic_editor.core.models import ChildRef, ImageObject, LayerNode, MirrorModifier, RasterObject
+from comic_editor.core.models import ChildRef, ImageObject, LayerNode, MirrorModifier, RasterObject, RadialBlurModifier
 from comic_editor.core.effect_geometry import effect_bounds
 from comic_editor.ui.effect_pipeline import aligned, empty_image, render_stages
 
@@ -24,6 +24,9 @@ def rasterize_reason(canvas, kind, identifier):
     target = chapter.layers.get(identifier) if kind == "layer" else chapter.objects.get(identifier)
     if target is None or isinstance(target, LayerNode) and target.is_page:
         return "Pages cannot be rasterized."
+    parent_id = target.parent_id if kind == "layer" else target.parent_layer_id
+    if parent_id and chapter.layers[parent_id].layer_kind == "text_container":
+        return "Rasterize the containing Free Text container instead; its children must remain Text objects."
     if kind == "layer":
         parent = chapter.closest_compound_ancestor(target.parent_id, include_self=True)
         reflected = any(isinstance(chapter.modifiers.get(mid), MirrorModifier) and
@@ -127,8 +130,10 @@ def rasterize(canvas, kind, identifier):
     painter.setTransform(mapping, True)
     was_visible, was_mask_only = target.visible, target.mask_only
     old_references = canvas._rendering_compound_references
+    old_interactive = canvas._interactive_render
     try:
         target.visible, target.mask_only = True, False
+        canvas._interactive_render = False
         canvas._rendering_compound_references = True
         if kind == "layer":
             canvas._render_layer(painter, target, 1.0, bounds)
@@ -137,6 +142,7 @@ def rasterize(canvas, kind, identifier):
     finally:
         target.visible, target.mask_only = was_visible, was_mask_only
         canvas._rendering_compound_references = old_references
+        canvas._interactive_render = old_interactive
         painter.end()
     data = QByteArray()
     buffer = QBuffer(data)
@@ -197,7 +203,10 @@ def apply_raster_modifiers(canvas, modifier_id):
             raise ValueError("The modifier must be attached to every selected Raster")
         prefix = obj.modifier_ids[:obj.modifier_ids.index(modifier_id) + 1]
         baked = [mid for mid in prefix if not chapter.modifiers[mid].muted]
-        bounds = aligned(canvas.tiles.content_bounds(identifier) or QRectF(*obj.interaction_rect))
+        bounds = canvas.tiles.content_bounds(identifier) or QRectF(*obj.interaction_rect)
+        if obj.modifier_source_frame is not None:
+            bounds = bounds.united(QRectF(*obj.modifier_source_frame))
+        bounds = aligned(bounds)
         image = empty_image(bounds)
         painter = QPainter(image)
         for (x, y), tile in canvas.tiles.iter_tiles(identifier):
@@ -218,6 +227,11 @@ def apply_raster_modifiers(canvas, modifier_id):
     identifiers = {identifier for _, identifier in targets}
     before = snapshot(canvas, identifiers)
     for obj, baked, bounds, tiles in prepared:
+        if obj.modifier_source_frame is not None or any(
+            isinstance(chapter.modifiers[mid], RadialBlurModifier) and not chapter.modifiers[mid].muted
+            for mid in obj.modifier_ids
+        ):
+            obj.modifier_source_frame = canvas._rect_signature(bounds)
         canvas.tiles.replace_object_tiles(obj.object_id, tiles)
         obj.modifier_ids = [mid for mid in obj.modifier_ids if mid not in baked]
         obj.interaction_rect = canvas._rect_signature(QRectF(*obj.interaction_rect).united(bounds))

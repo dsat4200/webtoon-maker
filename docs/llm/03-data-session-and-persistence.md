@@ -21,6 +21,27 @@ There is no separate `SessionDocument` or session database. "Session data" in th
 
 ## Saved document graph
 
+Chapter schema **24** adds `CageTransformModifier` geometry (frame, lattice,
+deformed points, optional source quad, pivot, smoothness, interpolation, and
+uniform mode). Legacy repeating-texture settings are ignored when loading;
+their layers retain ordinary shape behavior and source artwork.
+Cage targets are validated atomically and
+exclude raster/vector drawings, page roots, and text containers. Asset extraction
+and placement carry cage geometry; ImageStore retains original image bytes.
+The series schema is unchanged. Remembered modifier selection lives in
+`CanvasSessionState`, not the saved document. Cage tool transactions restore
+pixel/model snapshots on undo; unfinished direct previews cancel on tab changes.
+
+External image projects use `document_kind="image"`, allow the source image's
+native width, and retain a fixed canvas height. `external_image_path` stores the
+original file as the fallback Export Again destination; per-user export settings
+can override it after Export As. `prepare_image_project()` validates and embeds
+the original image bytes, builds a transparent page without an outline, saves a
+complete series in sibling staging storage, then publishes the image-stem folder.
+Repeated launches reuse the matching project; unrelated folder or image-extension
+collisions are rejected. Existing cached sessions retain unsaved edits.
+
+
 ```mermaid
 flowchart TD
     S["SeriesDocument"] --> CR["ChapterReference list"]
@@ -75,6 +96,12 @@ Series preferences save independently from the current chapter. Color/palette/gr
 
 ## Chapter data
 
+Chapter schema **23** adds `LayerNode.layer_kind="text_container"` (Text children only, `bound=null`) and persistent `text_transform_behavior` on containers / `transform_behavior` on Text objects (`bounds` or `stretch`). New objects default to Bounds. Missing text behavior fields load as Stretch without altering old free quads. Explicit strict-to-free conversion resolves placement and logical dimensions together and chooses Bounds.
+
+Raster prefix baking with Radial Blur also records an optional `modifier_source_frame` in tile coordinates (legacy default `null`). This retains the processed stage's transparent padding and sampling grid after baked stages are removed, so remaining effects and restored documents do not change appearance. Existing Raster stacks without radial baking retain their previous sampling behavior; object transforms are not rewritten.
+
+Blur records now include `algorithm` (`normal` or `legacy`). Missing algorithms load as Legacy, preserving IDs, stack position, masks, links, and pixels; the default name becomes “Blur Legacy”. Newly constructed Blur uses normal. `RadialBlurModifier` stores standard modifier fields plus finite document-space `center` and `angle` clamped to 0–360° (default 15°); intensity and angle can bind parameter masks. All fields survive chapter/asset round trips, session snapshots, and undo. This migration does not revisit schema-22 background choices or change series/settings schemas.
+
 Chapter schema **22** adds `MirrorModifier` and shape-node outline metadata.
 Mirror records common modifier fields plus `axis_start`, `axis_end` (distinct,
 finite document-space points), and `compound_operation` (default `ignore`).
@@ -111,7 +138,7 @@ succeeds; cancellation and failure do not change the remembered path.
 - every typed object record;
 - every `ModifierInstance` record;
 - every `ToneMask` record;
-- schema version 22 and `document_kind` (`chapter` or `asset`); and
+- schema version 24 and `document_kind` (`chapter`, `asset`, or `image`); and
 - runtime-only `legacy_fill_migrations` plans for pending one-time fill materialization.
 
 The default height is 3240. `ensure_height_for()` grows past a layer's bottom by an additional 1080-pixel margin. Other canvas workflows also grow for raster/object/page bounds. `trim_height()` rejects a height above which any root page remains visible; the UI also includes object bounds in its minimum.
@@ -159,13 +186,13 @@ A `ParameterMaskBinding` stores `mask_id`, `black_value`, and `white_value`. It 
 
 ## Modifier records
 
-`ModifierInstance = HueSaturationLightnessModifier | BlurModifier | OutlineModifier`. All share `modifier_id`, `modifier_type`, `name`, `intensity` (0–100), `expanded`, persistent `muted`, and `parameter_masks`. Legacy records without `muted` load as `false`; muting preserves every other field and requires no schema-version bump.
+`ModifierInstance = HueSaturationLightnessModifier | BlurModifier | OutlineModifier | MirrorModifier | RadialBlurModifier`. All share `modifier_id`, `modifier_type`, `name`, `intensity` (0–100), `expanded`, persistent `muted`, and `parameter_masks`. Legacy records without `muted` load as `false`; muting preserves every other field.
 
 - **HSL**: `hue` (−180…180), `saturation` (−100…100), `lightness` (−100…100).
 - **Blur**: `strength` (0–100 px), `mode` (`full` | `focal`), `focal_center`, `focal_radius`, `focal_ramp` (0–1), `focal_angle`.
 - **Outline**: `thickness` and `opacity` (0–100), `color` (canonical `#AARRGGBB`).
 
-Eligibility (`modifier_target`): non-page bounded layers and Raster, Vector Drawing, and Image objects. Text, gradient objects, pages, and open shapes are excluded. Validation filters `modifier_ids` to existing modifiers, enforces eligibility, and garbage-collects unreferenced modifiers.
+Eligibility (`modifier_target`): non-page shape layers (including open shapes), Free Text containers, and Raster, Vector Drawing, and Image objects. Individual Text boxes, gradient objects, and pages are excluded. Validation filters `modifier_ids`, enforces eligibility, and garbage-collects unreferenced modifiers.
 
 ## Object records
 
@@ -430,8 +457,8 @@ Undo history itself is never saved. Recovery autosave represents only the latest
 
 ## Migration behavior
 
-- Chapter schema 22 and series schema 17 are current; anything newer is rejected without rewrite.
-- Chapter load accepts older schemas, rebuilds typed objects, migrates legacy text alignment into free quads and legacy white chapter backgrounds to transparency, normalizes invariants, validates, and sets the in-memory schema to 22.
+- Chapter schema 24 and series schema 17 are current; anything newer is rejected without rewrite.
+- Chapter load accepts older schemas, rebuilds typed objects, preserves legacy blur/free-transform behavior, migrates legacy text alignment into free quads and pre-22 white chapter backgrounds to transparency, normalizes invariants, validates, and sets the in-memory schema to 24.
 - Legacy fill layers and owned vector fills are converted into pending tile materialization plans and rasterized after tile loading.
 - Legacy speed-line records and centers are dropped with warnings; references are repaired.
 - `LayerNode.from_dict()` accepts legacy fill/border/radius fields and converts them into `ShapeStyle`/node roundness.

@@ -44,7 +44,20 @@ class ImageStore:
         detected = bytes(reader.format())
         buffer.close()
         if image.isNull():
-            raise ValueError(reader.errorString() or "Unsupported or invalid image")
+            # TGA has no reliable magic header for Qt's byte-buffer reader.
+            # Pillow also covers formats absent from a particular Qt install.
+            from io import BytesIO
+            from PIL import Image
+            try:
+                with Image.open(BytesIO(data)) as decoded:
+                    detected = (decoded.format or "").lower().encode("ascii")
+                    rgba = decoded.convert("RGBA")
+                    image = QImage(
+                        rgba.tobytes(), rgba.width, rgba.height,
+                        rgba.width * 4, QImage.Format_RGBA8888,
+                    ).copy()
+            except (OSError, ValueError) as error:
+                raise ValueError(reader.errorString() or "Unsupported or invalid image") from error
         return image.convertToFormat(QImage.Format_ARGB32_Premultiplied), detected
 
     def put(

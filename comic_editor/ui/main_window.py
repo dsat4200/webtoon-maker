@@ -48,6 +48,7 @@ from comic_editor.core.commands import CallbackCommand, CommandStack
 from comic_editor.core.settings import load_settings, save_settings
 from comic_editor.core.tiles import TileStore
 from comic_editor.core.images import ImageStore
+from comic_editor.core.external_images import EXPORT_FORMATS, prepare_image_project
 from comic_editor.ui.canvas import (
     DrawingSelectionClipboard, ToolKind, create_canvas,
 )
@@ -330,6 +331,8 @@ class MainWindow(QMainWindow):
         self.open_series_action = self.file_menu.addAction("Open Series")
         self.open_recent_menu = self.file_menu.addMenu("Open Recent")
         self.import_images_action = self.file_menu.addAction("Import Images…")
+        self.open_image_action = self.file_menu.addAction("Open Image…")
+        self.open_image_action.triggered.connect(self._open_image_dialog)
         self.file_menu.addSeparator()
         self.save_action = self.file_menu.addAction("Save")
         self.save_as_action = self.file_menu.addAction("Save As")
@@ -397,6 +400,7 @@ class MainWindow(QMainWindow):
         labels.extend([
             (ToolKind.TEXT_EDIT, "Text Edit", "text"),
             (ToolKind.TRANSFORM, "Transform", "frame-tool"),
+            (ToolKind.CAGE_TRANSFORM, "Cage Transform", "view-grid"),
             (ToolKind.SHAPE_EDIT, "Shape Edit", "edit-pencil"),
             (
                 ToolKind.INSERT_PAGE_GAP, "Insert Page Gap",
@@ -458,6 +462,7 @@ class MainWindow(QMainWindow):
         self.tool_toolbar.addSeparator()
         self.add_page_button = ResponsiveToolButton("Add Page", "page-plus")
         self.add_text_button = ResponsiveToolButton("Add Text", "text-square")
+        self.add_free_text_button = ResponsiveToolButton("Free Text Container", "text-square")
         self.add_raster_button = ResponsiveToolButton(
             "Add Raster", "media-image-plus"
         )
@@ -466,6 +471,7 @@ class MainWindow(QMainWindow):
         )
         self.tool_toolbar.addWidget(self.add_page_button)
         self.tool_toolbar.addWidget(self.add_text_button)
+        self.tool_toolbar.addWidget(self.add_free_text_button)
         self.tool_toolbar.addWidget(self.add_raster_button)
         self.tool_toolbar.addWidget(self.add_vector_button)
         self.page_scope = QCheckBox("Select in page")
@@ -560,6 +566,7 @@ class MainWindow(QMainWindow):
             self.settings.blender_bridge_token,
         )
         blender_group.add_widget(self.blender_views_widget)
+        from comic_editor.ui.cage_controls import CageSettingsControls
 
         self.vector_tools_page = self.ribbon.add_page(
             "vector_tools", "Vector Tools", visible=False
@@ -582,6 +589,10 @@ class MainWindow(QMainWindow):
             self.vector_tools_controls.simplify_widget
         )
         self.canvas = create_canvas(self.settings)
+        self.cage_tool_group = self.tool_settings_page.add_group("Cage Transform")
+        self.cage_tool_controls = CageSettingsControls(self.canvas, self.ribbon)
+        self.cage_tool_group.add_widget(self.cage_tool_controls)
+        self.cage_tool_group.hide()
         self.modifier_controls = ModifierControls(
             self.canvas, self.modifiers_page
         )
@@ -762,7 +773,11 @@ class MainWindow(QMainWindow):
             QTreeView.EditKeyPressed | QTreeView.DoubleClicked
         )
         self.hierarchy_model = HierarchyModel()
+        self.hierarchy_model.prepare_text_move = self.canvas.prepare_text_move
         self.tree.setModel(self.hierarchy_model)
+        self.canvas.incompatibleSelection.connect(self.hierarchy_model.set_error_highlights)
+        self.canvas.operationError.connect(lambda title, message: QMessageBox.warning(self, title, message))
+        self.canvas.cageModifierRequested.connect(self._activate_cage_modifier)
         self.modifier_controls.linkModeChanged.connect(
             self.hierarchy_model.set_link_highlights
         )
@@ -1127,6 +1142,7 @@ class MainWindow(QMainWindow):
         self.add_raster_button.clicked.connect(self._add_raster)
         self.add_vector_button.clicked.connect(self._add_vector_drawing)
         self.add_text_button.clicked.connect(self._add_text)
+        self.add_free_text_button.clicked.connect(self._add_free_text_container)
         self.tool_settings_controls.pencilPresetSelected.connect(
             self._pencil_preset_selected
         )
@@ -2154,6 +2170,8 @@ class MainWindow(QMainWindow):
             )
             return False
         if session is self.active_session:
+            if not self.canvas.commit_active_cage():
+                return False
             self._capture_active_session()
         try:
             if session.kind == "series":
@@ -2278,6 +2296,39 @@ class MainWindow(QMainWindow):
         if root:
             self.open_series(root)
 
+    def _open_image_dialog(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Open Image", "",
+            "Images (*.png *.jpg *.jpeg *.bmp *.tif *.tiff *.tga *.webp)",
+        )
+        if path:
+            self.open_path(path)
+
+    def open_path(self, filename: str | Path) -> bool:
+        """Open a launch argument or image in its own cached project tab."""
+        if self._page_gap_mode_locked:
+            QMessageBox.warning(self, "Open file", "Confirm or cancel the page gap before opening a file.")
+            return False
+        path = Path(filename).expanduser().resolve()
+        if path.is_dir():
+            return self.open_series(path)
+        if path.name.lower() == "series.json":
+            return self.open_series(path.parent)
+        try:
+            root = prepare_image_project(path)
+            if not self.open_series(root):
+                return False
+            self.chapter.external_image_path = str(path)
+            self.settings.export_destinations[self._export_destination_key()] = str(path)
+            save_settings(self.settings)
+        except (OSError, ValueError) as error:
+            QMessageBox.critical(self, "Unable to open image", str(error))
+            return False
+        self.statusBar().showMessage(
+            f"Opened {path.name} — Export Again writes to {path}", 10000
+        )
+        return True
+
     def open_series(self, root: str | Path) -> bool:
         key = self._series_session_key(root)
         existing = self._tab_index_for_key(key)
@@ -2365,6 +2416,7 @@ class MainWindow(QMainWindow):
     def _new_chapter(self) -> None:
         if (
             self.repository is None or self.series is None
+            or (self.chapter is not None and self.chapter.document_kind == "image")
             or self.active_session is not None
             and self.active_session.kind != "series"
         ):
@@ -2536,6 +2588,7 @@ class MainWindow(QMainWindow):
     def _add_page(self) -> None:
         if (
             self.chapter is None
+            or self.chapter.document_kind == "image"
             or not self.canvas.active_page_id
             or self.canvas.active_page_id not in self.chapter.root_page_ids
         ):
@@ -2709,7 +2762,7 @@ class MainWindow(QMainWindow):
 
     def _add_raster(self) -> None:
         parent = self._selected_parent_layer(allow_page=True)
-        if parent is None:
+        if parent is None or parent.layer_kind == "text_container":
             self.statusBar().showMessage(
                 "Raster objects require a selected page or container layer",
                 4000,
@@ -2728,7 +2781,7 @@ class MainWindow(QMainWindow):
 
     def _add_vector_drawing(self) -> None:
         parent = self._selected_parent_layer(allow_page=True)
-        if parent is None or self.chapter is None:
+        if parent is None or self.chapter is None or parent.layer_kind == "text_container":
             self.statusBar().showMessage(
                 "Vector Drawings require a selected page or container layer",
                 4000,
@@ -2877,7 +2930,19 @@ class MainWindow(QMainWindow):
         self.canvas.documentChanged.emit(None)
         self._sync_contextual_ribbon()
 
+    def _add_free_text_container(self) -> None:
+        if self.chapter is None:
+            return
+        container = self.canvas._selected_text_container()
+        parent = self.chapter.layers.get(container.parent_id) if container else self._selected_parent_layer(allow_page=True)
+        if parent is not None:
+            self.canvas.begin_text_placement(parent.layer_id, new_container=True)
+
     def _add_text(self) -> None:
+        container = self.canvas._selected_text_container()
+        if container is not None:
+            self.canvas.begin_text_placement(container.layer_id)
+            return
         parent = self._selected_parent_layer(allow_page=True)
         if parent is None:
             self.statusBar().showMessage(
@@ -3035,7 +3100,7 @@ class MainWindow(QMainWindow):
         self._refresh_actions()
 
     def _trim_height(self) -> None:
-        if self.chapter is None:
+        if self.chapter is None or self.chapter.document_kind == "image":
             return
         minimum = self.chapter.minimum_safe_height()
         for object_id in self.chapter.objects:
@@ -3060,6 +3125,10 @@ class MainWindow(QMainWindow):
         self._mark_dirty(None)
 
     def _activate_tool(self, tool: ToolKind) -> bool:
+        if (tool == ToolKind.INSERT_PAGE_GAP and self.chapter is not None
+                and self.chapter.document_kind == "image"):
+            self.statusBar().showMessage("Image documents keep their original canvas size", 4000)
+            return False
         if (
             self._page_gap_mode_locked
             and tool != ToolKind.INSERT_PAGE_GAP
@@ -3082,7 +3151,7 @@ class MainWindow(QMainWindow):
             return changed
         if len(self.canvas.selected_entities) > 1:
             primary_raster = isinstance(selected_object, RasterObject)
-            if tool not in {ToolKind.TRANSFORM, ToolKind.FILL} or (
+            if tool not in {ToolKind.TRANSFORM, ToolKind.CAGE_TRANSFORM, ToolKind.FILL} or (
                 tool == ToolKind.FILL and not primary_raster
             ):
                 self.statusBar().showMessage(
@@ -3191,7 +3260,7 @@ class MainWindow(QMainWindow):
         if len(self.canvas.selected_entities) > 1:
             primary_raster = isinstance(selected_object, RasterObject)
             for candidate, button in self.tool_buttons.items():
-                available = candidate == ToolKind.TRANSFORM or (
+                available = candidate in {ToolKind.TRANSFORM, ToolKind.CAGE_TRANSFORM} or (
                     candidate == ToolKind.FILL and primary_raster
                 )
                 button.setVisible(available)
@@ -3242,6 +3311,7 @@ class MainWindow(QMainWindow):
             button.setChecked(self.canvas.tool == tool)
             button.blockSignals(False)
         for tool, button in self.shape_tool_buttons.items():
+            button.setEnabled(self.canvas._selected_text_container() is None)
             button.blockSignals(True)
             button.setChecked(self.canvas.tool == tool)
             button.blockSignals(False)
@@ -3277,6 +3347,9 @@ class MainWindow(QMainWindow):
         self.tool_buttons[ToolKind.GRADIENT].setVisible(gradient_available)
         self.tool_buttons[ToolKind.GRADIENT].setEnabled(gradient_available)
         text_selected = isinstance(selected_object, TextObject)
+        in_text_container = self.canvas._selected_text_container() is not None
+        self.tool_buttons[ToolKind.SHAPE_EDIT].setVisible(not in_text_container)
+        self.tool_buttons[ToolKind.SHAPE_EDIT].setEnabled(not in_text_container)
         self.tool_buttons[ToolKind.TEXT_EDIT].setVisible(self.chapter is not None)
         transform_available = (
             isinstance(
@@ -3326,13 +3399,24 @@ class MainWindow(QMainWindow):
             return ""
         return (
             obj.parent_layer_id
-            if obj.parent_layer_id in self.chapter.layers else ""
+            if obj.parent_layer_id in self.chapter.layers
+            and self.chapter.layers[obj.parent_layer_id].bound is not None else ""
         )
 
     def _ribbon_page_changed(self, key: str) -> None:
         """Remember an explicit ribbon-tab choice across context refreshes."""
         if not self._programmatic_ribbon_selection:
             self._manual_ribbon_page = key
+        if key != "modifiers" and self.canvas._cage_edit_before is not None:
+            self.canvas.finish_cage(True)
+        self.canvas.modifier_mode = key == "modifiers"
+        self.modifier_controls.refresh()
+        self.canvas.update()
+
+    def _activate_cage_modifier(self):
+        self._select_ribbon_page("modifiers")
+        self.canvas.modifier_mode = True
+        self.modifier_controls.add_modifier("cage_transform")
 
     def _select_ribbon_page(self, key: str) -> bool:
         """Select a page without treating an automatic route as a user choice."""
@@ -3364,6 +3448,11 @@ class MainWindow(QMainWindow):
     def _sync_contextual_ribbon(self) -> None:
         if not hasattr(self, "ribbon"):
             return
+        cage_tool = self.canvas._cage_session is not None
+        self.cage_tool_group.setVisible(cage_tool)
+        if cage_tool:
+            self._manual_ribbon_page = "tool_settings"
+            self._select_ribbon_page("tool_settings")
         drawing = self._active_vector_drawing()
         active = drawing is not None
         selected_object = (
@@ -5557,6 +5646,8 @@ class MainWindow(QMainWindow):
             return self._save_editor_session(self.active_session)
         if self.repository is None or self.chapter is None:
             return False
+        if not self.canvas.commit_active_cage():
+            return False
         try:
             self.repository.save_chapter(
                 self.chapter, self.canvas.tiles, self.canvas.images
@@ -5721,6 +5812,8 @@ class MainWindow(QMainWindow):
             )
             return False
 
+        if not self.canvas.commit_active_cage():
+            return False
         self._capture_active_session()
         source_root = context.repository.root
         project_sessions = [
@@ -5954,10 +6047,15 @@ class MainWindow(QMainWindow):
 
     def _undo(self) -> None:
         """Undo on the command stack owned by the currently active canvas."""
+        if self.canvas._cage_session is not None or self.canvas._cage_edit_before is not None:
+            self.canvas.finish_cage(False)
+            return
         self.canvas.command_stack.undo()
 
     def _redo(self) -> None:
         """Redo on the command stack owned by the currently active canvas."""
+        if self.canvas._cage_session is not None or self.canvas._cage_edit_before is not None:
+            self.canvas.finish_cage(False)
         self.canvas.command_stack.redo()
 
     def _toggle_grid(self) -> None:
@@ -6064,7 +6162,7 @@ class MainWindow(QMainWindow):
             return
         key = self._export_destination_key()
         name = re.sub(r'[<>:"/\\|?*\x00-\x1f]+', "-", self.chapter.name).strip(" .-") or "Chapter"
-        previous = self.settings.export_destinations.get(key)
+        previous = self.settings.export_destinations.get(key) or self.chapter.external_image_path
         filename, _ = QFileDialog.getSaveFileName(
             self, "Export As PNG", previous or str(self.repository.root / "exports" / f"{name}.png"),
             "PNG image (*.png)",
@@ -6081,28 +6179,50 @@ class MainWindow(QMainWindow):
     def _export_again(self) -> None:
         if self.chapter is None or self.repository is None:
             return
-        destination = self.settings.export_destinations.get(self._export_destination_key())
+        destination = (self.settings.export_destinations.get(self._export_destination_key())
+                       or self.chapter.external_image_path)
         if destination:
-            self._write_export_png(Path(destination))
+            self._write_export_image(Path(destination))
         else:
             self._export_as()
 
     def _write_export_png(self, destination: Path) -> bool:
+        return self._write_export_image(destination, "PNG")
+
+    def _write_export_image(self, destination: Path, image_format: str | None = None) -> bool:
         try:
+            image_format = image_format or EXPORT_FORMATS.get(destination.suffix.lower())
+            if image_format is None:
+                raise ValueError(f"Unsupported export format: {destination.suffix}")
+            if not self.canvas.commit_active_cage():
+                return False
             self.canvas.commit_active_text_edit()
             image = QImage(self.chapter.width, self.chapter.height, QImage.Format_ARGB32_Premultiplied)
             if image.isNull():
                 raise MemoryError("Could not allocate the chapter image")
             self.canvas.render_preview(image)
-            temporary = destination.with_name(f".{destination.name}.{new_id()}.tmp.png")
+            temporary = destination.with_name(f".{destination.name}.{new_id()}.tmp")
             try:
-                if not image.save(str(temporary), "PNG"):
-                    raise OSError("Qt could not encode the PNG")
+                if image_format == "PNG":
+                    if not image.save(str(temporary), "PNG"):
+                        raise OSError("Qt could not encode the PNG")
+                else:
+                    from PIL import Image
+                    rgba = image.convertToFormat(QImage.Format_RGBA8888)
+                    output = Image.frombytes(
+                        "RGBA", (rgba.width(), rgba.height()), bytes(rgba.constBits()),
+                        "raw", "RGBA", rgba.bytesPerLine(),
+                    )
+                    if image_format == "JPEG":
+                        background = Image.new("RGB", output.size, "white")
+                        background.paste(output, mask=output.getchannel("A"))
+                        output = background
+                    output.save(temporary, format=image_format)
                 temporary.replace(destination)
             finally:
                 temporary.unlink(missing_ok=True)
         except (MemoryError, OSError, ValueError) as error:
-            QMessageBox.critical(self, "Export PNG", f"Unable to export the chapter:\n{error}")
+            QMessageBox.critical(self, "Export image", f"Unable to export the image:\n{error}")
             return False
         self.statusBar().showMessage(f"Exported {destination}", 7000)
         return True
@@ -6121,6 +6241,8 @@ class MainWindow(QMainWindow):
         safe_name = safe_name.strip(" .-") or "Chapter"
         stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
         base = f"{safe_name}-{stamp}"
+        if not self.canvas.commit_active_cage():
+            return
         try:
             exports.mkdir(parents=True, exist_ok=True)
             destination = exports / f"{base}.png"
@@ -6164,6 +6286,7 @@ class MainWindow(QMainWindow):
             for button in (
                 self.add_page_button, self.add_raster_button,
                 self.add_vector_button, self.add_text_button,
+                self.add_free_text_button,
             ):
                 button.setEnabled(False)
             return
@@ -6172,18 +6295,21 @@ class MainWindow(QMainWindow):
         )
         self.save_action.setEnabled(active and self._dirty)
         self.save_as_action.setEnabled(self._current_project_context() is not None)
-        self.new_chapter_action.setEnabled(series_active and self.series is not None)
-        self.trim_action.setEnabled(series_active)
+        comic_active = series_active and self.chapter.document_kind != "image"
+        self.new_chapter_action.setEnabled(comic_active and self.series is not None)
+        self.trim_action.setEnabled(comic_active)
         self.export_png_action.setEnabled(series_active)
         self.export_as_action.setEnabled(series_active)
         self.export_again_action.setEnabled(series_active)
         self.export_png_toolbar_action.setEnabled(series_active)
-        self.add_page_button.setEnabled(series_active)
+        self.add_page_button.setEnabled(comic_active)
         self.undo_action.setEnabled(self.canvas.command_stack.can_undo)
         self.redo_action.setEnabled(self.canvas.command_stack.can_redo)
-        self.add_raster_button.setEnabled(active)
-        self.add_vector_button.setEnabled(active)
+        free_text_context = active and self.canvas._selected_text_container() is not None
+        self.add_raster_button.setEnabled(active and not free_text_context)
+        self.add_vector_button.setEnabled(active and not free_text_context)
         self.add_text_button.setEnabled(active)
+        self.add_free_text_button.setEnabled(active)
         self._sync_tool_buttons()
 
     def _toggle_fullscreen(self) -> None:
