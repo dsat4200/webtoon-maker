@@ -6,7 +6,7 @@ from PySide6.QtGui import QPainter, QTransform
 
 from comic_editor.core.assets import entity_visual_bounds
 from comic_editor.core.commands import CallbackCommand
-from comic_editor.core.models import ChildRef, ImageObject, LayerNode, MirrorModifier, RasterObject, RadialBlurModifier
+from comic_editor.core.models import ChildRef, ImageObject, LayerNode, MirrorModifier, RasterObject, RadialBlurModifier, TilingModifier
 from comic_editor.core.effect_geometry import effect_bounds
 from comic_editor.ui.effect_pipeline import aligned, empty_image, render_stages
 
@@ -69,6 +69,8 @@ def visual_bounds(canvas, kind, identifier):
     if kind == "layer":
         for ref in target.children:
             result = result.united(visual_bounds(canvas, ref.kind, ref.entity_id))
+    if canvas._own_tiling(target):
+        result = canvas._tiling_boundary(target).boundingRect()
     parent = target.parent_id if kind == "layer" else target.parent_layer_id
     mapping = canvas.layer_world_transform(parent) if parent else QTransform()
     inverse, valid = mapping.inverted()
@@ -212,7 +214,23 @@ def apply_raster_modifiers(canvas, modifier_id):
         for (x, y), tile in canvas.tiles.iter_tiles(identifier):
             painter.drawImage(QPointF(x * obj.tile_size, y * obj.tile_size) - bounds.topLeft(), tile)
         painter.end()
-        image, bounds = render_stages(canvas, image, bounds, [chapter.modifiers[mid] for mid in baked], canvas._drawing_local_to_world_transform(obj), nearest=True)
+        tiling = canvas._own_tiling(obj)
+        placement = None
+        if tiling and tiling.modifier_id in baked:
+            world_image, world_bounds = canvas._tiling_stage(obj)
+            world_image, world_bounds = render_stages(canvas, world_image, world_bounds,
+                [chapter.modifiers[mid] for mid in baked if mid != tiling.modifier_id], QTransform(), nearest=True)
+            mapping = canvas.layer_world_transform(obj.parent_layer_id)
+            inverse, valid = mapping.inverted()
+            if not valid:
+                raise ValueError("Cannot apply tiling through a singular drawing transform")
+            # Bake in document pixels to avoid two resamplings through an
+            # existing projective raster transform.
+            image, bounds = world_image, world_bounds
+            placement = [inverse.map(p).toTuple() for p in
+                (bounds.topLeft(), bounds.topRight(), bounds.bottomRight(), bounds.bottomLeft())]
+        else:
+            image, bounds = render_stages(canvas, image, bounds, [chapter.modifiers[mid] for mid in baked], canvas._drawing_local_to_world_transform(obj), nearest=True)
         tiles = {}
         size = obj.tile_size
         for y in range(math.floor(bounds.top() / size), math.ceil(bounds.bottom() / size)):
@@ -223,10 +241,16 @@ def apply_raster_modifiers(canvas, modifier_id):
                 painter.end()
                 if canvas.tiles._alpha_bbox(tile) is not None:
                     tiles[x, y] = tile
-        prepared.append((obj, baked, bounds, tiles))
+        prepared.append((obj, baked, bounds, tiles, placement))
     identifiers = {identifier for _, identifier in targets}
     before = snapshot(canvas, identifiers)
-    for obj, baked, bounds, tiles in prepared:
+    for obj, baked, bounds, tiles, placement in prepared:
+        if placement is not None:
+            obj.x, obj.y = 0., 0.
+            obj.transform_frame = canvas._rect_signature(bounds)
+            obj.transform_quad = placement
+            obj.interaction_rect = canvas._rect_signature(bounds)
+            obj.modifier_source_frame = canvas._rect_signature(bounds)
         if obj.modifier_source_frame is not None or any(
             isinstance(chapter.modifiers[mid], RadialBlurModifier) and not chapter.modifiers[mid].muted
             for mid in obj.modifier_ids

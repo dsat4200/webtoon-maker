@@ -80,11 +80,12 @@ class TileStore:
         antialias: bool = True,
         before: dict[tuple[int, int], QImage | None] | None = None,
         replace_alpha: bool = False,
+        tiling=None,
     ) -> QRectF:
         return self._paint_samples(
             object_id, [(QPointF(point), float(size), float(opacity))],
             color, erase=erase, square=square, antialias=antialias,
-            before=before, replace_alpha=replace_alpha,
+            before=before, replace_alpha=replace_alpha, tiling=tiling,
         )
 
     def paint_segment(
@@ -95,6 +96,7 @@ class TileStore:
         antialias: bool = True, density: float = 1.0,
         before: dict[tuple[int, int], QImage | None] | None = None,
         replace_alpha: bool = False,
+        tiling=None,
     ) -> QRectF:
         """Paint one pressure-varying segment with one painter per tile.
 
@@ -122,7 +124,7 @@ class TileStore:
         return self._paint_samples(
             object_id, samples, color, erase=erase, square=square,
             antialias=antialias, before=before,
-            replace_alpha=replace_alpha,
+            replace_alpha=replace_alpha, tiling=tiling,
         )
 
     def paint_line(
@@ -559,6 +561,11 @@ class TileStore:
         cancel_check: Callable[[], bool] | None = None,
     ) -> QRectF:
         """Sparse profile-driven fill over lazily supplied RGBA/mask tiles."""
+        if profile.get("_tiling_context") is not None:
+            from comic_editor.core.tiling_fill import periodic_fill
+            return periodic_fill(self, object_id, point, color, profile, before,
+                region_policy=region_policy, reference_tile=reference_tile,
+                selection_tile=selection_tile, cancel_check=cancel_check)
         if cancel_check is not None and cancel_check():
             return QRectF()
         frame = QRectF(bounds).normalized()
@@ -931,9 +938,14 @@ class TileStore:
         *, erase: bool, square: bool, antialias: bool,
         before: dict[tuple[int, int], QImage | None] | None,
         replace_alpha: bool = False,
+        tiling=None,
     ) -> QRectF:
         if not samples:
             return QRectF()
+        if tiling is not None:
+            from comic_editor.core.tiling_paint import paint_samples
+            return paint_samples(self, object_id, samples, color, tiling,
+                                 erase=erase, square=square, antialias=antialias, before=before)
         object_tiles = self._tiles.setdefault(object_id, {})
         grouped: dict[
             tuple[int, int], list[tuple[QPointF, float, float]]

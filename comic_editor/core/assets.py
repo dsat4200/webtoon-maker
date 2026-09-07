@@ -15,7 +15,7 @@ from PySide6.QtGui import QImage, QPolygonF, QTransform
 from .models import (
     BoundGeometry, ChapterDocument, ChildRef, ColorFillGradientObject,
     DocumentObject, EmbeddedImageSourceDescriptor, GradientObject, ImageObject,
-    LayerNode, RasterObject, ShapeStyle, MirrorModifier, RadialBlurModifier, CageTransformModifier,
+    LayerNode, RasterObject, ShapeStyle, MirrorModifier, RadialBlurModifier, CageTransformModifier, TilingModifier,
     SpeedLineCenterObject, SpeedLinesGradientObject, TextObject,
     ToneMask, VectorDrawingObject, modifier_from_dict, new_id,
     object_from_dict,
@@ -38,6 +38,27 @@ THUMBNAIL_FILE = "thumbnail.png"
 PENDING_FILE = ".save_pending"
 LAST_GOOD_DIR = "last_good"
 ASSET_PADDING = 64.0
+
+
+def _tiling_boundary_path(document, layer):
+    # Reuse the compositor's effective silhouette, including compound operands
+    # and open-shape thickness, without creating a canvas or touching pixels.
+    from comic_editor.ui.canvas import CanvasWidget
+    from comic_editor.ui.shape_outline import OutlineCache
+
+    class GeometryQuery:
+        _document_layer_effective_path = CanvasWidget._document_layer_effective_path
+        _layer_operand_path = CanvasWidget._layer_operand_path
+        _document_layer_world_transform = staticmethod(_layer_world_transform)
+        layer_shape_path = staticmethod(CanvasWidget.layer_shape_path)
+        open_shape_mesh = staticmethod(CanvasWidget.open_shape_mesh)
+        bound_path = staticmethod(CanvasWidget.bound_path)
+
+        def __init__(self):
+            self._outline_cache = OutlineCache()
+
+    return _layer_world_transform(document, layer.layer_id).map(
+        GeometryQuery()._document_layer_effective_path(document, layer.layer_id, {}))
 
 
 def _translate_cage(modifier, dx, dy):
@@ -408,6 +429,13 @@ def entity_visual_bounds(document: ChapterDocument, tiles: TileStore,
     def expanded(rect, target, parent_id):
         if not include_effects:
             return rect
+        if any(isinstance(document.modifiers.get(mid), TilingModifier) and not document.modifiers[mid].muted
+               and (document.modifiers[mid].intensity > 0 or document.modifiers[mid].parameter_masks) for mid in target.modifier_ids):
+            owner = target if isinstance(target, LayerNode) else document.layers.get(parent_id)
+            while owner is not None and owner.bound is None:
+                owner = document.layers.get(owner.parent_id)
+            if owner is not None:
+                rect = _tiling_boundary_path(document, owner).boundingRect()
         mapping = _layer_world_transform(document, parent_id) if parent_id else QTransform()
         inverse, valid = mapping.inverted()
         if not valid:
@@ -640,6 +668,15 @@ def extract_asset(
         if isinstance(root, SpeedLinesGradientObject) and root.center_shape_id:
             asset.objects[root.center_shape_id].parent_layer_id = container.layer_id
     container.children = [ChildRef(kind, entity_id)]
+    tiled_root = kind == "object" and any(isinstance(asset.modifiers.get(mid), TilingModifier) for mid in root.modifier_ids)
+    if tiled_root:
+        boundary_owner = document.layers[document.objects[entity_id].parent_layer_id]
+        while boundary_owner.bound is None and boundary_owner.parent_id:
+            boundary_owner = document.layers[boundary_owner.parent_id]
+        if boundary_owner.bound is not None:
+            from comic_editor.ui.canvas import CanvasWidget
+            container.bound = CanvasWidget._geometry_from_painter_path(
+                _tiling_boundary_path(document, boundary_owner)) or BoundGeometry.rectangle(0, 0, 0, 0)
 
     asset_images = ImageStore()
     for object_id in object_ids:
@@ -672,7 +709,7 @@ def extract_asset(
     for modifier in asset.modifiers.values():
         if isinstance(modifier, CageTransformModifier):
             _translate_cage(modifier, dx, dy)
-        if isinstance(modifier, RadialBlurModifier):
+        if isinstance(modifier, (RadialBlurModifier, TilingModifier)):
             modifier.center = (modifier.center[0]+dx, modifier.center[1]+dy)
         if isinstance(modifier, MirrorModifier):
             modifier.axis_start = (modifier.axis_start[0] + dx, modifier.axis_start[1] + dy)
@@ -684,7 +721,10 @@ def extract_asset(
     width = max(256, int(math.ceil(bounds.width() + ASSET_PADDING * 2)))
     height = max(256, int(math.ceil(bounds.height() + ASSET_PADDING * 2)))
     asset.width, asset.height = width, height
-    container.bound = BoundGeometry.rectangle(0, 0, width, height)
+    if tiled_root:
+        _translate_bound(container.bound, dx, dy)
+    else:
+        container.bound = BoundGeometry.rectangle(0, 0, width, height)
     fitted = entity_visual_bounds(asset, asset_tiles, kind, entity_id, include_effects=True)
     manifest = AssetManifest(
         name=name, root_kind=kind, root_id=entity_id, document=asset,
@@ -706,8 +746,11 @@ def _renew_internal_ids(layer: LayerNode | None, obj: DocumentObject | None) -> 
     if obj is None:
         return
     if isinstance(obj, VectorDrawingObject):
+        tiling_groups = {}
         for stroke in obj.strokes:
             stroke.stroke_id = new_id()
+            if stroke.tiling_group:
+                stroke.tiling_group = tiling_groups.setdefault(stroke.tiling_group, new_id())
             for point in stroke.points:
                 point.point_id = new_id()
     if isinstance(obj, GradientObject):
@@ -743,6 +786,12 @@ def instantiate_asset(
         raise ValueError("Free Text containers accept Text assets only")
     source = manifest.document
     layer_ids, object_ids = _collect_subtree(source, manifest.root_kind, manifest.root_id)
+    source_tiled = any(isinstance(source.modifiers.get(mid), TilingModifier)
+        for entity in [*(source.layers[key] for key in layer_ids), *(source.objects[key] for key in object_ids)]
+        for mid in entity.modifier_ids)
+    if source_tiled and any(isinstance(target.modifiers.get(mid), TilingModifier)
+        for ancestor in target.ancestor_layers(parent_id) for mid in ancestor.modifier_ids):
+        raise ValueError("Cannot place a tiled asset inside another tiling setup")
     layer_map = {old: new_id() for old in layer_ids}
     object_map = {old: new_id() for old in object_ids}
 
@@ -811,7 +860,7 @@ def instantiate_asset(
         modifier = target.modifiers[modifier_id]
         if isinstance(modifier, CageTransformModifier):
             _translate_cage(modifier, dx, dy)
-        if isinstance(modifier, RadialBlurModifier):
+        if isinstance(modifier, (RadialBlurModifier, TilingModifier)):
             modifier.center = (modifier.center[0]+dx, modifier.center[1]+dy)
         if isinstance(modifier, MirrorModifier):
             modifier.axis_start = (modifier.axis_start[0] + dx, modifier.axis_start[1] + dy)

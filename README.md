@@ -23,7 +23,7 @@ workflow.
 - Non-destructive hierarchical masks
 - Chapter-local reusable tone masks for opacity and modifier parameters, with
   live contributor alpha, raster paint, and a translucent blue edit overlay
-- Linked non-destructive HSL, blur, and exact outside-outline modifier stacks
+- Linked non-destructive HSL, blur, exact outside-outline, and hue-based Posterize modifier stacks
 - Sparse 256×256 raster tiles
 - Explicit, non-clipping raster interaction frames with drag-to-create
 - Named pressure-curve pencil presets, independent pressure channels,
@@ -48,6 +48,44 @@ workflow.
 - Command-based undo/redo and atomic autosave recovery
 - Blender 4.5 Comic Views as disk-published transparent image sources with
   persistent offline PNG caches
+
+## Posterize
+
+The **Modifiers → Add Modifier → Posterize…** command asks for 1–24 colors.
+It samples the selected artwork and creates hue ranges with average output
+colors. The circular editor shows hue around the ring and frequency as radial
+bars. Drag a boundary to resize a range; neighboring handles cannot cross.
+Click a color swatch (or **Color…**) to use the existing color picker. **+** splits
+the selected range; **−** merges it into the preceding range. The last range is
+kept. Ranges may wrap through red at 0°; gray pixels use hue 0°.
+
+Enable **Simplify colors**, above the posterization controls, to reduce fine
+grain before mapping hues. **Detail size** sets the neighborhood radius in
+artwork pixels; **Color tolerance** controls how readily nearby colors blend;
+**Strength** blends the simplified colors with the original. Start at 3 px,
+25% tolerance, and 100% strength. Increase detail size for coarser texture, or
+lower tolerance to protect more boundaries. The step uses alpha-weighted
+[RGB guided filtering](https://people.csail.mit.edu/kaiming/eccv10/index.html),
+preserves transparency, and updates the hue histogram without resetting the
+chosen ranges or palette. It starts disabled so existing artwork is unchanged.
+
+Posterize preserves source transparency and supports intensity, masks, linked
+targets, undo/redo, saving, export, and Raster **Apply**. Large artwork uses a
+bounded sample for the initial palette and live histogram; the effect itself
+is rendered at the artwork's resolution.
+
+**Posterize Value…** is the grayscale-source variant in the same menu. It
+groups perceived brightness (0 = black, 255 = white) instead of hue. Its
+rectangular editor shows a linear grayscale ramp and frequency bars, with a
+separate strip of output colors. Every range can map to any color through the
+same picker. Black and white are fixed endpoints; drag the internal boundaries
+to resize ranges, or use **+** / **−** to split and merge them. Initialization
+asks for a color count and seeds the output with grayscale averages.
+
+Posterize Value includes the same **Simplify colors** controls above the range
+editor. The source is converted to grayscale before smoothing and range mapping;
+the output palette stays editable. Intensity, masks, linking, undo/redo, saved
+projects, assets, export, and Raster **Apply** work with either variant.
 
 ## Run
 
@@ -373,11 +411,33 @@ retains point widths. Splitting edges interpolates widths and preserves hidden
 edges; deletion joins an edge only when both replaced edges were enabled.
 
 Click a modifier card's background/title to select it (blue border), and click
-again to deselect. Only its unmuted Mirror, focal Blur, or Radial Blur gizmos are shown.
+again to deselect. Only its selected, unmuted modifier's manipulation handles are shown.
 Mirror retains the original above its reflection. Its orange dotted axis has
 two endpoint handles and a midpoint handle; grid snapping applies to both.
 Shape mirrors can independently Add/Subtract into the nearest compound, or
 Ignore it. A linked Mirror shares one document-space axis across its targets.
+
+**Modifiers → Add Modifier → Tiling** repeats a movable crop of a raster drawing,
+vector drawing, image, or non-page shape. Choose Square, Hexagon, or reflected
+Triangle. Set the center, side length, and rotation numerically, or select the
+card and drag the center, corner, and rotation handles. Moving the tile samples
+different source artwork; muting or removing Tiling restores the source view.
+The orange source boundary stays visible while painting an affected drawing.
+
+Pencil and eraser gestures wrap complete brush footprints across tile edges,
+and raster fills use the same periodic boundaries, including vector reference
+artwork. Wrapped vector strokes remain editable and whole-stroke erasing keeps
+their seam fragments together. Selection and ordinary transforms edit source
+content; selecting repeated copies and direct vector fills are not supported.
+
+On shapes, Tiling repeats the children together, preserves their internal masks,
+and clips the result to the shape, including compound holes and open-shape
+silhouettes. The shape's own fill and outline stay in place. Tiled drawings and
+images fill their nearest enclosing shape or page. Tiling stays first in the
+modifier stack, supports intensity and masks, and allows one setup per hierarchy
+branch, including muted setups. Siblings can share a linked document-space grid.
+Save/reopen, assets, export, Rasterize, and Raster Apply retain the same result;
+baking removes the baked tiling behavior. Chapter files now use schema 25.
 
 Right-click an object or non-page shape and choose **Rasterize** to bake its
 subtree and active effects into one embedded Image. Undo restores the graph

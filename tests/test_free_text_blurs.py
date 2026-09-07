@@ -73,7 +73,7 @@ def test_schema_23_defaults_and_legacy_interactions():
     blur = BlurModifier(strength=12, mode="focal", muted=True)
     chapter.add_modifier(blur, [("object", raster.object_id)])
     payload = chapter.to_dict()
-    assert payload["schema_version"] == 24
+    assert payload["schema_version"] == 25
     assert text.transform_behavior == "bounds"
     assert blur.algorithm == "normal"
     payload["schema_version"] = 22

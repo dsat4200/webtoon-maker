@@ -1,5 +1,5 @@
 {
-  "schema_version": 21,
+  "schema_version": 24,
   "id": "2a9f55d8898c4d968c06336933bff773",
   "name": "Chapter 1",
   "size": [
@@ -7,7 +7,8 @@
     3240
   ],
   "document_kind": "chapter",
-  "background": "#ffffff",
+  "external_image_path": "",
+  "background": "#00000000",
   "grid": {
     "enabled": false,
     "size": 120,
@@ -29,6 +30,7 @@
       "name": "Page 1",
       "is_page": true,
       "layer_kind": "bounded",
+      "text_transform_behavior": "bounds",
       "parent_id": null,
       "children": [
         {
@@ -77,7 +79,9 @@
             "handles_locked": true,
             "roundness": 0.0,
             "roundness_enabled": false,
-            "width_multiplier": 1.0
+            "width_multiplier": 1.0,
+            "outline_multiplier": 1.0,
+            "outline_enabled": true
           },
           {
             "id": "57de7e6fb3b243c88190588aed37ddad",
@@ -91,7 +95,9 @@
             "handles_locked": true,
             "roundness": 0.0,
             "roundness_enabled": false,
-            "width_multiplier": 1.0
+            "width_multiplier": 1.0,
+            "outline_multiplier": 1.0,
+            "outline_enabled": true
           },
           {
             "id": "3339e0802f5f4d7b9c9bb6a92124bc30",
@@ -105,7 +111,9 @@
             "handles_locked": true,
             "roundness": 0.0,
             "roundness_enabled": false,
-            "width_multiplier": 1.0
+            "width_multiplier": 1.0,
+            "outline_multiplier": 1.0,
+            "outline_enabled": true
           },
           {
             "id": "780056c9557948148424ff7c67c39d9f",
@@ -119,7 +127,9 @@
             "handles_locked": true,
             "roundness": 0.0,
             "roundness_enabled": false,
-            "width_multiplier": 1.0
+            "width_multiplier": 1.0,
+            "outline_multiplier": 1.0,
+            "outline_enabled": true
           }
         ],
         "additional_contours": []
@@ -147,6 +157,7 @@
       "name": "Drawing Layer",
       "is_page": false,
       "layer_kind": "bounded",
+      "text_transform_behavior": "bounds",
       "parent_id": "4236406c49e848b9b1a89095c36f9fa3",
       "children": [
         {
@@ -183,7 +194,9 @@
             "handles_locked": true,
             "roundness": 0.0,
             "roundness_enabled": false,
-            "width_multiplier": 1.0
+            "width_multiplier": 1.0,
+            "outline_multiplier": 1.0,
+            "outline_enabled": true
           },
           {
             "id": "57de7e6fb3b243c88190588aed37ddad",
@@ -197,7 +210,9 @@
             "handles_locked": true,
             "roundness": 0.0,
             "roundness_enabled": false,
-            "width_multiplier": 1.0
+            "width_multiplier": 1.0,
+            "outline_multiplier": 1.0,
+            "outline_enabled": true
           },
           {
             "id": "f49cc2e02e724e39a8f6992d8a0fd3a0",
@@ -211,7 +226,9 @@
             "handles_locked": true,
             "roundness": 0.0,
             "roundness_enabled": false,
-            "width_multiplier": 1.0
+            "width_multiplier": 1.0,
+            "outline_multiplier": 1.0,
+            "outline_enabled": true
           },
           {
             "id": "3339e0802f5f4d7b9c9bb6a92124bc30",
@@ -225,7 +242,9 @@
             "handles_locked": true,
             "roundness": 0.0,
             "roundness_enabled": false,
-            "width_multiplier": 1.0
+            "width_multiplier": 1.0,
+            "outline_multiplier": 1.0,
+            "outline_enabled": true
           },
           {
             "id": "780056c9557948148424ff7c67c39d9f",
@@ -239,7 +258,9 @@
             "handles_locked": true,
             "roundness": 0.0,
             "roundness_enabled": false,
-            "width_multiplier": 1.0
+            "width_multiplier": 1.0,
+            "outline_multiplier": 1.0,
+            "outline_enabled": true
           }
         ],
         "additional_contours": []
@@ -267,6 +288,7 @@
       "name": "Layer 1",
       "is_page": false,
       "layer_kind": "bounded",
+      "text_transform_behavior": "bounds",
       "parent_id": "4236406c49e848b9b1a89095c36f9fa3",
       "children": [
         {
@@ -303,7 +325,9 @@
             "handles_locked": true,
             "roundness": 105.0,
             "roundness_enabled": true,
-            "width_multiplier": 1.0
+            "width_multiplier": 1.0,
+            "outline_multiplier": 1.0,
+            "outline_enabled": true
           },
           {
             "id": "c82c1e91a31e4d5ca7aa686af18b1d23",
@@ -317,7 +341,9 @@
             "handles_locked": true,
             "roundness": 0.0,
             "roundness_enabled": false,
-            "width_multiplier": 1.0
+            "width_multiplier": 1.0,
+            "outline_multiplier": 1.0,
+            "outline_enabled": true
           },
           {
             "id": "a3081989b17b401e94544e0c452fc0cb",
@@ -331,7 +357,9 @@
             "handles_locked": true,
             "roundness": 105.0,
             "roundness_enabled": true,
-            "width_multiplier": 1.0
+            "width_multiplier": 1.0,
+            "outline_multiplier": 1.0,
+            "outline_enabled": true
           },
           {
             "id": "2650531f645843f183d42b15604157dd",
@@ -345,7 +373,9 @@
             "handles_locked": true,
             "roundness": 105.0,
             "roundness_enabled": true,
-            "width_multiplier": 1.0
+            "width_multiplier": 1.0,
+            "outline_multiplier": 1.0,
+            "outline_enabled": true
           },
           {
             "id": "1d7a9dc3fdc347aaaf9b61d135f80993",
@@ -359,7 +389,9 @@
             "handles_locked": true,
             "roundness": 105.0,
             "roundness_enabled": true,
-            "width_multiplier": 1.0
+            "width_multiplier": 1.0,
+            "outline_multiplier": 1.0,
+            "outline_enabled": true
           }
         ],
         "additional_contours": []
@@ -387,6 +419,7 @@
       "name": "Layer 2",
       "is_page": false,
       "layer_kind": "open_shape",
+      "text_transform_behavior": "bounds",
       "parent_id": "522af5ab266d4a28882d067a49687769",
       "children": [],
       "visible": true,
@@ -414,7 +447,9 @@
             "handles_locked": true,
             "roundness": 0.0,
             "roundness_enabled": false,
-            "width_multiplier": 2.2
+            "width_multiplier": 2.2,
+            "outline_multiplier": 1.0,
+            "outline_enabled": true
           },
           {
             "id": "0bbbba7c6bbb4e009c2a931e8847f77e",
@@ -431,7 +466,9 @@
             "handles_locked": false,
             "roundness": 0.0,
             "roundness_enabled": false,
-            "width_multiplier": 0.1
+            "width_multiplier": 0.1,
+            "outline_multiplier": 1.0,
+            "outline_enabled": true
           }
         ],
         "additional_contours": []
@@ -459,6 +496,7 @@
       "name": "Layer 3",
       "is_page": false,
       "layer_kind": "bounded",
+      "text_transform_behavior": "bounds",
       "parent_id": "4236406c49e848b9b1a89095c36f9fa3",
       "children": [
         {
@@ -468,6 +506,10 @@
         {
           "kind": "object",
           "id": "f66e4d1b352d49afa4ae95179d6127f8"
+        },
+        {
+          "kind": "object",
+          "id": "d1f974afd18945dcb3d0a815f7043093"
         },
         {
           "kind": "object",
@@ -515,7 +557,9 @@
             "handles_locked": true,
             "roundness": 0.0,
             "roundness_enabled": false,
-            "width_multiplier": 1.0
+            "width_multiplier": 1.0,
+            "outline_multiplier": 1.0,
+            "outline_enabled": true
           },
           {
             "id": "dcf89befec484f03977c5ed0310c8114",
@@ -529,7 +573,9 @@
             "handles_locked": true,
             "roundness": 0.0,
             "roundness_enabled": false,
-            "width_multiplier": 1.0
+            "width_multiplier": 1.0,
+            "outline_multiplier": 1.0,
+            "outline_enabled": true
           },
           {
             "id": "adc737925f03421ab55e15bf8681618f",
@@ -543,7 +589,9 @@
             "handles_locked": true,
             "roundness": 0.0,
             "roundness_enabled": false,
-            "width_multiplier": 1.0
+            "width_multiplier": 1.0,
+            "outline_multiplier": 1.0,
+            "outline_enabled": true
           },
           {
             "id": "9bbbb1a49fb2463089a8e150abe814b5",
@@ -557,7 +605,9 @@
             "handles_locked": true,
             "roundness": 0.0,
             "roundness_enabled": false,
-            "width_multiplier": 1.0
+            "width_multiplier": 1.0,
+            "outline_multiplier": 1.0,
+            "outline_enabled": true
           }
         ],
         "additional_contours": []
@@ -585,6 +635,7 @@
       "name": "Basic Word Balloon",
       "is_page": false,
       "layer_kind": "bounded",
+      "text_transform_behavior": "bounds",
       "parent_id": "d7fd7612e6fd4aa8be0ca5c403fdc778",
       "children": [
         {
@@ -629,7 +680,9 @@
             "handles_locked": true,
             "roundness": 75.0,
             "roundness_enabled": true,
-            "width_multiplier": 1.0
+            "width_multiplier": 1.0,
+            "outline_multiplier": 1.0,
+            "outline_enabled": true
           },
           {
             "id": "e4cf574d54fc4ecfbdb06827d9e0e870",
@@ -643,7 +696,9 @@
             "handles_locked": true,
             "roundness": 75.0,
             "roundness_enabled": true,
-            "width_multiplier": 1.0
+            "width_multiplier": 1.0,
+            "outline_multiplier": 1.0,
+            "outline_enabled": true
           },
           {
             "id": "2d31ba14570541cf8ac5e3ce1fdfeba0",
@@ -657,7 +712,9 @@
             "handles_locked": true,
             "roundness": 75.0,
             "roundness_enabled": true,
-            "width_multiplier": 1.0
+            "width_multiplier": 1.0,
+            "outline_multiplier": 1.0,
+            "outline_enabled": true
           },
           {
             "id": "a409f0efc2ac400fa02e3aa14a13ee3a",
@@ -671,7 +728,9 @@
             "handles_locked": true,
             "roundness": 75.0,
             "roundness_enabled": true,
-            "width_multiplier": 1.0
+            "width_multiplier": 1.0,
+            "outline_multiplier": 1.0,
+            "outline_enabled": true
           }
         ],
         "additional_contours": []
@@ -701,6 +760,7 @@
       "name": "Layer 5",
       "is_page": false,
       "layer_kind": "open_shape",
+      "text_transform_behavior": "bounds",
       "parent_id": "ea5e5c25d23646fabf0541ce16c669a8",
       "children": [],
       "visible": true,
@@ -728,7 +788,9 @@
             "handles_locked": true,
             "roundness": 0.0,
             "roundness_enabled": false,
-            "width_multiplier": 5.9
+            "width_multiplier": 5.9,
+            "outline_multiplier": 1.0,
+            "outline_enabled": true
           },
           {
             "id": "4decbdac56924f04b36dd957519706f8",
@@ -745,7 +807,9 @@
             "handles_locked": false,
             "roundness": 0.0,
             "roundness_enabled": false,
-            "width_multiplier": 1.0
+            "width_multiplier": 1.0,
+            "outline_multiplier": 1.0,
+            "outline_enabled": true
           }
         ],
         "additional_contours": []
@@ -773,6 +837,7 @@
       "name": "Basic Word Balloon",
       "is_page": false,
       "layer_kind": "bounded",
+      "text_transform_behavior": "bounds",
       "parent_id": "4236406c49e848b9b1a89095c36f9fa3",
       "children": [
         {
@@ -809,7 +874,9 @@
             "handles_locked": true,
             "roundness": 89.0,
             "roundness_enabled": true,
-            "width_multiplier": 1.0
+            "width_multiplier": 1.0,
+            "outline_multiplier": 1.0,
+            "outline_enabled": true
           },
           {
             "id": "7b2d5bcbe0e34dcb861ce5f17bf09f1a",
@@ -823,7 +890,9 @@
             "handles_locked": true,
             "roundness": 89.0,
             "roundness_enabled": true,
-            "width_multiplier": 1.0
+            "width_multiplier": 1.0,
+            "outline_multiplier": 1.0,
+            "outline_enabled": true
           },
           {
             "id": "96522a2e3fbf441386ec6ae410ce0df1",
@@ -837,7 +906,9 @@
             "handles_locked": true,
             "roundness": 89.0,
             "roundness_enabled": true,
-            "width_multiplier": 1.0
+            "width_multiplier": 1.0,
+            "outline_multiplier": 1.0,
+            "outline_enabled": true
           },
           {
             "id": "2b7fc66634764f00aa7c968c10093c17",
@@ -851,7 +922,9 @@
             "handles_locked": true,
             "roundness": 89.0,
             "roundness_enabled": true,
-            "width_multiplier": 1.0
+            "width_multiplier": 1.0,
+            "outline_multiplier": 1.0,
+            "outline_enabled": true
           }
         ],
         "additional_contours": []
@@ -879,6 +952,7 @@
       "name": "Layer 5",
       "is_page": false,
       "layer_kind": "open_shape",
+      "text_transform_behavior": "bounds",
       "parent_id": "a2e741f7107b4172ba63f7ff7703e2d7",
       "children": [],
       "visible": true,
@@ -906,7 +980,9 @@
             "handles_locked": true,
             "roundness": 0.0,
             "roundness_enabled": false,
-            "width_multiplier": 5.9
+            "width_multiplier": 5.9,
+            "outline_multiplier": 1.0,
+            "outline_enabled": true
           },
           {
             "id": "bbf68cac2b72493c937e9706356a2bd0",
@@ -923,7 +999,9 @@
             "handles_locked": false,
             "roundness": 0.0,
             "roundness_enabled": false,
-            "width_multiplier": 1.0
+            "width_multiplier": 1.0,
+            "outline_multiplier": 1.0,
+            "outline_enabled": true
           }
         ],
         "additional_contours": []
@@ -951,6 +1029,7 @@
       "name": "Layer 6",
       "is_page": false,
       "layer_kind": "open_shape",
+      "text_transform_behavior": "bounds",
       "parent_id": "ea5e5c25d23646fabf0541ce16c669a8",
       "children": [],
       "visible": true,
@@ -978,7 +1057,9 @@
             "handles_locked": true,
             "roundness": 0.0,
             "roundness_enabled": false,
-            "width_multiplier": 1.0
+            "width_multiplier": 1.0,
+            "outline_multiplier": 1.0,
+            "outline_enabled": true
           },
           {
             "id": "93585873a5db408bb9edac2f777d7841",
@@ -995,7 +1076,9 @@
             "handles_locked": false,
             "roundness": 0.0,
             "roundness_enabled": false,
-            "width_multiplier": 3.4
+            "width_multiplier": 3.4,
+            "outline_multiplier": 1.0,
+            "outline_enabled": true
           }
         ],
         "additional_contours": []
@@ -1023,6 +1106,7 @@
       "name": "Layer 7",
       "is_page": false,
       "layer_kind": "bounded",
+      "text_transform_behavior": "bounds",
       "parent_id": "ea5e5c25d23646fabf0541ce16c669a8",
       "children": [
         {
@@ -1061,7 +1145,9 @@
             "handles_locked": true,
             "roundness": 0.0,
             "roundness_enabled": false,
-            "width_multiplier": 1.0
+            "width_multiplier": 1.0,
+            "outline_multiplier": 1.0,
+            "outline_enabled": true
           },
           {
             "id": "b61250cf539d4570ae50b6ca623ac7b6",
@@ -1081,7 +1167,9 @@
             "handles_locked": true,
             "roundness": 0.0,
             "roundness_enabled": false,
-            "width_multiplier": 1.0
+            "width_multiplier": 1.0,
+            "outline_multiplier": 1.0,
+            "outline_enabled": true
           },
           {
             "id": "86947f910f1c40359dbdeefad8333ee0",
@@ -1101,7 +1189,9 @@
             "handles_locked": true,
             "roundness": 0.0,
             "roundness_enabled": false,
-            "width_multiplier": 1.0
+            "width_multiplier": 1.0,
+            "outline_multiplier": 1.0,
+            "outline_enabled": true
           },
           {
             "id": "b13a81e9b0484d768596d4bfc7f3a20f",
@@ -1121,7 +1211,9 @@
             "handles_locked": true,
             "roundness": 0.0,
             "roundness_enabled": false,
-            "width_multiplier": 1.0
+            "width_multiplier": 1.0,
+            "outline_multiplier": 1.0,
+            "outline_enabled": true
           }
         ],
         "additional_contours": []
@@ -1167,6 +1259,7 @@
       "modifier_ids": [],
       "opacity_mask": null,
       "tile_size": 256,
+      "modifier_source_frame": null,
       "interaction_rect": [
         125.0,
         71.0,
@@ -23659,6 +23752,7 @@
       "kerning": 1.0,
       "line_spacing": 1.0,
       "layout_mode": "strict",
+      "transform_behavior": "stretch",
       "horizontal_alignment": "center",
       "vertical_alignment": "middle",
       "margin": 23.101941747572795,
@@ -53510,6 +53604,7 @@
       ],
       "opacity_mask": null,
       "tile_size": 256,
+      "modifier_source_frame": null,
       "interaction_rect": [
         -49.0,
         95.0,
@@ -53551,6 +53646,7 @@
       "kerning": 0.0,
       "line_spacing": 1.0,
       "layout_mode": "free",
+      "transform_behavior": "stretch",
       "horizontal_alignment": "center",
       "vertical_alignment": "middle",
       "margin": 24.0,
@@ -53613,7 +53709,9 @@
               "handles_locked": true,
               "roundness": 0.0,
               "roundness_enabled": false,
-              "width_multiplier": 1.0
+              "width_multiplier": 1.0,
+              "outline_multiplier": 1.0,
+              "outline_enabled": true
             },
             {
               "id": "09dc07ab029549b18c15d9e09bf8e46a",
@@ -53627,7 +53725,9 @@
               "handles_locked": true,
               "roundness": 0.0,
               "roundness_enabled": false,
-              "width_multiplier": 1.0
+              "width_multiplier": 1.0,
+              "outline_multiplier": 1.0,
+              "outline_enabled": true
             }
           ],
           "additional_contours": []
@@ -53719,7 +53819,9 @@
               "handles_locked": true,
               "roundness": 0.0,
               "roundness_enabled": false,
-              "width_multiplier": 1.0
+              "width_multiplier": 1.0,
+              "outline_multiplier": 1.0,
+              "outline_enabled": true
             },
             {
               "id": "dd1abde6f18d452197847a01039ffdff",
@@ -53733,7 +53835,9 @@
               "handles_locked": true,
               "roundness": 0.0,
               "roundness_enabled": false,
-              "width_multiplier": 1.0
+              "width_multiplier": 1.0,
+              "outline_multiplier": 1.0,
+              "outline_enabled": true
             }
           ],
           "additional_contours": []
@@ -53820,6 +53924,7 @@
       "kerning": 0.0,
       "line_spacing": 1.0,
       "layout_mode": "strict",
+      "transform_behavior": "stretch",
       "horizontal_alignment": "center",
       "vertical_alignment": "middle",
       "margin": 24.0,
@@ -53857,6 +53962,7 @@
       "kerning": 0.0,
       "line_spacing": 1.0,
       "layout_mode": "free",
+      "transform_behavior": "stretch",
       "horizontal_alignment": "center",
       "vertical_alignment": "middle",
       "margin": 24.0,
@@ -53878,6 +53984,66 @@
           1747.8198326527436
         ]
       ]
+    },
+    {
+      "id": "d1f974afd18945dcb3d0a815f7043093",
+      "type": "image",
+      "name": "Comic View 1.png",
+      "custom_name": false,
+      "parent_layer_id": "d7fd7612e6fd4aa8be0ca5c403fdc778",
+      "position": [
+        0.0,
+        0.0
+      ],
+      "visible": true,
+      "opacity": 1.0,
+      "mask_only": false,
+      "fill_reference": false,
+      "opacity_locked": true,
+      "geometry_reference": "direct",
+      "ignore_parent_mask": false,
+      "underlay_opacity": 0.0,
+      "modifier_ids": [],
+      "opacity_mask": null,
+      "source": {
+        "type": "blender_comic_view",
+        "project_uuid": "7cff45582b2a40ec940e993c2b7fac47",
+        "view_uuid": "d3ec648e0fc6443894ebd10c2f0556fd",
+        "display_name": "Comic View 1",
+        "last_revision": 5
+      },
+      "source_filename": "last-frame.png",
+      "source_mime_type": "image/png",
+      "pixel_size": [
+        1920,
+        1080
+      ],
+      "placement_mode": "free",
+      "fit_mode": "auto_height",
+      "transform_frame": [
+        0.0,
+        0.0,
+        1920.0,
+        1080.0
+      ],
+      "transform_quad": [
+        [
+          -118.40516220998654,
+          1347.1470962568826
+        ],
+        [
+          958.4051622099865,
+          1347.1470962568826
+        ],
+        [
+          958.4051622099865,
+          1952.8529037431174
+        ],
+        [
+          -118.40516220998654,
+          1952.8529037431174
+        ]
+      ]
     }
   ],
   "modifiers": [
@@ -53887,6 +54053,7 @@
       "name": "Hue / Saturation / Lightness",
       "intensity": 100.0,
       "expanded": true,
+      "muted": false,
       "hue": -8.0,
       "saturation": 27.0,
       "lightness": 12.0,
@@ -53895,10 +54062,12 @@
     {
       "id": "1d7357bafcfd44e7ab1f15968ab88d21",
       "type": "blur",
-      "name": "Blur",
+      "name": "Blur Legacy",
       "intensity": 45.0,
       "expanded": true,
+      "muted": false,
       "strength": 100.0,
+      "algorithm": "legacy",
       "mode": "focal",
       "focal_center": [
         519.5348215870289,

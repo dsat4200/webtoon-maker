@@ -91,7 +91,8 @@ from comic_editor.ui.shape_outline_compound import OutlineSource, compound_outli
 from comic_editor.ui.spatial_modifier_features import SpatialModifierFeatures
 from comic_editor.ui.text_features import TextFeatures
 from comic_editor.ui.cage_features import CageFeatures
-from comic_editor.core.models import CageTransformModifier
+from comic_editor.core.models import CageTransformModifier, TilingModifier
+from comic_editor.ui.tiling_features import TilingFeatures
 
 
 class ToolKind(Enum):
@@ -237,6 +238,9 @@ class _FillReplayWorker(QRunnable):
                     break
                 selection = QPainterPath(self.selection_path)
                 if extra_path is not None:
+                    if self.profile.get("_tiling_context"):
+                        from comic_editor.core.tiling_paint import folded_footprint
+                        extra_path = folded_footprint(extra_path, *self.profile["_tiling_context"])
                     selection = (
                         QPainterPath(extra_path) if selection.isEmpty()
                         else selection.intersected(extra_path)
@@ -547,7 +551,7 @@ class CanvasPerformanceMonitor:
         }
 
 
-class _CanvasLogic(CageFeatures, SpatialModifierFeatures, TextFeatures):
+class _CanvasLogic(TilingFeatures, CageFeatures, SpatialModifierFeatures, TextFeatures):
     documentChanged = Signal(object)
     visualChanged = Signal(object)
     selectionChanged = Signal(str, str)
@@ -1198,6 +1202,9 @@ class _CanvasLogic(CageFeatures, SpatialModifierFeatures, TextFeatures):
                 0, 0, self.chapter.width, self.chapter.height
             )
         modifier_ids = list(obj.modifier_ids)
+        context = self._drawing_tiling(obj)
+        if context:
+            world = self._tiling_boundary(context[0]).boundingRect()
         for layer in reversed(self.chapter.ancestor_layers(obj.parent_layer_id)):
             modifier_ids.extend(layer.modifier_ids)
         if any(isinstance(self.chapter.modifiers.get(mid), (MirrorModifier, RadialBlurModifier, CageTransformModifier)) for mid in modifier_ids):
@@ -4262,6 +4269,9 @@ class _CanvasLogic(CageFeatures, SpatialModifierFeatures, TextFeatures):
                 painter, layer, parent_opacity, visible_world
             )
             return
+        if self._render_base_alpha and ("layer", layer.layer_id) not in self._render_modifier_sources:
+            if self._render_tiled_target(painter, layer, parent_opacity, visible_world):
+                return
         painter.save()
         painter.setTransform(self._layer_parent_transform(layer), True)
         inverse, valid = self.layer_world_transform(layer.layer_id).inverted()
@@ -4411,6 +4421,8 @@ class _CanvasLogic(CageFeatures, SpatialModifierFeatures, TextFeatures):
         self, painter: QPainter, layer: LayerNode, parent_opacity: float,
         visible_world: QRectF,
     ) -> None:
+        if self._render_tiled_target(painter, layer, parent_opacity, visible_world):
+            return
         if layer.layer_kind == "text_container" or any(isinstance(m, (MirrorModifier, RadialBlurModifier, CageTransformModifier)) for m in self._active_modifier_instances(layer.modifier_ids)):
             self._render_mirror_target(painter, layer, parent_opacity, visible_world)
             return
@@ -5036,6 +5048,7 @@ class _CanvasLogic(CageFeatures, SpatialModifierFeatures, TextFeatures):
             stroke.closed,
             stroke.start_cap,
             stroke.end_cap,
+            tuple(stroke.clip_polygon or ()), stroke.tiling_group,
             round(requested_scale, 3),
             device_ratio,
         )
@@ -5051,6 +5064,8 @@ class _CanvasLogic(CageFeatures, SpatialModifierFeatures, TextFeatures):
             max(1.0, width + padding * 2),
             max(1.0, height + padding * 2),
         )
+        if stroke.clip_polygon:
+            target = aligned(target)
         render_scale = requested_scale
         maximum_dimension = max(target.width(), target.height()) * render_scale
         if maximum_dimension > 8192:
@@ -5064,6 +5079,9 @@ class _CanvasLogic(CageFeatures, SpatialModifierFeatures, TextFeatures):
         mask_painter.setCompositionMode(QPainter.CompositionMode_Lighten)
         mask_painter.scale(render_scale, render_scale)
         mask_painter.translate(-target.left(), -target.top())
+        if stroke.clip_polygon:
+            from comic_editor.core.tiling import polygon_path
+            mask_painter.setClipPath(polygon_path(stroke.clip_polygon))
         if len(stroke.points) == 1:
             point = stroke.points[0]
             mask_painter.setPen(Qt.NoPen)
@@ -5215,12 +5233,21 @@ class _CanvasLogic(CageFeatures, SpatialModifierFeatures, TextFeatures):
         }
         if not preview_points:
             return stroke
+        clip_polygon = copy.deepcopy(stroke.clip_polygon)
+        if clip_polygon and len(preview_points) == len(stroke.points):
+            drawing = self._drawing_selection_object()
+            if drawing is not None and self._selection_transform_start_quad and self._selection_transform_quad:
+                world = self._quad_to_quad_transform(self._selection_transform_start_quad, self._selection_transform_quad)
+                mapping = self._drawing_selection_transform(drawing)
+                local = mapping*world*mapping.inverted()[0]
+                clip_polygon = [local.map(QPointF(*p)).toTuple() for p in clip_polygon]
         return VectorStroke(
             stroke_id=stroke.stroke_id,
             color=stroke.color,
             closed=stroke.closed,
             start_cap=stroke.start_cap,
             end_cap=stroke.end_cap,
+            clip_polygon=clip_polygon, tiling_group=stroke.tiling_group,
             points=[
                 VectorStrokePoint(
                     point_id=point.point_id,
@@ -5274,10 +5301,16 @@ class _CanvasLogic(CageFeatures, SpatialModifierFeatures, TextFeatures):
             )
             if local_visible is not None else None
         )
+        drawn_tiling_groups = set()
         for stroke_index in self._vector_stroke_indexes(
             drawing, drawing_visible
         ):
             stroke = drawing.strokes[stroke_index]
+            if stroke.tiling_group:
+                if stroke.tiling_group not in drawn_tiling_groups:
+                    self._render_tiled_vector_group(painter, drawing, stroke.tiling_group)
+                    drawn_tiling_groups.add(stroke.tiling_group)
+                continue
             if (
                 drawing_visible is not None
                 and not QRectF(*stroke.derived_bounds()).intersects(
@@ -7027,6 +7060,9 @@ class _CanvasLogic(CageFeatures, SpatialModifierFeatures, TextFeatures):
                 painter, obj, parent_opacity, local_visible
             )
             return
+        if self._render_base_alpha and ("object", obj.object_id) not in self._render_modifier_sources:
+            if self._render_tiled_target(painter, obj, parent_opacity, self.layer_world_transform(obj.parent_layer_id).mapRect(local_visible)):
+                return
         painter.save()
         opacity = (
             parent_opacity
@@ -7049,6 +7085,8 @@ class _CanvasLogic(CageFeatures, SpatialModifierFeatures, TextFeatures):
         elif isinstance(obj, GradientObject):
             self._render_gradient(painter, obj, local_visible)
         elif isinstance(obj, RasterObject):
+            if self._render_tiling_raster_capture(painter, obj, local_visible):
+                return
             self._render_raster_content(
                 painter, obj, local_visible, use_transform_preview=True
             )
@@ -7475,6 +7513,8 @@ class _CanvasLogic(CageFeatures, SpatialModifierFeatures, TextFeatures):
             )
         if self._cage_session is not None and ("object", obj.object_id) in self._cage_session["targets"]:
             live = (*live, repr(self._cage_session["grid"].grid_dict()))
+        if getattr(self, "_tiling_capture_geometry", None) is not None:
+            live = (*live, repr(self._tiling_capture_geometry))
         return (
             json.dumps(
                 obj.to_dict(), sort_keys=True, separators=(",", ":")
@@ -7566,6 +7606,8 @@ class _CanvasLogic(CageFeatures, SpatialModifierFeatures, TextFeatures):
         self, painter: QPainter, obj: DocumentObject,
         parent_opacity: float, local_visible: QRectF,
     ) -> None:
+        if self._render_tiled_target(painter, obj, parent_opacity, self.layer_world_transform(obj.parent_layer_id).mapRect(local_visible)):
+            return
         if self._cage_session is not None and ("object", obj.object_id) in self._cage_session["targets"]:
             self._render_mirror_target(painter, obj, parent_opacity, local_visible)
             return
@@ -9975,6 +10017,14 @@ class _CanvasLogic(CageFeatures, SpatialModifierFeatures, TextFeatures):
             return
         for modifier_id in target.modifier_ids:
             modifier = self.chapter.modifiers.get(modifier_id)
+            if isinstance(modifier, TilingModifier) and len(self.chapter.modifier_target_ids(modifier_id)) == 1:
+                a, b = transform.map(QPointF(1, 0))-transform.map(QPointF()), transform.map(QPointF(0, 1))-transform.map(QPointF())
+                length_a, length_b = math.hypot(a.x(), a.y()), math.hypot(b.x(), b.y())
+                if transform.isAffine() and abs(length_a-length_b) < 1e-6 and abs(a.x()*b.x()+a.y()*b.y()) < 1e-6 and transform.determinant() > 0:
+                    modifier.center = transform.map(QPointF(*modifier.center)).toTuple()
+                    modifier.side = max(1., modifier.side*length_a)
+                    modifier.rotation = (modifier.rotation+math.degrees(math.atan2(a.y(), a.x()))) % 360
+                continue
             if isinstance(modifier, CageTransformModifier) and len(self.chapter.modifier_target_ids(modifier_id)) == 1:
                 rest = modifier.rest_points().reshape(modifier.rows, modifier.columns, 2)
                 corners = [rest[0, 0], rest[0, -1], rest[-1, -1], rest[-1, 0]]
@@ -10004,6 +10054,7 @@ class _CanvasLogic(CageFeatures, SpatialModifierFeatures, TextFeatures):
             modifier.focal_angle = math.atan2(delta.y(), delta.x())
 
     def _draw_focal_modifier_handles(self, painter: QPainter) -> None:
+        self._draw_tiling_handles(painter)
         if self._draw_cage_handles(painter):
             return
         if self._page_gap_draft is not None:
@@ -12697,6 +12748,14 @@ class _CanvasLogic(CageFeatures, SpatialModifierFeatures, TextFeatures):
         super().mouseDoubleClickEvent(event)
 
     def keyPressEvent(self, event) -> None:  # noqa: N802
+        if event.key() == Qt.Key_Escape and self._modifier_handle_drag and "tiling" in self._modifier_handle_drag:
+            before = self._modifier_handle_drag["before"]
+            self._modifier_handle_drag = None
+            self.replace_chapter(before)
+            self.documentChanged.emit(None)
+            self.update()
+            event.accept()
+            return
         if self._active_cage() is not None and event.key() in {Qt.Key_Escape, Qt.Key_Return, Qt.Key_Enter}:
             self.finish_cage(event.key() != Qt.Key_Escape)
             event.accept()
@@ -14050,6 +14109,13 @@ class _CanvasLogic(CageFeatures, SpatialModifierFeatures, TextFeatures):
             preview = dict(self._selection_vector_preview)
             changed_strokes: set[str] = set()
             for stroke in obj.strokes:
+                if stroke.clip_polygon and all(point.point_id in preview for point in stroke.points):
+                    source_quad, target_quad = self._selection_transform_start_quad, self._selection_transform_quad
+                    if source_quad and target_quad:
+                        world = self._quad_to_quad_transform(source_quad, target_quad)
+                        mapping = self._drawing_local_to_world_transform(obj)
+                        local = mapping*world*mapping.inverted()[0]
+                        stroke.clip_polygon = [local.map(QPointF(*p)).toTuple() for p in stroke.clip_polygon]
                 for point in stroke.points:
                     mapped = preview.get(point.point_id)
                     if mapped is None:
@@ -14635,6 +14701,7 @@ class _CanvasLogic(CageFeatures, SpatialModifierFeatures, TextFeatures):
                     closed=False,
                     start_cap=stroke.start_cap,
                     end_cap=stroke.end_cap,
+                    clip_polygon=copy.deepcopy(stroke.clip_polygon), tiling_group=stroke.tiling_group,
                     points=points,
                 ))
         return fragments
@@ -14748,9 +14815,14 @@ class _CanvasLogic(CageFeatures, SpatialModifierFeatures, TextFeatures):
             )
 
         result: list[VectorStroke] = []
+        tiling_groups = {}
         for source_stroke in payload.strokes:
             stroke = copy.deepcopy(source_stroke)
             stroke.stroke_id = new_id()
+            if stroke.tiling_group:
+                stroke.tiling_group = tiling_groups.setdefault(stroke.tiling_group, new_id())
+            if stroke.clip_polygon:
+                stroke.clip_polygon = [mapped(p).toTuple() for p in stroke.clip_polygon]
             for point in stroke.points:
                 source_position = point.position
                 origin = mapped(source_position)
@@ -16071,6 +16143,7 @@ class _CanvasLogic(CageFeatures, SpatialModifierFeatures, TextFeatures):
                     self._vector_preview_id, QPointF(*sample.point), width,
                     QColor(self.primary_color), opacity,
                     antialias=self._stroke_preset.antialiasing,
+                    tiling=getattr(self, "_tiling_vector_context", None),
                 )
             else:
                 previous_width, previous_opacity = self._vector_pressure_values(
@@ -16084,6 +16157,7 @@ class _CanvasLogic(CageFeatures, SpatialModifierFeatures, TextFeatures):
                     previous_opacity, opacity,
                     antialias=self._stroke_preset.antialiasing,
                     density=self._stroke_preset.density,
+                    tiling=getattr(self, "_tiling_vector_context", None),
                 )
         except Exception:
             self._cancel_vector_gesture(restore=True)
@@ -16109,6 +16183,7 @@ class _CanvasLogic(CageFeatures, SpatialModifierFeatures, TextFeatures):
     def _begin_vector_pencil(
         self, drawing: VectorDrawingObject, local: QPointF, pressure: float,
     ) -> None:
+        self._tiling_vector_context = self._tiling_brush_context(drawing)
         self._vector_before = {drawing.object_id: drawing.to_dict()}
         self._vector_gesture_mode = "pencil"
         self._vector_samples = []
@@ -16168,6 +16243,9 @@ class _CanvasLogic(CageFeatures, SpatialModifierFeatures, TextFeatures):
                 end_cap="round",
             )
             drawing.strokes.append(stroke)
+            if getattr(self, "_tiling_vector_context", None):
+                drawing.strokes.pop()
+                drawing.strokes.extend(self._tile_vector_stroke(stroke, self._tiling_vector_context))
             drawing.touch_revision()
             self._promoted_vector_preview = {
                 "drawing_id": drawing.object_id,
@@ -16244,6 +16322,7 @@ class _CanvasLogic(CageFeatures, SpatialModifierFeatures, TextFeatures):
             start_cap=source.start_cap if starts_original else "round",
             end_cap=source.end_cap if ends_original else "round",
             render_revision=source.render_revision + 1,
+            clip_polygon=copy.deepcopy(source.clip_polygon), tiling_group=source.tiling_group,
         )
         if preserve_id:
             result.stroke_id = source.stroke_id
@@ -16304,6 +16383,7 @@ class _CanvasLogic(CageFeatures, SpatialModifierFeatures, TextFeatures):
             end_cap=source.end_cap,
             points=points,
             render_revision=source.render_revision + 1,
+            clip_polygon=copy.deepcopy(source.clip_polygon), tiling_group=source.tiling_group,
         )
         if preserve_id:
             result.stroke_id = source.stroke_id
@@ -16363,6 +16443,8 @@ class _CanvasLogic(CageFeatures, SpatialModifierFeatures, TextFeatures):
     def _update_vector_eraser_preview(
         self, drawing: VectorDrawingObject,
     ) -> None:
+        if self._wrapped_vector_eraser_preview(drawing):
+            return
         sweep = [sample.point for sample in self._vector_sweep]
         if not sweep:
             return
@@ -16473,6 +16555,20 @@ class _CanvasLogic(CageFeatures, SpatialModifierFeatures, TextFeatures):
         radius: float,
     ) -> bool:
         shape = "square" if self.settings.eraser_square else "round"
+        if stroke.clip_polygon:
+            from comic_editor.core.tiling import polygon_path
+            clip = polygon_path(stroke.clip_polygon)
+            brush = QPainterPath()
+            for position in sweep:
+                brush.addEllipse(QPointF(*position), radius, radius)
+            for first, last in zip(sweep, sweep[1:]):
+                path = QPainterPath(QPointF(*first))
+                path.lineTo(QPointF(*last))
+                stroker = QPainterPathStroker()
+                stroker.setWidth(radius*2)
+                brush = brush.united(stroker.createStroke(path))
+            if not clip.intersects(brush):
+                return False
         if len(stroke.points) == 1:
             point = stroke.points[0]
             return corridor_contains(
@@ -17342,6 +17438,8 @@ class _CanvasLogic(CageFeatures, SpatialModifierFeatures, TextFeatures):
         ):
             return False
         obj = self.chapter.objects.get(state.object_id)
+        if obj is not None and state.profile.get("_tiling_context") != self._tiling_brush_context(obj):
+            return False
         if (
             not isinstance(obj, RasterObject)
             or json.dumps(obj.to_dict(), sort_keys=True) != state.object_model
@@ -17381,7 +17479,7 @@ class _CanvasLogic(CageFeatures, SpatialModifierFeatures, TextFeatures):
         self, state: _FillReplayState, obj: RasterObject,
         profile: dict[str, object], tolerance: int,
     ) -> bool:
-        frame = QRectF(*obj.interaction_rect)
+        frame = self._tiling_fill_frame(obj, profile)
         keys = self.tiles.keys_for_rect(frame)
         mode = str(profile.get("reference_mode", "editing"))
         reference_tiles: dict[tuple[int, int], QImage] | None = None
@@ -17534,6 +17632,9 @@ class _CanvasLogic(CageFeatures, SpatialModifierFeatures, TextFeatures):
         for point, extra_path, policy in state.steps:
             selection = QPainterPath(state.selection_path)
             if extra_path is not None:
+                if profile.get("_tiling_context"):
+                    from comic_editor.core.tiling_paint import folded_footprint
+                    extra_path = folded_footprint(extra_path, *profile["_tiling_context"])
                 selection = (
                     QPainterPath(extra_path) if selection.isEmpty()
                     else selection.intersected(extra_path)
@@ -17652,6 +17753,7 @@ class _CanvasLogic(CageFeatures, SpatialModifierFeatures, TextFeatures):
             "object_id": obj.object_id,
             "object_model": json.dumps(obj.to_dict(), sort_keys=True),
             "base_signature": self._fill_object_signature(obj.object_id),
+            "tiling_context": profile.get("_tiling_context"),
         }
         worker = _FillWorker(
             detached, obj.object_id, local, frame,
@@ -17686,6 +17788,7 @@ class _CanvasLogic(CageFeatures, SpatialModifierFeatures, TextFeatures):
             != result.get("object_model")
             or self._fill_object_signature(object_id)
             != result.get("base_signature")
+            or self._tiling_brush_context(obj) != result.get("tiling_context")
         ):
             self.interactionFinished.emit()
             return
@@ -17935,6 +18038,7 @@ class _CanvasLogic(CageFeatures, SpatialModifierFeatures, TextFeatures):
         cache_key = (
             target.object_id, key, signature, settings_signature,
             tuple(target.transform_quad or ()), target.x, target.y,
+            repr(profile.get("_tiling_context")),
         )
         cached = self._fill_reference_tile_cache.pop(cache_key, None)
         if cached is not None:
@@ -17961,8 +18065,19 @@ class _CanvasLogic(CageFeatures, SpatialModifierFeatures, TextFeatures):
         previous_exclude_text = self._render_exclude_text
         self._interactive_render = False
         self._render_exclude_text = True
+        tiling_context = self._drawing_tiling(target) if profile.get("_tiling_context") else None
         try:
             for kind, entity_id in entities:
+                if tiling_context and isinstance(tiling_context[0], LayerNode) and kind == "layer":
+                    owner = tiling_context[0]
+                    if any(layer.layer_id == entity_id for layer in self.chapter.ancestor_layers(owner.layer_id)):
+                        # The canonical tile may sit outside the owner's final
+                        # boundary. Reference its editable children before that
+                        # boundary, just as the repeating renderer does.
+                        bounds = aligned(visible_world)
+                        source = self._tiling_source(owner, bounds)
+                        painter.drawImage(bounds.topLeft(), source)
+                        continue
                 self._render_fill_reference_entity(
                     painter, kind, entity_id, visible_world
                 )
@@ -17996,7 +18111,11 @@ class _CanvasLogic(CageFeatures, SpatialModifierFeatures, TextFeatures):
             self._raster_local_point(obj, world_point)
             if world_point is not None else None
         )
-        frame = QRectF(*obj.interaction_rect)
+        tiling = (profile_snapshot or {}).get("_tiling_context", self._tiling_brush_context(obj))
+        if tiling is not None and local is not None:
+            geometry, mapping = tiling
+            local = mapping.inverted()[0].map(geometry.point(mapping.map(local)))
+        frame = self._tiling_fill_frame(obj, {"_tiling_context": tiling})
         if local is not None and not frame.contains(local):
             return False
         if local is None:
@@ -18006,7 +18125,7 @@ class _CanvasLogic(CageFeatures, SpatialModifierFeatures, TextFeatures):
                     QPainterPath(extra_path) if clip.isEmpty()
                     else clip.intersected(extra_path)
                 )
-            if not clip.isEmpty():
+            if not clip.isEmpty() and tiling is None:
                 frame = frame.intersected(clip.boundingRect())
             if frame.isEmpty():
                 return False
@@ -18018,6 +18137,8 @@ class _CanvasLogic(CageFeatures, SpatialModifierFeatures, TextFeatures):
         )
         if profile_overrides:
             profile.update(profile_overrides)
+        if tiling is not None:
+            profile["_tiling_context"] = tiling
         if extra_path is not None:
             profile["connected_pixels_only"] = False
         mode = str(profile.get("reference_mode", "editing"))
@@ -18042,6 +18163,9 @@ class _CanvasLogic(CageFeatures, SpatialModifierFeatures, TextFeatures):
             else self._drawing_selection_path
         )
         if extra_path is not None:
+            if tiling is not None:
+                from comic_editor.core.tiling_paint import folded_footprint
+                extra_path = folded_footprint(extra_path, *tiling)
             frozen_selection = (
                 QPainterPath(extra_path) if frozen_selection.isEmpty()
                 else frozen_selection.intersected(extra_path)
@@ -18128,6 +18252,9 @@ class _CanvasLogic(CageFeatures, SpatialModifierFeatures, TextFeatures):
         self._fill_operation_profile = dict(
             self.settings.active_fill_profile()
         )
+        context = self._tiling_brush_context(obj)
+        if context:
+            self._fill_operation_profile["_tiling_context"] = context
         self._fill_operation_color = self._active_fill_color()
         self._fill_operation_selection = QPainterPath(
             self._drawing_selection_path
@@ -18266,6 +18393,9 @@ class _CanvasLogic(CageFeatures, SpatialModifierFeatures, TextFeatures):
             return False
         self._clear_fill_replay()
         profile = dict(self.settings.active_fill_profile())
+        tiling = self._tiling_brush_context(obj)
+        if tiling:
+            profile["_tiling_context"] = tiling
         color = self._active_fill_color()
         self._fill_operation_base_tiles = self._snapshot_fill_object_tiles(
             obj.object_id
@@ -18276,7 +18406,7 @@ class _CanvasLogic(CageFeatures, SpatialModifierFeatures, TextFeatures):
             self._drawing_selection_path
         )
         self._fill_operation_reference_tiles = {}
-        frame = QRectF(*obj.interaction_rect).intersected(
+        frame = self._tiling_fill_frame(obj, profile).intersected(
             self._drawing_selection_path.boundingRect()
         )
         if (
@@ -18362,6 +18492,7 @@ class _CanvasLogic(CageFeatures, SpatialModifierFeatures, TextFeatures):
             self._begin_vector_pencil(drawing, local, pressure)
             return
         if self.tool == ToolKind.RASTER_ERASER:
+            self._tiling_eraser_context = self._tiling_brush_context(drawing)
             self._vector_before = {drawing.object_id: drawing.to_dict()}
             self._vector_gesture_mode = "eraser"
             self._clear_vector_eraser_live_cache()
@@ -18477,6 +18608,8 @@ class _CanvasLogic(CageFeatures, SpatialModifierFeatures, TextFeatures):
 
     # ---- tool actions --------------------------------------------------
     def _begin_modifier_handle(self, widget_point: QPointF) -> bool:
+        if self._begin_tiling_handle(widget_point):
+            return True
         if self._begin_radial_handle(widget_point):
             return True
         mirror = self._active_mirror_modifier()
@@ -18515,6 +18648,8 @@ class _CanvasLogic(CageFeatures, SpatialModifierFeatures, TextFeatures):
         return True
 
     def _move_modifier_handle(self, widget_point: QPointF) -> bool:
+        if self._move_tiling_handle(widget_point):
+            return True
         if self._queue_radial_handle(widget_point):
             return True
         state = self._modifier_handle_drag
@@ -18573,13 +18708,14 @@ class _CanvasLogic(CageFeatures, SpatialModifierFeatures, TextFeatures):
 
     def _finish_modifier_handle(self) -> bool:
         self._flush_radial_handle()
+        self._flush_tiling_handle()
         state, self._modifier_handle_drag = self._modifier_handle_drag, None
         if state is None or self.chapter is None:
             return False
         after = self.chapter.to_dict()
         if state["before"] != after:
             self.push_model_change(
-                state["before"], after, "Edit radial blur" if "radial" in state else "Edit mirror" if "mirror" in state else "Edit focal blur"
+                state["before"], after, "Edit tiling" if "tiling" in state else "Edit radial blur" if "radial" in state else "Edit mirror" if "mirror" in state else "Edit focal blur"
             )
         self.interactionFinished.emit()
         return True
@@ -18732,7 +18868,7 @@ class _CanvasLogic(CageFeatures, SpatialModifierFeatures, TextFeatures):
                     )
                     bounds.adjust(-radius, -radius, radius, radius)
                 local = self._vector_local_point(obj, point)
-                if not obj.strokes or bounds.contains(local):
+                if not obj.strokes or bounds.contains(local) or self._tiling_accepts_point(obj, point):
                     self._begin_vector_gesture(obj, point, pressure)
                 else:
                     self._pending_vector_press = (
@@ -18746,7 +18882,7 @@ class _CanvasLogic(CageFeatures, SpatialModifierFeatures, TextFeatures):
             path = QPainterPath()
             if quad:
                 path.addPolygon(QPolygonF([QPointF(*candidate) for candidate in quad]))
-            if quad and path.contains(point):
+            if isinstance(obj, RasterObject) and self._tiling_accepts_point(obj, point) or quad and path.contains(point):
                 self._begin_stroke(point, pressure)
             else:
                 self._pending_raster_press = (
@@ -21406,6 +21542,7 @@ class _CanvasLogic(CageFeatures, SpatialModifierFeatures, TextFeatures):
         if not isinstance(obj, RasterObject):
             return
         self._finalize_raster_paste_overlay(obj.object_id)
+        self._tiling_stroke_context = self._tiling_brush_context(obj)
         local = self._raster_local_point(obj, point)
         self._suspend_gc_for_stroke()
         self._drawing = True
@@ -21438,6 +21575,7 @@ class _CanvasLogic(CageFeatures, SpatialModifierFeatures, TextFeatures):
                     if self.tool == ToolKind.RASTER_PENCIL else False
                 ),
                 before=self._stroke_before,
+                tiling=self._tiling_stroke_context,
             )
         except Exception:
             self._abort_raster_stroke_after_error()
@@ -21470,6 +21608,7 @@ class _CanvasLogic(CageFeatures, SpatialModifierFeatures, TextFeatures):
                     if self.tool == ToolKind.RASTER_PENCIL else 1.0
                 ),
                 before=self._stroke_before,
+                tiling=getattr(self, "_tiling_stroke_context", None),
             )
         except Exception:
             self._abort_raster_stroke_after_error()
@@ -21477,7 +21616,7 @@ class _CanvasLogic(CageFeatures, SpatialModifierFeatures, TextFeatures):
         previous_local = QPointF(self._last_draw_point)
         self._last_draw_point = local
         self._last_pressure = actual_pressure
-        if self.settings.predictive_ink:
+        if self.settings.predictive_ink and not getattr(self, "_tiling_stroke_context", None):
             world_current = self._raster_world_point(obj, local)
             delta = local - previous_local
             # Prediction is intentionally short and transient; it never enters

@@ -4,7 +4,8 @@ import copy
 import numpy as np
 from PySide6.QtCore import QRectF, Qt
 from PySide6.QtGui import QImage, QPainter, QTransform
-from comic_editor.core.models import MirrorModifier, RadialBlurModifier, CageTransformModifier
+from comic_editor.core.models import MirrorModifier, RadialBlurModifier, CageTransformModifier, PosterizeModifier
+from comic_editor.core.color_smoothing import simplify_padding
 from comic_editor.core.effect_geometry import effect_bounds, reflection_transform
 from comic_editor.ui.modifier_rendering import apply_modifier_stack, _qimage_premultiplied, _premultiplied_qimage, _parameter_field
 
@@ -37,6 +38,9 @@ def render_stages(canvas, image, bounds, modifiers, local_to_world, *, nearest=F
                 # incoming stage, including completely outside this viewport.
                 break
             needed = effect_bounds(needed, [modifiers[index]], local_to_world)
+            if isinstance(modifiers[index], PosterizeModifier) and not modifiers[index].muted:
+                padding = simplify_padding(modifiers[index])
+                needed = needed.adjusted(-padding, -padding, padding, padding)
     provisional = False
     for index, modifier in enumerate(modifiers):
         if modifier.muted or modifier.intensity <= 0 and "intensity" not in modifier.parameter_masks:
@@ -56,9 +60,13 @@ def render_stages(canvas, image, bounds, modifiers, local_to_world, *, nearest=F
                tuple(getattr(local_to_world, f"m{i}{j}")() for i in range(1, 4) for j in range(1, 4)))
         cached = canvas._modifier_cache_get(key)
         if cached is None:
-            source = empty_image(target)
-            mapping = canvas._world_to_image_transform(local_to_world, target, source.width(), source.height())
-            fields = canvas._modifier_mask_fields([modifier], source.width(), source.height(), mapping, local_to_world.mapRect(target))
+            work_target = target
+            if isinstance(modifier, PosterizeModifier):
+                padding = simplify_padding(modifier)
+                work_target = aligned(target.adjusted(-padding, -padding, padding, padding).intersected(bounds))
+            source = empty_image(work_target)
+            mapping = canvas._world_to_image_transform(local_to_world, work_target, source.width(), source.height())
+            fields = canvas._modifier_mask_fields([modifier], source.width(), source.height(), mapping, local_to_world.mapRect(work_target))
             if isinstance(modifier, CageTransformModifier) and valid:
                 from comic_editor.ui.cage_rendering import warp_image
                 painter = QPainter(source)
@@ -154,14 +162,18 @@ def render_stages(canvas, image, bounds, modifiers, local_to_world, *, nearest=F
                     cached = compute()
             else:
                 painter = QPainter(source)
-                painter.drawImage(bounds.topLeft() - target.topLeft(), image)
+                painter.drawImage(bounds.topLeft() - work_target.topLeft(), image)
                 painter.end()
                 cached = apply_modifier_stack(
-                    source, [modifier], local_to_world.map(target.topLeft()).toTuple(), fields,
+                    source, [modifier], local_to_world.map(work_target.topLeft()).toTuple(), fields,
                     world_to_image=mapping, nearest=nearest,
                     outline_distance_cache=canvas._outline_distance_cache,
                     blur_pyramid_cache=canvas._blur_pyramid_cache,
                 )
+                if work_target != target:
+                    cropped = QRectF(target)
+                    cropped.translate(-work_target.topLeft())
+                    cached = cached.copy(cropped.toAlignedRect())
             if not provisional:
                 canvas._modifier_cache_put(key, cached)
         image, bounds = cached, target

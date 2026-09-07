@@ -2,11 +2,20 @@
 - exposes a gizmo that is a shape. dropdown in modifier settings lets you change the shape (different tiling types).
 	- each of these shapes is a "tile" that basically lets the user "cut" a specific part of the image layer the modifier is on (everything but shape objects for now)
 	- the tile gets repeated using various methods.
-	- for now, just do a triangular tile, a square tile, and a triangular tile and hexagonal tile.
-- when tile modifier is on a raster or vector layer, it causes drawing things outside of the tile to draw where they would be on the tile itself (a looping / repeated edge effect). this would make it easier to draw seamless repeating textures
+	- for now, just do a triangular tile, a square tile, and hexagonal tile.
+	- the tiles can be translated, scaled (uniform only for now) and rotated.
+- when tile modifier is on a raster or vector layer, it causes drawing things outside of the tile to draw where they would be on the tile itself (a looping / repeated edge effect). this would make it easier to draw seamless repeating textures.
+- when tiling is on
+- when tile modifier is on a shape, all its children should be affected, and the looping tile drawing effect should happen to its child raster and vector objects too.
+- tile modifier acts as a fill essentially, filling up to the borders of the parent shape.
 
-
-
+## new modifier - posterize modifier
+- takes the object it's on and maps all of its hues to a hue range with an axis for hue and another for how often it appears
+- visible in a circular map, draft of the UI below. 
+- like a coloramp in blender sort of - each hue range can map to another color (clicking each color icon opens up the expected picker we made)
+- color ranges can be created and removed, and their handles can't overlap. handles move around the circle when click-dragged.
+- when first added, asks how many colors to posterize to in a popup window, then automatically creates ranges based on the amount of colors. the range color selections in this case start off as simply the average color of the range found, but of course after initialization it's all user-editable.
+![[Pasted image 20260907122039.png]]
 
 ## thought balloons and screaming
 i still need to add border types for shapes, like round bubbly ones for thought balloons or pointy ones for screaming (or just have it be one with a sharpness value and sizing parameters... hmmm

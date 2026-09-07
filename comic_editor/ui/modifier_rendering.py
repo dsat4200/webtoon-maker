@@ -13,7 +13,7 @@ from scipy.ndimage import distance_transform_edt
 
 from comic_editor.core.models import (
     BlurModifier, HueSaturationLightnessModifier, ModifierInstance,
-    OutlineModifier, MirrorModifier, RadialBlurModifier,
+    OutlineModifier, MirrorModifier, RadialBlurModifier, PosterizeModifier, PosterizeValueModifier,
 )
 from comic_editor.core.effect_geometry import reflection_transform
 
@@ -409,6 +409,22 @@ def apply_modifier_stack(
                     (height, width), mask_fields,
                 ),
             )
+            mask = amount
+        elif isinstance(modifier, PosterizeModifier):
+            from comic_editor.core.color_smoothing import simplify_colors
+            from comic_editor.core.posterize import rgb_hues, range_indices, rgb_values, value_range_indices, grayscale_source
+            from PySide6.QtGui import QColor
+            straight = _straight(current)
+            if isinstance(modifier, PosterizeValueModifier):
+                straight = grayscale_source(straight)
+            straight = simplify_colors(straight, modifier)
+            indices = (value_range_indices(rgb_values(straight[..., :3]), modifier.ranges)
+                       if isinstance(modifier, PosterizeValueModifier)
+                       else range_indices(rgb_hues(straight[..., :3]), modifier.ranges))
+            palette = np.array([QColor(item.color).getRgbF() for item in modifier.ranges], dtype=np.float32)
+            effect = palette[indices].copy()
+            effect[..., 3:4] *= current[..., 3:4]
+            effect[..., :3] *= effect[..., 3:4]
             mask = amount
         elif isinstance(modifier, BlurModifier):
             effect = _variable_blur(

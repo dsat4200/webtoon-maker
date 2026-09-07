@@ -7,13 +7,15 @@ from comic_editor.core.vector_geometry import cubic_eval, cubic_derivative
 from comic_editor.ui.cage_rendering import transform_points
 
 
-def warp_vector(obj, grid, mapping, tolerance=.2):
+def warp_vector(obj, grid, mapping, tolerance=.2, *, point_mapper=None):
     inverse, valid = mapping.inverted()
     if not valid:
         raise ValueError("Cannot deform a vector drawing with a singular placement")
     result = copy.deepcopy(obj)
 
     def warp(points):
+        if point_mapper is not None:
+            return point_mapper(np.asarray(points, dtype=float))
         return transform_points(inverse, map_points(grid, transform_points(mapping, points)))
 
     def width_scale(point):
@@ -23,6 +25,25 @@ def warp_vector(obj, grid, mapping, tolerance=.2):
         return float(np.sqrt(abs(np.linalg.det(jacobian))))
 
     for stroke in result.strokes:
+        if stroke.clip_polygon:
+            polygon = stroke.clip_polygon
+            warped_clip = []
+
+            def map_edge(a, b, depth=0):
+                a, b = np.asarray(a), np.asarray(b)
+                mid = (a+b)/2
+                wa, wm, wb = warp([a, mid, b])
+                error = np.linalg.norm(transform_points(mapping, [wm])[0]
+                    - transform_points(mapping, [(wa+wb)/2])[0])
+                if error > tolerance and depth < 10:
+                    map_edge(a, mid, depth+1)
+                    map_edge(mid, b, depth+1)
+                else:
+                    warped_clip.append(tuple(wa))
+
+            for a, b in zip(polygon, polygon[1:]+polygon[:1]):
+                map_edge(a, b)
+            stroke.clip_polygon = warped_clip
         original = list(stroke.points)
         if len(original) == 1:
             original[0].width *= width_scale(original[0].position)

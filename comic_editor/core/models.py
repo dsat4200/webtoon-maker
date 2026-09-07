@@ -9,7 +9,7 @@ from typing import Any, Iterable, Iterator, Literal
 from comic_editor.core.cage import CageGrid
 
 
-SCHEMA_VERSION = 24
+SCHEMA_VERSION = 25
 SERIES_SCHEMA_VERSION = 17
 CHAPTER_WIDTH = 1080
 DEFAULT_CHAPTER_HEIGHT = 3240
@@ -1030,7 +1030,143 @@ class CageTransformModifier(CageGrid):
                 "muted": self.muted, "parameter_masks": _parameter_masks_to_dict(self.parameter_masks)}
 
 
-ModifierInstance = HueSaturationLightnessModifier | BlurModifier | OutlineModifier | MirrorModifier | RadialBlurModifier | CageTransformModifier
+POSTERIZE_MIN_SPAN = 10.0
+POSTERIZE_VALUE_MIN_SPAN = 4.0
+POSTERIZE_MAX_COLORS = 24
+
+
+@dataclass
+class PosterizeRange:
+    """A source interval from start to the next range's start."""
+
+    start: float = 0.0
+    color: str = "#FF808080"
+    range_id: str = field(default_factory=new_id)
+
+    def to_dict(self):
+        return {"id": self.range_id, "start": self.start, "color": self.color}
+
+
+@dataclass
+class PosterizeModifier:
+    modifier_id: str = field(default_factory=new_id)
+    modifier_type: Literal["posterize"] = "posterize"
+    name: str = "Posterize"
+    intensity: float = 100.0
+    expanded: bool = True
+    muted: bool = False
+    simplify_enabled: bool = False
+    simplify_radius: float = 3.0
+    simplify_tolerance: float = 25.0
+    simplify_strength: float = 100.0
+    ranges: list[PosterizeRange] = field(default_factory=lambda: [PosterizeRange()])
+    parameter_masks: dict[str, ParameterMaskBinding] = field(default_factory=dict)
+
+    def _validate_settings(self) -> None:
+        if not math.isfinite(float(self.intensity)):
+            raise ValueError("Posterize intensity must be finite")
+        self.intensity = max(0., min(100., float(self.intensity)))
+        self.name = str(self.name or type(self).name)
+        self.expanded, self.muted = bool(self.expanded), bool(self.muted)
+        self.simplify_enabled = bool(self.simplify_enabled)
+        for attribute, low, high in (("simplify_radius", 1., 24.),
+                                     ("simplify_tolerance", 1., 100.),
+                                     ("simplify_strength", 0., 100.)):
+            value = float(getattr(self, attribute))
+            if not math.isfinite(value):
+                raise ValueError("Simplify colors settings must be finite")
+            setattr(self, attribute, max(low, min(high, value)))
+        if not 1 <= len(self.ranges) <= POSTERIZE_MAX_COLORS:
+            raise ValueError(f"Posterize needs 1 to {POSTERIZE_MAX_COLORS} ranges")
+        identifiers = set()
+        for item in self.ranges:
+            if not math.isfinite(float(item.start)):
+                raise ValueError("Posterize boundaries must be finite")
+            item.start = float(item.start)
+            item.color = canonical_argb(item.color)
+            if not item.range_id or item.range_id in identifiers:
+                raise ValueError("Posterize ranges need unique identifiers")
+            identifiers.add(item.range_id)
+        _validate_parameter_masks(self.parameter_masks, {"intensity": (0., 100.)})
+
+    def validate(self) -> None:
+        self._validate_settings()
+        for item in self.ranges:
+            item.start %= 360.
+        self.ranges.sort(key=lambda item: item.start)
+        if len(self.ranges) > 1 and any(
+            (self.ranges[(i + 1) % len(self.ranges)].start - item.start) % 360.
+            < POSTERIZE_MIN_SPAN - 1e-7 for i, item in enumerate(self.ranges)
+        ):
+            raise ValueError("Posterize hue boundaries cannot overlap")
+
+    def to_dict(self):
+        self.validate()
+        return {"id": self.modifier_id, "type": self.modifier_type,
+                "name": self.name, "intensity": self.intensity,
+                "expanded": self.expanded, "muted": self.muted,
+                "simplify_enabled": self.simplify_enabled,
+                "simplify_radius": self.simplify_radius,
+                "simplify_tolerance": self.simplify_tolerance,
+                "simplify_strength": self.simplify_strength,
+                "ranges": [item.to_dict() for item in self.ranges],
+                "parameter_masks": _parameter_masks_to_dict(self.parameter_masks)}
+
+
+@dataclass
+class PosterizeValueModifier(PosterizeModifier):
+    modifier_type: Literal["posterize_value"] = "posterize_value"
+    name: str = "Posterize Value"
+
+    def validate(self) -> None:
+        self._validate_settings()
+        self.ranges.sort(key=lambda item: item.start)
+        if self.ranges[0].start != 0.:
+            raise ValueError("Posterize Value ranges must begin at black (0)")
+        edges = [item.start for item in self.ranges] + [256.]
+        if any(right - left < POSTERIZE_VALUE_MIN_SPAN - 1e-7
+               for left, right in zip(edges, edges[1:])):
+            raise ValueError("Posterize Value boundaries cannot overlap or exceed white")
+
+
+@dataclass
+class TilingModifier:
+    modifier_id: str = field(default_factory=new_id)
+    modifier_type: str = "tiling"
+    name: str = "Tiling"
+    intensity: float = 100.0
+    expanded: bool = True
+    muted: bool = False
+    shape: str = "square"
+    center: tuple[float, float] = (0., 0.)
+    side: float = 256.
+    rotation: float = 0.
+    parameter_masks: dict[str, ParameterMaskBinding] = field(default_factory=dict)
+
+    def validate(self):
+        self.center = _point(self.center)
+        self.side, self.rotation, self.intensity = float(self.side), float(self.rotation), float(self.intensity)
+        if not all(math.isfinite(v) for v in (*self.center, self.side, self.rotation, self.intensity)):
+            raise ValueError("Tiling values must be finite")
+        if self.side < 1:
+            raise ValueError("Tile side length must be at least one pixel")
+        if self.shape not in {"square", "hexagon", "triangle"}:
+            raise ValueError("Unknown tile shape")
+        self.rotation %= 360.
+        self.intensity = min(100., max(0., self.intensity))
+        self.name = str(self.name or "Tiling")
+        self.expanded, self.muted = bool(self.expanded), bool(self.muted)
+        _validate_parameter_masks(self.parameter_masks, {"intensity": (0., 100.)})
+
+    def to_dict(self):
+        self.validate()
+        return {"id": self.modifier_id, "type": "tiling", "name": self.name,
+                "intensity": self.intensity, "expanded": self.expanded, "muted": self.muted,
+                "shape": self.shape, "center": list(self.center), "side": self.side,
+                "rotation": self.rotation, "parameter_masks": _parameter_masks_to_dict(self.parameter_masks)}
+
+
+ModifierInstance = HueSaturationLightnessModifier | BlurModifier | OutlineModifier | MirrorModifier | RadialBlurModifier | CageTransformModifier | PosterizeModifier | PosterizeValueModifier | TilingModifier
 
 
 def modifier_from_dict(data: dict[str, Any]) -> ModifierInstance:
@@ -1045,8 +1181,24 @@ def modifier_from_dict(data: dict[str, Any]) -> ModifierInstance:
             data.get("parameter_masks")
         ),
     }
-    if modifier_type == "cage_transform":
+    if modifier_type == "tiling":
+        result = TilingModifier(**common, shape=str(data.get("shape", "square")),
+            center=_point(data.get("center", [0, 0])), side=float(data.get("side", 256)),
+            rotation=float(data.get("rotation", 0)))
+    elif modifier_type == "cage_transform":
         result = CageTransformModifier(**common, **CageGrid.grid_kwargs(data))
+    elif modifier_type in {"posterize", "posterize_value"}:
+        factory = PosterizeValueModifier if modifier_type == "posterize_value" else PosterizeModifier
+        result = factory(**common,
+            simplify_enabled=bool(data.get("simplify_enabled", False)),
+            simplify_radius=float(data.get("simplify_radius", 3.)),
+            simplify_tolerance=float(data.get("simplify_tolerance", 25.)),
+            simplify_strength=float(data.get("simplify_strength", 100.)), ranges=[
+            PosterizeRange(start=float(item.get("start", 0.)),
+                           color=str(item.get("color", "#FF808080")),
+                           range_id=str(item.get("id") or new_id()))
+            for item in data.get("ranges", [{"start": 0.}])
+        ])
     elif modifier_type == "hsl":
         result: ModifierInstance = HueSaturationLightnessModifier(
             **common,
@@ -2112,9 +2264,16 @@ class VectorStroke:
     points: list[VectorStrokePoint] = field(default_factory=list)
     # Independent cache revision; older drawings omit it and default to zero.
     render_revision: int = 0
+    clip_polygon: list[tuple[float, float]] | None = None
+    tiling_group: str = ""
 
     def validate(self) -> None:
         self.color = canonical_argb(self.color)
+        self.tiling_group = str(self.tiling_group)
+        if self.clip_polygon is not None:
+            self.clip_polygon = [_point(point) for point in self.clip_polygon]
+            if len(self.clip_polygon) < 3 or not all(math.isfinite(v) for p in self.clip_polygon for v in p):
+                raise ValueError("Vector stroke clip needs a finite polygon")
         if self.start_cap not in {"point", "square", "round"}:
             self.start_cap = "round"
         if self.end_cap not in {"point", "square", "round"}:
@@ -2154,6 +2313,11 @@ class VectorStroke:
         top = min(point[1] for point in coordinates) - maximum_radius
         right = max(point[0] for point in coordinates) + maximum_radius
         bottom = max(point[1] for point in coordinates) + maximum_radius
+        if self.clip_polygon:
+            left = max(left, min(p[0] for p in self.clip_polygon))
+            top = max(top, min(p[1] for p in self.clip_polygon))
+            right = max(left, min(right, max(p[0] for p in self.clip_polygon)))
+            bottom = max(top, min(bottom, max(p[1] for p in self.clip_polygon)))
         return left, top, right - left, bottom - top
 
     def to_dict(self) -> dict[str, Any]:
@@ -2165,6 +2329,8 @@ class VectorStroke:
             "start_cap": self.start_cap,
             "end_cap": self.end_cap,
             "render_revision": self.render_revision,
+            "clip_polygon": [list(p) for p in self.clip_polygon] if self.clip_polygon is not None else None,
+            "tiling_group": self.tiling_group,
             "points": [point.to_dict() for point in self.points],
         }
 
@@ -2177,6 +2343,8 @@ class VectorStroke:
             start_cap=str(data.get("start_cap", "round")),
             end_cap=str(data.get("end_cap", "round")),
             render_revision=int(data.get("render_revision", 0)),
+            clip_polygon=data.get("clip_polygon"),
+            tiling_group=str(data.get("tiling_group", "")),
             points=[
                 VectorStrokePoint.from_dict(item)
                 for item in data.get("points", [])
@@ -2940,10 +3108,14 @@ class ChapterDocument:
             if modifier.modifier_id != modifier_id:
                 modifier.modifier_id = modifier_id
             modifier.validate()
-            if isinstance(modifier, CageTransformModifier):
+            if isinstance(modifier, (CageTransformModifier, TilingModifier)):
                 incompatible = self.incompatible_modifier_targets(modifier, self.modifier_target_ids(modifier_id))
                 if incompatible:
                     raise ValueError(self.modifier_compatibility_message(modifier, incompatible))
+            if isinstance(modifier, TilingModifier):
+                for ref in self.modifier_target_ids(modifier_id):
+                    if self.modifier_target(*ref).modifier_ids[0] != modifier_id:
+                        raise ValueError("Tiling must be the first modifier")
             modifier.parameter_masks = {
                 name: binding
                 for name, binding in modifier.parameter_masks.items()
@@ -3132,7 +3304,10 @@ class ChapterDocument:
         self.modifiers[modifier.modifier_id] = modifier
         for target in resolved:
             if modifier.modifier_id not in target.modifier_ids:
-                target.modifier_ids.append(modifier.modifier_id)
+                if isinstance(modifier, TilingModifier):
+                    target.modifier_ids.insert(0, modifier.modifier_id)
+                else:
+                    target.modifier_ids.append(modifier.modifier_id)
 
     def set_modifier_targets(
         self, modifier_id: str, targets: Iterable[tuple[str, str]],
@@ -3156,11 +3331,15 @@ class ChapterDocument:
         for kind, entity_id in desired:
             target = self.modifier_target(kind, entity_id)
             if modifier_id not in target.modifier_ids:
-                target.modifier_ids.append(modifier_id)
+                if isinstance(self.modifiers[modifier_id], TilingModifier):
+                    target.modifier_ids.insert(0, modifier_id)
+                else:
+                    target.modifier_ids.append(modifier_id)
         if not desired:
             self.modifiers.pop(modifier_id, None)
 
     def incompatible_modifier_targets(self, modifier, targets):
+        targets = list(targets)
         result = []
         for ref in targets:
             target = self.modifier_target(*ref)
@@ -3168,6 +3347,14 @@ class ChapterDocument:
             if isinstance(modifier, CageTransformModifier):
                 compatible = isinstance(target, ImageObject) or (
                     isinstance(target, LayerNode) and target.layer_kind != "text_container")
+            if isinstance(modifier, TilingModifier):
+                compatible = target is not None and not (
+                    isinstance(target, LayerNode) and target.layer_kind == "text_container")
+                occupied = [other for mid, candidate in self.modifiers.items()
+                            if isinstance(candidate, TilingModifier) and mid != modifier.modifier_id
+                            for other in self.modifier_target_ids(mid)]
+                compatible = compatible and not any(self._tiling_related(ref, other)
+                    for other in occupied + [other for other in targets if other != ref])
             if not compatible:
                 result.append(ref)
         return result
@@ -3180,7 +3367,34 @@ class ChapterDocument:
         message = f"{modifier.name} is not compatible with: " + (", ".join(names) or "this selection") + "."
         if isinstance(modifier, CageTransformModifier):
             message += " Use the Cage Transform tool to transform raster and vector drawings. Select only drawings, or only images and shapes."
+        if isinstance(modifier, TilingModifier):
+            message += " Tiling requires a drawing, image, or non-page shape, with only one tiling setup per hierarchy branch (including muted setups)."
         return message
+
+    def _tiling_related(self, first, second, parent_overrides=None):
+        if first == second:
+            return True
+        overrides = parent_overrides or {}
+        def ancestors(ref):
+            seen = set()
+            while ref not in seen:
+                seen.add(ref)
+                entity = (self.layers if ref[0] == "layer" else self.objects).get(ref[1])
+                if entity is None:
+                    break
+                parent = overrides.get(ref, entity.parent_id if ref[0] == "layer" else entity.parent_layer_id)
+                if not parent:
+                    break
+                ref = ("layer", parent)
+                yield ref
+        return first in ancestors(second) or second in ancestors(first)
+
+    def validate_tiling_reparent(self, overrides):
+        occupied = [ref for mid, modifier in self.modifiers.items()
+                    if isinstance(modifier, TilingModifier) for ref in self.modifier_target_ids(mid)]
+        for index, ref in enumerate(occupied):
+            if any(self._tiling_related(ref, other, overrides) for other in occupied[index+1:]):
+                raise ValueError("This move would put two tiling setups in one hierarchy branch")
 
     def remove_modifier(self, modifier_id: str) -> None:
         for layer in self.layers.values():
@@ -3432,6 +3646,7 @@ class ChapterDocument:
         if new_parent_id is None:
             raise ValueError("Only page layers can be roots")
         new_parent = self.layers[new_parent_id]
+        self.validate_tiling_reparent({(kind, entity_id): new_parent_id})
         text_geometry = self._text_reparent_geometry(kind, entity_id, new_parent_id)
         if kind == "layer":
             cursor: str | None = new_parent_id
@@ -3563,6 +3778,7 @@ class ChapterDocument:
             moving.append(obj)
 
         moving_ids = {obj.object_id for obj in moving}
+        self.validate_tiling_reparent({("object", obj.object_id): new_parent_id for obj in moving})
         text_geometry = {
             obj.object_id: self._text_reparent_geometry("object", obj.object_id, new_parent_id)
             for obj in moving

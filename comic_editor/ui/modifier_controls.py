@@ -6,13 +6,14 @@ from PySide6.QtGui import QColor, QMouseEvent
 from PySide6.QtWidgets import (
     QComboBox, QFrame, QHBoxLayout, QLabel, QMenu, QPushButton,
     QSlider, QSpinBox, QToolButton, QVBoxLayout, QWidget, QSizePolicy,
+    QInputDialog, QMessageBox,
 )
 
 from comic_editor.core.models import (
     BlurModifier, HueSaturationLightnessModifier, ModifierInstance,
     OutlineModifier, MirrorModifier, RadialBlurModifier, RasterObject, LayerNode,
-    canonical_argb,
-    CageTransformModifier,
+    canonical_argb, TilingModifier,
+    CageTransformModifier, PosterizeModifier, PosterizeValueModifier, POSTERIZE_MAX_COLORS,
 )
 from comic_editor.ui.icons import iconoir
 from comic_editor.ui.mask_controls import DualEndpointSlider, MaskButton
@@ -132,13 +133,23 @@ class ModifierCard(QFrame):
         form = QVBoxLayout(body)
         form.setContentsMargins(6, 0, 6, 0)
         form.setSpacing(4)
+        if isinstance(modifier, PosterizeModifier):
+            from comic_editor.ui.posterize_controls import SimplifyColorsControls
+            form.addWidget(SimplifyColorsControls(modifier, owner, body))
+            form.addWidget(QLabel("Posterization", body))
         form.addWidget(self._slider_row(
             "Intensity", 0, 100, round(modifier.intensity),
             "intensity", "%",
         ))
-        if isinstance(modifier, CageTransformModifier):
+        if isinstance(modifier, TilingModifier):
+            from comic_editor.ui.tiling_controls import TilingSettingsControls
+            form.addWidget(TilingSettingsControls(owner, modifier, body))
+        elif isinstance(modifier, CageTransformModifier):
             from comic_editor.ui.cage_controls import CageSettingsControls
             form.addWidget(CageSettingsControls(owner.canvas, body, modifier.modifier_id))
+        elif isinstance(modifier, PosterizeModifier):
+            from comic_editor.ui.posterize_controls import PosterizeControls
+            form.addWidget(PosterizeControls(modifier, owner, body))
         elif isinstance(modifier, HueSaturationLightnessModifier):
             form.addWidget(self._slider_row(
                 "Hue", -180, 180, round(modifier.hue), "hue", "°"
@@ -223,7 +234,10 @@ class ModifierCard(QFrame):
 
     def _title_button(self, icon, tooltip, callback):
         button = QToolButton(self)
-        button.setFixedSize(28, 28)
+        size = 22 if isinstance(self.modifier, PosterizeModifier) else 28
+        button.setFixedSize(size, size)
+        if isinstance(self.modifier, PosterizeModifier):
+            button.setStyleSheet("padding: 2px;")
         button.setIcon(iconoir(icon))
         button.setToolTip(tooltip)
         button.setAutoRaise(True)
@@ -288,6 +302,10 @@ class ModifierCard(QFrame):
         value_box.setSuffix(suffix)
         value_box.setValue(value)
         value_box.setKeyboardTracking(False)
+        if isinstance(self.modifier, PosterizeModifier):
+            layout.setSpacing(3)
+            value_box.setFixedWidth(58)
+            mask_button.setFixedSize(22, 22)
         value_box.valueChanged.connect(lambda _value: self.owner.begin_parameter_drag())
         slider.valueChanged.connect(value_box.setValue)
         value_box.valueChanged.connect(slider.setValue)
@@ -301,6 +319,16 @@ class ModifierCard(QFrame):
         value_box.editingFinished.connect(
             self.owner.finish_parameter_drag
         )
+        if isinstance(self.modifier, PosterizeModifier):
+            layout.addStretch(1)
+            layout.addWidget(value_box)
+            container = QWidget(self)
+            column = QVBoxLayout(container)
+            column.setContentsMargins(0, 0, 0, 0)
+            column.setSpacing(2)
+            column.addWidget(row)
+            column.addWidget(slider)
+            return container
         layout.addWidget(slider, 1)
         layout.addWidget(value_box)
         return row
@@ -358,6 +386,9 @@ class ModifierControls(QWidget):
             lambda: self.add_modifier("outline")
         )
         menu.addAction("Mirror").triggered.connect(lambda: self.add_modifier("mirror"))
+        menu.addAction("Tiling").triggered.connect(lambda: self.add_modifier("tiling"))
+        menu.addAction("Posterize…").triggered.connect(lambda: self.add_modifier("posterize"))
+        menu.addAction("Posterize Value…").triggered.connect(lambda: self.add_modifier("posterize_value"))
         menu.addAction("Cage Transform").triggered.connect(lambda: self.add_modifier("cage_transform"))
         self.add_button.setMenu(menu)
         layout.addWidget(self.add_button)
@@ -478,9 +509,31 @@ class ModifierControls(QWidget):
         if chapter is None or not targets:
             return
         before = chapter.to_dict()
-        if modifier_type == "cage_transform":
+        if modifier_type == "tiling":
+            bounds = self.canvas._tiling_default_bounds(targets)
+            side = max(1., min(256., min(bounds.width(), bounds.height())/2))
+            modifier = TilingModifier(center=bounds.center().toTuple(), side=side)
+        elif modifier_type == "cage_transform":
             bounds = self._default_bounds()
             modifier = CageTransformModifier(frame=self.canvas._rect_signature(bounds) if bounds is not None and not bounds.isEmpty() else (0., 0., 100., 100.))
+        elif modifier_type in {"posterize", "posterize_value"}:
+            value_mode = modifier_type == "posterize_value"
+            modifier = PosterizeValueModifier() if value_mode else PosterizeModifier()
+            incompatible = chapter.incompatible_modifier_targets(modifier, targets)
+            if incompatible:
+                self.canvas.report_incompatible("Add modifier", chapter.modifier_compatibility_message(modifier, incompatible), incompatible)
+                return
+            count, accepted = QInputDialog.getInt(
+                self, modifier.name, "How many colors?", 6, 1, POSTERIZE_MAX_COLORS,
+            )
+            if not accepted:
+                return
+            from comic_editor.ui.posterize_controls import PosterizeSampler
+            try:
+                modifier.ranges = PosterizeSampler(value_mode=value_mode).sample(self.canvas, targets).initialize(count)
+            except (ValueError, MemoryError) as error:
+                QMessageBox.warning(self, modifier.name, str(error))
+                return
         elif modifier_type == "hsl":
             modifier: ModifierInstance = HueSaturationLightnessModifier()
         elif modifier_type in {"blur", "blur_legacy"}:
@@ -622,6 +675,8 @@ class ModifierControls(QWidget):
 
     def move_reorder(self, modifier_id: str, global_y: int) -> None:
         ids = self.common_ids()
+        if isinstance(self.canvas.chapter.modifiers.get(modifier_id), TilingModifier):
+            return
         if modifier_id not in ids or len(ids) < 2:
             return
         local_y = self.stack.mapFromGlobal(QPoint(0, global_y)).y()
@@ -632,6 +687,8 @@ class ModifierControls(QWidget):
                 destination = index
                 break
         source = ids.index(modifier_id)
+        if ids and isinstance(self.canvas.chapter.modifiers.get(ids[0]), TilingModifier):
+            destination = max(1, destination)
         if destination == source:
             return
         ids.insert(destination, ids.pop(source))
