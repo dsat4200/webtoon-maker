@@ -28,19 +28,73 @@ QSplitter::handle:hover,
 QSplitter::handle:pressed {
     background: #80c8ff;
 }
-QTabWidget#colorTabs::pane {
+/* Dialogs and popups also need explicit surfaces: the native Windows tab
+   and selection backgrounds can be light even when widget text is dark-theme. */
+QTabWidget::pane {
     border: 1px solid #33333a;
     background: #1c1c20;
 }
-QTabWidget#colorTabs QTabBar::tab {
+QTabBar::tab {
     background: #24242a;
+    color: #e6e6e8;
     border: none;
     border-bottom: 2px solid transparent;
     padding: 5px 12px;
 }
-QTabWidget#colorTabs QTabBar::tab:selected {
+QTabBar::tab:hover {
+    background: #303038;
+    color: #ffffff;
+}
+QTabBar::tab:selected {
+    background: #303842;
     border-bottom-color: #80c8ff;
     color: #ffffff;
+}
+QTabBar::tab:disabled {
+    background: #222227;
+    color: #9ea0a8;
+}
+QMenu, QMenuBar {
+    background: #25252b;
+    color: #e6e6e8;
+}
+QMenu {
+    border: 1px solid #45454e;
+    padding: 4px 0;
+}
+QMenu::item {
+    background: transparent;
+    color: #e6e6e8;
+    padding: 5px 28px;
+}
+QMenu::item:selected, QMenuBar::item:selected, QMenuBar::item:pressed {
+    background: #3a4a5a;
+    color: #ffffff;
+}
+QMenu::item:disabled, QMenuBar::item:disabled {
+    color: #9ea0a8;
+}
+QMenu::separator {
+    background: #45454e;
+    height: 1px;
+    margin: 4px 8px;
+}
+QComboBox QAbstractItemView {
+    background: #25252b;
+    color: #e6e6e8;
+    border: 1px solid #45454e;
+    selection-background-color: #3a4a5a;
+    selection-color: #ffffff;
+}
+QComboBox QAbstractItemView::item:selected {
+    background: #3a4a5a;
+    color: #ffffff;
+}
+QToolTip {
+    background: #303038;
+    color: #ffffff;
+    border: 1px solid #595963;
+    padding: 4px;
 }
 QToolButton, QPushButton {
     background: #2e2e34;

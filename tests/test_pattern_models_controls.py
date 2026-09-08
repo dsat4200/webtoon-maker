@@ -7,18 +7,17 @@ from PySide6.QtWidgets import QDoubleSpinBox
 
 from comic_editor.core.models import (
     HALFTONE_DOT_STYLES, HALFTONE_GRIDS, BoundGeometry, ChapterDocument,
+    BlenderComicViewSourceDescriptor, ImageObject, new_id,
     HalftoneModifier, ParameterMaskBinding, PixelateModifier, RasterObject,
-    ToneMask, modifier_from_dict, sanitize_halftone_svg,
+    ToneMask, modifier_from_dict,
 )
 from comic_editor.core.settings import EditorSettings
 from comic_editor.core.tiles import TileStore
 from comic_editor.ui.canvas import CanvasWidget
 from comic_editor.ui.mask_controls import MaskButton
 from comic_editor.ui.modifier_controls import ModifierControls
+from comic_editor.ui.main_window import MainWindow
 from comic_editor.ui.pattern_controls import HalftoneControls, PixelateControls
-
-
-SVG = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 10 10"><path fill="#f04" d="M0 0H10V10H0Z"/></svg>'
 
 
 @pytest.fixture
@@ -43,8 +42,8 @@ def test_pattern_round_trip_embeds_settings_and_preserves_shared_targets(pattern
     mask = ToneMask(name="Intensity", saved=True)
     chapter.masks[mask.mask_id] = mask
     halftone = HalftoneModifier(
-        grid_type="stippling", dot_style="custom", custom_svg=SVG,
-        custom_render_mode="original", color_mode="gradient", gradient_interpolation="oklch",
+        grid_type="stippling", dot_style="polygon", color_mode="target_layer", target_layer_id=layer.layer_id,
+        target_hue=27, target_saturation=-30, target_lightness=12, gradient_interpolation="oklch",
         gradient_stops=[[1, "#FFFFFF"], [.35, "#80FF0000"], [0, "#000"]],
         gamma=1.25, muted=True, expanded=False, smoothing_iterations=123,
         parameter_masks={"intensity": ParameterMaskBinding(mask.mask_id, 10., 80.)})
@@ -103,20 +102,13 @@ def test_halftone_validation_bounds_enums_and_gradient():
         HalftoneModifier(gradient_stops=[[0, "#000"]]).validate()
 
 
-def test_custom_svg_is_embedded_static_and_bounded():
-    unsafe = '''<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 10 10" onload="alert(1)">
-      <script>bad()</script><image href="https://example.com/private"/>
-      <path d="M0 0H10V10Z" style="fill:url(https://example.com/paint)"/>
-      <use href="file:///private.svg"/>
-    </svg>'''
-    safe = sanitize_halftone_svg(unsafe)
-    assert all(value not in safe for value in ("script", "image", "onload", "https://", "file:///"))
-    assert "path" in safe
-    assert sanitize_halftone_svg(safe) == safe
-    with pytest.raises(ValueError, match="document types"):
-        sanitize_halftone_svg('<!DOCTYPE svg [<!ENTITY secret SYSTEM "file:///private">]><svg/>')
-    with pytest.raises(ValueError, match="256 KB"):
-        sanitize_halftone_svg(" " * (256 * 1024 + 1) + "<svg/>")
+def test_custom_style_is_removed_and_existing_projects_still_load():
+    assert "custom" not in HALFTONE_DOT_STYLES
+    modifier = modifier_from_dict({"type": "halftone", "dot_style": "custom",
+                                  "custom_svg": "<svg/>", "custom_render_mode": "original"})
+    assert modifier.dot_style == "circle"
+    assert "custom_svg" not in modifier.to_dict()
+    assert "custom_render_mode" not in modifier.to_dict()
 
 
 def test_add_controls_decimal_keyboard_edit_undo_and_mask_scope(pattern_scene, qapp):
@@ -156,7 +148,7 @@ def test_add_controls_decimal_keyboard_edit_undo_and_mask_scope(pattern_scene, q
     controls.close()
 
 
-def test_halftone_all_modes_svg_gradient_edit_reset_undo(pattern_scene):
+def test_halftone_all_modes_gradient_edit_reset_undo(pattern_scene):
     canvas, controls, _, obj = pattern_scene
     controls.add_modifier("halftone")
     modifier = canvas.chapter.modifiers[obj.modifier_ids[-1]]
@@ -170,8 +162,6 @@ def test_halftone_all_modes_svg_gradient_edit_reset_undo(pattern_scene):
         combo = panel.combos["dot_style"]
         combo.setCurrentIndex(combo.findData(style))
         assert modifier.dot_style == style
-    panel.set_custom_svg(SVG)
-    assert "path" in modifier.custom_svg
     gradient = panel.gradient
     gradient.add_stop()
     assert len(modifier.gradient_stops) == 3
@@ -194,6 +184,114 @@ def test_halftone_all_modes_svg_gradient_edit_reset_undo(pattern_scene):
     assert (modifier.foreground, modifier.background) == original_colors[::-1]
     before = copy.deepcopy(modifier.to_dict())
     panel.reset_section("Dots and lines")
-    assert modifier.dot_style == "circle" and modifier.custom_svg == ""
+    assert modifier.dot_style == "circle"
     canvas.command_stack.undo()
     assert canvas.chapter.modifiers[identifier].to_dict() == before
+
+
+def test_target_layer_picker_parameter_undo_and_mode_lifecycle(pattern_scene):
+    canvas, controls, layer, obj = pattern_scene
+    controls.add_modifier("halftone")
+    identifier = obj.modifier_ids[-1]
+    controls.set_parameter(identifier, "color_mode", "target_layer", True)
+    original_selection = canvas.selected_entities[:]
+    controls.begin_target_layer_pick(identifier)
+    assert controls.target_layer_pick_id == identifier
+    assert not controls.choose_target_layer("object", "missing-object")
+    assert controls.target_layer_pick_id == identifier
+    assert controls.choose_target_layer("layer", layer.layer_id)
+    assert canvas.selected_entities == original_selection
+    assert canvas.chapter.modifiers[identifier].target_layer_id == layer.layer_id
+    assert not controls.target_layer_pick_id
+    canvas.command_stack.undo()
+    assert canvas.chapter.modifiers[identifier].target_layer_id == ""
+    canvas.command_stack.redo()
+    assert canvas.chapter.modifiers[identifier].target_layer_id == layer.layer_id
+    controls.toggle_link_mode(identifier)
+    controls.begin_target_layer_pick(identifier)
+    assert not controls.link_modifier_id
+    controls.toggle_link_mode(identifier)
+    assert not controls.target_layer_pick_id
+    controls.begin_target_layer_pick(identifier)
+    controls.set_parameter(identifier, "color_mode", "source", True)
+    assert not controls.target_layer_pick_id
+    controls.set_parameter(identifier, "color_mode", "target_layer", True)
+    controls.begin_target_layer_pick(identifier)
+    canvas.set_document(ChapterDocument(name="Other"), TileStore())
+    assert not controls.target_layer_pick_id
+
+
+def test_target_layer_hsl_controls_visibility_undo_and_reset(pattern_scene):
+    canvas, controls, _, obj = pattern_scene
+    controls.add_modifier("halftone")
+    identifier = obj.modifier_ids[-1]
+    panel = controls.findChild(HalftoneControls)
+    assert panel.target_layer_controls.isHidden()
+    mode = panel.combos["color_mode"]
+    mode.setCurrentIndex(mode.findData("target_layer"))
+    assert not panel.target_layer_controls.isHidden()
+    panel.numbers["target_hue"].value.setValue(45)
+    panel.numbers["target_saturation"].value.setValue(-35)
+    panel.numbers["target_lightness"].value.setValue(20)
+    modifier = canvas.chapter.modifiers[identifier]
+    assert (modifier.target_hue, modifier.target_saturation, modifier.target_lightness) == (45, -35, 20)
+    panel.reset_section("Colors")
+    assert (modifier.target_hue, modifier.target_saturation, modifier.target_lightness) == (0, 0, 0)
+    canvas.command_stack.undo()
+    modifier = canvas.chapter.modifiers[identifier]
+    assert (modifier.target_hue, modifier.target_saturation, modifier.target_lightness) == (45, -35, 20)
+
+
+@pytest.mark.parametrize("source_kind", ["layer", "object"])
+def test_main_window_target_layer_click_preserves_selection_and_escape_cancels(qapp, source_kind):
+    chapter = ChapterDocument(height=300)
+    page = chapter.add_page("Page", BoundGeometry.rectangle(0, 0, 400, 300))
+    layer = chapter.add_layer(page.layer_id, "Colors", BoundGeometry.rectangle(0, 0, 300, 200))
+    obj = chapter.add_object(layer.layer_id, RasterObject())
+    blender = chapter.add_object(layer.layer_id, ImageObject(
+        name="Blender Comic View", source=BlenderComicViewSourceDescriptor(
+            project_uuid=new_id(), view_uuid=new_id(), display_name="Blender Comic View")))
+    source_id = layer.layer_id if source_kind == "layer" else blender.object_id
+    source_name = layer.name if source_kind == "layer" else blender.name
+    window = MainWindow()
+    window._set_chapter(chapter, TileStore())
+    window.resize(1100, 760)
+    window.show()
+    try:
+        window.canvas.set_selection("object", obj.object_id)
+        controls = window.modifier_controls
+        controls.add_modifier("halftone")
+        identifier = obj.modifier_ids[-1]
+        controls.set_parameter(identifier, "color_mode", "target_layer", True)
+        window.tree.expandAll()
+        qapp.processEvents()
+        selected = window.canvas.selected_entities[:]
+        index = window.hierarchy_model.index_for_entity(source_kind, source_id)
+        controls.begin_target_layer_pick(identifier)
+        QTest.mouseClick(window.tree.viewport(), Qt.LeftButton, pos=window.tree.visualRect(index).center())
+        assert chapter.modifiers[identifier].target_layer_id == source_id
+        assert window.canvas.selected_entities == selected
+        assert len(window.tree.selectionModel().selectedRows()) == 1
+        current = window.hierarchy_model.item_for_index(window.tree.selectionModel().selectedRows()[0])
+        assert (current.kind, current.entity_id) == selected[0]
+        panel = controls._cards[identifier].findChild(HalftoneControls)
+        assert panel.target_layer_label.text() == source_name
+        window.canvas.command_stack.undo()
+        assert window.canvas.chapter.modifiers[identifier].target_layer_id == ""
+        assert window.canvas.selected_entities == selected
+        window.canvas.command_stack.redo()
+        assert window.canvas.chapter.modifiers[identifier].target_layer_id == source_id
+        assert window.canvas.selected_entities == selected
+        highlights = []
+        controls.targetLayerPickChanged.connect(highlights.append)
+        controls.begin_target_layer_pick(identifier)
+        assert highlights[-1] == {(source_kind, source_id)}
+        QTest.keyClick(window.tree, Qt.Key_Escape)
+        assert not controls.target_layer_pick_id
+        assert window.canvas.chapter.modifiers[identifier].target_layer_id == source_id
+        controls.begin_target_layer_pick(identifier)
+        window._set_chapter(ChapterDocument(name="Switched"), TileStore())
+        assert not controls.target_layer_pick_id
+    finally:
+        window.canvas._effect_jobs.cancel()
+        window.deleteLater()

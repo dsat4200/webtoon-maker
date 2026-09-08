@@ -15,6 +15,7 @@ from comic_editor.core.models import (
     canonical_argb, TilingModifier, ArrayModifier,
     CageTransformModifier, PosterizeModifier, PosterizeValueModifier, POSTERIZE_MAX_COLORS,
     HalftoneModifier, PixelateModifier,
+    ColorFillGradientObject,
     StrokeModifier, ScreamModifier, WobbleModifier, DotDashModifier, STROKE_MODIFIER_TYPES,
 )
 from comic_editor.ui.icons import iconoir
@@ -106,7 +107,18 @@ class ModifierCard(QFrame):
                 modifier.modifier_id, "expanded", not modifier.expanded, True
             ),
         )
+        collapse.setObjectName("modifierCollapseButton")
         title.layout().insertWidget(0, collapse)
+        self.preset_button = self._title_button("nav-arrow-down", "Modifier presets", lambda: None)
+        self.preset_button.setObjectName("modifierPresetButton")
+        self.preset_button.setAccessibleName("Modifier presets")
+        self.preset_button.setPopupMode(QToolButton.InstantPopup)
+        self.preset_button.setStyleSheet("QToolButton::menu-indicator { image: none; }")
+        preset_menu = QMenu(self.preset_button)
+        preset_menu.setObjectName("modifierPresetMenu")
+        preset_menu.aboutToShow.connect(lambda: owner.populate_preset_menu(preset_menu, modifier.modifier_id))
+        self.preset_button.setMenu(preset_menu)
+        title.layout().insertWidget(1, self.preset_button)
         self.mute_button = self._title_button(
             "eye-closed" if modifier.muted else "eye",
             "Unmute modifier" if modifier.muted else "Mute modifier",
@@ -135,8 +147,8 @@ class ModifierCard(QFrame):
             actions = QHBoxLayout()
             actions.setContentsMargins(6, 0, 6, 0)
             actions.addStretch(1)
-            while title.layout().count() > 2:
-                actions.addWidget(title.layout().takeAt(2).widget())
+            while title.layout().count() > 3:
+                actions.addWidget(title.layout().takeAt(3).widget())
             outer.addLayout(actions)
         body = QWidget(self)
         form = QVBoxLayout(body)
@@ -418,6 +430,7 @@ class ModifierCard(QFrame):
 
 class ModifierControls(QWidget):
     linkModeChanged = Signal(object)
+    targetLayerPickChanged = Signal(object)
     maskRequested = Signal(object)
     maskPreviewRequested = Signal(str, bool)
     maskContributorsDropped = Signal(object, object)
@@ -430,12 +443,16 @@ class ModifierControls(QWidget):
         self.link_modifier_id = ""
         self.link_original: set[tuple[str, str]] = set()
         self.link_working: set[tuple[str, str]] = set()
+        self.target_layer_pick_id = ""
+        self._target_layer_pick_owners = []
+        self._target_layer_pick_chapter = None
+        self.preset_controller = None
         self._parameter_before = None
         self._reorder_before = None
         self._cards: dict[str, ModifierCard] = {}
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
-        self.summary = QLabel("Select a drawing, image, or shape.", self)
+        self.summary = QLabel("Select a drawing, image, gradient, or shape.", self)
         self.summary.setWordWrap(True)
         layout.addWidget(self.summary)
         self.add_button = QPushButton("Add Modifier", self)
@@ -476,7 +493,8 @@ class ModifierControls(QWidget):
         layout.addWidget(self.stack)
         self.canvas.selectionChanged.connect(lambda *_: self.refresh())
         self.canvas.selectionSetChanged.connect(lambda *_: self.refresh())
-        self.canvas.chapterReplaced.connect(lambda *_: self.refresh())
+        self.canvas.chapterReplaced.connect(self._chapter_replaced)
+        self.canvas.hierarchyChanged.connect(self._validate_target_layer_pick)
         self.canvas.modifierSelectionChanged.connect(self._refresh_selection_style)
 
     def _refresh_selection_style(self, _identifier=""):
@@ -492,6 +510,13 @@ class ModifierControls(QWidget):
             target for target in self.canvas.selected_entities
             if self.canvas.chapter.modifier_target(*target) is not None
         ]
+
+    def populate_preset_menu(self, menu, modifier_id):
+        if self.preset_controller is not None:
+            self.preset_controller.populate_menu(menu, modifier_id)
+        else:
+            menu.clear()
+            menu.addAction("Open a series to use presets").setEnabled(False)
 
     @property
     def active_modifier_id(self):
@@ -524,6 +549,12 @@ class ModifierControls(QWidget):
         return [item for item in primary.modifier_ids if item in common]
 
     def refresh(self) -> None:
+        if self.target_layer_pick_id:
+            modifier = self.canvas.chapter.modifiers.get(self.target_layer_pick_id) if self.canvas.chapter else None
+            if (not isinstance(modifier, HalftoneModifier) or modifier.color_mode != "target_layer"
+                    or self.targets() != self._target_layer_pick_owners):
+                self.cancel_target_layer_pick()
+                return
         while self.stack_layout.count() > 1:
             item = self.stack_layout.takeAt(0)
             if item.widget() is not None:
@@ -535,14 +566,18 @@ class ModifierControls(QWidget):
             self.canvas.selected_entities
         )
         self.add_button.setEnabled(bool(self.canvas.selected_entities))
+        has_gradient = any(isinstance(chapter.modifier_target(*ref), ColorFillGradientObject) for ref in targets) if chapter else False
+        for action in self.add_button.menu().actions():
+            action.setVisible(not has_gradient or action.text() in {"Posterize…", "Posterize Value…", "Halftone"})
+        self.add_button.setToolTip("Color gradients support Posterize, Posterize Value, and Halftone." if has_gradient else "")
         self.stroke_menu.menuAction().setVisible(bool(eligible and all(
             chapter.stroke_modifier_target(*ref) for ref in targets)))
         if not eligible:
-            self.summary.setText("Select a drawing, image, or bounded shape.")
+            self.summary.setText("Select a drawing, image, gradient, or bounded shape.")
             return
         ids = self.common_ids()
         self.summary.setText(
-            "Shared modifiers" if len(targets) > 1 else "Modifier stack"
+            "Shared modifiers" if len(targets) > 1 else "Gradient modifiers" if has_gradient else "Modifier stack"
         )
         for modifier_id in ids:
             modifier = chapter.modifiers.get(modifier_id)
@@ -714,6 +749,9 @@ class ModifierControls(QWidget):
             self._push(before, "Edit modifier")
         if attribute in {"expanded", "muted"}:
             self.refresh()
+        if (attribute == "color_mode" and value != "target_layer"
+                and self.target_layer_pick_id == modifier_id):
+            self.cancel_target_layer_pick()
 
     def finish_parameter_drag(self) -> None:
         before, self._parameter_before = self._parameter_before, None
@@ -803,6 +841,7 @@ class ModifierControls(QWidget):
             self._push(before, "Reorder modifiers")
 
     def toggle_link_mode(self, modifier_id: str) -> None:
+        self.cancel_target_layer_pick()
         if self.link_modifier_id == modifier_id:
             self.commit_link_mode()
             return
@@ -860,5 +899,59 @@ class ModifierControls(QWidget):
         self.link_original.clear()
         self.link_working.clear()
         self.linkModeChanged.emit(None)
+        self.refresh()
+        return True
+
+    def _chapter_replaced(self, *_):
+        self.cancel_target_layer_pick()
+        self.refresh()
+
+    def _validate_target_layer_pick(self):
+        if self.target_layer_pick_id and (self.canvas.chapter is not self._target_layer_pick_chapter
+                or self.target_layer_pick_id not in self.canvas.chapter.modifiers):
+            self.cancel_target_layer_pick()
+
+    def begin_target_layer_pick(self, modifier_id: str) -> None:
+        if self.target_layer_pick_id == modifier_id:
+            self.cancel_target_layer_pick()
+            return
+        chapter = self.canvas.chapter
+        modifier = chapter.modifiers.get(modifier_id) if chapter else None
+        if not isinstance(modifier, HalftoneModifier) or modifier.color_mode != "target_layer":
+            return
+        self.finish_parameter_drag()
+        self.cancel_link_mode()
+        self.target_layer_pick_id = modifier_id
+        self._target_layer_pick_chapter = chapter
+        self._target_layer_pick_owners = self.targets()
+        source_kind = ("layer" if modifier.target_layer_id in chapter.layers
+                       else "object" if modifier.target_layer_id in chapter.objects else None)
+        highlights = {(source_kind, modifier.target_layer_id)} if source_kind else set()
+        self.targetLayerPickChanged.emit(highlights)
+        self.refresh()
+
+    def choose_target_layer(self, kind: str, entity_id: str) -> bool:
+        chapter = self.canvas.chapter
+        if not self.target_layer_pick_id or chapter is None:
+            return False
+        sources = chapter.layers if kind == "layer" else chapter.objects if kind == "object" else {}
+        if entity_id not in sources:
+            return False
+        modifier_id = self.target_layer_pick_id
+        self.target_layer_pick_id = ""
+        self._target_layer_pick_chapter = None
+        self._target_layer_pick_owners = []
+        self.targetLayerPickChanged.emit(None)
+        self.set_parameter(modifier_id, "target_layer_id", entity_id, True)
+        self.refresh()
+        return True
+
+    def cancel_target_layer_pick(self) -> bool:
+        if not self.target_layer_pick_id:
+            return False
+        self.target_layer_pick_id = ""
+        self._target_layer_pick_chapter = None
+        self._target_layer_pick_owners = []
+        self.targetLayerPickChanged.emit(None)
         self.refresh()
         return True

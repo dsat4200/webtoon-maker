@@ -15,7 +15,7 @@ from PySide6.QtGui import QImage, QPolygonF, QTransform
 from .models import (
     BoundGeometry, ChapterDocument, ChildRef, ColorFillGradientObject,
     DocumentObject, EmbeddedImageSourceDescriptor, GradientObject, ImageObject,
-    LayerNode, RasterObject, ShapeStyle, ArrayModifier, MirrorModifier, RadialBlurModifier, CageTransformModifier, TilingModifier,
+    LayerNode, RasterObject, ShapeStyle, ArrayModifier, MirrorModifier, RadialBlurModifier, CageTransformModifier, TilingModifier, HalftoneModifier,
     SpeedLineCenterObject, SpeedLinesGradientObject, TextObject,
     ToneMask, VectorDrawingObject, modifier_from_dict, new_id,
     object_from_dict,
@@ -136,6 +136,7 @@ def _copy_object(obj: DocumentObject) -> DocumentObject:
 def _clone_referenced_modifiers(
     source: ChapterDocument, destination: ChapterDocument,
     layers: list[LayerNode], objects: list[DocumentObject],
+    layer_map: dict[str, str], object_map: dict[str, str],
 ) -> dict[str, str]:
     """Clone only modifier identities referenced by the copied targets."""
     referenced = {
@@ -148,6 +149,9 @@ def _clone_referenced_modifiers(
     for old_id in referenced:
         clone = modifier_from_dict(source.modifiers[old_id].to_dict())
         clone.modifier_id = new_id()
+        if isinstance(clone, HalftoneModifier):
+            clone.target_layer_id = layer_map.get(clone.target_layer_id,
+                                                  object_map.get(clone.target_layer_id, ""))
         identifier_map[old_id] = clone.modifier_id
         destination.modifiers[clone.modifier_id] = clone
     for target in [*layers, *objects]:
@@ -640,6 +644,8 @@ def extract_asset(
         document, asset,
         [asset.layers[item] for item in layer_ids],
         [asset.objects[item] for item in object_ids],
+        {item: item for item in layer_ids},
+        {item: item for item in object_ids},
     )
     _clone_referenced_masks(
         document, asset,
@@ -823,7 +829,7 @@ def instantiate_asset(
 
     cloned_modifier_ids = _clone_referenced_modifiers(
         source, target, list(cloned_layers.values()),
-        list(cloned_objects.values()),
+        list(cloned_objects.values()), layer_map, object_map,
     )
     cloned_mask_ids = _clone_referenced_masks(
         source, target, list(cloned_layers.values()),

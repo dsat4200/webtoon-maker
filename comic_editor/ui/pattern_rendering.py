@@ -9,13 +9,11 @@ from functools import lru_cache
 import math
 
 import numpy as np
-from PySide6.QtCore import QByteArray, QRectF, Qt
-from PySide6.QtGui import QColor, QImage, QPainter
-from PySide6.QtSvg import QSvgRenderer
+from PySide6.QtGui import QColor, QImage
 from scipy.ndimage import gaussian_filter, map_coordinates
 from scipy.spatial import Delaunay, QhullError
 
-from comic_editor.core.models import HalftoneModifier, PixelateModifier, sanitize_halftone_svg
+from comic_editor.core.models import HalftoneModifier, PixelateModifier
 
 
 def _rgba(image: QImage) -> np.ndarray:
@@ -99,29 +97,6 @@ def gradient_lut(stops, interpolation: str = "rgb", count: int = 256) -> np.ndar
     if len(key) < 2:
         key = ((0., "#FF000000"), (1., "#FFFFFFFF"))
     return _gradient_lut_cached(key, interpolation, max(2, int(count)))
-
-
-@lru_cache(maxsize=24)
-def custom_stamp(svg: str) -> QImage:
-    """Render a safe embedded SVG once; CPU and GPU use the same alpha stamp."""
-    stamp = QImage(256, 256, QImage.Format.Format_ARGB32_Premultiplied)
-    stamp.fill(Qt.GlobalColor.transparent)
-    svg = sanitize_halftone_svg(svg)
-    if not svg:
-        return stamp
-    renderer = QSvgRenderer(QByteArray(svg.encode("utf-8")))
-    if not renderer.isValid():
-        return stamp
-    size = renderer.viewBoxF().size()
-    width, height = max(1e-6, size.width()), max(1e-6, size.height())
-    ratio = 256. / max(width, height)
-    rect = QRectF((256. - width * ratio) / 2., (256. - height * ratio) / 2.,
-                  width * ratio, height * ratio)
-    painter = QPainter(stamp)
-    painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-    renderer.render(painter, rect)
-    painter.end()
-    return stamp
 
 
 def halftone_unit(width: int, height: int, modifier) -> float:
@@ -293,9 +268,43 @@ def _tone(sample: np.ndarray, modifier) -> tuple[np.ndarray, np.ndarray]:
     return level.astype(np.float32), visible
 
 
-def _ink(sample: np.ndarray, level: np.ndarray, modifier) -> np.ndarray:
-    if modifier.color_mode == "source":
-        return np.concatenate((_straight(sample), np.ones_like(sample[..., 3:4])), axis=-1)
+def _target_hsl(rgb: np.ndarray, modifier) -> np.ndarray:
+    """Apply target-color HSL offsets without touching the tone sample."""
+    hue = float(getattr(modifier, "target_hue", 0.)) / 360.
+    saturation = float(getattr(modifier, "target_saturation", 0.)) / 100.
+    lightness = float(getattr(modifier, "target_lightness", 0.)) / 100.
+    if hue == 0. and saturation == 0. and lightness == 0.:
+        return rgb
+    maximum, minimum = rgb.max(axis=-1), rgb.min(axis=-1)
+    delta = maximum - minimum
+    light = (maximum + minimum) * .5
+    sat = np.divide(delta, 1. - np.abs(2. * light - 1.),
+                    out=np.zeros_like(light), where=delta > 1e-7)
+    denominator = np.maximum(delta, 1e-7)
+    phase = np.where(maximum == rgb[..., 0],
+                     (rgb[..., 1] - rgb[..., 2]) / denominator,
+                     np.where(maximum == rgb[..., 1],
+                              (rgb[..., 2] - rgb[..., 0]) / denominator + 2.,
+                              (rgb[..., 0] - rgb[..., 1]) / denominator + 4.))
+    phase = np.where(delta > 1e-7, phase / 6., 0.)
+    phase = (phase + hue) % 1.
+    sat = np.clip(sat + saturation, 0., 1.)
+    light = np.clip(light + lightness, 0., 1.)
+    amplitude = sat * np.minimum(light, 1. - light)
+    k = (phase[..., None] * 12. + np.array([0., 8., 4.], dtype=np.float32)) % 12.
+    triangle = np.maximum(-1., np.minimum(np.minimum(k - 3., 9. - k), 1.))
+    return np.clip(light[..., None] - amplitude[..., None] * triangle, 0., 1.)
+
+
+def _ink(sample: np.ndarray, level: np.ndarray, modifier,
+         color_sample: np.ndarray | None = None) -> np.ndarray:
+    if modifier.color_mode in {"source", "target_layer"}:
+        rgb = _straight(sample)
+        if modifier.color_mode == "target_layer" and color_sample is not None:
+            rgb = np.where(color_sample[..., 3:4] > 1e-5, _straight(color_sample), rgb)
+        if modifier.color_mode == "target_layer":
+            rgb = _target_hsl(rgb, modifier)
+        return np.concatenate((rgb, np.ones_like(sample[..., 3:4])), axis=-1)
     if modifier.color_mode == "gradient":
         lut = gradient_lut(modifier.gradient_stops, modifier.gradient_interpolation, 1024)
         return lut[np.minimum(1023, np.rint((1. - level) * 1023).astype(np.int32))]
@@ -339,20 +348,6 @@ def _edge_coverage(distance, antialias_distance=None, aa_width=None):
     return 1. - t * t * (3. - 2. * t)
 
 
-def _stamp_sample(x, y, level, spacing, modifier):
-    radius = spacing * .5 * modifier.size * np.sqrt(np.maximum(
-        0., (1. - modifier.scale_factor) + modifier.scale_factor * level))
-    rotation = modifier.rotation if modifier.link_rotation else modifier.dot_rotation
-    angle = math.radians(rotation)
-    px, py = x * math.cos(angle) + y * math.sin(angle), -x * math.sin(angle) + y * math.cos(angle)
-    u, v = px / np.maximum(radius * 2., 1e-6) + .5, py / np.maximum(radius * 2., 1e-6) + .5
-    stamp = _rgba(custom_stamp(modifier.custom_svg))
-    sampled = np.stack([map_coordinates(stamp[..., channel], [v * 255., u * 255.], order=1,
-                                       mode="constant", cval=0., prefilter=False)
-                        for channel in range(4)], axis=-1)
-    return sampled * (radius > 1e-6)[..., None]
-
-
 def _dot_coverage(x, y, level, spacing, modifier):
     scale = np.sqrt(np.maximum(0., (1. - modifier.scale_factor) + modifier.scale_factor * level))
     radius = spacing * .5 * modifier.size * scale
@@ -386,8 +381,6 @@ def _dot_coverage(x, y, level, spacing, modifier):
             distance = np.hypot(px, py) - radius * (1. + (modifier.star_inner - 1.) * wave)
     elif style == "line":
         distance = np.maximum(np.abs(py) - radius * .2, np.abs(px) - radius)
-    elif style == "custom":
-        return _stamp_sample(x, y, level, spacing, modifier)[..., 3]
     elif style == "liquid":
         distance = (px ** 4 + py ** 4) ** .25 - radius
     else:
@@ -396,7 +389,7 @@ def _dot_coverage(x, y, level, spacing, modifier):
     return _edge_coverage(distance, aa_width=aa) * (radius > 1e-6)
 
 
-def _delaunay(source, prepared, modifier):
+def _delaunay(source, prepared, modifier, color_source=None):
     height, width = source.shape[:2]
     triangles = delaunay_triangles(width, height, modifier)
     coverage = np.zeros((height, width), dtype=np.float32)
@@ -406,7 +399,9 @@ def _delaunay(source, prepared, modifier):
     centers = np.mean(triangles, axis=1)
     sampled = _sample(prepared, centers[:, 0], centers[:, 1])
     levels, visible = _tone(sampled, modifier)
-    inks = _ink(sampled, levels, modifier)
+    color_sample = (_sample(color_source, centers[:, 0], centers[:, 1])
+                    if color_source is not None else None)
+    inks = _ink(sampled, levels, modifier, color_sample)
     sizes = np.sqrt(np.maximum(0., 1. - modifier.scale_factor + modifier.scale_factor * levels)) * modifier.size
     triangles = centers[:, None, :] + (triangles - centers[:, None, :]) * sizes[:, None, None]
     if not modifier.link_rotation:
@@ -442,13 +437,14 @@ def _delaunay(source, prepared, modifier):
     return _composite(source, ink, coverage, modifier)
 
 
-def _halftone(source: np.ndarray, modifier: HalftoneModifier) -> np.ndarray:
+def _halftone(source: np.ndarray, modifier: HalftoneModifier,
+              color_source: np.ndarray | None = None) -> np.ndarray:
     height, width = source.shape[:2]
     unit = halftone_unit(width, height, modifier)
     spacing = max(.5, modifier.spacing * unit)
     prepared = _blur(source, modifier.blur * unit)
     if modifier.dot_style == "delaunay" and modifier.grid_type not in {"line", "ring"}:
-        return _delaunay(source, prepared, modifier)
+        return _delaunay(source, prepared, modifier, color_source)
     yy, xx = np.indices((height, width), dtype=np.float32)
     xx, yy = xx + .5, yy + .5
     angle = math.radians(modifier.rotation)
@@ -474,12 +470,13 @@ def _halftone(source: np.ndarray, modifier: HalftoneModifier) -> np.ndarray:
         thickness = spacing * .5 * getattr(modifier, "line_width", 1.) * (1. - modifier.scale_factor + modifier.scale_factor * line_level)
         coverage = _edge_coverage(np.abs(coordinate - band) - thickness, coordinate)
         coverage *= visible & (thickness > 1e-6)
-        return _composite(source, _ink(sampled, level, modifier), coverage, modifier)
+        color_sample = _sample(color_source, sx, sy) if color_source is not None else None
+        return _composite(source, _ink(sampled, level, modifier, color_sample), coverage, modifier)
 
     coverage = np.zeros((height, width), dtype=np.float32)
     chosen = _sample(prepared, xx, yy)
     chosen_tone = np.zeros((height, width), dtype=np.float32)
-    custom_color = np.zeros_like(source)
+    chosen_color = _sample(color_source, xx, yy) if color_source is not None else None
     joined = np.full((height, width), 1e20, dtype=np.float32)
     joins = np.zeros((height, width), dtype=np.int16)
     cell_x = np.floor(gx / spacing + .5)
@@ -545,18 +542,17 @@ def _halftone(source: np.ndarray, modifier: HalftoneModifier) -> np.ndarray:
             coverage = np.maximum(coverage, mark)
             chosen = np.where(replace[..., None], sampled, chosen)
             chosen_tone = np.where(replace, level, chosen_tone)
-            if modifier.dot_style == "custom" and getattr(modifier, "custom_render_mode", "silhouette") == "original":
-                stamp = _stamp_sample(xx - sx, yy - sy, level, spacing, modifier)
-                custom_color = np.where(replace[..., None], stamp, custom_color)
+            if color_source is not None:
+                color_sample = _sample(color_source, sx, sy)
+                chosen_color = np.where(replace[..., None], color_sample, chosen_color)
     if modifier.dot_style in {"blob", "liquid"}:
         coverage = _edge_coverage(joined)
-    ink = _ink(chosen, chosen_tone, modifier)
-    if modifier.dot_style == "custom" and getattr(modifier, "custom_render_mode", "silhouette") == "original":
-        ink = np.concatenate((_straight(custom_color), np.ones_like(custom_color[..., 3:4])), axis=-1)
+    ink = _ink(chosen, chosen_tone, modifier, chosen_color)
     return _composite(source, ink, coverage, modifier)
 
 
-def apply_pattern_effect(image: QImage, modifier, scale: float = 1.) -> QImage:
+def apply_pattern_effect(image: QImage, modifier, scale: float = 1.,
+                         color_source: QImage | None = None) -> QImage:
     """Apply a complete pattern effect, preserving dimensions and image alpha."""
     if image.isNull():
         return image.copy()
@@ -564,7 +560,11 @@ def apply_pattern_effect(image: QImage, modifier, scale: float = 1.) -> QImage:
     if isinstance(modifier, PixelateModifier):
         result = _pixelate(source, modifier, max(float(scale), 1e-6))
     elif isinstance(modifier, HalftoneModifier):
-        result = _halftone(source, modifier)
+        colors = None
+        if (modifier.color_mode == "target_layer" and color_source is not None
+                and not color_source.isNull() and color_source.size() == image.size()):
+            colors = _rgba(color_source)
+        result = _halftone(source, modifier, colors)
     else:
         return image.copy()
     return _image(result)

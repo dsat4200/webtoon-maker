@@ -370,7 +370,8 @@ def _outline_effect(
     return original + outline * (1.0 - original[..., 3:4])
 
 
-def apply_pattern_modifier(image, modifier, mask_fields=None, renderer=None):
+def apply_pattern_modifier(image, modifier, mask_fields=None, renderer=None,
+                           color_source: QImage | None = None):
     """Render a pattern once, blending intensity in premultiplied space."""
     if image.isNull() or modifier.muted:
         return image
@@ -382,11 +383,12 @@ def apply_pattern_modifier(image, modifier, mask_fields=None, renderer=None):
         return image
     if renderer is not None:
         result = renderer.render(image, modifier,
-                                 intensity_mask=amount if amount.ndim else None)
+                                 intensity_mask=amount if amount.ndim else None,
+                                 color_source=color_source)
         if result is not None:
             return result
     from comic_editor.ui.pattern_rendering import apply_pattern_effect
-    result = apply_pattern_effect(image, modifier)
+    result = apply_pattern_effect(image, modifier, color_source=color_source)
     if amount.ndim == 0 and float(amount) >= 1.0:
         return result
     if amount.ndim == 2:

@@ -6,7 +6,7 @@ from PySide6.QtGui import QPainter, QTransform
 
 from comic_editor.core.assets import entity_visual_bounds
 from comic_editor.core.commands import CallbackCommand
-from comic_editor.core.models import (ChildRef, ImageObject, LayerNode, ArrayModifier,
+from comic_editor.core.models import (ChildRef, ImageObject, LayerNode, ArrayModifier, ColorFillGradientObject,
     MirrorModifier, RasterObject, RadialBlurModifier, TilingModifier,
     HalftoneModifier, PixelateModifier)
 from comic_editor.core.effect_geometry import effect_bounds
@@ -75,6 +75,8 @@ def visual_bounds(canvas, kind, identifier):
         result = canvas._tiling_boundary(target).boundingRect()
     parent = target.parent_id if kind == "layer" else target.parent_layer_id
     mapping = canvas.layer_world_transform(parent) if parent else QTransform()
+    if isinstance(target, ColorFillGradientObject):
+        result = mapping.mapRect(canvas._color_gradient_local_bounds(target))
     inverse, valid = mapping.inverted()
     if not valid:
         raise ValueError("Cannot bake a singular transform")

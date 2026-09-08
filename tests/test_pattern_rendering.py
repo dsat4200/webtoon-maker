@@ -9,7 +9,7 @@ from PySide6.QtGui import QImage
 
 from comic_editor.core.models import HALFTONE_DOT_STYLES, HALFTONE_GRIDS, HalftoneModifier, PixelateModifier
 from comic_editor.ui.pattern_rendering import (
-    apply_pattern_effect, custom_stamp, delaunay_triangles, gradient_lut,
+    apply_pattern_effect, delaunay_triangles, gradient_lut,
     halftone_points, halftone_unit,
 )
 
@@ -48,8 +48,7 @@ def test_all_grids_preserve_source_dimensions_and_silhouette(grid):
 
 @pytest.mark.parametrize("style", HALFTONE_DOT_STYLES)
 def test_every_dot_style_renders_visible_geometry(style):
-    svg = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20"><path d="M10 0 L20 20 L0 20Z" fill="red"/></svg>'
-    result = rgba_from_image(apply_pattern_effect(solid(), halftone(dot_style=style, custom_svg=svg)))
+    result = rgba_from_image(apply_pattern_effect(solid(), halftone(dot_style=style)))
     assert result[..., 0].min() < 70
     assert result[..., 0].max() > 150
     assert np.all(result[..., 3] == 255)
@@ -120,17 +119,95 @@ def test_oklch_is_perceptual_and_handles_achromatic_endpoints():
     np.testing.assert_allclose(neutral[:, 0], neutral[:, 1], atol=1e-5)
 
 
-def test_custom_svg_shares_cached_rgba_stamp_and_native_color_mode():
-    svg = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20"><circle cx="10" cy="10" r="9" fill="#00ff00"/></svg>'
-    stamp = custom_stamp(svg)
-    assert stamp is custom_stamp(svg)
-    center = rgba_from_image(stamp)[128, 128]
-    np.testing.assert_array_equal(center, [0, 255, 0, 255])
-    native = rgba_from_image(apply_pattern_effect(solid(), halftone(
-        dot_style="custom", custom_svg=svg, custom_render_mode="original", transparent_background=True)))
-    ink = native[..., 3] == 255
-    assert np.any(ink)
-    np.testing.assert_array_equal(native[ink, :3], np.tile([0, 255, 0], (ink.sum(), 1)))
+@pytest.mark.parametrize("grid, style", [(grid, "circle") for grid in HALFTONE_GRIDS] + [("square", "delaunay")])
+def test_target_layer_changes_ink_without_changing_owner_geometry_or_alpha(grid, style):
+    owner = solid((160, 30, 70, 128))
+    target = solid((0, 255, 0, 64))
+    modifier = halftone(grid_type=grid, dot_style=style, color_mode="source", transparent_background=True)
+    original = rgba_from_image(apply_pattern_effect(owner, modifier))
+    colored = rgba_from_image(apply_pattern_effect(owner, replace(modifier, color_mode="target_layer"), color_source=target))
+    np.testing.assert_array_equal(colored[..., 3], original[..., 3])
+    assert np.any(colored[..., :3] != original[..., :3])
+    opaque_ink = colored[..., 3] > 120
+    assert np.any(opaque_ink)
+    np.testing.assert_array_equal(colored[opaque_ink, :3], np.tile([0, 255, 0], (opaque_ink.sum(), 1)))
+
+
+@pytest.mark.parametrize("style", ["circle", "delaunay"])
+def test_target_layer_transparent_pixels_fall_back_to_incoming_colors(style):
+    owner = solid((160, 30, 70, 255))
+    target_data = np.zeros((100, 100, 4), dtype=np.uint8)
+    target_data[:, :50] = [0, 255, 0, 255]
+    target_data[:, 50:] = [0, 0, 255, 0]
+    modifier = halftone(dot_style=style, color_mode="target_layer", transparent_background=True)
+    original = rgba_from_image(apply_pattern_effect(owner, replace(modifier, color_mode="source")))
+    colored = rgba_from_image(apply_pattern_effect(owner, modifier, color_source=image_from_rgba(target_data)))
+    np.testing.assert_array_equal(colored[..., 3], original[..., 3])
+    np.testing.assert_array_equal(colored[:, 75:], original[:, 75:])
+    assert np.any(colored[:, :25, :3] != original[:, :25, :3])
+
+
+@pytest.mark.parametrize("target", [None, QImage(), solid(width=20, height=20)])
+def test_missing_or_misaligned_target_falls_back_to_incoming_colors(target):
+    owner = solid((160, 30, 70, 255))
+    modifier = halftone(color_mode="target_layer", transparent_background=True)
+    expected = rgba_from_image(apply_pattern_effect(owner, replace(modifier, color_mode="source")))
+    actual = rgba_from_image(apply_pattern_effect(owner, modifier, color_source=target))
+    np.testing.assert_array_equal(actual, expected)
+
+
+def test_pattern_wrapper_forwards_target_to_gpu_and_cpu_fallback():
+    from comic_editor.ui.modifier_rendering import apply_pattern_modifier
+
+    class UnavailableRenderer:
+        def render(self, image, modifier, *, intensity_mask=None, color_source=None):
+            self.color_source = color_source
+            return None
+
+    owner, target = solid(), solid((0, 255, 0, 255))
+    modifier = halftone(color_mode="target_layer", transparent_background=True)
+    renderer = UnavailableRenderer()
+    actual = apply_pattern_modifier(owner, modifier, renderer=renderer, color_source=target)
+    expected = apply_pattern_effect(owner, modifier, color_source=target)
+    assert renderer.color_source is target
+    np.testing.assert_array_equal(rgba_from_image(actual), rgba_from_image(expected))
+
+
+@pytest.mark.parametrize("style", ["circle", "delaunay"])
+@pytest.mark.parametrize("adjustments, expected", [
+    ({}, [255, 0, 0]),
+    ({"target_hue": 120}, [0, 255, 0]),
+    ({"target_saturation": -100}, [128, 128, 128]),
+    ({"target_lightness": -100}, [0, 0, 0]),
+    ({"target_lightness": 100}, [255, 255, 255]),
+])
+def test_target_hsl_changes_only_ink_color(style, adjustments, expected):
+    owner, target = solid(), solid((255, 0, 0, 255))
+    modifier = halftone(dot_style=style, color_mode="target_layer", transparent_background=True)
+    original = rgba_from_image(apply_pattern_effect(owner, modifier, color_source=target))
+    adjusted = rgba_from_image(apply_pattern_effect(owner, replace(modifier, **adjustments), color_source=target))
+    np.testing.assert_array_equal(adjusted[..., 3], original[..., 3])
+    opaque_ink = adjusted[..., 3] == 255
+    assert np.any(opaque_ink)
+    np.testing.assert_allclose(adjusted[opaque_ink, :3], np.tile(expected, (opaque_ink.sum(), 1)), atol=1)
+
+
+def test_target_hsl_also_adjusts_missing_target_fallback_colors():
+    owner = solid((255, 0, 0, 255))
+    modifier = halftone(color_mode="target_layer", target_hue=120, transparent_background=True)
+    adjusted = rgba_from_image(apply_pattern_effect(owner, modifier))
+    opaque_ink = adjusted[..., 3] == 255
+    np.testing.assert_array_equal(adjusted[opaque_ink, :3], np.tile([0, 255, 0], (opaque_ink.sum(), 1)))
+
+
+def test_target_hsl_does_not_change_other_color_modes():
+    owner, target = solid((160, 30, 70, 255)), solid((255, 0, 0, 255))
+    for mode in ("source", "two", "gradient"):
+        modifier = halftone(color_mode=mode, transparent_background=True)
+        original = rgba_from_image(apply_pattern_effect(owner, modifier, color_source=target))
+        adjusted = rgba_from_image(apply_pattern_effect(owner, replace(modifier, target_hue=120,
+            target_saturation=-100, target_lightness=100), color_source=target))
+        np.testing.assert_array_equal(adjusted, original)
 
 
 def test_geometry_helpers_cache_and_apply_fit_rotation_and_seed():

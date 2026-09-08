@@ -50,7 +50,25 @@ workflow.
 - Blender 5.2 and 4.5 LTS Comic Views as disk-published transparent image sources with
   persistent offline PNG caches
 
+## Modifier presets
+
+Use the dropdown immediately to the right of a modifier's collapse button.
+**Load modifier preset** lists saved presets for that modifier type in the
+current series. **Save modifier preset** updates the loaded preset, or asks for
+a name if none is loaded. **Save as modifier preset…** saves a separate copy.
+**Manage modifier presets…** lets you rename and delete presets of that type.
+
+Presets are saved with the series and can be reused across its chapters and
+assets. Loading one updates the modifier's effect settings and can be undone;
+its linked targets, masks, source-object selection, name, and collapsed/muted
+state stay in place. Updating or deleting a preset leaves previously applied
+modifiers unchanged until another preset is loaded. Saving a chapter preserves
+which preset was last loaded or saved for each modifier.
+
 ## Halftone and Pixelate
+
+Halftone also works directly on linear, radial, and shape color gradients,
+including outward fades, through the same cached GPU effect pipeline.
 
 Choose **Modifiers → Add Modifier → Halftone** or **Pixelate** with an image,
 drawing, or shape selected. Both effects work in stack order, support linked
@@ -68,16 +86,22 @@ they do not resize the object. Grid placement stays stable while panning or
 cropping the viewport.
 
 **Dots and lines** includes circles, incircles, triangles, squares, polygons
-and stars, line marks, embedded custom SVGs, blobs, Delaunay triangles, and
+and stars, line marks, blobs, Delaunay triangles, and
 liquid shapes. Relevant controls appear for the selected style, including dot
 size, scale, rounding, line width, point spacing, and stippling variation.
 Stippling uses deterministic procedural relaxation: **Smoothing iterations**
 controls its convergence strength, and collision radii vary with source tone.
 This is a realtime approximation of the reference's iterative stippling solver.
 **Colors** supports two colors, editable gradients with RGB or OKLCH
-interpolation, and the incoming artwork's source colors. Enable **Transparent
-background** to leave only the marks. Custom SVGs can use either a silhouette
-or their own colors.
+interpolation, the incoming artwork's source colors, and **Target layer**.
+In Target layer mode, click **Pick layer or object** and select an outline row,
+including a Blender Comic View. Its latest cached render supplies the colors.
+**Hue**, **Saturation**, and **Lightness** adjust its sampled colors without
+changing the pattern. Colors follow canvas positions, including source-layer
+transforms. Hidden source layers and objects can be used, and transparent or missing samples
+use the incoming artwork's colors. Nested Target layer references use their
+incoming colors to avoid feedback. Enable **Transparent background** to leave
+only the marks.
 
 Pixelate includes [Pixel Art Village's](https://pixelartvillage.com/) pixel
 size (1–100), brightness, contrast, and saturation (−100–200) sliders, plus
@@ -113,6 +137,8 @@ Press Escape during a gizmo drag to cancel it.
 ## Posterize
 
 The **Modifiers → Add Modifier → Posterize…** command asks for 1–24 colors.
+Select a drawing, image, shape, or color gradient. Both Posterize variants work
+directly on linear, radial, and shape gradients, including outward fades.
 It samples the selected artwork and creates hue ranges with average output
 colors. The circular editor shows hue around the ring and frequency as radial
 bars. Drag a boundary to resize a range; neighboring handles cannot cross.

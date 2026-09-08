@@ -13,7 +13,7 @@ from PySide6.QtWidgets import (
 
 from comic_editor.core.models import (
     POSTERIZE_MAX_COLORS, POSTERIZE_MIN_SPAN, POSTERIZE_VALUE_MIN_SPAN,
-    PosterizeRange, PosterizeValueModifier,
+    ColorFillGradientObject, PosterizeRange, PosterizeValueModifier,
 )
 from comic_editor.core.posterize import HueStatistics, ValueStatistics, grayscale_source
 from comic_editor.ui.modifier_rendering import _qimage_premultiplied, _straight
@@ -76,18 +76,28 @@ class PosterizeSampler:
             painter.translate(-bounds.left(), -bounds.top())
             painter.setTransform(mapping, True)
             original = (target.modifier_ids, target.visible, target.mask_only,
-                        canvas._interactive_render, canvas._rendering_compound_references)
+                        canvas._interactive_render, canvas._rendering_compound_references,
+                        canvas._rendering_outward_gradient)
             try:
                 target.modifier_ids, target.visible, target.mask_only = prefix, True, False
                 canvas._interactive_render = False
                 canvas._rendering_compound_references = True
+                canvas._rendering_outward_gradient = bool(
+                    kind == "object" and isinstance(target, ColorFillGradientObject)
+                    and canvas._is_outward_gradient(target))
                 if kind == "layer":
                     canvas._render_layer(painter, target, 1., bounds)
                 else:
+                    if (isinstance(target, ColorFillGradientObject)
+                            and not canvas._rendering_outward_gradient
+                            and not target.ignore_parent_mask):
+                        painter.setClipPath(canvas.layer_effective_path(target.parent_layer_id),
+                                            Qt.IntersectClip)
                     canvas._render_object(painter, target, 1., inverse.mapRect(bounds))
             finally:
                 (target.modifier_ids, target.visible, target.mask_only,
-                 canvas._interactive_render, canvas._rendering_compound_references) = original
+                 canvas._interactive_render, canvas._rendering_compound_references,
+                 canvas._rendering_outward_gradient) = original
                 painter.end()
             samples.append((_straight(_qimage_premultiplied(image)), scale,
                             bounds.width() * bounds.height() / (width * height)))

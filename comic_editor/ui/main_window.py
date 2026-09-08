@@ -597,6 +597,9 @@ class MainWindow(QMainWindow):
         self.modifier_controls = ModifierControls(
             self.canvas, self.modifiers_page
         )
+        from comic_editor.ui.modifier_presets import ModifierPresetController
+        self.modifier_presets = ModifierPresetController(
+            self.modifier_controls, lambda: (self.series, self.repository))
         self.modifiers_group.add_widget(self.modifier_controls)
         self.text_object_controls = TextObjectControls(
             self.canvas, self.settings, self.ribbon
@@ -785,6 +788,10 @@ class MainWindow(QMainWindow):
         self.modifier_controls.linkModeChanged.connect(
             lambda targets: self._finish_mask_mode(True)
             if targets is not None else None
+        )
+        self.modifier_controls.targetLayerPickChanged.connect(self.hierarchy_model.set_link_highlights)
+        self.modifier_controls.targetLayerPickChanged.connect(
+            lambda targets: self._finish_mask_mode(True) if targets is not None else None
         )
         from comic_editor.ui.tree_model import EyeVisibilityDelegate, MaskOnlyRowDelegate
         self.tree.setItemDelegateForColumn(0, EyeVisibilityDelegate(self.tree))
@@ -1750,6 +1757,12 @@ class MainWindow(QMainWindow):
             QEvent.TabletMove, QEvent.TabletPress, QEvent.TabletRelease,
         }:
             return False
+        if event.type() == QEvent.TabletRelease and getattr(self, "_target_layer_pick_tablet_press", False):
+            self._target_layer_pick_tablet_press = False
+            self._tablet_outliner_contact = False
+            self._tablet_outliner_suppress_mouse_until = time.monotonic() + 0.15
+            event.accept()
+            return True
         viewport = self.tree.viewport()
         global_position = QPointF(event.globalPosition())
         local = viewport.mapFromGlobal(global_position.toPoint())
@@ -1761,6 +1774,13 @@ class MainWindow(QMainWindow):
             self._tablet_outliner_contact = True
             self._tablet_outliner_suppress_mouse_until = time.monotonic() + 0.2
             index = self.tree.indexAt(local).siblingAtColumn(0)
+            if self.modifier_controls.target_layer_pick_id:
+                self._target_layer_pick_tablet_press = True
+                if index.isValid():
+                    item = self.hierarchy_model.item_for_index(index)
+                    self.modifier_controls.choose_target_layer(item.kind, item.entity_id)
+                event.accept()
+                return True
             if self.canvas.active_tone_mask_id and index.isValid():
                 self._tablet_outliner_press = {
                     "global": QPointF(global_position),
@@ -1914,6 +1934,24 @@ class MainWindow(QMainWindow):
 
     def eventFilter(self, watched, event) -> bool:  # noqa: N802
         if self._suppress_outliner_compat_mouse(watched, event):
+            event.accept()
+            return True
+        if (event.type() == QEvent.MouseButtonRelease and event.button() == Qt.LeftButton
+                and getattr(self, "_target_layer_pick_mouse_press", False)):
+            self._target_layer_pick_mouse_press = False
+            event.accept()
+            return True
+        if (watched is self.tree.viewport() and event.type() == QEvent.MouseButtonPress
+                and event.button() == Qt.LeftButton and self.modifier_controls.target_layer_pick_id):
+            self._target_layer_pick_mouse_press = True
+            index = self.tree.indexAt(event.position().toPoint()).siblingAtColumn(0)
+            if index.isValid():
+                item = self.hierarchy_model.item_for_index(index)
+                self.modifier_controls.choose_target_layer(item.kind, item.entity_id)
+            event.accept()
+            return True
+        if (event.type() == QEvent.KeyPress and event.key() == Qt.Key_Escape
+                and self.modifier_controls.cancel_target_layer_pick()):
             event.accept()
             return True
         if (
@@ -4668,6 +4706,7 @@ class MainWindow(QMainWindow):
     ) -> None:
         if self.chapter is None or mask_id not in self.chapter.masks:
             return
+        self.modifier_controls.cancel_target_layer_pick()
         if self.modifier_controls.link_modifier_id:
             self.modifier_controls.cancel_link_mode()
         self._mask_context = context

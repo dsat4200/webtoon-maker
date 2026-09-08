@@ -3,19 +3,16 @@ from __future__ import annotations
 
 import copy
 import secrets
-from pathlib import Path
-
-from PySide6.QtCore import QByteArray, Qt, Signal, QRectF
+from PySide6.QtCore import Qt, Signal, QRectF
 from PySide6.QtGui import QColor, QLinearGradient, QPainter, QPen
-from PySide6.QtSvg import QSvgRenderer
 from PySide6.QtWidgets import (
-    QCheckBox, QComboBox, QDoubleSpinBox, QFileDialog, QHBoxLayout, QLabel,
-    QMessageBox, QPushButton, QSlider, QToolButton, QVBoxLayout, QWidget,
+    QCheckBox, QComboBox, QDoubleSpinBox, QHBoxLayout, QLabel,
+    QPushButton, QSlider, QToolButton, QVBoxLayout, QWidget,
 )
 
 from comic_editor.core.models import (
     HALFTONE_DOT_STYLES, HALFTONE_GRIDS, HALFTONE_MAX_GRADIENT_STOPS,
-    HALFTONE_MAX_SVG_BYTES, HalftoneModifier, sanitize_halftone_svg,
+    HalftoneModifier,
 )
 
 
@@ -440,7 +437,7 @@ class HalftoneControls(_PatternControls):
         self.number(sampling, "clamp_min", "Clamp minimum")
         self.number(sampling, "clamp_max", "Clamp maximum")
         dots = self.sections["Dots and lines"].form
-        labels = {"incircle": "Incircle", "custom": "Custom SVG", "delaunay": "Delaunay"}
+        labels = {"incircle": "Incircle", "delaunay": "Delaunay"}
         self.combo(dots, "dot_style", "Style", [(labels.get(key, key.title()), key) for key in HALFTONE_DOT_STYLES])
         self.number(dots, "size", "Size")
         self.number(dots, "scale_factor", "Scale factor")
@@ -457,20 +454,38 @@ class HalftoneControls(_PatternControls):
         self.check(dots, "star", "Star polygon")
         self.number(dots, "star_inner", "Star inner radius")
         self.number(dots, "corner_rounding", "Corner rounding")
-        self.svg_button = QPushButton("Load custom SVG…", self)
-        self.svg_button.setObjectName("halftoneLoadSvg")
-        self.svg_button.clicked.connect(self.load_svg)
-        dots.addWidget(self.svg_button)
-        self.svg_status = QLabel("Custom SVG embedded" if modifier.custom_svg else "No custom SVG loaded", self)
-        self.svg_status.setWordWrap(True)
-        dots.addWidget(self.svg_status)
-        self.combo(dots, "custom_render_mode", "Render mode", [("Silhouette", "silhouette"), ("Use source colors", "original")])
-        self.combos["custom_render_mode"].setToolTip("Silhouette uses the modifier's colors. Source colors use the custom SVG's colors.")
         self.seed_button = QPushButton("Randomize stippling", self)
         self.seed_button.clicked.connect(lambda: owner.set_parameter(modifier.modifier_id, "stipple_seed", secrets.randbits(32), True))
         pattern.addWidget(self.seed_button)
         colors = self.sections["Colors"].form
-        self.combo(colors, "color_mode", "Mode", [("Two colors", "two"), ("Gradient", "gradient"), ("Source colors", "source")])
+        self.combo(colors, "color_mode", "Mode", [("Two colors", "two"), ("Gradient", "gradient"),
+                                                   ("Source colors", "source"), ("Target layer", "target_layer")])
+        self.target_layer_controls = QWidget(self)
+        target_layout = QVBoxLayout(self.target_layer_controls)
+        target_layout.setContentsMargins(0, 0, 0, 0)
+        self.target_layer_label = QLabel(self.target_layer_controls)
+        self.target_layer_label.setObjectName("halftoneTargetLayerName")
+        self.target_layer_label.setWordWrap(True)
+        target_layout.addWidget(self.target_layer_label)
+        target_actions = QHBoxLayout()
+        self.pick_target_layer = QPushButton("Pick layer or object", self.target_layer_controls)
+        self.pick_target_layer.setObjectName("halftonePickTargetLayer")
+        self.pick_target_layer.setCheckable(True)
+        self.pick_target_layer.setChecked(owner.target_layer_pick_id == modifier.modifier_id)
+        self.pick_target_layer.clicked.connect(lambda: owner.begin_target_layer_pick(modifier.modifier_id))
+        target_actions.addWidget(self.pick_target_layer, 1)
+        self.clear_target_layer = QPushButton("Clear", self.target_layer_controls)
+        self.clear_target_layer.setObjectName("halftoneClearTargetLayer")
+        self.clear_target_layer.clicked.connect(self.clear_target)
+        target_actions.addWidget(self.clear_target_layer)
+        target_layout.addLayout(target_actions)
+        target_hint = QLabel("Pick a layer or object in the outline. Transparent areas use this object's colors. Press Escape to cancel.", self.target_layer_controls)
+        target_hint.setWordWrap(True)
+        target_layout.addWidget(target_hint)
+        self.number(target_layout, "target_hue", "Hue", 0, "°")
+        self.number(target_layout, "target_saturation", "Saturation", 0, "%")
+        self.number(target_layout, "target_lightness", "Lightness", 0, "%")
+        colors.addWidget(self.target_layer_controls)
         self.color_rows = {}
         for attribute, label in (("foreground", "Foreground"), ("background", "Background")):
             button = QPushButton(label, self)
@@ -517,9 +532,10 @@ class HalftoneControls(_PatternControls):
                         "point_spacing", "smoothing_iterations", "collide_min", "collide_max", "stipple_seed"),
             "Image sampling": ("fit_mode", "base_resolution", "blur", "gamma", "contrast", "clamp_min", "clamp_max"),
             "Dots and lines": ("dot_style", "size", "scale_factor", "dot_rotation", "link_rotation", "sides", "star",
-                               "star_inner", "corner_rounding", "custom_svg", "custom_render_mode", "line_width",
+                               "star_inner", "corner_rounding", "line_width",
                                "line_level_scale", "max_edge_length", "max_necks", "merge_strength", "min_neck_width", "even_merge_tone"),
-            "Colors": ("color_mode", "foreground", "background", "transparent_background", "gradient_stops", "gradient_interpolation"),
+            "Colors": ("color_mode", "target_layer_id", "target_hue", "target_saturation", "target_lightness",
+                       "foreground", "background", "transparent_background", "gradient_stops", "gradient_interpolation"),
         }[title]
         defaults = HalftoneModifier()
         self.owner.begin_parameter_drag()
@@ -544,9 +560,6 @@ class HalftoneControls(_PatternControls):
             self.numbers[attribute].setVisible(modifier.dot_style == "blob")
         self.checks["even_merge_tone"].setVisible(modifier.dot_style == "liquid")
         self.numbers["dot_rotation"].setEnabled(not modifier.link_rotation)
-        self.svg_button.setVisible(modifier.dot_style == "custom")
-        self.svg_status.setVisible(modifier.dot_style == "custom")
-        self.combos["custom_render_mode"].parentWidget().setVisible(modifier.dot_style == "custom")
         self.seed_button.setVisible(modifier.grid_type == "stippling")
         self.color_rows["foreground"].setVisible(modifier.color_mode == "two")
         self.swap_colors.setVisible(modifier.color_mode == "two")
@@ -554,7 +567,17 @@ class HalftoneControls(_PatternControls):
         self.gradient.setVisible(modifier.color_mode == "gradient")
         self.combos["gradient_interpolation"].parentWidget().setVisible(modifier.color_mode == "gradient")
         self.source_hint.setVisible(modifier.color_mode == "source")
+        self.target_layer_controls.setVisible(modifier.color_mode == "target_layer")
+        chapter = self.owner.canvas.chapter
+        target = (chapter.layers.get(modifier.target_layer_id) or chapter.objects.get(modifier.target_layer_id)) if chapter else None
+        self.target_layer_label.setText(target.name if target else "Selected source is unavailable" if modifier.target_layer_id else "No layer or object selected")
+        self.clear_target_layer.setEnabled(bool(modifier.target_layer_id))
         self.gradient.preview.update()
+
+    def clear_target(self):
+        self.owner.cancel_target_layer_pick()
+        self.owner.set_parameter(self.modifier.modifier_id, "target_layer_id", "", True)
+        self.owner.refresh()
 
     def swap_color_values(self):
         foreground, background = self.modifier.foreground, self.modifier.background
@@ -574,24 +597,3 @@ class HalftoneControls(_PatternControls):
             button.setStyleSheet(f"border-left: 12px solid {QColor(value).name()};")
             button.setToolTip(value)
         self._popup = choose_color(self, getattr(self.modifier, attribute), apply, attribute.title())
-
-    def set_custom_svg(self, source):
-        sanitized = sanitize_halftone_svg(source)
-        renderer = QSvgRenderer(QByteArray(sanitized.encode("utf-8")))
-        if not sanitized or not renderer.isValid() or renderer.viewBoxF().isEmpty():
-            raise ValueError("Choose an SVG with valid visible dimensions")
-        self.owner.set_parameter(self.modifier.modifier_id, "custom_svg", sanitized, True)
-        self.svg_status.setText("Custom SVG embedded")
-
-    def load_svg(self):
-        path, _ = QFileDialog.getOpenFileName(self, "Custom halftone dot", "", "SVG files (*.svg)")
-        if not path:
-            return
-        try:
-            with Path(path).open("rb") as stream:
-                data = stream.read(HALFTONE_MAX_SVG_BYTES + 1)
-            if len(data) > HALFTONE_MAX_SVG_BYTES:
-                raise ValueError("Custom SVG must be smaller than 256 KB")
-            self.set_custom_svg(data.decode("utf-8-sig"))
-        except (OSError, ValueError, UnicodeError) as error:
-            QMessageBox.warning(self, "Custom halftone dot", str(error))

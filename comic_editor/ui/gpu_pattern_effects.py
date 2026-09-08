@@ -74,14 +74,14 @@ FRAGMENT = """#version 330 core
 uniform sampler2D source;
 uniform sampler2D original;
 uniform sampler2D gradientMap;
-uniform sampler2D customMap;
+uniform sampler2D targetMap;
 uniform sampler2D intensityMap;
 uniform sampler2D triangleMap;
 uniform vec2 imageSize;
 uniform int effectType, gridType, dotStyle, colorMode;
 uniform int polygonSides, starShape, invertTone, transparentBackground, hasIntensity;
 uniform int sourceFlipped;
-uniform int trianglePass, customOriginal, evenMergeTone;
+uniform int trianglePass, hasColorSource, evenMergeTone;
 uniform float amount, pixelSize, brightness, contrast, saturation;
 uniform float spacing, rotation, dotRotation, gammaValue, clampLow, clampHigh;
 uniform float levelLow, levelHigh, dotSize, scaleFactor, starInner, cornerRound;
@@ -90,6 +90,7 @@ uniform uint seedBits;
 uniform float pointSpacing, stippleJitter, maxNecks, mergeStrength, minNeckWidth;
 uniform float collideMin, collideMax;
 uniform vec4 foregroundColor, backgroundColor;
+uniform vec3 targetHsl;
 in vec2 uv;
 in vec3 triangleBarycentric;
 flat in vec2 triangleCenter;
@@ -151,19 +152,40 @@ float dotCoverage(vec2 local,float radius) {
         }
     } else if(dotStyle==5) d=max(abs(local.y)-radius*.2,abs(local.x)-radius);
     else if(dotStyle==6) {
-        vec2 point=local/(max(radius,.001)*2)+.5;
-        if(any(lessThan(point,vec2(0))) || any(greaterThan(point,vec2(1)))) return 0;
-        return texture(customMap,point).a;
-    } else if(dotStyle==7) {
         float angle=atan(local.y,local.x);
         float wobble=1+.14*sin(angle*3+seed)+.08*cos(angle*5-seed);
         d=length(local)-radius*wobble;
-    } else if(dotStyle==9) {
+    } else if(dotStyle==8) {
         vec2 p=abs(local); d=pow(pow(p.x,4)+pow(p.y,4),.25)-radius;
     } else d=length(local)-radius;
     return 1-smoothstep(-aa*.5,aa*.5,d);
 }
-vec4 inkColor(vec4 sourceColor,float tone) {
+vec3 adjustTarget(vec3 rgb) {
+    if(all(equal(targetHsl,vec3(0)))) return rgb;
+    float maximum=max(rgb.r,max(rgb.g,rgb.b)), minimum=min(rgb.r,min(rgb.g,rgb.b));
+    float delta=maximum-minimum, lightness=(maximum+minimum)*.5;
+    float saturation=delta>.000001 ? delta/max(1-abs(2*lightness-1),.000001) : 0;
+    float hue=0;
+    if(delta>.000001) {
+        if(maximum==rgb.r) hue=mod((rgb.g-rgb.b)/delta,6)/6;
+        else if(maximum==rgb.g) hue=((rgb.b-rgb.r)/delta+2)/6;
+        else hue=((rgb.r-rgb.g)/delta+4)/6;
+    }
+    hue=fract(hue+targetHsl.x/360);
+    saturation=clamp(saturation+targetHsl.y/100,0,1);
+    lightness=clamp(lightness+targetHsl.z/100,0,1);
+    vec3 unitRgb=clamp(abs(mod(hue*6+vec3(0,4,2),6)-3)-1,0,1);
+    return lightness+saturation*min(lightness,1-lightness)*(2*unitRgb-1);
+}
+vec4 inkColor(vec4 sourceColor,float tone,vec2 samplePosition) {
+    if(colorMode==3) {
+        vec3 rgb=straight(sourceColor);
+        if(hasColorSource!=0) {
+            vec4 target=texture(targetMap,clamp(samplePosition/imageSize,vec2(0),vec2(1)));
+            if(target.a>.00001) rgb=target.rgb/target.a;
+        }
+        return vec4(adjustTarget(rgb),1);
+    }
     if(colorMode==2) return vec4(straight(sourceColor),1);
     if(colorMode==1) return texture(gradientMap,vec2(clamp(1-tone,0,1),.5));
     return foregroundColor;
@@ -182,13 +204,14 @@ void main() {
         vec2 middle=imageSize*.5;
         vec2 q=rotatePoint(p-middle,-rotation);
         float coverage=0,tone=0;
-        vec4 customColor=vec4(0);
         vec4 triangleInk=vec4(0);
         vec4 chosen=sampleAt(p);
+        vec2 chosenPoint=p;
         float joinedDistance=1e20;
         int joins=0;
         if(trianglePass!=0) {
             chosen=sampleAt(triangleCenter);
+            chosenPoint=triangleCenter;
             tone=toneAt(chosen);
             float shrink=dotSize*sqrt(max(0,mix(1,tone,scaleFactor)));
             if(shrink<=.00001 || tone<0) discard;
@@ -202,7 +225,7 @@ void main() {
                 coverage=tone<0 ? 0 : 1-smoothstep(-.5,.5,d);
             }
             if(coverage<=0) discard;
-        } else if(dotStyle==8 && gridType!=3 && gridType!=4) {
+        } else if(dotStyle==7 && gridType!=3 && gridType!=4) {
             triangleInk=texture(triangleMap,vec2(uv.x,1-uv.y));
             coverage=triangleInk.a;
         } else if(gridType==3 || gridType==4) {
@@ -212,6 +235,7 @@ void main() {
             along=floor(along/max(pointSpacing,.25)+.5)*max(pointSpacing,.25);
             vec2 center=gridType==3 ? vec2(along,band) : vec2(cos(along/max(abs(band),spacing)),sin(along/max(abs(band),spacing)))*band;
             chosen=sampleAt(rotatePoint(center,rotation)+middle);
+            chosenPoint=rotatePoint(center,rotation)+middle;
             tone=toneAt(chosen);
             float width=lineWidth*spacing*.5*mix(1,clamp(max(tone,0)*lineLevelScale,0,1),scaleFactor);
             float aa=max(fwidth(coordinate),.7);
@@ -239,35 +263,34 @@ void main() {
                 }
                 vec4 sampled=sampleAt(rotatePoint(center,rotation)+middle);
                 float t=toneAt(sampled);
-                float radius=spacing*(dotStyle==0 || dotStyle==7 ? .7071068 : .5)*dotSize*sqrt(max(0,mix(1,t,scaleFactor)));
+                float radius=spacing*(dotStyle==0 || dotStyle==6 ? .7071068 : .5)*dotSize*sqrt(max(0,mix(1,t,scaleFactor)));
                 float mark=t<0 || radius<.00001 ? 0 : dotCoverage(q-center,radius);
-                if((dotStyle==7 || dotStyle==9) && t>=0 && radius>.00001) {
+                if((dotStyle==6 || dotStyle==8) && t>=0 && radius>.00001) {
                     vec2 local=rotatePoint(q-center,-dotRotation);
                     float d=length(local)-radius;
                     float smoothing=spacing*.18*mergeStrength*minNeckWidth;
-                    if(dotStyle==9) {
+                    if(dotStyle==8) {
                         if(evenMergeTone!=0) radius=spacing*.5*dotSize*sqrt(max(0,mix(1,toneAt(sampleAt(p)),scaleFactor)));
                         vec2 rounded=abs(local)-radius*(1-cornerRound);
                         d=length(max(rounded,vec2(0)))+min(max(rounded.x,rounded.y),0)-radius*cornerRound;
                         smoothing=spacing*.15*cornerRound;
                     }
-                    bool merge=dotStyle==9 || joins<int(maxNecks);
+                    bool merge=dotStyle==8 || joins<int(maxNecks);
                     joinedDistance=merge ? smoothUnion(joinedDistance,d,smoothing) : min(joinedDistance,d);
                     if(d<spacing*.5) joins++;
                 }
                 if(mark>coverage) {
                     coverage=mark; chosen=sampled; tone=max(t,0);
-                    if(dotStyle==6 && customOriginal!=0) customColor=texture(customMap,rotatePoint(q-center,-dotRotation)/(max(radius,.001)*2)+.5);
+                    chosenPoint=rotatePoint(center,rotation)+middle;
                 }
             }
-            if(dotStyle==7 || dotStyle==9) {
+            if(dotStyle==6 || dotStyle==8) {
                 float aa=max(fwidth(joinedDistance),.7);
                 coverage=1-smoothstep(-aa*.5,aa*.5,joinedDistance);
             }
         }
-        vec4 ink=inkColor(chosen,tone);
-        if(dotStyle==8 && trianglePass==0 && gridType!=3 && gridType!=4) ink=triangleInk.a>.00001 ? vec4(triangleInk.rgb/triangleInk.a,1) : vec4(0);
-        if(dotStyle==6 && customOriginal!=0 && customColor.a>.00001) ink=vec4(customColor.rgb/customColor.a,1);
+        vec4 ink=inkColor(chosen,tone,chosenPoint);
+        if(dotStyle==7 && trianglePass==0 && gridType!=3 && gridType!=4) ink=triangleInk.a>.00001 ? vec4(triangleInk.rgb/triangleInk.a,1) : vec4(0);
         vec4 bg=transparentBackground!=0 ? vec4(0) : backgroundColor;
         ink.rgb*=ink.a; bg.rgb*=bg.a;
         if(trianglePass!=0) { color=ink*coverage; return; }
@@ -288,12 +311,13 @@ class GpuPatternRenderer:
         self.reason = ""
         self.context = self.surface = self.functions = None
         self.program = self.blur_program = self.triangle_program = self.vao = self.buffer = self.triangle_buffer = None
-        self.source = self.gradient = self.stamp = self.mask = None
+        self.source = self.gradient = self.color_source_texture = self.mask = None
         self.output = self.blur_x = self.blur_y = self.triangle_output = None
-        self.source_key = self.blur_key = self.gradient_key = self.stamp_key = None
+        self.source_key = self.blur_key = self.gradient_key = self.color_source_key = None
         self.triangle_key = None
         self.triangle_count = 0
         self.uploads = self.draws = self.blur_draws = 0
+        self.color_uploads = 0
         if QGuiApplication.instance() is None:
             self.reason = "No Qt application"
             return
@@ -381,6 +405,8 @@ class GpuPatternRenderer:
         elif isinstance(value, (tuple, list)):
             if len(value) == 2:
                 gl.glUniform2f(location, *map(float, value))
+            elif len(value) == 3:
+                gl.glUniform3f(location, *map(float, value))
             elif len(value) == 4:
                 gl.glUniform4f(location, *map(float, value))
         else:
@@ -448,12 +474,16 @@ class GpuPatternRenderer:
             self.blur_draws += 2
         return int(self.blur_y.texture())
 
-    def render(self, image, modifier, scale=1., *, intensity_mask=None, parameter_fields=None):
+    def render(self, image, modifier, scale=1., *, intensity_mask=None, parameter_fields=None,
+               color_source: QImage | None = None):
         """Return a filtered QImage, or None when a safe CPU fallback is needed.
 
         ``intensity_mask`` is already mapped to 0..1. Spatial masks for other
         controls currently use the CPU fallback rather than silently ignoring
-        them. No GL objects are accessed from effect-worker threads.
+        them. ``color_source`` is an aligned image used only for target-layer
+        ink colors. Missing/transparent samples retain incoming source colors;
+        the owner's image continues to determine every mark and its alpha.
+        No GL objects are accessed from effect-worker threads.
         """
         if not self.available or image.isNull():
             return None
@@ -477,14 +507,26 @@ class GpuPatternRenderer:
                 self.blur_key = None
                 self.uploads += 1
             is_pixel = type(modifier).__name__ == "PixelateModifier"
+            has_color_source = (not is_pixel and getattr(modifier,"color_mode","") == "target_layer"
+                                and color_source is not None and not color_source.isNull()
+                                and color_source.size() == image.size())
             edge = {"short": min(width,height), "long": max(width,height), "width": width, "height": height}.get(getattr(modifier,"fit_mode","short"),min(width,height))
             unit = max(.0001, float(scale)) if is_pixel else edge/max(1.,float(getattr(modifier,"base_resolution",1000)))
             source = self._filtered_source(image, float(getattr(modifier,"blur",0))*unit)
             self.output = self._framebuffer(self.output, width, height)
             textures = {"source": source, "original": self.source}
+            if has_color_source:
+                if self.color_source_key != int(color_source.cacheKey()):
+                    if self.color_source_texture:
+                        self.color_source_texture.destroy()
+                    self.color_source_texture = self._texture(self._pixels(color_source))
+                    self.color_source_key = int(color_source.cacheKey())
+                    self.color_uploads += 1
+                textures["targetMap"] = self.color_source_texture
             uniforms = {"effectType": int(is_pixel), "imageSize": (width,height),
                         "sourceFlipped": int(isinstance(source,int)),
                         "trianglePass": 0,
+                        "hasColorSource": int(has_color_source),
                         "amount": float(getattr(modifier,"intensity",100))/100,
                         "hasIntensity": int(intensity_mask is not None),
                         "pixelSize": max(1.,float(getattr(modifier,"pixel_size",8))*unit),
@@ -542,8 +584,9 @@ class GpuPatternRenderer:
         dot_angle = 0. if value("link_rotation",True) else float(value("dot_rotation",0))-angle
         uniforms.update({
             "gridType": {"square":0,"hexagonal":1,"radial":2,"line":3,"ring":4,"stippling":5}.get(value("grid_type","square"),0),
-            "dotStyle": {"circle":0,"incircle":1,"triangle":2,"square":3,"polygon":4,"line":5,"custom":6,"blob":7,"delaunay":8,"liquid":9}.get(value("dot_style","circle"),0),
-            "colorMode": {"two":0,"gradient":1,"source":2}.get(value("color_mode","two"),0),
+            "dotStyle": {"circle":0,"incircle":1,"triangle":2,"square":3,"polygon":4,"line":5,"blob":6,"delaunay":7,"liquid":8}.get(value("dot_style","circle"),0),
+            "colorMode": {"two":0,"gradient":1,"source":2,"target_layer":3}.get(value("color_mode","two"),0),
+            "targetHsl": (float(value("target_hue",0)),float(value("target_saturation",0)),float(value("target_lightness",0))),
             "spacing": max(.5,float(value("spacing",10))*unit),
             "rotation": math.radians(angle), "dotRotation": math.radians(dot_angle),
             "gammaValue": float(value("gamma",1)), "clampLow": float(value("clamp_min",0)),
@@ -558,7 +601,6 @@ class GpuPatternRenderer:
             "collideMin": float(value("collide_min",.25)), "collideMax": float(value("collide_max",1)),
             "maxNecks": float(value("max_necks",4)), "mergeStrength": float(value("merge_strength",1)),
             "minNeckWidth": float(value("min_neck_width",.5)), "evenMergeTone": bool(value("even_merge_tone",False)),
-            "customOriginal": value("custom_render_mode","silhouette") == "original",
             "seed": float(value("stipple_seed",0)),
             "seedBits": int(value("stipple_seed",0)),
             "foregroundColor": QColor(value("foreground","#FF000000")).getRgbF(),
@@ -578,19 +620,6 @@ class GpuPatternRenderer:
                 self.gradient = self._texture(pixels.reshape(1,-1,4))
                 self.gradient_key = gradient_key
             textures["gradientMap"] = self.gradient
-        if value("dot_style","circle") == "custom":
-            svg = value("custom_svg","")
-            if self.stamp_key != svg:
-                from comic_editor.ui.pattern_rendering import custom_stamp
-                stamp = custom_stamp(svg)
-                if stamp is None or stamp.isNull():
-                    raise ValueError("Custom SVG has no drawable shape")
-                if self.stamp:
-                    self.stamp.destroy()
-                self.stamp = self._texture(self._pixels(stamp))
-                self.stamp_key = svg
-            textures["customMap"] = self.stamp
-
     def close(self):
         self.available = False
         if self.context is None or self.surface is None:
@@ -598,7 +627,7 @@ class GpuPatternRenderer:
         previous = QOpenGLContext.currentContext()
         previous_surface = previous.surface() if previous else None
         if self.context.makeCurrent(self.surface):
-            for texture in (self.source,self.gradient,self.stamp,self.mask):
+            for texture in (self.source,self.gradient,self.color_source_texture,self.mask):
                 if texture:
                     texture.destroy()
             if self.buffer:
@@ -607,7 +636,7 @@ class GpuPatternRenderer:
                 self.triangle_buffer.destroy()
             if self.vao:
                 self.vao.destroy()
-            self.source = self.gradient = self.stamp = self.mask = None
+            self.source = self.gradient = self.color_source_texture = self.mask = None
             self.output = self.blur_x = self.blur_y = self.triangle_output = None
             self.program = self.blur_program = self.triangle_program = self.buffer = self.triangle_buffer = self.vao = None
             self.triangle_key = None

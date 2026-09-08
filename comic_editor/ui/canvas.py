@@ -1206,6 +1206,9 @@ class _CanvasLogic(MaskSelectionFeatures, MaskGradientFeatures, TilingFeatures, 
         obj = self.chapter.objects.get(object_id)
         if obj is None:
             return QRectF(world)
+        from comic_editor.ui.halftone_source import references_entity
+        if references_entity(self, "object", object_id):
+            return QRectF(0, 0, self.chapter.width, self.chapter.height).united(world)
         if self._object_is_mask_contributor(object_id):
             return QRectF(
                 0, 0, self.chapter.width, self.chapter.height
@@ -1245,6 +1248,9 @@ class _CanvasLogic(MaskSelectionFeatures, MaskGradientFeatures, TilingFeatures, 
         """Conservatively include effects and mask dependants for a subtree."""
         if self.chapter is None or world.isEmpty():
             return QRectF(world)
+        from comic_editor.ui.halftone_source import references_entity
+        if references_entity(self, kind, entity_id):
+            return QRectF(0, 0, self.chapter.width, self.chapter.height).united(world)
         targets: list[LayerNode | DocumentObject] = []
 
         def collect_layer(layer_id: str) -> None:
@@ -6045,6 +6051,32 @@ class _CanvasLogic(MaskSelectionFeatures, MaskGradientFeatures, TilingFeatures, 
             scalar, coverage, obj.ramp, bounds, scalar_key
         )
 
+    def _color_gradient_local_bounds(self, obj: ColorFillGradientObject) -> QRectF:
+        """Full painted frame, independent of the gradient's control handles."""
+        bounds = self.layer_effective_path(obj.parent_layer_id).boundingRect()
+        if obj.field_type == "parent_shape" and obj.shape_field.reverse_direction:
+            distance = obj.shape_field.distance
+            return bounds.adjusted(-distance, -distance, distance, distance)
+        if obj.field_type == "radial":
+            field = obj.radial_field
+            if field.reverse_direction:
+                radius_y = field.radius_y if field.ellipse_enabled else field.radius_x
+                radius = math.hypot(field.radius_x + field.distance, radius_y + field.distance)
+                return QRectF(field.origin_x - radius, field.origin_y - radius, radius * 2, radius * 2)
+            if field.uniform:
+                return self._radial_boundary_path(field).boundingRect()
+            if obj.ignore_parent_mask:
+                # A padded radial field can fill beyond its direct parent.
+                # Capture its containing page so adding an effect does not
+                # replace that field with a rectangle around the handles.
+                page = self.chapter.page_for_layer(obj.parent_layer_id)
+                inverse, valid = self.layer_world_transform(obj.parent_layer_id).inverted()
+                if valid:
+                    bounds = bounds.united(inverse.mapRect(
+                        self.layer_world_transform(page.layer_id).mapRect(
+                            self.layer_effective_path(page.layer_id).boundingRect())))
+        return bounds
+
     def _render_color_gradient(
         self, painter: QPainter, obj: ColorFillGradientObject,
         local_visible: QRectF,
@@ -7184,6 +7216,9 @@ class _CanvasLogic(MaskSelectionFeatures, MaskGradientFeatures, TilingFeatures, 
 
     def _modifier_parameter_signature(self, ids: Iterable[str]) -> tuple[str, ...]:
         result: list[str] = []
+        capturing_colors = getattr(self, "_rendering_halftone_source", False)
+        if capturing_colors:
+            result.append("halftone-color-source")
         mask_ids: set[str] = set()
         for item in ids:
             modifier = self.chapter.modifiers.get(item)
@@ -7192,6 +7227,10 @@ class _CanvasLogic(MaskSelectionFeatures, MaskGradientFeatures, TilingFeatures, 
             result.append(json.dumps(
                 modifier.to_dict(), sort_keys=True, separators=(",", ":"),
             ))
+            if (isinstance(modifier, HalftoneModifier)
+                    and modifier.color_mode == "target_layer" and not capturing_colors):
+                from comic_editor.ui.halftone_source import source_signature
+                result.append(repr(source_signature(self, modifier.target_layer_id)))
             mask_ids.update(
                 binding.mask_id
                 for binding in modifier.parameter_masks.values()
@@ -7212,6 +7251,16 @@ class _CanvasLogic(MaskSelectionFeatures, MaskGradientFeatures, TilingFeatures, 
         if mask_id in _stack:
             return (mask_id, "cycle")
         stack = _stack | {mask_id}
+        capturing_colors = getattr(self, "_rendering_halftone_source", False)
+
+        def modifier_signature(modifier):
+            source = ()
+            if (isinstance(modifier, HalftoneModifier)
+                    and modifier.color_mode == "target_layer" and not capturing_colors):
+                from comic_editor.ui.halftone_source import source_signature
+                source = source_signature(self, modifier.target_layer_id)
+            return (json.dumps(modifier.to_dict(), sort_keys=True,
+                               separators=(",", ":")), source)
 
         def entity_signature(kind: str, entity_id: str) -> tuple:
             entity = self.chapter.mask_contributor(kind, entity_id)
@@ -7257,10 +7306,7 @@ class _CanvasLogic(MaskSelectionFeatures, MaskGradientFeatures, TilingFeatures, 
                 (
                     json.dumps(layer.to_dict(), sort_keys=True),
                     tuple(
-                        json.dumps(
-                            modifier.to_dict(), sort_keys=True,
-                            separators=(",", ":"),
-                        )
+                        modifier_signature(modifier)
                         for modifier in self._active_modifier_instances(
                             layer.modifier_ids
                         )
@@ -7283,10 +7329,7 @@ class _CanvasLogic(MaskSelectionFeatures, MaskGradientFeatures, TilingFeatures, 
                 kind, entity_id,
                 json.dumps(entity.to_dict(), sort_keys=True),
                 tuple(
-                    json.dumps(
-                        modifier.to_dict(), sort_keys=True,
-                        separators=(",", ":"),
-                    )
+                    modifier_signature(modifier)
                     for modifier in entity_modifiers
                 ),
                 pixels, children, ancestors,
@@ -7306,6 +7349,7 @@ class _CanvasLogic(MaskSelectionFeatures, MaskGradientFeatures, TilingFeatures, 
         return (
             json.dumps(mask.to_dict(), sort_keys=True), paint,
             tuple(entity_signature(*item) for item in mask.contributors),
+            capturing_colors,
         )
 
     def _ancestor_mask_path(
@@ -7568,6 +7612,11 @@ class _CanvasLogic(MaskSelectionFeatures, MaskGradientFeatures, TilingFeatures, 
             ))
         elif isinstance(obj, ImageObject):
             pixels = (int(self.images.image(obj.object_id).cacheKey()),)
+        elif isinstance(obj, ColorFillGradientObject):
+            # Shape gradients and line-field coverage also depend on the
+            # effective parent shape, including edits with unchanged bounds.
+            pixels = ("gradient-parent", self._gradient_path_signature(
+                self.layer_effective_path(obj.parent_layer_id)))
         live = ()
         if obj.object_id == self.selected_object_id:
             selection_preview = ()
@@ -7711,6 +7760,9 @@ class _CanvasLogic(MaskSelectionFeatures, MaskGradientFeatures, TilingFeatures, 
             ),
         )
         world_bounds = self.object_world_rect(obj.object_id)
+        if isinstance(obj, ColorFillGradientObject):
+            world_bounds = self.layer_world_transform(obj.parent_layer_id).mapRect(
+                self._color_gradient_local_bounds(obj))
         if isinstance(obj, RasterObject):
             preview_bounds = self._raster_selection_preview_world_bounds(obj)
             if preview_bounds is not None:
@@ -7856,7 +7908,12 @@ class _CanvasLogic(MaskSelectionFeatures, MaskGradientFeatures, TilingFeatures, 
         )
         if includes_preview and preview_bounds is not None:
             world = world.united(self._drawing_local_to_world_transform(drawing).mapRect(preview_bounds))
-        bounds = aligned(inverse.mapRect(world))
+        # Gradient handles may describe a zero-height line or a small ellipse.
+        # Sample the full painted field in local coordinates so its halftone
+        # grid stays stable through parent transforms and viewport cropping.
+        bounds = (aligned(self._color_gradient_local_bounds(target))
+                  if isinstance(target, ColorFillGradientObject)
+                  else aligned(inverse.mapRect(world)))
         signature = self._modifier_layer_signature(identifier) if layer else self._modifier_object_signature(target)
         key = ("mirror-source", kind, identifier, signature[0], signature[3], signature[4], self._rect_signature(bounds), tuple(self._transform_preview_quad or ()), self._render_exclude_text)
         if layer and scoped(self, target):
@@ -7912,7 +7969,12 @@ class _CanvasLogic(MaskSelectionFeatures, MaskGradientFeatures, TilingFeatures, 
             from comic_editor.ui.stroke_rendering import render_stroke_stack
             image, bounds = render_stroke_stack(self, target, image, bounds, modifiers, mapping, key, request_scope)
         else:
-            image, bounds = render_stages(self, image, bounds, modifiers, mapping, nearest=isinstance(target, RasterObject), required=inverse.mapRect(visible) if layer else visible, request_scope=request_scope)
+            # Keep the cached gradient output intact. Cropping its image before
+            # a projective parent transform changes Qt's edge resampling as the
+            # viewport moves; the destination painter already clips the view.
+            required = (None if isinstance(target, ColorFillGradientObject)
+                        else inverse.mapRect(visible) if layer else visible)
+            image, bounds = render_stages(self, image, bounds, modifiers, mapping, nearest=isinstance(target, RasterObject), required=required, request_scope=request_scope)
         if target.opacity_mask is not None:
             binding = target.opacity_mask
             field = self.render_tone_mask_field(binding.mask_id, image.width(), image.height(), self._world_to_image_transform(mapping, bounds, image.width(), image.height()), mapping.mapRect(bounds))
@@ -8540,7 +8602,8 @@ class _CanvasLogic(MaskSelectionFeatures, MaskGradientFeatures, TilingFeatures, 
 
     def _render_image_object(self, painter: QPainter, obj: ImageObject) -> None:
         image = self.images.image(obj.object_id)
-        if image.isNull() and not obj.is_blender_linked:
+        if image.isNull() and (not obj.is_blender_linked
+                or getattr(self, "_rendering_halftone_source", False)):
             return
         source = QRectF(0, 0, obj.pixel_width, obj.pixel_height)
         destination = self._image_local_quad(obj)

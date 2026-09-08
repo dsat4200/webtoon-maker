@@ -5,7 +5,6 @@ import copy
 import math
 import uuid
 from dataclasses import dataclass, field, fields
-from functools import lru_cache
 from typing import Any, Iterable, Iterator, Literal
 from comic_editor.core.cage import CageGrid
 
@@ -1217,50 +1216,8 @@ class PosterizeValueModifier(PosterizeModifier):
 
 HALFTONE_GRIDS = ("square", "hexagonal", "radial", "line", "ring", "stippling")
 HALFTONE_DOT_STYLES = ("circle", "incircle", "triangle", "square", "polygon", "line",
-                       "custom", "blob", "delaunay", "liquid")
+                       "blob", "delaunay", "liquid")
 HALFTONE_MAX_GRADIENT_STOPS = 32
-HALFTONE_MAX_SVG_BYTES = 256 * 1024
-
-
-@lru_cache(maxsize=32)
-def sanitize_halftone_svg(source: str) -> str:
-    """Embed a bounded, static SVG without files, network references or scripts."""
-    import re
-    import xml.etree.ElementTree as ET
-
-    source = str(source or "")
-    if not source.strip():
-        return ""
-    if len(source.encode("utf-8")) > HALFTONE_MAX_SVG_BYTES:
-        raise ValueError("Custom SVG must be smaller than 256 KB")
-    if re.search(r"<!\s*(DOCTYPE|ENTITY)", source, re.I):
-        raise ValueError("Custom SVG cannot include document types or entities")
-    try:
-        root = ET.fromstring(source)
-    except ET.ParseError as error:
-        raise ValueError("Custom dot must be a valid SVG") from error
-    local = lambda value: value.rsplit("}", 1)[-1]
-    if local(root.tag) != "svg":
-        raise ValueError("Custom dot must have an SVG root")
-    allowed = {"svg", "g", "defs", "path", "rect", "circle", "ellipse", "line",
-               "polyline", "polygon", "use", "clipPath", "mask", "linearGradient",
-               "radialGradient", "stop", "title", "desc"}
-    nodes = list(root.iter())
-    if len(nodes) > 4096:
-        raise ValueError("Custom SVG has too many shapes")
-    for parent in nodes:
-        for child in list(parent):
-            if local(child.tag) not in allowed:
-                parent.remove(child)
-        for key, value in list(parent.attrib.items()):
-            attribute = local(key).lower()
-            urls = re.findall(r"url\s*\(\s*['\"]?([^)'\"\s]+)", value, re.I)
-            if (attribute.startswith("on") or attribute in {"base", "src"}
-                    or attribute == "href" and not value.startswith("#")
-                    or any(not url.startswith("#") for url in urls)
-                    or "@import" in value.lower()):
-                del parent.attrib[key]
-    return ET.tostring(root, encoding="unicode")
 
 
 @dataclass
@@ -1325,13 +1282,15 @@ class HalftoneModifier(_PatternModifier):
     star_inner: float = 0.5
     corner_rounding: float = 0.0
     color_mode: str = "two"
+    target_layer_id: str = ""
+    target_hue: float = 0.0
+    target_saturation: float = 0.0
+    target_lightness: float = 0.0
     foreground: str = "#FF000000"
     background: str = "#FFFFFFFF"
     transparent_background: bool = False
     gradient_stops: list = field(default_factory=lambda: [[0., "#FF000000"], [1., "#FFFFFFFF"]])
     gradient_interpolation: str = "rgb"
-    custom_svg: str = ""
-    custom_render_mode: str = "silhouette"
     stipple_seed: int = 0
     point_spacing: float = 5.0
     line_width: float = 1.0
@@ -1355,14 +1314,15 @@ class HalftoneModifier(_PatternModifier):
                 "point_spacing": (1., 100.), "line_width": (0., 3.), "line_level_scale": (0., 3.),
                 "smoothing_iterations": (0., 200.), "collide_min": (0., 2.), "collide_max": (0., 2.),
                 "max_edge_length": (1., 100.), "max_necks": (0., 12.),
-                "merge_strength": (0., 3.), "min_neck_width": (0., 1.)}
+                "merge_strength": (0., 3.), "min_neck_width": (0., 1.),
+                "target_hue": (-180., 180.), "target_saturation": (-100., 100.),
+                "target_lightness": (-100., 100.)}
 
     def validate(self):
         super().validate()
         for attribute, choices in (("grid_type", HALFTONE_GRIDS),
                 ("fit_mode", ("short", "long", "width", "height")),
-                ("dot_style", HALFTONE_DOT_STYLES), ("color_mode", ("two", "gradient", "source")),
-                ("custom_render_mode", ("silhouette", "original")),
+                ("dot_style", HALFTONE_DOT_STYLES), ("color_mode", ("two", "gradient", "source", "target_layer")),
                 ("gradient_interpolation", ("rgb", "oklch"))):
             if getattr(self, attribute) not in choices:
                 raise ValueError(f"Unknown halftone {attribute.replace('_', ' ')}")
@@ -1386,7 +1346,7 @@ class HalftoneModifier(_PatternModifier):
                 raise ValueError("Halftone gradient positions must be finite")
             stops.append([max(0., min(1., position)), canonical_argb(stop[1])])
         self.gradient_stops = sorted(stops, key=lambda stop: stop[0])
-        self.custom_svg = sanitize_halftone_svg(self.custom_svg)
+        self.target_layer_id = str(self.target_layer_id or "")
         seed = float(self.stipple_seed)
         if not math.isfinite(seed):
             raise ValueError("Stippling seed must be finite")
@@ -1570,6 +1530,8 @@ def modifier_from_dict(data: dict[str, Any]) -> ModifierInstance:
         defaults = factory().to_dict()
         values = {key: data.get(key, value) for key, value in defaults.items()
                   if key not in {"id", "type", "name", "intensity", "expanded", "muted", "parameter_masks"}}
+        if modifier_type == "halftone" and values.get("dot_style") == "custom":
+            values["dot_style"] = "circle"
         result = factory(**common, **values)
     elif modifier_type == "array":
         result = ArrayModifier(
@@ -3233,6 +3195,7 @@ class ChapterDocument:
     layers: dict[str, LayerNode] = field(default_factory=dict)
     objects: dict[str, ObjectEntity] = field(default_factory=dict)
     modifiers: dict[str, ModifierInstance] = field(default_factory=dict)
+    modifier_preset_ids: dict[str, str] = field(default_factory=dict)
     masks: dict[str, ToneMask] = field(default_factory=dict)
     document_kind: Literal["chapter", "asset", "image"] = "chapter"
     external_image_path: str = ""
@@ -3391,7 +3354,10 @@ class ChapterDocument:
                 str(item) for item in obj.modifier_ids
                 if str(item) in self.modifiers
             ))
-            if not isinstance(
+            if isinstance(obj, ColorFillGradientObject):
+                obj.modifier_ids = [mid for mid in obj.modifier_ids
+                                    if isinstance(self.modifiers[mid], (PosterizeModifier, HalftoneModifier))]
+            elif not isinstance(
                 obj, (RasterObject, VectorDrawingObject, ImageObject)
             ):
                 obj.modifier_ids.clear()
@@ -3550,12 +3516,24 @@ class ChapterDocument:
             for modifier_id, modifier in self.modifiers.items()
             if modifier_id in referenced_modifiers
         }
+        self._validate_modifier_preset_ids()
         referenced_masks = self.referenced_mask_ids()
         self.masks = {
             mask_id: mask for mask_id, mask in self.masks.items()
             if mask.saved or mask_id in referenced_masks
         }
         self._assert_acyclic()
+
+    def _validate_modifier_preset_ids(self) -> None:
+        if not isinstance(self.modifier_preset_ids, dict):
+            raise ValueError("Modifier preset associations must be an object")
+        if any(not isinstance(key, str) or not isinstance(value, str)
+               for key, value in self.modifier_preset_ids.items()):
+            raise ValueError("Modifier preset associations require string IDs")
+        self.modifier_preset_ids = {
+            key: value for key, value in self.modifier_preset_ids.items()
+            if key in self.modifiers and value
+        }
 
     def _assert_mask_dependencies_acyclic(self) -> None:
         """Reject masks that recursively require their own rendered target."""
@@ -3685,7 +3663,7 @@ class ChapterDocument:
             return None
         obj = self.objects.get(entity_id)
         return obj if isinstance(
-            obj, (RasterObject, VectorDrawingObject, ImageObject)
+            obj, (RasterObject, VectorDrawingObject, ImageObject, ColorFillGradientObject)
         ) else None
 
     def add_modifier(
@@ -3736,6 +3714,7 @@ class ChapterDocument:
                     target.modifier_ids.append(modifier_id)
         if not desired:
             self.modifiers.pop(modifier_id, None)
+            self.modifier_preset_ids.pop(modifier_id, None)
 
     def incompatible_modifier_targets(self, modifier, targets):
         targets = list(targets)
@@ -3756,6 +3735,8 @@ class ChapterDocument:
                             for other in self.modifier_target_ids(mid)]
                 compatible = compatible and not any(self._tiling_related(ref, other)
                     for other in occupied + [other for other in targets if other != ref])
+            if isinstance(target, ColorFillGradientObject):
+                compatible = compatible and isinstance(modifier, (PosterizeModifier, HalftoneModifier))
             if not compatible:
                 result.append(ref)
         return result
@@ -3772,6 +3753,10 @@ class ChapterDocument:
             message += " Use the Cage Transform tool to transform raster and vector drawings. Select only drawings, or only images and shapes."
         if isinstance(modifier, TilingModifier):
             message += " Tiling requires a drawing, image, or non-page shape, with only one tiling setup per hierarchy branch (including muted setups)."
+        if not isinstance(modifier, (PosterizeModifier, HalftoneModifier)) and any(
+                kind == "object" and isinstance(self.objects.get(identifier), ColorFillGradientObject)
+                for kind, identifier in targets):
+            message += " Color gradients support Posterize, Posterize Value, and Halftone."
         return message
 
     def stroke_modifier_target(self, kind, identifier):
@@ -3819,6 +3804,7 @@ class ChapterDocument:
                 item for item in obj.modifier_ids if item != modifier_id
             ]
         self.modifiers.pop(modifier_id, None)
+        self.modifier_preset_ids.pop(modifier_id, None)
         self.garbage_collect_masks()
 
     def _assert_acyclic(self) -> None:
@@ -4282,6 +4268,7 @@ class ChapterDocument:
         }
         for modifier_id in candidates - referenced:
             self.modifiers.pop(modifier_id, None)
+            self.modifier_preset_ids.pop(modifier_id, None)
         self.garbage_collect_masks()
 
     def layer_world_translation(self, layer_id: str) -> tuple[float, float]:
@@ -4416,6 +4403,7 @@ class ChapterDocument:
             raise ValueError(
                 "Legacy fills must be materialized before this document can be saved"
             )
+        self._validate_modifier_preset_ids()
         return {
             "schema_version": self.schema_version, "id": self.chapter_id,
             "name": self.name, "size": [self.width, self.height],
@@ -4429,6 +4417,7 @@ class ChapterDocument:
             "modifiers": [
                 modifier.to_dict() for modifier in self.modifiers.values()
             ],
+            "modifier_preset_ids": dict(self.modifier_preset_ids),
             "masks": [mask.to_dict() for mask in self.masks.values()],
         }
 
@@ -4521,6 +4510,7 @@ class ChapterDocument:
                     if isinstance(raw, dict)
                 )
             },
+            modifier_preset_ids=copy.deepcopy(data.get("modifier_preset_ids", {})),
             masks={
                 item.mask_id: item
                 for item in (
@@ -4687,6 +4677,40 @@ def default_color_palette() -> ColorPalette:
 
 
 @dataclass
+class ModifierPreset:
+    """Series-owned named settings for exactly one modifier kind."""
+
+    preset_id: str = field(default_factory=new_id)
+    name: str = "Preset"
+    modifier_type: str = "blur"
+    settings: dict[str, Any] = field(default_factory=dict)
+
+    def validate(self) -> None:
+        from comic_editor.core.modifier_presets import validate_modifier_preset_settings
+        if not isinstance(self.preset_id, str) or not self.preset_id.strip():
+            raise ValueError("Modifier preset requires an ID")
+        if not isinstance(self.name, str) or not self.name.strip():
+            raise ValueError("Modifier preset requires a name")
+        self.name = self.name.strip()
+        self.settings = validate_modifier_preset_settings(self.modifier_type, self.settings)
+
+    def to_dict(self) -> dict[str, Any]:
+        self.validate()
+        return {"id": self.preset_id, "name": self.name,
+                "modifier_type": self.modifier_type, "settings": copy.deepcopy(self.settings)}
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "ModifierPreset":
+        if not isinstance(data, dict):
+            raise ValueError("Modifier preset must be an object")
+        result = cls(preset_id=data.get("id") or new_id(), name=data.get("name", "Preset"),
+                     modifier_type=data.get("modifier_type", ""),
+                     settings=copy.deepcopy(data.get("settings", {})))
+        result.validate()
+        return result
+
+
+@dataclass
 class SeriesDocument:
     series_id: str = field(default_factory=new_id)
     name: str = "Untitled Series"
@@ -4701,6 +4725,7 @@ class SeriesDocument:
     gradient_ramp_presets: list[ColorGradientRampPreset] = field(
         default_factory=lambda: [default_gradient_ramp_preset()]
     )
+    modifier_presets: list[ModifierPreset] = field(default_factory=list)
     schema_version: int = SERIES_SCHEMA_VERSION
 
     def validate(self) -> None:
@@ -4738,6 +4763,16 @@ class SeriesDocument:
                 preset.preset_id = new_id()
             preset_ids.add(preset.preset_id)
             preset.validate()
+        if not isinstance(self.modifier_presets, list):
+            raise ValueError("Series modifier presets must be a list")
+        modifier_preset_ids: set[str] = set()
+        for preset in self.modifier_presets:
+            if not isinstance(preset, ModifierPreset):
+                raise ValueError("Series modifier presets must contain modifier presets")
+            preset.validate()
+            if preset.preset_id in modifier_preset_ids:
+                raise ValueError("Modifier presets require unique IDs")
+            modifier_preset_ids.add(preset.preset_id)
 
     def to_dict(self) -> dict[str, Any]:
         self.validate()
@@ -4752,6 +4787,7 @@ class SeriesDocument:
             "gradient_ramp_presets": [
                 preset.to_dict() for preset in self.gradient_ramp_presets
             ],
+            "modifier_presets": [preset.to_dict() for preset in self.modifier_presets],
         }
 
     @classmethod
@@ -4773,6 +4809,9 @@ class SeriesDocument:
             ColorGradientRampPreset.from_dict(item)
             for item in data.get("gradient_ramp_presets", [])
         ]
+        raw_modifier_presets = data.get("modifier_presets", [])
+        if not isinstance(raw_modifier_presets, list):
+            raise ValueError("Series modifier presets must be a list")
         result = cls(
             series_id=str(data["id"]), name=str(data.get("name", "Untitled Series")),
             chapters=[
@@ -4788,6 +4827,7 @@ class SeriesDocument:
                 gradient_presets
                 or [default_gradient_ramp_preset(primary, secondary)]
             ),
+            modifier_presets=[ModifierPreset.from_dict(item) for item in raw_modifier_presets],
             schema_version=SERIES_SCHEMA_VERSION,
         )
         result.validate()

@@ -64,10 +64,17 @@ def render_stages(canvas, image, bounds, modifiers, local_to_world, *, nearest=F
         if target.isEmpty():
             image, bounds = empty_image(QRectF(0, 0, 1, 1)), target
             continue
+        color_signature = ()
+        if isinstance(modifier, HalftoneModifier) and modifier.color_mode == "target_layer":
+            if getattr(canvas, "_rendering_halftone_source", False):
+                color_signature = ("incoming-colors",)
+            else:
+                from comic_editor.ui.halftone_source import source_signature
+                color_signature = source_signature(canvas, modifier.target_layer_id)
         key = ("stage", int(image.cacheKey()), canvas._rect_signature(bounds),
                canvas._rect_signature(target),
                repr(modifier.to_dict()), canvas._modifier_parameter_signature([modifier.modifier_id]),
-               tuple(local_to_world.map(bounds.topLeft()).toTuple()), nearest,
+               tuple(local_to_world.map(bounds.topLeft()).toTuple()), nearest, color_signature,
                tuple(getattr(local_to_world, f"m{i}{j}")() for i in range(1, 4) for j in range(1, 4)))
         cached = canvas._modifier_cache_get(key)
         if cached is None:
@@ -86,7 +93,11 @@ def render_stages(canvas, image, bounds, modifiers, local_to_world, *, nearest=F
             if pattern:
                 from comic_editor.ui.gpu_pattern_effects import renderer_for
                 from comic_editor.ui.modifier_rendering import apply_pattern_modifier
-                cached = apply_pattern_modifier(source, modifier, fields, renderer_for(canvas))
+                from comic_editor.ui.halftone_source import render_color_source
+                color_source = (render_color_source(canvas, modifier, source, work_target, local_to_world)
+                                if isinstance(modifier, HalftoneModifier) else None)
+                cached = apply_pattern_modifier(source, modifier, fields, renderer_for(canvas),
+                                                color_source=color_source)
                 if work_target != target:
                     cropped = QRectF(target)
                     cropped.translate(-work_target.topLeft())
