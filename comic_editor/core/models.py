@@ -678,6 +678,11 @@ class ToneMask:
     saved: bool = False
     contributors: list[tuple[str, str]] = field(default_factory=list)
     revision: int = 0
+    # Owned by this mask, outside the drawable hierarchy. Coordinates are
+    # chapter-local, just like the mask's painted tiles.
+    gradient: ColorFillGradientObject | None = None
+    # Signed paint keeps cutouts editable without baking linked mask sources.
+    paint_has_subtractions: bool = False
 
     def validate(self) -> None:
         self.mask_id = str(self.mask_id)
@@ -685,6 +690,7 @@ class ToneMask:
             raise ValueError("Tone mask requires an ID")
         self.name = str(self.name).strip()
         self.saved = bool(self.saved)
+        self.paint_has_subtractions = bool(self.paint_has_subtractions)
         if self.saved and not self.name:
             self.name = "Mask"
         if not self.saved:
@@ -701,6 +707,23 @@ class ToneMask:
             canonical.append(item)
         self.contributors = canonical
         self.revision = max(0, int(self.revision))
+        if self.gradient is not None:
+            gradient = self.gradient
+            gradient.field_type = "line"
+            gradient.parent_layer_id = ""
+            gradient.mask_only = True
+            gradient.line_field.direction_mode = "parallel"
+            geometry = gradient.line_field.geometry
+            geometry.closed = False
+            geometry.additional_contours = []
+            if len(geometry.nodes) > 2:
+                geometry.nodes = [geometry.nodes[0], geometry.nodes[-1]]
+            for node in geometry.nodes:
+                node.point_type = "vector"
+                node.incoming = node.outgoing = None
+                node.roundness = 0.0
+                node.roundness_enabled = False
+            gradient.validate_gradient()
 
     def touch(self) -> None:
         self.revision += 1
@@ -716,6 +739,8 @@ class ToneMask:
                 for kind, entity_id in self.contributors
             ],
             "revision": self.revision,
+            "gradient": self.gradient.to_dict() if self.gradient else None,
+            "paint_has_subtractions": self.paint_has_subtractions,
         }
 
     @classmethod
@@ -732,6 +757,14 @@ class ToneMask:
                 if isinstance(item, (dict, list, tuple))
             ],
             revision=int(data.get("revision", 0)),
+            paint_has_subtractions=bool(data.get("paint_has_subtractions", False)),
+            gradient=(
+                object_from_dict(data["gradient"])
+                if isinstance(data.get("gradient"), dict)
+                and data["gradient"].get("type") == "gradient"
+                and data["gradient"].get("gradient_type") == "color_fill"
+                else None
+            ),
         )
         result.validate()
         return result
@@ -969,6 +1002,58 @@ class MirrorModifier:
 
 
 @dataclass
+class ArrayModifier:
+    """Copies in document space; the source entity's transform is untouched."""
+
+    modifier_id: str = field(default_factory=new_id)
+    modifier_type: Literal["array"] = "array"
+    name: str = "Array"
+    intensity: float = 100.0
+    expanded: bool = True
+    muted: bool = False
+    axis_start: tuple[float, float] = (0.0, 0.0)
+    axis_end: tuple[float, float] = (100.0, 0.0)
+    center: tuple[float, float] = (0.0, 0.0)
+    count: int = 3
+    angle_offset: float = 0.0
+    scale_offset: float = 0.0
+    repeat_type: Literal["center", "first", "last"] = "first"
+    parameter_masks: dict[str, ParameterMaskBinding] = field(default_factory=dict)
+
+    def validate(self) -> None:
+        self.axis_start, self.axis_end, self.center = (
+            _point(self.axis_start), _point(self.axis_end), _point(self.center)
+        )
+        values = tuple(float(v) for v in (
+            *self.axis_start, *self.axis_end, *self.center,
+            self.count, self.angle_offset, self.scale_offset, self.intensity,
+        ))
+        if not all(math.isfinite(v) for v in values):
+            raise ValueError("Array values must be finite")
+        self.count = max(0, min(100, int(self.count)))
+        self.angle_offset = max(-360., min(360., float(self.angle_offset)))
+        self.scale_offset = max(-90., min(100., float(self.scale_offset)))
+        self.intensity = max(0., min(100., float(self.intensity)))
+        if self.repeat_type not in {"center", "first", "last"}:
+            raise ValueError("Unknown array repeat type")
+        self.name = str(self.name or "Array")
+        self.expanded, self.muted = bool(self.expanded), bool(self.muted)
+        _validate_parameter_masks(self.parameter_masks, {"intensity": (0., 100.)})
+
+    def to_dict(self) -> dict[str, Any]:
+        self.validate()
+        return {
+            "id": self.modifier_id, "type": "array", "name": self.name,
+            "intensity": self.intensity, "expanded": self.expanded, "muted": self.muted,
+            "axis_start": list(self.axis_start), "axis_end": list(self.axis_end),
+            "center": list(self.center), "count": self.count,
+            "angle_offset": self.angle_offset, "scale_offset": self.scale_offset,
+            "repeat_type": self.repeat_type,
+            "parameter_masks": _parameter_masks_to_dict(self.parameter_masks),
+        }
+
+
+@dataclass
 class RadialBlurModifier:
     """Transparency-aware circular spin in document coordinates."""
 
@@ -1166,7 +1251,108 @@ class TilingModifier:
                 "rotation": self.rotation, "parameter_masks": _parameter_masks_to_dict(self.parameter_masks)}
 
 
-ModifierInstance = HueSaturationLightnessModifier | BlurModifier | OutlineModifier | MirrorModifier | RadialBlurModifier | CageTransformModifier | PosterizeModifier | PosterizeValueModifier | TilingModifier
+@dataclass
+class StrokeModifier:
+    """Appearance-only effect; source anchors and their controls are never edited."""
+
+    modifier_id: str = field(default_factory=new_id)
+    modifier_type: str = "stroke"
+    name: str = "Stroke"
+    intensity: float = 100.0
+    expanded: bool = True
+    muted: bool = False
+    parameter_masks: dict[str, ParameterMaskBinding] = field(default_factory=dict)
+
+    def parameter_ranges(self):
+        return {"intensity": (0., 100.)}
+
+    def validate(self):
+        for attribute, (minimum, maximum) in self.parameter_ranges().items():
+            value = float(getattr(self, attribute))
+            if not math.isfinite(value):
+                raise ValueError("Stroke modifier values must be finite")
+            setattr(self, attribute, min(maximum, max(minimum, value)))
+        self.expanded, self.muted = bool(self.expanded), bool(self.muted)
+        self.name = str(self.name or type(self)().name)
+        _validate_parameter_masks(self.parameter_masks, self.parameter_ranges())
+
+    def to_dict(self):
+        self.validate()
+        result = {"id": self.modifier_id, "type": self.modifier_type,
+                  "name": self.name, "expanded": self.expanded, "muted": self.muted,
+                  "parameter_masks": _parameter_masks_to_dict(self.parameter_masks)}
+        result.update({key: getattr(self, key) for key in self.parameter_ranges()})
+        return result
+
+
+@dataclass
+class ScreamModifier(StrokeModifier):
+    modifier_type: str = "stroke_scream"
+    name: str = "Scream / Thought"
+    height: float = 24.
+    width: float = 32.
+    roundness: float = 0.
+
+    def parameter_ranges(self):
+        return {**super().parameter_ranges(), "height": (0., 200.),
+                "width": (4., 400.), "roundness": (0., 100.)}
+
+
+@dataclass
+class WobbleModifier(StrokeModifier):
+    modifier_type: str = "stroke_wobble"
+    name: str = "Wobble"
+    position: float = 12.
+    strength: float = 0.
+    noise_scale: float = 60.
+    noise_offset: float = 0.
+    seed: int = 0
+
+    def parameter_ranges(self):
+        return {**super().parameter_ranges(), "position": (0., 200.),
+                "strength": (0., 100.), "noise_scale": (4., 400.),
+                "noise_offset": (-10000., 10000.)}
+
+    def validate(self):
+        super().validate()
+        self.seed = int(self.seed) % (2**32)
+
+    def to_dict(self):
+        return {**super().to_dict(), "seed": self.seed}
+
+
+@dataclass
+class DotDashModifier(StrokeModifier):
+    modifier_type: str = "stroke_dot_dash"
+    name: str = "DotDash"
+    distance: float = 12.
+    mode: str = "dot"
+    length: float = 20.
+    pattern: str = "-"
+    roundness: float = 100.
+
+    def parameter_ranges(self):
+        return {**super().parameter_ranges(), "distance": (1., 400.),
+                "length": (1., 400.), "roundness": (0., 100.)}
+
+    def validate(self):
+        super().validate()
+        if self.mode not in {"dot", "dash"}:
+            raise ValueError("DotDash mode must be dot or dash")
+        self.pattern = str(self.pattern)[:256]
+        if any(character not in " -" for character in self.pattern):
+            raise ValueError("DotDash patterns use only spaces and dashes")
+
+    def to_dict(self):
+        return {**super().to_dict(), "mode": self.mode, "pattern": self.pattern}
+
+
+STROKE_MODIFIER_TYPES = {"stroke_scream": ScreamModifier,
+                         "stroke_wobble": WobbleModifier,
+                         "stroke_dot_dash": DotDashModifier}
+
+
+ModifierInstance = HueSaturationLightnessModifier | BlurModifier | OutlineModifier | MirrorModifier | ArrayModifier | RadialBlurModifier | CageTransformModifier | PosterizeModifier | PosterizeValueModifier | TilingModifier | ScreamModifier | WobbleModifier | DotDashModifier
 
 
 def modifier_from_dict(data: dict[str, Any]) -> ModifierInstance:
@@ -1181,7 +1367,22 @@ def modifier_from_dict(data: dict[str, Any]) -> ModifierInstance:
             data.get("parameter_masks")
         ),
     }
-    if modifier_type == "tiling":
+    if modifier_type in STROKE_MODIFIER_TYPES:
+        factory = STROKE_MODIFIER_TYPES[modifier_type]
+        defaults = factory().to_dict()
+        values = {key: data.get(key, value) for key, value in defaults.items()
+                  if key not in {"id", "type", "name", "intensity", "expanded", "muted", "parameter_masks"}}
+        result = factory(**common, **values)
+    elif modifier_type == "array":
+        result = ArrayModifier(
+            **common, axis_start=_point(data.get("axis_start", [0, 0])),
+            axis_end=_point(data.get("axis_end", [100, 0])),
+            center=_point(data.get("center", [0, 0])), count=data.get("count", 3),
+            angle_offset=float(data.get("angle_offset", 0)),
+            scale_offset=float(data.get("scale_offset", 0)),
+            repeat_type=str(data.get("repeat_type", "first")),
+        )
+    elif modifier_type == "tiling":
         result = TilingModifier(**common, shape=str(data.get("shape", "square")),
             center=_point(data.get("center", [0, 0])), side=float(data.get("side", 256)),
             rotation=float(data.get("rotation", 0)))
@@ -3344,6 +3545,8 @@ class ChapterDocument:
         for ref in targets:
             target = self.modifier_target(*ref)
             compatible = target is not None
+            if isinstance(modifier, StrokeModifier):
+                compatible = self.stroke_modifier_target(*ref)
             if isinstance(modifier, CageTransformModifier):
                 compatible = isinstance(target, ImageObject) or (
                     isinstance(target, LayerNode) and target.layer_kind != "text_container")
@@ -3365,11 +3568,24 @@ class ChapterDocument:
             entity = (self.layers if kind == "layer" else self.objects).get(identifier)
             names.append(entity.name if entity else identifier)
         message = f"{modifier.name} is not compatible with: " + (", ".join(names) or "this selection") + "."
+        if isinstance(modifier, StrokeModifier):
+            message += " Stroke modifiers require closed shapes or drawings with closed vector strokes. Open and compound shapes are not supported."
         if isinstance(modifier, CageTransformModifier):
             message += " Use the Cage Transform tool to transform raster and vector drawings. Select only drawings, or only images and shapes."
         if isinstance(modifier, TilingModifier):
             message += " Tiling requires a drawing, image, or non-page shape, with only one tiling setup per hierarchy branch (including muted setups)."
         return message
+
+    def stroke_modifier_target(self, kind, identifier):
+        target = self.modifier_target(kind, identifier)
+        if isinstance(target, LayerNode):
+            return bool(target.bound is not None and target.bound.closed
+                        and target.layer_kind == "bounded" and not target.compound_enabled
+                        and self.contributing_compound_ancestor(identifier) is None)
+        if isinstance(target, VectorDrawingObject):
+            return bool(target.strokes and all(stroke.closed and len(stroke.points) >= 3
+                                              and not stroke.tiling_group for stroke in target.strokes))
+        return False
 
     def _tiling_related(self, first, second, parent_overrides=None):
         if first == second:

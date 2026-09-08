@@ -6,14 +6,15 @@ from PySide6.QtGui import QColor, QMouseEvent
 from PySide6.QtWidgets import (
     QComboBox, QFrame, QHBoxLayout, QLabel, QMenu, QPushButton,
     QSlider, QSpinBox, QToolButton, QVBoxLayout, QWidget, QSizePolicy,
-    QInputDialog, QMessageBox,
+    QInputDialog, QMessageBox, QLineEdit,
 )
 
 from comic_editor.core.models import (
     BlurModifier, HueSaturationLightnessModifier, ModifierInstance,
     OutlineModifier, MirrorModifier, RadialBlurModifier, RasterObject, LayerNode,
-    canonical_argb, TilingModifier,
+    canonical_argb, TilingModifier, ArrayModifier,
     CageTransformModifier, PosterizeModifier, PosterizeValueModifier, POSTERIZE_MAX_COLORS,
+    StrokeModifier, ScreamModifier, WobbleModifier, DotDashModifier, STROKE_MODIFIER_TYPES,
 )
 from comic_editor.ui.icons import iconoir
 from comic_editor.ui.mask_controls import DualEndpointSlider, MaskButton
@@ -129,6 +130,13 @@ class ModifierCard(QFrame):
             lambda: self.removeRequested.emit(modifier.modifier_id),
         ))
         outer.addWidget(title)
+        if isinstance(modifier, StrokeModifier):
+            actions = QHBoxLayout()
+            actions.setContentsMargins(6, 0, 6, 0)
+            actions.addStretch(1)
+            while title.layout().count() > 2:
+                actions.addWidget(title.layout().takeAt(2).widget())
+            outer.addLayout(actions)
         body = QWidget(self)
         form = QVBoxLayout(body)
         form.setContentsMargins(6, 0, 6, 0)
@@ -138,10 +146,52 @@ class ModifierCard(QFrame):
             form.addWidget(SimplifyColorsControls(modifier, owner, body))
             form.addWidget(QLabel("Posterization", body))
         form.addWidget(self._slider_row(
-            "Intensity", 0, 100, round(modifier.intensity),
+            "Strength" if isinstance(modifier, StrokeModifier) else "Intensity", 0, 100, round(modifier.intensity),
             "intensity", "%",
         ))
-        if isinstance(modifier, TilingModifier):
+        if isinstance(modifier, StrokeModifier):
+            labels = {"height": "Spike height", "width": "Spike width", "roundness": "Roundness",
+                      "position": "Position", "strength": "Opacity noise", "noise_scale": "Noise scale",
+                      "noise_offset": "Noise offset", "distance": "Distance", "length": "Length"}
+            if isinstance(modifier, DotDashModifier):
+                mode = QComboBox(body)
+                mode.addItem("Dots", "dot")
+                mode.addItem("Dashes", "dash")
+                mode.setCurrentIndex(0 if modifier.mode == "dot" else 1)
+                mode.currentIndexChanged.connect(lambda _index: (
+                    owner.set_parameter(modifier.modifier_id, "mode", mode.currentData(), True), owner.refresh()))
+                form.addWidget(mode)
+                pattern = QLineEdit(modifier.pattern, body)
+                pattern.setObjectName("strokePattern")
+                pattern.setMaxLength(256)
+                pattern.setPlaceholderText("Pattern: - is a mark, space is a gap")
+                from PySide6.QtCore import QRegularExpression
+                from PySide6.QtGui import QRegularExpressionValidator
+                pattern.setValidator(QRegularExpressionValidator(QRegularExpression("[ -]*"), pattern))
+                pattern.setToolTip("Repeats around the loop. Use - for a mark and a space to skip one.\nAn empty pattern hides the stroke.")
+                pattern.editingFinished.connect(lambda: owner.set_parameter(modifier.modifier_id, "pattern", pattern.text(), True))
+                form.addWidget(QLabel("Pattern", body))
+                form.addWidget(pattern)
+            for attribute, (minimum, maximum) in modifier.parameter_ranges().items():
+                if attribute == "intensity" or attribute == "length" and modifier.mode != "dash":
+                    continue
+                suffix = "%" if attribute in {"roundness", "strength"} else " px"
+                form.addWidget(self._slider_row(labels[attribute], int(minimum), int(maximum),
+                                               round(getattr(modifier, attribute)), attribute, suffix))
+            if isinstance(modifier, WobbleModifier):
+                randomize = QPushButton("Randomize seed", body)
+                randomize.setToolTip(f"Seed: {modifier.seed}")
+                def randomize_seed():
+                    import secrets
+                    seed = (modifier.seed + 1 + secrets.randbelow(2**32 - 1)) % (2**32)
+                    owner.set_parameter(modifier.modifier_id, "seed", seed, True)
+                    randomize.setToolTip(f"Seed: {seed}")
+                randomize.clicked.connect(randomize_seed)
+                form.addWidget(randomize)
+        elif isinstance(modifier, ArrayModifier):
+            from comic_editor.ui.array_controls import ArraySettingsControls
+            form.addWidget(ArraySettingsControls(owner, modifier, body))
+        elif isinstance(modifier, TilingModifier):
             from comic_editor.ui.tiling_controls import TilingSettingsControls
             form.addWidget(TilingSettingsControls(owner, modifier, body))
         elif isinstance(modifier, CageTransformModifier):
@@ -249,7 +299,14 @@ class ModifierCard(QFrame):
         attribute: str, suffix: str,
     ) -> QWidget:
         row = QWidget(self)
-        layout = QHBoxLayout(row)
+        stroke_column = QVBoxLayout(row) if isinstance(self.modifier, StrokeModifier) else None
+        if stroke_column is not None:
+            stroke_column.setContentsMargins(0, 0, 0, 0)
+            stroke_column.setSpacing(2)
+            layout = QHBoxLayout()
+            stroke_column.addLayout(layout)
+        else:
+            layout = QHBoxLayout(row)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.addWidget(QLabel(label, row))
         binding = self.modifier.parameter_masks.get(attribute)
@@ -275,6 +332,13 @@ class ModifierCard(QFrame):
             lambda value=context: self.owner.detach_mask(value)
         )
         layout.addWidget(mask_button)
+        if stroke_column is not None:
+            layout.addStretch(1)
+            mask_button.setFixedSize(22, 22)
+            layout = QHBoxLayout()
+            layout.setContentsMargins(0, 0, 0, 0)
+            layout.setSpacing(4)
+            stroke_column.addLayout(layout)
         if binding is not None:
             endpoints = DualEndpointSlider(
                 minimum, maximum,
@@ -371,6 +435,10 @@ class ModifierControls(QWidget):
         layout.addWidget(self.summary)
         self.add_button = QPushButton("Add Modifier", self)
         menu = QMenu(self.add_button)
+        self.stroke_menu = menu.addMenu("Stroke modifiers")
+        for modifier_type, factory in STROKE_MODIFIER_TYPES.items():
+            self.stroke_menu.addAction(factory().name).triggered.connect(
+                lambda _checked=False, kind=modifier_type: self.add_modifier(kind))
         menu.addAction("Hue / Saturation / Lightness").triggered.connect(
             lambda: self.add_modifier("hsl")
         )
@@ -386,6 +454,7 @@ class ModifierControls(QWidget):
             lambda: self.add_modifier("outline")
         )
         menu.addAction("Mirror").triggered.connect(lambda: self.add_modifier("mirror"))
+        menu.addAction("Array").triggered.connect(lambda: self.add_modifier("array"))
         menu.addAction("Tiling").triggered.connect(lambda: self.add_modifier("tiling"))
         menu.addAction("Posterize…").triggered.connect(lambda: self.add_modifier("posterize"))
         menu.addAction("Posterize Value…").triggered.connect(lambda: self.add_modifier("posterize_value"))
@@ -459,6 +528,8 @@ class ModifierControls(QWidget):
             self.canvas.selected_entities
         )
         self.add_button.setEnabled(bool(self.canvas.selected_entities))
+        self.stroke_menu.menuAction().setVisible(bool(eligible and all(
+            chapter.stroke_modifier_target(*ref) for ref in targets)))
         if not eligible:
             self.summary.setText("Select a drawing, image, or bounded shape.")
             return
@@ -509,7 +580,9 @@ class ModifierControls(QWidget):
         if chapter is None or not targets:
             return
         before = chapter.to_dict()
-        if modifier_type == "tiling":
+        if modifier_type in STROKE_MODIFIER_TYPES:
+            modifier = STROKE_MODIFIER_TYPES[modifier_type]()
+        elif modifier_type == "tiling":
             bounds = self.canvas._tiling_default_bounds(targets)
             side = max(1., min(256., min(bounds.width(), bounds.height())/2))
             modifier = TilingModifier(center=bounds.center().toTuple(), side=side)
@@ -553,6 +626,13 @@ class ModifierControls(QWidget):
             bounds = self._default_bounds()
             center = bounds.center() if bounds is not None else QPoint()
             modifier = RadialBlurModifier(center=(float(center.x()), float(center.y())))
+        elif modifier_type == "array":
+            bounds = self._default_bounds()
+            center = bounds.center() if bounds is not None else QPoint()
+            width = max(25., bounds.width()*1.25) if bounds is not None else 100.
+            y = bounds.bottom()+24. if bounds is not None else 24.
+            modifier = ArrayModifier(center=(center.x(), center.y()),
+                axis_start=(center.x(), y), axis_end=(center.x()+width, y))
         elif modifier_type == "mirror":
             bounds = self._default_bounds()
             center = bounds.center() if bounds is not None else QPoint()

@@ -131,6 +131,57 @@ def test_container_placement_cancel_creation_and_typing_undo(canvas):
     canvas.chapter.validate()
 
 
+@pytest.mark.parametrize("in_container", [False, True])
+@pytest.mark.parametrize("transformed", [False, True])
+def test_free_text_stays_visible_during_live_edit(
+    canvas, qapp, in_container, transformed,
+):
+    canvas.settings.grid_overlay_visible = False
+    parent = canvas.chapter.layers[canvas.active_page_id]
+    if transformed:
+        parent = canvas.chapter.add_layer(
+            parent.layer_id, "Clip", BoundGeometry.rectangle(80, 50, 250, 140),
+        )
+        parent.fill_color, parent.border_width, parent.opacity = None, 0, 0.7
+        parent.translate_x, parent.translate_y = 25, 15
+    if in_container:
+        parent = canvas.chapter.add_layer(
+            parent.layer_id, "Free Text", layer_kind="text_container",
+        )
+        parent.opacity = 0.6
+        parent.translate_x, parent.translate_y = 10, 5
+    obj = add_box(canvas, parent.layer_id, text="First")
+    canvas.set_selection("object", obj.object_id)
+    canvas.show()
+    qapp.processEvents()
+
+    def capture_without_caret():
+        canvas._text_caret_timer.stop()
+        canvas._text_caret_visible = False
+        return canvas.grab().toImage()
+
+    resting = capture_without_caret()
+    assert canvas.start_text_edit()
+    editing = capture_without_caret()
+    assert editing == resting
+
+    canvas._text_caret_visible = True
+    assert canvas.grab().toImage() != editing
+    QTest.keyClick(canvas, Qt.Key_A, Qt.ControlModifier)
+    assert capture_without_caret() != editing
+
+    QTest.keyClicks(canvas, "Live")
+    live = capture_without_caret()
+    assert obj.text == "Live"
+    assert live != editing
+    QTest.keyClicks(canvas, "!")
+    updated = capture_without_caret()
+    assert obj.text == "Live!"
+    assert updated != live
+    canvas.commit_active_text_edit()
+    assert capture_without_caret() == updated
+
+
 def test_container_ui_add_second_box_and_mode_settings(qapp, monkeypatch):
     monkeypatch.setattr("comic_editor.ui.main_window.save_settings", lambda _: None)
     window = MainWindow()

@@ -1,4 +1,4 @@
-"""Geometry-free Comic View capture and restore for Blender 4.5."""
+"""Geometry-free Comic View capture and restore for Blender 4.5 and 5.2 LTS."""
 from __future__ import annotations
 
 import hashlib
@@ -144,6 +144,20 @@ def repair_duplicate_uuids(scene: bpy.types.Scene) -> list[str]:
         seen_candidates.add(identity)
         unique_candidates.append(item)
     candidates = unique_candidates
+    groups: dict[str, list[tuple[int, object]]] = {}
+    for order, item in enumerate(candidates):
+        if not _editable(item):
+            continue
+        identifier = ensure_uuid(item)
+        groups.setdefault(identifier, []).append((order, item))
+    duplicates_by_uuid = {
+        identifier: items for identifier, items in groups.items() if len(items) > 1
+    }
+    if not duplicates_by_uuid:
+        return warnings
+
+    # Saved names only matter when deciding which duplicate keeps its UUID.
+    # Most captures have no duplicates, so avoid parsing every saved view.
     known_names: dict[str, set[str]] = {}
     for view in getattr(scene, "webtoon_comic_views", ()):
         try:
@@ -177,15 +191,7 @@ def repair_duplicate_uuids(scene: bpy.types.Scene) -> list[str]:
                     str(record.get("name", ""))
                 )
 
-    groups: dict[str, list[tuple[int, object]]] = {}
-    for order, item in enumerate(candidates):
-        if not _editable(item):
-            continue
-        identifier = ensure_uuid(item)
-        groups.setdefault(identifier, []).append((order, item))
-    for identifier, duplicates in groups.items():
-        if len(duplicates) < 2:
-            continue
+    for identifier, duplicates in duplicates_by_uuid.items():
         expected_names = known_names.get(identifier, set())
 
         def priority(candidate: tuple[int, object]) -> tuple[int, int, int]:
@@ -266,7 +272,9 @@ def _assign_vector(target: object, attribute: str, values: object) -> None:
         current = getattr(target, attribute)
         if len(current) != len(values):
             return
-        setattr(target, attribute, tuple(_finite(item) for item in values))
+        normalized = tuple(_finite(item) for item in values)
+        if tuple(current) != normalized:
+            setattr(target, attribute, normalized)
     except (AttributeError, TypeError, ValueError):
         return
 
@@ -274,7 +282,8 @@ def _assign_vector(target: object, attribute: str, values: object) -> None:
 def _apply_transform(target: object, values: dict[str, Any], *, obj=False) -> None:
     mode = str(values.get("rotation_mode", getattr(target, "rotation_mode", "XYZ")))
     try:
-        target.rotation_mode = mode
+        if target.rotation_mode != mode:
+            target.rotation_mode = mode
     except (AttributeError, TypeError, ValueError):
         pass
     for attribute in (

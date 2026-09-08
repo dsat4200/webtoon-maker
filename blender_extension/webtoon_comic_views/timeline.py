@@ -8,6 +8,10 @@ from typing import Any, Iterable
 import bpy
 
 from . import diagnostics
+from .action_channels import (
+    action_curve_index, find_action_curve, is_layered_action, iter_action_curves,
+    iter_slot_channelbags,
+)
 from .state import ensure_uuid, parse_state, state_digest
 
 
@@ -22,7 +26,7 @@ OBJECT_DELTA_FIELDS = (
 FRAME_EPSILON = 1.0e-4
 VALUE_EPSILON = 1.0e-5
 UUID_PROPERTY = "webtoon_comic_uuid"
-BAKE_VERSION = 1
+BAKE_VERSION = 2
 
 
 def _escape(value: object) -> str:
@@ -116,11 +120,30 @@ class SnapshotChannel:
 def _add_channel(
     result: dict[ChannelKey, SnapshotChannel], owner: object | None,
     data_path: str, value: object, label: str, *, strict_driver: bool = False,
+    lookup: _SnapshotLookup | None = None,
 ) -> None:
     if owner is None:
         return
-    pointer, identifier = _owner_key(owner)
-    for index, number in _components(owner, data_path, value):
+    if lookup is None:
+        pointer, identifier = _owner_key(owner)
+    else:
+        pointer = int(owner.as_pointer())
+        identifier = lookup.owner_uuids.get(pointer)
+        if identifier is None:
+            identifier = ensure_uuid(owner)
+            lookup.owner_uuids[pointer] = identifier
+    components = _components(owner, data_path, value)
+    if not components:
+        return
+    if lookup is None:
+        animatable = _channel_is_animatable(owner, data_path)
+    else:
+        capability_key = (pointer, data_path)
+        animatable = lookup.animatable.get(capability_key)
+        if animatable is None:
+            animatable = _channel_is_animatable(owner, data_path)
+            lookup.animatable[capability_key] = animatable
+    for index, number in components:
         key = ChannelKey(pointer, identifier, data_path, index)
         result[key] = SnapshotChannel(
             key=key,
@@ -129,7 +152,7 @@ def _add_channel(
             label=f"{label}[{index}]" if isinstance(value, list) else label,
             discrete=isinstance(value, (bool, str)),
             strict_driver=strict_driver,
-            animatable=_channel_is_animatable(owner, data_path),
+            animatable=animatable,
         )
 
 
@@ -139,8 +162,13 @@ def _object_lookup(scene: bpy.types.Scene) -> dict[str, bpy.types.Object]:
 
 def _collection_lookup(scene: bpy.types.Scene) -> dict[str, object]:
     result: dict[str, object] = {}
+    visited: set[int] = set()
 
     def walk(collection: object) -> None:
+        pointer = int(collection.as_pointer())
+        if pointer in visited:
+            return
+        visited.add(pointer)
         result.setdefault(ensure_uuid(collection), collection)
         for child in collection.children:
             walk(child)
@@ -149,12 +177,60 @@ def _collection_lookup(scene: bpy.types.Scene) -> dict[str, object]:
     return result
 
 
+@dataclass
+class _SnapshotLookup:
+    """Scene/RNA metadata shared only while flattening a group of snapshots."""
+    objects: dict[str, object]
+    collections: dict[str, object]
+    bones: dict[int, dict[str, object]] = field(default_factory=dict)
+    modifiers: dict[int, dict[str, object]] = field(default_factory=dict)
+    owner_uuids: dict[int, str] = field(default_factory=dict)
+    animatable: dict[tuple[int, str], bool] = field(default_factory=dict)
+    registered_owners: dict[str, object] | None = None
+
+    @classmethod
+    def from_scene(cls, scene: bpy.types.Scene) -> _SnapshotLookup:
+        return cls(_object_lookup(scene), _collection_lookup(scene))
+
+    def bone(self, obj: object, identifier: str, name: str) -> object | None:
+        pointer = int(obj.as_pointer())
+        if pointer not in self.bones:
+            by_uuid: dict[str, object] = {}
+            for candidate in obj.pose.bones:
+                by_uuid.setdefault(ensure_uuid(candidate.bone), candidate)
+            self.bones[pointer] = by_uuid
+        return self.bones[pointer].get(identifier) or obj.pose.bones.get(name)
+
+    def modifier(self, obj: object, identifier: str, name: str) -> object | None:
+        pointer = int(obj.as_pointer())
+        if pointer not in self.modifiers:
+            by_uuid: dict[str, object] = {}
+            for candidate in obj.modifiers:
+                by_uuid.setdefault(ensure_uuid(candidate), candidate)
+            self.modifiers[pointer] = by_uuid
+        return self.modifiers[pointer].get(identifier) or obj.modifiers.get(name)
+
+    def registered(self) -> dict[str, object]:
+        if self.registered_owners is None:
+            self.registered_owners = {}
+            for collection_name in (
+                "scenes", "objects", "collections", "cameras", "lights",
+                "materials", "worlds", "node_groups", "armatures", "shape_keys",
+            ):
+                for owner in getattr(bpy.data, collection_name, ()):
+                    identifier = str(owner.get(UUID_PROPERTY, ""))
+                    self.registered_owners.setdefault(identifier, owner)
+        return self.registered_owners
+
+
 def snapshot_channels(
     scene: bpy.types.Scene, snapshot: dict[str, Any],
+    *, lookup: _SnapshotLookup | None = None,
 ) -> dict[ChannelKey, SnapshotChannel]:
     """Flatten one saved snapshot into writable, numeric RNA channels."""
     result: dict[ChannelKey, SnapshotChannel] = {}
-    objects = _object_lookup(scene)
+    lookup = lookup or _SnapshotLookup.from_scene(scene)
+    objects = lookup.objects
     for record in snapshot.get("objects", []):
         identifier = str(record.get("uuid", ""))
         obj = objects.get(identifier)
@@ -166,14 +242,18 @@ def snapshot_channels(
                 result, obj, field, transform.get(field),
                 f"{obj.name}.{field}",
                 strict_driver=obj.type == "CAMERA",
+                lookup=lookup,
             )
         for field in ("hide_viewport", "hide_render"):
             _add_channel(
-                result, obj, field, record.get(field), f"{obj.name}.{field}"
+                result, obj, field, record.get(field), f"{obj.name}.{field}",
+                lookup=lookup,
             )
         for name, value in record.get("custom_properties", {}).items():
             path = f'["{_escape(name)}"]'
-            _add_channel(result, obj, path, value, f"{obj.name}[{name}]")
+            _add_channel(
+                result, obj, path, value, f"{obj.name}[{name}]", lookup=lookup,
+            )
 
     for record in snapshot.get("poses", []):
         obj = objects.get(str(record.get("object_uuid", "")))
@@ -181,14 +261,7 @@ def snapshot_channels(
         bone = None
         if obj is not None and obj.pose:
             wanted = str(record.get("bone_uuid", ""))
-            bone = next(
-                (
-                    candidate for candidate in obj.pose.bones
-                    if ensure_uuid(candidate.bone) == wanted
-                ),
-                None,
-            )
-            bone = bone or obj.pose.bones.get(bone_name)
+            bone = lookup.bone(obj, wanted, bone_name)
         if bone is None:
             continue
         bone_name = bone.name
@@ -198,11 +271,13 @@ def snapshot_channels(
             _add_channel(
                 result, obj, f"{prefix}.{field}", transform.get(field),
                 f"{obj.name}.{bone_name}.{field}",
+                lookup=lookup,
             )
         for name, value in record.get("custom_properties", {}).items():
             path = f'{prefix}["{_escape(name)}"]'
             _add_channel(
-                result, obj, path, value, f"{obj.name}.{bone_name}[{name}]"
+                result, obj, path, value, f"{obj.name}.{bone_name}[{name}]",
+                lookup=lookup,
             )
 
     for group in ("cameras", "lights"):
@@ -216,6 +291,7 @@ def snapshot_channels(
                     result, owner, str(path), value,
                     f"{getattr(owner, 'name', group)}.{path}",
                     strict_driver=True,
+                    lookup=lookup,
                 )
 
     for record in snapshot.get("shape_keys", []):
@@ -229,6 +305,7 @@ def snapshot_channels(
             _add_channel(
                 result, owner, f"{prefix}.{field}", record.get(field),
                 f"{obj.name}.{name}.{field}",
+                lookup=lookup,
             )
 
     for record in snapshot.get("modifiers", []):
@@ -237,14 +314,7 @@ def snapshot_channels(
         modifier = None
         if obj is not None:
             wanted = str(record.get("uuid", ""))
-            modifier = next(
-                (
-                    candidate for candidate in obj.modifiers
-                    if ensure_uuid(candidate) == wanted
-                ),
-                None,
-            )
-            modifier = modifier or obj.modifiers.get(name)
+            modifier = lookup.modifier(obj, wanted, name)
         if modifier is None:
             continue
         name = modifier.name
@@ -253,9 +323,10 @@ def snapshot_channels(
             _add_channel(
                 result, obj, f"{prefix}.{field}", value,
                 f"{obj.name}.{name}.{field}",
+                lookup=lookup,
             )
 
-    collections = _collection_lookup(scene)
+    collections = lookup.collections
     for record in snapshot.get("collections", []):
         owner = collections.get(str(record.get("uuid", "")))
         if owner is None:
@@ -264,20 +335,11 @@ def snapshot_channels(
             _add_channel(
                 result, owner, field, record.get(field),
                 f"{owner.name}.{field}",
+                lookup=lookup,
             )
 
     registered = snapshot.get("registered", [])
-    wanted_ids = {str(record.get("owner_uuid", "")) for record in registered}
-    all_ids = {}
-    if wanted_ids:
-        for collection_name in (
-            "scenes", "objects", "collections", "cameras", "lights",
-            "materials", "worlds", "node_groups", "armatures", "shape_keys",
-        ):
-            for owner in getattr(bpy.data, collection_name, ()):
-                identifier = str(owner.get(UUID_PROPERTY, ""))
-                if identifier in wanted_ids:
-                    all_ids.setdefault(identifier, owner)
+    all_ids = lookup.registered() if registered else {}
     for record in registered:
         owner = all_ids.get(str(record.get("owner_uuid", "")))
         if owner is None:
@@ -289,16 +351,13 @@ def snapshot_channels(
             result, owner, path, record.get("value"),
             str(record.get("label", path)),
             strict_driver=True,
+            lookup=lookup,
         )
     return result
 
 
 def _action_curve(owner: object, key: ChannelKey) -> object | None:
-    animation = getattr(owner, "animation_data", None)
-    action = getattr(animation, "action", None)
-    if action is None:
-        return None
-    return action.fcurves.find(key.data_path, index=key.array_index)
+    return find_action_curve(owner, key.data_path, key.array_index)
 
 
 def _values_differ(values: Iterable[float]) -> bool:
@@ -311,8 +370,8 @@ def _values_differ(values: Iterable[float]) -> bool:
 def _max_animation_frame() -> int:
     maximum = 0.0
     for action in bpy.data.actions:
-        for curve in action.fcurves:
-            for point in curve.keyframe_points:
+        for curve in iter_action_curves(action):
+            for point in (*curve.keyframe_points, *curve.sampled_points):
                 maximum = max(maximum, float(point.co.x))
     for collection_name in (
         "scenes", "objects", "collections", "cameras", "lights",
@@ -339,7 +398,10 @@ class _PointMutation:
 class _ActionMutation:
     owner: object
     original: object | None
-    replacement: object
+    original_slot: object | None
+    had_animation_data: bool
+    last_slot_identifier: str
+    replacement: object | None = None
 
 
 @dataclass
@@ -352,6 +414,7 @@ class _PointStyle:
     handle_right_type: str
     handle_left: tuple[float, float]
     handle_right: tuple[float, float]
+    owned: bool = False
 
 
 @dataclass
@@ -362,6 +425,7 @@ class BakeTransaction:
     frame_assignments: list[tuple[object, int]] = field(default_factory=list)
     point_mutations: list[_PointMutation] = field(default_factory=list)
     new_curves: list[tuple[object, object]] = field(default_factory=list)
+    new_action_structures: list[tuple[object, object]] = field(default_factory=list)
     action_mutations: list[_ActionMutation] = field(default_factory=list)
     bake_assignments: list[tuple[object, str, str]] = field(default_factory=list)
     preserved_styles: list[_PointStyle] = field(default_factory=list)
@@ -373,6 +437,10 @@ class BakeTransaction:
     cached: bool = False
     _recorded_points: set[tuple[int, int]] = field(default_factory=set)
     _preserved_curves: set[int] = field(default_factory=set)
+    _styles_by_curve: dict[int, list[_PointStyle]] = field(default_factory=dict)
+    _curve_indexes: dict[int, dict[tuple[str, int], object]] = field(
+        default_factory=dict,
+    )
     _finished: bool = False
 
     def commit(self) -> None:
@@ -420,10 +488,10 @@ class BakeTransaction:
                 curve.update()
             except (ReferenceError, RuntimeError):
                 pass
-        _restore_point_styles(self)
-        for action, curve in reversed(self.new_curves):
+        _restore_point_styles(self, rollback=True)
+        for curves, curve in reversed(self.new_curves):
             try:
-                action.fcurves.remove(curve)
+                curves.remove(curve)
             except (ReferenceError, RuntimeError):
                 pass
         for mutation in reversed(self.action_mutations):
@@ -431,11 +499,27 @@ class BakeTransaction:
             if animation is not None:
                 try:
                     animation.action = mutation.original
+                    if mutation.original is not None:
+                        animation.action_slot = mutation.original_slot
+                    animation.last_slot_identifier = mutation.last_slot_identifier
+                    if not mutation.had_animation_data:
+                        mutation.owner.animation_data_clear()
                 except (AttributeError, RuntimeError, TypeError):
                     pass
+        for collection, item in reversed(self.new_action_structures):
             try:
-                if mutation.replacement.users == 0:
-                    bpy.data.actions.remove(mutation.replacement)
+                # Blender 4.5 can remove an empty group with its final F-Curve.
+                if any(candidate == item for candidate in collection):
+                    collection.remove(item)
+            except (ReferenceError, RuntimeError):
+                pass
+        for mutation in reversed(self.action_mutations):
+            try:
+                replacement = mutation.replacement
+                if replacement is not None and replacement.users <= int(
+                    replacement.use_fake_user
+                ):
+                    bpy.data.actions.remove(replacement)
             except (ReferenceError, RuntimeError):
                 pass
         for view, old_frame in self.frame_assignments:
@@ -467,6 +551,7 @@ def _ensure_action(
             f"{channel_label} belongs to linked data and cannot receive Comic View keys"
         )
     owner_name = getattr(owner, "name", type(owner).__name__)
+    had_animation_data = getattr(owner, "animation_data", None) is not None
     try:
         creator = getattr(owner, "animation_data_create")
         animation = creator()
@@ -479,6 +564,11 @@ def _ensure_action(
             f"Blender did not provide animation data for animatable channel "
             f"{channel_label} on {owner_name}"
         )
+    mutation = _ActionMutation(
+        owner, animation.action, animation.action_slot, had_animation_data,
+        animation.last_slot_identifier,
+    )
+    transaction.action_mutations.append(mutation)
     for track in getattr(animation, "nla_tracks", ()):
         if not track.mute and any(not strip.mute for strip in track.strips):
             raise RuntimeError(
@@ -492,17 +582,24 @@ def _ensure_action(
         )
     if action is None:
         action = bpy.data.actions.new(f"Webtoon Comic Views - {owner.name}")
+        mutation.replacement = action
         animation.action = action
-        transaction.action_mutations.append(_ActionMutation(owner, None, action))
     elif action.users > 1:
         original = action
         action = action.copy()
+        mutation.replacement = action
         action.name = f"{original.name} - Webtoon Comic Views - {owner.name}"
         animation.action = action
-        transaction.action_mutations.append(
-            _ActionMutation(owner, original, action)
+        # Action assignment may auto-select another compatible slot. Copies keep
+        # identifiers, so restore the exact assigned slot explicitly.
+        animation.action_slot = (
+            action.slots[mutation.original_slot.identifier]
+            if mutation.original_slot is not None else None
         )
     cache[pointer] = action
+    # A shared Action may have been copied (and its assigned slot restored).
+    # Never retain F-Curve references belonging to the pre-copy Action.
+    transaction._curve_indexes.pop(pointer, None)
     return action
 
 
@@ -516,6 +613,24 @@ def _driver_conflict(owner: object, channel: SnapshotChannel) -> bool:
         ):
             return True
     return False
+
+
+def _active_drivers(owner: object) -> set[tuple[str, int]]:
+    animation = getattr(owner, "animation_data", None)
+    return {
+        (curve.data_path, int(curve.array_index))
+        for curve in getattr(animation, "drivers", ())
+        if not curve.mute
+    } if animation is not None else set()
+
+
+def _indexed_curve(
+    transaction: BakeTransaction, owner: object, key: ChannelKey,
+) -> object | None:
+    pointer = int(owner.as_pointer())
+    if pointer not in transaction._curve_indexes:
+        transaction._curve_indexes[pointer] = action_curve_index(owner)
+    return transaction._curve_indexes[pointer].get((key.data_path, key.array_index))
 
 
 def _point_at(curve: object, frame: int) -> object | None:
@@ -535,13 +650,14 @@ def _preserve_point_styles(
     if pointer in transaction._preserved_curves:
         return
     transaction._preserved_curves.add(pointer)
+    styles: list[_PointStyle] = []
+    transaction._styles_by_curve[pointer] = styles
     for point in curve.keyframe_points:
-        if any(
+        owned = any(
             abs(float(point.co.x) - frame) <= FRAME_EPSILON
             for frame in owned_frames
-        ):
-            continue
-        transaction.preserved_styles.append(_PointStyle(
+        )
+        style = _PointStyle(
             curve=curve,
             frame=float(point.co.x),
             interpolation=str(point.interpolation),
@@ -550,17 +666,24 @@ def _preserve_point_styles(
             handle_right_type=str(point.handle_right_type),
             handle_left=tuple(float(value) for value in point.handle_left),
             handle_right=tuple(float(value) for value in point.handle_right),
-        ))
+            owned=owned,
+        )
+        transaction.preserved_styles.append(style)
+        styles.append(style)
 
 
 def _restore_point_styles(
-    transaction: BakeTransaction, curve: object | None = None,
+    transaction: BakeTransaction, curve: object | None = None, *,
+    rollback: bool = False,
 ) -> None:
-    for style in transaction.preserved_styles:
-        if (
-            curve is not None
-            and int(style.curve.as_pointer()) != int(curve.as_pointer())
-        ):
+    # Each completed curve restores only its own keys. Scanning all styles
+    # accumulated so far here makes a bake quadratic in the channel count.
+    styles = (
+        transaction.preserved_styles if curve is None
+        else transaction._styles_by_curve.get(int(curve.as_pointer()), ())
+    )
+    for style in styles:
+        if style.owned and not rollback:
             continue
         try:
             point = _point_at(style.curve, style.frame)
@@ -602,15 +725,60 @@ def _write_point(
 def _ensure_curve(
     transaction: BakeTransaction, action: object, channel: SnapshotChannel,
 ) -> object:
-    curve = action.fcurves.find(
-        channel.key.data_path, index=channel.key.array_index
-    )
-    if curve is None:
-        curve = action.fcurves.new(
+    curve = _indexed_curve(transaction, channel.owner, channel.key)
+    if curve is not None:
+        return curve
+    if not is_layered_action(action):
+        curves = action.fcurves
+        curve = curves.new(
             channel.key.data_path, index=channel.key.array_index,
             action_group="Webtoon Comic Views",
         )
-        transaction.new_curves.append((action, curve))
+        transaction.new_curves.append((curves, curve))
+        transaction._curve_indexes[channel.key.owner_pointer][
+            (channel.key.data_path, channel.key.array_index)
+        ] = curve
+        return curve
+
+    animation = channel.owner.animation_data
+    slot = animation.action_slot
+    if slot is None:
+        slot = action.slots.new(
+            id_type=channel.owner.id_type, name=channel.owner.name,
+        )
+        transaction.new_action_structures.append((action.slots, slot))
+        animation.action_slot = slot
+    bags = list(iter_slot_channelbags(action, slot))
+    if bags:
+        bag = bags[0]
+    else:
+        layer = next(iter(action.layers), None)
+        if layer is None:
+            layer = action.layers.new("Webtoon Comic Views")
+            transaction.new_action_structures.append((action.layers, layer))
+        strip = next(
+            (item for item in layer.strips if item.type == "KEYFRAME"), None,
+        )
+        if strip is None:
+            strip = layer.strips.new(type="KEYFRAME")
+            transaction.new_action_structures.append((layer.strips, strip))
+        bag = strip.channelbags.new(slot)
+        transaction.new_action_structures.append((strip.channelbags, bag))
+    # Assigning the channelbag group works in both 4.5 and 5.2; the group keyword
+    # on fcurves.new was only added in 5.0.
+    group = bag.groups.get("Webtoon Comic Views")
+    if group is None:
+        group = bag.groups.new("Webtoon Comic Views")
+        transaction.new_action_structures.append((bag.groups, group))
+    curve = bag.fcurves.new(
+        channel.key.data_path, index=channel.key.array_index,
+    )
+    transaction.new_curves.append((bag.fcurves, curve))
+    curve.group = group
+    curve.update_autoflags(channel.owner)
+    transaction._curve_indexes[channel.key.owner_pointer][
+        (channel.key.data_path, channel.key.array_index)
+    ] = curve
     return curve
 
 
@@ -626,14 +794,28 @@ def _allocate_frames(
     settings = getattr(scene, "webtoon_comic_settings", None)
     cursor = int(getattr(settings, "next_timeline_frame", 0))
     transaction.next_frame_cursor = cursor
+    # Existing unique v2 frames require no allocation. The next actual
+    # allocation still scans every Action slot/NLA strip before reserving a
+    # frame, including user animation added since the previous save.
+    needs_allocation = (
+        len(existing_frames) != len(views)
+        or any(
+            str(getattr(view, "bake_hash", "")).startswith("1:")
+            for view in views
+        )
+    )
     next_frame = max(
-        int(scene.frame_end), _max_animation_frame(),
+        int(scene.frame_end), _max_animation_frame() if needs_allocation else 0,
         max(existing_frames, default=0), cursor - 1,
     ) + 1
     for view in views:
         identifier = str(getattr(view, "view_uuid", ""))
         frame = int(getattr(view, "timeline_frame", 0))
-        if frame <= 0 or frame in used:
+        # Version 1 scanned only the first Action slot. Its reserved frames can
+        # overlap untouched user keys in another slot, so migrate those views
+        # past all animation once instead of overwriting the old frame.
+        legacy_bake = str(getattr(view, "bake_hash", "")).startswith("1:")
+        if frame <= 0 or frame in used or legacy_bake:
             old_frame = frame
             while next_frame in used:
                 next_frame += 1
@@ -659,6 +841,7 @@ def _bake_marker(snapshot: dict[str, Any]) -> str:
 
 def _cached_bake(
     usable_views: list[object], target: object, candidate: dict[str, Any],
+    *, prepared_states: dict[str, tuple[dict[str, Any], str]] | None = None,
 ) -> bool:
     frames: set[int] = set()
     target_uuid = str(getattr(target, "view_uuid", ""))
@@ -667,12 +850,18 @@ def _cached_bake(
         if frame <= 0 or frame in frames:
             return False
         frames.add(frame)
-        snapshot = (
-            candidate
-            if str(getattr(view, "view_uuid", "")) == target_uuid
-            else parse_state(view.state_json)
-        )
-        if str(getattr(view, "bake_hash", "")) != _bake_marker(snapshot):
+        identifier = str(getattr(view, "view_uuid", ""))
+        if prepared_states is not None and identifier in prepared_states:
+            _snapshot, marker = prepared_states[identifier]
+        else:
+            snapshot = (
+                candidate if identifier == target_uuid
+                else parse_state(view.state_json)
+            )
+            marker = _bake_marker(snapshot)
+            if prepared_states is not None:
+                prepared_states[identifier] = (snapshot, marker)
+        if str(getattr(view, "bake_hash", "")) != marker:
             return False
     return True
 
@@ -690,9 +879,18 @@ def prepare_bake(
             or str(getattr(view, "view_uuid", "")) == target_uuid
         )
     ]
-    transaction = BakeTransaction(scene=scene, frame_end=int(scene.frame_end))
+    transaction = BakeTransaction(
+        scene=scene, frame_end=int(scene.frame_end),
+        next_frame_cursor=int(getattr(
+            getattr(scene, "webtoon_comic_settings", None),
+            "next_timeline_frame", 0,
+        )),
+    )
     try:
-        if not force and _cached_bake(usable_views, target, candidate):
+        prepared_states: dict[str, tuple[dict[str, Any], str]] = {}
+        if not force and _cached_bake(
+            usable_views, target, candidate, prepared_states=prepared_states,
+        ):
             transaction.target_frame = int(target.timeline_frame)
             transaction.cached = True
             scene.frame_end = max(
@@ -702,45 +900,50 @@ def prepare_bake(
             return transaction
         frames = _allocate_frames(scene, usable_views, transaction)
         transaction.target_frame = frames[target_uuid]
-        snapshots: list[tuple[object, dict[str, Any], dict[ChannelKey, SnapshotChannel]]] = []
+        lookup = _SnapshotLookup.from_scene(scene)
+        channels_by_key: dict[ChannelKey, list[tuple[int, SnapshotChannel]]] = {}
         for view in usable_views:
-            state = (
-                candidate
-                if str(getattr(view, "view_uuid", "")) == target_uuid
-                else parse_state(view.state_json)
-            )
-            snapshots.append((view, state, snapshot_channels(scene, state)))
+            identifier = str(getattr(view, "view_uuid", ""))
+            prepared = prepared_states.pop(identifier, None)
+            if prepared is None:
+                state = (
+                    candidate if identifier == target_uuid
+                    else parse_state(view.state_json)
+                )
+                marker = _bake_marker(state)
+            else:
+                state, marker = prepared
+            for key, channel in snapshot_channels(scene, state, lookup=lookup).items():
+                channels_by_key.setdefault(key, []).append((frames[identifier], channel))
             transaction.bake_assignments.append((
-                view, str(getattr(view, "bake_hash", "")), _bake_marker(state)
+                view, str(getattr(view, "bake_hash", "")), marker,
             ))
 
-        all_keys: set[ChannelKey] = set()
-        for _view, _state, channels in snapshots:
-            all_keys.update(channels)
         needed: set[ChannelKey] = set()
-        for key in all_keys:
-            channels = [mapping[key] for _view, _state, mapping in snapshots if key in mapping]
-            sample = channels[0]
+        for key, entries in channels_by_key.items():
+            sample = entries[0][1]
             if not sample.animatable:
                 transaction.apply_only_channels += 1
                 continue
-            if _values_differ(channel.value for channel in channels):
+            if _values_differ(channel.value for _frame, channel in entries):
                 needed.add(key)
                 continue
-            if _action_curve(sample.owner, key) is not None:
+            if _indexed_curve(transaction, sample.owner, key) is not None:
                 needed.add(key)
 
         action_cache: dict[int, object] = {}
+        driver_cache: dict[int, set[tuple[str, int]]] = {}
         boundary_curves: set[int] = set()
         owned_frames = set(frames.values())
         for key in sorted(
             needed,
             key=lambda item: (item.owner_uuid, item.data_path, item.array_index),
         ):
-            sample = next(
-                mapping[key] for _view, _state, mapping in snapshots if key in mapping
-            )
-            if _driver_conflict(sample.owner, sample):
+            entries = channels_by_key[key]
+            sample = entries[0][1]
+            if key.owner_pointer not in driver_cache:
+                driver_cache[key.owner_pointer] = _active_drivers(sample.owner)
+            if (key.data_path, key.array_index) in driver_cache[key.owner_pointer]:
                 if sample.strict_driver:
                     raise RuntimeError(f"Driver conflicts with {sample.label}")
                 # Rig deformation channels commonly contain driver-evaluated output.
@@ -774,12 +977,9 @@ def prepare_bake(
                     boundary_value, discrete=True,
                 )
                 boundary_curves.add(curve_pointer)
-            for view, _state, mapping in snapshots:
-                channel = mapping.get(key)
-                if channel is None:
-                    continue
+            for frame, channel in entries:
                 _write_point(
-                    transaction, curve, frames[str(view.view_uuid)],
+                    transaction, curve, frame,
                     channel.value, discrete=True,
                 )
             curve.update()

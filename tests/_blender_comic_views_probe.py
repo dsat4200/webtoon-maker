@@ -1,4 +1,4 @@
-"""Assertions executed inside Blender 4.5 by test_blender_extension.py."""
+"""Assertions executed inside Blender 4.5/5.2 by test_blender_extension.py."""
 from __future__ import annotations
 
 import json
@@ -15,6 +15,9 @@ import bpy
 
 extension_root = Path(os.environ["WEBTOON_EXTENSION_ROOT"])
 sys.path.insert(0, str(extension_root.parent))
+sys.path.insert(0, str(Path(__file__).parent))
+
+from _blender_action_test_utils import owner_curve, owner_curves  # noqa: E402
 
 import webtoon_comic_views as addon  # noqa: E402
 from webtoon_comic_views import (  # noqa: E402
@@ -87,7 +90,11 @@ try:
         "type": "HELLO", "protocol": PROTOCOL_VERSION,
         "token": "probe-token",
     }).encode("utf-8") + b"\n")
-    assert receive_line(good)["type"] == "HELLO"
+    hello = receive_line(good)
+    assert hello["type"] == "HELLO"
+    assert hello["extension_version"] == addon.EXTENSION_VERSION
+    assert hello["blender_version"] == bpy.app.version_string
+    assert {"layered_actions", "published_png"} <= set(hello["capabilities"])
     good.close()
     server.stop()
 
@@ -144,7 +151,7 @@ try:
         bpy.context, runtime, extension_version=addon.EXTENSION_VERSION,
         protocol_version=PROTOCOL_VERSION,
     )
-    assert "Extension: 0.5.1" in report
+    assert f"Extension: {addon.EXTENSION_VERSION}" in report
     assert "Authentication token: [redacted]" in report
     assert "Render published" in report
     assert view.view_uuid in report
@@ -283,7 +290,7 @@ try:
         (curve.data_path, curve.array_index): float(
             next(point for point in curve.keyframe_points if point.co.x == 2).co.y
         )
-        for curve in camera.animation_data.action.fcurves
+        for curve in owner_curves(camera)
     }
     original_camera_styles = {
         (curve.data_path, curve.array_index): (
@@ -291,7 +298,7 @@ try:
             str(point.handle_right_type), tuple(point.handle_left),
             tuple(point.handle_right),
         )
-        for curve in camera.animation_data.action.fcurves
+        for curve in owner_curves(camera)
         for point in curve.keyframe_points if point.co.x == 2
     }
 
@@ -379,8 +386,8 @@ try:
     runtime.save_view_state(scene, timeline_two)
     scene.webtoon_comic_settings.loaded_view_uuid = timeline_two.view_uuid
     assert timeline_two.timeline_frame > first_timeline_frame
-    assert timeline_one.bake_hash.startswith("1:")
-    assert timeline_two.bake_hash.startswith("1:")
+    assert timeline_one.bake_hash.startswith(f"{timeline.BAKE_VERSION}:")
+    assert timeline_two.bake_hash.startswith(f"{timeline.BAKE_VERSION}:")
 
     runtime.load_view_state(scene, timeline_one)
     assert scene.frame_current == timeline_one.timeline_frame
@@ -422,35 +429,31 @@ try:
     )
     camera_action = camera.animation_data.action
     assert shared_camera.animation_data.action is not camera_action
-    assert camera_action.fcurves.find('["comic_pose"]', index=0) is not None
-    assert camera_action.fcurves.find('["static_pose"]', index=0) is None
-    assert camera_action.fcurves.find("delta_location", index=0) is not None
-    assert camera.data.animation_data.action.fcurves.find("lens", index=0) is not None
-    assert light.data.animation_data.action.fcurves.find("energy", index=0) is not None
-    shape_action = shape_object.data.shape_keys.animation_data.action
-    assert shape_action.fcurves.find(
+    assert owner_curve(camera, '["comic_pose"]', index=0) is not None
+    assert owner_curve(camera, '["static_pose"]', index=0) is None
+    assert owner_curve(camera, "delta_location", index=0) is not None
+    assert owner_curve(camera.data, "lens", index=0) is not None
+    assert owner_curve(light.data, "energy", index=0) is not None
+    assert owner_curve(shape_object.data.shape_keys,
         'key_blocks["Expression"].value', index=0
     ) is not None
-    assert shape_object.animation_data.action.fcurves.find(
+    assert owner_curve(shape_object,
         'modifiers["Timeline Probe Modifier"].show_viewport', index=0
     ) is not None
-    assert scene.animation_data.action.fcurves.find(
+    assert owner_curve(scene,
         "render.film_transparent", index=0
     ) is not None
-    pose_action = armature.animation_data.action
-    assert pose_action.fcurves.find(
+    assert owner_curve(armature,
         'pose.bones["Control"]["pose_strength"]', index=0
     ) is not None
-    assert pose_action.fcurves.find(
+    assert owner_curve(armature,
         'pose.bones["Axis Control"].rotation_axis_angle', index=0
     ) is not None
-    for action in (
-        camera_action, camera.data.animation_data.action,
-        light.data.animation_data.action, shape_action,
-        shape_object.animation_data.action, scene.animation_data.action,
-        pose_action,
+    for owner in (
+        camera, camera.data, light.data, shape_object.data.shape_keys,
+        shape_object, scene, armature,
     ):
-        for curve in action.fcurves:
+        for curve in owner_curves(owner):
             for owned_frame in (timeline_one.timeline_frame, timeline_two.timeline_frame):
                 point = next(
                     (
@@ -461,7 +464,7 @@ try:
                 )
                 if point is not None:
                     assert point.interpolation == "CONSTANT"
-    for curve in camera_action.fcurves:
+    for curve in owner_curves(camera):
         original = original_camera_keys.get((curve.data_path, curve.array_index))
         if original is None:
             continue
@@ -475,7 +478,7 @@ try:
 
     # Cached selection performs no normal rewrite, but externally damaged
     # owned keys are detected after dependency-graph evaluation and repaired.
-    location_x = camera_action.fcurves.find("location", index=0)
+    location_x = owner_curve(camera, "location", index=0)
     damaged = next(
         point for point in location_x.keyframe_points
         if point.co.x == timeline_one.timeline_frame
@@ -611,7 +614,7 @@ try:
             (float(point.co.x), float(point.co.y), str(point.interpolation))
             for point in curve.keyframe_points
         ]
-        for curve in camera.animation_data.action.fcurves
+        for curve in owner_curves(camera)
     }
     failed_view = timeline_view("Rollback Probe")
     try:
@@ -632,7 +635,7 @@ try:
             (float(point.co.x), float(point.co.y), str(point.interpolation))
             for point in curve.keyframe_points
         ]
-        for curve in camera.animation_data.action.fcurves
+        for curve in owner_curves(camera)
     }
     camera.driver_remove("location", 0)
     scene.webtoon_comic_views.remove(len(scene.webtoon_comic_views) - 1)

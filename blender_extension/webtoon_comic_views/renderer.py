@@ -17,6 +17,7 @@ from . import viewport
 MAX_AXIS = 4096
 MAX_PIXELS = 16_777_216
 THUMBNAIL_LIMIT = 256
+THUMBNAIL_ICON_LIMIT = 32
 
 
 @dataclass(frozen=True)
@@ -175,48 +176,102 @@ def render_thumbnail(
     )
 
 
+def _resize_pixels(source: np.ndarray, limit: int) -> np.ndarray:
+    source_height, source_width = source.shape[:2]
+    ratio = min(1.0, limit / max(1, source_width, source_height))
+    width = max(1, round(source_width * ratio))
+    height = max(1, round(source_height * ratio))
+    if (width, height) == (source_width, source_height):
+        return np.ascontiguousarray(source)
+    rows = np.linspace(0, source_height - 1, height).round().astype(int)
+    columns = np.linspace(0, source_width - 1, width).round().astype(int)
+    # Index both axes together: the intermediate must stay thumbnail-sized,
+    # even when reducing a large, wide render.
+    return np.ascontiguousarray(source[rows[:, None], columns])
+
+
 def thumbnail_from_frame(frame: RenderFrame) -> RenderFrame:
     """Create a compact nearest-neighbor preview from an existing render."""
-    ratio = min(
-        THUMBNAIL_LIMIT / max(1, frame.width),
-        THUMBNAIL_LIMIT / max(1, frame.height),
-    )
-    width = max(1, round(frame.width * min(1.0, ratio)))
-    height = max(1, round(frame.height * min(1.0, ratio)))
-    if (width, height) == (frame.width, frame.height):
-        return frame
     source = np.frombuffer(frame.rgba, dtype=np.uint8).reshape(
         frame.height, frame.width, 4
     )
-    rows = np.linspace(0, frame.height - 1, height).round().astype(int)
-    columns = np.linspace(0, frame.width - 1, width).round().astype(int)
-    resized = np.ascontiguousarray(source[rows][:, columns])
+    resized = _resize_pixels(source, THUMBNAIL_LIMIT)
+    height, width = resized.shape[:2]
+    if (width, height) == (frame.width, frame.height):
+        return frame
     return RenderFrame(width, height, resized.tobytes())
 
 
-def update_thumbnail_image(view: object, frame: RenderFrame) -> None:
-    """Store a packed preview image and compact PNG copy in the .blend."""
-    name = str(view.thumbnail_image or f"Webtoon Comic View {view.view_uuid}")
-    image = bpy.data.images.get(name)
+def _set_thumbnail_preview(image: object, pixels: np.ndarray) -> None:
+    """Replace both cached UI sizes, using Blender's bottom-up pixel order."""
+    preview = image.preview_ensure()
+    for kind, limit in (("image", THUMBNAIL_LIMIT), ("icon", THUMBNAIL_ICON_LIMIT)):
+        resized = _resize_pixels(pixels, limit)
+        height, width = resized.shape[:2]
+        setattr(preview, f"{kind}_size", (width, height))
+        setattr(preview, f"is_{kind}_custom", True)
+        getattr(preview, f"{kind}_pixels_float").foreach_set(resized.reshape(-1))
+
+
+def ensure_thumbnail_preview(view: object) -> None:
+    """Seed old .blend thumbnails once at load; panel draws only read previews."""
+    image = bpy.data.images.get(view.thumbnail_image)
     if image is None:
-        image = bpy.data.images.new(
-            name, width=frame.width, height=frame.height, alpha=True
-        )
-    elif tuple(image.size) != (frame.width, frame.height):
-        image.scale(frame.width, frame.height)
+        return
+    # Older versions packed generated images without changing their source;
+    # Blender regenerates a blank buffer for those on reopening the .blend.
+    if image.source == "GENERATED" and image.packed_file is not None:
+        image.source = "FILE"
+    preview = image.preview
+    if preview is not None and preview.is_image_custom and preview.is_icon_custom:
+        return
+    width, height = tuple(image.size)
+    if width <= 0 or height <= 0:
+        return
+    pixels = np.empty(width * height * 4, dtype=np.float32)
+    image.pixels.foreach_get(pixels)
+    _set_thumbnail_preview(image, pixels.reshape(height, width, 4))
+
+
+def release_thumbnail_image(name: str) -> None:
+    """Free an unused thumbnail and its preview, preserving shared images."""
+    if not name or any(
+        view.thumbnail_image == name
+        for scene in bpy.data.scenes
+        for view in getattr(scene, "webtoon_comic_views", ())
+    ):
+        return
+    image = bpy.data.images.get(name)
+    if image is not None and image.users <= int(image.use_fake_user):
+        bpy.data.images.remove(image)
+
+
+def update_thumbnail_image(view: object, frame: RenderFrame) -> None:
+    """Commit a fresh packed image and UI preview after successful preparation."""
+    frame = thumbnail_from_frame(frame)
+    encoded = png_bytes(frame)
+    encoded_text = base64.b64encode(encoded).decode("ascii")
+    previous_name = str(view.thumbnail_image)
     rows = np.frombuffer(frame.rgba, dtype=np.uint8).reshape(
         frame.height, frame.width, 4
     )
-    pixels = np.flipud(rows).astype(np.float32).reshape(-1) / 255.0
-    image.pixels.foreach_set(pixels)
-    image.update()
-    image.use_fake_user = True
-    encoded = png_bytes(frame)
+    pixels = np.ascontiguousarray(np.flipud(rows), dtype=np.float32) / 255.0
+    # Duplicated Comic Views can initially share a packed thumbnail. Build a
+    # replacement before changing either the image or preview seen by a view.
+    image = bpy.data.images.new(
+        f"Webtoon Comic View {view.view_uuid}",
+        width=frame.width, height=frame.height, alpha=True,
+    )
     try:
+        image.pixels.foreach_set(pixels.reshape(-1))
+        image.update()
+        image.use_fake_user = True
         image.pack(data=encoded, data_len=len(encoded))
-    except RuntimeError:
-        # Generated images are already stored in the blend; packing is an
-        # additional size optimization and is not required for persistence.
-        pass
+        image.source = "FILE"
+        _set_thumbnail_preview(image, pixels)
+    except Exception:
+        bpy.data.images.remove(image)
+        raise
     view.thumbnail_image = image.name
-    view.thumbnail_png = base64.b64encode(encoded).decode("ascii")
+    view.thumbnail_png = encoded_text
+    release_thumbnail_image(previous_name)

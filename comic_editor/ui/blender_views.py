@@ -8,7 +8,9 @@ from PySide6.QtWidgets import (
     QPushButton, QSpinBox, QVBoxLayout, QWidget,
 )
 
-from comic_editor.integrations.blender_source import ComicViewInfo
+from comic_editor.integrations.blender_source import (
+    BLENDER_52_EXTENSION_VERSION, BlenderProviderInfo, ComicViewInfo,
+)
 
 
 class BlenderViewsWidget(QWidget):
@@ -50,6 +52,14 @@ class BlenderViewsWidget(QWidget):
         self.status = QLabel("Disconnected", self)
         self.status.setWordWrap(True)
         layout.addWidget(self.status)
+        self.provider_version = QLabel(self)
+        self.provider_version.setWordWrap(True)
+        self.provider_version.setToolTip(
+            f"Blender 5.2 requires Webtoon Comic Views {BLENDER_52_EXTENSION_VERSION} or later. "
+            "Older extensions do not report their version."
+        )
+        self.provider_version.hide()
+        layout.addWidget(self.provider_version)
 
         self.list = QListWidget(self)
         self.list.setViewMode(QListWidget.IconMode)
@@ -94,6 +104,19 @@ class BlenderViewsWidget(QWidget):
 
     def set_status_message(self, message: str) -> None:
         self.status.setText(str(message))
+
+    def set_provider_info(self, info: BlenderProviderInfo | None) -> None:
+        if info is None:
+            self.provider_version.clear()
+            self.provider_version.hide()
+            return
+        blender = f"Blender {info.blender_version}" if info.blender_version else "Blender"
+        extension = (
+            f"Comic Views {info.extension_version}"
+            if info.extension_version else "Comic Views version unavailable"
+        )
+        self.provider_version.setText(f"{blender} • {extension}")
+        self.provider_version.show()
 
     def set_relink_mode(self, enabled: bool, name: str = "") -> None:
         self._relinking = bool(enabled)

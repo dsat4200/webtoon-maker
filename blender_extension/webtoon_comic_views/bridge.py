@@ -18,6 +18,7 @@ from .state import (
     apply_state, capture_state, migrate_legacy_presentation, parse_state,
     state_digest, state_json, view_layer_for_state,
 )
+from .version import EXTENSION_VERSION
 
 
 PROTOCOL_VERSION = 3
@@ -107,6 +108,7 @@ class BridgeServer:
         self.host = "127.0.0.1"
         self.port = 47837
         self.token = ""
+        self._provider_info: dict[str, Any] = {}
         self._server: socket.socket | None = None
         self._accept_thread: threading.Thread | None = None
         self._stop = threading.Event()
@@ -122,6 +124,12 @@ class BridgeServer:
 
     def start(self, port: int, token: str) -> None:
         self.stop()
+        # Snapshot Blender metadata on the main thread, before socket workers.
+        self._provider_info = {
+            "extension_version": EXTENSION_VERSION,
+            "blender_version": bpy.app.version_string,
+            "capabilities": ["layered_actions", "published_png"],
+        }
         self.port = max(1024, min(65535, int(port)))
         self.token = str(token)
         server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -293,6 +301,7 @@ class BridgeServer:
                         self._direct_send(connection, {
                             "type": "HELLO", "protocol": PROTOCOL_VERSION,
                             "provider": "webtoon_comic_views",
+                            **self._provider_info,
                         })
                         self.incoming.put({
                             "type": "_CONNECTED",
@@ -446,6 +455,7 @@ class BridgeRuntime:
     def save_view_state(
         self, scene: bpy.types.Scene, view: object,
     ) -> list[str]:
+        started = time.perf_counter()
         bounds = viewport.frame_bounds(view)
         width, height = viewport.derive_resolution(view.width, bounds, scene)
         viewport.set_working_resolution(view, width, height)
@@ -453,9 +463,11 @@ class BridgeRuntime:
             scene, bpy.context.view_layer,
             stream_frame=bounds, output_resolution=(width, height),
         )
+        captured_at = time.perf_counter()
         transaction = timeline.prepare_bake(
             scene, list(self._views(scene)), view, captured
         )
+        baked_at = time.perf_counter()
         original_frame = int(scene.frame_current)
         original_subframe = float(scene.frame_subframe)
         old_metadata = (
@@ -517,6 +529,15 @@ class BridgeRuntime:
         self.ignore_updates_until = time.monotonic() + 0.3
         self.state_check_due = 0.0
         self.send_views(scene)
+        finished = time.perf_counter()
+        diagnostics.record(
+            "INFO", "Comic View saved", view=getattr(view, "name", ""),
+            elapsed_ms=round((finished - started) * 1000),
+            capture_ms=round((captured_at - started) * 1000),
+            bake_ms=round((baked_at - captured_at) * 1000),
+            restore_ms=round((finished - baked_at) * 1000),
+            cached=transaction.cached,
+        )
         return warnings
 
     def capture_into_view(
@@ -740,6 +761,7 @@ class BridgeRuntime:
         view.published_frame_path = str(destination)
         view.updated_at = time.time()
         prune_published_frames(destination.parent)
+        viewport.tag_redraw()
         self.send_views(scene)
         self.last_error = ""
         diagnostics.record(

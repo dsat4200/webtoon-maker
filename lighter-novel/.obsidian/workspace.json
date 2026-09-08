@@ -55,12 +55,12 @@
             "state": {
               "type": "markdown",
               "state": {
-                "file": "Not Implemented.md",
+                "file": "implemented.md",
                 "mode": "source",
                 "source": false
               },
               "icon": "lucide-file",
-              "title": "Not Implemented"
+              "title": "implemented"
             }
           },
           {
@@ -314,10 +314,11 @@
   },
   "active": "7f0a4da81575daa1",
   "lastOpenFiles": [
+    "Not Implemented.md",
+    "implemented.md",
+    "Pasted image 20260729180627.png",
     "Pasted image 20260907122039.png",
     "Pasted image 20260907121943.png",
-    "implemented.md",
-    "Not Implemented.md",
     "technical art plugins/Technical Art Plugins, Wishlist.md",
     "Pasted image 20260906150201.png",
     "Pasted image 20260906150148.png",
@@ -330,8 +331,6 @@
     "characters.md",
     "planning/lighter novel/what is the lighter novel.md",
     "Glendale Community College - Arizona/Glendale community college re-creation.md",
-    "Glendale Community College - Arizona/Pasted image 20260904155809.png",
-    "Pasted image 20260904152041.png",
     "Glendale Community College - California/Glendale Community College - Recreation.md",
     "Glendale Community College - Arizona",
     "Glendale Community College/Unconfirmed 962460.crdownload",

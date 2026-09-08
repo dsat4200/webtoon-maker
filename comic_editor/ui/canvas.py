@@ -52,7 +52,7 @@ from comic_editor.core.models import (
     ColorGradientRamp, ColorGradientStop, DocumentObject, GradientObject,
     GridSettings, LineGradientField, LayerNode, RadialGradientField,
     ImageObject, PathContour, PathNode, RasterObject, ShapeStyle, TextObject,
-    BlurModifier, OutlineModifier, MirrorModifier, RadialBlurModifier, ToneMask,
+    BlurModifier, OutlineModifier, MirrorModifier, ArrayModifier, RadialBlurModifier, ToneMask, StrokeModifier,
     SpeedLineCenterObject, SpeedLinesGradientObject, VectorDrawingObject,
     VectorStroke, VectorStrokePoint, new_id,
     ImageSourceDescriptor, canonical_argb, image_source_from_dict,
@@ -89,10 +89,13 @@ from comic_editor.ui.shape_outline import (
 )
 from comic_editor.ui.shape_outline_compound import OutlineSource, compound_outline, ribbon_source
 from comic_editor.ui.spatial_modifier_features import SpatialModifierFeatures
+from comic_editor.ui.array_features import ArrayFeatures
 from comic_editor.ui.text_features import TextFeatures
 from comic_editor.ui.cage_features import CageFeatures
 from comic_editor.core.models import CageTransformModifier, TilingModifier
 from comic_editor.ui.tiling_features import TilingFeatures
+from comic_editor.ui.mask_gradient import MaskGradientFeatures
+from comic_editor.ui.mask_selection import MaskSelectionFeatures
 
 
 class ToolKind(Enum):
@@ -102,6 +105,7 @@ class ToolKind(Enum):
     EYEDROPPER = "eyedropper"
     FILL = "fill"
     GRADIENT = "gradient"
+    MASK_SELECT = "mask_select"
     TEXT_EDIT = "text_edit"
     TRANSFORM = "transform"
     CAGE_TRANSFORM = "cage_transform"
@@ -551,7 +555,7 @@ class CanvasPerformanceMonitor:
         }
 
 
-class _CanvasLogic(TilingFeatures, CageFeatures, SpatialModifierFeatures, TextFeatures):
+class _CanvasLogic(MaskSelectionFeatures, MaskGradientFeatures, TilingFeatures, CageFeatures, ArrayFeatures, SpatialModifierFeatures, TextFeatures):
     documentChanged = Signal(object)
     visualChanged = Signal(object)
     selectionChanged = Signal(str, str)
@@ -560,6 +564,7 @@ class _CanvasLogic(TilingFeatures, CageFeatures, SpatialModifierFeatures, TextFe
     chapterReplaced = Signal(object)
     cameraChanged = Signal()
     interactionFinished = Signal()
+    maskContentChanged = Signal()
     toolChanged = Signal(object)
     textEditingChanged = Signal(bool)
     selectionCandidatesRequested = Signal(object, object)
@@ -597,6 +602,9 @@ class _CanvasLogic(TilingFeatures, CageFeatures, SpatialModifierFeatures, TextFe
         self.selected_entities: list[tuple[str, str]] = []
         self.active_modifier_id = ""
         self.active_tone_mask_id = ""
+        self._mask_gradient_drag = None
+        self._mask_selection_gesture = None
+        self._mask_return_tool = None
         self.preview_tone_mask_id = ""
         self._mask_stroke_dirty = QRectF()
         self._mask_stroke_revision_before = 0
@@ -1207,7 +1215,7 @@ class _CanvasLogic(TilingFeatures, CageFeatures, SpatialModifierFeatures, TextFe
             world = self._tiling_boundary(context[0]).boundingRect()
         for layer in reversed(self.chapter.ancestor_layers(obj.parent_layer_id)):
             modifier_ids.extend(layer.modifier_ids)
-        if any(isinstance(self.chapter.modifiers.get(mid), (MirrorModifier, RadialBlurModifier, CageTransformModifier)) for mid in modifier_ids):
+        if any(isinstance(self.chapter.modifiers.get(mid), (MirrorModifier, ArrayModifier, RadialBlurModifier, CageTransformModifier, StrokeModifier)) for mid in modifier_ids):
             return effect_bounds(world, self._active_modifier_instances(modifier_ids))
         padding = max((
             self._modifier_maximum(
@@ -1279,7 +1287,7 @@ class _CanvasLogic(TilingFeatures, CageFeatures, SpatialModifierFeatures, TextFe
             parent = self.chapter.layers[parent_id]
             modifier_ids.extend(parent.modifier_ids)
             parent_id = parent.parent_id
-        if any(isinstance(self.chapter.modifiers.get(mid), (MirrorModifier, RadialBlurModifier, CageTransformModifier)) for mid in modifier_ids):
+        if any(isinstance(self.chapter.modifiers.get(mid), (MirrorModifier, ArrayModifier, RadialBlurModifier, CageTransformModifier, StrokeModifier)) for mid in modifier_ids):
             return effect_bounds(world, self._active_modifier_instances(modifier_ids))
         padding = max((
             self._modifier_maximum(
@@ -1396,6 +1404,7 @@ class _CanvasLogic(TilingFeatures, CageFeatures, SpatialModifierFeatures, TextFe
 
     def _clear_detached_input_state(self) -> None:
         """Reset transient pointer state that cannot survive without a document."""
+        self._mask_selection_gesture = None
         self._effect_jobs.cancel()
         self._clear_creation_gesture()
         self._cancel_text_features()
@@ -1462,6 +1471,10 @@ class _CanvasLogic(TilingFeatures, CageFeatures, SpatialModifierFeatures, TextFe
         self, chapter: ChapterDocument, tiles: TileStore,
         images: ImageStore | None = None, reset_view: bool = True,
     ) -> None:
+        self._cancel_mask_selection()
+        self._mask_gradient_drag = None
+        self.active_tone_mask_id = self.preview_tone_mask_id = ""
+        self._mask_return_tool = None
         self._cage_timer.stop()
         self._cage_session = self._cage_edit_before = self._cage_drag = self._cage_pending = None
         self._modifier_selection.clear()
@@ -1735,6 +1748,8 @@ class _CanvasLogic(TilingFeatures, CageFeatures, SpatialModifierFeatures, TextFe
         self.active_color_slot = slot
 
     def replace_chapter(self, state: dict) -> None:
+        self._cancel_mask_selection()
+        self._mask_gradient_drag = None
         self._cage_timer.stop()
         self._cage_session = self._cage_edit_before = self._cage_drag = self._cage_pending = None
         self._effect_jobs.cancel()
@@ -2440,6 +2455,13 @@ class _CanvasLogic(TilingFeatures, CageFeatures, SpatialModifierFeatures, TextFe
         ), already_done=True)
 
     def set_tool(self, tool: ToolKind) -> bool:
+        if tool == ToolKind.MASK_SELECT and not self.active_tone_mask_id:
+            return False
+        if tool != self.tool:
+            self._cancel_mask_selection()
+            self._finish_mask_gradient()
+            if self.active_tone_mask_id and self._drawing:
+                self._end_mask_stroke()
         if tool == ToolKind.CAGE_TRANSFORM:
             if not self.begin_cage_tool():
                 return False
@@ -2528,7 +2550,7 @@ class _CanvasLogic(TilingFeatures, CageFeatures, SpatialModifierFeatures, TextFe
                     "layer", selected.parent_layer_id,
                     activate_default_tool=False,
                 )
-        if tool in {ToolKind.RASTER_PENCIL, ToolKind.RASTER_ERASER}:
+        if tool in {ToolKind.RASTER_PENCIL, ToolKind.RASTER_ERASER} and not self.active_tone_mask_id:
             if self.selected_kind != "object" or self.chapter is None:
                 return False
             if not isinstance(
@@ -3063,6 +3085,10 @@ class _CanvasLogic(TilingFeatures, CageFeatures, SpatialModifierFeatures, TextFe
             painter.restore()
         painter.save()
         self._draw_tone_mask_preview(painter)
+        self._draw_mask_selection(painter)
+        mask_gradient = self.active_mask_gradient()
+        if mask_gradient is not None and self.tool == ToolKind.GRADIENT:
+            self._draw_gradient_edit_handles(painter, mask_gradient)
         if not (self.active_tone_mask_id or self.preview_tone_mask_id):
             self._draw_selection(painter)
             self._draw_focal_modifier_handles(painter)
@@ -3133,9 +3159,17 @@ class _CanvasLogic(TilingFeatures, CageFeatures, SpatialModifierFeatures, TextFe
         painter.restore()
 
     def set_tone_mask_mode(self, mask_id: str) -> None:
+        self._cancel_mask_selection()
+        self._finish_mask_gradient()
+        self._cancel_gradient_creation()
+        if mask_id and not self.active_tone_mask_id:
+            self._mask_return_tool = self.tool
         if self._drawing and self.active_tone_mask_id:
             self._end_mask_stroke()
         self.active_tone_mask_id = str(mask_id)
+        if not mask_id and self._mask_return_tool is not None:
+            previous_tool, self._mask_return_tool = self._mask_return_tool, None
+            self.set_tool(previous_tool)
         self.preview_tone_mask_id = ""
         self._mask_sample_timer.stop()
         self._mask_sample_queue.clear()
@@ -3178,6 +3212,16 @@ class _CanvasLogic(TilingFeatures, CageFeatures, SpatialModifierFeatures, TextFe
         width, height = max(1, self.width()), max(1, self.height())
         mask = self.chapter.masks.get(mask_id)
         if mask is None:
+            return
+        if mask.paint_has_subtractions:
+            field = self.render_tone_mask_field(
+                mask_id, width, height, self.camera_transform(),
+                self.visible_document_rect(),
+            )
+            painter.save()
+            painter.setTransform(QTransform())
+            painter.drawImage(0, 0, self._blue_mask_image(field))
+            painter.restore()
             return
         transform = self.camera_transform()
         transform_key = tuple(round(value, 6) for value in (
@@ -4384,7 +4428,7 @@ class _CanvasLogic(TilingFeatures, CageFeatures, SpatialModifierFeatures, TextFe
                     painter, self.chapter.objects[child.entity_id], opacity,
                     local_visible,
                 )
-        if layer.border_width > 0:
+        if layer.border_width > 0 and getattr(self, "_stroke_hide_border_id", None) != layer.layer_id:
             painter.save()
             painter.setOpacity(opacity)
             painter.setClipPath(layer_path, Qt.IntersectClip)
@@ -4423,7 +4467,7 @@ class _CanvasLogic(TilingFeatures, CageFeatures, SpatialModifierFeatures, TextFe
     ) -> None:
         if self._render_tiled_target(painter, layer, parent_opacity, visible_world):
             return
-        if layer.layer_kind == "text_container" or any(isinstance(m, (MirrorModifier, RadialBlurModifier, CageTransformModifier)) for m in self._active_modifier_instances(layer.modifier_ids)):
+        if layer.layer_kind == "text_container" or any(isinstance(m, (MirrorModifier, ArrayModifier, RadialBlurModifier, CageTransformModifier, StrokeModifier)) for m in self._active_modifier_instances(layer.modifier_ids)):
             self._render_mirror_target(painter, layer, parent_opacity, visible_world)
             return
         world_bounds = self.entity_world_rect("layer", layer.layer_id)
@@ -4698,7 +4742,7 @@ class _CanvasLogic(TilingFeatures, CageFeatures, SpatialModifierFeatures, TextFe
     ) -> None:
         if not layer.visible:
             return
-        if ("layer", layer.layer_id) not in self._render_modifier_sources and any(isinstance(modifier, (MirrorModifier, RadialBlurModifier, CageTransformModifier)) for modifier in self._active_modifier_instances(layer.modifier_ids)):
+        if ("layer", layer.layer_id) not in self._render_modifier_sources and any(isinstance(modifier, (MirrorModifier, ArrayModifier, RadialBlurModifier, CageTransformModifier)) for modifier in self._active_modifier_instances(layer.modifier_ids)):
             self._render_mirror_target(painter, layer, parent_opacity, visible_world)
             return
         painter.save()
@@ -7370,6 +7414,10 @@ class _CanvasLogic(TilingFeatures, CageFeatures, SpatialModifierFeatures, TextFe
         )
         if cached is None:
             result = np.zeros((height, width), dtype=np.float32)
+            if mask.gradient is not None:
+                result += self._render_mask_gradient_field(
+                    mask.gradient, width, height, world_to_image
+                )
             for kind, entity_id in mask.contributors:
                 image = QImage(
                     width, height, QImage.Format.Format_ARGB32_Premultiplied
@@ -7422,7 +7470,10 @@ class _CanvasLogic(TilingFeatures, CageFeatures, SpatialModifierFeatures, TextFe
                     tile,
                 )
             painter.end()
-            result += self._image_alpha_array(paint)
+            result += (
+                self._signed_mask_paint(paint)
+                if mask.paint_has_subtractions else self._image_alpha_array(paint)
+            )
         return np.clip(result, 0.0, 1.0)
 
     @staticmethod
@@ -7611,10 +7662,10 @@ class _CanvasLogic(TilingFeatures, CageFeatures, SpatialModifierFeatures, TextFe
         if self._cage_session is not None and ("object", obj.object_id) in self._cage_session["targets"]:
             self._render_mirror_target(painter, obj, parent_opacity, local_visible)
             return
-        if isinstance(obj, RasterObject) and (obj.modifier_source_frame is not None or any(isinstance(m, RadialBlurModifier) for m in self._active_modifier_instances(obj.modifier_ids))):
+        if isinstance(obj, RasterObject) and (obj.modifier_source_frame is not None or any(isinstance(m, (RadialBlurModifier, ArrayModifier)) for m in self._active_modifier_instances(obj.modifier_ids))):
             self._render_radial_raster(painter, obj, parent_opacity, local_visible)
             return
-        if any(isinstance(m, (MirrorModifier, RadialBlurModifier, CageTransformModifier)) for m in self._active_modifier_instances(obj.modifier_ids)):
+        if any(isinstance(m, (MirrorModifier, ArrayModifier, RadialBlurModifier, CageTransformModifier, StrokeModifier)) for m in self._active_modifier_instances(obj.modifier_ids)):
             self._render_mirror_target(painter, obj, parent_opacity, local_visible)
             return
         modifiers = self._active_modifier_instances(
@@ -7795,8 +7846,9 @@ class _CanvasLogic(TilingFeatures, CageFeatures, SpatialModifierFeatures, TextFe
                 source.end()
             self._modifier_source_cache_put(key, image)
         modifiers = self._active_modifier_instances(target.modifier_ids, suppress_outline=self._suppress_outline_for_mask)
+        has_stroke = any(isinstance(modifier, StrokeModifier) for modifier in modifiers)
         opacity = target.opacity if layer or not target.opacity_locked else 1.0
-        if modifiers and isinstance(modifiers[-1], MirrorModifier) and not modifiers[-1].parameter_masks and target.opacity_mask is None and parent_opacity * opacity == 1:
+        if not has_stroke and modifiers and isinstance(modifiers[-1], MirrorModifier) and not modifiers[-1].parameter_masks and target.opacity_mask is None and parent_opacity * opacity == 1:
             # Axis dragging reuses the source stages without allocating the gap.
             image, bounds = render_stages(self, image, bounds, modifiers[:-1], mapping, nearest=isinstance(target, RasterObject), request_scope=request_scope)
             mirror = modifiers[-1]
@@ -7812,7 +7864,11 @@ class _CanvasLogic(TilingFeatures, CageFeatures, SpatialModifierFeatures, TextFe
             painter.drawImage(bounds.topLeft(), image)
             painter.restore()
             return
-        image, bounds = render_stages(self, image, bounds, modifiers, mapping, nearest=isinstance(target, RasterObject), required=inverse.mapRect(visible) if layer else visible, request_scope=request_scope)
+        if has_stroke:
+            from comic_editor.ui.stroke_rendering import render_stroke_stack
+            image, bounds = render_stroke_stack(self, target, image, bounds, modifiers, mapping, key, request_scope)
+        else:
+            image, bounds = render_stages(self, image, bounds, modifiers, mapping, nearest=isinstance(target, RasterObject), required=inverse.mapRect(visible) if layer else visible, request_scope=request_scope)
         if target.opacity_mask is not None:
             binding = target.opacity_mask
             field = self.render_tone_mask_field(binding.mask_id, image.width(), image.height(), self._world_to_image_transform(mapping, bounds, image.width(), image.height()), mapping.mapRect(bounds))
@@ -7822,6 +7878,8 @@ class _CanvasLogic(TilingFeatures, CageFeatures, SpatialModifierFeatures, TextFe
         painter.setOpacity(parent_opacity * opacity)
         if isinstance(target, RasterObject):
             self._set_crisp_raster_transform(painter)
+        elif has_stroke:
+            painter.setRenderHint(QPainter.SmoothPixmapTransform, True)
         painter.drawImage(bounds.topLeft(), image)
         painter.restore()
 
@@ -8855,6 +8913,11 @@ class _CanvasLogic(TilingFeatures, CageFeatures, SpatialModifierFeatures, TextFe
     def _gradient_control_points(
         self, obj: GradientObject,
     ) -> dict[str, QPointF]:
+        if obj is self.active_mask_gradient():
+            return {
+                f"node:{node.node_id}": QPointF(*node.position)
+                for node in obj.line_field.geometry.nodes
+            }
         result: dict[str, QPointF] = {}
         if obj.field_type == "line":
             geometry = obj.line_field.geometry
@@ -9003,6 +9066,9 @@ class _CanvasLogic(TilingFeatures, CageFeatures, SpatialModifierFeatures, TextFe
     def _draw_gradient_edit_handles(
         self, painter: QPainter, obj: GradientObject,
     ) -> None:
+        if obj is self.active_mask_gradient():
+            self._draw_mask_gradient_handles(painter, obj)
+            return
         scale = max(self.scale, 0.05)
         controls = self._gradient_control_points(obj)
         painter.save()
@@ -10032,6 +10098,11 @@ class _CanvasLogic(TilingFeatures, CageFeatures, SpatialModifierFeatures, TextFe
                 modifier.points = [transform.map(QPointF(*p)).toTuple() for p in modifier.points]
                 modifier.pivot = transform.map(QPointF(*modifier.pivot)).toTuple()
                 continue
+            if isinstance(modifier, ArrayModifier) and len(self.chapter.modifier_target_ids(modifier_id)) == 1:
+                modifier.axis_start = transform.map(QPointF(*modifier.axis_start)).toTuple()
+                modifier.axis_end = transform.map(QPointF(*modifier.axis_end)).toTuple()
+                modifier.center = transform.map(QPointF(*modifier.center)).toTuple()
+                continue
             if isinstance(modifier, RadialBlurModifier) and len(self.chapter.modifier_target_ids(modifier_id)) == 1:
                 modifier.center = transform.map(QPointF(*modifier.center)).toTuple()
                 continue
@@ -10060,6 +10131,8 @@ class _CanvasLogic(TilingFeatures, CageFeatures, SpatialModifierFeatures, TextFe
         if self._page_gap_draft is not None:
             return
         if self._draw_radial_modifier_handles(painter):
+            return
+        if self._draw_array_handles(painter):
             return
         mirror = self._active_mirror_modifier()
         if mirror is not None:
@@ -12462,6 +12535,7 @@ class _CanvasLogic(TilingFeatures, CageFeatures, SpatialModifierFeatures, TextFe
         if modifiers == Qt.ShiftModifier:
             if (
                 self.tool in {
+                    ToolKind.MASK_SELECT,
                     ToolKind.SHAPE_EDIT,
                     ToolKind.VECTOR_EDIT,
                     ToolKind.DRAW_SELECT_RECT,
@@ -12487,6 +12561,12 @@ class _CanvasLogic(TilingFeatures, CageFeatures, SpatialModifierFeatures, TextFe
             return
         point = QPointF(widget_point)
         world = self.widget_to_document(point)
+        if self.active_tone_mask_id and self.tool == ToolKind.MASK_SELECT:
+            self.setCursor(Qt.CrossCursor)
+            return
+        if self.active_tone_mask_id and self.tool == ToolKind.GRADIENT:
+            self._mask_gradient_hover(world)
+            return
         shape_overlay_hit = self._shape_overlay_hit(point)
         shape_hover_kind = (
             self._shape_hover_target.get("kind")
@@ -12651,6 +12731,7 @@ class _CanvasLogic(TilingFeatures, CageFeatures, SpatialModifierFeatures, TextFe
         if event.button() == Qt.LeftButton:
             self._queue_radial_handle(event.position())
             world = self.widget_to_document(event.position())
+            self._move_mask_selection(world)
             self._queue_free_text_drag(world)
             self._text_placement_move(world)
             if self._active_shape_control == "outline_width":
@@ -12678,6 +12759,9 @@ class _CanvasLogic(TilingFeatures, CageFeatures, SpatialModifierFeatures, TextFe
         return False
 
     def mouseDoubleClickEvent(self, event: QMouseEvent) -> None:  # noqa: N802
+        if self.active_tone_mask_id and self.tool in {ToolKind.GRADIENT, ToolKind.MASK_SELECT}:
+            event.accept()
+            return
         if self._reset_outline_width_at(event.position()):
             event.accept()
             return
@@ -12748,7 +12832,15 @@ class _CanvasLogic(TilingFeatures, CageFeatures, SpatialModifierFeatures, TextFe
         super().mouseDoubleClickEvent(event)
 
     def keyPressEvent(self, event) -> None:  # noqa: N802
-        if event.key() == Qt.Key_Escape and self._modifier_handle_drag and "tiling" in self._modifier_handle_drag:
+        if event.key() == Qt.Key_Escape and self._cancel_mask_selection():
+            event.accept()
+            return
+        if event.key() == Qt.Key_Escape and self._finish_mask_gradient(False):
+            event.accept()
+            return
+        if event.key() == Qt.Key_Escape and self._modifier_handle_drag and any(
+            key in self._modifier_handle_drag for key in ("tiling", "array")
+        ):
             before = self._modifier_handle_drag["before"]
             self._modifier_handle_drag = None
             self.replace_chapter(before)
@@ -13066,6 +13158,7 @@ class _CanvasLogic(TilingFeatures, CageFeatures, SpatialModifierFeatures, TextFe
                 self._tablet_tool_active = False
                 self._queue_radial_handle(event.position())
                 world = self.widget_to_document(event.position())
+                self._move_mask_selection(world)
                 self._queue_free_text_drag(world)
                 self._text_placement_move(world)
                 if self._active_shape_control == "outline_width":
@@ -18608,6 +18701,8 @@ class _CanvasLogic(TilingFeatures, CageFeatures, SpatialModifierFeatures, TextFe
 
     # ---- tool actions --------------------------------------------------
     def _begin_modifier_handle(self, widget_point: QPointF) -> bool:
+        if self._begin_array_handle(widget_point):
+            return True
         if self._begin_tiling_handle(widget_point):
             return True
         if self._begin_radial_handle(widget_point):
@@ -18648,6 +18743,8 @@ class _CanvasLogic(TilingFeatures, CageFeatures, SpatialModifierFeatures, TextFe
         return True
 
     def _move_modifier_handle(self, widget_point: QPointF) -> bool:
+        if self._move_array_handle(widget_point):
+            return True
         if self._move_tiling_handle(widget_point):
             return True
         if self._queue_radial_handle(widget_point):
@@ -18715,7 +18812,7 @@ class _CanvasLogic(TilingFeatures, CageFeatures, SpatialModifierFeatures, TextFe
         after = self.chapter.to_dict()
         if state["before"] != after:
             self.push_model_change(
-                state["before"], after, "Edit tiling" if "tiling" in state else "Edit radial blur" if "radial" in state else "Edit mirror" if "mirror" in state else "Edit focal blur"
+                state["before"], after, "Edit array" if "array" in state else "Edit tiling" if "tiling" in state else "Edit radial blur" if "radial" in state else "Edit mirror" if "mirror" in state else "Edit focal blur"
             )
         self.interactionFinished.emit()
         return True
@@ -18740,6 +18837,12 @@ class _CanvasLogic(TilingFeatures, CageFeatures, SpatialModifierFeatures, TextFe
         point = self.widget_to_document(widget_point)
         self._press_widget_point = QPointF(widget_point)
         self._press_document_point = QPointF(point)
+        if self.active_tone_mask_id and self.tool == ToolKind.MASK_SELECT:
+            self._begin_mask_selection(point, modifiers)
+            return
+        if self.active_tone_mask_id and self.tool == ToolKind.GRADIENT:
+            self._mask_gradient_press(point)
+            return
         if self._text_placement_press(point):
             return
         if self._page_gap_draft is not None:
@@ -19199,6 +19302,12 @@ class _CanvasLogic(TilingFeatures, CageFeatures, SpatialModifierFeatures, TextFe
             self._clear_detached_input_state()
             return
         point = self.widget_to_document(widget_point)
+        if self.active_tone_mask_id and self.tool == ToolKind.MASK_SELECT:
+            self._move_mask_selection(point)
+            return
+        if self.active_tone_mask_id and self.tool == ToolKind.GRADIENT:
+            self._mask_gradient_move(point)
+            return
         if self._text_placement_move(point) or self._queue_free_text_drag(point):
             return
         if (
@@ -19484,6 +19593,10 @@ class _CanvasLogic(TilingFeatures, CageFeatures, SpatialModifierFeatures, TextFe
             self._update_shape_hover(point)
 
     def _tool_release(self) -> None:
+        if self._finish_mask_selection():
+            return
+        if self._finish_mask_gradient():
+            return
         if self._finish_text_placement() or self._finish_free_text_drag():
             return
         self._flush_outline_edit()
@@ -22783,13 +22896,16 @@ class _CanvasLogic(TilingFeatures, CageFeatures, SpatialModifierFeatures, TextFe
         try:
             opacity = 1.0
             for layer in self.chapter.ancestor_layers(obj.parent_layer_id):
-                if not layer.visible or layer.opacity <= 0 or layer.bound is None:
+                if not layer.visible or layer.opacity <= 0:
                     return
                 painter.setTransform(self._layer_parent_transform(layer), True)
-                painter.setClipPath(
-                    self.layer_effective_path(layer.layer_id),
-                    Qt.IntersectClip,
-                )
+                # Free Text containers have no boundary but still contribute
+                # their transform and opacity to the live text preview.
+                if layer.bound is not None:
+                    painter.setClipPath(
+                        self.layer_effective_path(layer.layer_id),
+                        Qt.IntersectClip,
+                    )
                 opacity *= layer.opacity
             inverse, valid = self.layer_world_transform(
                 obj.parent_layer_id

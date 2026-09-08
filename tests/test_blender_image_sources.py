@@ -321,3 +321,27 @@ def test_relink_is_undoable_and_render_once_ui_is_removed(qapp, tmp_path):
     finally:
         window._dirty = False
         window.close()
+
+
+def test_blender_connection_ui_shows_versions_and_preserves_upgrade_guidance(qapp):
+    window = MainWindow()
+    try:
+        client = window.blender_sources.client
+        client._send = lambda *_args, **_kwargs: True
+        client._handle({
+            "type": "HELLO", "protocol": 3,
+            "extension_version": "0.6.0", "blender_version": "5.2.1 LTS",
+            "capabilities": ["layered_actions", "published_png"],
+        })
+        widget = window.blender_views_widget
+        assert widget.provider_version.text() == "Blender 5.2.1 LTS • Comic Views 0.6.0"
+        assert not widget.provider_version.isHidden()
+
+        client._handle({"type": "ERROR", "code": "PROTOCOL_MISMATCH"})
+        assert "update Webtoon Maker" in widget.status.text()
+        assert widget.provider_version.isHidden()
+        assert widget.connect_button.isEnabled()
+        assert not widget.refresh_button.isEnabled()
+    finally:
+        window._dirty = False
+        window.close()

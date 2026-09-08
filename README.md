@@ -46,8 +46,27 @@ workflow.
 - Pixel-snapped pan, zoom, rotation, and aspect-preserving chapter preview navigation
 - Touch navigation controlled only by Tablet Navigation mode
 - Command-based undo/redo and atomic autosave recovery
-- Blender 4.5 Comic Views as disk-published transparent image sources with
+- Blender 5.2 and 4.5 LTS Comic Views as disk-published transparent image sources with
   persistent offline PNG caches
+
+## Array
+
+Choose **Modifiers → Add Modifier → Array** to repeat the selected artwork
+without changing its original position, rotation, or scale. **Count** is the
+number of added copies (0–100). **First** repeats forward, **Last** backward,
+and **Center** splits the copies around the original; an odd count places the
+extra copy forward.
+
+Drag either orange dot to set the distance and direction between repetitions.
+The arrow indicates forward. The independent blue crosshair sets the rotation
+and scale center. **Angle offset** adds degrees per step. **Scale offset** is
+a percentage change per step: +10% produces 110%, 121%, 133.1%, and so on.
+Backward steps use negative rotation and inverse scale so the original keeps
+its place in the sequence. Copy centers follow the straight repetition axis.
+
+Array supports modifier ordering, intensity and intensity masks, linked
+targets, undo/redo, saved projects, assets, export, and Raster **Apply**.
+Press Escape during a gizmo drag to cancel it.
 
 ## Posterize
 
@@ -152,9 +171,9 @@ normal raster or vector layers above the image.
 
 To install and connect it:
 
-1. Install Blender 4.5 LTS on Windows.
+1. Install Blender 5.2 LTS on Windows (4.5 LTS is also supported).
 2. Run `blender_extension/webtoon_comic_views/build.ps1`, or use the already
-   built `blender_extension/webtoon_comic_views-0.5.1.zip`.
+   built `blender_extension/webtoon_comic_views-0.6.1.zip`.
 3. In Blender, choose **Edit → Preferences → Get Extensions → Install from
    Disk**, select the ZIP, and enable **Webtoon Comic Views**.
 4. In a 3D View, open the **Comic Views** sidebar. Create, Save, and Render views and
@@ -165,6 +184,18 @@ To install and connect it:
 If something fails, click **Copy Logs** in Blender's Comic Views panel. It
 copies a token-redacted diagnostic report with extension events, render errors,
 active-view metadata, and published-file status for easy bug reports.
+
+When upgrading, save your `.blend`, install the 0.6.1 ZIP
+using **Install from Disk**, and restart Blender and Webtoon Maker. Existing
+Comic Views, animation keys, and embedded comic images are retained. Version
+0.6.1 uses Blender's Action slots and channelbags, replacing the legacy
+`Action.fcurves` API removed in Blender 5.0. The editor displays the connected
+Blender and extension versions when the extension reports them. The build
+script prefers Blender 5.2 and accepts `-BlenderExecutable` for a custom path.
+
+Version 0.6.1 removes repeated rig and animation-key searches from Save and
+Save-and-switch. Render refreshes both Blender's list icon and the larger Comic
+View preview immediately, and those previews persist when reopening the blend.
 
 Blender scene edits remain working changes until **Save** stores them. Save
 automatically assigns the view a private timeline frame and bakes the camera,
@@ -369,6 +400,17 @@ appearing in the outliner. Their processed results are cached separately from
 their isolated source images. Outline color, thickness, opacity, intensity,
 and parameter-mask edits therefore reuse the same exact alpha distance field;
 only source-alpha changes rebuild it.
+
+**Stroke modifiers** appear under **Add Modifier** for closed shapes and vector
+drawings whose strokes are closed. **Scream / Thought** adds adjustable spikes;
+Roundness turns them into thought-bubble lobes. **Wobble** uses seeded noise to
+vary position and opacity, with scale, offset, and a Randomize seed button.
+**DotDash** adds curved dashes or fixed-orientation dots, spacing, length,
+corner roundness, and repeating patterns (`-` marks and spaces).
+All three have a 0–100% Strength slider and masks on every numeric setting.
+They share the existing ordered, linkable stack, support undo and export, and
+keep the editable source points intact. Whole repeats close around each loop.
+Open shapes, compound shapes, images, and raster drawings are ineligible.
 
 **Free Text Container** holds independent text boxes without adding a shape or
 clipping boundary. Click to place its first box or drag its wrapping bounds;

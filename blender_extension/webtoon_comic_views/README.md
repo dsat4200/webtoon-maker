@@ -1,6 +1,6 @@
 # Webtoon Comic Views
 
-This Blender 4.5 LTS extension stores named, geometry-free Comic View state in
+This Blender 5.2 / 4.5 LTS extension stores named, geometry-free Comic View state in
 the current `.blend` file and publishes a cropped 3D viewport as transparent RGBA to
 Webtoon Maker.
 
@@ -26,6 +26,34 @@ as revisioned PNGs below `%LOCALAPPDATA%\Webtoon Maker\Comic View Frames`.
 
 ## Workflow
 
+### Upgrading to 0.6.1
+
+Save your `.blend`, install `webtoon_comic_views-0.6.1.zip` with **Install from
+Disk**, then restart Blender and Webtoon Maker. Existing views and their saved
+states need no manual conversion. The extension uses Action slots and
+channelbags on both supported versions, fixing the `Action.fcurves` error on
+Blender 5.2. Shared Actions keep each owner's assigned slot, and failed Saves
+restore the prior Action, slot, and animation keys. Protocol 3 and the saved
+Comic View format remain unchanged.
+
+On the first Save or Load, views baked by 0.5.1 receive new timeline frames
+after all existing animation. The previous keys are retained: older versions
+could miss animation in another Action slot when choosing a frame. Subsequent
+Saves keep the new frame numbers. Large scenes may take longer on this first
+operation while their saved views are rebaked.
+
+Version 0.6.1 speeds up saving large scenes by indexing rigs, channels, and key
+styles once per operation. A regular Save keeps its existing frame and skips
+the full animation-range scan. These lookups are discarded after the operation,
+so subsequent scene edits, Undo, and changed Actions are read afresh.
+**Copy Logs** includes Save timings to help diagnose any remaining slow scenes.
+
+`build.ps1` prefers installed Blender 5.2, then 4.5. Set `-BlenderExecutable`
+or `BLENDER_EXECUTABLE` to use a custom installation. Package validation must
+succeed before the ZIP is built.
+
+### Saving and rendering
+
 - **New** performs an initial Save and Render. **Save** captures the active
   camera and view layer, every object/rig control, visibility, collection and
   Local View state, lights, shape keys, modifier flags, and 3D View shading,
@@ -42,6 +70,9 @@ as revisioned PNGs below `%LOCALAPPDATA%\Webtoon Maker\Comic View Frames`.
   and advances the revision. Unsaved working changes are restored afterward,
   even when rendering fails. The legacy `webtoon.update_comic_view` operator
   remains an alias for Render.
+  Both the list icon and the larger Blender preview update on success and are
+  retained when reopening the `.blend`. Duplicated views have independent
+  thumbnails, so rendering a duplicate does not change the original's preview.
 - **Set Stream Frame** is available in Camera View. It stores the orange crop
   in camera-gate coordinates, permits crops beyond the gate, and derives
   height from the camera gate and crop aspect. Viewport pan/zoom/rotation do

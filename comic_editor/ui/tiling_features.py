@@ -5,7 +5,7 @@ import numpy as np
 from PySide6.QtCore import QPointF, QRectF, Qt, QTimer
 from PySide6.QtGui import QColor, QPainter, QPen, QTransform
 
-from comic_editor.core.models import TilingModifier, LayerNode, RasterObject, VectorDrawingObject, new_id
+from comic_editor.core.models import TilingModifier, LayerNode, RasterObject, VectorDrawingObject, new_id, StrokeModifier
 from comic_editor.core.tiling import TilingGeometry, polygon_path
 from comic_editor.ui.effect_pipeline import aligned, empty_image, render_stages
 from comic_editor.ui.modifier_rendering import (
@@ -297,7 +297,7 @@ class TilingFeatures:
         path = self.layer_effective_path(layer.layer_id)
         painter.save()
         painter.setTransform(self.layer_world_transform(layer.layer_id), True)
-        if outline and layer.border_width > 0:
+        if outline and layer.border_width > 0 and getattr(self, "_stroke_hide_border_id", None) != layer.layer_id:
             if layer.compound_enabled:
                 coverage = self._compound_outline_mesh(layer, path, self._outline_tolerance(painter, path.boundingRect()))
             elif layer.layer_kind == "open_shape":
@@ -331,7 +331,7 @@ class TilingFeatures:
             source, source_bounds, source_mapping = self._tiling_raster_pixels(target, geometry)
         else:
             source = self._tiling_source(target, source_bounds)
-        key = ("tiling-output", source.cacheKey(), repr(modifier.to_dict()), self._rect_signature(bounds),
+        key = ("tiling-output", source.cacheKey(), repr(modifier.to_dict()), self._rect_signature(bounds), getattr(self, "_stroke_hide_border_id", None),
                self._modifier_parameter_signature([modifier.modifier_id]),
                repr(target.to_dict()), boundary)
         # QPainterPath isn't hashable; serialize its geometry into the key.
@@ -382,9 +382,14 @@ class TilingFeatures:
         image, bounds = self._tiling_stage(target, None if rest else visible_world)
         kind, identifier = ("layer", target.layer_id) if isinstance(target, LayerNode) else ("object", target.object_id)
         if rest:
-            image, bounds = render_stages(self, image, bounds, rest, QTransform(),
-                nearest=isinstance(target, RasterObject), required=visible_world,
-                request_scope=(kind, identifier, getattr(self, "_effect_preview_channel", "canvas")))
+            scope = (kind, identifier, getattr(self, "_effect_preview_channel", "canvas"))
+            if any(isinstance(effect, StrokeModifier) for effect in rest):
+                from comic_editor.ui.stroke_rendering import render_stroke_stack
+                image, bounds = render_stroke_stack(self, target, image, bounds, rest,
+                    QTransform(), ("tiled-stroke", image.cacheKey()), scope, tiled=True)
+            else:
+                image, bounds = render_stages(self, image, bounds, rest, QTransform(),
+                    nearest=isinstance(target, RasterObject), required=visible_world, request_scope=scope)
         if target.opacity_mask is not None:
             binding = target.opacity_mask
             image = apply_opacity_mask(image, self.render_tone_mask_field(binding.mask_id,

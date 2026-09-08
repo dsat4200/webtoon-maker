@@ -220,6 +220,13 @@ class GradientToolsControls(QWidget):
         self.type_parameters_widget = QWidget(self)
         type_parameters = QVBoxLayout(self.type_parameters_widget)
         type_parameters.setContentsMargins(0, 0, 0, 0)
+        self.mask_hint = QLabel(
+            "Stop opacity controls mask strength.\nDrag on the canvas to redraw the gradient.",
+            self.type_parameters_widget,
+        )
+        self.mask_hint.setWordWrap(True)
+        self.mask_hint.hide()
+        type_parameters.addWidget(self.mask_hint)
         self.opacity_lock = QCheckBox(
             "Lock opacity", self.type_parameters_widget
         )
@@ -475,6 +482,11 @@ class GradientToolsControls(QWidget):
     def selected_gradient(
         self,
     ) -> ColorFillGradientObject | SpeedLinesGradientObject | None:
+        if self.canvas.active_tone_mask_id:
+            return (
+                self.canvas.active_mask_gradient()
+                if self.canvas.tool.value == "gradient" else None
+            )
         if (
             self.canvas.chapter is None
             or self.canvas.selected_kind != "object"
@@ -486,6 +498,8 @@ class GradientToolsControls(QWidget):
         return None
 
     def context_parent_id(self) -> str:
+        if self.canvas.active_tone_mask_id:
+            return ""
         if self.canvas.chapter is None:
             return ""
         if self.canvas.selected_kind == "layer":
@@ -507,6 +521,9 @@ class GradientToolsControls(QWidget):
 
     def refresh(self) -> None:
         obj = self.selected_gradient()
+        mask_active = bool(self.canvas.active_tone_mask_id)
+        self.mask_hint.setVisible(mask_active)
+        self.field_type.setItemText(0, "Line" if mask_active else "Line / Curve")
         context_kind = (
             "speed" if isinstance(obj, SpeedLinesGradientObject)
             else "color" if isinstance(obj, ColorFillGradientObject)
@@ -685,6 +702,18 @@ class GradientToolsControls(QWidget):
                 context_parent, selected_type, family="speed_lines"
             )
         )
+        if mask_active:
+            self.field_type.setCurrentIndex(self.field_type.findData("line"))
+            self.direction_row.hide()
+            self.distance_row.hide()
+            self.create_speed.hide()
+            self.select_gradient.hide()
+            self.create_color.setEnabled(True)
+        self.create_color.setText("Draw Mask Gradient" if mask_active else "Add Color Fill")
+        self.create_color.setToolTip(
+            "Drag on the canvas to set the two endpoints. Stop alpha controls mask strength."
+            if mask_active else "Create a color fill gradient"
+        )
         self._loading = False
         if context_changed:
             self.contextChanged.emit(context_kind)
@@ -715,7 +744,7 @@ class GradientToolsControls(QWidget):
         self.canvas.update()
 
     def _field_changed(self) -> None:
-        if self._loading:
+        if self._loading or self.canvas.active_tone_mask_id:
             return
         obj = self.selected_gradient()
         field_type = self.field_type.currentData()

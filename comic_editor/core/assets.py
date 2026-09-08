@@ -15,7 +15,7 @@ from PySide6.QtGui import QImage, QPolygonF, QTransform
 from .models import (
     BoundGeometry, ChapterDocument, ChildRef, ColorFillGradientObject,
     DocumentObject, EmbeddedImageSourceDescriptor, GradientObject, ImageObject,
-    LayerNode, RasterObject, ShapeStyle, MirrorModifier, RadialBlurModifier, CageTransformModifier, TilingModifier,
+    LayerNode, RasterObject, ShapeStyle, ArrayModifier, MirrorModifier, RadialBlurModifier, CageTransformModifier, TilingModifier,
     SpeedLineCenterObject, SpeedLinesGradientObject, TextObject,
     ToneMask, VectorDrawingObject, modifier_from_dict, new_id,
     object_from_dict,
@@ -709,9 +709,9 @@ def extract_asset(
     for modifier in asset.modifiers.values():
         if isinstance(modifier, CageTransformModifier):
             _translate_cage(modifier, dx, dy)
-        if isinstance(modifier, (RadialBlurModifier, TilingModifier)):
+        if isinstance(modifier, (RadialBlurModifier, TilingModifier, ArrayModifier)):
             modifier.center = (modifier.center[0]+dx, modifier.center[1]+dy)
-        if isinstance(modifier, MirrorModifier):
+        if isinstance(modifier, (MirrorModifier, ArrayModifier)):
             modifier.axis_start = (modifier.axis_start[0] + dx, modifier.axis_start[1] + dy)
             modifier.axis_end = (modifier.axis_end[0] + dx, modifier.axis_end[1] + dy)
     if kind == "layer":
@@ -860,9 +860,9 @@ def instantiate_asset(
         modifier = target.modifiers[modifier_id]
         if isinstance(modifier, CageTransformModifier):
             _translate_cage(modifier, dx, dy)
-        if isinstance(modifier, (RadialBlurModifier, TilingModifier)):
+        if isinstance(modifier, (RadialBlurModifier, TilingModifier, ArrayModifier)):
             modifier.center = (modifier.center[0]+dx, modifier.center[1]+dy)
-        if isinstance(modifier, MirrorModifier):
+        if isinstance(modifier, (MirrorModifier, ArrayModifier)):
             modifier.axis_start = (modifier.axis_start[0] + dx, modifier.axis_start[1] + dy)
             modifier.axis_end = (modifier.axis_end[0] + dx, modifier.axis_end[1] + dy)
 

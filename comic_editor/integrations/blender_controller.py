@@ -82,6 +82,7 @@ def load_published_png(view: ComicViewInfo) -> tuple[bytes, object]:
 class BlenderImageSourceController(QObject):
     viewsChanged = Signal(object)
     connectionStateChanged = Signal(str)
+    providerInfoChanged = Signal(object)
     statusChanged = Signal(str)
     switchDecisionRequired = Signal(object)
     frameImported = Signal()
@@ -97,6 +98,7 @@ class BlenderImageSourceController(QObject):
         self.client.viewsChanged.connect(self._set_views)
         self.client.activeViewChanged.connect(self._active_view_changed)
         self.client.connectionStateChanged.connect(self._connection_changed)
+        self.client.providerInfoChanged.connect(self.providerInfoChanged)
         self.client.switchDecisionRequired.connect(self.switchDecisionRequired)
         self.client.switchCanceled.connect(lambda: self._emit_selected_status("ready"))
         self.client.errorOccurred.connect(self._client_error)

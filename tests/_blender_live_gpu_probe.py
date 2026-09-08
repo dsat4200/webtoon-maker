@@ -1,4 +1,4 @@
-"""Visible opt-in GPU smoke test, executed inside Blender 4.5."""
+"""Opt-in GPU smoke test, executed inside Blender 4.5/5.2."""
 from __future__ import annotations
 
 import os

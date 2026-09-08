@@ -4,13 +4,18 @@ import copy
 import numpy as np
 from PySide6.QtCore import QRectF, Qt
 from PySide6.QtGui import QImage, QPainter, QTransform
-from comic_editor.core.models import MirrorModifier, RadialBlurModifier, CageTransformModifier, PosterizeModifier
+from comic_editor.core.models import ArrayModifier, MirrorModifier, RadialBlurModifier, CageTransformModifier, PosterizeModifier
 from comic_editor.core.color_smoothing import simplify_padding
-from comic_editor.core.effect_geometry import effect_bounds, reflection_transform
+from comic_editor.core.effect_geometry import effect_bounds, reflection_transform, array_indices, array_transform, array_input_bounds
 from comic_editor.ui.modifier_rendering import apply_modifier_stack, _qimage_premultiplied, _premultiplied_qimage, _parameter_field
 
 
 def aligned(bounds):
+    # Qt's integer rectangles wrap outside this range. Report an oversized
+    # bake instead of producing a corrupt image after cumulative array scale.
+    if any(not math.isfinite(v) or abs(v) > 1_000_000_000 for v in
+           (bounds.left(), bounds.top(), bounds.right(), bounds.bottom())):
+        raise ValueError("Effect bounds are too large to render. Reduce the count, scale offset, or spacing.")
     return QRectF(bounds.toAlignedRect())
 
 
@@ -37,7 +42,10 @@ def render_stages(canvas, image, bounds, modifiers, local_to_world, *, nearest=F
                 # A displaced cage can pull source pixels from anywhere in the
                 # incoming stage, including completely outside this viewport.
                 break
-            needed = effect_bounds(needed, [modifiers[index]], local_to_world)
+            if isinstance(modifiers[index], ArrayModifier) and not modifiers[index].muted:
+                needed = array_input_bounds(needed, modifiers[index], local_to_world)
+            else:
+                needed = effect_bounds(needed, [modifiers[index]], local_to_world)
             if isinstance(modifiers[index], PosterizeModifier) and not modifiers[index].muted:
                 padding = simplify_padding(modifiers[index])
                 needed = needed.adjusted(-padding, -padding, padding, padding)
@@ -47,9 +55,10 @@ def render_stages(canvas, image, bounds, modifiers, local_to_world, *, nearest=F
             continue
         if isinstance(modifier, RadialBlurModifier) and modifier.angle <= 0 and "angle" not in modifier.parameter_masks:
             continue
-        target = aligned(effect_bounds(bounds, [modifier], local_to_world))
+        target = effect_bounds(bounds, [modifier], local_to_world)
         if requirements[index] is not None:
-            target = aligned(target.intersected(requirements[index]))
+            target = target.intersected(requirements[index])
+        target = aligned(target)
         if target.isEmpty():
             image, bounds = empty_image(QRectF(0, 0, 1, 1)), target
             continue
@@ -110,6 +119,29 @@ def render_stages(canvas, image, bounds, modifiers, local_to_world, *, nearest=F
                     provisional = True
                 else:
                     cached = compute()
+            elif isinstance(modifier, ArrayModifier) and valid:
+                painter = QPainter(source)
+                painter.setRenderHint(QPainter.SmoothPixmapTransform, not nearest)
+                painter.setRenderHint(QPainter.Antialiasing, not nearest)
+                try:
+                    for step in array_indices(modifier):
+                        transform = local_to_world * array_transform(modifier, step) * inverse
+                        if not transform.mapRect(bounds).intersects(target):
+                            continue
+                        painter.setTransform(QTransform.fromTranslate(bounds.left(), bounds.top())
+                            * transform * QTransform.fromTranslate(-target.left(), -target.top()))
+                        painter.drawImage(0, 0, image)
+                finally:
+                    painter.end()
+                amount = np.asarray(_parameter_field(modifier, "intensity", modifier.intensity,
+                    (source.height(), source.width()), fields)) / 100
+                if amount.ndim == 2:
+                    amount = amount[..., None]
+                cached = source if np.ndim(amount) == 0 and float(amount) == 1. else _premultiplied_qimage(
+                    _qimage_premultiplied(source) * amount)
+                painter = QPainter(cached)
+                painter.drawImage(bounds.topLeft() - target.topLeft(), image)
+                painter.end()
             elif isinstance(modifier, MirrorModifier) and valid:
                 painter = QPainter(source)
                 painter.setRenderHint(QPainter.SmoothPixmapTransform, not nearest)

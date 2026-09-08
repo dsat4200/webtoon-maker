@@ -221,6 +221,14 @@ class ToolSettingsControls(QWidget):
         self.stack.addWidget(self.pencil_page)
         self.mask_pencil_page = self._build_mask_pencil_page()
         self.stack.addWidget(self.mask_pencil_page)
+        self.mask_select_page = QLabel(
+            "Lasso to add an area.\n\n"
+            "Shift: Add\nControl: Remove\nEscape: Cancel lasso",
+            self,
+        )
+        self.mask_select_page.setWordWrap(True)
+        self.mask_select_page.setAlignment(Qt.AlignTop | Qt.AlignLeft)
+        self.stack.addWidget(self.mask_select_page)
         self.eraser_page = self._build_eraser_page()
         self.stack.addWidget(self.eraser_page)
         self.fill_page = self._build_fill_page()
@@ -546,7 +554,10 @@ class ToolSettingsControls(QWidget):
         raster_active: bool = False, mask_active: bool = False,
     ) -> None:
         value = _tool_value(tool)
-        if value == "raster_pencil":
+        if value == "mask_select" and mask_active:
+            self.context_label.setText("Mask Select")
+            self.stack.setCurrentWidget(self.mask_select_page)
+        elif value == "raster_pencil":
             if mask_active:
                 self.context_label.setText("Mask Pencil")
                 self.stack.setCurrentWidget(self.mask_pencil_page)

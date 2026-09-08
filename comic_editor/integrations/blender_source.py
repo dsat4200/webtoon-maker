@@ -17,6 +17,7 @@ MAX_AXIS = 4096
 MAX_PIXELS = 16_777_216
 MAX_CONTROL_MESSAGE = 4_194_304
 MAX_THUMBNAIL_BYTES = 1_048_576
+BLENDER_52_EXTENSION_VERSION = "0.6.0"
 
 
 def canonical_uuid(value: object) -> str:
@@ -24,6 +25,28 @@ def canonical_uuid(value: object) -> str:
         return uuid.UUID(str(value)).hex
     except (ValueError, AttributeError, TypeError) as error:
         raise ValueError("Expected a valid UUID") from error
+
+
+@dataclass(frozen=True)
+class BlenderProviderInfo:
+    extension_version: str = ""
+    blender_version: str = ""
+    capabilities: tuple[str, ...] = ()
+
+    @classmethod
+    def from_message(cls, message: dict[str, object]) -> "BlenderProviderInfo":
+        def optional_text(key: str) -> str:
+            value = message.get(key, "")
+            return value.strip()[:120] if isinstance(value, str) else ""
+
+        capabilities = message.get("capabilities", [])
+        return cls(
+            optional_text("extension_version"), optional_text("blender_version"),
+            tuple(
+                value for value in capabilities
+                if isinstance(value, str) and len(value) <= 120
+            ) if isinstance(capabilities, list) else (),
+        )
 
 
 @dataclass(frozen=True)
@@ -72,6 +95,7 @@ class ComicViewInfo:
 
 class BlenderSourceClient(QObject):
     connectionStateChanged = Signal(str)
+    providerInfoChanged = Signal(object)
     viewsChanged = Signal(object)
     activeViewChanged = Signal(object)
     switchDecisionRequired = Signal(object)
@@ -89,8 +113,10 @@ class BlenderSourceClient(QObject):
         self._token = ""
         self._authorized = False
         self._state = "disconnected"
+        self._provider_info: BlenderProviderInfo | None = None
         self._views: list[ComicViewInfo] = []
         self._requested_view_uuid = ""
+        self._activation_request_id: int | None = None
         self._active_project_uuid = ""
         self._active_view_uuid = ""
         self._request_sequence = 0
@@ -109,6 +135,15 @@ class BlenderSourceClient(QObject):
     @property
     def views(self) -> list[ComicViewInfo]:
         return list(self._views)
+
+    @property
+    def provider_info(self) -> BlenderProviderInfo | None:
+        return self._provider_info
+
+    def _clear_provider_info(self) -> None:
+        if self._provider_info is not None:
+            self._provider_info = None
+            self.providerInfoChanged.emit(None)
 
     def _set_state(self, value: str) -> None:
         if value == self._state:
@@ -135,7 +170,9 @@ class BlenderSourceClient(QObject):
         self._timeout.stop()
         self._authorized = False
         self._requested_view_uuid = ""
+        self._activation_request_id = None
         self._active_project_uuid = self._active_view_uuid = ""
+        self._clear_provider_info()
         self._buffer.clear()
         self.socket.abort()
         self._set_state("disconnected")
@@ -149,8 +186,17 @@ class BlenderSourceClient(QObject):
     def _socket_disconnected(self) -> None:
         self._timeout.stop()
         self._authorized = False
+        self._requested_view_uuid = ""
+        self._activation_request_id = None
         self._active_project_uuid = self._active_view_uuid = ""
+        self._clear_provider_info()
         self._set_state("disconnected")
+
+    def _fail_connection(self, message: str) -> None:
+        # Disconnect first so its status update cannot hide upgrade guidance.
+        self.disconnect_from_provider()
+        self._set_state("error")
+        self.errorOccurred.emit(message)
 
     def _socket_error(self, _error: object) -> None:
         if self.socket.error() == QAbstractSocket.RemoteHostClosedError:
@@ -195,11 +241,15 @@ class BlenderSourceClient(QObject):
             return False
         if wanted in {self._requested_view_uuid, self._active_view_uuid}:
             return False
-        self._requested_view_uuid = wanted
-        return self._send({
+        request_id = self._next_request()
+        sent = self._send({
             "type": "ACTIVATE_VIEW", "view_uuid": wanted,
-            "request_id": self._next_request(),
+            "request_id": request_id,
         })
+        if sent:
+            self._requested_view_uuid = wanted
+            self._activation_request_id = request_id
+        return sent
 
     def resolve_dirty_switch(self, resolution: str) -> None:
         resolution = str(resolution).lower()
@@ -242,15 +292,20 @@ class BlenderSourceClient(QObject):
     def _handle(self, message: dict[str, object]) -> None:
         kind = str(message.get("type", ""))
         if kind == "HELLO":
-            if int(message.get("protocol", 0)) != PROTOCOL_VERSION:
-                self.errorOccurred.emit(
+            try:
+                protocol_matches = int(message.get("protocol", 0)) == PROTOCOL_VERSION
+            except (TypeError, ValueError, OverflowError):
+                protocol_matches = False
+            if not protocol_matches:
+                self._fail_connection(
                     "Blender uses a different Comic Views protocol; update the editor and extension"
                 )
-                self.disconnect_from_provider()
                 return
             self._authorized = True
             self._timeout.stop()
             self._set_state("connected")
+            self._provider_info = BlenderProviderInfo.from_message(message)
+            self.providerInfoChanged.emit(self._provider_info)
             self.refresh_views()
         elif kind == "VIEWS_CHANGED":
             try:
@@ -280,24 +335,40 @@ class BlenderSourceClient(QObject):
             except (TypeError, ValueError) as error:
                 self.errorOccurred.emit(str(error))
                 return
+            if message.get("request_id") in (None, self._activation_request_id):
+                self._requested_view_uuid = self._active_view_uuid
+                self._activation_request_id = None
             self.activeViewChanged.emit(dict(message))
         elif kind == "SWITCH_REQUIRES_DECISION":
             self.switchDecisionRequired.emit(dict(message))
         elif kind == "SWITCH_CANCELED":
             self._requested_view_uuid = self._active_view_uuid
+            self._activation_request_id = None
             self.switchCanceled.emit()
         elif kind == "ERROR":
             code = str(message.get("code", "ERROR"))
             value = str(message.get("message", "Blender bridge error"))
             if code == "PROTOCOL_MISMATCH":
-                self.errorOccurred.emit(
+                self._fail_connection(
                     "Comic Views protocol mismatch; update Webtoon Maker and the Blender extension"
                 )
-                self.disconnect_from_provider()
+            elif code == "AUTHENTICATION_FAILED":
+                self._fail_connection(f"{code}: {value}")
             else:
+                if self._activation_request_id is not None and (
+                    message.get("request_id") == self._activation_request_id
+                    or code in {"SAVE_FAILED", "NO_PENDING_SWITCH", "BAD_RESOLUTION"}
+                ):
+                    self._requested_view_uuid = self._active_view_uuid
+                    self._activation_request_id = None
+                if "'Action' object has no attribute 'fcurves'" in value:
+                    value = (
+                        "This Blender extension uses an animation API removed in Blender 5. "
+                        f"Install Webtoon Comic Views {BLENDER_52_EXTENSION_VERSION} or later "
+                        "in Blender Preferences > Add-ons, restart Blender, and reconnect. "
+                        f"Details: {value}"
+                    )
                 self.errorOccurred.emit(f"{code}: {value}")
-                if code == "AUTHENTICATION_FAILED":
-                    self.disconnect_from_provider()
         elif kind == "PONG":
             return
 

@@ -1,4 +1,4 @@
-"""Webtoon Comic Views Blender 4.5 extension."""
+"""Webtoon Comic Views extension for Blender 4.5 and 5.2 LTS."""
 from __future__ import annotations
 
 import time
@@ -16,9 +16,7 @@ from . import bridge, diagnostics, renderer, viewport
 from .state import (
     ensure_uuid, migrate_legacy_presentation, parse_state, state_digest, state_json,
 )
-
-
-EXTENSION_VERSION = "0.5.1"
+from .version import EXTENSION_VERSION
 
 
 def _resolution_changed(item: object, _context: object) -> None:
@@ -416,10 +414,7 @@ class WEBTOON_OT_delete_comic_view(Operator):
         _settings(scene).active_index = min(index, len(_views(scene)) - 1)
         if not _views(scene):
             _settings(scene).loaded_view_uuid = ""
-        if thumbnail and not any(item.thumbnail_image == thumbnail for item in _views(scene)):
-            image = bpy.data.images.get(thumbnail)
-            if image is not None:
-                bpy.data.images.remove(image)
+        renderer.release_thumbnail_image(thumbnail)
         bridge.RUNTIME.delete_published_frames(scene, deleted_view_uuid)
         bridge.RUNTIME.send_views(scene)
         return {"FINISHED"}
@@ -714,8 +709,7 @@ class WEBTOON_UL_comic_views(UIList):
     ) -> None:
         row = layout.row(align=True)
         image = bpy.data.images.get(item.thumbnail_image)
-        if image is not None:
-            image.preview_ensure()
+        if image is not None and image.preview is not None:
             row.label(text="", icon_value=image.preview.icon_id)
         row.prop(item, "name", text="", emboss=False)
         row.label(text=f"r{item.revision}")
@@ -775,8 +769,7 @@ class WEBTOON_PT_comic_views(Panel):
         view = _active_view(scene)
         if view is not None:
             image = bpy.data.images.get(view.thumbnail_image)
-            if image is not None:
-                image.preview_ensure()
+            if image is not None and image.preview is not None:
                 layout.template_icon(icon_value=image.preview.icon_id, scale=6.0)
             layout.prop(view, "name")
             row = layout.row(align=True)
@@ -874,6 +867,13 @@ def _initialize_scenes() -> bool:
     for scene in scenes:
         _ensure_project_uuid(scene)
         for view in scene.webtoon_comic_views:
+            try:
+                renderer.ensure_thumbnail_preview(view)
+            except (RuntimeError, TypeError, ValueError) as error:
+                diagnostics.record(
+                    "WARNING", "Thumbnail preview could not be restored",
+                    view=view.name, error=str(error),
+                )
             if not view.published_width:
                 view.published_width = max(64, int(view.width))
             if not view.published_height:

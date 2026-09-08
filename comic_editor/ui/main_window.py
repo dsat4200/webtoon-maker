@@ -397,6 +397,7 @@ class MainWindow(QMainWindow):
         if fill_tool is not None:
             labels.append((fill_tool, "Fill", "fill-color"))
         labels.append((ToolKind.GRADIENT, "Gradient", "contrast-circle"))
+        labels.append((ToolKind.MASK_SELECT, "Select", "agile"))
         labels.extend([
             (ToolKind.TEXT_EDIT, "Text Edit", "text"),
             (ToolKind.TRANSFORM, "Transform", "frame-tool"),
@@ -988,6 +989,8 @@ class MainWindow(QMainWindow):
         self.canvas.interactionFinished.connect(
             self.text_object_controls.refresh
         )
+        self.canvas.maskContentChanged.connect(self._sync_contextual_ribbon)
+        self.canvas.maskContentChanged.connect(self._refresh_masks_panel)
         self.canvas.selectionCandidatesRequested.connect(
             self._show_selection_candidates
         )
@@ -1090,6 +1093,9 @@ class MainWindow(QMainWindow):
         )
         self.blender_sources.connectionStateChanged.connect(
             self.blender_views_widget.set_connection_state
+        )
+        self.blender_sources.providerInfoChanged.connect(
+            self.blender_views_widget.set_provider_info
         )
         self.blender_sources.connectionStateChanged.connect(
             self._blender_connection_changed
@@ -1974,6 +1980,20 @@ class MainWindow(QMainWindow):
         if (
             event.type() == QEvent.KeyPress
             and event.key() == Qt.Key_Escape
+            and self.canvas._cancel_mask_selection()
+        ):
+            event.accept()
+            return True
+        if (
+            event.type() == QEvent.KeyPress
+            and event.key() == Qt.Key_Escape
+            and self.canvas._finish_mask_gradient(False)
+        ):
+            event.accept()
+            return True
+        if (
+            event.type() == QEvent.KeyPress
+            and event.key() == Qt.Key_Escape
             and self._finish_mask_mode(False)
         ):
             event.accept()
@@ -2814,6 +2834,10 @@ class MainWindow(QMainWindow):
     def _create_gradient(
         self, field_type: str, gradient_type: str = "color_fill",
     ) -> None:
+        if self.canvas.active_tone_mask_id:
+            self._activate_tool(ToolKind.GRADIENT)
+            self.statusBar().showMessage("Drag to draw a mask gradient; drag either endpoint to adjust it.", 7000)
+            return
         parent_id = self._gradient_context_parent_id()
         if not parent_id:
             self.statusBar().showMessage(
@@ -3125,6 +3149,14 @@ class MainWindow(QMainWindow):
         self._mark_dirty(None)
 
     def _activate_tool(self, tool: ToolKind) -> bool:
+        if self.canvas.active_tone_mask_id and tool in {
+            ToolKind.GRADIENT, ToolKind.RASTER_PENCIL, ToolKind.RASTER_ERASER,
+            ToolKind.MASK_SELECT,
+        }:
+            changed = self.canvas.set_tool(tool)
+            self._sync_tool_buttons()
+            self._select_ribbon_page("tool_settings")
+            return changed
         if (tool == ToolKind.INSERT_PAGE_GAP and self.chapter is not None
                 and self.chapter.document_kind == "image"):
             self.statusBar().showMessage("Image documents keep their original canvas size", 4000)
@@ -3249,6 +3281,19 @@ class MainWindow(QMainWindow):
                 )
             )
             button.blockSignals(False)
+        if self.canvas.active_tone_mask_id:
+            for tool, button in self.tool_buttons.items():
+                available = tool in {
+                    ToolKind.GRADIENT, ToolKind.RASTER_PENCIL,
+                    ToolKind.RASTER_ERASER, ToolKind.EYEDROPPER,
+                    ToolKind.MASK_SELECT,
+                }
+                button.setVisible(available)
+                button.setEnabled(available)
+            self.drawing_selection_category.hide()
+            self.fill_tool_button.hide()
+            self._sync_contextual_ribbon()
+            return
         selected_object = (
             self.chapter.objects.get(self.canvas.selected_id)
             if (
@@ -3276,6 +3321,8 @@ class MainWindow(QMainWindow):
         self.selection_settings.setVisible(True)
         for button in self.tool_buttons.values():
             button.setVisible(True)
+            button.setEnabled(self.chapter is not None)
+        self.tool_buttons[ToolKind.MASK_SELECT].hide()
         raster_selected = isinstance(selected_object, RasterObject)
         vector_selected = isinstance(
             selected_object, VectorDrawingObject
@@ -3463,12 +3510,15 @@ class MainWindow(QMainWindow):
             )
             else None
         )
+        if self.canvas.active_tone_mask_id:
+            selected_object = None
+            active = False
         vector_tool_context = isinstance(selected_object, VectorDrawingObject)
         text_active = isinstance(selected_object, TextObject)
         selected_gradient = self.gradient_tools_controls.selected_gradient()
         gradient_selected = selected_gradient is not None
         gradient_parent_id = self._gradient_context_parent_id()
-        gradient_active = bool(gradient_parent_id)
+        gradient_active = bool(gradient_parent_id or self.canvas.active_tone_mask_id)
         entering = active and not self._vector_ribbon_context
         entering_text = text_active and not self._text_ribbon_context
         selected_gradient_id = (
@@ -3483,7 +3533,13 @@ class MainWindow(QMainWindow):
         self._gradient_ribbon_context = gradient_active
         self._selected_gradient_ribbon_id = selected_gradient_id
         self.ribbon.set_page_visible("vector_tools", active)
-        self.tool_settings_group.setVisible(not text_active and not gradient_selected)
+        self.tool_settings_group.setVisible(
+            not text_active and not gradient_selected
+            and not (
+                self.canvas.active_tone_mask_id
+                and self.canvas.tool == ToolKind.GRADIENT
+            )
+        )
         for group in (
             self.text_object_group,
             self.text_typography_group,
@@ -4618,6 +4674,9 @@ class MainWindow(QMainWindow):
         mask = self.chapter.masks[mask_id]
         self._mask_original_contributors = list(mask.contributors)
         self.canvas.set_tone_mask_mode(mask_id)
+        self.canvas.set_tool(
+            ToolKind.GRADIENT if mask.gradient is not None else ToolKind.RASTER_PENCIL
+        )
         self.hierarchy_model.set_mask_highlights(set(mask.contributors))
         self.masks_panel.set_active(mask_id)
         self.settings_tabs.setCurrentWidget(self.masks_panel)
