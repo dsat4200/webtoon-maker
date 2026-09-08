@@ -24,6 +24,7 @@ workflow.
 - Chapter-local reusable tone masks for opacity and modifier parameters, with
   live contributor alpha, raster paint, and a translucent blue edit overlay
 - Linked non-destructive HSL, blur, exact outside-outline, and hue-based Posterize modifier stacks
+- GPU-accelerated Halftone and Pixelate modifiers with editable colors and pre-filter blur
 - Sparse 256×256 raster tiles
 - Explicit, non-clipping raster interaction frames with drag-to-create
 - Named pressure-curve pencil presets, independent pressure channels,
@@ -48,6 +49,47 @@ workflow.
 - Command-based undo/redo and atomic autosave recovery
 - Blender 5.2 and 4.5 LTS Comic Views as disk-published transparent image sources with
   persistent offline PNG caches
+
+## Halftone and Pixelate
+
+Choose **Modifiers → Add Modifier → Halftone** or **Pixelate** with an image,
+drawing, or shape selected. Both effects work in stack order, support linked
+targets, intensity masks, mute, undo/redo, saved projects, assets, export, and
+Raster **Apply**. Their controls change the rendered appearance without editing
+the source artwork. Transparency is processed in premultiplied color to avoid
+fringes around cutouts.
+
+Halftone provides the six pattern families from
+[Halftone Maker's Simple mode](https://halftonemaker.com/): square, hexagonal,
+radial, line, ring, and stippling. Adjust spacing, rotation, inverse-luminance
+sampling, level limits, blur, gamma, contrast, and input clamp. The **Base
+resolution** and **Fit** controls define pattern units relative to the artwork;
+they do not resize the object. Grid placement stays stable while panning or
+cropping the viewport.
+
+**Dots and lines** includes circles, incircles, triangles, squares, polygons
+and stars, line marks, embedded custom SVGs, blobs, Delaunay triangles, and
+liquid shapes. Relevant controls appear for the selected style, including dot
+size, scale, rounding, line width, point spacing, and stippling variation.
+Stippling uses deterministic procedural relaxation: **Smoothing iterations**
+controls its convergence strength, and collision radii vary with source tone.
+This is a realtime approximation of the reference's iterative stippling solver.
+**Colors** supports two colors, editable gradients with RGB or OKLCH
+interpolation, and the incoming artwork's source colors. Enable **Transparent
+background** to leave only the marks. Custom SVGs can use either a silhouette
+or their own colors.
+
+Pixelate includes [Pixel Art Village's](https://pixelartvillage.com/) pixel
+size (1–100), brightness, contrast, and saturation (−100–200) sliders, plus
+**Pre-filter blur**. Blur is applied before sampling the pixel blocks; zero
+disables it. **Reset All** restores the adjustment defaults in one undo step.
+
+On supported OpenGL 3.3 hardware, cached textures and shader passes keep live
+adjustments on the GPU, with bounded blur kernels and cached pattern geometry.
+The raster renderer and unsupported drivers use a CPU fallback. Run
+`python tests/benchmark_pattern_effects.py` for local GPU timing and visual
+checks; it writes a contact sheet and timing data under
+`.artifacts/pattern-modifiers/`.
 
 ## Array
 

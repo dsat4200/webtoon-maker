@@ -53,6 +53,7 @@ from comic_editor.core.models import (
     GridSettings, LineGradientField, LayerNode, RadialGradientField,
     ImageObject, PathContour, PathNode, RasterObject, ShapeStyle, TextObject,
     BlurModifier, OutlineModifier, MirrorModifier, ArrayModifier, RadialBlurModifier, ToneMask, StrokeModifier,
+    HalftoneModifier, PixelateModifier,
     SpeedLineCenterObject, SpeedLinesGradientObject, VectorDrawingObject,
     VectorStroke, VectorStrokePoint, new_id,
     ImageSourceDescriptor, canonical_argb, image_source_from_dict,
@@ -1215,6 +1216,11 @@ class _CanvasLogic(MaskSelectionFeatures, MaskGradientFeatures, TilingFeatures, 
             world = self._tiling_boundary(context[0]).boundingRect()
         for layer in reversed(self.chapter.ancestor_layers(obj.parent_layer_id)):
             modifier_ids.extend(layer.modifier_ids)
+        if any(isinstance(m, (HalftoneModifier, PixelateModifier))
+               for m in self._active_modifier_instances(modifier_ids)):
+            # A new stroke can change the reference frame or a neighboring
+            # cell's sample. Refresh the visible document, not only its pixels.
+            return QRectF(0, 0, self.chapter.width, self.chapter.height).united(world)
         if any(isinstance(self.chapter.modifiers.get(mid), (MirrorModifier, ArrayModifier, RadialBlurModifier, CageTransformModifier, StrokeModifier)) for mid in modifier_ids):
             return effect_bounds(world, self._active_modifier_instances(modifier_ids))
         padding = max((
@@ -1287,6 +1293,9 @@ class _CanvasLogic(MaskSelectionFeatures, MaskGradientFeatures, TilingFeatures, 
             parent = self.chapter.layers[parent_id]
             modifier_ids.extend(parent.modifier_ids)
             parent_id = parent.parent_id
+        if any(isinstance(m, (HalftoneModifier, PixelateModifier))
+               for m in self._active_modifier_instances(modifier_ids)):
+            return QRectF(0, 0, self.chapter.width, self.chapter.height).united(world)
         if any(isinstance(self.chapter.modifiers.get(mid), (MirrorModifier, ArrayModifier, RadialBlurModifier, CageTransformModifier, StrokeModifier)) for mid in modifier_ids):
             return effect_bounds(world, self._active_modifier_instances(modifier_ids))
         padding = max((
@@ -4467,7 +4476,7 @@ class _CanvasLogic(MaskSelectionFeatures, MaskGradientFeatures, TilingFeatures, 
     ) -> None:
         if self._render_tiled_target(painter, layer, parent_opacity, visible_world):
             return
-        if layer.layer_kind == "text_container" or any(isinstance(m, (MirrorModifier, ArrayModifier, RadialBlurModifier, CageTransformModifier, StrokeModifier)) for m in self._active_modifier_instances(layer.modifier_ids)):
+        if layer.layer_kind == "text_container" or any(isinstance(m, (MirrorModifier, ArrayModifier, RadialBlurModifier, CageTransformModifier, StrokeModifier, HalftoneModifier, PixelateModifier)) for m in self._active_modifier_instances(layer.modifier_ids)):
             self._render_mirror_target(painter, layer, parent_opacity, visible_world)
             return
         world_bounds = self.entity_world_rect("layer", layer.layer_id)
@@ -4742,7 +4751,7 @@ class _CanvasLogic(MaskSelectionFeatures, MaskGradientFeatures, TilingFeatures, 
     ) -> None:
         if not layer.visible:
             return
-        if ("layer", layer.layer_id) not in self._render_modifier_sources and any(isinstance(modifier, (MirrorModifier, ArrayModifier, RadialBlurModifier, CageTransformModifier)) for modifier in self._active_modifier_instances(layer.modifier_ids)):
+        if ("layer", layer.layer_id) not in self._render_modifier_sources and any(isinstance(modifier, (MirrorModifier, ArrayModifier, RadialBlurModifier, CageTransformModifier, HalftoneModifier, PixelateModifier)) for modifier in self._active_modifier_instances(layer.modifier_ids)):
             self._render_mirror_target(painter, layer, parent_opacity, visible_world)
             return
         painter.save()
@@ -7096,6 +7105,7 @@ class _CanvasLogic(MaskSelectionFeatures, MaskGradientFeatures, TilingFeatures, 
             (
                 self._has_active_modifiers(obj.modifier_ids)
                 or obj.opacity_mask is not None
+                or isinstance(obj, RasterObject) and obj.modifier_source_frame is not None
             )
             and not self._render_base_alpha
             and ("object", obj.object_id) not in self._render_modifier_sources
@@ -7662,10 +7672,10 @@ class _CanvasLogic(MaskSelectionFeatures, MaskGradientFeatures, TilingFeatures, 
         if self._cage_session is not None and ("object", obj.object_id) in self._cage_session["targets"]:
             self._render_mirror_target(painter, obj, parent_opacity, local_visible)
             return
-        if isinstance(obj, RasterObject) and (obj.modifier_source_frame is not None or any(isinstance(m, (RadialBlurModifier, ArrayModifier)) for m in self._active_modifier_instances(obj.modifier_ids))):
+        if isinstance(obj, RasterObject) and (obj.modifier_source_frame is not None or any(isinstance(m, (RadialBlurModifier, ArrayModifier, HalftoneModifier, PixelateModifier)) for m in self._active_modifier_instances(obj.modifier_ids))):
             self._render_radial_raster(painter, obj, parent_opacity, local_visible)
             return
-        if any(isinstance(m, (MirrorModifier, ArrayModifier, RadialBlurModifier, CageTransformModifier, StrokeModifier)) for m in self._active_modifier_instances(obj.modifier_ids)):
+        if any(isinstance(m, (MirrorModifier, ArrayModifier, RadialBlurModifier, CageTransformModifier, StrokeModifier, HalftoneModifier, PixelateModifier)) for m in self._active_modifier_instances(obj.modifier_ids)):
             self._render_mirror_target(painter, obj, parent_opacity, local_visible)
             return
         modifiers = self._active_modifier_instances(

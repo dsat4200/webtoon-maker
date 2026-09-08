@@ -14,6 +14,7 @@ from scipy.ndimage import distance_transform_edt
 from comic_editor.core.models import (
     BlurModifier, HueSaturationLightnessModifier, ModifierInstance,
     OutlineModifier, MirrorModifier, RadialBlurModifier, PosterizeModifier, PosterizeValueModifier,
+    HalftoneModifier, PixelateModifier,
 )
 from comic_editor.core.effect_geometry import reflection_transform
 
@@ -369,6 +370,31 @@ def _outline_effect(
     return original + outline * (1.0 - original[..., 3:4])
 
 
+def apply_pattern_modifier(image, modifier, mask_fields=None, renderer=None):
+    """Render a pattern once, blending intensity in premultiplied space."""
+    if image.isNull() or modifier.muted:
+        return image
+    modifier.validate()
+    amount = _parameter_field(modifier, "intensity", modifier.intensity,
+                              (image.height(), image.width()), mask_fields or {})
+    amount = np.asarray(amount, dtype=np.float32) / 100.0
+    if np.max(amount) <= 0.0:
+        return image
+    if renderer is not None:
+        result = renderer.render(image, modifier,
+                                 intensity_mask=amount if amount.ndim else None)
+        if result is not None:
+            return result
+    from comic_editor.ui.pattern_rendering import apply_pattern_effect
+    result = apply_pattern_effect(image, modifier)
+    if amount.ndim == 0 and float(amount) >= 1.0:
+        return result
+    if amount.ndim == 2:
+        amount = amount[..., None]
+    return _premultiplied_qimage(_qimage_premultiplied(image) * (1.0 - amount)
+                                + _qimage_premultiplied(result) * amount)
+
+
 def apply_modifier_stack(
     image: QImage, modifiers: list[ModifierInstance],
     world_origin: tuple[float, float],
@@ -393,7 +419,12 @@ def apply_modifier_stack(
         amount = np.asarray(amount, dtype=np.float32) / 100.0
         if np.max(amount) <= 0.0:
             continue
-        if isinstance(modifier, HueSaturationLightnessModifier):
+        if isinstance(modifier, (HalftoneModifier, PixelateModifier)):
+            from comic_editor.ui.pattern_rendering import apply_pattern_effect
+            effect = _qimage_premultiplied(apply_pattern_effect(
+                _premultiplied_qimage(current), modifier))
+            mask = amount
+        elif isinstance(modifier, HueSaturationLightnessModifier):
             effect = _hsl_effect(
                 current,
                 _parameter_field(

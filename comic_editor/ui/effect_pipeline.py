@@ -4,7 +4,8 @@ import copy
 import numpy as np
 from PySide6.QtCore import QRectF, Qt
 from PySide6.QtGui import QImage, QPainter, QTransform
-from comic_editor.core.models import ArrayModifier, MirrorModifier, RadialBlurModifier, CageTransformModifier, PosterizeModifier
+from comic_editor.core.models import (ArrayModifier, MirrorModifier, RadialBlurModifier,
+    CageTransformModifier, PosterizeModifier, HalftoneModifier, PixelateModifier)
 from comic_editor.core.color_smoothing import simplify_padding
 from comic_editor.core.effect_geometry import effect_bounds, reflection_transform, array_indices, array_transform, array_input_bounds
 from comic_editor.ui.modifier_rendering import apply_modifier_stack, _qimage_premultiplied, _premultiplied_qimage, _parameter_field
@@ -38,9 +39,10 @@ def render_stages(canvas, image, bounds, modifiers, local_to_world, *, nearest=F
         needed = QRectF(required)
         for index in range(len(modifiers) - 1, -1, -1):
             requirements[index] = needed
-            if isinstance(modifiers[index], CageTransformModifier):
+            if isinstance(modifiers[index], (CageTransformModifier, HalftoneModifier, PixelateModifier)):
                 # A displaced cage can pull source pixels from anywhere in the
-                # incoming stage, including completely outside this viewport.
+                # incoming stage. Pattern effects also need the full frame:
+                # cropping first changes their grid origin and reference scale.
                 break
             if isinstance(modifiers[index], ArrayModifier) and not modifiers[index].muted:
                 needed = array_input_bounds(needed, modifiers[index], local_to_world)
@@ -70,13 +72,26 @@ def render_stages(canvas, image, bounds, modifiers, local_to_world, *, nearest=F
         cached = canvas._modifier_cache_get(key)
         if cached is None:
             work_target = target
+            pattern = isinstance(modifier, (HalftoneModifier, PixelateModifier))
+            if pattern:
+                work_target = bounds
             if isinstance(modifier, PosterizeModifier):
                 padding = simplify_padding(modifier)
                 work_target = aligned(target.adjusted(-padding, -padding, padding, padding).intersected(bounds))
-            source = empty_image(work_target)
+            # Keep the upstream image identity for cached GPU uploads and blur
+            # passes when a pattern slider changes.
+            source = image if pattern else empty_image(work_target)
             mapping = canvas._world_to_image_transform(local_to_world, work_target, source.width(), source.height())
             fields = canvas._modifier_mask_fields([modifier], source.width(), source.height(), mapping, local_to_world.mapRect(work_target))
-            if isinstance(modifier, CageTransformModifier) and valid:
+            if pattern:
+                from comic_editor.ui.gpu_pattern_effects import renderer_for
+                from comic_editor.ui.modifier_rendering import apply_pattern_modifier
+                cached = apply_pattern_modifier(source, modifier, fields, renderer_for(canvas))
+                if work_target != target:
+                    cropped = QRectF(target)
+                    cropped.translate(-work_target.topLeft())
+                    cached = cached.copy(cropped.toAlignedRect())
+            elif isinstance(modifier, CageTransformModifier) and valid:
                 from comic_editor.ui.cage_rendering import warp_image
                 painter = QPainter(source)
                 painter.drawImage(bounds.topLeft()-target.topLeft(), image)

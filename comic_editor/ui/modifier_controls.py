@@ -14,6 +14,7 @@ from comic_editor.core.models import (
     OutlineModifier, MirrorModifier, RadialBlurModifier, RasterObject, LayerNode,
     canonical_argb, TilingModifier, ArrayModifier,
     CageTransformModifier, PosterizeModifier, PosterizeValueModifier, POSTERIZE_MAX_COLORS,
+    HalftoneModifier, PixelateModifier,
     StrokeModifier, ScreamModifier, WobbleModifier, DotDashModifier, STROKE_MODIFIER_TYPES,
 )
 from comic_editor.ui.icons import iconoir
@@ -188,6 +189,10 @@ class ModifierCard(QFrame):
                     randomize.setToolTip(f"Seed: {seed}")
                 randomize.clicked.connect(randomize_seed)
                 form.addWidget(randomize)
+        elif isinstance(modifier, (HalftoneModifier, PixelateModifier)):
+            from comic_editor.ui.pattern_controls import HalftoneControls, PixelateControls
+            factory = HalftoneControls if isinstance(modifier, HalftoneModifier) else PixelateControls
+            form.addWidget(factory(modifier, owner, body))
         elif isinstance(modifier, ArrayModifier):
             from comic_editor.ui.array_controls import ArraySettingsControls
             form.addWidget(ArraySettingsControls(owner, modifier, body))
@@ -458,6 +463,8 @@ class ModifierControls(QWidget):
         menu.addAction("Tiling").triggered.connect(lambda: self.add_modifier("tiling"))
         menu.addAction("Posterize…").triggered.connect(lambda: self.add_modifier("posterize"))
         menu.addAction("Posterize Value…").triggered.connect(lambda: self.add_modifier("posterize_value"))
+        menu.addAction("Halftone").triggered.connect(lambda: self.add_modifier("halftone"))
+        menu.addAction("Pixelate").triggered.connect(lambda: self.add_modifier("pixelate"))
         menu.addAction("Cage Transform").triggered.connect(lambda: self.add_modifier("cage_transform"))
         self.add_button.setMenu(menu)
         layout.addWidget(self.add_button)
@@ -582,6 +589,8 @@ class ModifierControls(QWidget):
         before = chapter.to_dict()
         if modifier_type in STROKE_MODIFIER_TYPES:
             modifier = STROKE_MODIFIER_TYPES[modifier_type]()
+        elif modifier_type in {"halftone", "pixelate"}:
+            modifier = HalftoneModifier() if modifier_type == "halftone" else PixelateModifier()
         elif modifier_type == "tiling":
             bounds = self.canvas._tiling_default_bounds(targets)
             side = max(1., min(256., min(bounds.width(), bounds.height())/2))

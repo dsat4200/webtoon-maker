@@ -4,7 +4,8 @@ from __future__ import annotations
 import copy
 import math
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
+from functools import lru_cache
 from typing import Any, Iterable, Iterator, Literal
 from comic_editor.core.cage import CageGrid
 
@@ -1214,6 +1215,202 @@ class PosterizeValueModifier(PosterizeModifier):
             raise ValueError("Posterize Value boundaries cannot overlap or exceed white")
 
 
+HALFTONE_GRIDS = ("square", "hexagonal", "radial", "line", "ring", "stippling")
+HALFTONE_DOT_STYLES = ("circle", "incircle", "triangle", "square", "polygon", "line",
+                       "custom", "blob", "delaunay", "liquid")
+HALFTONE_MAX_GRADIENT_STOPS = 32
+HALFTONE_MAX_SVG_BYTES = 256 * 1024
+
+
+@lru_cache(maxsize=32)
+def sanitize_halftone_svg(source: str) -> str:
+    """Embed a bounded, static SVG without files, network references or scripts."""
+    import re
+    import xml.etree.ElementTree as ET
+
+    source = str(source or "")
+    if not source.strip():
+        return ""
+    if len(source.encode("utf-8")) > HALFTONE_MAX_SVG_BYTES:
+        raise ValueError("Custom SVG must be smaller than 256 KB")
+    if re.search(r"<!\s*(DOCTYPE|ENTITY)", source, re.I):
+        raise ValueError("Custom SVG cannot include document types or entities")
+    try:
+        root = ET.fromstring(source)
+    except ET.ParseError as error:
+        raise ValueError("Custom dot must be a valid SVG") from error
+    local = lambda value: value.rsplit("}", 1)[-1]
+    if local(root.tag) != "svg":
+        raise ValueError("Custom dot must have an SVG root")
+    allowed = {"svg", "g", "defs", "path", "rect", "circle", "ellipse", "line",
+               "polyline", "polygon", "use", "clipPath", "mask", "linearGradient",
+               "radialGradient", "stop", "title", "desc"}
+    nodes = list(root.iter())
+    if len(nodes) > 4096:
+        raise ValueError("Custom SVG has too many shapes")
+    for parent in nodes:
+        for child in list(parent):
+            if local(child.tag) not in allowed:
+                parent.remove(child)
+        for key, value in list(parent.attrib.items()):
+            attribute = local(key).lower()
+            urls = re.findall(r"url\s*\(\s*['\"]?([^)'\"\s]+)", value, re.I)
+            if (attribute.startswith("on") or attribute in {"base", "src"}
+                    or attribute == "href" and not value.startswith("#")
+                    or any(not url.startswith("#") for url in urls)
+                    or "@import" in value.lower()):
+                del parent.attrib[key]
+    return ET.tostring(root, encoding="unicode")
+
+
+@dataclass
+class _PatternModifier:
+    modifier_id: str = field(default_factory=new_id)
+    modifier_type: str = "pattern"
+    name: str = "Pattern"
+    intensity: float = 100.0
+    expanded: bool = True
+    muted: bool = False
+    parameter_masks: dict[str, ParameterMaskBinding] = field(default_factory=dict)
+
+    def numeric_ranges(self):
+        return {"intensity": (0., 100.)}
+
+    def validate(self):
+        for attribute, (minimum, maximum) in self.numeric_ranges().items():
+            value = float(getattr(self, attribute))
+            if not math.isfinite(value):
+                raise ValueError(f"{type(self).name} values must be finite")
+            setattr(self, attribute, max(minimum, min(maximum, value)))
+        self.name = str(self.name or type(self).name)
+        self.expanded, self.muted = bool(self.expanded), bool(self.muted)
+        _validate_parameter_masks(self.parameter_masks, {"intensity": (0., 100.)})
+
+    def to_dict(self):
+        self.validate()
+        result = {item.name: copy.deepcopy(getattr(self, item.name))
+                  for item in fields(self) if item.name not in
+                  {"modifier_id", "modifier_type", "parameter_masks"}}
+        result.update(id=self.modifier_id, type=self.modifier_type,
+                      parameter_masks=_parameter_masks_to_dict(self.parameter_masks))
+        return result
+
+
+@dataclass
+class HalftoneModifier(_PatternModifier):
+    """Object-local halftone with a luminance sample and editable color mapping."""
+
+    modifier_type: str = "halftone"
+    name: str = "Halftone"
+    grid_type: str = "square"
+    fit_mode: str = "short"
+    base_resolution: int = 1000
+    blur: float = 5.0
+    gamma: float = 1.0
+    contrast: float = 0.0
+    clamp_min: float = 0.0
+    clamp_max: float = 1.0
+    spacing: float = 10.0
+    rotation: float = 0.0
+    invert: bool = False
+    level_min: float = 0.0
+    level_max: float = 1.0
+    dot_style: str = "circle"
+    size: float = 1.0
+    scale_factor: float = 1.0
+    dot_rotation: float = 0.0
+    link_rotation: bool = True
+    sides: int = 6
+    star: bool = False
+    star_inner: float = 0.5
+    corner_rounding: float = 0.0
+    color_mode: str = "two"
+    foreground: str = "#FF000000"
+    background: str = "#FFFFFFFF"
+    transparent_background: bool = False
+    gradient_stops: list = field(default_factory=lambda: [[0., "#FF000000"], [1., "#FFFFFFFF"]])
+    gradient_interpolation: str = "rgb"
+    custom_svg: str = ""
+    custom_render_mode: str = "silhouette"
+    stipple_seed: int = 0
+    point_spacing: float = 5.0
+    line_width: float = 1.0
+    line_level_scale: float = 1.0
+    smoothing_iterations: int = 100
+    collide_min: float = 0.25
+    collide_max: float = 1.0
+    max_edge_length: float = 10.0
+    max_necks: int = 4
+    merge_strength: float = 1.0
+    min_neck_width: float = 0.5
+    even_merge_tone: bool = False
+
+    def numeric_ranges(self):
+        return {**super().numeric_ranges(), "base_resolution": (100., 4000.),
+                "blur": (0., 100.), "gamma": (0., 5.), "contrast": (-3., 3.),
+                "clamp_min": (0., 1.), "clamp_max": (0., 1.), "spacing": (2., 200.),
+                "rotation": (-180., 180.), "level_min": (0., 1.), "level_max": (0., 1.),
+                "size": (0., 3.), "scale_factor": (0., 1.), "dot_rotation": (-180., 180.),
+                "sides": (3., 16.), "star_inner": (0., 1.), "corner_rounding": (0., 1.),
+                "point_spacing": (1., 100.), "line_width": (0., 3.), "line_level_scale": (0., 3.),
+                "smoothing_iterations": (0., 200.), "collide_min": (0., 2.), "collide_max": (0., 2.),
+                "max_edge_length": (1., 100.), "max_necks": (0., 12.),
+                "merge_strength": (0., 3.), "min_neck_width": (0., 1.)}
+
+    def validate(self):
+        super().validate()
+        for attribute, choices in (("grid_type", HALFTONE_GRIDS),
+                ("fit_mode", ("short", "long", "width", "height")),
+                ("dot_style", HALFTONE_DOT_STYLES), ("color_mode", ("two", "gradient", "source")),
+                ("custom_render_mode", ("silhouette", "original")),
+                ("gradient_interpolation", ("rgb", "oklch"))):
+            if getattr(self, attribute) not in choices:
+                raise ValueError(f"Unknown halftone {attribute.replace('_', ' ')}")
+        self.base_resolution, self.sides = round(self.base_resolution), round(self.sides)
+        self.clamp_min, self.clamp_max = sorted((self.clamp_min, self.clamp_max))
+        self.level_min, self.level_max = sorted((self.level_min, self.level_max))
+        self.collide_min, self.collide_max = sorted((self.collide_min, self.collide_max))
+        self.smoothing_iterations, self.max_necks = round(self.smoothing_iterations), round(self.max_necks)
+        for attribute in ("invert", "link_rotation", "star", "transparent_background", "even_merge_tone"):
+            setattr(self, attribute, bool(getattr(self, attribute)))
+        self.foreground = canonical_argb(self.foreground)
+        self.background = canonical_argb(self.background, "#FFFFFFFF")
+        if not isinstance(self.gradient_stops, (list, tuple)) or not 2 <= len(self.gradient_stops) <= HALFTONE_MAX_GRADIENT_STOPS:
+            raise ValueError("Halftone gradients need 2 to 32 stops")
+        stops = []
+        for stop in self.gradient_stops:
+            if not isinstance(stop, (list, tuple)) or len(stop) != 2:
+                raise ValueError("Halftone gradient stops need a position and color")
+            position = float(stop[0])
+            if not math.isfinite(position):
+                raise ValueError("Halftone gradient positions must be finite")
+            stops.append([max(0., min(1., position)), canonical_argb(stop[1])])
+        self.gradient_stops = sorted(stops, key=lambda stop: stop[0])
+        self.custom_svg = sanitize_halftone_svg(self.custom_svg)
+        seed = float(self.stipple_seed)
+        if not math.isfinite(seed):
+            raise ValueError("Stippling seed must be finite")
+        self.stipple_seed = int(seed) % (2 ** 32)
+
+
+@dataclass
+class PixelateModifier(_PatternModifier):
+    """Pixel blocks with preprocessing controls and transparency preservation."""
+
+    modifier_type: str = "pixelate"
+    name: str = "Pixelate"
+    pixel_size: float = 8.0
+    brightness: float = 0.0
+    contrast: float = 0.0
+    saturation: float = 0.0
+    blur: float = 0.0
+
+    def numeric_ranges(self):
+        return {**super().numeric_ranges(), "pixel_size": (1., 100.),
+                "brightness": (-100., 200.), "contrast": (-100., 200.),
+                "saturation": (-100., 200.), "blur": (0., 100.)}
+
+
 @dataclass
 class TilingModifier:
     modifier_id: str = field(default_factory=new_id)
@@ -1352,7 +1549,7 @@ STROKE_MODIFIER_TYPES = {"stroke_scream": ScreamModifier,
                          "stroke_dot_dash": DotDashModifier}
 
 
-ModifierInstance = HueSaturationLightnessModifier | BlurModifier | OutlineModifier | MirrorModifier | ArrayModifier | RadialBlurModifier | CageTransformModifier | PosterizeModifier | PosterizeValueModifier | TilingModifier | ScreamModifier | WobbleModifier | DotDashModifier
+ModifierInstance = HueSaturationLightnessModifier | BlurModifier | OutlineModifier | MirrorModifier | ArrayModifier | RadialBlurModifier | CageTransformModifier | PosterizeModifier | PosterizeValueModifier | TilingModifier | ScreamModifier | WobbleModifier | DotDashModifier | HalftoneModifier | PixelateModifier
 
 
 def modifier_from_dict(data: dict[str, Any]) -> ModifierInstance:
@@ -1367,8 +1564,9 @@ def modifier_from_dict(data: dict[str, Any]) -> ModifierInstance:
             data.get("parameter_masks")
         ),
     }
-    if modifier_type in STROKE_MODIFIER_TYPES:
-        factory = STROKE_MODIFIER_TYPES[modifier_type]
+    if modifier_type in STROKE_MODIFIER_TYPES or modifier_type in {"halftone", "pixelate"}:
+        factory = ({"halftone": HalftoneModifier, "pixelate": PixelateModifier}.get(modifier_type)
+                   or STROKE_MODIFIER_TYPES[modifier_type])
         defaults = factory().to_dict()
         values = {key: data.get(key, value) for key, value in defaults.items()
                   if key not in {"id", "type", "name", "intensity", "expanded", "muted", "parameter_masks"}}
