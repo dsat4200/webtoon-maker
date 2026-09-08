@@ -298,7 +298,19 @@ class TilingFeatures:
         painter.save()
         painter.setTransform(self.layer_world_transform(layer.layer_id), True)
         if outline and layer.border_width > 0 and getattr(self, "_stroke_hide_border_id", None) != layer.layer_id:
-            if layer.compound_enabled:
+            from comic_editor.ui.compound_strokes import scoped, appearance, paint_outline
+            if scoped(self, layer):
+                from comic_editor.ui.shape_outline_compound import OutlineSource
+                styled = appearance(self, layer)
+                sources = (self._compound_outline_mesh(layer, path, sources_only=True)
+                           if layer.compound_enabled else [OutlineSource(
+                               styled.bound if styled is not None else layer.bound, layer.border_width,
+                               QTransform(), owner_id=layer.layer_id)])
+                paint_outline(self, painter, layer, path, sources,
+                              self._outline_tolerance(painter, path.boundingRect()))
+                painter.restore()
+                return
+            elif layer.compound_enabled:
                 coverage = self._compound_outline_mesh(layer, path, self._outline_tolerance(painter, path.boundingRect()))
             elif layer.layer_kind == "open_shape":
                 style = layer.shape_style
@@ -376,6 +388,10 @@ class TilingFeatures:
             return False
         rest = [m for m in self._active_modifier_instances(target.modifier_ids,
             suppress_outline=self._suppress_outline_for_mask) if not isinstance(m, TilingModifier)]
+        if isinstance(target, LayerNode):
+            from comic_editor.ui.compound_strokes import scoped
+            if scoped(self, target):
+                rest = [m for m in rest if not isinstance(m, StrokeModifier)]
         if self._render_base_alpha:
             rest = []
         # Other spatial effects may pull any part of the finite tiled fill.

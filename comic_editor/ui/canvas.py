@@ -2875,7 +2875,9 @@ class _CanvasLogic(MaskSelectionFeatures, MaskGradientFeatures, TilingFeatures, 
                    if isinstance(m := self.chapter.modifiers.get(mid), MirrorModifier)),
              tuple((repr(m.grid_dict()), m.muted, m.intensity)
                    for mid in layer.modifier_ids
-                   if isinstance(m := self.chapter.modifiers.get(mid), CageTransformModifier)))
+                   if isinstance(m := self.chapter.modifiers.get(mid), CageTransformModifier)),
+             self._modifier_parameter_signature([mid for mid in layer.modifier_ids
+                 if isinstance(self.chapter.modifiers.get(mid), StrokeModifier)]))
             for layer in self.chapter.layers.values()
         )
         if signature != self._compound_geometry_signature:
@@ -2883,9 +2885,13 @@ class _CanvasLogic(MaskSelectionFeatures, MaskGradientFeatures, TilingFeatures, 
             self._compound_geometry_signature = signature
         self._asset_drag_clip_cache.clear()
 
-    def _layer_operand_path(self, layer: LayerNode) -> QPainterPath:
+    def _layer_operand_path(self, layer: LayerNode, document=None) -> QPainterPath:
         if layer.bound is None:
             return QPainterPath()
+        from comic_editor.ui.compound_strokes import appearance
+        styled = appearance(self, layer, document)
+        if styled is not None:
+            return QPainterPath(styled.path)
         if layer.layer_kind == "open_shape":
             return self.open_shape_mesh(
                 layer.bound, layer.shape_style.base_thickness, 0,
@@ -2907,7 +2913,7 @@ class _CanvasLogic(MaskSelectionFeatures, MaskGradientFeatures, TilingFeatures, 
         """Build one effective shape, optionally including a virtual child."""
         layer = document.layers[layer_id]
         if not layer.compound_enabled:
-            return self.layer_shape_path(layer)
+            return self._layer_operand_path(layer, document) if layer.layer_kind != "open_shape" else self.layer_shape_path(layer)
         cached = cache.get(layer_id)
         if cached is not None:
             return QPainterPath(cached)
@@ -2916,7 +2922,7 @@ class _CanvasLogic(MaskSelectionFeatures, MaskGradientFeatures, TilingFeatures, 
         ).inverted()
         if not invertible:
             return QPainterPath()
-        additions = QPainterPath(self._layer_operand_path(layer))
+        additions = QPainterPath(self._layer_operand_path(layer, document))
         additions.setFillRule(Qt.OddEvenFill)
         subtractions = QPainterPath()
         subtractions.setFillRule(Qt.OddEvenFill)
@@ -2940,7 +2946,7 @@ class _CanvasLogic(MaskSelectionFeatures, MaskGradientFeatures, TilingFeatures, 
                         virtual_operation=virtual_operation,
                     )
                     if child.compound_enabled
-                    else self._layer_operand_path(child)
+                    else self._layer_operand_path(child, document)
                 )
                 world_operand = self._document_layer_world_transform(document, child.layer_id).map(operand)
                 cages = tuple(m for mid in child.modifier_ids
@@ -4412,10 +4418,7 @@ class _CanvasLogic(MaskSelectionFeatures, MaskGradientFeatures, TilingFeatures, 
                     )
             painter.restore()
             return
-        layer_path = self._outline_cache.get(
-            ("fill", geometry_key(layer.bound)),
-            lambda: self.bound_path(layer.bound, layer.vertex_radius),
-        )
+        layer_path = self._layer_operand_path(layer)
         opacity = parent_opacity * layer_opacity
         if layer.fill_color:
             painter.save()
@@ -4447,11 +4450,18 @@ class _CanvasLogic(MaskSelectionFeatures, MaskGradientFeatures, TilingFeatures, 
             )
             painter.setPen(pen)
             painter.setBrush(Qt.NoBrush)
-            painter.fillPath(outline_mesh(
-                layer.bound, layer.border_width, layer_path,
-                cache=self._outline_cache,
-                tolerance=self._outline_tolerance(painter, layer_path.controlPointRect()),
-            ), QColor(layer.border_color))
+            from comic_editor.ui.compound_strokes import appearance, paint_outline
+            styled = appearance(self, layer)
+            if styled is not None:
+                paint_outline(self, painter, layer, layer_path,
+                    [OutlineSource(styled.bound, layer.border_width, QTransform(), owner_id=layer.layer_id)],
+                    self._outline_tolerance(painter, layer_path.controlPointRect()))
+            else:
+                painter.fillPath(outline_mesh(
+                    layer.bound, layer.border_width, layer_path,
+                    cache=self._outline_cache,
+                    tolerance=self._outline_tolerance(painter, layer_path.controlPointRect()),
+                ), QColor(layer.border_color))
             painter.restore()
         painter.restore()
         for child in reversed(layer.children):
@@ -4474,6 +4484,17 @@ class _CanvasLogic(MaskSelectionFeatures, MaskGradientFeatures, TilingFeatures, 
         self, painter: QPainter, layer: LayerNode, parent_opacity: float,
         visible_world: QRectF,
     ) -> None:
+        from comic_editor.ui.compound_strokes import scoped
+        if scoped(self, layer) and layer.opacity_mask is None and all(
+                isinstance(m, StrokeModifier) for m in self._active_modifier_instances(layer.modifier_ids)):
+            self._render_modifier_sources.add(("layer", layer.layer_id))
+            try:
+                # Local stroke effects are already in this operand. Preserve
+                # normal subtree composition and the owner's opacity here.
+                self._render_layer(painter, layer, parent_opacity*layer.opacity, visible_world)
+            finally:
+                self._render_modifier_sources.discard(("layer", layer.layer_id))
+            return
         if self._render_tiled_target(painter, layer, parent_opacity, visible_world):
             return
         if layer.layer_kind == "text_container" or any(isinstance(m, (MirrorModifier, ArrayModifier, RadialBlurModifier, CageTransformModifier, StrokeModifier, HalftoneModifier, PixelateModifier)) for m in self._active_modifier_instances(layer.modifier_ids)):
@@ -4625,11 +4646,11 @@ class _CanvasLogic(MaskSelectionFeatures, MaskGradientFeatures, TilingFeatures, 
         painter.drawImage(bounds.topLeft(), processed)
         painter.restore()
 
-    def _compound_outline_mesh(self, layer, path, tolerance=.125):
+    def _compound_outline_mesh(self, layer, path, tolerance=.125, *, sources_only=False):
         """Attribute surviving compound boundaries, including reflected edges."""
         root_inverse, valid = self.layer_world_transform(layer.layer_id).inverted()
         if not valid:
-            return QPainterPath()
+            return [] if sources_only else QPainterPath()
 
         def operand_sources(item, post):
             result = []
@@ -4642,7 +4663,10 @@ class _CanvasLogic(MaskSelectionFeatures, MaskGradientFeatures, TilingFeatures, 
                     if source is not None:
                         result.append(source)
                 else:
-                    result.append(OutlineSource(item.bound, item.border_width, mapping))
+                    from comic_editor.ui.compound_strokes import appearance
+                    styled = appearance(self, item)
+                    result.append(OutlineSource(styled.bound if styled is not None else item.bound,
+                        item.border_width, mapping, owner_id=item.layer_id))
             if item.compound_enabled:
                 result.extend(contributions(item, post))
             return result
@@ -4673,6 +4697,8 @@ class _CanvasLogic(MaskSelectionFeatures, MaskGradientFeatures, TilingFeatures, 
             return result
 
         sources = operand_sources(layer, QTransform())
+        if sources_only:
+            return sources
         return compound_outline(path, layer.border_width, sources,
                                 self._outline_cache, tolerance)
 
@@ -4726,10 +4752,10 @@ class _CanvasLogic(MaskSelectionFeatures, MaskGradientFeatures, TilingFeatures, 
             )
             painter.setPen(pen)
             painter.setBrush(Qt.NoBrush)
-            coverage = self._compound_outline_mesh(
-                layer, layer_path, self._outline_tolerance(painter, layer_path.controlPointRect()),
-            )
-            painter.fillPath(coverage, QColor(layer.border_color))
+            from comic_editor.ui.compound_strokes import paint_outline
+            tolerance = self._outline_tolerance(painter, layer_path.controlPointRect())
+            sources = self._compound_outline_mesh(layer, layer_path, tolerance, sources_only=True)
+            paint_outline(self, painter, layer, layer_path, sources, tolerance)
             painter.restore()
         for child in reversed(layer.children):
             if not self._child_ignores_parent_mask(child):
@@ -7812,6 +7838,9 @@ class _CanvasLogic(MaskSelectionFeatures, MaskGradientFeatures, TilingFeatures, 
             from comic_editor.ui.baking import visual_bounds
             for child in target.children:
                 world = world.united(visual_bounds(self, child.kind, child.entity_id))
+            from comic_editor.ui.compound_strokes import scoped
+            if scoped(self, target):
+                world = world.united(self.layer_world_transform(identifier).mapRect(self.layer_effective_path(identifier).controlPointRect()))
         if self._cage_session is not None:
             affected = (kind, identifier) in self._cage_session["targets"] or layer and any(
                 any(parent.layer_id == identifier for parent in self.chapter.ancestor_layers(self.chapter.objects[ref[1]].parent_layer_id))
@@ -7830,6 +7859,9 @@ class _CanvasLogic(MaskSelectionFeatures, MaskGradientFeatures, TilingFeatures, 
         bounds = aligned(inverse.mapRect(world))
         signature = self._modifier_layer_signature(identifier) if layer else self._modifier_object_signature(target)
         key = ("mirror-source", kind, identifier, signature[0], signature[3], signature[4], self._rect_signature(bounds), tuple(self._transform_preview_quad or ()), self._render_exclude_text)
+        if layer and scoped(self, target):
+            key = (*key, self._modifier_parameter_signature([mid for mid in target.modifier_ids
+                if isinstance(self.chapter.modifiers.get(mid), StrokeModifier)]))
         image = self._modifier_source_cache_get(key)
         if image is None:
             image = empty_image(bounds)
@@ -7856,6 +7888,8 @@ class _CanvasLogic(MaskSelectionFeatures, MaskGradientFeatures, TilingFeatures, 
                 source.end()
             self._modifier_source_cache_put(key, image)
         modifiers = self._active_modifier_instances(target.modifier_ids, suppress_outline=self._suppress_outline_for_mask)
+        if layer and scoped(self, target):
+            modifiers = [modifier for modifier in modifiers if not isinstance(modifier, StrokeModifier)]
         has_stroke = any(isinstance(modifier, StrokeModifier) for modifier in modifiers)
         opacity = target.opacity if layer or not target.opacity_locked else 1.0
         if not has_stroke and modifiers and isinstance(modifiers[-1], MirrorModifier) and not modifiers[-1].parameter_masks and target.opacity_mask is None and parent_opacity * opacity == 1:

@@ -452,7 +452,11 @@ corner roundness, and repeating patterns (`-` marks and spaces).
 All three have a 0–100% Strength slider and masks on every numeric setting.
 They share the existing ordered, linkable stack, support undo and export, and
 keep the editable source points intact. Whole repeats close around each loop.
-Open shapes, compound shapes, images, and raster drawings are ineligible.
+On compound shapes, each stroke effect changes only its owner's shape and
+outline. That modified shape contributes using its existing Add, Subtract, or
+Ignore mode, including nested compounds. Children retain their own geometry
+and artwork; the resulting compound boundary still clips their content.
+Open shapes, images, and raster drawings are ineligible.
 
 **Free Text Container** holds independent text boxes without adding a shape or
 clipping boundary. Click to place its first box or drag its wrapping bounds;

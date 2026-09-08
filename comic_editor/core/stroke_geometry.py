@@ -144,14 +144,20 @@ def stroke_path(points, width, roundness=100, closed=False):
     return stroker.createStroke(loop_path(points))
 
 
-def dot_dash_path(loop, modifier, parameter):
+def dot_dash_path(loop, modifier, parameter, *, spacing_points=None):
     """Fit whole pattern repeats to a closed circumference; no seam fragment."""
     result = QPainterPath()
     result.setFillRule(Qt.WindingFill)
     pattern = modifier.pattern
     if not pattern or not pattern.strip():
         return result
-    cumulative, edges = distances(loop.points)
+    cumulative, edges = distances(loop.points if spacing_points is None else spacing_points)
+    def locate(positions):
+        if spacing_points is None:
+            return interpolate(loop.points, positions)
+        closed = np.vstack((loop.points, loop.points[0]))
+        positions = np.asarray(positions) % max(cumulative[-1], 1e-9)
+        return np.column_stack([np.interp(positions, cumulative, closed[:, axis]) for axis in (0, 1)])
     length = cumulative[-1]
     mark_lengths = parameter("length") if modifier.mode == "dash" else np.full(len(loop.points), loop.width)
     pitch = np.maximum(1, mark_lengths+parameter("distance"))
@@ -167,7 +173,7 @@ def dot_dash_path(loop, modifier, parameter):
         roundness = float(parameter("roundness")[sample])
         width = loop.width
         if modifier.mode == "dot":
-            x, y = interpolate(loop.points, [center])[0]
+            x, y = locate([center])[0]
             from PySide6.QtCore import QRectF
             result.addRoundedRect(QRectF(x-width/2, y-width/2, width, width),
                                   width*.5*roundness/100, width*.5*roundness/100)
@@ -175,5 +181,5 @@ def dot_dash_path(loop, modifier, parameter):
             span = min(float(mark_lengths[sample]), length/count*.98)
             positions = np.linspace(center-span/2, center+span/2,
                                     max(2, min(1024, math.ceil(span/.75))))
-            result.addPath(stroke_path(interpolate(loop.points, positions), width, roundness))
+            result.addPath(stroke_path(locate(positions), width, roundness))
     return result

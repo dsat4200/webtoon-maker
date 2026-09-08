@@ -128,7 +128,7 @@ def test_compatibility_and_ui(scene, qapp):
     controls.refresh()
     assert not controls.stroke_menu.menuAction().isVisible()
     layer.compound_enabled = True
-    assert not chapter.stroke_modifier_target("layer", layer.layer_id)
+    assert chapter.stroke_modifier_target("layer", layer.layer_id)
     layer.compound_enabled = False
     layer.bound.closed = False
     assert not chapter.stroke_modifier_target("layer", layer.layer_id)

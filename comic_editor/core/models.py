@@ -3767,7 +3767,7 @@ class ChapterDocument:
             names.append(entity.name if entity else identifier)
         message = f"{modifier.name} is not compatible with: " + (", ".join(names) or "this selection") + "."
         if isinstance(modifier, StrokeModifier):
-            message += " Stroke modifiers require closed shapes or drawings with closed vector strokes. Open and compound shapes are not supported."
+            message += " Stroke modifiers require closed shapes or drawings with closed vector strokes. Open shapes are not supported."
         if isinstance(modifier, CageTransformModifier):
             message += " Use the Cage Transform tool to transform raster and vector drawings. Select only drawings, or only images and shapes."
         if isinstance(modifier, TilingModifier):
@@ -3778,8 +3778,7 @@ class ChapterDocument:
         target = self.modifier_target(kind, identifier)
         if isinstance(target, LayerNode):
             return bool(target.bound is not None and target.bound.closed
-                        and target.layer_kind == "bounded" and not target.compound_enabled
-                        and self.contributing_compound_ancestor(identifier) is None)
+                        and target.layer_kind == "bounded")
         if isinstance(target, VectorDrawingObject):
             return bool(target.strokes and all(stroke.closed and len(stroke.points) >= 3
                                               and not stroke.tiling_group for stroke in target.strokes))

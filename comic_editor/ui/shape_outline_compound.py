@@ -31,6 +31,7 @@ class OutlineSource:
     # Transient ribbon surfaces may have a width discontinuity at an
     # intersection. Keep both endpoint widths per outgoing boundary span.
     edge_styles: tuple = ()
+    owner_id: str = ""
 
     def style(self, contour, edge):
         if self.edge_styles:
@@ -274,13 +275,13 @@ def ribbon_source(bound, baseline, mapping, base_width, start_cap, end_cap, cach
     return OutlineSource(surface, baseline, mapping, tuple(styles))
 
 
-def compound_outline(path, baseline, sources, cache=None, tolerance=.125):
+def compound_outline(path, baseline, sources, cache=None, tolerance=.125, *, source_indices=None):
     geometry = tuple((geometry_key(s.bound), transform_key(s.mapping)) for s in sources)
     attribution_key = ("attribution", path_key(path), geometry, tolerance)
     styles = tuple((s.baseline, s.edge_styles or tuple(tuple((n.outline_multiplier, n.outline_enabled)
                                           for n in c.nodes) for c in s.bound.iter_contours()))
                    for s in sources)
-    key = ("compound_outline", attribution_key, baseline, styles)
+    key = ("compound_outline", attribution_key, baseline, styles, source_indices)
 
     def build():
         compiled = [_cached(cache, ("contours", geometry_key(s.bound)),
@@ -289,14 +290,19 @@ def compound_outline(path, baseline, sources, cache=None, tolerance=.125):
                                  lambda: attribute_boundary(path, sources, compiled, tolerance))
         result = QPainterPath()
         result.setFillRule(Qt.WindingFill)
-        result.addPath(native_stroke(fallback, baseline, tolerance=tolerance))
+        if source_indices is None or -1 in source_indices:
+            result.addPath(native_stroke(fallback, baseline, tolerance=tolerance))
         active = {}
         for span in spans:
+            if source_indices is not None and span.source not in source_indices:
+                continue
             source = sources[span.source]
             a, b, enabled = source.style(span.contour, span.edge)
             if enabled and max(a, b) > 0 and source.baseline > 0:
                 active.setdefault((span.source, span.contour, span.edge), []).append(span)
         for span in spans:
+            if source_indices is not None and span.source not in source_indices:
+                continue
             source = sources[span.source]
             contour = list(source.bound.iter_contours())[span.contour]
             first, last, enabled = source.style(span.contour, span.edge)
