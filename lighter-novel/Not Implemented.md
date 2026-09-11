@@ -1,5 +1,7 @@
 
 
+- allow reference images to overflow beyond the page off to the sides?
+- pasting images
 ## Stroke modifier - Set brush
 - lets the user change the brush used for that object via a modifier.
 - works on closed an open shapes too.
