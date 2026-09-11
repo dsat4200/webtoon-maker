@@ -226,6 +226,7 @@ class TilingFeatures:
         cached = self._modifier_source_cache_get(key)
         if cached is not None:
             return cached
+        revision = getattr(self, "_effect_provisional_revision", 0)
         image = empty_image(bounds)
         painter = QPainter(image)
         painter.setRenderHint(QPainter.Antialiasing, True)
@@ -250,7 +251,8 @@ class TilingFeatures:
             self._tiling_capture_geometry = previous_geometry
             painter.end()
             self._render_modifier_sources.discard((kind, identifier))
-        self._modifier_source_cache_put(key, image)
+        if revision == getattr(self, "_effect_provisional_revision", 0):
+            self._modifier_source_cache_put(key, image)
         return image
 
     def _tiling_raster_pixels(self, obj, geometry, world_bounds=None):
@@ -331,6 +333,7 @@ class TilingFeatures:
         painter.restore()
 
     def _tiling_stage(self, target, required=None):
+        revision = getattr(self, "_effect_provisional_revision", 0)
         modifier = self._own_tiling(target)
         geometry = TilingGeometry.from_modifier(modifier)
         boundary = self._tiling_boundary(target)
@@ -379,7 +382,8 @@ class TilingFeatures:
         if isinstance(target, LayerNode):
             self._tiling_shape_style(painter, target, outline=True)
         painter.end()
-        self._modifier_cache_put(key, result)
+        if revision == getattr(self, "_effect_provisional_revision", 0):
+            self._modifier_cache_put(key, result)
         return result, bounds
 
     def _render_tiled_target(self, painter, target, parent_opacity, visible_world):
@@ -395,17 +399,26 @@ class TilingFeatures:
         if self._render_base_alpha:
             rest = []
         # Other spatial effects may pull any part of the finite tiled fill.
+        revision = getattr(self, "_effect_provisional_revision", 0)
         image, bounds = self._tiling_stage(target, None if rest else visible_world)
+        provisional = revision != getattr(self, "_effect_provisional_revision", 0)
         kind, identifier = ("layer", target.layer_id) if isinstance(target, LayerNode) else ("object", target.object_id)
         if rest:
             scope = (kind, identifier, getattr(self, "_effect_preview_channel", "canvas"))
+            signature = (self._modifier_layer_signature(identifier) if kind == "layer"
+                         else self._modifier_object_signature(target))
+            source_key = ("tiled-stages", kind, identifier, signature,
+                          self._rect_signature(bounds), self._render_exclude_text,
+                          self._render_excluded_object_id, getattr(self, "_stroke_hide_border_id", None))
             if any(isinstance(effect, StrokeModifier) for effect in rest):
                 from comic_editor.ui.stroke_rendering import render_stroke_stack
                 image, bounds = render_stroke_stack(self, target, image, bounds, rest,
-                    QTransform(), ("tiled-stroke", image.cacheKey()), scope, tiled=True)
+                    QTransform(), source_key, scope, tiled=True,
+                    provisional=provisional)
             else:
                 image, bounds = render_stages(self, image, bounds, rest, QTransform(),
-                    nearest=isinstance(target, RasterObject), required=visible_world, request_scope=scope)
+                    nearest=isinstance(target, RasterObject), required=visible_world, request_scope=scope,
+                    provisional=provisional, source_key=source_key)
         if target.opacity_mask is not None:
             binding = target.opacity_mask
             image = apply_opacity_mask(image, self.render_tone_mask_field(binding.mask_id,

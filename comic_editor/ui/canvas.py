@@ -76,7 +76,7 @@ from comic_editor.core.vector_geometry import (
 )
 from comic_editor.ui.windows_input import configure_simultaneous_pen_touch
 from comic_editor.ui.modifier_rendering import (
-    BlurPyramidCache, OutlineDistanceCache, apply_modifier_stack,
+    BlurPyramidCache, OutlineDistanceCache,
     apply_opacity_mask,
 )
 from comic_editor.core.effect_geometry import effect_bounds, reflection_transform
@@ -1391,20 +1391,17 @@ class _CanvasLogic(MaskSelectionFeatures, MaskGradientFeatures, TilingFeatures, 
             if valid else self.visible_document_rect()
         )
         self._set_live_underlay_context()
-        previous_excluded = self._render_excluded_object_id
         previous_interactive = self._interactive_render
         self._interactive_render = True
-        if self._text_editing:
-            selected = self.chapter.objects.get(self.selected_object_id)
-            if isinstance(selected, TextObject):
-                self._render_excluded_object_id = selected.object_id
+        # Editing changes the text's content, not its place in the scene.
+        # Keep glyphs in the ordinary hierarchy on every typing/deletion frame;
+        # only caret/selection are painted later as an editing overlay.
         try:
             for page_id in reversed(self.chapter.root_page_ids):
                 self._render_layer(
                     painter, self.chapter.layers[page_id], 1.0, visible
                 )
         finally:
-            self._render_excluded_object_id = previous_excluded
             self._interactive_render = previous_interactive
         self._render_selected_drawing_underlay(painter, visible)
         self._clear_live_underlay_context()
@@ -3099,9 +3096,7 @@ class _CanvasLogic(MaskSelectionFeatures, MaskGradientFeatures, TilingFeatures, 
                 self.selected_object_id
             )
             if self._text_editing and isinstance(selected_live, TextObject):
-                self._render_selected_raster_preview(
-                    painter, self.visible_document_rect()
-                )
+                self._draw_selected_text_edit_overlay(painter, selected_live)
             self._draw_page_gap_overlay(painter)
             painter.restore()
         painter.save()
@@ -4307,15 +4302,7 @@ class _CanvasLogic(MaskSelectionFeatures, MaskGradientFeatures, TilingFeatures, 
         self, painter: QPainter, layer: LayerNode, parent_opacity: float,
         visible_world: QRectF,
     ) -> None:
-        if (
-            layer.mask_only
-            and self._rendering_mask_contributor <= 0
-            and not (
-                self._interactive_render
-                and self.selected_kind == "layer"
-                and self.selected_id == layer.layer_id
-            )
-        ):
+        if layer.mask_only and not self._mask_only_render_visible("layer", layer.layer_id):
             return
         if not layer.visible or (
             layer.opacity <= 0 and layer.opacity_mask is None
@@ -4537,22 +4524,25 @@ class _CanvasLogic(MaskSelectionFeatures, MaskGradientFeatures, TilingFeatures, 
                 + layer.shape_style.outline_thickness + 2
             )
             local.adjust(-padding, -padding, padding, padding)
-        expansion = max((
+        expansion = sum(
             self._modifier_maximum(
                 modifier, "strength", modifier.strength
             ) * 3.0
             if isinstance(modifier, BlurModifier)
-            else 100.0
+            else 25.0
             if isinstance(modifier, OutlineModifier)
             else 0.0
             for modifier in modifiers
-        ), default=0.0)
+        )
         local.adjust(-expansion, -expansion, expansion, expansion)
         bounds = QRectF(
             math.floor(local.left()), math.floor(local.top()),
             max(1, math.ceil(local.right()) - math.floor(local.left())),
             max(1, math.ceil(local.bottom()) - math.floor(local.top())),
         )
+        if not bounds.intersects(parent_inverse.mapRect(visible_world)):
+            return
+        capture_world = parent_transform.mapRect(bounds)
         world_origin = parent_transform.map(bounds.topLeft())
         layer_signature = self._modifier_layer_signature(layer.layer_id)
         cache_key = (
@@ -4561,6 +4551,7 @@ class _CanvasLogic(MaskSelectionFeatures, MaskGradientFeatures, TilingFeatures, 
             self._render_exclude_text,
             self._rect_signature(bounds), world_origin.toTuple(),
         )
+        from comic_editor.ui.interactive_effects import render_interactive_stack
         processed = self._modifier_cache_get(cache_key)
         if processed is None:
             source_key = (
@@ -4569,8 +4560,10 @@ class _CanvasLogic(MaskSelectionFeatures, MaskGradientFeatures, TilingFeatures, 
                 self._render_exclude_text,
                 self._rect_signature(bounds), world_origin.toTuple(),
             )
+            source_provisional = False
             image = self._modifier_source_cache_get(source_key)
             if image is None:
+                revision = getattr(self, "_effect_provisional_revision", 0)
                 image = QImage(
                     max(1, math.ceil(bounds.width())),
                     max(1, math.ceil(bounds.height())),
@@ -4582,7 +4575,7 @@ class _CanvasLogic(MaskSelectionFeatures, MaskGradientFeatures, TilingFeatures, 
                 source.translate(-bounds.left(), -bounds.top())
                 self._render_modifier_sources.add(("layer", layer.layer_id))
                 try:
-                    self._render_layer(source, layer, 1.0, visible_world)
+                    self._render_layer(source, layer, 1.0, capture_world)
                     drawing = self._active_vector_drawing()
                     modified_ancestors = (
                         [
@@ -4612,19 +4605,22 @@ class _CanvasLogic(MaskSelectionFeatures, MaskGradientFeatures, TilingFeatures, 
                         ("layer", layer.layer_id)
                     )
                     source.end()
-                self._modifier_source_cache_put(source_key, image)
+                source_provisional = revision != getattr(self, "_effect_provisional_revision", 0)
+                if not source_provisional:
+                    self._modifier_source_cache_put(source_key, image)
             width, height = image.width(), image.height()
             world_to_image = self._world_to_image_transform(
                 parent_transform, bounds, width, height
             )
-            processed = apply_modifier_stack(
-                image, modifiers, world_origin.toTuple(),
+            processed, provisional = render_interactive_stack(
+                self, image, modifiers, world_origin.toTuple(),
                 self._modifier_mask_fields(
                     modifiers, width, height,
-                    world_to_image, visible_world,
+                    world_to_image, capture_world,
                 ),
-                outline_distance_cache=self._outline_distance_cache,
-                blur_pyramid_cache=self._blur_pyramid_cache,
+                cache_key=("interactive-stack", cache_key),
+                scope=("layer", layer.layer_id, getattr(self, "_effect_preview_channel", "canvas")),
+                upstream_provisional=source_provisional,
             )
             if layer.opacity_mask is not None:
                 binding = layer.opacity_mask
@@ -4632,11 +4628,12 @@ class _CanvasLogic(MaskSelectionFeatures, MaskGradientFeatures, TilingFeatures, 
                     processed,
                     self.render_tone_mask_field(
                         binding.mask_id, width, height,
-                        world_to_image, visible_world,
+                        world_to_image, capture_world,
                     ),
                     binding.black_value, binding.white_value,
                 )
-            self._modifier_cache_put(cache_key, processed)
+            if not provisional:
+                self._modifier_cache_put(cache_key, processed)
         painter.save()
         painter.setOpacity(parent_opacity * layer.opacity)
         outline_overflows = any(
@@ -7133,15 +7130,7 @@ class _CanvasLogic(MaskSelectionFeatures, MaskGradientFeatures, TilingFeatures, 
             return
         if obj.object_id == self._render_excluded_object_id:
             return
-        if (
-            obj.mask_only
-            and self._rendering_mask_contributor <= 0
-            and not (
-                self._interactive_render
-                and self.selected_kind == "object"
-                and self.selected_id == obj.object_id
-            )
-        ):
+        if obj.mask_only and not self._mask_only_render_visible("object", obj.object_id):
             return
         if (
             not self._rendering_compound_references
@@ -7601,6 +7590,13 @@ class _CanvasLogic(MaskSelectionFeatures, MaskGradientFeatures, TilingFeatures, 
             float(binding.white_value) if binding is not None else fallback,
         )
 
+    def _mask_only_render_visible(self, kind: str, identifier: str) -> bool:
+        return self._rendering_mask_contributor > 0 or bool(
+            self._interactive_render
+            and not getattr(self, "_rendering_halftone_source", False)
+            and self.selected_kind == kind and self.selected_id == identifier
+        )
+
     def _modifier_object_signature(self, obj: DocumentObject) -> tuple:
         pixels: tuple = ()
         if isinstance(obj, RasterObject):
@@ -7617,6 +7613,10 @@ class _CanvasLogic(MaskSelectionFeatures, MaskGradientFeatures, TilingFeatures, 
             # effective parent shape, including edits with unchanged bounds.
             pixels = ("gradient-parent", self._gradient_path_signature(
                 self.layer_effective_path(obj.parent_layer_id)))
+        elif isinstance(obj, TextObject) and obj.layout_mode == "strict":
+            # Strict wrapping follows the parent, even when the text's own
+            # stored frame and typography have not changed.
+            pixels = ("text-layout", self._rect_signature(self._strict_text_rect(obj)))
         live = ()
         if obj.object_id == self.selected_object_id:
             selection_preview = ()
@@ -7651,6 +7651,8 @@ class _CanvasLogic(MaskSelectionFeatures, MaskGradientFeatures, TilingFeatures, 
             live = (*live, repr(self._cage_session["grid"].grid_dict()))
         if getattr(self, "_tiling_capture_geometry", None) is not None:
             live = (*live, repr(self._tiling_capture_geometry))
+        if obj.mask_only:
+            live = (*live, ("mask-only-visible", self._mask_only_render_visible("object", obj.object_id)))
         return (
             json.dumps(
                 obj.to_dict(), sort_keys=True, separators=(",", ":")
@@ -7678,6 +7680,11 @@ class _CanvasLogic(MaskSelectionFeatures, MaskGradientFeatures, TilingFeatures, 
             if self._geometry_transform_target == ("layer_group", layer_id)
             else ()
         )
+        if self._render_excluded_object_id:
+            # Background captures must not become the cached visible subtree.
+            preview = (*preview, ("excluded-object", self._render_excluded_object_id))
+        if layer.mask_only:
+            preview = (*preview, ("mask-only-visible", self._mask_only_render_visible("layer", layer_id)))
         return (
             json.dumps(
                 layer.to_dict(), sort_keys=True, separators=(",", ":")
@@ -7697,17 +7704,19 @@ class _CanvasLogic(MaskSelectionFeatures, MaskGradientFeatures, TilingFeatures, 
 
     def _modifier_cache_put(self, key: tuple, image: QImage) -> None:
         size = int(image.sizeInBytes())
-        if size <= 0 or size > self._modifier_render_cache_budget:
+        if size <= 0:
             return
         previous = self._modifier_render_cache.pop(key, None)
         if previous is not None:
             self._modifier_render_cache_bytes -= int(previous.sizeInBytes())
         self._modifier_render_cache[key] = QImage(image)
         self._modifier_render_cache_bytes += size
+        # Admit one oversized result exclusively so exact worker completions
+        # remain consumable even when a document image exceeds the usual LRU.
         while (
             self._modifier_render_cache
             and self._modifier_render_cache_bytes
-            > self._modifier_render_cache_budget
+            > max(self._modifier_render_cache_budget, size)
         ):
             _old_key, old_image = self._modifier_render_cache.popitem(
                 last=False
@@ -7723,17 +7732,18 @@ class _CanvasLogic(MaskSelectionFeatures, MaskGradientFeatures, TilingFeatures, 
 
     def _modifier_source_cache_put(self, key: tuple, image: QImage) -> None:
         size = int(image.sizeInBytes())
-        if size <= 0 or size > self._modifier_source_cache_budget:
+        if size <= 0:
             return
         previous = self._modifier_source_cache.pop(key, None)
         if previous is not None:
             self._modifier_source_cache_bytes -= int(previous.sizeInBytes())
         self._modifier_source_cache[key] = QImage(image)
         self._modifier_source_cache_bytes += size
+        # A single large source keeps its identity across asynchronous stages.
         while (
             self._modifier_source_cache
             and self._modifier_source_cache_bytes
-            > self._modifier_source_cache_budget
+            > max(self._modifier_source_cache_budget, size)
         ):
             _old_key, old = self._modifier_source_cache.popitem(last=False)
             self._modifier_source_cache_bytes -= int(old.sizeInBytes())
@@ -7787,22 +7797,24 @@ class _CanvasLogic(MaskSelectionFeatures, MaskGradientFeatures, TilingFeatures, 
         if not valid:
             return
         local = layer_inverse.mapRect(world_bounds)
-        expansion = max((
+        expansion = sum(
             self._modifier_maximum(
                 modifier, "strength", modifier.strength
             ) * 3.0
             if isinstance(modifier, BlurModifier)
-            else 100.0
+            else 25.0
             if isinstance(modifier, OutlineModifier)
             else 0.0
             for modifier in modifiers
-        ), default=0.0)
+        )
         local.adjust(-expansion, -expansion, expansion, expansion)
         bounds = QRectF(
             math.floor(local.left()), math.floor(local.top()),
             max(1, math.ceil(local.right()) - math.floor(local.left())),
             max(1, math.ceil(local.bottom()) - math.floor(local.top())),
         )
+        if not bounds.intersects(local_visible):
+            return
         world_origin = layer_transform.map(bounds.topLeft())
         object_signature = self._modifier_object_signature(obj)
         cache_key = (
@@ -7810,6 +7822,7 @@ class _CanvasLogic(MaskSelectionFeatures, MaskGradientFeatures, TilingFeatures, 
             object_signature,
             self._rect_signature(bounds), world_origin.toTuple(),
         )
+        from comic_editor.ui.interactive_effects import render_interactive_stack
         processed = self._modifier_cache_get(cache_key)
         if processed is None:
             source_key = (
@@ -7817,8 +7830,10 @@ class _CanvasLogic(MaskSelectionFeatures, MaskGradientFeatures, TilingFeatures, 
                 object_signature[0], object_signature[3], object_signature[4],
                 self._rect_signature(bounds), world_origin.toTuple(),
             )
+            source_provisional = False
             image = self._modifier_source_cache_get(source_key)
             if image is None:
+                revision = getattr(self, "_effect_provisional_revision", 0)
                 image = QImage(
                     max(1, math.ceil(bounds.width())),
                     max(1, math.ceil(bounds.height())),
@@ -7840,19 +7855,22 @@ class _CanvasLogic(MaskSelectionFeatures, MaskGradientFeatures, TilingFeatures, 
                         ("object", obj.object_id)
                     )
                     source.end()
-                self._modifier_source_cache_put(source_key, image)
+                source_provisional = revision != getattr(self, "_effect_provisional_revision", 0)
+                if not source_provisional:
+                    self._modifier_source_cache_put(source_key, image)
             width, height = image.width(), image.height()
             world_to_image = self._world_to_image_transform(
                 layer_transform, bounds, width, height
             )
-            processed = apply_modifier_stack(
-                image, modifiers, world_origin.toTuple(),
+            processed, provisional = render_interactive_stack(
+                self, image, modifiers, world_origin.toTuple(),
                 self._modifier_mask_fields(
                     modifiers, width, height,
                     world_to_image, world_bounds,
                 ),
-                outline_distance_cache=self._outline_distance_cache,
-                blur_pyramid_cache=self._blur_pyramid_cache,
+                cache_key=("interactive-stack", cache_key),
+                scope=("object", obj.object_id, getattr(self, "_effect_preview_channel", "canvas")),
+                upstream_provisional=source_provisional,
             )
             if obj.opacity_mask is not None:
                 binding = obj.opacity_mask
@@ -7864,7 +7882,8 @@ class _CanvasLogic(MaskSelectionFeatures, MaskGradientFeatures, TilingFeatures, 
                     ),
                     binding.black_value, binding.white_value,
                 )
-            self._modifier_cache_put(cache_key, processed)
+            if not provisional:
+                self._modifier_cache_put(cache_key, processed)
         opacity = parent_opacity if self._render_base_alpha else (
             parent_opacity
             if obj.opacity_locked else parent_opacity * obj.opacity
@@ -7919,8 +7938,10 @@ class _CanvasLogic(MaskSelectionFeatures, MaskGradientFeatures, TilingFeatures, 
         if layer and scoped(self, target):
             key = (*key, self._modifier_parameter_signature([mid for mid in target.modifier_ids
                 if isinstance(self.chapter.modifiers.get(mid), StrokeModifier)]))
+        source_provisional = False
         image = self._modifier_source_cache_get(key)
         if image is None:
+            revision = getattr(self, "_effect_provisional_revision", 0)
             image = empty_image(bounds)
             source = QPainter(image)
             source.setRenderHint(QPainter.Antialiasing, True)
@@ -7943,7 +7964,9 @@ class _CanvasLogic(MaskSelectionFeatures, MaskGradientFeatures, TilingFeatures, 
             finally:
                 self._render_modifier_sources.discard((kind, identifier))
                 source.end()
-            self._modifier_source_cache_put(key, image)
+            source_provisional = revision != getattr(self, "_effect_provisional_revision", 0)
+            if not source_provisional:
+                self._modifier_source_cache_put(key, image)
         modifiers = self._active_modifier_instances(target.modifier_ids, suppress_outline=self._suppress_outline_for_mask)
         if layer and scoped(self, target):
             modifiers = [modifier for modifier in modifiers if not isinstance(modifier, StrokeModifier)]
@@ -7951,7 +7974,7 @@ class _CanvasLogic(MaskSelectionFeatures, MaskGradientFeatures, TilingFeatures, 
         opacity = target.opacity if layer or not target.opacity_locked else 1.0
         if not has_stroke and modifiers and isinstance(modifiers[-1], MirrorModifier) and not modifiers[-1].parameter_masks and target.opacity_mask is None and parent_opacity * opacity == 1:
             # Axis dragging reuses the source stages without allocating the gap.
-            image, bounds = render_stages(self, image, bounds, modifiers[:-1], mapping, nearest=isinstance(target, RasterObject), request_scope=request_scope)
+            image, bounds = render_stages(self, image, bounds, modifiers[:-1], mapping, nearest=isinstance(target, RasterObject), request_scope=request_scope, provisional=source_provisional, source_key=key)
             mirror = modifiers[-1]
             painter.save()
             painter.setRenderHint(QPainter.SmoothPixmapTransform, not isinstance(target, RasterObject))
@@ -7967,14 +7990,15 @@ class _CanvasLogic(MaskSelectionFeatures, MaskGradientFeatures, TilingFeatures, 
             return
         if has_stroke:
             from comic_editor.ui.stroke_rendering import render_stroke_stack
-            image, bounds = render_stroke_stack(self, target, image, bounds, modifiers, mapping, key, request_scope)
+            image, bounds = render_stroke_stack(self, target, image, bounds, modifiers, mapping, key, request_scope,
+                                                provisional=source_provisional)
         else:
             # Keep the cached gradient output intact. Cropping its image before
             # a projective parent transform changes Qt's edge resampling as the
             # viewport moves; the destination painter already clips the view.
             required = (None if isinstance(target, ColorFillGradientObject)
                         else inverse.mapRect(visible) if layer else visible)
-            image, bounds = render_stages(self, image, bounds, modifiers, mapping, nearest=isinstance(target, RasterObject), required=required, request_scope=request_scope)
+            image, bounds = render_stages(self, image, bounds, modifiers, mapping, nearest=isinstance(target, RasterObject), required=required, request_scope=request_scope, provisional=source_provisional, source_key=key)
         if target.opacity_mask is not None:
             binding = target.opacity_mask
             field = self.render_tone_mask_field(binding.mask_id, image.width(), image.height(), self._world_to_image_transform(mapping, bounds, image.width(), image.height()), mapping.mapRect(bounds))
@@ -8289,7 +8313,8 @@ class _CanvasLogic(MaskSelectionFeatures, MaskGradientFeatures, TilingFeatures, 
             return max(0.0, (available_height - content_height) / 2)
         return 0.0
 
-    def _draw_text_object(self, painter: QPainter, obj: TextObject) -> None:
+    def _draw_text_object(self, painter: QPainter, obj: TextObject,
+                          *, editing_overlay: bool = False) -> None:
         if obj.layout_mode == "strict":
             rect = self._strict_text_rect(obj)
             document = self._text_document(obj, rect.width())
@@ -8297,7 +8322,8 @@ class _CanvasLogic(MaskSelectionFeatures, MaskGradientFeatures, TilingFeatures, 
             painter.save()
             painter.setClipRect(rect, Qt.IntersectClip)
             painter.translate(rect.left(), rect.top() + offset)
-            self._draw_text_document(painter, obj, document)
+            self._draw_text_document(painter, obj, document, editing_overlay=editing_overlay,
+                                     show_editing=False)
             painter.restore()
             return
         source = QRectF(0, 0, max(1.0, obj.width), max(1.0, obj.height))
@@ -8308,15 +8334,23 @@ class _CanvasLogic(MaskSelectionFeatures, MaskGradientFeatures, TilingFeatures, 
         painter.setTransform(transform, True)
         painter.setClipRect(source, Qt.IntersectClip)
         painter.translate(0, offset)
-        self._draw_text_document(painter, obj, document)
+        self._draw_text_document(painter, obj, document, editing_overlay=editing_overlay,
+                                 show_editing=False)
         painter.restore()
 
     def _draw_text_document(
         self, painter: QPainter, obj: TextObject, document: QTextDocument,
+        *, editing_overlay: bool = False, show_editing: bool = True,
     ) -> None:
         context = QAbstractTextDocumentLayout.PaintContext()
-        context.palette.setColor(QPalette.Text, QColor("#111111"))
-        editing = self._text_editing and obj.object_id == self.selected_object_id
+        context.palette.setColor(QPalette.Text, QColor(Qt.transparent) if editing_overlay else QColor("#111111"))
+        # Decorations are UI, never source alpha for effects, masks or exports.
+        editing = (self._text_editing and obj.object_id == self.selected_object_id
+                   and (editing_overlay or show_editing
+                        and not self._render_modifier_sources
+                        and not self._render_base_alpha
+                        and self._rendering_mask_contributor <= 0
+                        and not self._object_has_effect_modifiers(obj.object_id)))
         if editing and self._text_cursor_position != self._text_selection_anchor:
             selection = QAbstractTextDocumentLayout.Selection()
             cursor = QTextCursor(document)
@@ -8326,6 +8360,8 @@ class _CanvasLogic(MaskSelectionFeatures, MaskGradientFeatures, TilingFeatures, 
             highlight = QColor("#F2A23A")
             highlight.setAlphaF(0.4)
             selection.format.setBackground(highlight)
+            if editing_overlay:
+                selection.format.setForeground(QColor(Qt.transparent))
             context.selections = [selection]
         document.documentLayout().draw(painter, context)
         if (
@@ -8337,6 +8373,28 @@ class _CanvasLogic(MaskSelectionFeatures, MaskGradientFeatures, TilingFeatures, 
             pen.setCosmetic(True)
             painter.setPen(pen)
             painter.drawLine(caret.topLeft(), caret.bottomLeft())
+
+    def _draw_selected_text_edit_overlay(self, painter: QPainter, obj: TextObject) -> None:
+        """Keep caret/selection live without invalidating cached outlined glyphs."""
+        if not obj.visible:
+            return
+        painter.save()
+        try:
+            clip = self._ancestor_mask_path("object", obj.object_id)
+            if clip is not None:
+                if clip.isEmpty():
+                    return
+                painter.setClipPath(clip, Qt.IntersectClip)
+            opacity = 1.0
+            for layer in self.chapter.ancestor_layers(obj.parent_layer_id):
+                if not layer.visible or layer.opacity <= 0:
+                    return
+                opacity *= layer.opacity
+            painter.setTransform(self.layer_world_transform(obj.parent_layer_id), True)
+            painter.setOpacity(opacity if obj.opacity_locked else opacity * obj.opacity)
+            self._draw_text_object(painter, obj, editing_overlay=True)
+        finally:
+            painter.restore()
 
     def _blink_text_caret(self) -> None:
         if not self._text_editing:
@@ -17537,9 +17595,8 @@ class _CanvasLogic(MaskSelectionFeatures, MaskGradientFeatures, TilingFeatures, 
         if self.chapter is None or object_id not in self.chapter.objects:
             return
         self._finalize_raster_paste_overlay(object_id)
-        self._modifier_source_cache.clear()
-        self._modifier_source_cache_bytes = 0
-        self._outline_distance_cache.clear()
+        # Raster image identities already invalidate the target's effects.
+        # Keep unrelated outline fields and source images warm after a fill.
         widget = self._mark_scene_dirty_world(world)
         self.documentChanged.emit(world)
         if not widget.isEmpty():
@@ -17590,9 +17647,16 @@ class _CanvasLogic(MaskSelectionFeatures, MaskGradientFeatures, TilingFeatures, 
     def _install_fill_replay(
         self, obj: RasterObject, command: TilePatchCommand,
         steps: list[tuple[QPointF | None, QPainterPath | None, str]],
-        dirty_world: QRectF,
+        dirty_world: QRectF, *, operation: dict | None = None,
     ) -> None:
-        profile = dict(self._fill_operation_profile)
+        operation = operation or {
+            "profile": self._fill_operation_profile,
+            "base_tiles": self._fill_operation_base_tiles,
+            "selection": self._fill_operation_selection,
+            "color": self._fill_operation_color,
+            "reference_tiles": self._fill_operation_reference_tiles,
+        }
+        profile = dict(operation["profile"])
         entities = self._fill_reference_entities(obj, profile)
         self._fill_replay_generation += 1
         self._fill_replay_state = _FillReplayState(
@@ -17603,7 +17667,7 @@ class _CanvasLogic(MaskSelectionFeatures, MaskGradientFeatures, TilingFeatures, 
             history_revision=self.command_stack.revision,
             base_tiles={
                 key: QImage(image)
-                for key, image in self._fill_operation_base_tiles.items()
+                for key, image in operation["base_tiles"].items()
             },
             steps=[
                 (
@@ -17613,8 +17677,8 @@ class _CanvasLogic(MaskSelectionFeatures, MaskGradientFeatures, TilingFeatures, 
                 )
                 for point, path, policy in steps
             ],
-            selection_path=QPainterPath(self._fill_operation_selection),
-            color=QColor(self._fill_operation_color),
+            selection_path=QPainterPath(operation["selection"]),
+            color=QColor(operation["color"]),
             profile=profile,
             reference_entities=list(entities),
             reference_signature=self._fill_reference_signature(
@@ -17623,7 +17687,7 @@ class _CanvasLogic(MaskSelectionFeatures, MaskGradientFeatures, TilingFeatures, 
             reference_settings=self._fill_reference_settings_signature(profile),
             reference_tiles={
                 key: QImage(image)
-                for key, image in self._fill_operation_reference_tiles.items()
+                for key, image in operation["reference_tiles"].items()
             },
             current_signature=self._fill_object_signature(obj.object_id),
             dirty_world=QRectF(dirty_world),
@@ -17660,6 +17724,10 @@ class _CanvasLogic(MaskSelectionFeatures, MaskGradientFeatures, TilingFeatures, 
     ) -> None:
         tolerance = max(0, min(255, int(tolerance)))
         state = self._fill_replay_state
+        if state is None and (self._fill_job_cancel is not None
+                              or getattr(self, "_fill_async_gesture", None) is not None):
+            self._fill_job_pending_tolerance = tolerance
+            return
         if state is None or not self._fill_replay_is_eligible(state):
             if state is not None:
                 self._clear_fill_replay()
@@ -17680,12 +17748,23 @@ class _CanvasLogic(MaskSelectionFeatures, MaskGradientFeatures, TilingFeatures, 
         profile: dict[str, object], tolerance: int,
     ) -> bool:
         frame = self._tiling_fill_frame(obj, profile)
-        keys = self.tiles.keys_for_rect(frame)
+        if not profile.get("_tiling_context"):
+            if not state.selection_path.isEmpty():
+                frame = frame.intersected(state.selection_path.boundingRect())
+            if state.steps and all(path is not None for _point, path, _policy in state.steps):
+                bounds = QRectF()
+                for _point, path, _policy in state.steps:
+                    bounds = bounds.united(path.boundingRect())
+                frame = frame.intersected(bounds)
+        keys = self._fill_reference_keys(frame, profile)
         mode = str(profile.get("reference_mode", "editing"))
         reference_tiles: dict[tuple[int, int], QImage] | None = None
         if mode != "editing":
-            required = len(keys) * self.tiles.tile_size ** 2 * 4
-            if required > self._fill_reference_tile_cache_budget:
+            # A large async operation already captured its complete reference
+            # snapshot in bounded GUI batches. Reuse it regardless of the LRU
+            # cache budget; that budget is not a supported document-size limit.
+            if (len(keys) * self.tiles.tile_size ** 2 * 4 > self._fill_reference_tile_cache_budget
+                    and any(key not in state.reference_tiles for key in keys)):
                 return False
             signature = self._fill_reference_signature(
                 state.reference_entities
@@ -17703,8 +17782,7 @@ class _CanvasLogic(MaskSelectionFeatures, MaskGradientFeatures, TilingFeatures, 
                     stored = QImage(image) if image is not None else QImage()
                     state.reference_tiles[key] = QImage(stored)
                 reference_tiles[key] = QImage(stored)
-        detached = TileStore(self.tiles.tile_size)
-        detached.replace_object_tiles(state.object_id, state.base_tiles)
+        detached = self._detached_fill_store(state.object_id, state.base_tiles)
         self._fill_replay_generation += 1
         generation = self._fill_replay_generation
         cancel_event = threading.Event()
@@ -17891,14 +17969,24 @@ class _CanvasLogic(MaskSelectionFeatures, MaskGradientFeatures, TilingFeatures, 
             self._preserve_fill_reference_cache = False
         self.interactionFinished.emit()
 
-    def _cancel_fill_job(self) -> bool:
+    def _cancel_fill_job(self, *, preserve_gesture: bool = False) -> bool:
         event = self._fill_job_cancel
-        if event is None:
-            return False
-        event.set()
-        self._fill_job_cancel = None
-        self._fill_job_generation += 1
-        return True
+        if event is not None:
+            event.set()
+            self._fill_job_cancel = None
+            self._fill_job_generation += 1
+        gesture = getattr(self, "_fill_async_gesture", None)
+        if gesture is not None and not preserve_gesture:
+            self._discard_async_fill_gesture(gesture)
+        return event is not None or (gesture is not None and not preserve_gesture)
+
+    def _detached_fill_store(self, object_id: str, base_tiles: dict) -> TileStore:
+        # Images from the live store are already sparse and validated. QImage
+        # wrappers share immutable pixels until the worker writes; rebuilding
+        # every alpha bound here would scan the entire painted layer on the UI.
+        detached = TileStore(self.tiles.tile_size)
+        detached._tiles[object_id] = {key: QImage(image) for key, image in base_tiles.items()}
+        return detached
 
     def _fill_object_signature(self, object_id: str) -> tuple:
         return tuple(sorted(
@@ -17906,47 +17994,64 @@ class _CanvasLogic(MaskSelectionFeatures, MaskGradientFeatures, TilingFeatures, 
             for key, image in self.tiles.object_tiles(object_id).items()
         ))
 
+    def _fill_tile_count(self, frame: QRectF) -> int:
+        """Count a region without allocating millions of tile coordinates."""
+        if frame.isEmpty():
+            return 0
+        size = self.tiles.tile_size
+        return (max(0, math.ceil(frame.right() / size) - math.floor(frame.left() / size))
+                * max(0, math.ceil(frame.bottom() / size) - math.floor(frame.top() / size)))
+
+    def _fill_reference_keys(self, frame: QRectF, profile: dict) -> set[tuple[int, int]]:
+        # Boundary closing and narrow-area filters read neighbouring tiles,
+        # including outside the destination rectangle, during replay as well.
+        halo = (max(1, math.ceil(min(16, max(0, float(profile.get("gap_threshold", 0)))) / self.tiles.tile_size))
+                if profile.get("close_gap") or not profile.get("fill_narrow_areas", True) else 0)
+        padding = halo * self.tiles.tile_size
+        return self.tiles.keys_for_rect(frame.adjusted(-padding, -padding, padding, padding))
+
     def _start_async_fill(
         self, obj: RasterObject, local: QPointF | None, frame: QRectF,
         profile: dict[str, object], extra_path: QPainterPath | None,
         color: QColor, region_policy: str,
         reference_tiles: dict[tuple[int, int], QImage] | None = None,
+        *, steps: list | None = None, label: str = "Fill Selection",
+        gesture: dict | None = None,
     ) -> bool:
-        """Run a large editing-layer fill off-thread on detached QImages."""
-        self._cancel_fill_job()
+        """Snapshot a large fill in bounded GUI batches, then compute off-thread."""
+        self._cancel_fill_job(preserve_gesture=gesture is not None)
+        selection = QPainterPath(gesture["operation"]["selection"] if gesture is not None
+                                 else self._fill_operation_selection)
+        frame = QRectF(frame)
+        if not selection.isEmpty() and not profile.get("_tiling_context"):
+            frame = frame.intersected(selection.boundingRect())
+        if frame.isEmpty():
+            return False
         self._fill_job_generation += 1
         generation = self._fill_job_generation
         cancel_event = threading.Event()
         self._fill_job_cancel = cancel_event
         self._fill_job_error = None
-        detached = TileStore(self.tiles.tile_size)
-        detached.replace_object_tiles(
-            obj.object_id, self.tiles.object_tiles(obj.object_id)
-        )
-        selection = QPainterPath(self._drawing_selection_path)
-        if extra_path is not None:
-            selection = (
-                QPainterPath(extra_path) if selection.isEmpty()
-                else selection.intersected(extra_path)
-            )
-        tile_size = self.tiles.tile_size
-
-        def selection_tile(key: tuple[int, int]) -> np.ndarray | None:
-            if selection.isEmpty():
-                return None
-            image = QImage(
-                tile_size, tile_size,
-                QImage.Format.Format_ARGB32_Premultiplied,
-            )
-            image.fill(Qt.GlobalColor.transparent)
-            painter = QPainter(image)
-            painter.translate(-key[0] * tile_size, -key[1] * tile_size)
-            painter.fillPath(selection, QColor("white"))
-            painter.end()
-            rgba = image.convertToFormat(QImage.Format.Format_RGBA8888)
-            values = np.frombuffer(bytes(rgba.constBits()), dtype=np.uint8)
-            return values.reshape((tile_size, tile_size, 4))[..., 3] > 0
-
+        if gesture is None or not gesture["submitted"]:
+            self._fill_job_pending_tolerance = None
+        base_tiles = self._snapshot_fill_object_tiles(obj.object_id)
+        detached = self._detached_fill_store(obj.object_id, base_tiles)
+        frozen_steps = [
+            (QPointF(point) if point is not None else None,
+             QPainterPath(path) if path is not None else None, str(policy))
+            for point, path, policy in (steps if steps is not None else [(local, extra_path, region_policy)])
+        ]
+        profile = dict(profile)
+        if any(path is not None for _point, path, _policy in frozen_steps):
+            profile["connected_pixels_only"] = False
+        entities = self._fill_reference_entities(obj, profile)
+        captured = {key: QImage(image) if image is not None else QImage()
+                    for key, image in (reference_tiles or {}).items()}
+        operation = {
+            "base_tiles": base_tiles, "profile": profile,
+            "selection": selection, "color": QColor(color),
+            "reference_tiles": captured,
+        }
         context = {
             "generation": generation,
             "chapter": self.chapter,
@@ -17954,26 +18059,187 @@ class _CanvasLogic(MaskSelectionFeatures, MaskGradientFeatures, TilingFeatures, 
             "object_model": json.dumps(obj.to_dict(), sort_keys=True),
             "base_signature": self._fill_object_signature(obj.object_id),
             "tiling_context": profile.get("_tiling_context"),
+            "history_revision": self.command_stack.revision,
+            "reference_entities": entities,
+            "reference_signature": self._fill_reference_signature(entities),
+            "operation": operation, "steps": frozen_steps, "label": label,
+            "gesture": gesture,
         }
-        worker = _FillWorker(
-            detached, obj.object_id, local, frame,
-            color, profile, region_policy, selection_tile,
-            reference_tiles, cancel_event, context,
-        )
-        worker.signals.finished.connect(self._finish_async_fill)
-        self._fill_workers.add(worker)
-        QThreadPool.globalInstance().start(worker)
+        if gesture is not None:
+            gesture["context"] = context
+
+        def submit():
+            if cancel_event.is_set() or not self._async_fill_is_current(context):
+                if generation == self._fill_job_generation:
+                    self._cancel_fill_job()
+                return
+            worker = _FillReplayWorker(
+                detached, obj.object_id, frame, frozen_steps, selection,
+                color, profile, None if profile.get("reference_mode", "editing") == "editing" else captured,
+                cancel_event, context,
+            )
+            worker.signals.finished.connect(self._finish_async_fill)
+            self._fill_workers.add(worker)
+            QThreadPool.globalInstance().start(worker)
+
+        if profile.get("reference_mode", "editing") == "editing":
+            submit()
+            return True
+        keys = self._fill_reference_keys(frame, profile)
+        pending = iter(key for key in keys if key not in captured)
+        settings_signature = self._fill_reference_settings_signature(profile)
+
+        def capture_batch():
+            if cancel_event.is_set() or not self._async_fill_is_current(context):
+                if generation == self._fill_job_generation:
+                    self._cancel_fill_job()
+                return
+            deadline = time.perf_counter() + 0.004
+            try:
+                while True:
+                    key = next(pending, None)
+                    if key is None:
+                        submit()
+                        return
+                    image = self._fill_reference_tile(
+                        obj, key, profile, entities=entities,
+                        signature=context["reference_signature"], settings_signature=settings_signature,
+                    )
+                    # Tall transparent reference areas need only a sentinel;
+                    # don't retain a full RGBA allocation for every empty tile.
+                    captured[key] = (QImage(image) if image is not None and not image.isNull()
+                                     and np.any(self._image_alpha_array(image)) else QImage())
+                    if time.perf_counter() >= deadline:
+                        QTimer.singleShot(0, self, capture_batch)
+                        return
+            except Exception as error:
+                self._fill_job_error = error
+                self._cancel_fill_job()
+                self.interactionFinished.emit()
+
+        QTimer.singleShot(0, self, capture_batch)
         return True
 
+    def _async_fill_is_current(self, context: dict) -> bool:
+        if (self.chapter is not context["chapter"]
+                or context["generation"] != self._fill_job_generation
+                or self.command_stack.revision != context["history_revision"]
+                or self.selected_object_id != context["object_id"]
+                or (context.get("gesture") is not None
+                    and context["gesture"] is not getattr(self, "_fill_async_gesture", None))):
+            return False
+        obj = self.chapter.objects.get(context["object_id"])
+        if (not isinstance(obj, RasterObject)
+                or json.dumps(obj.to_dict(), sort_keys=True) != context["object_model"]
+                or self._fill_object_signature(obj.object_id) != context["base_signature"]
+                or self._tiling_brush_context(obj) != context["tiling_context"]
+                or self._drawing_selection_path != context["operation"]["selection"]):
+            return False
+        entities = self._fill_reference_entities(obj, context["operation"]["profile"])
+        return (entities == context["reference_entities"]
+                and self._fill_reference_signature(entities) == context["reference_signature"])
+
+    def _dispatch_async_fill_gesture(self, obj: RasterObject, gesture: dict) -> None:
+        if gesture is not getattr(self, "_fill_async_gesture", None) or self._fill_job_cancel is not None:
+            return
+        previous = gesture.get("context")
+        if previous is not None and not self._async_fill_is_current(previous):
+            self._discard_async_fill_gesture(gesture)
+            return
+        points = self._fill_gesture_points[gesture["submitted"]:]
+        if not points:
+            if gesture["released"]:
+                self._commit_async_fill_gesture(obj, gesture)
+            return
+        operation = gesture["operation"]
+        submitted = self._start_async_fill(
+            obj, None, gesture["frame"], operation["profile"], None,
+            operation["color"], "seed", operation["reference_tiles"],
+            steps=[(point, None, "seed") for point in points],
+            label=gesture["label"], gesture=gesture,
+        )
+        if submitted:
+            gesture["submitted"] += len(points)
+        else:
+            self._discard_async_fill_gesture(gesture)
+
+    def _discard_async_fill_gesture(self, gesture: dict) -> None:
+        if gesture is not getattr(self, "_fill_async_gesture", None):
+            return
+        self._fill_async_gesture = None
+        if self.chapter is gesture["chapter"] and gesture["object_id"] in self.chapter.objects:
+            object_id = gesture["object_id"]
+            for key, before in gesture["before"].items():
+                current = self.tiles.tile(object_id, key)
+                signature = int(current.cacheKey()) if current is not None else None
+                # A command or direct edit may have touched a preview tile.
+                # Restore only images still owned by this gesture's preview.
+                if signature == gesture["preview_signatures"].get(key):
+                    self.tiles.set_tile(object_id, key, before)
+            if not gesture["dirty"].isEmpty():
+                self._raster_fill_visual_changed(object_id, gesture["dirty"])
+        self._fill_before = {}
+        self._fill_dirty_world = QRectF()
+        self._fill_gesture_points = []
+        self._fill_gesture_active = False
+        self._fill_gesture_async = False
+        self.update()
+
+    def _commit_async_fill_gesture(self, obj: RasterObject, gesture: dict) -> None:
+        self._fill_async_gesture = None
+        points = self._fill_gesture_points
+        self._fill_gesture_points = []
+        before, dirty = gesture["before"], gesture["dirty"]
+        if before:
+            after = self.tiles.snapshot(obj.object_id, set(before))
+            callback = lambda target=obj.object_id, rect=QRectF(dirty): (
+                self._raster_fill_visual_changed(target, rect)
+            )
+            command = TilePatchCommand(gesture["label"], self.tiles, obj.object_id, before, after, callback)
+            self.command_stack.push(command, already_done=True)
+            self._install_fill_replay(
+                obj, command, [(point, None, "seed") for point in points], dirty,
+                operation=gesture["operation"],
+            )
+        self.interactionFinished.emit()
+        pending = getattr(self, "_fill_job_pending_tolerance", None)
+        self._fill_job_pending_tolerance = None
+        if pending is not None:
+            self.request_fill_tolerance_replay(pending, immediate=True)
+
+    def _preview_async_fill_gesture(self, obj: RasterObject, result: dict) -> None:
+        gesture = result["gesture"]
+        before, after = result.get("before") or {}, result.get("after") or {}
+        dirty_local = QRectF(result.get("dirty") or QRectF())
+        for key, image in before.items():
+            gesture["before"].setdefault(key, image)
+        for key, image in after.items():
+            self.tiles.set_tile(obj.object_id, key, image)
+            current = self.tiles.tile(obj.object_id, key)
+            gesture["preview_signatures"][key] = int(current.cacheKey()) if current is not None else None
+        if not dirty_local.isEmpty():
+            dirty = self.modifier_expanded_dirty(
+                obj.object_id, self._drawing_local_rect_to_world(obj, dirty_local)
+            )
+            gesture["dirty"] = gesture["dirty"].united(dirty)
+            self._raster_fill_visual_changed(obj.object_id, dirty)
+        gesture["operation"]["reference_tiles"].update(result["operation"]["reference_tiles"])
+        # The next batch starts from our own exact preview, while replay and
+        # cancellation retain the immutable snapshot from the initial press.
+        result["base_signature"] = self._fill_object_signature(obj.object_id)
+        result["reference_signature"] = self._fill_reference_signature(result["reference_entities"])
+        gesture["context"] = result
+        self._dispatch_async_fill_gesture(obj, gesture)
+
     def _finish_async_fill(
-        self, worker: _FillWorker, result: dict,
+        self, worker: _FillWorker | _FillReplayWorker, result: dict,
     ) -> None:
         self._fill_workers.discard(worker)
         generation = int(result.get("generation", -1))
         if generation == self._fill_job_generation:
             self._fill_job_cancel = None
         error = result.get("error")
-        if isinstance(error, Exception):
+        if isinstance(error, Exception) and generation == self._fill_job_generation:
             self._fill_job_error = error
         object_id = str(result.get("object_id", ""))
         obj = (
@@ -17982,15 +18248,15 @@ class _CanvasLogic(MaskSelectionFeatures, MaskGradientFeatures, TilingFeatures, 
         )
         if (
             result.get("cancelled") or error is not None
-            or generation != self._fill_job_generation
-            or not isinstance(obj, RasterObject)
-            or json.dumps(obj.to_dict(), sort_keys=True)
-            != result.get("object_model")
-            or self._fill_object_signature(object_id)
-            != result.get("base_signature")
-            or self._tiling_brush_context(obj) != result.get("tiling_context")
+            or not self._async_fill_is_current(result)
         ):
+            gesture = result.get("gesture")
+            if gesture is not None and gesture is getattr(self, "_fill_async_gesture", None):
+                self._discard_async_fill_gesture(gesture)
             self.interactionFinished.emit()
+            return
+        if result.get("gesture") is not None:
+            self._preview_async_fill_gesture(obj, result)
             return
         before = result.get("before") or {}
         after = result.get("after") or {}
@@ -18007,15 +18273,19 @@ class _CanvasLogic(MaskSelectionFeatures, MaskGradientFeatures, TilingFeatures, 
             self._raster_fill_visual_changed(target, rect)
         )
         command = TilePatchCommand(
-            "Fill Selection", self.tiles, object_id,
+            result["label"], self.tiles, object_id,
             before, after, callback,
         )
         self.command_stack.push(command, already_done=True)
         self._install_fill_replay(
-            obj, command, [(None, None, "area")], dirty_world
+            obj, command, result["steps"], dirty_world, operation=result["operation"]
         )
         self._raster_fill_visual_changed(object_id, dirty_world)
         self.interactionFinished.emit()
+        pending_tolerance = getattr(self, "_fill_job_pending_tolerance", None)
+        self._fill_job_pending_tolerance = None
+        if pending_tolerance is not None:
+            self.request_fill_tolerance_replay(pending_tolerance, immediate=True)
 
     def _fill_selection_mask_tile(
         self, key: tuple[int, int], extra_path: QPainterPath | None = None,
@@ -18156,8 +18426,7 @@ class _CanvasLogic(MaskSelectionFeatures, MaskGradientFeatures, TilingFeatures, 
     def _fill_reference_signature(
         self, entities: list[tuple[str, str]], *, skip_pixels_for: str = "",
     ) -> tuple:
-        result: list[tuple] = []
-        for kind, entity_id in entities:
+        def signature(kind, entity_id):
             entity = (
                 self.chapter.layers[entity_id]
                 if kind == "layer" else self.chapter.objects[entity_id]
@@ -18173,11 +18442,24 @@ class _CanvasLogic(MaskSelectionFeatures, MaskGradientFeatures, TilingFeatures, 
                 ))
             elif isinstance(entity, ImageObject):
                 pixels = (int(self.images.image(entity_id).cacheKey()),)
-            result.append((
+            children = tuple(signature(child.kind, child.entity_id)
+                             for child in entity.children) if isinstance(entity, LayerNode) else ()
+            return (
                 kind, entity_id,
                 json.dumps(entity.to_dict(), sort_keys=True), pixels,
-            ))
-        return tuple(result)
+                self._modifier_parameter_signature(entity.modifier_ids),
+                self._tone_mask_signature(entity.opacity_mask.mask_id) if entity.opacity_mask is not None else (),
+                children,
+            )
+        ancestors = set()
+        for kind, entity_id in entities:
+            parent_id = (self.chapter.layers[entity_id].parent_id if kind == "layer"
+                         else self.chapter.objects[entity_id].parent_layer_id)
+            if parent_id:
+                ancestors.update(layer.layer_id for layer in self.chapter.ancestor_layers(parent_id))
+        return (tuple(signature(*entity) for entity in entities),
+                tuple((identifier, json.dumps(self.chapter.layers[identifier].to_dict(), sort_keys=True))
+                      for identifier in sorted(ancestors)))
 
     def _render_fill_reference_entity(
         self, painter: QPainter, kind: str, entity_id: str,
@@ -18443,6 +18725,7 @@ class _CanvasLogic(MaskSelectionFeatures, MaskGradientFeatures, TilingFeatures, 
     def _begin_fill_gesture(
         self, obj: RasterObject, world_point: QPointF,
     ) -> None:
+        self._cancel_fill_job()
         self._clear_fill_replay()
         self._fill_before = {}
         self._fill_dirty_world = QRectF()
@@ -18465,15 +18748,34 @@ class _CanvasLogic(MaskSelectionFeatures, MaskGradientFeatures, TilingFeatures, 
         ]
         self._fill_last_world = QPointF(world_point)
         self._fill_gesture_active = True
+        frame = self._tiling_fill_frame(obj, self._fill_operation_profile)
+        self._fill_gesture_async = self._fill_tile_count(frame) * self.tiles.tile_size ** 2 > 1024 * 1024
         subtool = self.settings.active_fill_subtool
         if subtool not in {"enclose_fill", "lasso_fill"}:
-            self._apply_raster_fill(
-                obj, world_point, before=self._fill_before, commit=False,
-                profile_snapshot=self._fill_operation_profile,
-                color=self._fill_operation_color,
-                selection_path=self._fill_operation_selection,
-                reference_capture=self._fill_operation_reference_tiles,
-            )
+            if self._fill_gesture_async:
+                gesture = {
+                    "chapter": self.chapter, "object_id": obj.object_id,
+                    "frame": frame, "submitted": 0, "released": False,
+                    "before": {}, "dirty": QRectF(), "preview_signatures": {},
+                    "label": "Leftover Pen" if subtool == "leftover_pen" else "Raster fill",
+                    "operation": {
+                        "base_tiles": self._fill_operation_base_tiles,
+                        "profile": dict(self._fill_operation_profile),
+                        "color": QColor(self._fill_operation_color),
+                        "selection": QPainterPath(self._fill_operation_selection),
+                        "reference_tiles": {},
+                    },
+                }
+                self._fill_async_gesture = gesture
+                self._dispatch_async_fill_gesture(obj, gesture)
+            else:
+                self._apply_raster_fill(
+                    obj, world_point, before=self._fill_before, commit=False,
+                    profile_snapshot=self._fill_operation_profile,
+                    color=self._fill_operation_color,
+                    selection_path=self._fill_operation_selection,
+                    reference_capture=self._fill_operation_reference_tiles,
+                )
 
     def _continue_fill_gesture(
         self, obj: RasterObject, world_point: QPointF,
@@ -18493,7 +18795,7 @@ class _CanvasLogic(MaskSelectionFeatures, MaskGradientFeatures, TilingFeatures, 
             return
         self._fill_gesture_points.append(local)
         self._fill_last_world = QPointF(world_point)
-        if subtool not in {"enclose_fill", "lasso_fill"}:
+        if subtool not in {"enclose_fill", "lasso_fill"} and not self._fill_gesture_async:
             self._apply_raster_fill(
                 obj, world_point, before=self._fill_before, commit=False,
                 profile_snapshot=self._fill_operation_profile,
@@ -18502,12 +18804,50 @@ class _CanvasLogic(MaskSelectionFeatures, MaskGradientFeatures, TilingFeatures, 
                 reference_capture=self._fill_operation_reference_tiles,
             )
         else:
+            gesture = getattr(self, "_fill_async_gesture", None)
+            if gesture is not None:
+                self._dispatch_async_fill_gesture(obj, gesture)
             self.update()
 
     def _finish_fill_gesture(self, obj: RasterObject) -> None:
         if not self._fill_gesture_active:
             return
         subtool = self.settings.active_fill_subtool
+        if self._fill_gesture_async:
+            gesture = getattr(self, "_fill_async_gesture", None)
+            if gesture is not None:
+                gesture["released"] = True
+                self._fill_gesture_active = False
+                self._fill_gesture_async = False
+                self._dispatch_async_fill_gesture(obj, gesture)
+                self.update()
+                return
+            points = self._fill_gesture_points
+            self._fill_gesture_points = []
+            self._fill_gesture_active = False
+            self._fill_gesture_async = False
+            if subtool in {"enclose_fill", "lasso_fill"}:
+                if len(points) < 3:
+                    self.interactionFinished.emit()
+                    self.update()
+                    return
+                path = QPainterPath()
+                path.addPolygon(QPolygonF(points))
+                path.closeSubpath()
+                steps = [(None, path, "transparent" if subtool == "enclose_fill" else "area")]
+            else:
+                steps = [(point, None, "seed") for point in points]
+            label = {"enclose_fill": "Enclose and Fill", "lasso_fill": "Lasso Fill",
+                     "leftover_pen": "Leftover Pen"}.get(subtool, "Raster fill")
+            frame = self._tiling_fill_frame(obj, self._fill_operation_profile)
+            if subtool in {"enclose_fill", "lasso_fill"} and not self._fill_operation_profile.get("_tiling_context"):
+                frame = frame.intersected(path.boundingRect())
+            self._start_async_fill(
+                obj, None, frame, self._fill_operation_profile, None,
+                self._fill_operation_color, "seed", steps=steps, label=label,
+            )
+            self.update()
+            return
         if (
             subtool in {"enclose_fill", "lasso_fill"}
             and len(self._fill_gesture_points) >= 3
@@ -18533,6 +18873,7 @@ class _CanvasLogic(MaskSelectionFeatures, MaskGradientFeatures, TilingFeatures, 
         self._fill_dirty_world = QRectF()
         self._fill_gesture_points = []
         self._fill_gesture_active = False
+        self._fill_gesture_async = False
         if not before:
             self.interactionFinished.emit()
             self.update()
@@ -18565,6 +18906,9 @@ class _CanvasLogic(MaskSelectionFeatures, MaskGradientFeatures, TilingFeatures, 
         self.interactionFinished.emit()
 
     def _cancel_fill_gesture(self, *, restore: bool = True) -> bool:
+        if getattr(self, "_fill_async_gesture", None) is not None:
+            self._cancel_fill_job()
+            return True
         if not self._fill_gesture_active:
             return False
         obj = (
@@ -18582,6 +18926,7 @@ class _CanvasLogic(MaskSelectionFeatures, MaskGradientFeatures, TilingFeatures, 
         self._fill_dirty_world = QRectF()
         self._fill_gesture_points = []
         self._fill_gesture_active = False
+        self._fill_gesture_async = False
         self.update()
         return True
 
@@ -18591,6 +18936,7 @@ class _CanvasLogic(MaskSelectionFeatures, MaskGradientFeatures, TilingFeatures, 
         obj = self.chapter.objects.get(self.selected_object_id)
         if not isinstance(obj, RasterObject):
             return False
+        self._cancel_fill_job()
         self._clear_fill_replay()
         profile = dict(self.settings.active_fill_profile())
         tiling = self._tiling_brush_context(obj)
@@ -18610,45 +18956,11 @@ class _CanvasLogic(MaskSelectionFeatures, MaskGradientFeatures, TilingFeatures, 
             self._drawing_selection_path.boundingRect()
         )
         if (
-            len(self.tiles.keys_for_rect(frame)) > 16
+            self._fill_tile_count(frame) * self.tiles.tile_size ** 2 > 1024 * 1024
         ):
             profile["connected_pixels_only"] = False
-            reference_tiles = None
-            if str(profile.get("reference_mode", "editing")) != "editing":
-                keys = self.tiles.keys_for_rect(frame)
-                required = len(keys) * self.tiles.tile_size ** 2 * 4
-                if required > self._fill_reference_tile_cache_budget:
-                    return self._apply_raster_fill(
-                        obj, None, profile_snapshot=profile, color=color,
-                        region_policy="area",
-                        selection_path=self._fill_operation_selection,
-                        reference_capture=self._fill_operation_reference_tiles,
-                    )
-                entities = self._fill_reference_entities(obj, profile)
-                signature = self._fill_reference_signature(entities)
-                settings_signature = tuple(sorted(
-                    (name, repr(profile.get(name))) for name in (
-                        "reference_mode", "exclude_editing_target",
-                        "exclude_images",
-                        "exclude_gradients", "exclude_mask_only",
-                        "fill_up_to_vector_path", "include_vector_path",
-                    )
-                ))
-                reference_tiles = {
-                    key: self._fill_reference_tile(
-                        obj, key, profile, entities=entities,
-                        signature=signature,
-                        settings_signature=settings_signature,
-                    )
-                    for key in keys
-                }
-                self._fill_operation_reference_tiles = {
-                    key: QImage(image) if image is not None else QImage()
-                    for key, image in reference_tiles.items()
-                }
             return self._start_async_fill(
                 obj, None, frame, profile, None, color, "area",
-                reference_tiles,
             )
         return self._apply_raster_fill(
             obj, None, profile_snapshot=profile, color=color,
@@ -19195,6 +19507,16 @@ class _CanvasLogic(MaskSelectionFeatures, MaskGradientFeatures, TilingFeatures, 
                     point, allow_interior=False, modifiers=modifiers
                 )
             ):
+                return
+            if self.selected_kind == "layer" and any(
+                any(layer.layer_id == self.selected_id
+                    for layer in self.chapter.ancestor_layers(
+                        self.chapter.objects[object_id].parent_layer_id))
+                for object_id in self.hit_test_objects(point, text_only=True)
+            ):
+                # Shape handles retain priority, but an interior click on its
+                # text should select that text, even inside collapsed groups.
+                self._request_object_selection(point, widget_point)
                 return
             if (
                 self.selected_kind == "layer"

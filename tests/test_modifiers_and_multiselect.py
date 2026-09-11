@@ -570,14 +570,15 @@ def test_object_modifier_render_cache_updates_pixels_and_reuses_result(
     canvas = CanvasWidget(EditorSettings())
     canvas.set_document(chapter, tiles)
     calls = 0
-    original = canvas_module.apply_modifier_stack
+    from comic_editor.ui import interactive_effects
+    original = interactive_effects.apply_modifier_stack
 
     def counted(*args, **kwargs):
         nonlocal calls
         calls += 1
         return original(*args, **kwargs)
 
-    monkeypatch.setattr(canvas_module, "apply_modifier_stack", counted)
+    monkeypatch.setattr(interactive_effects, "apply_modifier_stack", counted)
     for _ in range(2):
         image = QImage(
             1080, 400, QImage.Format.Format_ARGB32_Premultiplied
@@ -894,7 +895,8 @@ def test_muted_modifier_bypasses_isolation_masks_bounds_and_focal_handles(
     canvas.active_modifier_id = modifier.modifier_id
     applied = 0
     masks = 0
-    original_apply = canvas_module.apply_modifier_stack
+    from comic_editor.ui import interactive_effects
+    original_apply = interactive_effects.apply_modifier_stack
 
     def counted_apply(*args, **kwargs):
         nonlocal applied
@@ -906,7 +908,7 @@ def test_muted_modifier_bypasses_isolation_masks_bounds_and_focal_handles(
         masks += 1
         return np.zeros((height, width), dtype=np.float32)
 
-    monkeypatch.setattr(canvas_module, "apply_modifier_stack", counted_apply)
+    monkeypatch.setattr(interactive_effects, "apply_modifier_stack", counted_apply)
     monkeypatch.setattr(canvas, "render_tone_mask_field", counted_mask)
     dirty = QRectF(40, 50, 8, 9)
     assert canvas.modifier_expanded_dirty(

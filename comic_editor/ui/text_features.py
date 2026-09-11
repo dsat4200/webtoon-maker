@@ -224,11 +224,9 @@ class TextFeatures:
             mode, handle = self._transform_control_hit(quad, world)
         if not mode:
             return False
-        live_parent_effects = isinstance(entity, TextObject) and any(
-            self._has_active_modifiers(layer.modifier_ids) or layer.opacity_mask is not None
-            for layer in self.chapter.ancestor_layers(entity.parent_layer_id)
-        )
-        if isinstance(entity, TextObject) and not live_parent_effects and (behavior == "stretch" or mode != "handle"):
+        live_effects = (isinstance(entity, TextObject)
+                        and self._object_has_effect_modifiers(entity.object_id))
+        if isinstance(entity, TextObject) and not live_effects and (behavior == "stretch" or mode != "handle"):
             # Existing cached text transforms are ideal for moving/rotating
             # and stretching. Only Bounds resizing needs live layout work.
             return False

@@ -65,6 +65,21 @@ state stay in place. Updating or deleting a preset leaves previously applied
 modifiers unchanged until another preset is loaded. Saving a chapter preserves
 which preset was last loaded or saved for each modifier.
 
+## Text outlines
+
+Select a text box or Free Text container, then choose **Modifiers → Add
+Modifier → Outline**. The outline follows the letters, including wrapped and
+transformed text. Text stays editable, and outlines support linked targets,
+parameter masks, presets, undo/redo, assets, and export.
+
+Live width, color, opacity, and intensity edits reuse the source silhouette and
+its exact distance field. Rendering limits pixel calculations to the lettering
+and its outline, with bounded caches. Carets and selection highlights are drawn
+separately so they remain responsive and never enter the exported outline.
+Run `python tests/benchmark_canvas_text_outlines.py` to measure canvas updates,
+typing, and cache use on your machine; `tests/benchmark_text_outlines.py`
+measures the outline renderer alone.
+
 ## Halftone and Pixelate
 
 Halftone also works directly on linear, radial, and shape color gradients,
@@ -656,6 +671,9 @@ available, with a CPU fallback and bounded caches. See
 for controls and measurements.
 
 ## Test
+
+See [editing performance notes](docs/editor-performance.md) for measured
+modifier, drawing, fill, and autosave responsiveness and reproducible benchmarks.
 
 ```powershell
 python -m pytest -q

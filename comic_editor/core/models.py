@@ -3357,6 +3357,9 @@ class ChapterDocument:
             if isinstance(obj, ColorFillGradientObject):
                 obj.modifier_ids = [mid for mid in obj.modifier_ids
                                     if isinstance(self.modifiers[mid], (PosterizeModifier, HalftoneModifier))]
+            elif isinstance(obj, TextObject):
+                obj.modifier_ids = [mid for mid in obj.modifier_ids
+                                    if isinstance(self.modifiers[mid], OutlineModifier)]
             elif not isinstance(
                 obj, (RasterObject, VectorDrawingObject, ImageObject)
             ):
@@ -3663,7 +3666,7 @@ class ChapterDocument:
             return None
         obj = self.objects.get(entity_id)
         return obj if isinstance(
-            obj, (RasterObject, VectorDrawingObject, ImageObject, ColorFillGradientObject)
+            obj, (RasterObject, VectorDrawingObject, ImageObject, ColorFillGradientObject, TextObject)
         ) else None
 
     def add_modifier(
@@ -3737,6 +3740,8 @@ class ChapterDocument:
                     for other in occupied + [other for other in targets if other != ref])
             if isinstance(target, ColorFillGradientObject):
                 compatible = compatible and isinstance(modifier, (PosterizeModifier, HalftoneModifier))
+            if isinstance(target, TextObject):
+                compatible = compatible and isinstance(modifier, OutlineModifier)
             if not compatible:
                 result.append(ref)
         return result
@@ -3757,6 +3762,10 @@ class ChapterDocument:
                 kind == "object" and isinstance(self.objects.get(identifier), ColorFillGradientObject)
                 for kind, identifier in targets):
             message += " Color gradients support Posterize, Posterize Value, and Halftone."
+        if not isinstance(modifier, OutlineModifier) and any(
+                kind == "object" and isinstance(self.objects.get(identifier), TextObject)
+                for kind, identifier in targets):
+            message += " Text boxes support Outline. Apply other supported effects to their text container."
         return message
 
     def stroke_modifier_target(self, kind, identifier):

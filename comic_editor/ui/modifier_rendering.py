@@ -3,7 +3,8 @@ from __future__ import annotations
 
 from collections import OrderedDict
 import hashlib
-import zlib
+import math
+import sys
 
 import numpy as np
 from PIL import Image
@@ -61,12 +62,6 @@ def _hsl_effect(
     maximum = np.max(rgb, axis=2)
     minimum = np.min(rgb, axis=2)
     delta = maximum - minimum
-    light = (maximum + minimum) * 0.5
-    saturation = np.divide(
-        delta, 1.0 - np.abs(2.0 * light - 1.0),
-        out=np.zeros_like(delta),
-        where=(delta > 1e-7) & (np.abs(2.0 * light - 1.0) < 1.0),
-    )
     hue = np.zeros_like(maximum)
     nonzero = delta > 1e-7
     red = nonzero & (maximum == rgb[..., 0])
@@ -82,39 +77,50 @@ def _hsl_effect(
         (rgb[..., 0][blue] - rgb[..., 1][blue]) / delta[blue] + 4.0
     )
     hue = np.mod(hue / 6.0 + hue_delta / 360.0, 1.0)
-    sat_delta = np.asarray(saturation_delta, dtype=np.float32) / 100.0
-    saturation = np.where(
-        sat_delta >= 0,
-        saturation + (1.0 - saturation) * sat_delta,
-        saturation * (1.0 + sat_delta),
-    )
-    light_delta = np.asarray(lightness_delta, dtype=np.float32) / 100.0
-    light = np.where(
-        light_delta >= 0,
-        light + (1.0 - light) * light_delta,
-        light * (1.0 + light_delta),
-    )
-    saturation = np.clip(saturation, 0.0, 1.0)
-    light = np.clip(light, 0.0, 1.0)
-    chroma = (1.0 - np.abs(2.0 * light - 1.0)) * saturation
+    hue_only = (np.ndim(saturation_delta) == 0 and float(saturation_delta) == 0.0
+                and np.ndim(lightness_delta) == 0 and float(lightness_delta) == 0.0)
+    if hue_only:
+        # A hue drag preserves chroma and the RGB minimum exactly; there is
+        # no need to derive and reconstruct unchanged saturation/lightness.
+        chroma, base = delta, minimum
+    else:
+        light = (maximum + minimum) * 0.5
+        saturation = np.divide(
+            delta, 1.0 - np.abs(2.0 * light - 1.0),
+            out=np.zeros_like(delta),
+            where=(delta > 1e-7) & (np.abs(2.0 * light - 1.0) < 1.0),
+        )
+        sat_delta = np.asarray(saturation_delta, dtype=np.float32) / 100.0
+        saturation = np.where(
+            sat_delta >= 0,
+            saturation + (1.0 - saturation) * sat_delta,
+            saturation * (1.0 + sat_delta),
+        )
+        light_delta = np.asarray(lightness_delta, dtype=np.float32) / 100.0
+        light = np.where(
+            light_delta >= 0,
+            light + (1.0 - light) * light_delta,
+            light * (1.0 + light_delta),
+        )
+        saturation = np.clip(saturation, 0.0, 1.0)
+        light = np.clip(light, 0.0, 1.0)
+        chroma = (1.0 - np.abs(2.0 * light - 1.0)) * saturation
+        base = light - chroma * 0.5
     sector = hue * 6.0
-    x = chroma * (1.0 - np.abs(np.mod(sector, 2.0) - 1.0))
-    zero = np.zeros_like(chroma)
-    choices = (
-        np.stack((chroma, x, zero), axis=2),
-        np.stack((x, chroma, zero), axis=2),
-        np.stack((zero, chroma, x), axis=2),
-        np.stack((zero, x, chroma), axis=2),
-        np.stack((x, zero, chroma), axis=2),
-        np.stack((chroma, zero, x), axis=2),
-    )
-    sector_index = np.floor(sector).astype(np.int32) % 6
-    output = np.zeros_like(rgb)
-    for index, choice in enumerate(choices):
-        mask = sector_index == index
-        output[mask] = choice[mask]
-    output += (light - chroma * 0.5)[..., None]
-    output *= straight[..., 3:4]
+    output = np.empty_like(rgb)
+    # Each channel is a shifted, clipped triangle wave around the hue wheel.
+    # This is the same six-sector HSL interpolation without allocating six
+    # complete RGB candidate images and copying their boolean selections.
+    for channel, phase in enumerate((0.0, 4.0, 2.0)):
+        value = np.mod(sector + phase, 6.0)
+        value -= 3.0
+        np.abs(value, out=value)
+        value -= 1.0
+        np.clip(value, 0.0, 1.0, out=value)
+        value *= chroma
+        value += base
+        value *= straight[..., 3]
+        output[..., channel] = value
     return np.concatenate((output, original[..., 3:4]), axis=2)
 
 
@@ -287,37 +293,71 @@ def _variable_blur(
 
 
 class OutlineDistanceCache:
-    """Byte-budgeted cache of exact source-alpha distance fields."""
+    """Byte-budgeted cache of exact silhouette distances and occupied bounds.
+
+    Distances depend on occupied pixels, not their alpha values or colors.
+    Packing that silhouette makes warmed lookups inexpensive and also lets
+    changes to text color/opacity reuse the same exact distance transform.
+    """
 
     def __init__(self, budget: int = 64 * 1024 * 1024):
         self.budget = max(0, int(budget))
         self.bytes = 0
-        self._values: OrderedDict[tuple, np.ndarray] = OrderedDict()
+        self._values: OrderedDict[
+            tuple, tuple[np.ndarray, tuple[int, int, int, int], tuple[int, int, int, int]]
+        ] = OrderedDict()
         self.computations = 0
 
     @staticmethod
     def _key(alpha: np.ndarray) -> tuple:
-        contiguous = np.ascontiguousarray(alpha, dtype=np.float32)
+        packed = np.packbits(alpha > 1e-6)
         return (
-            contiguous.shape,
-            zlib.crc32(memoryview(contiguous).cast("B")),
+            alpha.shape,
+            hashlib.blake2b(memoryview(packed), digest_size=16).digest(),
         )
 
     def distance(self, alpha: np.ndarray) -> np.ndarray:
-        key = self._key(alpha)
+        return self.field(alpha)[0]
+
+    def field(
+        self, alpha: np.ndarray, margin: int | None = None,
+    ) -> tuple[np.ndarray, tuple[int, int, int, int], tuple[int, int, int, int]]:
+        """Return distances, occupied bounds, and the distance field's bounds.
+
+        A bounded margin avoids running the transform across empty canvas.
+        Every occupied pixel remains inside the region, so distances within
+        that region are identical to a full-image transform.
+        """
+        key = (margin, *self._key(alpha))
         cached = self._values.pop(key, None)
         if cached is not None:
             self._values[key] = cached
             return cached
-        result = _outside_distance(alpha)
+        occupied = alpha > 1e-6
+        rows = np.flatnonzero(np.any(occupied, axis=1))
+        columns = np.flatnonzero(np.any(occupied, axis=0))
+        bounds = (
+            (int(columns[0]), int(rows[0]), int(columns[-1]) + 1, int(rows[-1]) + 1)
+            if rows.size else (0, 0, 0, 0)
+        )
+        if margin is None:
+            extent = (0, 0, alpha.shape[1], alpha.shape[0])
+        elif rows.size:
+            extent = (max(0, bounds[0] - margin), max(0, bounds[1] - margin),
+                      min(alpha.shape[1], bounds[2] + margin),
+                      min(alpha.shape[0], bounds[3] + margin))
+        else:
+            extent = (0, 0, 0, 0)
+        left, top, right, bottom = extent
+        result = (_outside_distance(alpha[top:bottom, left:right]), bounds, extent)
         self.computations += 1
-        size = int(result.nbytes)
+        size = int(result[0].nbytes)
         if 0 < size <= self.budget:
             self._values[key] = result
             self.bytes += size
             while self._values and self.bytes > self.budget:
                 _old_key, old = self._values.popitem(last=False)
-                self.bytes -= int(old.nbytes)
+                self.bytes -= int(old[0].nbytes)
         return result
 
     def clear(self) -> None:
@@ -339,39 +379,160 @@ def _outside_distance(alpha: np.ndarray) -> np.ndarray:
 def _outline_effect(
     original: np.ndarray, thickness, opacity, color: str,
     distance_cache: OutlineDistanceCache | None = None,
+    amount=1.0,
 ) -> np.ndarray:
     alpha = original[..., 3]
     distance = (
         distance_cache.distance(alpha)
         if distance_cache is not None else _outside_distance(alpha)
     )
-    thickness_field = np.broadcast_to(
-        np.asarray(thickness, dtype=np.float32), alpha.shape
-    )
-    opacity_field = np.broadcast_to(
-        np.asarray(opacity, dtype=np.float32), alpha.shape
-    ) / 100.0
-    coverage = np.clip(thickness_field + 0.5 - distance, 0.0, 1.0)
-    coverage *= np.clip(1.0 - alpha, 0.0, 1.0)
-    coverage *= np.clip(opacity_field, 0.0, 1.0)
+    rgba = _outline_color(color)
+    coverage = _outline_coverage(alpha, distance, thickness, opacity, rgba[3], amount)
+    result = original.copy()
+    for channel in range(3):
+        result[..., channel] += coverage * rgba[channel]
+    result[..., 3] += coverage
+    return result
+
+
+def _outline_color(color: str) -> tuple[float, float, float, float]:
     raw = color.lstrip("#")
     if len(raw) == 8:
-        color_alpha = int(raw[0:2], 16) / 255.0
-        rgb = np.array([
-            int(raw[2:4], 16), int(raw[4:6], 16), int(raw[6:8], 16),
-        ], dtype=np.float32) / 255.0
-    else:
-        color_alpha = 1.0
-        rgb = np.zeros(3, dtype=np.float32)
-    outline_alpha = coverage * color_alpha
-    outline = np.zeros_like(original)
-    outline[..., :3] = rgb * outline_alpha[..., None]
-    outline[..., 3] = outline_alpha
-    return original + outline * (1.0 - original[..., 3:4])
+        return tuple(int(raw[index:index + 2], 16) / 255.0 for index in (2, 4, 6, 0))
+    return 0.0, 0.0, 0.0, 1.0
+
+
+def _outline_coverage(alpha, distance, thickness, opacity, color_alpha, amount=1.0):
+    """One-channel premultiplied contribution, including intensity blending."""
+    coverage = np.asarray(thickness, dtype=np.float32) + 0.5 - distance
+    np.clip(coverage, 0.0, 1.0, out=coverage)
+    transparent = np.clip(1.0 - alpha, 0.0, 1.0)
+    # Preserve the existing outside-only coverage and source-over treatment
+    # of partially transparent antialiased edges.
+    coverage *= transparent
+    coverage *= np.clip(np.asarray(opacity, dtype=np.float32) / 100.0, 0.0, 1.0)
+    coverage *= color_alpha
+    coverage *= transparent
+    coverage *= amount
+    return coverage
+
+
+def _outline_qimage(
+    image: QImage, modifier: OutlineModifier,
+    mask_fields: dict[tuple[str, str], np.ndarray],
+    distance_cache: OutlineDistanceCache | None,
+) -> QImage:
+    """Apply a single outline without converting the full RGBA image to floats.
+
+    Only the occupied rectangle and its outline fringe need arithmetic. The
+    remaining pixels are copied directly, so a small caption on a large layer
+    does not incur several full-canvas float buffers on every slider movement.
+    """
+    modifier.validate()
+    height, width = image.height(), image.width()
+    shape = (height, width)
+    fields = {
+        name: _parameter_field(modifier, name, getattr(modifier, name), shape, mask_fields)
+        for name in ("thickness", "opacity", "intensity")
+    }
+    rgba = _outline_color(modifier.color)
+    if (rgba[3] <= 0.0 or np.max(fields["opacity"]) <= 0.0
+            or np.max(fields["intensity"]) <= 0.0):
+        return image
+    source = image.convertToFormat(QImage.Format.Format_ARGB32_Premultiplied)
+    pixels = np.frombuffer(source.constBits(), dtype=np.uint8).reshape(
+        height, source.bytesPerLine()
+    )[:, :width * 4].reshape(height, width, 4)
+    channels = (2, 1, 0, 3) if sys.byteorder == "little" else (1, 2, 3, 0)
+    alpha = pixels[..., channels[3]]
+    padding = max(0, math.ceil(float(np.max(fields["thickness"])) + 0.5))
+    # Quantized padding keeps the expensive distance field reusable throughout
+    # the full legal 0..25px thickness range, including thickness masks.
+    cache_margin = max(32, math.ceil(padding / 32) * 32)
+    distance, bounds, extent = (distance_cache or OutlineDistanceCache(0)).field(
+        alpha, margin=cache_margin
+    )
+    if bounds[0] == bounds[2]:
+        return image
+    left, top, right, bottom = bounds
+    left, top, right, bottom = (max(0, left - padding), max(0, top - padding),
+                               min(width, right + padding), min(height, bottom + padding))
+    region = np.s_[top:bottom, left:right]
+    distance = distance[top - extent[1]:bottom - extent[1], left - extent[0]:right - extent[0]]
+    for name, field in fields.items():
+        if np.ndim(field):
+            fields[name] = field[region]
+    coverage = _outline_coverage(
+        alpha[region].astype(np.float32) / 255.0, distance,
+        fields["thickness"], fields["opacity"], rgba[3],
+        np.asarray(fields["intensity"], dtype=np.float32) / 100.0,
+    )
+    coverage *= 255.0
+    result = source.copy()
+    output = np.frombuffer(result.bits(), dtype=np.uint8).reshape(
+        height, result.bytesPerLine()
+    )[:, :width * 4].reshape(height, width, 4)[region]
+    for channel, coefficient in zip(channels, (*rgba[:3], 1.0)):
+        if coefficient == 0.0:
+            continue
+        values = output[..., channel] + coverage * coefficient
+        np.minimum(values, 255.0, out=values)
+        output[..., channel] = values.astype(np.uint8)
+    return result
+
+
+def _outline_stack_qimage(
+    image: QImage, modifiers: list[OutlineModifier],
+    mask_fields: dict[tuple[str, str], np.ndarray],
+    distance_cache: OutlineDistanceCache | None,
+) -> QImage:
+    """Keep float precision between outlines, limited to their combined bounds."""
+    shape = (image.height(), image.width())
+    parameters = []
+    padding = 0
+    for modifier in modifiers:
+        modifier.validate()
+        fields = {
+            name: _parameter_field(modifier, name, getattr(modifier, name), shape, mask_fields)
+            for name in ("thickness", "opacity", "intensity")
+        }
+        parameters.append(fields)
+        fringe = max(0, math.ceil(float(np.max(fields["thickness"])) + 0.5))
+        padding += max(32, math.ceil(fringe / 32) * 32)
+    source = image.convertToFormat(QImage.Format.Format_ARGB32_Premultiplied)
+    pixels = np.frombuffer(source.constBits(), dtype=np.uint8).reshape(
+        shape[0], source.bytesPerLine()
+    )[:, :shape[1] * 4].reshape(*shape, 4)
+    alpha = pixels[..., 3 if sys.byteorder == "little" else 0]
+    rows = np.flatnonzero(np.any(alpha, axis=1))
+    if not rows.size:
+        return image
+    columns = np.flatnonzero(np.any(alpha, axis=0))
+    left, top = max(0, int(columns[0]) - padding), max(0, int(rows[0]) - padding)
+    right = min(shape[1], int(columns[-1]) + 1 + padding)
+    bottom = min(shape[0], int(rows[-1]) + 1 + padding)
+    region = np.s_[top:bottom, left:right]
+    current = _qimage_premultiplied(source.copy(left, top, right - left, bottom - top))
+    for modifier, fields in zip(modifiers, parameters):
+        for name, field in fields.items():
+            if np.ndim(field):
+                fields[name] = field[region]
+        amount = np.asarray(fields["intensity"], dtype=np.float32) / 100.0
+        if np.max(amount) <= 0.0:
+            continue
+        current = _outline_effect(current, fields["thickness"], fields["opacity"],
+                                  modifier.color, distance_cache, amount)
+    result = source.copy()
+    painter = QPainter(result)
+    painter.setCompositionMode(QPainter.CompositionMode.CompositionMode_Source)
+    painter.drawImage(left, top, _premultiplied_qimage(current))
+    painter.end()
+    return result
 
 
 def apply_pattern_modifier(image, modifier, mask_fields=None, renderer=None,
-                           color_source: QImage | None = None):
+                           color_source: QImage | None = None, *,
+                           allow_cpu_fallback=True, cancelled=None):
     """Render a pattern once, blending intensity in premultiplied space."""
     if image.isNull() or modifier.muted:
         return image
@@ -387,8 +548,11 @@ def apply_pattern_modifier(image, modifier, mask_fields=None, renderer=None,
                                  color_source=color_source)
         if result is not None:
             return result
+    if not allow_cpu_fallback:
+        return None
     from comic_editor.ui.pattern_rendering import apply_pattern_effect
-    result = apply_pattern_effect(image, modifier, color_source=color_source)
+    result = apply_pattern_effect(image, modifier, color_source=color_source,
+                                  cancelled=cancelled)
     if amount.ndim == 0 and float(amount) >= 1.0:
         return result
     if amount.ndim == 2:
@@ -409,6 +573,10 @@ def apply_modifier_stack(
     active_modifiers = [modifier for modifier in modifiers if not modifier.muted]
     if image.isNull() or not active_modifiers:
         return image
+    if len(active_modifiers) == 1 and isinstance(active_modifiers[0], OutlineModifier):
+        return _outline_qimage(image, active_modifiers[0], mask_fields or {}, outline_distance_cache)
+    if all(isinstance(modifier, OutlineModifier) for modifier in active_modifiers):
+        return _outline_stack_qimage(image, active_modifiers, mask_fields or {}, outline_distance_cache)
     current = _qimage_premultiplied(image)
     height, width = current.shape[:2]
     mask_fields = mask_fields or {}
@@ -519,13 +687,18 @@ def apply_modifier_stack(
                 ),
                 modifier.color,
                 outline_distance_cache,
+                amount,
             )
-            mask = amount
+            current = effect
+            continue
         else:
             continue
         if np.ndim(mask) == 2:
             mask = mask[..., None]
-        current = current * (1.0 - mask) + effect * mask
+        if np.ndim(mask) == 0 and float(mask) == 1.0:
+            current = effect
+        else:
+            current = current * (1.0 - mask) + effect * mask
     return _premultiplied_qimage(np.clip(current, 0.0, 1.0))
 
 

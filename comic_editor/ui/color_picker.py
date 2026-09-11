@@ -908,12 +908,15 @@ class ColorPickerPopup(QDialog):
         while parent is not None and parent is not host:
             if isinstance(parent, QDialog) and parent.isVisible():
                 self._sample_parents.append((parent, parent.windowModality()))
-                parent.setModal(False)
                 parent.hide()
+                parent.setWindowModality(Qt.NonModal)
             parent = parent.parentWidget()
         host._color_dialog_sample = self
-        self.setModal(False)
+        # Qt unregisters a modal window when it is hidden. Clearing modality
+        # first leaves the hidden dialog in Qt's modal stack and blocks canvas
+        # input indefinitely, especially for popups opened with QDialog.open().
         self.hide()
+        self.setWindowModality(Qt.NonModal)
         host.canvas.set_tool(ToolKind.EYEDROPPER)
         host.canvas.setFocus()
 

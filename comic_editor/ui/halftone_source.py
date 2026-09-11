@@ -76,7 +76,8 @@ def render_color_source(canvas, modifier, image, bounds, local_to_world):
     overrides = {
         "_render_modifier_sources": set(),
         "_render_base_alpha": False,
-        "_interactive_render": False,
+        "_interactive_render": (canvas._interactive_render and not canvas._render_base_alpha
+                                and canvas._rendering_mask_contributor <= 0),
         "_render_excluded_object_id": "",
         "_render_exclude_text": False,
         "_rendering_mask_contributor": 0,
@@ -86,6 +87,7 @@ def render_color_source(canvas, modifier, image, bounds, local_to_world):
         "_tiling_capture_geometry": None,
     }
     previous = {name: getattr(canvas, name, None) for name in overrides}
+    revision = getattr(canvas, "_effect_provisional_revision", 0)
     painter = QPainter(result)
     painter.setRenderHint(QPainter.Antialiasing, True)
     painter.setRenderHint(QPainter.SmoothPixmapTransform, True)
@@ -105,7 +107,8 @@ def render_color_source(canvas, modifier, image, bounds, local_to_world):
         painter.end()
         for name, value in previous.items():
             setattr(canvas, name, value)
-    canvas._modifier_source_cache_put(key, result)
+    if getattr(canvas, "_effect_provisional_revision", 0) == revision:
+        canvas._modifier_source_cache_put(key, result)
     return result
 
 

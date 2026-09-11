@@ -36,6 +36,8 @@ class EditorSession:
     canvas_state: CanvasSessionState | None = None
     dirty: bool = False
     last_autosave: float = 0.0
+    edit_revision: int = 0
+    recovery_revision: int = -1
     expanded_entities: set[str] = field(default_factory=set)
     manual_ribbon_page: str = ""
 

@@ -78,6 +78,7 @@ from comic_editor.ui.modifier_controls import ModifierControls
 from comic_editor.ui.mask_controls import MaskButton, MasksPanel
 from comic_editor.ui.tree_model import HierarchyModel
 from comic_editor.ui.asset_library import AssetLibraryWidget
+from comic_editor.ui.autosave import AutosaveJobs, RecoveryRequest, RecoverySnapshot
 from comic_editor.ui.blender_views import BlenderViewsWidget
 from comic_editor.ui.sessions import EditorSession, ProjectContext
 from comic_editor.ui.windows_input import tablet_multitouch_native_result
@@ -273,6 +274,8 @@ class MainWindow(QMainWindow):
         self._switching_session = False
         self._dirty = False
         self._last_autosave = 0.0
+        self._edit_revision = 0
+        self._recovery_revision = -1
         self._loading_chapter = False
         self._blender_relink_object_id = ""
         self._mask_context: tuple | None = None
@@ -810,7 +813,8 @@ class MainWindow(QMainWindow):
         )
         self._tablet_drop_indicator.hide()
         self._hierarchy_reset_expanded: set[str] = set()
-        self._hierarchy_reset_selection: tuple[str, str] = ("", "")
+        self._pending_hierarchy_reveal: tuple[str, str] = ("", "")
+        self._tree_selection_in_progress = False
         self.hierarchy_model.modelAboutToBeReset.connect(
             self._capture_hierarchy_view_state
         )
@@ -879,6 +883,8 @@ class MainWindow(QMainWindow):
         self.page_gap_confirmation.hide()
         self.autosave_timer = QTimer(self)
         self.autosave_timer.setSingleShot(True)
+        self._autosave_jobs = AutosaveJobs(self)
+        self._autosave_jobs.completed.connect(self._autosave_completed)
         self.series_preferences_timer = QTimer(self)
         self.series_preferences_timer.setSingleShot(True)
         self.layout_settings_timer = QTimer(self)
@@ -2231,6 +2237,7 @@ class MainWindow(QMainWindow):
             if not self.canvas.commit_active_cage():
                 return False
             self._capture_active_session()
+        self._autosave_jobs.drain(self._autosave_scope(session))
         try:
             if session.kind == "series":
                 session.context.repository.save_chapter(
@@ -2276,6 +2283,7 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "Save failed", str(error))
             return False
         session.dirty = False
+        session.recovery_revision = session.edit_revision
         if session is self.active_session:
             self._dirty = False
             self.autosave_timer.stop()
@@ -2308,6 +2316,7 @@ class MainWindow(QMainWindow):
                 return
             if answer == QMessageBox.Save and not self._save_editor_session(session):
                 return
+        self._autosave_jobs.drain(self._autosave_scope(session))
         was_active = session is self.active_session
         self.sessions.pop(session.key, None)
         if was_active:
@@ -2521,6 +2530,7 @@ class MainWindow(QMainWindow):
     def _load_chapter(self, chapter_id: str) -> None:
         if self.repository is None:
             return
+        self._autosave_jobs.drain((str(self.repository.root), "series", chapter_id))
         recover = False
         if self.repository.has_recovery(chapter_id):
             recover = QMessageBox.question(
@@ -2548,6 +2558,8 @@ class MainWindow(QMainWindow):
     def _set_chapter(
         self, chapter, tiles, images: ImageStore | None = None,
     ) -> None:
+        self._edit_revision += 1
+        self._recovery_revision = -1
         self.chapter = chapter
         images = images or ImageStore()
         self.canvas.set_document(chapter, tiles, images)
@@ -2556,6 +2568,9 @@ class MainWindow(QMainWindow):
             self.active_session.tiles = tiles
             self.active_session.images = images
             self.active_session.canvas_state = None
+            self.active_session.edit_revision += 1
+            self.active_session.recovery_revision = -1
+            self.active_session.last_autosave = 0.0
         self.hierarchy_model.set_chapter(chapter)
         if self.repository is not None:
             try:
@@ -3012,12 +3027,6 @@ class MainWindow(QMainWindow):
                 4000,
             )
             return
-        parent_index = self.hierarchy_model.index_for_entity(
-            "layer", parent.layer_id
-        )
-        parent_was_expanded = bool(
-            parent_index.isValid() and self.tree.isExpanded(parent_index)
-        )
         before = self.chapter.to_dict()
         left, top, width, height = parent.bound.bbox()
         count = sum(isinstance(item, TextObject) for item in self.chapter.objects.values()) + 1
@@ -3050,12 +3059,6 @@ class MainWindow(QMainWindow):
         self.canvas.push_model_change(before, after, "Add text object")
         self._after_structure(obj.object_id, "object")
         self.canvas.start_text_edit(select_all=True)
-        if not parent_was_expanded:
-            parent_index = self.hierarchy_model.index_for_entity(
-                "layer", parent.layer_id
-            )
-            if parent_index.isValid():
-                self.tree.setExpanded(parent_index, False)
 
     def _next_layer_name(self) -> str:
         numbers = []
@@ -3868,6 +3871,7 @@ class MainWindow(QMainWindow):
                     folder_id=self.asset_library.selected_folder_id(),
                 )
             else:
+                self._autosave_jobs.drain((str(context.repository.root), "asset", existing.asset_id))
                 manifest = context.assets.replace(
                     existing.asset_id, manifest, tiles, thumbnail,
                     images=images,
@@ -3962,6 +3966,8 @@ class MainWindow(QMainWindow):
         session.canvas_state = None
         session.dirty = False
         session.last_autosave = 0.0
+        session.edit_revision += 1
+        session.recovery_revision = session.edit_revision
         session.expanded_entities.clear()
         if session is not self.active_session:
             self._refresh_project_tabs()
@@ -4036,6 +4042,7 @@ class MainWindow(QMainWindow):
         )
         if not accepted or not name.strip() or name.strip() == manifest.name:
             return
+        self._autosave_jobs.drain((str(context.repository.root), "asset", asset_id))
         try:
             renamed = context.assets.rename(asset_id, name)
         except (OSError, ValueError) as error:
@@ -4049,6 +4056,14 @@ class MainWindow(QMainWindow):
                 and session.asset_manifest.asset_id == asset_id
             ):
                 session.asset_manifest.name = renamed.name
+                if session.dirty:
+                    # Rename publishes a newer manual manifest. Refresh any
+                    # unsaved content recovery so it remains newer and offered.
+                    session.edit_revision += 1
+                    session.last_autosave = 0.0
+                    if session is self.active_session:
+                        self._last_autosave = 0.0
+                    self.autosave_timer.start(2000)
         if (
             self.active_session is not None
             and self.active_session.kind == "asset"
@@ -4079,6 +4094,7 @@ class MainWindow(QMainWindow):
         if answer != QMessageBox.StandardButton.Yes:
             return
         try:
+            self._autosave_jobs.drain((str(context.repository.root), "asset", asset_id))
             context.assets.delete(asset_id)
         except (OSError, ValueError, FileNotFoundError) as error:
             QMessageBox.warning(self, "Unable to delete asset", str(error))
@@ -4137,6 +4153,8 @@ class MainWindow(QMainWindow):
         if answer != QMessageBox.StandardButton.Yes:
             return
         try:
+            for asset in assets:
+                self._autosave_jobs.drain((str(repository.series_root), "asset", asset.asset_id))
             deleted_ids = repository.delete_folder(folder_id, recursive=True)
         except (OSError, ValueError, FileNotFoundError) as error:
             QMessageBox.warning(self, "Unable to delete folder", str(error))
@@ -5038,16 +5056,20 @@ class MainWindow(QMainWindow):
             kind == "layer" and self.chapter.layers.get(entity_id) is not None and self.chapter.layers[entity_id].is_page
             for kind, entity_id in entities
         )
-        if has_page and len(entities) > 1:
-            blocker = QSignalBlocker(self.tree.selectionModel())
-            self.tree.selectionModel().select(
-                current,
-                QItemSelectionModel.ClearAndSelect | QItemSelectionModel.Rows,
-            )
-            del blocker
-            self.canvas.set_selection(*primary, activate_default_tool=True)
-            return
-        self.canvas.set_selection_set(entities, primary)
+        self._tree_selection_in_progress = True
+        try:
+            if has_page and len(entities) > 1:
+                blocker = QSignalBlocker(self.tree.selectionModel())
+                self.tree.selectionModel().select(
+                    current,
+                    QItemSelectionModel.ClearAndSelect | QItemSelectionModel.Rows,
+                )
+                del blocker
+                self.canvas.set_selection(*primary, activate_default_tool=True)
+                return
+            self.canvas.set_selection_set(entities, primary)
+        finally:
+            self._tree_selection_in_progress = False
 
     def _show_selection_candidates(self, candidates, global_point) -> None:
         if self.chapter is None:
@@ -5096,23 +5118,7 @@ class MainWindow(QMainWindow):
         ):
             self._blender_relink_object_id = ""
             self.blender_views_widget.set_relink_mode(False)
-        if entity_id:
-            blocker = QSignalBlocker(self.tree.selectionModel())
-            self.tree.selectionModel().clearSelection()
-            for selected_kind, selected_id in self.canvas.selected_entities:
-                index = self.hierarchy_model.index_for_entity(
-                    selected_kind, selected_id
-                )
-                if not index.isValid():
-                    continue
-                self.tree.selectionModel().select(
-                    index,
-                    QItemSelectionModel.Select | QItemSelectionModel.Rows,
-                )
-                if (selected_kind, selected_id) == (kind, entity_id):
-                    self.tree.setCurrentIndex(index)
-                    self.tree.scrollTo(index)
-            del blocker
+        self._sync_hierarchy_selection(reveal=not self._tree_selection_in_progress)
         new_vector_id = ""
         if self.chapter is not None and kind == "object":
             selected = self.chapter.objects.get(entity_id)
@@ -5232,14 +5238,43 @@ class MainWindow(QMainWindow):
 
     def _capture_hierarchy_view_state(self) -> None:
         self._hierarchy_reset_expanded = self._expanded_layer_ids()
-        current = self.tree.currentIndex()
+
+    def _sync_hierarchy_selection(self, *, reveal: bool = False) -> None:
+        """Match canvas selection, including entities inserted before a tree reset."""
+        primary = (self.canvas.selected_kind, self.canvas.selected_id)
+        selection = self.tree.selectionModel()
+        blocker = QSignalBlocker(selection)
+        selection.clearSelection()
+        current = QModelIndex()
+        for kind, entity_id in self.canvas.selected_entities:
+            index = self.hierarchy_model.index_for_entity(kind, entity_id)
+            if not index.isValid():
+                continue
+            selection.select(index, QItemSelectionModel.Select | QItemSelectionModel.Rows)
+            if reveal:
+                ancestors = []
+                parent = index.parent()
+                while parent.isValid():
+                    ancestors.append(parent)
+                    parent = parent.parent()
+                for parent in reversed(ancestors):
+                    self.tree.setExpanded(parent, True)
+            if (kind, entity_id) == primary:
+                current = index
+        # Setting a view's current index can clear other selected rows. Keep
+        # the full multi-selection while moving its keyboard/focus anchor.
+        selection.setCurrentIndex(current, QItemSelectionModel.NoUpdate)
         if current.isValid():
-            item = self.hierarchy_model.item_for_index(current)
-            self._hierarchy_reset_selection = (item.kind, item.entity_id)
-        else:
-            self._hierarchy_reset_selection = (
-                self.canvas.selected_kind, self.canvas.selected_id
-            )
+            if reveal:
+                self.tree.scrollTo(current, QTreeView.PositionAtCenter)
+            self._pending_hierarchy_reveal = ("", "")
+        elif reveal and primary[1]:
+            # Asset drops select their new root before hierarchyChanged builds
+            # its model index. Finish revealing it immediately after the reset.
+            self._pending_hierarchy_reveal = primary
+        elif not primary[1]:
+            self._pending_hierarchy_reveal = ("", "")
+        del blocker
 
     def _restore_hierarchy_view_state(self) -> None:
         for entity_id in self._hierarchy_reset_expanded:
@@ -5252,45 +5287,12 @@ class MainWindow(QMainWindow):
             index = self.hierarchy_model.index_for_entity(kind, entity_id)
             if index.isValid():
                 self.tree.setExpanded(index, True)
-        kind, entity_id = self._hierarchy_reset_selection
-        if entity_id:
-            blocker = QSignalBlocker(self.tree.selectionModel())
-            self.tree.selectionModel().clearSelection()
-            for selected_kind, selected_id in (
-                self.canvas.selected_entities or [(kind, entity_id)]
-            ):
-                index = self.hierarchy_model.index_for_entity(
-                    selected_kind, selected_id
-                )
-                if not index.isValid():
-                    continue
-                self.tree.selectionModel().select(
-                    index,
-                    QItemSelectionModel.Select | QItemSelectionModel.Rows,
-                )
-                if (selected_kind, selected_id) == (kind, entity_id):
-                    self.tree.setCurrentIndex(index)
-            del blocker
+        self._sync_hierarchy_selection(reveal=self._pending_hierarchy_reveal == (
+            self.canvas.selected_kind, self.canvas.selected_id))
 
     def _refresh_hierarchy(self) -> None:
-        expanded = self._expanded_layer_ids()
-        selected = list(self.canvas.selected_entities)
         blocker = QSignalBlocker(self.tree.selectionModel())
         self.hierarchy_model.set_chapter(self.chapter)
-        for entity_id in expanded:
-            kind = (
-                "layer" if entity_id in self.chapter.layers else "object"
-            )
-            index = self.hierarchy_model.index_for_entity(kind, entity_id)
-            if index.isValid():
-                self.tree.setExpanded(index, True)
-        for kind, entity_id in selected:
-            index = self.hierarchy_model.index_for_entity(kind, entity_id)
-            if index.isValid():
-                self.tree.selectionModel().select(
-                    index,
-                    QItemSelectionModel.Select | QItemSelectionModel.Rows,
-                )
         del blocker
 
     # ---- per-series colors and palettes -------------------------------
@@ -5723,8 +5725,10 @@ class MainWindow(QMainWindow):
         if self.chapter is None:
             return
         self._dirty = True
+        self._edit_revision += 1
         if self.active_session is not None:
             self.active_session.dirty = True
+            self.active_session.edit_revision += 1
         self.autosave_timer.start(2000)
         self._refresh_project_tabs()
         self._refresh_actions()
@@ -5746,6 +5750,7 @@ class MainWindow(QMainWindow):
             return False
         if not self.canvas.commit_active_cage():
             return False
+        self._autosave_jobs.drain(self._autosave_scope())
         try:
             self.repository.save_chapter(
                 self.chapter, self.canvas.tiles, self.canvas.images
@@ -5758,6 +5763,7 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "Save failed", str(error))
             return False
         self._dirty = False
+        self._recovery_revision = self._edit_revision
         self.autosave_timer.stop()
         self.statusBar().showMessage("Saved", 3000)
         self._refresh_actions()
@@ -5842,6 +5848,8 @@ class MainWindow(QMainWindow):
             replacements[old_key] = session.key
             session.dirty = False
             session.last_autosave = 0.0
+            session.edit_revision += 1
+            session.recovery_revision = session.edit_revision
             session.tiles.dirty.clear()
             session.images.dirty.clear()
 
@@ -5918,6 +5926,8 @@ class MainWindow(QMainWindow):
             session for session in self.sessions.values()
             if session.context.repository.root == source_root
         ]
+        for session in project_sessions:
+            self._autosave_jobs.drain(self._autosave_scope(session))
         cloned_series = copy.deepcopy(context.series)
         cloned_series.series_id = new_id()
 
@@ -5945,79 +5955,83 @@ class MainWindow(QMainWindow):
         )
         return True
 
+    def _autosave_scope(self, session=None):
+        repository = session.context.repository if session is not None else self.repository
+        chapter = session.chapter if session is not None else self.chapter
+        if repository is None or chapter is None:
+            return None
+        asset = session.asset_manifest if session is not None and session.kind == "asset" else None
+        return (str(repository.root), "asset" if asset is not None else "series",
+                asset.asset_id if asset is not None else chapter.chapter_id)
+
     def _autosave(self) -> None:
+        if self._autosave_jobs.closed:
+            return
         if self.canvas.page_gap_mode_active():
             if not self._page_gap_mode_locked:
                 self.autosave_timer.start(2000)
             return
-        if self.sessions:
-            now = time.monotonic()
-            deferred: list[float] = []
-            saved = False
-            for session in self.sessions.values():
-                if not session.dirty:
-                    continue
-                elapsed = now - session.last_autosave
-                if session.last_autosave and elapsed < 30:
-                    deferred.append(30 - elapsed)
-                    continue
-                try:
-                    if session.kind == "asset" and session.asset_manifest is not None:
-                        session.asset_manifest.document = session.chapter
-                        session.context.assets.save(
-                            session.asset_manifest, session.tiles,
-                            images=session.images,
-                            autosave=True,
-                        )
-                    else:
-                        session.context.repository.save_chapter(
-                            session.chapter, session.tiles, session.images,
-                            autosave=True,
-                        )
-                    session.last_autosave = now
-                    saved = True
-                except (OSError, ValueError) as error:
-                    self.statusBar().showMessage(
-                        f"Autosave failed for {session.name}: {error}", 7000
-                    )
-            if self.active_session is not None:
-                self._last_autosave = self.active_session.last_autosave
-            if deferred:
-                self.autosave_timer.start(
-                    max(1, round(min(deferred) * 1000))
-                )
-            if saved:
-                self.statusBar().showMessage("Recovery autosave updated", 2000)
+        targets = list(self.sessions.values()) if self.sessions else [None]
+        now, deferred = time.monotonic(), []
+        for session in targets:
+            dirty = session.dirty if session is not None else self._dirty
+            revision = session.edit_revision if session is not None else self._edit_revision
+            recovered = session.recovery_revision if session is not None else self._recovery_revision
+            scope = self._autosave_scope(session)
+            if not dirty or scope is None or revision == recovered:
+                continue
+            if self._autosave_jobs.contains(scope, revision):
+                continue
+            last = session.last_autosave if session is not None else self._last_autosave
+            if last and now-last < 30:
+                deferred.append(30-(now-last))
+                continue
+            chapter = session.chapter if session is not None else self.chapter
+            tiles = session.tiles if session is not None else self.canvas.tiles
+            images = session.images if session is not None else self.canvas.images
+            asset = session.asset_manifest if session is not None and session.kind == "asset" else None
+            name = session.name if session is not None else chapter.name
+            try:
+                snapshot = RecoverySnapshot.capture(scope[0], chapter, tiles, images, asset)
+                self._autosave_jobs.submit(RecoveryRequest(scope, revision, session, snapshot, name))
+            except (OSError, ValueError) as error:
+                self.statusBar().showMessage(f"Autosave failed for {name}: {error}", 7000)
+                deferred.append(5)
+        if deferred:
+            self.autosave_timer.start(max(1, round(min(deferred)*1000)))
+
+    def _autosave_completed(self, request, error) -> None:
+        session = request.owner
+        if session is not None:
+            if self.sessions.get(session.key) is not session or self._autosave_scope(session) != request.scope:
+                return
+            current = session.edit_revision
+            dirty = session.dirty
+        else:
+            if self.active_session is not None or self._autosave_scope() != request.scope:
+                return
+            current, dirty = self._edit_revision, self._dirty
+        if not dirty:
             return
-        if not self._dirty or self.repository is None or self.chapter is None:
+        if error is not None:
+            self.statusBar().showMessage(f"Autosave failed for {request.name}: {error}", 7000)
+            self.autosave_timer.start(5000)
             return
-        elapsed = time.monotonic() - self._last_autosave
-        if self._last_autosave and elapsed < 30:
-            self.autosave_timer.start(round((30 - elapsed) * 1000))
+        if current != request.revision:
+            # A finished older snapshot is recoverable, but newer edits still
+            # need their own save. Do not advance their revision or cooldown.
+            self.autosave_timer.start(2000)
             return
-        try:
-            if (
-                self.active_session is not None
-                and self.active_session.kind == "asset"
-                and self.active_session.asset_manifest is not None
-            ):
-                self.active_session.asset_manifest.document = self.chapter
-                self.active_session.context.assets.save(
-                    self.active_session.asset_manifest,
-                    self.canvas.tiles, images=self.canvas.images,
-                    autosave=True,
-                )
-            else:
-                self.repository.save_chapter(
-                    self.chapter, self.canvas.tiles, self.canvas.images,
-                    autosave=True,
-                )
-            self._last_autosave = time.monotonic()
-            if self.active_session is not None:
-                self.active_session.last_autosave = self._last_autosave
-            self.statusBar().showMessage("Recovery autosave updated", 2000)
-        except (OSError, ValueError) as error:
-            self.statusBar().showMessage(f"Autosave failed: {error}", 7000)
+        completed = time.monotonic()
+        if session is not None:
+            session.recovery_revision = current
+            session.last_autosave = completed
+            if session is self.active_session:
+                self._last_autosave = completed
+        else:
+            self._recovery_revision = current
+            self._last_autosave = completed
+        self.statusBar().showMessage("Recovery autosave updated", 2000)
 
     def _settings_changed(self, *args) -> None:
         self.settings.tablet_mode = self.tablet_mode.isChecked()
@@ -6436,6 +6450,8 @@ class MainWindow(QMainWindow):
         elif not self._confirm_discard_or_save():
             event.ignore()
             return
+        self.autosave_timer.stop()
+        self._autosave_jobs.shutdown()
         self.blender_sources.shutdown()
         self._flush_series_preferences()
         self.layout_settings_timer.stop()

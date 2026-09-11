@@ -874,7 +874,7 @@ def test_outliner_colors_collapsed_add_and_dynamic_tools(qapp):
     assert window.canvas.has_active_text_edit()
     assert window.canvas._text_selection_range() == [0, 4]
     refreshed = window.hierarchy_model.index_for_entity("layer", layer.layer_id)
-    assert not window.tree.isExpanded(refreshed)
+    assert window.tree.isExpanded(refreshed)
     assert window.hierarchy_model.data(refreshed, Qt.BackgroundRole).name() == "#303238"
     object_index = window.hierarchy_model.index_for_entity("object", object_id)
     assert window.hierarchy_model.data(object_index, Qt.BackgroundRole).name() == "#050505"

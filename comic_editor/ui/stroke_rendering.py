@@ -178,11 +178,12 @@ def transformed_loops(loops, modifier, mapping):
     return loops
 
 
-def render_stroke_stack(canvas, target, image, bounds, modifiers, mapping, source_key, request_scope, *, tiled=False):
+def render_stroke_stack(canvas, target, image, bounds, modifiers, mapping, source_key, request_scope,
+                        *, tiled=False, provisional=False):
     kind, identifier = ("layer", target.layer_id) if isinstance(target, LayerNode) else ("object", target.object_id)
     if not canvas.chapter.stroke_modifier_target(kind, identifier):
         return render_stages(canvas, image, bounds, [m for m in modifiers if not isinstance(m, StrokeModifier)],
-                             mapping, request_scope=request_scope)
+                             mapping, request_scope=request_scope, provisional=provisional, source_key=source_key)
     loops = target_loops(canvas, target)
     if tiled:
         parent = target.parent_id if isinstance(target, LayerNode) else target.parent_layer_id
@@ -190,7 +191,7 @@ def render_stroke_stack(canvas, target, image, bounds, modifiers, mapping, sourc
         loops = [loop.mapped(parent_mapping) for loop in loops]
     if not loops:
         return render_stages(canvas, image, bounds, [m for m in modifiers if not isinstance(m, StrokeModifier)],
-                             mapping, request_scope=request_scope)
+                             mapping, request_scope=request_scope, provisional=provisional, source_key=source_key)
     final_bounds = QRectF(bounds)
     for modifier in modifiers:
         if not modifier.muted:
@@ -198,11 +199,20 @@ def render_stroke_stack(canvas, target, image, bounds, modifiers, mapping, sourc
     key = ("stroke-stack", source_key, tiled, repr([m.to_dict() for m in modifiers]),
            canvas._modifier_parameter_signature(target.modifier_ids), canvas._rect_signature(final_bounds),
            tuple(getattr(mapping, f"m{i}{j}")() for i in range(1, 4) for j in range(1, 4)))
-    cached = canvas._modifier_cache_get(key)
+    cached = None if provisional else canvas._modifier_cache_get(key)
+    retention_scope = ("stroke-stack", request_scope)
+    retain = (request_scope is not None and canvas._interactive_render and not provisional
+              and getattr(canvas, "_effect_preview_channel", "canvas") != "navigator")
+    if cached is None and retain:
+        retained = canvas._effect_jobs.retained_get(retention_scope, key)
+        cached = retained[0] if retained is not None else None
     if cached is not None:
         return cached, final_bounds
-    background = empty_image(bounds)
-    if isinstance(target, LayerNode) and tiled:
+    background_key = ("stroke-fill-source", source_key, tiled, canvas._rect_signature(bounds))
+    background = None if provisional else canvas._modifier_source_cache_get(background_key)
+    background_provisional = provisional
+    revision = getattr(canvas, "_effect_provisional_revision", 0)
+    if background is None and isinstance(target, LayerNode) and tiled:
         previous = getattr(canvas, "_stroke_hide_border_id", None)
         canvas._stroke_hide_border_id = identifier
         try:
@@ -210,7 +220,8 @@ def render_stroke_stack(canvas, target, image, bounds, modifiers, mapping, sourc
             background = placed(background, back_bounds, bounds)
         finally:
             canvas._stroke_hide_border_id = previous
-    elif isinstance(target, LayerNode):
+    elif background is None and isinstance(target, LayerNode):
+        background = empty_image(bounds)
         painter = QPainter(background)
         painter.setRenderHint(QPainter.Antialiasing, True)
         painter.translate(-bounds.x(), -bounds.y())
@@ -223,28 +234,65 @@ def render_stroke_stack(canvas, target, image, bounds, modifiers, mapping, sourc
             canvas._stroke_hide_border_id = previous
             canvas._render_modifier_sources.discard((kind, identifier))
             painter.end()
-    for modifier in modifiers:
+    elif background is None:
+        background = empty_image(bounds)
+    background_provisional |= getattr(canvas, "_effect_provisional_revision", 0) != revision
+    if not background_provisional:
+        canvas._modifier_source_cache_put(background_key, background)
+    provisional |= background_provisional
+    for index, modifier in enumerate(modifiers):
         if modifier.muted or modifier.intensity <= 0 and "intensity" not in modifier.parameter_masks:
             continue
         if not isinstance(modifier, StrokeModifier):
             old_bounds = QRectF(bounds)
-            image, bounds = render_stages(canvas, image, old_bounds, [modifier], mapping)
+            prefix_key = (source_key, tiled, repr([m.to_dict() for m in modifiers[:index]]),
+                          canvas._modifier_parameter_signature([m.modifier_id for m in modifiers[:index]]))
+            revision = getattr(canvas, "_effect_provisional_revision", 0)
+            image, bounds = render_stages(canvas, image, old_bounds, [modifier], mapping,
+                request_scope=(*request_scope, "stroke-material", modifier.modifier_id) if request_scope is not None else None,
+                provisional=provisional, source_key=("stroke-material", prefix_key))
+            provisional |= getattr(canvas, "_effect_provisional_revision", 0) != revision
+            revision = getattr(canvas, "_effect_provisional_revision", 0)
             background, background_bounds = render_stages(canvas, background, old_bounds, [modifier], mapping,
-                                                          request_scope=None)
+                request_scope=(*request_scope, "stroke-background", modifier.modifier_id) if request_scope is not None else None,
+                provisional=background_provisional, source_key=("stroke-background", prefix_key))
+            background_provisional |= getattr(canvas, "_effect_provisional_revision", 0) != revision
+            provisional |= background_provisional
             background = placed(background, background_bounds, bounds)
             loops = transformed_loops(loops, modifier, mapping)
             continue
         expanded = aligned(effect_bounds(bounds, [modifier], mapping))
         image, background = placed(image, bounds, expanded), placed(background, bounds, expanded)
         bounds = expanded
+        prefix = modifiers[:index + 1]
+        stage_key = ("stroke-material-stage", source_key, tiled, repr([m.to_dict() for m in prefix]),
+                     canvas._modifier_parameter_signature([m.modifier_id for m in prefix]),
+                     canvas._rect_signature(bounds),
+                     tuple(getattr(mapping, f"m{i}{j}")() for i in range(1, 4) for j in range(1, 4)))
+        material = None if provisional else canvas._modifier_cache_get(stage_key)
+        fill = None if provisional else canvas._modifier_cache_get(("stroke-background-stage", stage_key))
+        if isinstance(modifier, DotDashModifier) and material is not None and fill is not None:
+            image, background = material, fill
+            continue
         parameters = mask_parameters(canvas, modifier, loops, bounds, mapping)
         if isinstance(modifier, DotDashModifier):
             image = apply_dots(image, background, bounds, loops, modifier, parameters)
         else:
             result = [deform_loop(loop, modifier, parameter) for loop, parameter in zip(loops, parameters)]
             moved, opacity = [item[0] for item in result], [item[1] for item in result]
+            if material is not None and fill is not None:
+                image, background, loops = material, fill, moved
+                continue
             image, background = warp_material(image, background, bounds, loops, moved)
             loops = moved
             image = opacity_noise(image, background, bounds, loops, opacity)
-    canvas._modifier_cache_put(key, image)
+        if not provisional:
+            canvas._modifier_cache_put(stage_key, image)
+            canvas._modifier_cache_put(("stroke-background-stage", stage_key), background)
+    if not provisional:
+        canvas._modifier_cache_put(key, image)
+        if retain:
+            canvas._effect_jobs.retained_put(retention_scope, key, image)
+    else:
+        canvas._effect_provisional_revision = getattr(canvas, "_effect_provisional_revision", 0) + 1
     return image, bounds

@@ -55,12 +55,12 @@
             "state": {
               "type": "markdown",
               "state": {
-                "file": "implemented.md",
+                "file": "Not Implemented.md",
                 "mode": "source",
                 "source": false
               },
               "icon": "lucide-file",
-              "title": "implemented"
+              "title": "Not Implemented"
             }
           },
           {
@@ -314,8 +314,8 @@
   },
   "active": "7f0a4da81575daa1",
   "lastOpenFiles": [
-    "Not Implemented.md",
     "implemented.md",
+    "Not Implemented.md",
     "Pasted image 20260729180627.png",
     "Pasted image 20260907122039.png",
     "Pasted image 20260907121943.png",

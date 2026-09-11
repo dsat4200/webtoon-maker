@@ -47,7 +47,8 @@ class SpatialModifierFeatures:
             self._modifier_source_cache_put(key, image)
         modifiers = self._active_modifier_instances(obj.modifier_ids, suppress_outline=self._suppress_outline_for_mask)
         image, bounds = render_stages(self, image, bounds, modifiers, mapping, nearest=True,
-            required=inverse.mapRect(visible), request_scope=("object", obj.object_id, getattr(self, "_effect_preview_channel", "canvas")))
+            required=inverse.mapRect(visible), source_key=key,
+            request_scope=("object", obj.object_id, getattr(self, "_effect_preview_channel", "canvas")))
         if obj.opacity_mask is not None:
             binding = obj.opacity_mask
             field = self.render_tone_mask_field(binding.mask_id, image.width(), image.height(),

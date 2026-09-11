@@ -16,6 +16,12 @@ from scipy.spatial import Delaunay, QhullError
 from comic_editor.core.models import HalftoneModifier, PixelateModifier
 
 
+def _check_cancelled(cancelled):
+    if cancelled is not None and cancelled():
+        from comic_editor.ui.radial_blur import RadialRenderCancelled
+        raise RadialRenderCancelled()
+
+
 def _rgba(image: QImage) -> np.ndarray:
     image = image.convertToFormat(QImage.Format.Format_RGBA8888_Premultiplied)
     data = np.frombuffer(image.constBits(), dtype=np.uint8,
@@ -389,7 +395,7 @@ def _dot_coverage(x, y, level, spacing, modifier):
     return _edge_coverage(distance, aa_width=aa) * (radius > 1e-6)
 
 
-def _delaunay(source, prepared, modifier, color_source=None):
+def _delaunay(source, prepared, modifier, color_source=None, cancelled=None):
     height, width = source.shape[:2]
     triangles = delaunay_triangles(width, height, modifier)
     coverage = np.zeros((height, width), dtype=np.float32)
@@ -410,6 +416,7 @@ def _delaunay(source, prepared, modifier, color_source=None):
                              [-math.sin(angle), math.cos(angle)]], dtype=np.float32)
         triangles = centers[:, None, :] + (triangles - centers[:, None, :]) @ rotation
     for triangle, center, rgba, valid, size in zip(triangles, centers, inks, visible, sizes):
+        _check_cancelled(cancelled)
         if not valid or size <= 1e-6:
             continue
         x0, y0 = np.maximum(np.floor(triangle.min(axis=0) - 1), 0).astype(int)
@@ -437,14 +444,50 @@ def _delaunay(source, prepared, modifier, color_source=None):
     return _composite(source, ink, coverage, modifier)
 
 
+def _cell_sample_table(prepared, color_source, cell_x, cell_y, spacing, angle, modifier, half_span):
+    """Sample each repeated grid cell once instead of once per output pixel."""
+    if modifier.grid_type not in {"square", "hexagonal", "stippling"}:
+        return None
+    left, top = int(cell_x.min()) - half_span, int(cell_y.min()) - half_span
+    right, bottom = int(cell_x.max()) + half_span + 1, int(cell_y.max()) + half_span + 1
+    # Very fine grids can contain more cells than pixels. Keep their original
+    # bounded neighborhood path rather than allocating a larger cell table.
+    if (right - left) * (bottom - top) > cell_x.size // 2:
+        return None
+    ix, iy = np.meshgrid(np.arange(left, right, dtype=np.float32),
+                         np.arange(top, bottom, dtype=np.float32))
+    cx, cy = ix * spacing, iy * spacing
+    if modifier.grid_type == "hexagonal":
+        cx = (ix + (iy % 2.) * .5) * spacing
+        cy = iy * spacing * math.sqrt(.75)
+    cosine, sine = math.cos(angle), math.sin(angle)
+    height, width = prepared.shape[:2]
+    if modifier.grid_type == "stippling":
+        bx, by = cx * cosine - cy * sine + width / 2., cx * sine + cy * cosine + height / 2.
+        density, valid = _tone(_sample(prepared, bx, by), modifier)
+        density = np.where(valid, density, 0.)
+        collision = modifier.collide_min + (modifier.collide_max - modifier.collide_min) * density
+        jitter_amount = .5 + 1. / (1. + modifier.smoothing_iterations / 100.)
+        jitter = ((_stipple_hash(ix, iy, modifier.stipple_seed) - .5) * spacing
+                  * jitter_amount / (1. + .4 * collision[..., None]))
+        cx, cy = cx + jitter[..., 0], cy + jitter[..., 1]
+    sx, sy = cx * cosine - cy * sine + width / 2., cx * sine + cy * cosine + height / 2.
+    sampled = _sample(prepared, sx, sy)
+    level, visible = _tone(sampled, modifier)
+    colors = _sample(color_source, sx, sy) if color_source is not None else None
+    return ((cell_x - left).astype(np.int32), (cell_y - top).astype(np.int32),
+            sx, sy, sampled, level, visible, colors)
+
+
 def _halftone(source: np.ndarray, modifier: HalftoneModifier,
-              color_source: np.ndarray | None = None) -> np.ndarray:
+              color_source: np.ndarray | None = None, cancelled=None) -> np.ndarray:
     height, width = source.shape[:2]
     unit = halftone_unit(width, height, modifier)
     spacing = max(.5, modifier.spacing * unit)
     prepared = _blur(source, modifier.blur * unit)
+    _check_cancelled(cancelled)
     if modifier.dot_style == "delaunay" and modifier.grid_type not in {"line", "ring"}:
-        return _delaunay(source, prepared, modifier, color_source)
+        return _delaunay(source, prepared, modifier, color_source, cancelled)
     yy, xx = np.indices((height, width), dtype=np.float32)
     xx, yy = xx + .5, yy + .5
     angle = math.radians(modifier.rotation)
@@ -474,46 +517,61 @@ def _halftone(source: np.ndarray, modifier: HalftoneModifier,
         return _composite(source, _ink(sampled, level, modifier, color_sample), coverage, modifier)
 
     coverage = np.zeros((height, width), dtype=np.float32)
-    chosen = _sample(prepared, xx, yy)
-    chosen_tone = np.zeros((height, width), dtype=np.float32)
-    chosen_color = _sample(color_source, xx, yy) if color_source is not None else None
-    joined = np.full((height, width), 1e20, dtype=np.float32)
-    joins = np.zeros((height, width), dtype=np.int16)
+    # Sampling at the original pixel centers is exactly an identity.
+    chosen = prepared
+    chosen_tone = np.zeros((height, width), dtype=np.float32) if modifier.color_mode == "gradient" else None
+    chosen_color = color_source
+    merged_marks = modifier.dot_style in {"blob", "liquid"}
+    joined = np.full((height, width), 1e20, dtype=np.float32) if merged_marks else None
+    joins = np.zeros((height, width), dtype=np.int16) if merged_marks else None
+    source_colors = modifier.color_mode in {"source", "target_layer"}
     cell_x = np.floor(gx / spacing + .5)
     cell_y = np.floor(gy / (spacing * math.sqrt(.75) if grid == "hexagonal" else spacing) + .5)
-    radial_ring = np.floor(np.hypot(gx, gy) / spacing + .5)
+    radial_ring = np.floor(np.hypot(gx, gy) / spacing + .5) if grid == "radial" else None
     half_span = 2 if modifier.size > 1.5 else 1
     jitter_amount = .5 + 1. / (1. + modifier.smoothing_iterations / 100.)
-    local_tone, local_valid = _tone(chosen, modifier)
-    local_tone = np.where(local_valid, local_tone, -1.)
+    local_tone = None
+    if modifier.dot_style == "liquid" and modifier.even_merge_tone:
+        local_tone, local_valid = _tone(chosen, modifier)
+        local_tone = np.where(local_valid, local_tone, -1.)
+    cell_samples = _cell_sample_table(prepared, color_source, cell_x, cell_y,
+                                      spacing, angle, modifier, half_span)
     for iy in range(-half_span, half_span + 1):
         for ix in range(-half_span, half_span + 1):
-            index_x, index_y = cell_x + ix, cell_y + iy
-            cx, cy = index_x * spacing, index_y * spacing
-            candidate_valid = np.ones((height, width), dtype=bool)
-            if grid == "hexagonal":
-                cx = (index_x + (index_y % 2.) * .5) * spacing
-                cy = index_y * spacing * math.sqrt(.75)
-            elif grid == "radial":
-                ring = np.maximum(0., radial_ring + iy)
-                candidate_valid = (radial_ring + iy >= 0.) & ((ring != 0.) | (ix == 0))
-                count = np.maximum(1., np.floor(2. * np.pi * ring + .5))
-                theta = (np.floor(np.arctan2(gy, gx) / (2. * np.pi) * count + .5) + ix) * 2. * np.pi / count
-                cx, cy = np.cos(theta) * ring * spacing, np.sin(theta) * ring * spacing
-            elif grid == "stippling":
-                base_x = cx * math.cos(angle) - cy * math.sin(angle) + width / 2.
-                base_y = cx * math.sin(angle) + cy * math.cos(angle) + height / 2.
-                density, density_valid = _tone(_sample(prepared, base_x, base_y), modifier)
-                density = np.where(density_valid, density, 0.)
-                collision = modifier.collide_min + (modifier.collide_max - modifier.collide_min) * density
-                jitter = ((_stipple_hash(index_x, index_y, modifier.stipple_seed) - .5)
-                          * spacing * jitter_amount / (1. + .4 * collision[..., None]))
-                cx, cy = cx + jitter[..., 0], cy + jitter[..., 1]
-            sx = cx * math.cos(angle) - cy * math.sin(angle) + width / 2.
-            sy = cx * math.sin(angle) + cy * math.cos(angle) + height / 2.
-            sampled = _sample(prepared, sx, sy)
-            level, visible = _tone(sampled, modifier)
-            visible &= candidate_valid
+            _check_cancelled(cancelled)
+            if cell_samples is not None:
+                xids, yids, sxs, sys, samples, levels, visible_cells, colors = cell_samples
+                ids = (yids + iy, xids + ix)
+                sx, sy = sxs[ids], sys[ids]
+                sampled = samples[ids] if source_colors else None
+                level, visible = levels[ids], visible_cells[ids]
+            else:
+                index_x, index_y = cell_x + ix, cell_y + iy
+                cx, cy = index_x * spacing, index_y * spacing
+                candidate_valid = np.ones((height, width), dtype=bool)
+                if grid == "hexagonal":
+                    cx = (index_x + (index_y % 2.) * .5) * spacing
+                    cy = index_y * spacing * math.sqrt(.75)
+                elif grid == "radial":
+                    ring = np.maximum(0., radial_ring + iy)
+                    candidate_valid = (radial_ring + iy >= 0.) & ((ring != 0.) | (ix == 0))
+                    count = np.maximum(1., np.floor(2. * np.pi * ring + .5))
+                    theta = (np.floor(np.arctan2(gy, gx) / (2. * np.pi) * count + .5) + ix) * 2. * np.pi / count
+                    cx, cy = np.cos(theta) * ring * spacing, np.sin(theta) * ring * spacing
+                elif grid == "stippling":
+                    base_x = cx * math.cos(angle) - cy * math.sin(angle) + width / 2.
+                    base_y = cx * math.sin(angle) + cy * math.cos(angle) + height / 2.
+                    density, density_valid = _tone(_sample(prepared, base_x, base_y), modifier)
+                    density = np.where(density_valid, density, 0.)
+                    collision = modifier.collide_min + (modifier.collide_max - modifier.collide_min) * density
+                    jitter = ((_stipple_hash(index_x, index_y, modifier.stipple_seed) - .5)
+                              * spacing * jitter_amount / (1. + .4 * collision[..., None]))
+                    cx, cy = cx + jitter[..., 0], cy + jitter[..., 1]
+                sx = cx * math.cos(angle) - cy * math.sin(angle) + width / 2.
+                sy = cx * math.sin(angle) + cy * math.cos(angle) + height / 2.
+                sampled = _sample(prepared, sx, sy)
+                level, visible = _tone(sampled, modifier)
+                visible &= candidate_valid
             mark = _dot_coverage(xx - sx, yy - sy, level, spacing, modifier) * visible
             if modifier.dot_style in {"blob", "liquid"}:
                 radius = spacing * (.7071068 if modifier.dot_style == "blob" else .5) * modifier.size * np.sqrt(
@@ -540,10 +598,12 @@ def _halftone(source: np.ndarray, modifier: HalftoneModifier,
                 joins += (distance < spacing * .5).astype(np.int16)
             replace = mark > coverage
             coverage = np.maximum(coverage, mark)
-            chosen = np.where(replace[..., None], sampled, chosen)
-            chosen_tone = np.where(replace, level, chosen_tone)
+            if source_colors:
+                chosen = np.where(replace[..., None], sampled, chosen)
+            if chosen_tone is not None:
+                chosen_tone = np.where(replace, level, chosen_tone)
             if color_source is not None:
-                color_sample = _sample(color_source, sx, sy)
+                color_sample = colors[ids] if cell_samples is not None else _sample(color_source, sx, sy)
                 chosen_color = np.where(replace[..., None], color_sample, chosen_color)
     if modifier.dot_style in {"blob", "liquid"}:
         coverage = _edge_coverage(joined)
@@ -552,10 +612,11 @@ def _halftone(source: np.ndarray, modifier: HalftoneModifier,
 
 
 def apply_pattern_effect(image: QImage, modifier, scale: float = 1.,
-                         color_source: QImage | None = None) -> QImage:
+                         color_source: QImage | None = None, *, cancelled=None) -> QImage:
     """Apply a complete pattern effect, preserving dimensions and image alpha."""
     if image.isNull():
         return image.copy()
+    _check_cancelled(cancelled)
     source = _rgba(image)
     if isinstance(modifier, PixelateModifier):
         result = _pixelate(source, modifier, max(float(scale), 1e-6))
@@ -564,7 +625,8 @@ def apply_pattern_effect(image: QImage, modifier, scale: float = 1.,
         if (modifier.color_mode == "target_layer" and color_source is not None
                 and not color_source.isNull() and color_source.size() == image.size()):
             colors = _rgba(color_source)
-        result = _halftone(source, modifier, colors)
+        result = _halftone(source, modifier, colors, cancelled)
     else:
         return image.copy()
+    _check_cancelled(cancelled)
     return _image(result)

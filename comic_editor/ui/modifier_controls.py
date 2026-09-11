@@ -15,7 +15,7 @@ from comic_editor.core.models import (
     canonical_argb, TilingModifier, ArrayModifier,
     CageTransformModifier, PosterizeModifier, PosterizeValueModifier, POSTERIZE_MAX_COLORS,
     HalftoneModifier, PixelateModifier,
-    ColorFillGradientObject,
+    ColorFillGradientObject, TextObject,
     StrokeModifier, ScreamModifier, WobbleModifier, DotDashModifier, STROKE_MODIFIER_TYPES,
 )
 from comic_editor.ui.icons import iconoir
@@ -452,7 +452,7 @@ class ModifierControls(QWidget):
         self._cards: dict[str, ModifierCard] = {}
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
-        self.summary = QLabel("Select a drawing, image, gradient, or shape.", self)
+        self.summary = QLabel("Select a drawing, image, gradient, text, or shape.", self)
         self.summary.setWordWrap(True)
         layout.addWidget(self.summary)
         self.add_button = QPushButton("Add Modifier", self)
@@ -567,13 +567,20 @@ class ModifierControls(QWidget):
         )
         self.add_button.setEnabled(bool(self.canvas.selected_entities))
         has_gradient = any(isinstance(chapter.modifier_target(*ref), ColorFillGradientObject) for ref in targets) if chapter else False
+        has_text = any(isinstance(chapter.modifier_target(*ref), TextObject) for ref in targets) if chapter else False
         for action in self.add_button.menu().actions():
-            action.setVisible(not has_gradient or action.text() in {"Posterize…", "Posterize Value…", "Halftone"})
-        self.add_button.setToolTip("Color gradients support Posterize, Posterize Value, and Halftone." if has_gradient else "")
+            action.setVisible(
+                (not has_gradient or action.text() in {"Posterize…", "Posterize Value…", "Halftone"})
+                and (not has_text or action.text() == "Outline")
+            )
+        self.add_button.setToolTip(
+            "Text boxes support Outline." if has_text else
+            "Color gradients support Posterize, Posterize Value, and Halftone." if has_gradient else ""
+        )
         self.stroke_menu.menuAction().setVisible(bool(eligible and all(
             chapter.stroke_modifier_target(*ref) for ref in targets)))
         if not eligible:
-            self.summary.setText("Select a drawing, image, gradient, or bounded shape.")
+            self.summary.setText("Select a drawing, image, gradient, text, or bounded shape.")
             return
         ids = self.common_ids()
         self.summary.setText(
