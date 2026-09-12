@@ -15,9 +15,18 @@ class TextFeatures:
         self._free_text_timer.timeout.connect(self._flush_free_text_drag)
         self._text_color_popup = None
 
+    def _text_gizmo_color(self, obj):
+        from comic_editor.core.text_styles import text_color_at
+
+        position = (
+            min(self._text_cursor_position, self._text_selection_anchor)
+            if self.has_active_text_edit() else 0
+        )
+        return text_color_at(obj, position)
+
     def _open_text_color_picker(self):
         """Keep canvas selection stable while the shared picker owns focus."""
-        from comic_editor.core.text_styles import apply_text_color, text_color_at
+        from comic_editor.core.text_styles import apply_text_color
         from comic_editor.ui.color_picker import ColorPickerPopup
 
         obj = self._selected_text_for_gizmos()
@@ -34,7 +43,7 @@ class TextFeatures:
         start, end = sorted((position, anchor)) if was_editing else (0, 0)
         if start == end:
             start, end = 0, len(obj.text)
-        popup = ColorPickerPopup(text_color_at(obj, start), self)
+        popup = ColorPickerPopup(self._text_gizmo_color(obj), self)
         self._text_color_popup = popup
         popup.setWindowTitle("Change text color")
         popup.setAttribute(Qt.WA_DeleteOnClose)

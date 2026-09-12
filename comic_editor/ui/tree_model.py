@@ -2,11 +2,12 @@
 from __future__ import annotations
 
 import json
+import math
 from dataclasses import dataclass, field
 
 from PySide6.QtCore import QAbstractItemModel, QMimeData, QModelIndex, Qt, Signal
-from PySide6.QtCore import QRect
-from PySide6.QtGui import QColor, QIcon, QPainter, QPen, QPixmap
+from PySide6.QtCore import QPointF, QRect
+from PySide6.QtGui import QColor, QIcon, QPainter, QPen, QPixmap, QPolygonF
 from PySide6.QtWidgets import QApplication, QStyledItemDelegate, QStyle, QStyleOptionViewItem
 
 from comic_editor.core.models import (
@@ -25,6 +26,9 @@ class TreeItem:
 
 class HierarchyModel(QAbstractItemModel):
     mutationCommitted = Signal(object, object, str)
+    soloToggleRequested = Signal(str, str)
+    SoloRole = Qt.ItemDataRole.UserRole + 1
+    SoloHighlightRole = Qt.ItemDataRole.UserRole + 2
 
     MIME = "application/x-vertical-comic-entity"
     _reference_icon_cache: QIcon | None = None
@@ -57,6 +61,8 @@ class HierarchyModel(QAbstractItemModel):
         self.link_highlights: set[tuple[str, str]] = set()
         self.mask_highlights: set[tuple[str, str]] = set()
         self.error_highlights: set[tuple[str, str]] = set()
+        self.solo_entities: set[tuple[str, str]] = set()
+        self.current_entity: tuple[str, str] = ("", "")
         self.rebuild()
 
     def set_chapter(self, chapter: ChapterDocument | None) -> None:
@@ -160,6 +166,11 @@ class HierarchyModel(QAbstractItemModel):
             self.chapter.layers[item.entity_id]
             if item.kind == "layer" else self.chapter.objects[item.entity_id]
         )
+        key = (item.kind, item.entity_id)
+        if role == self.SoloRole:
+            return key in self.solo_entities
+        if role == self.SoloHighlightRole:
+            return key in self.solo_entities and key != self.current_entity
         if role in (Qt.DisplayRole, Qt.EditRole):
             if index.column() == 0:
                 if isinstance(entity, TextObject):
@@ -206,6 +217,8 @@ class HierarchyModel(QAbstractItemModel):
                 return "Editable vector strokes."
             return "Drag objects between page or container layers."
         if role == Qt.BackgroundRole:
+            if key in self.solo_entities and key != self.current_entity:
+                return QColor("#c5a137")
             if (item.kind, item.entity_id) in self.error_highlights:
                 return QColor("#913a40")
             if (item.kind, item.entity_id) in self.mask_highlights:
@@ -214,6 +227,8 @@ class HierarchyModel(QAbstractItemModel):
                 return QColor("#b85b12")
             return QColor("#303238") if item.kind == "layer" else QColor("#050505")
         if role == Qt.ForegroundRole:
+            if key in self.solo_entities and key != self.current_entity:
+                return QColor("#171717")
             return QColor("#eeeeee")
         return None
 
@@ -412,6 +427,25 @@ class HierarchyModel(QAbstractItemModel):
         self.mutationCommitted.emit(before, after, "Reorder hierarchy")
         return True
 
+    def set_solo_entities(self, targets) -> None:
+        previous = self.solo_entities
+        self.solo_entities = set(targets)
+        self._update_solo_rows(previous | self.solo_entities)
+
+    def set_current_entity(self, kind: str, identifier: str) -> None:
+        previous = self.current_entity
+        self.current_entity = (kind, identifier)
+        self._update_solo_rows({previous, self.current_entity})
+
+    def _update_solo_rows(self, entries) -> None:
+        for kind, identifier in entries:
+            index = self.index_for_entity(kind, identifier)
+            if index.isValid():
+                self.dataChanged.emit(index, index.siblingAtColumn(2), [
+                    Qt.BackgroundRole, Qt.ForegroundRole,
+                    self.SoloRole, self.SoloHighlightRole,
+                ])
+
     def set_error_highlights(self, targets):
         previous = self.error_highlights
         self.error_highlights = {tuple(ref) for ref in targets}
@@ -447,9 +481,25 @@ class HierarchyModel(QAbstractItemModel):
                 )
 
 
-class EyeVisibilityDelegate(QStyledItemDelegate):
+class SoloRowDelegate(QStyledItemDelegate):
+    def initStyleOption(self, option, index):
+        super().initStyleOption(option, index)
+        if index.data(HierarchyModel.SoloHighlightRole):
+            option.state &= ~QStyle.StateFlag.State_Selected
+
+
+class EyeVisibilityDelegate(SoloRowDelegate):
     _eye = None
     _eye_closed = None
+
+    @staticmethod
+    def star_rect(rect: QRect) -> QRect:
+        return QRect(rect.left() + 2, rect.top(), 20, rect.height())
+
+    @classmethod
+    def eye_rect(cls, rect: QRect, index) -> QRect:
+        offset = 22 if index.data(HierarchyModel.SoloRole) else 0
+        return QRect(rect.left() + 2 + offset, rect.top() + 2, 24, rect.height() - 4)
 
     def _icons(self):
         if EyeVisibilityDelegate._eye is None:
@@ -473,7 +523,21 @@ class EyeVisibilityDelegate(QStyledItemDelegate):
         style = widget.style() if widget is not None else QApplication.style()
         style.drawControl(QStyle.ControlElement.CE_ItemViewItem, opt, painter, widget)
         r = option.rect
-        btn_rect = QRect(r.left() + 2, r.top() + 2, 24, r.height() - 4)
+        btn_rect = self.eye_rect(r, index)
+        if index.data(HierarchyModel.SoloRole):
+            center = self.star_rect(r).center()
+            points = []
+            for i in range(10):
+                angle = -math.pi / 2 + i * math.pi / 5
+                radius = 8.0 if i % 2 == 0 else 3.5
+                points.append(QPointF(center.x() + math.cos(angle) * radius,
+                                     center.y() + math.sin(angle) * radius))
+            painter.save()
+            painter.setRenderHint(QPainter.Antialiasing, True)
+            painter.setPen(QPen(QColor("#7e6011"), 0.7))
+            painter.setBrush(QColor("#ffe14a"))
+            painter.drawPolygon(QPolygonF(points))
+            painter.restore()
         painter.save()
         painter.setRenderHint(QPainter.Antialiasing, True)
         bg = QColor("#3a3a42") if visible else QColor("#f2a23a")
@@ -496,15 +560,20 @@ class EyeVisibilityDelegate(QStyledItemDelegate):
                 painter.drawPixmap(btn_rect.right() + 6, iy, rp)
             painter.setPen(opt.palette.color(opt.palette.ColorRole.Text) if not (opt.state & QStyle.StateFlag.State_Selected) else opt.palette.color(opt.palette.ColorRole.HighlightedText))
             text_rect = r.adjusted(text_x - r.left(), 0, 0, 0)
-            painter.drawText(text_rect, Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft, str(display))
+            label = opt.fontMetrics.elidedText(str(display), Qt.ElideRight, max(0, text_rect.width()))
+            painter.drawText(text_rect, Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft, label)
 
     def editorEvent(self, event, model, option, index):
         if index.column() != 0 or not index.isValid():
             return super().editorEvent(event, model, option, index)
         if event.type() in (event.Type.MouseButtonRelease, event.Type.MouseButtonDblClick):
             r = option.rect
-            btn_rect = QRect(r.left() + 2, r.top() + 2, 24, r.height() - 4)
+            btn_rect = self.eye_rect(r, index)
             pos = event.position().toPoint() if hasattr(event, "position") else event.pos()
+            if index.data(HierarchyModel.SoloRole) and self.star_rect(r).contains(pos):
+                item = model.item_for_index(index)
+                model.soloToggleRequested.emit(item.kind, item.entity_id)
+                return True
             if btn_rect.contains(pos):
                 current = index.data(Qt.CheckStateRole)
                 new_state = Qt.Unchecked if current == Qt.Checked else Qt.Checked
@@ -513,7 +582,7 @@ class EyeVisibilityDelegate(QStyledItemDelegate):
         return super().editorEvent(event, model, option, index)
 
 
-class MaskOnlyRowDelegate(QStyledItemDelegate):
+class MaskOnlyRowDelegate(SoloRowDelegate):
     _mask_on = None
     _mask_off = None
 

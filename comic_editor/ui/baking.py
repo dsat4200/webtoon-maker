@@ -141,10 +141,11 @@ def rasterize(canvas, kind, identifier):
         target.visible, target.mask_only = True, False
         canvas._interactive_render = False
         canvas._rendering_compound_references = True
-        if kind == "layer":
-            canvas._render_layer(painter, target, 1.0, bounds)
-        else:
-            canvas._render_object(painter, target, 1.0, inverse.mapRect(bounds))
+        with canvas.without_solo():
+            if kind == "layer":
+                canvas._render_layer(painter, target, 1.0, bounds)
+            else:
+                canvas._render_object(painter, target, 1.0, inverse.mapRect(bounds))
     finally:
         target.visible, target.mask_only = was_visible, was_mask_only
         canvas._rendering_compound_references = old_references

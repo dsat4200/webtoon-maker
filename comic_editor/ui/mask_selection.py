@@ -1,4 +1,4 @@
-"""Lasso additions and cutouts for the currently edited tone mask."""
+"""Lasso and magic-wand additions and cutouts for the edited tone mask."""
 from __future__ import annotations
 
 import math
@@ -8,9 +8,71 @@ from PySide6.QtCore import QPointF, QRectF, Qt
 from PySide6.QtGui import QColor, QImage, QPainter, QPainterPath, QPen
 
 from comic_editor.core.commands import TilePatchCommand
+from comic_editor.core.tiles import TileStore
 
 
 class MaskSelectionFeatures:
+    def _mask_wand_press(self, point: QPointF, modifiers) -> None:
+        mask = (
+            self.chapter.masks.get(self.active_tone_mask_id)
+            if self.chapter else None
+        )
+        if mask is None:
+            return
+        frame = QRectF(0, 0, self.chapter.width, self.chapter.height)
+        if not frame.contains(point):
+            return
+        remove = bool(modifiers & Qt.ControlModifier)
+        size = self.tiles.tile_size
+        selected = TileStore(tile_size=size)
+
+        def reference_tile(key):
+            image = QImage(size, size, QImage.Format_ARGB32_Premultiplied)
+            # Render artwork at document resolution, without the blue mask
+            # overlay, grid, or selection handles. All source pixels are read
+            # before any mask paint changes, including across tile boundaries.
+            self.render_preview(image, source_rect=QRectF(
+                key[0] * size, key[1] * size, size, size,
+            ))
+            return image
+
+        previous_interactive = self._interactive_render
+        self._interactive_render = False
+        try:
+            selected.advanced_fill(
+                mask.mask_id, point, frame, QColor("white"),
+                {
+                    "tolerance": self.settings.mask_wand_tolerance,
+                    "connected_pixels_only": True,
+                    "antialiasing": False,
+                },
+                reference_tile=reference_tile,
+            )
+        finally:
+            self._interactive_render = previous_interactive
+        before, after = {}, {}
+        for key, coverage in selected.object_tiles(mask.mask_id).items():
+            if remove:
+                painter = QPainter(coverage)
+                painter.setCompositionMode(QPainter.CompositionMode_SourceIn)
+                painter.fillRect(coverage.rect(), QColor("black"))
+                painter.end()
+            original = self.tiles.tile(mask.mask_id, key)
+            image = (
+                QImage(original) if original is not None
+                else self.tiles._empty(size)
+            )
+            painter = QPainter(image)
+            painter.drawImage(0, 0, coverage)
+            painter.end()
+            if image == original:
+                continue
+            before[key] = QImage(original) if original is not None else None
+            after[key] = image
+        self._commit_mask_selection(mask, before, after, remove)
+        self.interactionFinished.emit()
+        self.update()
+
     def _begin_mask_selection(self, point: QPointF, modifiers) -> None:
         if (
             self.chapter is None
@@ -120,6 +182,9 @@ class MaskSelectionFeatures:
                 continue
             before[key] = QImage(original) if original is not None else None
             after[key] = image
+        self._commit_mask_selection(mask, before, after, remove)
+
+    def _commit_mask_selection(self, mask, before, after, remove: bool) -> None:
         if not after:
             return
         before_state = (mask.revision, mask.paint_has_subtractions)

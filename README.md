@@ -67,8 +67,9 @@ which preset was last loaded or saved for each modifier.
 
 ## Text color and spacing
 
-The on-canvas text gizmos include **Change color** immediately after Italic.
-It opens the floating color picker: select a text range to color just that
+The on-canvas text gizmos include a rounded square color swatch immediately
+after Italic. It shows the color at the start of the selected range or at the
+caret and opens the floating color picker: select a text range to color just that
 range, or leave the selection empty to recolor the whole object. Click Apply
 to keep the color or Cancel to leave it unchanged. Colors survive typing,
 undo, saving, copying objects, and export.
@@ -481,6 +482,15 @@ pixels and frame together.
 Reordering or reparenting items in the layer outliner preserves expanded
 pages/layers and the current selection, including across hierarchy undo/redo.
 
+Use **S**, just to the right of the lock above the outliner, to solo the current
+layer or object. Add more entries by selecting them and pressing **S**; a solo
+layer includes its descendants. The button stays pressed for a soloed current
+selection. Other soloed rows have a yellow background, and every soloed entry
+has a yellow five-point star immediately before its eye icon. Click its star
+or press **S** again to remove it from solo. Removing the last entry restores
+normal visibility. Solo is remembered per open project tab, preserves the eye
+settings, and affects the canvas and navigator without changing exported art.
+
 Use **Add Page** after selecting a page or one of its descendants, then draw
 the new page as a rectangle, circle, or closed custom shape below the active
 page. It is inserted immediately after that page in the outliner without
@@ -557,6 +567,13 @@ configurable From and To values (0 to 1 by default), or paints one constant To
 value when pressure is disabled. It replaces existing mask alpha so light
 pressure can lower coverage; Eraser still removes it. Both use queued tile
 strokes and one Undo command per gesture.
+
+Mask mode also offers **Select** for freehand lasso regions and **Magic Wand**
+for connected areas of similar visible color. Set the wand's **Color tolerance**
+in Tool Settings (0–255); higher values include more color variation. Each
+gesture adds to the mask. Hold **Ctrl** while drawing a lasso or clicking the
+wand to remove that region, including coverage from linked contributors.
+These edits support Undo and Redo and are saved with the mask.
 
 HSL, Blur, Radial Blur, Outline, and Mirror modifiers remain attached to their objects rather than
 appearing in the outliner. Their processed results are cached separately from

@@ -239,6 +239,7 @@ class EditorSettings:
     mask_pencil_pressure_sensitive: bool = True
     mask_pencil_from_alpha: float = 0.0
     mask_pencil_to_alpha: float = 1.0
+    mask_wand_tolerance: int = 16
     draw_shape_simplify: float = 2.0
     ui_splitter_sizes: dict[str, list[int]] = field(default_factory=dict)
     navigator_expanded: bool = False
@@ -543,6 +544,7 @@ class EditorSettings:
         self.mask_pencil_to_alpha = max(
             0.0, min(1.0, float(self.mask_pencil_to_alpha))
         )
+        self.mask_wand_tolerance = max(0, min(255, int(self.mask_wand_tolerance)))
         try:
             self.draw_shape_simplify = max(0.5, min(5.0, float(self.draw_shape_simplify)))
         except Exception:

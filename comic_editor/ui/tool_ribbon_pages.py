@@ -19,6 +19,7 @@ from PySide6.QtWidgets import (
     QMenu,
     QMessageBox,
     QPushButton,
+    QSizePolicy,
     QSlider,
     QSpinBox,
     QStackedWidget,
@@ -229,6 +230,8 @@ class ToolSettingsControls(QWidget):
         self.mask_select_page.setWordWrap(True)
         self.mask_select_page.setAlignment(Qt.AlignTop | Qt.AlignLeft)
         self.stack.addWidget(self.mask_select_page)
+        self.mask_wand_page = self._build_mask_wand_page()
+        self.stack.addWidget(self.mask_wand_page)
         self.eraser_page = self._build_eraser_page()
         self.stack.addWidget(self.eraser_page)
         self.fill_page = self._build_fill_page()
@@ -237,6 +240,53 @@ class ToolSettingsControls(QWidget):
         self.stack.addWidget(self.draw_shape_page)
         self.refresh()
         self.set_context(None, False)
+
+    def _build_mask_wand_page(self) -> QWidget:
+        page = QWidget(self)
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(0, 0, 0, 0)
+        description = QLabel(
+            "Click to add a connected area of similar color from the visible artwork.\n\n"
+            "Control: Remove\nShift: Add", page,
+        )
+        description.setWordWrap(True)
+        description.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+        layout.addWidget(description)
+        group = QWidget(page)
+        tolerance_layout = QVBoxLayout(group)
+        tolerance_layout.setContentsMargins(0, 0, 0, 0)
+        tolerance_layout.setSpacing(4)
+        value_row = QHBoxLayout()
+        value_row.addWidget(QLabel("Color tolerance", group))
+        self.mask_wand_tolerance = QSpinBox(group)
+        self.mask_wand_tolerance.setRange(0, 255)
+        self.mask_wand_tolerance.setButtonSymbols(QAbstractSpinBox.NoButtons)
+        self.mask_wand_tolerance.setMinimumWidth(48)
+        value_row.addWidget(self.mask_wand_tolerance)
+        tolerance_layout.addLayout(value_row)
+        self.mask_wand_tolerance_slider = QSlider(Qt.Horizontal, group)
+        self.mask_wand_tolerance_slider.setRange(0, 255)
+        self.mask_wand_tolerance_slider.valueChanged.connect(
+            self.mask_wand_tolerance.setValue
+        )
+        self.mask_wand_tolerance.valueChanged.connect(
+            self.mask_wand_tolerance_slider.setValue
+        )
+        tolerance_layout.addWidget(self.mask_wand_tolerance_slider)
+        group.setToolTip(
+            "0 selects an exact color; higher values include more similar colors (up to 255)."
+        )
+        layout.addWidget(group)
+        layout.addStretch(1)
+        self.mask_wand_tolerance.valueChanged.connect(self._mask_wand_tolerance_changed)
+        return page
+
+    def _mask_wand_tolerance_changed(self, value: int) -> None:
+        if self._loading:
+            return
+        self.settings.mask_wand_tolerance = value
+        self.settings.clamp()
+        self.settingsChanged.emit()
 
     def _build_pencil_page(self) -> QWidget:
         page = QWidget(self)
@@ -557,6 +607,9 @@ class ToolSettingsControls(QWidget):
         if value == "mask_select" and mask_active:
             self.context_label.setText("Mask Select")
             self.stack.setCurrentWidget(self.mask_select_page)
+        elif value == "mask_wand" and mask_active:
+            self.context_label.setText("Magic Wand")
+            self.stack.setCurrentWidget(self.mask_wand_page)
         elif value == "raster_pencil":
             if mask_active:
                 self.context_label.setText("Mask Pencil")
@@ -585,6 +638,13 @@ class ToolSettingsControls(QWidget):
         else:
             self.context_label.setText("No settings for the current tool")
             self.stack.setCurrentWidget(self.empty_page)
+        # Other, inactive tool pages have wide controls. Let the compact wand
+        # page use the sidebar width instead of inheriting their minimum width.
+        self.stack.setSizePolicy(
+            QSizePolicy.Ignored if value == "mask_wand" and mask_active
+            else QSizePolicy.Preferred,
+            QSizePolicy.Preferred,
+        )
         self.vector_eraser_label.setVisible(False)
         self.vector_eraser_group.setVisible(vector_active)
         for widget in self._vector_fill_widgets:
@@ -637,6 +697,7 @@ class ToolSettingsControls(QWidget):
             self.settings.mask_pencil_from_alpha,
             self.settings.mask_pencil_to_alpha,
         )
+        self.mask_wand_tolerance.setValue(self.settings.mask_wand_tolerance)
         self.pencil_transform_handles.setChecked(
             self.settings.pencil_transform_handles_visible
         )

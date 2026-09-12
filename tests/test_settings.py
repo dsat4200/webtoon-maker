@@ -23,6 +23,22 @@ def test_missing_settings_file_has_complete_hotkeys(monkeypatch, tmp_path):
     assert loaded.blender_bridge_token == ""
 
 
+def test_mask_wand_tolerance_defaults_clamps_and_persists(monkeypatch, tmp_path):
+    path = tmp_path / "settings.json"
+    _use_settings_file(monkeypatch, path)
+    loaded = load_settings()
+    assert loaded.mask_wand_tolerance == 16
+    loaded.mask_wand_tolerance = 47
+    save_settings(loaded)
+    assert load_settings().mask_wand_tolerance == 47
+    loaded.mask_wand_tolerance = 999
+    loaded.clamp()
+    assert loaded.mask_wand_tolerance == 255
+    loaded.mask_wand_tolerance = -1
+    loaded.clamp()
+    assert loaded.mask_wand_tolerance == 0
+
+
 def test_settings_v21_adds_clamps_and_persists_grid_defaults(
     monkeypatch, tmp_path,
 ):

@@ -5,6 +5,7 @@ import copy
 
 import pytest
 from PySide6.QtCore import QPointF, Qt
+from PySide6.QtGui import QColor
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication, QDialogButtonBox
 
@@ -50,7 +51,9 @@ def _open_picker(canvas, qapp):
     overlay = canvas._text_gizmo_overlay
     assert overlay.isVisible()
     assert overlay.color.x() >= overlay.italic.geometry().right()
-    assert overlay.color.width() >= overlay.color.fontMetrics().horizontalAdvance("Change color") + 16
+    assert overlay.color.width() == overlay.color.height() == 34
+    assert overlay.color.text() == ""
+    assert overlay.color.accessibleName() == "Text color"
     QTest.mouseClick(overlay.color, Qt.LeftButton)
     qapp.processEvents()
     popup = canvas._text_color_popup
@@ -76,23 +79,67 @@ def test_color_gizmo_preserves_range_and_applies_once_with_keyboard_undo(text_ca
     original = obj.to_dict()
     canvas._text_selection_anchor, canvas._text_cursor_position = 1, 6
     revision = canvas.command_stack.revision
+    swatch = canvas._text_gizmo_overlay.color
+    assert swatch.grab().toImage().pixelColor(17, 17) == QColor("#FF111111")
     popup = _open_picker(canvas, qapp)
     popup.setColor("#FFCC2244")
     popup.picker.setFocus()
     qapp.processEvents()
     assert canvas._text_selection_range() == [1, 6]
     assert obj.to_dict() == original  # Picker preview is a draft until Apply.
+    assert swatch.property("textColor") == "#FF111111"
     _apply(popup, qapp)
     assert canvas.has_active_text_edit()
     assert canvas._text_selection_range() == [1, 6]
     assert canvas.command_stack.revision == revision + 1
+    assert swatch.property("textColor") == "#FFCC2244"
     assert [text_color_at(obj, i) for i in range(len(obj.text))] == [
         "#FFCC2244" if 1 <= i < 6 else "#FF111111" for i in range(len(obj.text))
     ]
     _key(canvas, Qt.Key_Z, Qt.ControlModifier)
+    qapp.processEvents()
     assert canvas.chapter.objects[object_id].to_dict() == original
+    assert swatch.property("textColor") == "#FF111111"
     _key(canvas, Qt.Key_Y, Qt.ControlModifier)
+    qapp.processEvents()
     assert text_color_at(canvas.chapter.objects[object_id], 3) == "#FFCC2244"
+    assert swatch.property("textColor") == "#FFCC2244"
+
+
+def test_swatch_follows_selection_caret_and_selected_object(text_canvas, qapp):
+    canvas, object_id = text_canvas
+    obj = canvas.chapter.objects[object_id]
+    apply_text_color(obj, 2, 5, "#804422CC")
+    canvas.commit_active_text_edit()
+    canvas.start_text_edit()
+    swatch = canvas._text_gizmo_overlay.color
+    for anchor, position in ((3, 3), (2, 5), (5, 2)):
+        canvas._text_selection_anchor, canvas._text_cursor_position = anchor, position
+        canvas.update()
+        qapp.processEvents()
+        assert swatch.property("textColor") == "#804422CC"
+        popup = _open_picker(canvas, qapp)
+        assert popup.color_argb() == "#804422CC"
+        popup.setColor("#FFFF0000")
+        popup.reject()
+        qapp.processEvents()
+        assert swatch.property("textColor") == "#804422CC"
+    _key(canvas, Qt.Key_Home, Qt.ControlModifier)
+    qapp.processEvents()
+    assert swatch.property("textColor") == "#FF111111"
+    second = canvas.chapter.add_object(obj.parent_layer_id, TextObject(
+        text="", text_color="#FF2266CC", layout_mode="free",
+    ))
+    canvas.set_selection("object", second.object_id)
+    canvas.start_text_edit()
+    qapp.processEvents()
+    assert swatch.property("textColor") == "#FF2266CC"
+    canvas.set_solo_entities({("object", object_id)})
+    qapp.processEvents()
+    assert not canvas._text_gizmo_overlay.isVisible()
+    canvas.set_solo_entities(set())
+    qapp.processEvents()
+    assert canvas._text_gizmo_overlay.isVisible()
 
 
 def test_color_with_no_selection_recolors_every_existing_run(text_canvas, qapp):

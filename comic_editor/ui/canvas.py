@@ -102,6 +102,7 @@ from comic_editor.core.models import CageTransformModifier, TilingModifier
 from comic_editor.ui.tiling_features import TilingFeatures
 from comic_editor.ui.mask_gradient import MaskGradientFeatures
 from comic_editor.ui.mask_selection import MaskSelectionFeatures
+from comic_editor.ui.solo_features import SoloFeatures
 
 
 class ToolKind(Enum):
@@ -112,6 +113,7 @@ class ToolKind(Enum):
     FILL = "fill"
     GRADIENT = "gradient"
     MASK_SELECT = "mask_select"
+    MASK_WAND = "mask_wand"
     TEXT_EDIT = "text_edit"
     TRANSFORM = "transform"
     CAGE_TRANSFORM = "cage_transform"
@@ -447,9 +449,12 @@ class _TextGizmoOverlay(QWidget):
         italic_font = self.italic.font()
         italic_font.setItalic(True)
         self.italic.setFont(italic_font)
-        self.color = self._button("Change color", "Change the selected text color, or all text when none is selected")
+        self.color = self._button("", "Change the selected text color, or all text when none is selected")
         self.color.setObjectName("textGizmoChangeColor")
+        self.color.setAccessibleName("Text color")
+        self.color.setFixedSize(34, 34)
         self.color.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.color.setCursor(Qt.CursorShape.PointingHandCursor)
         for control in (
             self.decrease, self.size, self.increase, self.bold, self.italic,
             self.color,
@@ -458,8 +463,7 @@ class _TextGizmoOverlay(QWidget):
             font = control.font()
             font.setPointSizeF(max(1.0, font.pointSizeF() * 1.4))
             control.setFont(font)
-        self.color.ensurePolished()
-        self.color.setFixedWidth(self.color.fontMetrics().horizontalAdvance("Change color") + 32)
+        self.set_color("#FF111111")
         self.decrease.clicked.connect(self.sizeDecreaseRequested)
         self.increase.clicked.connect(self.sizeIncreaseRequested)
         self.bold.clicked.connect(self.boldRequested)
@@ -490,6 +494,21 @@ class _TextGizmoOverlay(QWidget):
         self.italic.setChecked(bool(italic))
         for control in (self.size, self.bold, self.italic):
             control.blockSignals(False)
+
+    def set_color(self, value: str) -> None:
+        color = QColor(value)
+        value = color.name(QColor.NameFormat.HexArgb).upper()
+        if self.color.property("textColor") == value:
+            return
+        self.color.setProperty("textColor", value)
+        self.color.setStyleSheet(
+            "QToolButton#textGizmoChangeColor { "
+            f"background-color: rgba({color.red()}, {color.green()}, "
+            f"{color.blue()}, {color.alpha()}); "
+            "border: 1px solid #b89b70; border-radius: 6px; padding: 0; }"
+            "QToolButton#textGizmoChangeColor:hover { border-color: #f2a23a; }"
+            "QToolButton#textGizmoChangeColor:pressed { border: 2px solid #f2a23a; }"
+        )
 
 
 @dataclass
@@ -537,6 +556,7 @@ class CanvasSessionState:
     blur_pyramid_cache: BlurPyramidCache
     drawing_selection: _DrawingSelectionSessionState | None = None
     modifier_selection: dict = field(default_factory=dict)
+    solo_entities: set[tuple[str, str]] = field(default_factory=set)
 
 
 class CanvasPerformanceMonitor:
@@ -569,12 +589,13 @@ class CanvasPerformanceMonitor:
         }
 
 
-class _CanvasLogic(ViewFeatures, MaskSelectionFeatures, MaskGradientFeatures, TilingFeatures, CageFeatures, ArrayFeatures, SpatialModifierFeatures, TextFeatures):
+class _CanvasLogic(SoloFeatures, ViewFeatures, MaskSelectionFeatures, MaskGradientFeatures, TilingFeatures, CageFeatures, ArrayFeatures, SpatialModifierFeatures, TextFeatures):
     documentChanged = Signal(object)
     viewSettingsChanged = Signal()
     visualChanged = Signal(object)
     selectionChanged = Signal(str, str)
     selectionSetChanged = Signal(object)
+    soloChanged = Signal(object)
     hierarchyChanged = Signal()
     chapterReplaced = Signal(object)
     cameraChanged = Signal()
@@ -616,6 +637,7 @@ class _CanvasLogic(ViewFeatures, MaskSelectionFeatures, MaskGradientFeatures, Ti
         self.active_layer_id = ""
         self.selected_object_id = ""
         self.selected_entities: list[tuple[str, str]] = []
+        self._solo_entities: set[tuple[str, str]] = set()
         self.active_modifier_id = ""
         self.active_tone_mask_id = ""
         self._mask_gradient_drag = None
@@ -1512,6 +1534,7 @@ class _CanvasLogic(ViewFeatures, MaskSelectionFeatures, MaskGradientFeatures, Ti
         self, chapter: ChapterDocument, tiles: TileStore,
         images: ImageStore | None = None, reset_view: bool = True,
     ) -> None:
+        self._solo_entities = set()
         self._cancel_mask_selection()
         self._mask_gradient_drag = None
         self.active_tone_mask_id = self.preview_tone_mask_id = ""
@@ -1622,6 +1645,7 @@ class _CanvasLogic(ViewFeatures, MaskSelectionFeatures, MaskGradientFeatures, Ti
             blur_pyramid_cache=self._blur_pyramid_cache,
             drawing_selection=drawing_selection,
             modifier_selection=dict(self._modifier_selection),
+            solo_entities=self.solo_entities,
         )
 
     def _capture_drawing_selection_state(self) -> _DrawingSelectionSessionState:
@@ -1706,6 +1730,7 @@ class _CanvasLogic(ViewFeatures, MaskSelectionFeatures, MaskGradientFeatures, Ti
         )
         self.selected_object_id = state.selected_object_id
         self.selected_entities = list(state.selected_entities)
+        self._solo_entities = set(state.solo_entities)
         self._modifier_selection = dict(state.modifier_selection)
         self._restore_modifier_selection()
         self._restore_drawing_selection_state(state.drawing_selection)
@@ -1741,6 +1766,7 @@ class _CanvasLogic(ViewFeatures, MaskSelectionFeatures, MaskGradientFeatures, Ti
         self.toolChanged.emit(self.tool)
 
     def clear_document(self) -> None:
+        self._solo_entities = set()
         self._outline_cache.clear()
         if self._page_gap_draft is not None:
             self.cancel_page_gap_transaction()
@@ -2501,7 +2527,7 @@ class _CanvasLogic(ViewFeatures, MaskSelectionFeatures, MaskGradientFeatures, Ti
         ), already_done=True)
 
     def set_tool(self, tool: ToolKind) -> bool:
-        if tool == ToolKind.MASK_SELECT and not self.active_tone_mask_id:
+        if tool in {ToolKind.MASK_SELECT, ToolKind.MASK_WAND} and not self.active_tone_mask_id:
             return False
         if tool != self.tool:
             self._cancel_mask_selection()
@@ -4168,6 +4194,7 @@ class _CanvasLogic(ViewFeatures, MaskSelectionFeatures, MaskGradientFeatures, Ti
         if (
             not isinstance(obj, (RasterObject, VectorDrawingObject, ImageObject))
             or not obj.visible
+            or not self._solo_content_visible("object", obj.object_id)
         ):
             return
         ancestors = self.chapter.ancestor_layers(obj.parent_layer_id)
@@ -4287,21 +4314,22 @@ class _CanvasLogic(ViewFeatures, MaskSelectionFeatures, MaskGradientFeatures, Ti
                     scale, 0.0, 0.0, scale,
                     -bounds.left() * scale, -bounds.top() * scale,
                 ))
-                if kind == "layer":
-                    self._render_layer(
-                        painter, document.layers[entity_id], 1.0, bounds
-                    )
-                else:
-                    obj = document.objects[entity_id]
-                    parent_transform = self.layer_world_transform(
-                        obj.parent_layer_id
-                    )
-                    inverse, valid = parent_transform.inverted()
-                    painter.setTransform(parent_transform, True)
-                    self._render_object(
-                        painter, obj, 1.0,
-                        inverse.mapRect(bounds) if valid else bounds,
-                    )
+                with self.without_solo():
+                    if kind == "layer":
+                        self._render_layer(
+                            painter, document.layers[entity_id], 1.0, bounds
+                        )
+                    else:
+                        obj = document.objects[entity_id]
+                        parent_transform = self.layer_world_transform(
+                            obj.parent_layer_id
+                        )
+                        inverse, valid = parent_transform.inverted()
+                        painter.setTransform(parent_transform, True)
+                        self._render_object(
+                            painter, obj, 1.0,
+                            inverse.mapRect(bounds) if valid else bounds,
+                        )
             finally:
                 if painter.isActive():
                     painter.end()
@@ -4387,6 +4415,8 @@ class _CanvasLogic(ViewFeatures, MaskSelectionFeatures, MaskGradientFeatures, Ti
         self, painter: QPainter, layer: LayerNode, parent_opacity: float,
         visible_world: QRectF,
     ) -> None:
+        if not self._solo_branch_visible(layer.layer_id):
+            return
         if layer.mask_only and not self._mask_only_render_visible("layer", layer.layer_id):
             return
         if not layer.visible or (
@@ -4446,9 +4476,10 @@ class _CanvasLogic(ViewFeatures, MaskSelectionFeatures, MaskGradientFeatures, Ti
                 cache=self._outline_cache,
                 tolerance=self._outline_tolerance(painter, QRectF(*layer.bound.bbox())),
             )
-            painter.fillPath(
-                core, QColor(style.primary_color or "#111111"),
-            )
+            if self._solo_content_visible("layer", layer.layer_id):
+                painter.fillPath(
+                    core, QColor(style.primary_color or "#111111"),
+                )
             clip_path = self.open_shape_mesh(
                 layer.bound, style.base_thickness,
                 style.outline_thickness * 2,
@@ -4472,7 +4503,7 @@ class _CanvasLogic(ViewFeatures, MaskSelectionFeatures, MaskGradientFeatures, Ti
                         opacity, local_visible,
                     )
             painter.restore()
-            if style.outline_thickness > 0:
+            if style.outline_thickness > 0 and self._solo_content_visible("layer", layer.layer_id):
                 ring = outline_mesh(
                     layer.bound, style.outline_thickness, clip_path,
                     core=core, base_width=style.base_thickness,
@@ -4498,7 +4529,7 @@ class _CanvasLogic(ViewFeatures, MaskSelectionFeatures, MaskGradientFeatures, Ti
             return
         layer_path = self._layer_operand_path(layer)
         opacity = parent_opacity * layer_opacity
-        if layer.fill_color:
+        if layer.fill_color and self._solo_content_visible("layer", layer.layer_id):
             painter.save()
             painter.setOpacity(opacity)
             painter.setClipPath(layer_path, Qt.IntersectClip)
@@ -4518,7 +4549,8 @@ class _CanvasLogic(ViewFeatures, MaskSelectionFeatures, MaskGradientFeatures, Ti
                     painter, self.chapter.objects[child.entity_id], opacity,
                     local_visible,
                 )
-        if layer.border_width > 0 and getattr(self, "_stroke_hide_border_id", None) != layer.layer_id:
+        if (layer.border_width > 0 and self._solo_content_visible("layer", layer.layer_id)
+                and getattr(self, "_stroke_hide_border_id", None) != layer.layer_id):
             painter.save()
             painter.setOpacity(opacity)
             painter.setClipPath(layer_path, Qt.IntersectClip)
@@ -4804,7 +4836,7 @@ class _CanvasLogic(ViewFeatures, MaskSelectionFeatures, MaskGradientFeatures, Ti
         local_visible = inverse.mapRect(visible_world) if valid else visible_world
         painter.save()
         painter.setClipPath(layer_path, Qt.IntersectClip)
-        if layer.fill_color:
+        if layer.fill_color and self._solo_content_visible("layer", layer.layer_id):
             painter.save()
             painter.setOpacity(opacity)
             painter.fillPath(layer_path, QColor(layer.fill_color))
@@ -4831,7 +4863,7 @@ class _CanvasLogic(ViewFeatures, MaskSelectionFeatures, MaskGradientFeatures, Ti
             painter, layer.layer_id, opacity, visible_world
         )
         painter.restore()
-        if layer.border_width > 0:
+        if layer.border_width > 0 and self._solo_content_visible("layer", layer.layer_id):
             painter.save()
             painter.setOpacity(opacity)
             pen = QPen(
@@ -4863,7 +4895,7 @@ class _CanvasLogic(ViewFeatures, MaskSelectionFeatures, MaskGradientFeatures, Ti
         self, painter: QPainter, layer: LayerNode, parent_opacity: float,
         visible_world: QRectF,
     ) -> None:
-        if not layer.visible:
+        if not layer.visible or not self._solo_branch_visible(layer.layer_id):
             return
         if ("layer", layer.layer_id) not in self._render_modifier_sources and any(isinstance(modifier, (MirrorModifier, ArrayModifier, RadialBlurModifier, CageTransformModifier, HalftoneModifier, PixelateModifier)) for modifier in self._active_modifier_instances(layer.modifier_ids)):
             self._render_mirror_target(painter, layer, parent_opacity, visible_world)
@@ -7211,6 +7243,8 @@ class _CanvasLogic(ViewFeatures, MaskSelectionFeatures, MaskGradientFeatures, Ti
         self, painter: QPainter, obj: DocumentObject, parent_opacity: float,
         local_visible: QRectF,
     ) -> None:
+        if not self._solo_content_visible("object", obj.object_id):
+            return
         if self._render_exclude_text and isinstance(obj, TextObject):
             return
         if obj.object_id == self._render_excluded_object_id:
@@ -7770,6 +7804,10 @@ class _CanvasLogic(ViewFeatures, MaskSelectionFeatures, MaskGradientFeatures, Ti
             preview = (*preview, ("excluded-object", self._render_excluded_object_id))
         if layer.mask_only:
             preview = (*preview, ("mask-only-visible", self._mask_only_render_visible("layer", layer_id)))
+        if self._solo_signature():
+            # Source caches consume this preview portion independently of the
+            # owner's modifier parameters, including mirror and blur captures.
+            preview = (*preview, ("solo", self._solo_signature()))
         return (
             json.dumps(
                 layer.to_dict(), sort_keys=True, separators=(",", ":")
@@ -8488,7 +8526,7 @@ class _CanvasLogic(ViewFeatures, MaskSelectionFeatures, MaskGradientFeatures, Ti
 
     def _draw_selected_text_edit_overlay(self, painter: QPainter, obj: TextObject) -> None:
         """Keep caret/selection live without invalidating cached outlined glyphs."""
-        if not obj.visible:
+        if not obj.visible or not self._solo_content_visible("object", obj.object_id):
             return
         painter.save()
         try:
@@ -8636,7 +8674,8 @@ class _CanvasLogic(ViewFeatures, MaskSelectionFeatures, MaskGradientFeatures, Ti
         if self.chapter is None or self.selected_kind != "object":
             return
         obj = self.chapter.objects.get(self.selected_id)
-        if not isinstance(obj, RasterObject):
+        if (not isinstance(obj, RasterObject)
+                or not self._solo_content_visible("object", obj.object_id)):
             return
         painter.save()
         for layer in self.chapter.ancestor_layers(obj.parent_layer_id):
@@ -8655,6 +8694,9 @@ class _CanvasLogic(ViewFeatures, MaskSelectionFeatures, MaskGradientFeatures, Ti
         painter.restore()
 
     def _draw_live_vector_gesture(self, painter: QPainter) -> None:
+        drawing = self._active_vector_drawing()
+        if drawing is not None and not self._solo_content_visible("object", drawing.object_id):
+            return
         if (
             self._vector_gesture_mode == "simplify"
             and self._vector_sweep
@@ -8818,6 +8860,7 @@ class _CanvasLogic(ViewFeatures, MaskSelectionFeatures, MaskGradientFeatures, Ti
         if (
             drawing is None or self._vector_gesture_mode != "pencil"
             or not self._vector_samples
+            or not self._solo_content_visible("object", drawing.object_id)
         ):
             return
         if coordinate_parent_id != drawing.parent_layer_id:
@@ -8901,6 +8944,8 @@ class _CanvasLogic(ViewFeatures, MaskSelectionFeatures, MaskGradientFeatures, Ti
     def _draw_selection(self, painter: QPainter) -> None:
         if self._active_cage() is not None:
             return
+        if self.selected_id and not self._solo_content_visible(self.selected_kind, self.selected_id):
+            return
         if self.tool in {
             ToolKind.DRAW_SELECT_RECT,
             ToolKind.DRAW_SELECT_LASSO,
@@ -8927,6 +8972,7 @@ class _CanvasLogic(ViewFeatures, MaskSelectionFeatures, MaskGradientFeatures, Ti
                 rect = self.object_world_rect(object_id)
                 if (
                     isinstance(obj, TextObject) and obj.visible and rect is not None
+                    and self._solo_content_visible("object", object_id)
                     and rect.intersects(visible)
                 ):
                     painter.drawPolygon(QPolygonF([
@@ -9005,7 +9051,7 @@ class _CanvasLogic(ViewFeatures, MaskSelectionFeatures, MaskGradientFeatures, Ti
                     1.3 / max(self.scale, 0.05), Qt.PenStyle.DotLine,
                 ))
                 for kind, entity_id in self.selected_entities:
-                    if kind != "object":
+                    if kind != "object" or not self._solo_content_visible(kind, entity_id):
                         continue
                     local_preview = self._multi_transform_preview_quads.get(
                         entity_id
@@ -11790,7 +11836,7 @@ class _CanvasLogic(ViewFeatures, MaskSelectionFeatures, MaskGradientFeatures, Ti
     def _object_hit_contains(
         self, obj: DocumentObject, point: QPointF,
     ) -> bool:
-        if not obj.visible:
+        if not obj.visible or not self._solo_content_visible("object", obj.object_id):
             return False
         if isinstance(obj, TextObject) and not obj.opacity_locked and obj.opacity <= 0:
             return False
@@ -11891,6 +11937,7 @@ class _CanvasLogic(ViewFeatures, MaskSelectionFeatures, MaskGradientFeatures, Ti
         layer = self.chapter.layers[layer_id]
         if (
             not layer.visible or layer.bound is None
+            or not self._solo_content_visible("layer", layer_id)
             or (layer.is_page and not include_pages)
             or (
                 not raw
@@ -12813,6 +12860,7 @@ class _CanvasLogic(ViewFeatures, MaskSelectionFeatures, MaskGradientFeatures, Ti
             if (
                 self.tool in {
                     ToolKind.MASK_SELECT,
+                    ToolKind.MASK_WAND,
                     ToolKind.SHAPE_EDIT,
                     ToolKind.VECTOR_EDIT,
                     ToolKind.DRAW_SELECT_RECT,
@@ -12838,8 +12886,13 @@ class _CanvasLogic(ViewFeatures, MaskSelectionFeatures, MaskGradientFeatures, Ti
             return
         point = QPointF(widget_point)
         world = self.widget_to_document(point)
-        if self.active_tone_mask_id and self.tool == ToolKind.MASK_SELECT:
+        if self.active_tone_mask_id and self.tool in {ToolKind.MASK_SELECT, ToolKind.MASK_WAND}:
             self.setCursor(Qt.CrossCursor)
+            self.setToolTip(
+                "Click to add a color region; Control-click to remove"
+                if self.tool == ToolKind.MASK_WAND else
+                "Lasso to add an area; hold Control to remove"
+            )
             return
         if self.active_tone_mask_id and self.tool == ToolKind.GRADIENT:
             self._mask_gradient_hover(world)
@@ -13059,7 +13112,7 @@ class _CanvasLogic(ViewFeatures, MaskSelectionFeatures, MaskGradientFeatures, Ti
         if self.export_rect_editing:
             event.accept()
             return
-        if self.active_tone_mask_id and self.tool in {ToolKind.GRADIENT, ToolKind.MASK_SELECT}:
+        if self.active_tone_mask_id and self.tool in {ToolKind.GRADIENT, ToolKind.MASK_SELECT, ToolKind.MASK_WAND}:
             event.accept()
             return
         if self._reset_outline_width_at(event.position()):
@@ -19408,6 +19461,9 @@ class _CanvasLogic(ViewFeatures, MaskSelectionFeatures, MaskGradientFeatures, Ti
         point = self.widget_to_document(widget_point)
         self._press_widget_point = QPointF(widget_point)
         self._press_document_point = QPointF(point)
+        if self.active_tone_mask_id and self.tool == ToolKind.MASK_WAND:
+            self._mask_wand_press(point, modifiers)
+            return
         if self.active_tone_mask_id and self.tool == ToolKind.MASK_SELECT:
             self._begin_mask_selection(point, modifiers)
             return
@@ -19883,6 +19939,8 @@ class _CanvasLogic(ViewFeatures, MaskSelectionFeatures, MaskGradientFeatures, Ti
             self._clear_detached_input_state()
             return
         point = self.widget_to_document(widget_point)
+        if self.active_tone_mask_id and self.tool == ToolKind.MASK_WAND:
+            return
         if self.active_tone_mask_id and self.tool == ToolKind.MASK_SELECT:
             self._move_mask_selection(point)
             return
@@ -20174,6 +20232,8 @@ class _CanvasLogic(ViewFeatures, MaskSelectionFeatures, MaskGradientFeatures, Ti
             self._update_shape_hover(point)
 
     def _tool_release(self) -> None:
+        if self.active_tone_mask_id and self.tool == ToolKind.MASK_WAND:
+            return
         if self._finish_mask_selection():
             return
         if self._finish_mask_gradient():
@@ -23527,6 +23587,7 @@ class _CanvasLogic(ViewFeatures, MaskSelectionFeatures, MaskGradientFeatures, Ti
         if (
             not isinstance(obj, TextObject)
             or not obj.visible
+            or not self._solo_content_visible("object", obj.object_id)
             or self._text_transform_cache.isNull()
             or self._transform_preview_quad is None
         ):
@@ -23670,11 +23731,13 @@ class _CanvasLogic(ViewFeatures, MaskSelectionFeatures, MaskGradientFeatures, Ti
         overlay = self._text_gizmo_overlay
         obj = self._selected_text_for_gizmos()
         quad = self._selected_world_quad() if obj is not None else None
-        if obj is None or not quad:
+        if (obj is None or not quad
+                or not self._solo_content_visible("object", obj.object_id)):
             overlay.hide()
             return
         if not overlay.size.hasFocus():
             overlay.set_state(round(obj.font_size), obj.bold, obj.italic)
+        overlay.set_color(self._text_gizmo_color(obj))
         overlay.adjustSize()
         bounds = self.camera_transform().map(
             QPolygonF([QPointF(*point) for point in quad])

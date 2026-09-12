@@ -425,6 +425,7 @@ class MainWindow(QMainWindow):
             labels.append((fill_tool, "Fill", "fill-color"))
         labels.append((ToolKind.GRADIENT, "Gradient", "contrast-circle"))
         labels.append((ToolKind.MASK_SELECT, "Select", "agile"))
+        labels.append((ToolKind.MASK_WAND, "Magic Wand", "magic-wand"))
         labels.extend([
             (ToolKind.TEXT_EDIT, "Text Edit", "text"),
             (ToolKind.TRANSFORM, "Transform", "frame-tool"),
@@ -826,9 +827,13 @@ class MainWindow(QMainWindow):
         self.modifier_controls.targetLayerPickChanged.connect(
             lambda targets: self._finish_mask_mode(True) if targets is not None else None
         )
-        from comic_editor.ui.tree_model import EyeVisibilityDelegate, MaskOnlyRowDelegate
+        from comic_editor.ui.tree_model import EyeVisibilityDelegate, MaskOnlyRowDelegate, SoloRowDelegate
         self.tree.setItemDelegateForColumn(0, EyeVisibilityDelegate(self.tree))
+        self.tree.setItemDelegateForColumn(1, SoloRowDelegate(self.tree))
         self.tree.setItemDelegateForColumn(2, MaskOnlyRowDelegate(self.tree))
+        self.canvas.soloChanged.connect(self.hierarchy_model.set_solo_entities)
+        self.canvas.selectionChanged.connect(self.hierarchy_model.set_current_entity)
+        self.hierarchy_model.soloToggleRequested.connect(self.canvas.toggle_solo)
         self.tree.viewport().installEventFilter(self)
         self.tree.setContextMenuPolicy(Qt.CustomContextMenu)
         self._tablet_outliner_press: dict | None = None
@@ -1971,9 +1976,62 @@ class MainWindow(QMainWindow):
             )
         )
 
+    def _handle_solo_star_event(self, watched, event) -> bool:
+        """Handle stars before row selection, pen forwarding, or mask picking."""
+        event_type = event.type()
+        mouse = event_type in {QEvent.MouseButtonPress, QEvent.MouseButtonRelease}
+        tablet = event_type in {QEvent.TabletPress, QEvent.TabletRelease}
+        if not (mouse or tablet):
+            return False
+        if mouse and (watched is not self.tree.viewport() or event.button() != Qt.LeftButton):
+            if event_type == QEvent.MouseButtonRelease and event.button() == Qt.LeftButton:
+                self._solo_star_press = None
+            return False
+        viewport = self.tree.viewport()
+        point = (viewport.mapFromGlobal(event.globalPosition().toPoint()) if tablet
+                 else event.position().toPoint())
+        released = event_type in {QEvent.MouseButtonRelease, QEvent.TabletRelease}
+        if released:
+            pressed = getattr(self, "_solo_star_press", None)
+            if pressed is None:
+                return False
+            self._solo_star_press = None
+            if tablet:
+                self._tablet_outliner_contact = False
+                self._tablet_outliner_suppress_mouse_until = time.monotonic() + 0.15
+            index = self.hierarchy_model.index_for_entity(*pressed)
+            from comic_editor.ui.tree_model import EyeVisibilityDelegate
+            if (index.isValid()
+                    and EyeVisibilityDelegate.star_rect(self.tree.visualRect(index)).contains(point)):
+                entries = self.canvas.solo_entities
+                entries.discard(pressed)
+                self.canvas.set_solo_entities(entries)
+            event.accept()
+            return True
+        index = self.tree.indexAt(point)
+        if not index.isValid() or index.column() != 0:
+            return False
+        from comic_editor.ui.tree_model import EyeVisibilityDelegate
+        item = self.hierarchy_model.item_for_index(index)
+        key = (item.kind, item.entity_id)
+        if (key not in self.canvas.solo_entities
+                or not EyeVisibilityDelegate.star_rect(self.tree.visualRect(index)).contains(point)):
+            return False
+        self._solo_star_press = key
+        if tablet:
+            self._tablet_outliner_contact = True
+            self._tablet_outliner_suppress_mouse_until = time.monotonic() + 0.2
+        event.accept()
+        return True
+
     def eventFilter(self, watched, event) -> bool:  # noqa: N802
+        if (event.type() == QEvent.ApplicationDeactivate
+                or (event.type() == QEvent.KeyPress and event.key() == Qt.Key_Escape)):
+            self._solo_star_press = None
         if self._suppress_outliner_compat_mouse(watched, event):
             event.accept()
+            return True
+        if self._handle_solo_star_event(watched, event):
             return True
         if (event.type() == QEvent.MouseButtonRelease and event.button() == Qt.LeftButton
                 and getattr(self, "_target_layer_pick_mouse_press", False)):
@@ -3237,7 +3295,7 @@ class MainWindow(QMainWindow):
     def _activate_tool(self, tool: ToolKind) -> bool:
         if self.canvas.active_tone_mask_id and tool in {
             ToolKind.GRADIENT, ToolKind.RASTER_PENCIL, ToolKind.RASTER_ERASER,
-            ToolKind.MASK_SELECT,
+            ToolKind.MASK_SELECT, ToolKind.MASK_WAND,
         }:
             changed = self.canvas.set_tool(tool)
             self._sync_tool_buttons()
@@ -3372,7 +3430,7 @@ class MainWindow(QMainWindow):
                 available = tool in {
                     ToolKind.GRADIENT, ToolKind.RASTER_PENCIL,
                     ToolKind.RASTER_ERASER, ToolKind.EYEDROPPER,
-                    ToolKind.MASK_SELECT,
+                    ToolKind.MASK_SELECT, ToolKind.MASK_WAND,
                 }
                 button.setVisible(available)
                 button.setEnabled(available)
@@ -3409,6 +3467,7 @@ class MainWindow(QMainWindow):
             button.setVisible(True)
             button.setEnabled(self.chapter is not None)
         self.tool_buttons[ToolKind.MASK_SELECT].hide()
+        self.tool_buttons[ToolKind.MASK_WAND].hide()
         raster_selected = isinstance(selected_object, RasterObject)
         vector_selected = isinstance(
             selected_object, VectorDrawingObject
@@ -5350,6 +5409,8 @@ class MainWindow(QMainWindow):
         if self.chapter is not self.canvas.chapter:
             self.chapter = self.canvas.chapter
         self._refresh_hierarchy()
+        self.hierarchy_model.set_solo_entities(self.canvas.solo_entities)
+        self.hierarchy_model.set_current_entity(self.canvas.selected_kind, self.canvas.selected_id)
         self.selection_common.refresh()
         self.selection_settings.refresh()
         self._refresh_masks_panel()

@@ -53,6 +53,17 @@ class SelectionCommonControls(QWidget):
         self.opacity_lock.setAutoRaise(True)
         self.opacity_lock.setFixedSize(30, 28)
         self.opacity_lock.setAccessibleName("Lock opacity")
+        self.solo_button = QToolButton(self)
+        self.solo_button.setText("S")
+        self.solo_button.setCheckable(True)
+        self.solo_button.setAutoRaise(True)
+        self.solo_button.setFixedSize(30, 28)
+        self.solo_button.setObjectName("soloSelectionButton")
+        self.solo_button.setAccessibleName("Solo")
+        self.solo_button.setToolTip("Solo selected object or layer")
+        self.solo_button.setStyleSheet(
+            "QToolButton:checked { background: #b89527; color: #181818; }"
+        )
         self.opacity = QSlider(Qt.Orientation.Horizontal, self)
         self.opacity.setRange(0, 100)
         self.opacity_mask_button = MaskButton(self)
@@ -72,6 +83,7 @@ class SelectionCommonControls(QWidget):
         layout.addWidget(self.trash_button)
         layout.addWidget(self.visible_button)
         layout.addWidget(self.opacity_lock)
+        layout.addWidget(self.solo_button)
         layout.addWidget(QLabel("Opacity", self))
         layout.addWidget(self.opacity_mask_button)
         layout.addWidget(self.opacity, 1)
@@ -81,6 +93,8 @@ class SelectionCommonControls(QWidget):
         self.trash_button.clicked.connect(self._delete_selected)
         self.visible_button.toggled.connect(self._visibility_changed)
         self.opacity_lock.toggled.connect(self._opacity_lock_changed)
+        self.solo_button.clicked.connect(self._solo_clicked)
+        self.canvas.soloChanged.connect(lambda _entries: self.refresh())
         self.mask_only_button.toggled.connect(self._mask_only_changed)
         self.opacity.sliderPressed.connect(self._begin_opacity_drag)
         self.opacity.valueChanged.connect(self._opacity_changed)
@@ -114,6 +128,11 @@ class SelectionCommonControls(QWidget):
         if self.canvas.selected_kind == "object":
             return chapter.objects.get(self.canvas.selected_id)
         return None
+
+    def _solo_clicked(self) -> None:
+        if self._selected() is not None:
+            self.canvas.toggle_solo(self.canvas.selected_kind, self.canvas.selected_id)
+
 
     def _commit_text(self, target) -> None:
         if isinstance(target, TextObject):
@@ -152,6 +171,13 @@ class SelectionCommonControls(QWidget):
             self.trash_button.setEnabled(not is_page)
             self.trash_button.setToolTip("Delete selected")
         self.visible.setEnabled(enabled)
+        solo = (self.canvas.selected_kind, self.canvas.selected_id) in self.canvas.solo_entities
+        self.solo_button.setEnabled(enabled)
+        self.solo_button.setChecked(solo)
+        self.solo_button.setToolTip(
+            "Remove selected object or layer from solo" if solo
+            else "Solo selected object or layer"
+        )
         object_target = (
             enabled
             and self.canvas.selected_kind == "object"

@@ -2,12 +2,13 @@ from __future__ import annotations
 
 import numpy as np
 import pytest
-from PySide6.QtCore import QCoreApplication, QEvent, QPointF, QRectF, Qt
-from PySide6.QtGui import QGuiApplication, QPointingDevice, QTabletEvent, QTransform
+from PySide6.QtCore import QCoreApplication, QEvent, QPoint, QPointF, QRectF, Qt
+from PySide6.QtGui import QFont, QGuiApplication, QPointingDevice, QTabletEvent, QTransform
 from PySide6.QtTest import QTest
+from PySide6.QtWidgets import QLabel
 
 from comic_editor.core.models import (
-    BoundGeometry, ChapterDocument, SeriesDocument, ToneMask,
+    BoundGeometry, ChapterDocument, SeriesDocument, ShapeStyle, ToneMask,
 )
 from comic_editor.core.persistence import SeriesRepository
 from comic_editor.core.settings import EditorSettings
@@ -156,9 +157,61 @@ def test_select_button_and_context_are_only_available_in_mask_mode(qapp):
         assert window.canvas.tool == ToolKind.MASK_SELECT
         assert window.tool_settings_controls.context_label.text() == "Mask Select"
         assert window.tool_settings_controls.stack.currentWidget() is window.tool_settings_controls.mask_select_page
+        wand = window.tool_buttons[ToolKind.MASK_WAND]
+        assert not wand.isHidden()
+        wand.click()
+        assert window.canvas.tool == ToolKind.MASK_WAND
+        controls = window.tool_settings_controls
+        assert controls.context_label.text() == "Magic Wand"
+        assert controls.stack.currentWidget() is controls.mask_wand_page
+        controls.mask_wand_tolerance.setValue(42)
+        assert controls.mask_wand_tolerance_slider.value() == 42
+        assert window.canvas.settings.mask_wand_tolerance == 42
         window._finish_mask_mode(True)
         assert button.isHidden()
+        assert wand.isHidden()
+        assert not window.canvas.set_tool(ToolKind.MASK_WAND)
         assert window.tool_buttons[ToolKind.OBJECT_SELECT].isEnabled()
+    finally:
+        window._dirty = False
+        window.close()
+        window.deleteLater()
+
+
+def test_wand_settings_fit_narrow_sidebar(qapp, text_outline_font_family):
+    window = MainWindow()
+    window.setFont(QFont(text_outline_font_family, 9))
+    window.resize(1400, 960)
+    chapter = ChapterDocument(height=600)
+    page = chapter.add_page()
+    mask = ToneMask(saved=True)
+    chapter.masks[mask.mask_id] = mask
+    window.series = SeriesDocument()
+    window._set_chapter(chapter, TileStore())
+    window.canvas.set_selection("layer", page.layer_id)
+    window.show()
+    window.workspace_splitter.setSizes([230, 1170])
+    window._enter_mask_mode(mask.mask_id)
+    window.tool_buttons[ToolKind.MASK_WAND].click()
+    try:
+        # Nested scroll/ribbon layouts settle through posted layout requests.
+        for _ in range(6):
+            qapp.processEvents()
+        viewport = window.tool_settings_page.viewport()
+        controls = window.tool_settings_controls
+        assert viewport.width() <= 200
+        widgets = [
+            controls.mask_wand_tolerance, controls.mask_wand_tolerance_slider,
+            *controls.mask_wand_page.findChildren(QLabel),
+        ]
+        for widget in widgets:
+            left = widget.mapTo(viewport, QPoint()).x()
+            assert 0 <= left
+            assert left + widget.width() <= viewport.width()
+            if isinstance(widget, QLabel) and widget.wordWrap():
+                assert widget.height() >= widget.heightForWidth(widget.width())
+        assert controls.mask_wand_tolerance_slider.y() > controls.mask_wand_tolerance.y()
+        assert window.tool_settings_page.horizontalScrollBar().maximum() == 0
     finally:
         window._dirty = False
         window.close()
@@ -211,3 +264,125 @@ def test_mask_pencil_can_add_back_after_control_lasso(canvas):
     canvas._tool_release()
     assert _field(canvas)[100, 100] > .9
     assert _field(canvas)[175, 175] == 0
+
+
+def _wand_artwork(canvas):
+    page = canvas.chapter.root_page_ids[0]
+    layers = []
+    for name, rect, color in (
+        ("Dark", (200, 50, 100, 100), "#202020"),
+        ("Similar", (300, 50, 100, 100), "#303030"),
+        ("Disconnected", (200, 250, 100, 100), "#202020"),
+    ):
+        layers.append(canvas.chapter.add_layer(
+            page, name, BoundGeometry.rectangle(*rect),
+            style=ShapeStyle(primary_color=color, outline_thickness=0),
+        ))
+    canvas._invalidate_scene_cache()
+    return layers
+
+
+def _wand_click(canvas, point, modifiers=Qt.NoModifier):
+    assert canvas.set_tool(ToolKind.MASK_WAND)
+    QTest.mouseClick(
+        canvas, Qt.LeftButton, modifiers,
+        canvas.document_to_widget(QPointF(*point)).toPoint(),
+    )
+
+
+def test_wand_tolerance_connectivity_and_undo_across_tiles(canvas):
+    _wand_artwork(canvas)
+    canvas.settings.mask_wand_tolerance = 0
+    _wand_click(canvas, (220, 100))
+    assert _field(canvas)[100, [220, 280, 350, 450]] == pytest.approx([1, 1, 0, 0])
+    assert _field(canvas)[300, 250] == 0
+    assert len(canvas.command_stack._undo) == 1
+    canvas.command_stack.undo()
+    assert not _field(canvas).any()
+    canvas.settings.mask_wand_tolerance = 16
+    _wand_click(canvas, (220, 100))
+    assert _field(canvas)[100, [220, 280, 350, 450]] == pytest.approx([1, 1, 1, 0])
+    assert _field(canvas)[300, 250] == 0
+    expected = _field(canvas)
+    _wand_click(canvas, (220, 100))
+    assert len(canvas.command_stack._undo) == 1  # Re-selecting is a no-op.
+    canvas.command_stack.undo()
+    assert not _field(canvas).any()
+    canvas.command_stack.redo()
+    np.testing.assert_array_equal(_field(canvas), expected)
+
+
+def test_wand_control_removes_and_shift_control_takes_priority(canvas, monkeypatch):
+    _wand_artwork(canvas)
+    _lasso(canvas, [(190, 40), (410, 40), (410, 160), (190, 160)])
+    canvas.rotation, canvas.scale = 25, .8
+    canvas.settings.mask_wand_tolerance = 0
+    _wand_click(canvas, (220, 100), Qt.ControlModifier | Qt.ShiftModifier)
+    assert _field(canvas)[100, [220, 280, 350, 405]] == pytest.approx([0, 0, 1, 1])
+    assert canvas.chapter.masks[canvas.active_tone_mask_id].paint_has_subtractions
+    assert canvas._nav_mode is None
+    assert len(canvas.command_stack._undo) == 2
+    canvas.command_stack.undo()
+    assert _field(canvas)[100, 220] == 1
+    assert not canvas.chapter.masks[canvas.active_tone_mask_id].paint_has_subtractions
+    canvas.command_stack.redo()
+    monkeypatch.setattr(QGuiApplication, "keyboardModifiers", lambda: Qt.ShiftModifier)
+    _wand_click(canvas, (220, 100), Qt.ShiftModifier)
+    assert _field(canvas)[100, 220] == 1
+    assert canvas._nav_mode is None
+
+
+def test_wand_control_cutout_preserves_gradient_and_source_artwork(canvas):
+    _wand_artwork(canvas)
+    canvas.set_tool(ToolKind.GRADIENT)
+    canvas._mask_gradient_press(QPointF(50, 300))
+    canvas._mask_gradient_move(QPointF(450, 300))
+    canvas._finish_mask_gradient()
+    gradient = canvas.active_mask_gradient().to_dict()
+    source_layers = {key: layer.to_dict() for key, layer in canvas.chapter.layers.items()}
+    _wand_click(canvas, (220, 100), Qt.ControlModifier)
+    assert _field(canvas)[100, 250] == 0
+    assert _field(canvas)[300, 250] > .4
+    assert canvas.active_mask_gradient().to_dict() == gradient
+    assert {key: layer.to_dict() for key, layer in canvas.chapter.layers.items()} == source_layers
+    assert not canvas.chapter.objects
+
+
+def test_wand_stops_at_document_bounds_and_ignores_hidden_art(canvas):
+    layers = _wand_artwork(canvas)
+    for layer in layers:
+        layer.visible = False
+    canvas.chapter.width, canvas.chapter.height = 500, 600
+    canvas.settings.mask_wand_tolerance = 255
+    _wand_click(canvas, (220, 100))
+    assert _field(canvas).all()
+    outside = canvas.render_tone_mask_field(
+        canvas.active_tone_mask_id, 550, 650, QTransform(), QRectF(0, 0, 550, 650),
+    )
+    assert not outside[600:, :].any()
+    assert not outside[:, 500:].any()
+    count = len(canvas.command_stack._undo)
+    canvas._mask_wand_press(QPointF(-1, 100), Qt.NoModifier)
+    canvas._mask_wand_press(QPointF(500, 600), Qt.ControlModifier)
+    assert len(canvas.command_stack._undo) == count
+
+
+@pytest.mark.parametrize("modifiers,expected", [(Qt.ShiftModifier, 1), (Qt.ControlModifier, 0)])
+def test_pen_wand_honors_modifiers(canvas, monkeypatch, modifiers, expected):
+    _wand_artwork(canvas)
+    _lasso(canvas, [(190, 40), (410, 40), (410, 160), (190, 160)])
+    assert canvas.set_tool(ToolKind.MASK_WAND)
+    monkeypatch.setattr(QGuiApplication, "keyboardModifiers", lambda: modifiers)
+    local = canvas.document_to_widget(QPointF(220, 100))
+    for kind in (QEvent.TabletPress, QEvent.TabletRelease):
+        release = kind == QEvent.TabletRelease
+        event = QTabletEvent(
+            kind, QPointingDevice.primaryPointingDevice(), local,
+            QPointF(canvas.mapToGlobal(local.toPoint())), 0 if release else .7,
+            0, 0, 0, 0, 0, modifiers, Qt.LeftButton,
+            Qt.NoButton if release else Qt.LeftButton,
+        )
+        QCoreApplication.sendEvent(canvas, event)
+    assert _field(canvas)[100, 250] == expected
+    assert canvas._nav_mode is None
+    assert not canvas._tablet_tool_active

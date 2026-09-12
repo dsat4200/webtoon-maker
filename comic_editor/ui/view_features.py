@@ -33,10 +33,11 @@ class ViewFeatures:
                        QImage.Format.Format_ARGB32_Premultiplied)
         if image.isNull():
             raise MemoryError("Could not allocate the export image")
-        if self.chapter.export_rect_enabled and self.chapter.export_rect is not None:
-            self.render_preview(image, source_rect=source)
-        else:
-            self.render_preview(image)
+        with self.without_solo():
+            if self.chapter.export_rect_enabled and self.chapter.export_rect is not None:
+                self.render_preview(image, source_rect=source)
+            else:
+                self.render_preview(image)
         return image
 
     def _view_settings_changed(self) -> None:
