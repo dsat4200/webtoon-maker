@@ -34,6 +34,7 @@ def default_hotkeys() -> dict[str, str]:
         "copy": "",
         "paste": "Ctrl+V",
         "paste_as_new": "",
+        "clipboard_image_history": "Ctrl+Shift+V",
         "save": "Ctrl+S",
         "undo": "Ctrl+Z",
         "redo": "Ctrl+Shift+Z",

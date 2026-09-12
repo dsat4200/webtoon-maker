@@ -58,7 +58,7 @@ def test_extension_manifest_declares_supported_blender_windows_and_io_permission
     )
     assert manifest["schema_version"] == "1.0.0"
     assert manifest["id"] == "webtoon_comic_views"
-    assert manifest["version"] == "0.6.1"
+    assert manifest["version"] == "0.8.0"
     assert manifest["blender_version_min"] == "4.5.0"
     assert manifest["platforms"] == ["windows-x64"]
     assert "network" in manifest["permissions"]
@@ -70,6 +70,8 @@ def test_extension_manifest_declares_supported_blender_windows_and_io_permission
     ("_blender_action_slots_probe.py", "WEBTOON_ACTION_SLOTS_PROBE_OK"),
     ("_blender_bake_bookkeeping_probe.py", "WEBTOON_BAKE_BOOKKEEPING_PROBE_OK"),
     ("_blender_thumbnails_probe.py", "WEBTOON_THUMBNAILS_PROBE_OK"),
+    ("_blender_textures_probe.py", "WEBTOON_TEXTURES_PROBE_OK"),
+    ("_blender_texture_materials_probe.py", "WEBTOON_TEXTURE_MATERIALS_PROBE_OK"),
 ])
 def test_blender_background_state_bridge_and_publication_probe(
     blender_executable, blender_environment, probe, marker,
@@ -90,6 +92,23 @@ def test_blender_background_state_bridge_and_publication_probe(
     output = result.stdout + "\n" + result.stderr
     assert result.returncode == 0, output
     assert marker in output
+    if probe == "_blender_textures_probe.py":
+        # Consume a real Blender-generated PNG/UV sidecar with the desktop app.
+        from comic_editor.core.external_images import prepare_image_project
+        from comic_editor.core.persistence import SeriesRepository
+
+        texture = (Path(blender_environment["WEBTOON_COMIC_VIEW_FRAME_ROOT"]).parent
+                   / "texture-probe" / "tex" / "Persisted.png")
+        repository = SeriesRepository(prepare_image_project(texture))
+        series = repository.load_series()
+        chapter, _, images = repository.load_chapter(
+            series.chapters[0].chapter_id, include_images=True,
+        )
+        guides = [obj for obj in chapter.objects.values() if obj.reference_role == "uv_map"]
+        assert len(guides) == 1
+        assert len(chapter.objects) == 2
+        guide = images.image(guides[0].object_id)
+        assert (guide.width(), guide.height()) == (48, 32)
     for line in output.splitlines():
         if line.startswith("WEBTOON_BAKE_TIMING "):
             print(f"{Path(blender_executable).parent.name}: {line}")

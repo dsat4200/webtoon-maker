@@ -688,6 +688,9 @@ def test_external_drag_normalizes_and_imports_explorer_and_browser_payloads(
     assert len(imported) == 1
     assert imported[0].source_filename == source_path.name
     assert canvas.images.source(imported[0].object_id).data == source_path.read_bytes()
+    assert imported[0].parent_layer_id == shape.layer_id
+    assert imported[0].placement_mode == "free"
+    assert canvas._rect_from_quad(imported[0].transform_quad).center() == QPointF(250, 220)
 
     encoded = base64.b64encode(_png_bytes(20, 10)).decode("ascii")
     browser = QMimeData()

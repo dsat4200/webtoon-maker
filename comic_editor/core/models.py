@@ -1931,6 +1931,7 @@ class ImageObject(DocumentObject):
     transform_frame: tuple[float, float, float, float] | None = None
     transform_quad: list[tuple[float, float]] | None = None
     source: ImageSourceDescriptor | None = None
+    reference_role: str = ""
 
     def __post_init__(self) -> None:
         if self.source is None:
@@ -1964,6 +1965,7 @@ class ImageObject(DocumentObject):
         result = self.common_dict()
         result.update({
             "source": self.source.to_dict(),
+            "reference_role": self.reference_role,
             "source_filename": self.source_filename,
             "source_mime_type": self.source_mime_type,
             "pixel_size": [self.pixel_width, self.pixel_height],
@@ -1986,6 +1988,8 @@ class TextObject(DocumentObject):
     object_type: str = "text"
     name: str = "Text"
     text: str = "Text"
+    text_color: str = "#FF111111"
+    color_runs: list[dict[str, Any]] = field(default_factory=list)
     width: float = 360.0
     height: float = 120.0
     font_family: str = "Segoe UI"
@@ -2002,6 +2006,11 @@ class TextObject(DocumentObject):
     transform_quad: list[tuple[float, float]] | None = None
     legacy_alignment: str | None = field(default=None, repr=False, compare=False)
 
+    def __post_init__(self) -> None:
+        from comic_editor.core.text_styles import normalized_color_runs
+        self.text_color = canonical_argb(self.text_color, "#FF111111")
+        self.color_runs = normalized_color_runs(self.text, self.color_runs, self.text_color)
+
     @property
     def display_name(self) -> str:
         """Short content-derived label used by UI surfaces."""
@@ -2011,6 +2020,8 @@ class TextObject(DocumentObject):
         result = self.common_dict()
         result.update({
             "text": self.text, "size": [self.width, self.height],
+            "text_color": self.text_color,
+            "color_runs": [dict(run) for run in self.color_runs],
             "font_family": self.font_family, "font_size": self.font_size,
             "bold": self.bold, "italic": self.italic, "kerning": self.kerning,
             "line_spacing": max(0.5, min(3.0, float(self.line_spacing))),
@@ -2905,6 +2916,7 @@ def object_from_dict(data: dict[str, Any]) -> ObjectEntity:
         )
         return ImageObject(
             **common,
+            reference_role="uv_map" if data.get("reference_role") == "uv_map" else "",
             source_filename=str(data.get("source_filename", "image")),
             source_mime_type=str(data.get(
                 "source_mime_type", "application/octet-stream"
@@ -2935,6 +2947,8 @@ def object_from_dict(data: dict[str, Any]) -> ObjectEntity:
             line_spacing = 1.0
         return TextObject(
             **common, text=str(data.get("text", "Text")),
+            text_color=str(data.get("text_color", "#FF111111")),
+            color_runs=data.get("color_runs", []),
             width=float(size[0]), height=float(size[1]),
             font_family=str(data.get("font_family", "Segoe UI")),
             font_size=float(data.get("font_size", 32)),
@@ -3199,6 +3213,9 @@ class ChapterDocument:
     masks: dict[str, ToneMask] = field(default_factory=dict)
     document_kind: Literal["chapter", "asset", "image"] = "chapter"
     external_image_path: str = ""
+    view_overflow: float = 0.0
+    export_rect_enabled: bool = False
+    export_rect: tuple[float, float, float, float] | None = None
     schema_version: int = SCHEMA_VERSION
     legacy_fill_migrations: list[dict[str, Any]] = field(
         default_factory=list, repr=False, compare=False
@@ -3215,6 +3232,18 @@ class ChapterDocument:
             raise ValueError(f"Chapter width must be {CHAPTER_WIDTH}")
         self.width = max(1, int(self.width))
         self.height = max(1, int(self.height))
+        self.view_overflow = float(self.view_overflow)
+        if not math.isfinite(self.view_overflow):
+            self.view_overflow = 0.0
+        self.view_overflow = min(1.0, max(0.0, self.view_overflow))
+        self.export_rect_enabled = bool(self.export_rect_enabled)
+        if self.export_rect is not None:
+            if not isinstance(self.export_rect, (tuple, list)) or len(self.export_rect) != 4:
+                raise ValueError("Export rectangle must contain x, y, width, height")
+            rect = tuple(float(value) for value in self.export_rect)
+            if not all(math.isfinite(value) for value in rect) or min(rect[2:]) < 1:
+                raise ValueError("Export rectangle must have finite coordinates and positive size")
+            self.export_rect = rect
         self.grid.validate()
         self.grid_override_enabled = bool(self.grid_override_enabled)
         for mask_id, mask in list(self.masks.items()):
@@ -4418,6 +4447,9 @@ class ChapterDocument:
             "name": self.name, "size": [self.width, self.height],
             "document_kind": self.document_kind,
             "external_image_path": self.external_image_path,
+            "view_overflow": self.view_overflow,
+            "export_rect_enabled": self.export_rect_enabled,
+            "export_rect": list(self.export_rect) if self.export_rect is not None else None,
             "background": self.background, "grid": self.grid.to_dict(),
             "grid_override_enabled": self.grid_override_enabled,
             "root_page_ids": list(self.root_page_ids),
@@ -4497,6 +4529,9 @@ class ChapterDocument:
             width=int(size[0]), height=int(size[1]),
             document_kind=str(data.get("document_kind", "chapter")),
             external_image_path=str(data.get("external_image_path", "")),
+            view_overflow=float(data.get("view_overflow", 0.0)),
+            export_rect_enabled=bool(data.get("export_rect_enabled", False)),
+            export_rect=data.get("export_rect"),
             background=(
                 "#00000000" if legacy_background
                 and data.get("document_kind", "chapter") == "chapter"

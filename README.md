@@ -65,6 +65,17 @@ state stay in place. Updating or deleting a preset leaves previously applied
 modifiers unchanged until another preset is loaded. Saving a chapter preserves
 which preset was last loaded or saved for each modifier.
 
+## Text color and spacing
+
+The on-canvas text gizmos include **Change color** immediately after Italic.
+It opens the floating color picker: select a text range to color just that
+range, or leave the selection empty to recolor the whole object. Click Apply
+to keep the color or Cancel to leave it unchanged. Colors survive typing,
+undo, saving, copying objects, and export.
+
+Drag the orange **L** handle beside **S** (size) and **K** (kerning) to change
+line spacing from 0.5× to 3×. Escape cancels a drag.
+
 ## Text outlines
 
 Select a text box or Free Text container, then choose **Modifiers → Add
@@ -202,6 +213,42 @@ python -m pip install -r requirements.txt
 python main.py
 ```
 
+## View settings, image placement, and file feedback
+
+The **View Settings** tab sits beside **Layer Settings** and **Masks**. Its
+**Overflow** slider shows artwork outside the rendered page area: 0 hides it,
+1 shows it normally, and intermediate values fade it. This is an editing aid
+and does not change the exported artwork. Tablet Navigation, Reset View, and
+Fullscreen are also in this tab.
+
+Enable **Export rect**, then choose **Edit export rect**. Drag inside the
+rectangle to move it or drag its eight handles to resize it. **Save export
+rect** leaves editing mode. The geometry and enabled state are saved with
+the chapter, and editing again starts from the last rectangle. Full-page and
+rectangle exports have separate remembered destinations.
+
+Drop images from File Explorer or a browser onto the canvas to place them
+at the cursor at their native size. Pasted images use the cursor position
+too. The selected container becomes their parent; when a leaf is selected,
+the new image becomes its sibling immediately above it. New images become
+selected. Web image downloads run in the background; sources that require
+website sign-in or prevent direct image downloads may need Copy Image or a
+local file instead.
+
+Right-click an outliner item for **Copy Object**, **Paste Object**, and **Duplicate Object**.
+Copies retain editable descendants, masks, effects, and embedded image/raster
+data and can be pasted into another chapter or project. **Ctrl+Shift+V** opens
+the scrollable **Clipboard image history**, with square previews of images,
+drawing selections, and copied objects. It pastes at the position captured
+when the popup opened. History stays in memory for the current application
+session, bounded to 30 entries and 128 MiB; oversized copies remain available
+to ordinary Paste.
+
+The title bar shows the project directory followed by its name. Successful
+manual saves and exports show a floating row at the top of the canvas, with
+the filename, directory, and a button to open that directory. The row replaces
+the previous notification, pauses its timeout while hovered, and can be dismissed.
+
 ## Use as Blender's external image editor
 
 Run `build-launcher.ps1` once after installing `requirements.txt`. It creates
@@ -246,6 +293,38 @@ them to an external editor. See the [Blender image editing manual](https://docs.
 
 ## Blender Comic Views prototype
 
+### Create textures and include UV maps
+
+In Blender's **Comic Views** N sidebar, expand **Textures**. Enter a name and
+choose Prefix, Suffix, or Full Name. Prefix and Suffix use the active object's
+name. Expand **Texture Creation Settings** for dimensions, fill, color, and
+alpha. **Save File Settings** chooses either the `tex` directory beside the
+saved `.blend`, or a custom directory selected with the folder button.
+**Create Texture** creates the directory if needed, saves the PNG directly
+there, and opens it using Blender's configured external image editor.
+Existing filenames receive a numbered suffix instead of being overwritten.
+
+Expand **Material Settings** to choose the object's material slot (slot 1 by
+default). Creating a texture applies the included comic shader to that slot,
+names the material after the texture, and connects the image. An existing
+Comic Views preset is updated in place. **Transparency**, **Color**,
+**Metallic**, and **Roughness** control the preset directly; shared materials
+are made independent so changes stay on the selected object.
+
+**Include UV Map Layer** sends the active mesh's active UV layout with the
+texture. Webtoon Maker embeds it as a separate visible UV guide, preserving
+the texture pixels. The guide is excluded from exports and chapter previews.
+For an existing texture use **Edit Texture Externally** in the sidebar or
+**Image → Edit in Webtoon Maker (with UV Map)**. Reopening refreshes changed
+UVs without duplicating the guide or replacing your painted layers. The
+small `.webtoon.json` file beside the texture carries the UV edges; once
+imported, the guide is stored inside the portable project.
+
+After exporting your painting from Webtoon Maker, click **Reload Texture**
+to refresh the saved image in Blender and every material using it.
+
+### Connecting Comic Views
+
 The Blender integration keeps the 3D scene wholly inside Blender. A linked
 Comic View is an ordinary Image Object in the editor: translation, free or
 uniform projective transforms, masks, opacity, hierarchy, and compositing all
@@ -256,7 +335,7 @@ To install and connect it:
 
 1. Install Blender 5.2 LTS on Windows (4.5 LTS is also supported).
 2. Run `blender_extension/webtoon_comic_views/build.ps1`, or use the already
-   built `blender_extension/webtoon_comic_views-0.6.1.zip`.
+   built `blender_extension/webtoon_comic_views-0.8.0.zip`.
 3. In Blender, choose **Edit → Preferences → Get Extensions → Install from
    Disk**, select the ZIP, and enable **Webtoon Comic Views**.
 4. In a 3D View, open the **Comic Views** sidebar. Create, Save, and Render views and
@@ -268,7 +347,7 @@ If something fails, click **Copy Logs** in Blender's Comic Views panel. It
 copies a token-redacted diagnostic report with extension events, render errors,
 active-view metadata, and published-file status for easy bug reports.
 
-When upgrading, save your `.blend`, install the 0.6.1 ZIP
+When upgrading, save your `.blend`, install the 0.8.0 ZIP
 using **Install from Disk**, and restart Blender and Webtoon Maker. Existing
 Comic Views, animation keys, and embedded comic images are retained. Version
 0.6.1 uses Blender's Action slots and channelbags, replacing the legacy
@@ -314,7 +393,8 @@ Navigation defaults:
 - `P`, `E`, `F`, `S`, `T`, `B`: Pencil, Eraser, Fill, Object Select,
   Transform, Shape Edit
 - `Ctrl+D`: deselect the active drawing selection
-- `Ctrl+V`: paste the newest drawing-selection buffer or clipboard image
+- `Ctrl+V`: paste the newest drawing-selection, outliner-object, or clipboard image buffer at the cursor
+- `Ctrl+Shift+V`: open **Clipboard image history**; clicking a thumbnail pastes at the cursor position captured when the hotkey was pressed
 - `Delete`: delete the selected layer or object when no field or canvas
   sub-editor owns the key
 
@@ -521,8 +601,10 @@ large angles can take appreciably longer than a frame to finish.
 **Export As…** chooses a PNG filename; **Export Again** overwrites the last
 successful destination for that chapter, remembered across restarts. Without
 a remembered destination it opens Export As. The timestamped **Export PNG**
-action remains available. All three export current content at full chapter
-size. Chapter backgrounds now default to transparent; page fills retain their
+action remains available. All three use the enabled export rectangle, or the
+full chapter when it is disabled. Rectangle exports remember their own destination;
+their first export opens the file picker even for a texture with an existing
+full-image destination. Chapter backgrounds default to transparent; page fills retain their
 own alpha. Legacy white chapter backgrounds migrate to transparent, while
 white page fills and nonwhite backgrounds remain unchanged.
 

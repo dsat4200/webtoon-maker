@@ -41,6 +41,20 @@ complete series in sibling staging storage, then publishes the image-stem folder
 Repeated launches reuse the matching project; unrelated folder or image-extension
 collisions are rejected. Existing cached sessions retain unsaved edits.
 
+View preferences `view_overflow`, `export_rect_enabled`, and `export_rect`
+(x, y, width, height in document coordinates) are optional chapter fields.
+Existing projects default to hidden overflow and full-chapter exports. Export
+rectangle geometry survives toggling, session switches, Save, and recovery;
+the interactive edit mode itself is transient. Per-user export destination
+keys append `export_rect` for cropped exports. Full-image launch registration
+must never overwrite the crop destination.
+
+Blender texture handoffs optionally add a separate embedded image whose
+`reference_role` is `uv_map`. Its source filename includes a digest of UV
+metadata and canvas size. Reopening unchanged metadata reuses the guide;
+changed UVs refresh its image bytes without replacing painted objects. Clean
+previews/exports omit these guides even while the editor shows them.
+
 
 ```mermaid
 flowchart TD
@@ -228,6 +242,15 @@ Schema-16 image records without a nested descriptor load as embedded sources. Th
 ### TextObject
 
 Adds plain text, logical width/height, font family/size, bold, italic, kerning, object-wide `line_spacing`, layout mode, horizontal/vertical alignment, margin, and an optional four-point transform quad. `line_spacing` is persisted as a 0.5–3.0 multiplier, defaults to 1.0 for legacy records, and is applied through the shared Qt text document used by rendering and editing. Its display name is derived at runtime from content.
+
+`text_color` stores the object's base ARGB color (legacy default `#FF111111`).
+`color_runs` stores sparse `{start, end, color}` overrides with exclusive ends
+and Python string indexes. Loading clamps and merges ranges; later overlapping
+entries win. Text replacement shifts surviving ranges and inherits the insertion
+color. Whole-object recoloring replaces the base and clears overrides. The
+shared Qt document applies these colors for editing, effects, and exports;
+UTF-16 positions are converted at the UI boundary. Chapter saves, assets, and
+undo snapshots retain these additive fields.
 
 Legacy text alignment is migrated into an explicit free transform quad. Invalid alignment/layout values are corrected or rejected during load/validation.
 

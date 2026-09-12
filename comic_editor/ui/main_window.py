@@ -48,7 +48,7 @@ from comic_editor.core.commands import CallbackCommand, CommandStack
 from comic_editor.core.settings import load_settings, save_settings
 from comic_editor.core.tiles import TileStore
 from comic_editor.core.images import ImageStore
-from comic_editor.core.external_images import EXPORT_FORMATS, prepare_image_project
+from comic_editor.core.external_images import EXPORT_FORMATS, import_uv_overlay, prepare_image_project
 from comic_editor.ui.canvas import (
     DrawingSelectionClipboard, ToolKind, create_canvas,
 )
@@ -61,6 +61,10 @@ from comic_editor.ui.selection_settings import (
 )
 from comic_editor.ui.icons import iconoir
 from comic_editor.ui.hotkeys_dialog import HotkeysDialog
+from comic_editor.ui.clipboard_history import (
+    ClipboardImageHistory, ClipboardHistoryPopup, ExternalClipboardReader, capture_object,
+    cursor_world, drawing_at, paste_object,
+)
 from comic_editor.ui.settings_dialog import SettingsDialog
 from comic_editor.ui.hotkeys import (
     MODIFIER_LABELS, chord_keys, chord_text,
@@ -71,6 +75,7 @@ from comic_editor.ui.gradient_tools import (
 from comic_editor.ui.pencil_settings_dialog import PencilSettingsDialog
 from comic_editor.ui.preview import ChapterPreview
 from comic_editor.ui.ribbon import RibbonWidget, VerticalTabWidget
+from comic_editor.ui.view_settings import ViewSettingsPanel
 from comic_editor.ui.tool_ribbon_pages import (
     TextObjectControls, ToolSettingsControls, VectorToolsControls,
 )
@@ -81,6 +86,7 @@ from comic_editor.ui.asset_library import AssetLibraryWidget
 from comic_editor.ui.autosave import AutosaveJobs, RecoveryRequest, RecoverySnapshot
 from comic_editor.ui.blender_views import BlenderViewsWidget
 from comic_editor.ui.sessions import EditorSession, ProjectContext
+from comic_editor.ui.file_notification import CanvasFileNotification
 from comic_editor.ui.windows_input import tablet_multitouch_native_result
 from comic_editor.integrations.blender_controller import (
     BlenderImageSourceController,
@@ -262,7 +268,7 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.resize(1500, 950)
-        self.setWindowTitle("Vertical Comic Editor")
+        self.setWindowTitle("Webtoon Maker")
         self.settings = load_settings()
         self.settings.active_pencil_size = self.settings.pencil_default_size
         self.settings.active_eraser_size = self.settings.eraser_default_size
@@ -284,10 +290,19 @@ class MainWindow(QMainWindow):
         self._clipboard_serial = 0
         self._drawing_clipboard_serial = 0
         self._image_clipboard_serial = 0
+        self._object_clipboard = None
+        self._object_clipboard_serial = 0
+        self.clipboard_image_history = ClipboardImageHistory()
+        self._clipboard_history_popup = None
+        self._clipboard_sources_cache = []
         self._page_gap_mode_locked = False
         self._page_gap_resume_autosave = False
         self._page_gap_mask_controls_visible = (False, False)
         self._build_ui()
+        self.canvas.imagesImported.connect(self.clipboard_image_history.add_images)
+        self._external_clipboard_reader = ExternalClipboardReader(self.canvas, self)
+        self._external_clipboard_reader.resolved.connect(self._clipboard_images_resolved)
+        self._pending_clipboard_paste = None
         QApplication.clipboard().dataChanged.connect(
             self._clipboard_data_changed
         )
@@ -324,6 +339,17 @@ class MainWindow(QMainWindow):
                 self.blender_sources.resume_for_context()
 
     # ---- UI ------------------------------------------------------------
+    def _update_project_title(self, name: str | None = None) -> None:
+        if self.repository is None:
+            self.setWindowTitle("Webtoon Maker")
+            return
+        if name is None:
+            name = self.active_session.name if self.active_session is not None else self.series.name
+        self.setWindowTitle(f"{self.repository.root} — {name} — Webtoon Maker")
+
+    def _show_file_notification(self, operation: str, destination: Path) -> None:
+        self.file_notification.show_result(operation, destination)
+
     def _build_ui(self) -> None:
         style = Path(__file__).with_name("style.qss")
         if style.is_file():
@@ -369,8 +395,6 @@ class MainWindow(QMainWindow):
         )
         self.snap_grid = QCheckBox("Snap to grid", self.file_toolbar)
         self.snap_grid.setChecked(self.settings.snap_to_grid)
-        self.file_toolbar.addWidget(self.tablet_mode)
-        self.file_toolbar.addWidget(self.reset_view_button)
         self.file_toolbar.addWidget(self.snap_grid)
         self.file_toolbar.addSeparator()
         self.chapter_combo = QComboBox()
@@ -387,7 +411,7 @@ class MainWindow(QMainWindow):
         export_button = self.file_toolbar.widgetForAction(self.export_png_toolbar_action)
         export_button.setMenu(export_menu)
         export_button.setPopupMode(QToolButton.MenuButtonPopup)
-        self.fullscreen_action = self.file_toolbar.addAction("Fullscreen")
+        self.fullscreen_action = QAction("Fullscreen", self)
 
         self.tool_toolbar = ScrollableToolPanel(self)
         self.tool_buttons: dict[ToolKind, QToolButton] = {}
@@ -684,6 +708,7 @@ class MainWindow(QMainWindow):
         canvas_layout.setContentsMargins(0, 0, 0, 0)
         canvas_layout.setSpacing(0)
         canvas_layout.addWidget(self.canvas, 1)
+        self.file_notification = CanvasFileNotification(self.canvas)
         self.navigator_panel = NavigatorPanel(
             self.canvas, self.settings.navigator_expanded, canvas_shell
         )
@@ -770,6 +795,11 @@ class MainWindow(QMainWindow):
         self.settings_tabs = VerticalTabWidget(hierarchy_panel)
         self.settings_tabs.addTab(self.settings_scroll, "Settings")
         self.settings_tabs.addTab(self.masks_panel, "Masks")
+        self.view_settings = ViewSettingsPanel(
+            self.canvas, self.tablet_mode, self.reset_view_button,
+            self.fullscreen_action, hierarchy_panel,
+        )
+        self.settings_tabs.addTab(self.view_settings, "View Settings")
         self.tree = QTreeView()
         self.tree.setSelectionMode(QTreeView.ExtendedSelection)
         self.tree.setDragDropMode(QTreeView.InternalMove)
@@ -1307,6 +1337,7 @@ class MainWindow(QMainWindow):
             "copy": self._copy_drawing_selection,
             "paste": self._paste,
             "paste_as_new": self._paste_drawing_as_new,
+            "clipboard_image_history": self._show_clipboard_image_history,
             "delete_selected": self._delete_selected,
             "clear_canvas": self._clear_canvas,
         }
@@ -1365,12 +1396,14 @@ class MainWindow(QMainWindow):
     ) -> bool:
         if self._page_gap_mode_locked:
             return True
-        if action_id in {"cut", "copy", "paste", "paste_as_new"}:
+        if action_id in {"cut", "copy", "paste", "paste_as_new", "clipboard_image_history"}:
             if self._hotkey_text_input_active():
                 return True
             if action_id == "paste" and not (
                 self._drawing_clipboard is not None
+                or self._object_clipboard is not None
                 or self._clipboard_image_sources()
+                or self._external_clipboard_reader.pending
             ):
                 return True
             if action_id == "paste_as_new" and self._drawing_clipboard is None:
@@ -2193,7 +2226,7 @@ class MainWindow(QMainWindow):
             else:
                 self.chapter_combo.setEnabled(True)
                 self._sync_chapter_combo()
-            self.setWindowTitle(f"{session.name} — Vertical Comic Editor")
+            self._update_project_title(session.name)
             self.preview.invalidate_all()
             self.selection_common.refresh()
             self.selection_settings.refresh()
@@ -2224,7 +2257,8 @@ class MainWindow(QMainWindow):
         self.asset_library.set_repository(None)
         self.chapter_combo.clear()
         self.chapter_combo.setEnabled(False)
-        self.setWindowTitle("Vertical Comic Editor")
+        self._update_project_title()
+        self.file_notification.hide()
         self._refresh_actions()
 
     def _save_editor_session(self, session: EditorSession) -> bool:
@@ -2290,6 +2324,12 @@ class MainWindow(QMainWindow):
         self.asset_library.refresh()
         self._refresh_project_tabs()
         self.statusBar().showMessage("Saved", 3000)
+        destination = (
+            session.context.assets.asset_root(session.asset_manifest.asset_id) / "asset.json"
+            if session.kind == "asset" and session.asset_manifest is not None
+            else session.context.repository.series_path
+        )
+        self._show_file_notification("saved", destination)
         self._refresh_actions()
         return True
 
@@ -2386,7 +2426,12 @@ class MainWindow(QMainWindow):
             if not self.open_series(root):
                 return False
             self.chapter.external_image_path = str(path)
-            self.settings.export_destinations[self._export_destination_key()] = str(path)
+            if import_uv_overlay(self.chapter, self.canvas.images, path):
+                self.hierarchy_model.set_chapter(self.chapter)
+                self.canvas._invalidate_scene_cache()
+                self.canvas.update()
+                self._mark_dirty(None)
+            self.settings.export_destinations[self._export_destination_key(cropped=False)] = str(path)
             save_settings(self.settings)
         except (OSError, ValueError) as error:
             QMessageBox.critical(self, "Unable to open image", str(error))
@@ -2477,7 +2522,7 @@ class MainWindow(QMainWindow):
             assets = AssetRepository(repository.root)
             self.canvas.asset_repository = assets
             self.asset_library.set_repository(assets)
-        self.setWindowTitle(f"{series.name} — Vertical Comic Editor")
+        self._update_project_title(series.name)
         self._refresh_actions()
 
     def _new_chapter(self) -> None:
@@ -3719,6 +3764,11 @@ class MainWindow(QMainWindow):
         self.canvas.set_selection(item.kind, item.entity_id, activate_default_tool=True)
         menu = QMenu(self)
         rename = menu.addAction("Rename")
+        copy_object = menu.addAction("Copy Object")
+        paste_object_action = menu.addAction("Paste Object")
+        paste_object_action.setEnabled(self._object_clipboard is not None)
+        duplicate_object = menu.addAction("Duplicate Object")
+        menu.addSeparator()
         copy_asset = menu.addAction("Copy as Asset")
         mask_only = None
         mask_only_target = self._mask_only_context_target(
@@ -3780,6 +3830,12 @@ class MainWindow(QMainWindow):
         selected = menu.exec(self.tree.viewport().mapToGlobal(point))
         if selected is rename:
             self.tree.edit(index)
+        elif selected is copy_object:
+            self._copy_outliner_object(item.kind, item.entity_id)
+        elif selected is paste_object_action:
+            self._paste_outliner_object()
+        elif selected is duplicate_object:
+            self._duplicate_outliner_object(item.kind, item.entity_id)
         elif selected is copy_asset:
             self._copy_selected_as_asset(item.kind, item.entity_id)
         elif mask_only is not None and selected is mask_only:
@@ -3982,7 +4038,7 @@ class MainWindow(QMainWindow):
         self.canvas.command_stack.changed_callback = self._command_stack_changed
         self.canvas.set_selection(manifest.root_kind, manifest.root_id)
         self.chapter_combo.setItemText(0, f"Asset: {manifest.name}")
-        self.setWindowTitle(f"{manifest.name} — Vertical Comic Editor")
+        self._update_project_title(manifest.name)
         self.preview.invalidate_all()
         self.selection_common.refresh()
         self.selection_settings.refresh()
@@ -4071,7 +4127,7 @@ class MainWindow(QMainWindow):
             and self.active_session.asset_manifest.asset_id == asset_id
         ):
             self.chapter_combo.setItemText(0, f"Asset: {renamed.name}")
-            self.setWindowTitle(f"{renamed.name} — Vertical Comic Editor")
+            self._update_project_title(renamed.name)
         self.asset_library.refresh()
         self._refresh_project_tabs()
 
@@ -4414,8 +4470,10 @@ class MainWindow(QMainWindow):
 
     def _place_import_sources(
         self, sources: list[tuple[str, str, bytes]], label: str,
+        world: QPointF | None = None,
     ) -> list[str]:
-        parent = self._selected_parent_layer(allow_page=True)
+        parent_id, insertion_index = self.canvas.image_import_target()
+        parent = self.chapter.layers.get(parent_id) if self.chapter is not None else None
         if (
             parent is None and self.chapter is not None
             and self.chapter.document_kind != "asset"
@@ -4429,8 +4487,8 @@ class MainWindow(QMainWindow):
             return []
         created = self.canvas.place_image_sources(
             sources, parent.layer_id,
-            self._selected_parent_center(parent.layer_id),
-            insertion_index=self._new_object_insertion_index(parent.layer_id),
+            world if world is not None else self._selected_parent_center(parent.layer_id),
+            insertion_index=insertion_index,
             fit_parent=False, label=label,
         )
         if len(created) != len(sources):
@@ -4459,50 +4517,34 @@ class MainWindow(QMainWindow):
             self._place_import_sources(sources, "Import images")
 
     def _clipboard_image_sources(self) -> list[tuple[str, str, bytes]]:
-        mime = QApplication.clipboard().mimeData()
-        if mime is None:
-            return []
-        sources: list[tuple[str, str, bytes]] = []
-        for url in mime.urls() if mime.hasUrls() else []:
-            if not url.isLocalFile():
-                continue
-            path = Path(url.toLocalFile())
-            try:
-                data = path.read_bytes()
-            except OSError:
-                continue
-            probe = ImageStore()
-            try:
-                probe.put("clipboard", path.name, data)
-            except ValueError:
-                continue
-            sources.append((path.name, "", data))
-        if sources:
-            return sources
-        if not mime.hasImage():
-            return []
-        value = mime.imageData()
-        image = value.toImage() if hasattr(value, "toImage") else QImage(value)
-        if image.isNull():
-            return []
-        payload = QByteArray()
-        buffer = QBuffer(payload)
-        buffer.open(QIODevice.OpenModeFlag.WriteOnly)
-        saved = image.save(buffer, "PNG")
-        buffer.close()
-        return [(
-            "Clipboard Image.png", "image/png", bytes(payload)
-        )] if saved else []
+        return list(self._clipboard_sources_cache)
 
     def _next_clipboard_serial(self) -> int:
         self._clipboard_serial += 1
         return self._clipboard_serial
 
     def _clipboard_data_changed(self) -> None:
+        mime = QApplication.clipboard().mimeData()
+        self._pending_clipboard_paste = None
+        self._clipboard_sources_cache = self._external_clipboard_reader.read(mime)
         self._image_clipboard_serial = (
             self._next_clipboard_serial()
-            if self._clipboard_image_sources() else 0
+            if self._clipboard_sources_cache or self._external_clipboard_reader.pending else 0
         )
+        self.clipboard_image_history.add_images(self._clipboard_sources_cache)
+
+    def _clipboard_images_resolved(self, sources) -> None:
+        self._clipboard_sources_cache = sources
+        self.clipboard_image_history.add_images(sources)
+        pending = self._pending_clipboard_paste
+        self._pending_clipboard_paste = None
+        if pending is not None and self.chapter is pending[0]:
+            _chapter, parent_id, index, world = pending
+            if sources:
+                self.canvas.place_image_sources(sources, parent_id, world,
+                                                insertion_index=index, label="Paste image")
+            else:
+                self.statusBar().showMessage("The copied web image could not be downloaded", 4000)
 
     def _capture_drawing_selection(self, *, cut: bool) -> bool:
         payload = self.canvas.drawing_selection_clipboard()
@@ -4515,6 +4557,7 @@ class MainWindow(QMainWindow):
             return False
         self._drawing_clipboard = payload
         self._drawing_clipboard_serial = self._next_clipboard_serial()
+        self.clipboard_image_history.add_drawing(self.canvas, payload)
         self.statusBar().showMessage(
             "Cut drawing selection" if cut else "Copied drawing selection",
             2500,
@@ -4529,24 +4572,29 @@ class MainWindow(QMainWindow):
 
     def _paste_image(
         self, sources: list[tuple[str, str, bytes]] | None = None,
+        world: QPointF | None = None,
     ) -> bool:
         sources = (
             sources
             if sources is not None else self._clipboard_image_sources()
         )
         return bool(
-            sources and self._place_import_sources(sources, "Paste image")
+            sources and self._place_import_sources(
+                sources, "Paste image", world if world is not None else cursor_world(self.canvas)
+            )
         )
 
     def _paste(self) -> bool:
         image_sources = self._clipboard_image_sources()
-        image_serial = self._image_clipboard_serial if image_sources else 0
+        image_serial = self._image_clipboard_serial if image_sources or self._external_clipboard_reader.pending else 0
+        if self._object_clipboard is not None and self._object_clipboard_serial >= max(image_serial, self._drawing_clipboard_serial):
+            return self._paste_outliner_object(world=cursor_world(self.canvas))
         use_drawing = bool(
             self._drawing_clipboard is not None
             and self._drawing_clipboard_serial >= image_serial
         )
         if use_drawing:
-            if self.canvas.paste_drawing_clipboard(self._drawing_clipboard):
+            if self._paste_drawing_payload(self._drawing_clipboard, cursor_world(self.canvas)):
                 self.statusBar().showMessage("Pasted drawing selection", 2500)
                 return True
             self.statusBar().showMessage(
@@ -4556,6 +4604,14 @@ class MainWindow(QMainWindow):
             return False
         if image_sources:
             return self._paste_image(image_sources)
+        if self._external_clipboard_reader.pending and self.chapter is not None:
+            parent_id, index = self.canvas.image_import_target()
+            if parent_id not in self.chapter.layers:
+                return False
+            world = cursor_world(self.canvas) or self._selected_parent_center(parent_id)
+            self._pending_clipboard_paste = (self.chapter, parent_id, index, world)
+            self.statusBar().showMessage("Downloading copied image…", 3000)
+            return True
         self.statusBar().showMessage("Nothing available to paste", 3000)
         return False
 
@@ -4566,21 +4622,8 @@ class MainWindow(QMainWindow):
                 "Copy or cut a drawing selection first", 3500
             )
             return False
-        anchor = (
-            self.chapter.objects.get(self.canvas.selected_id)
-            if (
-                self.chapter is not None
-                and self.canvas.selected_kind == "object"
-            )
-            else None
-        )
-        if not isinstance(anchor, (RasterObject, VectorDrawingObject)):
-            self.statusBar().showMessage(
-                "Select a raster or vector object to paste above", 4000
-            )
-            return False
         created = self.canvas.paste_drawing_clipboard_as_new(
-            payload, anchor.object_id
+            drawing_at(payload, cursor_world(self.canvas)), self.canvas.selected_id
         )
         if not created:
             self.statusBar().showMessage(
@@ -4588,6 +4631,101 @@ class MainWindow(QMainWindow):
             )
             return False
         self.statusBar().showMessage("Pasted selection as a new object", 2500)
+        return True
+
+    def _paste_drawing_payload(self, payload, world=None) -> bool:
+        placed = drawing_at(payload, world)
+        if self.canvas.paste_drawing_clipboard(placed):
+            self.clipboard_image_history.add_drawing(self.canvas, payload)
+            return True
+        anchor = self.canvas.selected_id
+        created = self.canvas.paste_drawing_clipboard_as_new(placed, anchor)
+        if created:
+            self.clipboard_image_history.add_drawing(self.canvas, payload)
+        return bool(created)
+
+    def _copy_outliner_object(self, kind: str, entity_id: str) -> bool:
+        try:
+            payload = capture_object(self.canvas, kind, entity_id)
+        except (KeyError, ValueError, OSError) as error:
+            self.statusBar().showMessage(str(error), 5000)
+            return False
+        self._object_clipboard = payload
+        self._object_clipboard_serial = self._next_clipboard_serial()
+        self.clipboard_image_history.add_object(self.canvas, payload)
+        self.statusBar().showMessage(f"Copied {payload.manifest.name}", 2500)
+        return True
+
+    def _paste_outliner_object(self, payload=None, world=None, *, parent_id=None,
+                               insertion_index=None, label="Paste object") -> bool:
+        payload = payload or self._object_clipboard
+        if payload is None or self.chapter is None:
+            return False
+        parent = self._selected_parent_layer(allow_page=True)
+        parent_id = parent_id or (parent.layer_id if parent is not None else self.canvas.active_page_id)
+        if parent_id not in self.chapter.layers:
+            return False
+        destination = self.chapter.layers[parent_id]
+        root = (payload.manifest.document.layers[payload.manifest.root_id]
+                if payload.manifest.root_kind == "layer"
+                else payload.manifest.document.objects[payload.manifest.root_id])
+        if destination.layer_kind == "text_container" and not isinstance(root, TextObject):
+            anchor_id, parent_id = parent_id, destination.parent_id
+            if parent_id not in self.chapter.layers:
+                return False
+            insertion_index = next((i for i, child in enumerate(self.chapter.layers[parent_id].children)
+                                    if child.entity_id == anchor_id), 0)
+        if insertion_index is None:
+            insertion_index = self._new_object_insertion_index(parent_id)
+        if world is None:
+            world = payload.original_center
+        try:
+            created = paste_object(self.canvas, payload, parent_id, world, insertion_index, label)
+        except (ValueError, KeyError, OSError) as error:
+            self.statusBar().showMessage(str(error), 5000)
+            return False
+        if created:
+            self.statusBar().showMessage(f"Pasted {payload.manifest.name}", 2500)
+        return bool(created)
+
+    def _duplicate_outliner_object(self, kind: str, entity_id: str) -> bool:
+        if self.chapter is None:
+            return False
+        try:
+            payload = capture_object(self.canvas, kind, entity_id)
+        except (KeyError, ValueError, OSError) as error:
+            self.statusBar().showMessage(str(error), 5000)
+            return False
+        entity = self.chapter.layers[entity_id] if kind == "layer" else self.chapter.objects[entity_id]
+        parent_id = entity.parent_id if kind == "layer" else entity.parent_layer_id
+        if not parent_id:
+            parent_id = entity_id
+        index = next((i for i, child in enumerate(self.chapter.layers[parent_id].children)
+                      if child.entity_id == entity_id), None)
+        return self._paste_outliner_object(payload, payload.original_center, parent_id=parent_id,
+                                           insertion_index=index, label="Duplicate object")
+
+    def _show_clipboard_image_history(self) -> bool:
+        if self.chapter is None:
+            return False
+        position = QCursor.pos()
+        world = cursor_world(self.canvas)
+        if world is None:
+            world = self.canvas.widget_to_document(QPointF(self.canvas.rect().center()))
+        def activate(entry):
+            if entry.kind == "image":
+                self._paste_image(entry.payload, world)
+            elif entry.kind == "drawing":
+                self._paste_drawing_payload(entry.payload, world)
+            else:
+                self._paste_outliner_object(entry.payload, world)
+        if self._clipboard_history_popup is not None:
+            self._clipboard_history_popup.close()
+            self._clipboard_history_popup.deleteLater()
+        self._clipboard_history_popup = ClipboardHistoryPopup(
+            self.clipboard_image_history.entries, activate, self,
+        )
+        self._clipboard_history_popup.open_at(position)
         return True
 
     # ---- selection and model synchronization --------------------------
@@ -5766,6 +5904,7 @@ class MainWindow(QMainWindow):
         self._recovery_revision = self._edit_revision
         self.autosave_timer.stop()
         self.statusBar().showMessage("Saved", 3000)
+        self._show_file_notification("saved", self.repository.series_path)
         self._refresh_actions()
         return True
 
@@ -5871,9 +6010,7 @@ class MainWindow(QMainWindow):
             self.autosave_timer.stop()
             self.canvas.asset_repository = clone_context.assets
             self.asset_library.set_repository(clone_context.assets)
-            self.setWindowTitle(
-                f"{self.active_session.name} — Vertical Comic Editor"
-            )
+            self._update_project_title(self.active_session.name)
         self.asset_library.refresh()
         self.preview.invalidate_all()
         self._refresh_project_tabs()
@@ -5953,6 +6090,7 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(
             f"Saved clone to {cloned_repository.root}", 5000
         )
+        self._show_file_notification("saved", cloned_repository.series_path)
         return True
 
     def _autosave_scope(self, session=None):
@@ -6266,15 +6404,23 @@ class MainWindow(QMainWindow):
             return False
         return self.save() if answer == QMessageBox.Save else True
 
-    def _export_destination_key(self) -> str:
-        return json.dumps([str(self.repository.root.resolve()).casefold(), self.chapter.chapter_id])
+    def _export_destination_key(self, *, cropped: bool | None = None) -> str:
+        parts = [str(self.repository.root.resolve()).casefold(), self.chapter.chapter_id]
+        cropped = self.chapter.export_rect_enabled if cropped is None else cropped
+        if cropped:
+            parts.append("export_rect")
+        return json.dumps(parts)
 
     def _export_as(self) -> None:
         if self.chapter is None or self.repository is None:
             return
         key = self._export_destination_key()
         name = re.sub(r'[<>:"/\\|?*\x00-\x1f]+', "-", self.chapter.name).strip(" .-") or "Chapter"
-        previous = self.settings.export_destinations.get(key) or self.chapter.external_image_path
+        previous = self.settings.export_destinations.get(key)
+        if not self.chapter.export_rect_enabled:
+            previous = previous or self.chapter.external_image_path
+        if self.chapter.export_rect_enabled:
+            name += "-rect"
         filename, _ = QFileDialog.getSaveFileName(
             self, "Export As PNG", previous or str(self.repository.root / "exports" / f"{name}.png"),
             "PNG image (*.png)",
@@ -6291,8 +6437,9 @@ class MainWindow(QMainWindow):
     def _export_again(self) -> None:
         if self.chapter is None or self.repository is None:
             return
-        destination = (self.settings.export_destinations.get(self._export_destination_key())
-                       or self.chapter.external_image_path)
+        destination = self.settings.export_destinations.get(self._export_destination_key())
+        if not self.chapter.export_rect_enabled:
+            destination = destination or self.chapter.external_image_path
         if destination:
             self._write_export_image(Path(destination))
         else:
@@ -6309,10 +6456,8 @@ class MainWindow(QMainWindow):
             if not self.canvas.commit_active_cage():
                 return False
             self.canvas.commit_active_text_edit()
-            image = QImage(self.chapter.width, self.chapter.height, QImage.Format_ARGB32_Premultiplied)
-            if image.isNull():
-                raise MemoryError("Could not allocate the chapter image")
-            self.canvas.render_preview(image)
+            image = self.canvas.render_export_image()
+            destination.parent.mkdir(parents=True, exist_ok=True)
             temporary = destination.with_name(f".{destination.name}.{new_id()}.tmp")
             try:
                 if image_format == "PNG":
@@ -6337,6 +6482,7 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "Export image", f"Unable to export the image:\n{error}")
             return False
         self.statusBar().showMessage(f"Exported {destination}", 7000)
+        self._show_file_notification("exported", destination)
         return True
 
     def _export_png(self) -> None:
@@ -6346,6 +6492,9 @@ class MainWindow(QMainWindow):
             or (self.active_session is not None
                 and self.active_session.kind != "series")
         ):
+            return
+        if self.chapter.export_rect_enabled:
+            self._export_again()
             return
         exports = self.repository.root / "exports"
         raw_name = self.chapter_combo.currentText().strip() or "Chapter"
@@ -6362,13 +6511,8 @@ class MainWindow(QMainWindow):
             while destination.exists():
                 destination = exports / f"{base}-{suffix}.png"
                 suffix += 1
-            image = QImage(
-                int(self.chapter.width), int(self.chapter.height),
-                QImage.Format.Format_ARGB32_Premultiplied,
-            )
-            if image.isNull():
-                raise MemoryError("could not allocate the chapter image")
-            self.canvas.render_preview(image)
+            self.canvas.commit_active_text_edit()
+            image = self.canvas.render_export_image()
             temporary = destination.with_name(f".{destination.name}.tmp.png")
             try:
                 if not image.save(str(temporary), "PNG"):
@@ -6383,6 +6527,7 @@ class MainWindow(QMainWindow):
             )
             return
         self.statusBar().showMessage(f"Exported {destination.name}", 7000)
+        self._show_file_notification("exported", destination)
 
     def _refresh_actions(self) -> None:
         active = self.chapter is not None

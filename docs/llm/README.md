@@ -17,7 +17,43 @@ This folder is a source-verified guide to the current `webtoon-maker` codebase. 
 - `arst/` and `Test/` are user series data folders produced by running the editor; they are not code.
 - `paint/handles.png` is an unreferenced image asset in the current source.
 - `program-map.txt` is a useful historical generated map, but it is not authoritative. Its line counts, schema versions, and file lists lag the current source. These documents follow the current code.
-- The current chapter schema is version 24, the series schema is version 17, asset manifests are schema 2, editor settings are version 22, the Blender bridge protocol is version 3, and the Blender extension is version `0.5.1`.
+- The current chapter schema is version 25, the series schema is version 17, asset manifests are schema 2, editor settings are version 22, the Blender bridge protocol is version 3, and the Blender extension is version `0.8.0`.
+
+## Texture, view, and clipboard additions
+
+- `blender_extension/webtoon_comic_views/textures.py` creates named PNG textures,
+  chooses blend-relative `tex` or custom directories, and emits normalized UV
+  edges in `<texture>.webtoon.json` before invoking Blender's existing external
+  image editor operator. It uses the active mesh and active UV map.
+- `blender_extension/webtoon_comic_views/materials.py` assigns the bundled
+  `assets/comic_texture.blend` preset to an object-local selected material slot.
+  Transparency, color, metallic, and roughness read/write the actual shader
+  nodes; existing presets retain their graph and settings. Shared material
+  users are isolated on edit. Reload Texture refreshes the existing image from
+  disk without rebuilding the shader or UV guide.
+- `core/text_styles.py` maintains sparse per-character color ranges and converts
+  Python string indexes at Qt's UTF-16 boundary. Text gizmos open the existing
+  floating picker with a captured selection, or color the whole object when
+  no range is selected. The L handle changes object-wide line spacing beside
+  size and kerning; these changes participate in undo and persistence.
+- `core/external_images.py::import_uv_overlay` embeds the UV map as a separate
+  `ImageObject(reference_role="uv_map")`. A content hash prevents re-rendering
+  unchanged guides. Clean canvas previews/exports temporarily exclude guides;
+  ordinary editing renders them. Paint layers survive repeated handoffs.
+- `ui/view_features.py` and `ui/view_settings.py` implement viewport overflow and
+  export rectangle interaction. `ChapterDocument.view_overflow`, `export_rect`,
+  and `export_rect_enabled` persist with the document. Export allocation uses
+  only the crop's pixel dimensions. Cropped and full-image exports have separate
+  destination keys; opening an image registers only the full-image key.
+- `ui/clipboard_history.py` owns session-local clipboard history, async browser
+  clipboard resolution, previews, and editable outliner transfers through the
+  existing asset extraction/instantiation resource remapping. Ctrl+Shift+V opens
+  a popup that captures the paste location before changing focus. History is
+  bounded by count and memory. The object clipboard survives chapter/project
+  changes and ordinary paste selects the new root.
+- `ui/file_notification.py` owns one reusable floating canvas confirmation for
+  manual save/export success, with a directory-opening button. Autosave remains
+  quiet. MainWindow titles show the active project directory and name.
 
 ## One-paragraph architecture
 

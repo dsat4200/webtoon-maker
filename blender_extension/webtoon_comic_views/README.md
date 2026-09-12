@@ -26,6 +26,72 @@ as revisioned PNGs below `%LOCALAPPDATA%\Webtoon Maker\Comic View Frames`.
 
 ## Workflow
 
+### Textures, materials, and UV guides (0.8.0)
+
+Install `webtoon_comic_views-0.8.0.zip` using **Install from Disk**, then restart
+Blender when you have saved your work. Existing Comic Views and the configured
+external image editor continue to work.
+
+Open **Comic Views → Textures** in the 3D View's N sidebar:
+
+- Enter **Name** and select **Prefix**, **Suffix**, or **Full Name**. Prefix and
+  suffix are applied to the active object's name, or the blend filename when no
+  object is active. Include separators such as `_` in the name text. The filename
+  preview updates immediately. Existing images, files, and Webtoon Maker project
+  folders are preserved by adding `.001`, `.002`, and so on when necessary.
+- Expand **Texture Creation Settings** for width, height, blank/UV-grid/color-grid
+  fill, color, and alpha. The default is a transparent 1024 × 1024 PNG, with up
+  to 8192 pixels in each dimension and the resulting megapixel count displayed.
+- By default, textures are saved directly in **tex** beside the saved `.blend`;
+  **Create Texture** creates that directory. Enable **Use Custom Directory** to
+  enter another path. **Save File Settings → Choose Texture Directory** opens a
+  directory picker and enables the custom path. A custom absolute directory also
+  works before the `.blend` has been saved.
+- Expand **Material Settings** and select a **Material Slot** on the active
+  object. Slot 1 is the default. **Create Texture** applies the supplied comic
+  shader to that slot, names the material after the texture, and assigns the
+  image. An existing copy of the preset is updated in place, retaining its
+  shader edits. Other slots and objects keep their materials, including linked
+  duplicates. A shared preset becomes a local copy when edited.
+- **Transparency** controls the final Mix Shader factor (0 opaque, 1 transparent),
+  **Color** controls the preset's Color node, and **Metallic** and **Roughness**
+  control the corresponding Principled BSDF inputs. Set these before creating a
+  texture, or change them live on an existing preset. Each selected slot reads
+  its actual node values, including changes made in the Shader Editor. The
+  supplied vertex-color, RGB ramps, and texture multiplication graph is retained;
+  its Shader to RGB shading is intended for Eevee.
+- **Create Texture** creates and saves the PNG, applies the material, then calls Blender's existing
+  **Edit Externally** operation with that file. Keep Webtoon Maker configured in
+  Blender's **Preferences → File Paths → Applications → Image Editor**. A failed
+  launch leaves the saved texture available for **Edit Texture Externally** to
+  retry.
+- **Include UV Map Layer** sends the active mesh object's active UV map as a
+  separate guide for Webtoon Maker. It reads current UVs in both Object and Edit
+  modes and does not change mode, geometry, materials, or selections. An object
+  without UVs simply opens the texture without a guide. Existing images can be
+  selected in the **Texture** field and opened with **Edit Texture Externally**,
+  or opened from the Image Editor's **Image → Edit in Webtoon Maker (with UV Map)**.
+  Blender's ordinary **Edit Externally** command is unchanged.
+- After saving changes in Webtoon Maker, press **Reload Texture** to refresh the
+  selected texture from disk and update its material users. Reload keeps the
+  existing image, material, and UV guide. A confirmation appears if Blender has
+  unsaved image edits; packed images and missing files report an error.
+
+Texture settings, per-object material slot choices, shader values, and the
+selected texture are stored in the `.blend`. New image
+datablocks have a fake user so they remain available after reopening the file.
+PNG generation and encoding use Blender's native image implementation instead
+of allocating a Python list for every pixel. UV edges are deduplicated and
+limited to 200,000; larger maps report a clear error while keeping the saved
+texture, allowing a retry with a simplified map or the guide disabled.
+
+The UV handoff is a small JSON sidecar beside the PNG, for example
+`tex/Hero.png.webtoon.json`. Its schema is `webtoon.texture.v1`, its `image` field
+matches the image filename, and `uv_overlay` contains `name`, `width`, `height`,
+and `segments` of `[u1, v1, u2, v2]` values. Coordinates use Blender's normalized
+UV convention, with V increasing upward. The sidecar is published atomically
+before opening the image; no full-size temporary UV bitmap is needed.
+
 ### Upgrading to 0.6.1
 
 Save your `.blend`, install `webtoon_comic_views-0.6.1.zip` with **Install from

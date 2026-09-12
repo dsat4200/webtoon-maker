@@ -1,8 +1,40 @@
 
 
-- allow reference images to overflow beyond the page off to the sides?
-- pasting images
-## Stroke modifier - Set brush
+- [x] allow reference images to overflow beyond the page off to the sides?
+- [x] pasting images
+- [x] open export location
+- [x] egxport rect area option
+
+
+make documentation
+
+
+mask edit mode:
+- add a magic wand tool for selections. in tool settings, lets the user set color tolerance.
+- holding control should remove from selection in magic wand, lasso mask edit tools
+
+New feature: solo'ing layers:
+- add an "S" button to the bar above the outliner, right of the lock button.
+	- this is the "solo" button. when solo'd only the selected object or layer is visible, everything else is hidden. pressing it again removes that object from the solo selection.
+	- layers/objects that are solo'd should have a yellow selection background in the outliner (it should show on all solo'd objects, except the currently selected solo object)
+	- like the eye and lock, the solo icon should appear pressed if the object that's selected is solo'd.
+	- solo'd objects should have a yellow 5 pointed star to the left of their  respective eye icon in the outliner list. clicking it removes them from the solo selection. when not solo'd, this star is not visible.
+	- basically, it functions similar to isolating in blender.
+text edit change:
+- instead of saying "change color", just make the color change gizmo into a square rounded swatch of the color of the text.
+
+
+
+shift/control lasso selection check
+- in raster mode and mask selection mode
+- shift should add, control should remove
+
+autosave
+
+## brush overhaul
+
+
+## Stroke modifier - Set brus
 - lets the user change the brush used for that object via a modifier.
 - works on closed an open shapes too.
 - custom dot toggle.

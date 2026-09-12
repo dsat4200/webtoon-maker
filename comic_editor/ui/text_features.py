@@ -13,6 +13,65 @@ class TextFeatures:
         self._free_text_timer = QTimer(self)
         self._free_text_timer.setSingleShot(True)
         self._free_text_timer.timeout.connect(self._flush_free_text_drag)
+        self._text_color_popup = None
+
+    def _open_text_color_picker(self):
+        """Keep canvas selection stable while the shared picker owns focus."""
+        from comic_editor.core.text_styles import apply_text_color, text_color_at
+        from comic_editor.ui.color_picker import ColorPickerPopup
+
+        obj = self._selected_text_for_gizmos()
+        if obj is None:
+            return
+        if self._text_color_popup is not None:
+            self._text_color_popup.raise_()
+            self._text_color_popup.activateWindow()
+            return
+        chapter = self.chapter
+        object_id = obj.object_id
+        position, anchor = self._text_cursor_position, self._text_selection_anchor
+        was_editing = self.has_active_text_edit()
+        start, end = sorted((position, anchor)) if was_editing else (0, 0)
+        if start == end:
+            start, end = 0, len(obj.text)
+        popup = ColorPickerPopup(text_color_at(obj, start), self)
+        self._text_color_popup = popup
+        popup.setWindowTitle("Change text color")
+        popup.setAttribute(Qt.WA_DeleteOnClose)
+
+        def target():
+            if self.chapter is not chapter:
+                return None
+            candidate = self.chapter.objects.get(object_id)
+            return candidate if isinstance(candidate, TextObject) else None
+
+        def apply(color):
+            current = target()
+            if current is None:
+                return
+            # Separate previous typing from the single color undo command.
+            self.commit_active_text_edit()
+            before = self.chapter.to_dict()
+            apply_text_color(current, start, end, color)
+            self._finish_text_property_change(before, "Change text color")
+
+        def finished(_result):
+            self._text_color_popup = None
+            current = target()
+            if current is None or self.selected_object_id != object_id:
+                return
+            if was_editing and self._editing_text_object() is not None:
+                # Eyedropper sampling briefly switches tools; restore the
+                # original selection after either Apply or Cancel as well.
+                self._begin_text_session(current)
+                self._text_cursor_position = min(position, len(current.text))
+                self._text_selection_anchor = min(anchor, len(current.text))
+            self.setFocus(Qt.OtherFocusReason)
+            self.update()
+
+        popup.colorApplied.connect(apply)
+        popup.finished.connect(finished)
+        popup.open()
 
     def set_text_layout_mode(self, obj, mode):
         """The only strict/free transition: capture layout before changing it."""

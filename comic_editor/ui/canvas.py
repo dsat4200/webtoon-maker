@@ -32,7 +32,7 @@ from PySide6.QtGui import (
     QLinearGradient,
     QMouseEvent, QOffscreenSurface, QOpenGLContext, QPainter, QPainterPath,
     QPainterPathStroker, QPalette,
-    QPen, QPolygonF, QRadialGradient, QSurfaceFormat, QTextBlockFormat,
+    QPen, QPolygonF, QRadialGradient, QSurfaceFormat, QTextBlockFormat, QTextCharFormat,
     QTextCursor, QTextDocument, QTransform, QValidator,
 )
 from PySide6.QtOpenGLWidgets import QOpenGLWidget
@@ -62,6 +62,10 @@ from comic_editor.core.models import (
 from comic_editor.core.pressure import BrushPreset
 from comic_editor.core.settings import EditorSettings
 from comic_editor.core.tiles import TileStore
+from comic_editor.core.text_styles import (
+    qt_position_to_text_index, replace_text_range, text_color_at,
+    text_index_to_qt_position, text_indexes_to_qt_positions,
+)
 from comic_editor.core.images import ImageStore
 from comic_editor.core.vector_geometry import (
     Cubic, CubicSpan, FreehandSample, centerline_hit, connect_cubic_paths,
@@ -92,6 +96,7 @@ from comic_editor.ui.shape_outline_compound import OutlineSource, compound_outli
 from comic_editor.ui.spatial_modifier_features import SpatialModifierFeatures
 from comic_editor.ui.array_features import ArrayFeatures
 from comic_editor.ui.text_features import TextFeatures
+from comic_editor.ui.view_features import ViewFeatures
 from comic_editor.ui.cage_features import CageFeatures
 from comic_editor.core.models import CageTransformModifier, TilingModifier
 from comic_editor.ui.tiling_features import TilingFeatures
@@ -409,6 +414,7 @@ class _TextGizmoOverlay(QWidget):
     sizeIncreaseRequested = Signal()
     boldRequested = Signal()
     italicRequested = Signal()
+    colorRequested = Signal()
     sizeEditStarted = Signal(int)
     sizeEditCanceled = Signal()
     sizeCommitted = Signal(int)
@@ -441,17 +447,24 @@ class _TextGizmoOverlay(QWidget):
         italic_font = self.italic.font()
         italic_font.setItalic(True)
         self.italic.setFont(italic_font)
+        self.color = self._button("Change color", "Change the selected text color, or all text when none is selected")
+        self.color.setObjectName("textGizmoChangeColor")
+        self.color.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         for control in (
             self.decrease, self.size, self.increase, self.bold, self.italic,
+            self.color,
         ):
             layout.addWidget(control)
             font = control.font()
             font.setPointSizeF(max(1.0, font.pointSizeF() * 1.4))
             control.setFont(font)
+        self.color.ensurePolished()
+        self.color.setFixedWidth(self.color.fontMetrics().horizontalAdvance("Change color") + 32)
         self.decrease.clicked.connect(self.sizeDecreaseRequested)
         self.increase.clicked.connect(self.sizeIncreaseRequested)
         self.bold.clicked.connect(self.boldRequested)
         self.italic.clicked.connect(self.italicRequested)
+        self.color.clicked.connect(self.colorRequested)
         self.size.editStarted.connect(self.sizeEditStarted)
         self.size.editCanceled.connect(self.sizeEditCanceled)
         self.size.editingFinished.connect(
@@ -556,8 +569,9 @@ class CanvasPerformanceMonitor:
         }
 
 
-class _CanvasLogic(MaskSelectionFeatures, MaskGradientFeatures, TilingFeatures, CageFeatures, ArrayFeatures, SpatialModifierFeatures, TextFeatures):
+class _CanvasLogic(ViewFeatures, MaskSelectionFeatures, MaskGradientFeatures, TilingFeatures, CageFeatures, ArrayFeatures, SpatialModifierFeatures, TextFeatures):
     documentChanged = Signal(object)
+    viewSettingsChanged = Signal()
     visualChanged = Signal(object)
     selectionChanged = Signal(str, str)
     selectionSetChanged = Signal(object)
@@ -578,6 +592,7 @@ class _CanvasLogic(MaskSelectionFeatures, MaskGradientFeatures, TilingFeatures, 
     pageGapGeometryChanged = Signal()
     transformModeChanged = Signal(str)
     importStatusMessage = Signal(str)
+    imagesImported = Signal(object)
     colorSampled = Signal(str)
     colorSampleCommitted = Signal(str)
     eyedropperGestureChanged = Signal(bool)
@@ -734,6 +749,9 @@ class _CanvasLogic(MaskSelectionFeatures, MaskGradientFeatures, TilingFeatures, 
         self._text_gizmo_overlay.italicRequested.connect(
             lambda: self._toggle_selected_text_property("italic", "Toggle italic")
         )
+        self._text_gizmo_overlay.colorRequested.connect(
+            self._open_text_color_picker
+        )
         self._text_gizmo_overlay.sizeEditStarted.connect(
             self._begin_text_size_edit
         )
@@ -746,7 +764,7 @@ class _CanvasLogic(MaskSelectionFeatures, MaskGradientFeatures, TilingFeatures, 
         self._text_dragging = False
         self._last_text_double_click: tuple[float, QPointF, str] | None = None
         self._text_before_state: dict | None = None
-        self._text_local_history: list[tuple[str, int, int]] = []
+        self._text_local_history: list[tuple[str, list[dict], int, int]] = []
         self._strict_margin_start: float | None = None
         self._strict_margin_edge: int | None = None
         self._strict_margin_press = QPointF()
@@ -1336,6 +1354,13 @@ class _CanvasLogic(MaskSelectionFeatures, MaskGradientFeatures, TilingFeatures, 
             round(float(self.devicePixelRatioF()), 4),
             round(self.center_x, 6), round(self.center_y, 6),
             round(self.scale, 8), round(self.rotation, 6),
+            self.chapter.view_overflow if self.chapter is not None else 0.0,
+            # Overflow uses ordinary subtree rendering during transforms and
+            # vector erasing; the document model may stay unchanged until the
+            # gesture commits, so its live preview also identifies the cache.
+            (tuple(self._transform_preview_quad or ()),
+             self._vector_eraser_preview_revision)
+            if self.chapter is not None and self.chapter.view_overflow > 0 else (),
         )
 
     def _ensure_scene_cache(self) -> None:
@@ -1380,15 +1405,16 @@ class _CanvasLogic(MaskSelectionFeatures, MaskGradientFeatures, TilingFeatures, 
             QRectF(0, 0, self.chapter.width, self.chapter.height),
             QColor(self.chapter.background),
         )
-        painter.save()
-        painter.setClipRect(
-            QRectF(0, 0, self.chapter.width, self.chapter.height),
-            Qt.IntersectClip,
-        )
         inverse, valid = self.camera_transform().inverted()
         visible = (
             inverse.map(QPolygonF(QRectF(dirty))).boundingRect()
             if valid else self.visible_document_rect()
+        )
+        self._render_canvas_overflow(painter, dirty, visible)
+        painter.save()
+        painter.setClipRect(
+            QRectF(0, 0, self.chapter.width, self.chapter.height),
+            Qt.IntersectClip,
         )
         self._set_live_underlay_context()
         previous_interactive = self._interactive_render
@@ -1416,6 +1442,9 @@ class _CanvasLogic(MaskSelectionFeatures, MaskGradientFeatures, TilingFeatures, 
 
     def _clear_detached_input_state(self) -> None:
         """Reset transient pointer state that cannot survive without a document."""
+        if self.export_rect_editing:
+            self.set_export_rect_editing(False)
+        self._view_overflow_image = QImage()
         self._mask_selection_gesture = None
         self._effect_jobs.cancel()
         self._clear_creation_gesture()
@@ -1496,6 +1525,7 @@ class _CanvasLogic(MaskSelectionFeatures, MaskGradientFeatures, TilingFeatures, 
         self._clear_fill_replay()
         self._clear_detached_input_state()
         self.chapter = chapter
+        self.viewSettingsChanged.emit()
         self.tiles = tiles
         self.images = images or ImageStore()
         self._compound_path_cache.clear()
@@ -1551,6 +1581,7 @@ class _CanvasLogic(MaskSelectionFeatures, MaskGradientFeatures, TilingFeatures, 
         """Detach the committed document state without discarding warm caches."""
         if self.chapter is None:
             return None
+        self.set_export_rect_editing(False)
         if self._cage_session is not None:
             self.finish_cage(False)
         elif self._cage_edit_before is not None:
@@ -1666,6 +1697,7 @@ class _CanvasLogic(MaskSelectionFeatures, MaskGradientFeatures, TilingFeatures, 
         self.chapter, self.tiles, self.images = (
             state.chapter, state.tiles, state.images
         )
+        self.viewSettingsChanged.emit()
         self.command_stack = state.command_stack
         self.tool = state.tool
         self.selected_kind, self.selected_id = state.selected_kind, state.selected_id
@@ -1760,6 +1792,7 @@ class _CanvasLogic(MaskSelectionFeatures, MaskGradientFeatures, TilingFeatures, 
         self.active_color_slot = slot
 
     def replace_chapter(self, state: dict) -> None:
+        self._reset_export_rect_editor()
         self._cancel_mask_selection()
         self._mask_gradient_drag = None
         self._cage_timer.stop()
@@ -1779,6 +1812,7 @@ class _CanvasLogic(MaskSelectionFeatures, MaskGradientFeatures, TilingFeatures, 
         self.pageGapConfirmationChanged.emit(False)
         self.pageGapModeChanged.emit(False)
         self.chapter = ChapterDocument.from_dict(state)
+        self.viewSettingsChanged.emit()
         self._compound_path_cache.clear()
         self._gradient_geometry_cache.clear()
         self._gradient_scalar_cache.clear()
@@ -3051,6 +3085,7 @@ class _CanvasLogic(MaskSelectionFeatures, MaskGradientFeatures, TilingFeatures, 
             painter.restore()
             self._draw_selection(painter)
             self._draw_focal_modifier_handles(painter)
+            self._draw_export_rect(painter)
             self._performance.frame_ms.append(
                 (time.perf_counter_ns() - frame_started) / 1_000_000
             )
@@ -3112,6 +3147,7 @@ class _CanvasLogic(MaskSelectionFeatures, MaskGradientFeatures, TilingFeatures, 
             self._draw_asset_drag_preview(painter)
         painter.restore()
         painter.setTransform(QTransform())
+        self._draw_export_rect(painter)
         self._draw_tablet_hover(painter)
         self._draw_simplify_hover(painter)
         self._draw_eyedropper_swatch(painter)
@@ -3139,7 +3175,8 @@ class _CanvasLogic(MaskSelectionFeatures, MaskGradientFeatures, TilingFeatures, 
         )
 
         target = self.chapter.layers.get(self._asset_drag_parent_id)
-        if isinstance(root, ImageObject) and target is not None and not target.is_page:
+        if (isinstance(root, ImageObject) and target is not None
+                and not target.is_page and not self._external_drag_entries):
             bounds = self.layer_world_transform(target.layer_id).map(
                 self.layer_effective_path(target.layer_id)
             ).boundingRect()
@@ -3369,8 +3406,8 @@ class _CanvasLogic(MaskSelectionFeatures, MaskGradientFeatures, TilingFeatures, 
                 if insertion_index is not None else None
             )
             self.chapter.add_object(parent_id, obj, index=index)
-            self.images.put(
-                obj.object_id, obj.source_filename, data,
+            self.images.put_decoded(
+                obj.object_id, obj.source_filename, data, image,
                 obj.source_mime_type,
             )
             created.append(obj.object_id)
@@ -3394,7 +3431,41 @@ class _CanvasLogic(MaskSelectionFeatures, MaskGradientFeatures, TilingFeatures, 
         self.documentChanged.emit(QRectF())
         self.interactionFinished.emit()
         self.update()
+        self.imagesImported.emit([
+            (self.images.source(identifier).filename,
+             self.images.source(identifier).mime_type,
+             self.images.source(identifier).data)
+            for identifier in created
+        ])
         return created
+
+    def image_import_target(self) -> tuple[str, int | None]:
+        """Use the selected container or insert immediately above its object."""
+        if self.chapter is None:
+            return "", None
+        if self.selected_kind == "layer":
+            layer = self.chapter.layers.get(self.selected_id)
+            if layer is not None and layer.layer_kind != "text_container":
+                return layer.layer_id, 0
+            anchor_kind, anchor_id = "layer", self.selected_id
+            parent_id = layer.parent_id if layer is not None else ""
+        else:
+            selected = self.chapter.objects.get(self.selected_id)
+            parent_id = selected.parent_layer_id if selected is not None else ""
+            anchor_kind, anchor_id = "object", self.selected_id
+            parent = self.chapter.layers.get(parent_id)
+            if parent is not None and parent.layer_kind == "text_container":
+                anchor_kind, anchor_id = "layer", parent.layer_id
+                parent_id = parent.parent_id
+        if parent_id in self.chapter.layers:
+            children = self.chapter.layers[parent_id].children
+            index = next((i for i, child in enumerate(children)
+                          if child.kind == anchor_kind and child.entity_id == anchor_id), 0)
+            return parent_id, index
+        parent_id = self.active_page_id
+        if parent_id not in self.chapter.layers and self.chapter.root_page_ids:
+            parent_id = self.chapter.root_page_ids[0]
+        return parent_id, 0
 
     def _asset_root_bypasses_parent_mask(self) -> bool:
         manifest = self._asset_drag_manifest
@@ -3669,7 +3740,7 @@ class _CanvasLogic(MaskSelectionFeatures, MaskGradientFeatures, TilingFeatures, 
                     validated = self._validated_image_source(
                         path.name,
                         mimetypes.guess_type(path.name)[0] or "",
-                        path.read_bytes(),
+                        path.read_bytes() if path.stat().st_size <= 256 * 1024 * 1024 else b"",
                     )
                 except OSError:
                     validated = None
@@ -3727,6 +3798,10 @@ class _CanvasLogic(MaskSelectionFeatures, MaskGradientFeatures, TilingFeatures, 
         )
         reply = self._network_manager.get(request)
         self._external_drag_replies[reply] = (generation, entry)
+        reply.downloadProgress.connect(
+            lambda received, total, current=reply: current.abort()
+            if max(received, total) > 256 * 1024 * 1024 else None
+        )
         reply.finished.connect(lambda current=reply: self._finish_external_drag_download(current))
         QTimer.singleShot(
             15000,
@@ -3923,8 +3998,9 @@ class _CanvasLogic(MaskSelectionFeatures, MaskGradientFeatures, TilingFeatures, 
         if self._asset_drag_manifest is None:
             return
         self._asset_drag_world = self.widget_to_document(widget_point)
-        self._asset_drag_parent_id = self._asset_target_parent(
-            self._asset_drag_world, self._asset_drag_manifest
+        self._asset_drag_parent_id = (
+            self.image_import_target()[0] if self._external_drag_entries
+            else self._asset_target_parent(self._asset_drag_world, self._asset_drag_manifest)
         )
         if self._asset_drag_changes_compound_path(self._asset_drag_parent_id):
             self._asset_drag_clip_cache.clear()
@@ -3960,23 +4036,17 @@ class _CanvasLogic(MaskSelectionFeatures, MaskGradientFeatures, TilingFeatures, 
             event.ignore()
             return
         if self._external_drag_entries:
+            self._update_asset_drag(event.position())
             parent_id = self._asset_drag_parent_id
             parent = self.chapter.layers.get(parent_id)
-            insertion_index = None
-            selected = self.chapter.objects.get(self.selected_object_id)
-            if selected is not None and selected.parent_layer_id == parent_id:
-                insertion_index = next((
-                    index for index, child in enumerate(parent.children)
-                    if child.kind == "object"
-                    and child.entity_id == selected.object_id
-                ), None)
+            insertion_index = self.image_import_target()[1]
             if any(entry["pending"] for entry in self._external_drag_entries):
                 self._pending_external_drop = {
                     "entries": list(self._external_drag_entries),
                     "parent_id": parent_id,
                     "world": QPointF(self._asset_drag_world),
                     "insertion_index": insertion_index,
-                    "fit_parent": bool(parent is not None and not parent.is_page),
+                    "fit_parent": False,
                 }
                 self._asset_drag_manifest = None
                 self._asset_drag_tiles = None
@@ -3994,7 +4064,7 @@ class _CanvasLogic(MaskSelectionFeatures, MaskGradientFeatures, TilingFeatures, 
                 created = self.place_image_sources(
                     sources, parent_id, QPointF(self._asset_drag_world),
                     insertion_index=insertion_index,
-                    fit_parent=bool(parent is not None and not parent.is_page),
+                    fit_parent=False,
                     label="Drop images",
                 )
                 self._clear_asset_drag_preview()
@@ -4276,7 +4346,10 @@ class _CanvasLogic(MaskSelectionFeatures, MaskGradientFeatures, TilingFeatures, 
         painter.end()
         return result
 
-    def render_preview(self, image: QImage, clip: QRect | None = None) -> None:
+    def render_preview(
+        self, image: QImage, clip: QRect | None = None,
+        *, source_rect: QRectF | None = None,
+    ) -> None:
         if self.chapter is None or image.isNull():
             return
         painter = QPainter(image)
@@ -4290,13 +4363,25 @@ class _CanvasLogic(MaskSelectionFeatures, MaskGradientFeatures, TilingFeatures, 
         else:
             painter.fillRect(image.rect(), QColor(self.chapter.background))
         painter.setCompositionMode(QPainter.CompositionMode_SourceOver)
+        source = (QRectF(source_rect) if source_rect is not None else
+                  QRectF(0, 0, self.chapter.width, self.chapter.height))
         transform = QTransform()
-        transform.scale(image.width() / self.chapter.width, image.height() / self.chapter.height)
+        transform.scale(image.width() / source.width(), image.height() / source.height())
+        transform.translate(-source.x(), -source.y())
         painter.setTransform(transform)
-        visible = QRectF(0, 0, self.chapter.width, self.chapter.height)
-        for page_id in reversed(self.chapter.root_page_ids):
-            self._render_layer(painter, self.chapter.layers[page_id], 1.0, visible)
-        painter.end()
+        guides = [obj for obj in self.chapter.objects.values()
+                  if getattr(obj, "reference_role", "") == "uv_map" and obj.visible]
+        try:
+            # UV references are an editing aid. Visibility also participates in
+            # effect-source signatures, so cached parent effects stay correct.
+            for obj in guides:
+                obj.visible = False
+            for page_id in reversed(self.chapter.root_page_ids):
+                self._render_layer(painter, self.chapter.layers[page_id], 1.0, source)
+        finally:
+            for obj in guides:
+                obj.visible = True
+            painter.end()
 
     def _render_layer(
         self, painter: QPainter, layer: LayerNode, parent_opacity: float,
@@ -8203,8 +8288,11 @@ class _CanvasLogic(MaskSelectionFeatures, MaskGradientFeatures, TilingFeatures, 
             target_path
         ).boundingRect()
 
-    def _text_document(self, obj: TextObject, width: float) -> QTextDocument:
+    def _text_document(
+        self, obj: TextObject, width: float, *, editing_overlay: bool = False,
+    ) -> QTextDocument:
         document = QTextDocument()
+        document.setUndoRedoEnabled(False)
         document.setDocumentMargin(0)
         font = QFont(obj.font_family)
         font.setPixelSize(max(1, round(obj.font_size)))
@@ -8216,6 +8304,9 @@ class _CanvasLogic(MaskSelectionFeatures, MaskGradientFeatures, TilingFeatures, 
         document.setTextWidth(max(1.0, width))
         cursor = QTextCursor(document)
         cursor.select(QTextCursor.Document)
+        character = QTextCharFormat()
+        character.setForeground(QColor(Qt.transparent) if editing_overlay else QColor(obj.text_color))
+        cursor.mergeCharFormat(character)
         block = QTextBlockFormat()
         block.setAlignment({
             "left": Qt.AlignLeft,
@@ -8228,6 +8319,22 @@ class _CanvasLogic(MaskSelectionFeatures, MaskGradientFeatures, TilingFeatures, 
             QTextBlockFormat.LineHeightTypes.ProportionalHeight.value,
         )
         cursor.mergeBlockFormat(block)
+        if editing_overlay:
+            # This scratch layout only supplies Qt selection backgrounds and
+            # caret geometry. Keeping its actual glyphs transparent avoids
+            # antialiasing leaks at the edges of layout selection rectangles.
+            return document
+        positions = text_indexes_to_qt_positions(
+            obj.text, (run[key] for run in obj.color_runs for key in ("start", "end")),
+        ) if obj.color_runs else {}
+        for run in obj.color_runs:
+            start, end = (max(0, min(len(obj.text), run[key])) for key in ("start", "end"))
+            cursor.setPosition(positions[start])
+            cursor.setPosition(
+                positions[end], QTextCursor.KeepAnchor,
+            )
+            character.setForeground(QColor(run["color"]))
+            cursor.mergeCharFormat(character)
         return document
 
     def _strict_text_rect(self, obj: TextObject) -> QRectF:
@@ -8317,7 +8424,7 @@ class _CanvasLogic(MaskSelectionFeatures, MaskGradientFeatures, TilingFeatures, 
                           *, editing_overlay: bool = False) -> None:
         if obj.layout_mode == "strict":
             rect = self._strict_text_rect(obj)
-            document = self._text_document(obj, rect.width())
+            document = self._text_document(obj, rect.width(), editing_overlay=editing_overlay)
             offset = self._text_vertical_offset(obj, document, rect.height())
             painter.save()
             painter.setClipRect(rect, Qt.IntersectClip)
@@ -8327,7 +8434,7 @@ class _CanvasLogic(MaskSelectionFeatures, MaskGradientFeatures, TilingFeatures, 
             painter.restore()
             return
         source = QRectF(0, 0, max(1.0, obj.width), max(1.0, obj.height))
-        document = self._text_document(obj, source.width())
+        document = self._text_document(obj, source.width(), editing_overlay=editing_overlay)
         offset = self._text_vertical_offset(obj, document, source.height())
         transform = self._quad_transform(source, self._text_quad(obj))
         painter.save()
@@ -8343,7 +8450,8 @@ class _CanvasLogic(MaskSelectionFeatures, MaskGradientFeatures, TilingFeatures, 
         *, editing_overlay: bool = False, show_editing: bool = True,
     ) -> None:
         context = QAbstractTextDocumentLayout.PaintContext()
-        context.palette.setColor(QPalette.Text, QColor(Qt.transparent) if editing_overlay else QColor("#111111"))
+        context.palette.setColor(QPalette.Text, QColor(Qt.transparent) if editing_overlay else QColor(obj.text_color))
+        selections = []
         # Decorations are UI, never source alpha for effects, masks or exports.
         editing = (self._text_editing and obj.object_id == self.selected_object_id
                    and (editing_overlay or show_editing
@@ -8354,22 +8462,26 @@ class _CanvasLogic(MaskSelectionFeatures, MaskGradientFeatures, TilingFeatures, 
         if editing and self._text_cursor_position != self._text_selection_anchor:
             selection = QAbstractTextDocumentLayout.Selection()
             cursor = QTextCursor(document)
-            cursor.setPosition(self._text_selection_anchor)
-            cursor.setPosition(self._text_cursor_position, QTextCursor.KeepAnchor)
+            cursor.setPosition(text_index_to_qt_position(obj.text, self._text_selection_anchor))
+            cursor.setPosition(
+                text_index_to_qt_position(obj.text, self._text_cursor_position),
+                QTextCursor.KeepAnchor,
+            )
             selection.cursor = cursor
             highlight = QColor("#F2A23A")
             highlight.setAlphaF(0.4)
             selection.format.setBackground(highlight)
             if editing_overlay:
                 selection.format.setForeground(QColor(Qt.transparent))
-            context.selections = [selection]
+            selections.append(selection)
+        context.selections = selections
         document.documentLayout().draw(painter, context)
         if (
             editing and self.hasFocus() and self._text_caret_visible
             and self._text_cursor_position == self._text_selection_anchor
         ):
             caret = self._text_caret_rect(document, self._text_cursor_position)
-            pen = QPen(QColor("#111111"), 1)
+            pen = QPen(QColor(text_color_at(obj, self._text_cursor_position)), 1)
             pen.setCosmetic(True)
             painter.setPen(pen)
             painter.drawLine(caret.topLeft(), caret.bottomLeft())
@@ -8406,7 +8518,7 @@ class _CanvasLogic(MaskSelectionFeatures, MaskGradientFeatures, TilingFeatures, 
     @staticmethod
     def _text_caret_rect(document: QTextDocument, position: int) -> QRectF:
         cursor = QTextCursor(document)
-        cursor.setPosition(max(0, min(position, len(document.toPlainText()))))
+        cursor.setPosition(text_index_to_qt_position(document.toPlainText(), position))
         block = cursor.block()
         layout = block.layout()
         relative = cursor.position() - block.position()
@@ -9046,7 +9158,7 @@ class _CanvasLogic(MaskSelectionFeatures, MaskGradientFeatures, TilingFeatures, 
                     radius * 2, radius * 2,
                 ),
                 Qt.AlignmentFlag.AlignCenter,
-                "S" if key == "font_size" else "K",
+                {"font_size": "S", "kerning": "K", "line_spacing": "L"}[key],
             )
             painter.setPen(QPen(QColor("#f2a23a"), 4 / scale))
         painter.restore()
@@ -12742,7 +12854,14 @@ class _CanvasLogic(MaskSelectionFeatures, MaskGradientFeatures, TilingFeatures, 
         )
         if shape_hover_kind not in {None, "interior"}:
             shape_overlay_hit = ""
-        over_text_property = bool(self._text_property_handle_hit(point))
+        over_text_property = self._text_property_handle_hit(point)
+        property_tooltip = {
+            "font_size": "Font size: drag left or right",
+            "kerning": "Kerning: drag left or right",
+            "line_spacing": "Line spacing: drag left or right (0.5–3.0)",
+        }.get(over_text_property, "")
+        if self.toolTip() != property_tooltip:
+            self.setToolTip(property_tooltip)
         selected_object = self.chapter.objects.get(self.selected_object_id)
         selected_gradient = (
             selected_object
@@ -12849,6 +12968,10 @@ class _CanvasLogic(MaskSelectionFeatures, MaskGradientFeatures, TilingFeatures, 
         if nav:
             self._begin_navigation(nav, event.position())
             return
+        if self.export_rect_editing:
+            self._export_rect_pointer_press(event.position())
+            event.accept()
+            return
         if self._select_all_text_from_triple_click(QPointF(event.position())):
             event.accept()
             return
@@ -12869,6 +12992,10 @@ class _CanvasLogic(MaskSelectionFeatures, MaskGradientFeatures, TilingFeatures, 
             self._queue_navigation_update(event.position())
             return
         self._pointer_hover_widget = QPointF(event.position())
+        if self.export_rect_editing:
+            self._export_rect_pointer_move(event.position())
+            event.accept()
+            return
         world = self.widget_to_document(event.position())
         if self.tool == ToolKind.SHAPE_CREATE and self._creation_nodes:
             self._update_creation_hover(world)
@@ -12892,6 +13019,11 @@ class _CanvasLogic(MaskSelectionFeatures, MaskGradientFeatures, TilingFeatures, 
             return
         if self._nav_mode:
             self._end_navigation(event.position())
+            return
+        if self.export_rect_editing:
+            if event.button() == Qt.LeftButton:
+                self._export_rect_pointer_release(event.position())
+            event.accept()
             return
         if event.button() == Qt.LeftButton:
             self._queue_radial_handle(event.position())
@@ -12924,6 +13056,9 @@ class _CanvasLogic(MaskSelectionFeatures, MaskGradientFeatures, TilingFeatures, 
         return False
 
     def mouseDoubleClickEvent(self, event: QMouseEvent) -> None:  # noqa: N802
+        if self.export_rect_editing:
+            event.accept()
+            return
         if self.active_tone_mask_id and self.tool in {ToolKind.GRADIENT, ToolKind.MASK_SELECT}:
             event.accept()
             return
@@ -13227,6 +13362,18 @@ class _CanvasLogic(MaskSelectionFeatures, MaskGradientFeatures, TilingFeatures, 
                     event.ignore()
                     return
         self._tablet_hover_widget = QPointF(event.position())
+        if self.export_rect_editing and not self._nav_mode and not self._navigation_mode():
+            if event.type() == QEvent.Type.TabletPress:
+                self._cancel_touch_navigation(emit_finished=True, flush_pending=False)
+                self._pen_contact_active = self._tablet_tool_active = True
+                self._export_rect_pointer_press(event.position())
+            elif event.type() == QEvent.Type.TabletMove:
+                self._export_rect_pointer_move(event.position())
+            elif event.type() == QEvent.Type.TabletRelease:
+                self._export_rect_pointer_release(event.position())
+                self._pen_contact_active = self._tablet_tool_active = False
+            event.accept()
+            return
         hover_world = self.widget_to_document(event.position())
         if self.tool == ToolKind.SHAPE_CREATE and self._creation_nodes:
             self._update_creation_hover(hover_world)
@@ -15259,18 +15406,23 @@ class _CanvasLogic(MaskSelectionFeatures, MaskGradientFeatures, TilingFeatures, 
     def paste_drawing_clipboard_as_new(
         self, payload: DrawingSelectionClipboard, anchor_id: str,
     ) -> str:
-        """Create a clipboard-backed sibling immediately above the anchor."""
+        """Create editable drawing content above an object or in a container."""
+        if self.chapter is not None and not anchor_id:
+            anchor_id = self.active_page_id or next(iter(self.chapter.root_page_ids), "")
         if (
             self.chapter is None
-            or anchor_id not in self.chapter.objects
-            or not isinstance(
-                self.chapter.objects[anchor_id],
-                (RasterObject, VectorDrawingObject),
-            )
+            or not isinstance(payload, (RasterSelectionClipboard, VectorSelectionClipboard))
+            or anchor_id not in self.chapter.objects and anchor_id not in self.chapter.layers
         ):
             return ""
-        anchor = self.chapter.objects[anchor_id]
-        parent_id = anchor.parent_layer_id
+        anchor = self.chapter.objects.get(anchor_id)
+        anchor_kind = "object" if anchor is not None else "layer"
+        parent_id = anchor.parent_layer_id if anchor is not None else anchor_id
+        if self.chapter.layers[parent_id].layer_kind == "text_container":
+            anchor_id, anchor_kind = parent_id, "layer"
+            parent_id = self.chapter.layers[parent_id].parent_id
+        if parent_id not in self.chapter.layers:
+            return ""
         parent_to_world = self.layer_world_transform(parent_id)
         world_to_parent, valid = parent_to_world.inverted()
         if not valid:
@@ -15278,8 +15430,8 @@ class _CanvasLogic(MaskSelectionFeatures, MaskGradientFeatures, TilingFeatures, 
         siblings = self.chapter.layers[parent_id].children
         insertion_index = next((
             index for index, reference in enumerate(siblings)
-            if reference.kind == "object" and reference.entity_id == anchor_id
-        ), None)
+            if reference.kind == anchor_kind and reference.entity_id == anchor_id
+        ), 0 if parent_id == anchor_id else None)
         if insertion_index is None:
             return ""
         before_model = self.chapter.to_dict()
@@ -23261,7 +23413,7 @@ class _CanvasLogic(MaskSelectionFeatures, MaskGradientFeatures, TilingFeatures, 
         self, object_id: str,
     ) -> QImage:
         if (
-            self.chapter is None or not object_id
+            self.chapter is None or self.chapter.view_overflow > 0 or not object_id
             or self.width() <= 0 or self.height() <= 0
         ):
             return QImage()
@@ -23614,20 +23766,26 @@ class _CanvasLogic(MaskSelectionFeatures, MaskGradientFeatures, TilingFeatures, 
         quad = self._selected_world_quad() if obj is not None else None
         if not quad:
             return {}
-        top_right = QPointF(*quad[1])
-        bottom_right = QPointF(*quad[2])
+        top_right = self.document_to_widget(QPointF(*quad[1]))
+        bottom_right = self.document_to_widget(QPointF(*quad[2]))
         edge = bottom_right - top_right
+        length = math.hypot(edge.x(), edge.y())
+        direction = edge / length if length > 1e-6 else QPointF(0, 1)
+        center = (top_right + bottom_right) / 2.0
+        # Keep the three handles distinct even on short boxes or zoomed out.
+        spacing = max(40.0, length / 4.0)
         return {
-            "font_size": top_right + edge / 3.0,
-            "kerning": top_right + edge * (2.0 / 3.0),
+            key: self.widget_to_document(center + direction * offset * spacing)
+            for key, offset in (("font_size", -1), ("kerning", 0), ("line_spacing", 1))
         }
 
     def _text_property_handle_hit(self, widget_point: QPointF) -> str:
-        for key, world in self._text_property_handle_positions().items():
-            position = self.document_to_widget(world)
-            if math.dist(position.toTuple(), widget_point.toTuple()) <= 28:
-                return key
-        return ""
+        distances = [
+            (math.dist(self.document_to_widget(world).toTuple(), widget_point.toTuple()), key)
+            for key, world in self._text_property_handle_positions().items()
+        ]
+        distance, key = min(distances, default=(math.inf, ""))
+        return key if distance <= 28 else ""
 
     def _begin_text_property_drag(self, widget_point: QPointF) -> bool:
         key = self._text_property_handle_hit(widget_point)
@@ -23670,6 +23828,10 @@ class _CanvasLogic(MaskSelectionFeatures, MaskGradientFeatures, TilingFeatures, 
             value = max(
                 10, min(100, round(state["start_value"]) + steps)
             )
+        elif state["key"] == "line_spacing":
+            value = max(
+                0.5, min(3.0, round((state["start_value"] + steps * 0.1) * 10) / 10),
+            )
         else:
             value = max(
                 1.0,
@@ -23684,10 +23846,10 @@ class _CanvasLogic(MaskSelectionFeatures, MaskGradientFeatures, TilingFeatures, 
         if state is None or self.chapter is None:
             return False
         self.unsetCursor()
-        label = (
-            "Drag text size" if state["key"] == "font_size"
-            else "Drag text kerning"
-        )
+        label = {
+            "font_size": "Drag text size", "kerning": "Drag text kerning",
+            "line_spacing": "Drag text line spacing",
+        }[state["key"]]
         self._finish_text_property_change(state["before"], label)
         return True
 
@@ -23761,7 +23923,7 @@ class _CanvasLogic(MaskSelectionFeatures, MaskGradientFeatures, TilingFeatures, 
         local.setX(max(0.0, min(local.x(), max(0.0, document.textWidth()))))
         local.setY(max(0.0, min(local.y(), document.size().height())))
         position = document.documentLayout().hitTest(local, Qt.FuzzyHit)
-        return document, max(0, min(len(obj.text), position))
+        return document, qt_position_to_text_index(obj.text, position)
 
     def _select_text_word_at(self, point: QPointF) -> bool:
         obj = self._editing_text_object()
@@ -23773,10 +23935,10 @@ class _CanvasLogic(MaskSelectionFeatures, MaskGradientFeatures, TilingFeatures, 
         document, position = hit
         self._begin_text_session(obj)
         cursor = QTextCursor(document)
-        cursor.setPosition(position)
+        cursor.setPosition(text_index_to_qt_position(obj.text, position))
         cursor.select(QTextCursor.SelectionType.WordUnderCursor)
-        self._text_selection_anchor = max(0, cursor.selectionStart())
-        self._text_cursor_position = min(len(obj.text), cursor.selectionEnd())
+        self._text_selection_anchor = qt_position_to_text_index(obj.text, cursor.selectionStart())
+        self._text_cursor_position = qt_position_to_text_index(obj.text, cursor.selectionEnd())
         self._text_dragging = False
         self.setFocus(Qt.MouseFocusReason)
         self.update()
@@ -23901,7 +24063,8 @@ class _CanvasLogic(MaskSelectionFeatures, MaskGradientFeatures, TilingFeatures, 
 
     def _remember_text_state(self, obj: TextObject) -> None:
         self._text_local_history.append((
-            obj.text, self._text_cursor_position, self._text_selection_anchor
+            obj.text, copy.deepcopy(obj.color_runs),
+            self._text_cursor_position, self._text_selection_anchor
         ))
         if len(self._text_local_history) > 100:
             self._text_local_history.pop(0)
@@ -23913,7 +24076,7 @@ class _CanvasLogic(MaskSelectionFeatures, MaskGradientFeatures, TilingFeatures, 
         start, end = self._text_selection_range()
         self._begin_text_session(obj)
         self._remember_text_state(obj)
-        obj.text = obj.text[:start] + value + obj.text[end:]
+        replace_text_range(obj, start, end, value)
         self._text_cursor_position = start + len(value)
         self._text_selection_anchor = self._text_cursor_position
         self.documentChanged.emit(QRectF())
@@ -23941,13 +24104,27 @@ class _CanvasLogic(MaskSelectionFeatures, MaskGradientFeatures, TilingFeatures, 
         if control and event.key() == Qt.Key_V:
             self._replace_text_selection(QGuiApplication.clipboard().text())
             return True
-        if control and event.key() == Qt.Key_Z:
-            if self._text_local_history:
-                obj.text, self._text_cursor_position, self._text_selection_anchor = (
+        if control and event.key() in (Qt.Key_Z, Qt.Key_Y):
+            redo = event.key() == Qt.Key_Y or shift
+            if self._text_local_history and not redo:
+                obj.text, obj.color_runs, self._text_cursor_position, self._text_selection_anchor = (
                     self._text_local_history.pop()
                 )
                 self.documentChanged.emit(QRectF())
                 self.update()
+            else:
+                position, anchor = self._text_cursor_position, self._text_selection_anchor
+                self.commit_active_text_edit()
+                if redo:
+                    self.command_stack.redo()
+                else:
+                    self.command_stack.undo()
+                current = self._editing_text_object()
+                if current is not None:
+                    self._begin_text_session(current)
+                    self._text_cursor_position = min(position, len(current.text))
+                    self._text_selection_anchor = min(anchor, len(current.text))
+                    self.update()
             return True
         if event.key() in (Qt.Key_Return, Qt.Key_Enter):
             self._replace_text_selection("\n")
@@ -23973,9 +24150,9 @@ class _CanvasLogic(MaskSelectionFeatures, MaskGradientFeatures, TilingFeatures, 
                 if obj.layout_mode == "strict" else obj.width
             ))
             cursor = QTextCursor(document)
-            cursor.setPosition(self._text_cursor_position)
+            cursor.setPosition(text_index_to_qt_position(obj.text, self._text_cursor_position))
             cursor.movePosition(moves[event.key()])
-            self._text_cursor_position = cursor.position()
+            self._text_cursor_position = qt_position_to_text_index(obj.text, cursor.position())
             if not shift:
                 self._text_selection_anchor = self._text_cursor_position
             self.update()

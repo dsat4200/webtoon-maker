@@ -12,7 +12,7 @@ from bpy.props import (
 )
 from bpy.types import AddonPreferences, Operator, Panel, PropertyGroup, UIList
 
-from . import bridge, diagnostics, renderer, viewport
+from . import bridge, diagnostics, materials, renderer, textures, viewport
 from .state import (
     ensure_uuid, migrate_legacy_presentation, parse_state, state_digest, state_json,
 )
@@ -856,6 +856,8 @@ CLASSES = (
     WEBTOON_UL_comic_views,
     WEBTOON_UL_registered_properties,
     WEBTOON_PT_comic_views,
+    *materials.CLASSES,
+    *textures.CLASSES,
 )
 
 
@@ -942,6 +944,9 @@ def register() -> None:
         type=WebtoonRegisteredProperty
     )
     bpy.types.Scene.webtoon_comic_settings = PointerProperty(type=WebtoonComicSettings)
+    bpy.types.Scene.webtoon_texture_settings = PointerProperty(type=textures.WebtoonTextureSettings)
+    bpy.types.Object.webtoon_texture_material_settings = PointerProperty(type=materials.WebtoonTextureMaterialSettings)
+    bpy.types.IMAGE_MT_image.append(textures.draw_image_menu)
     if _depsgraph_updated not in bpy.app.handlers.depsgraph_update_post:
         bpy.app.handlers.depsgraph_update_post.append(_depsgraph_updated)
     if _load_post not in bpy.app.handlers.load_post:
@@ -985,6 +990,9 @@ def unregister() -> None:
     ):
         if handler in collection:
             collection.remove(handler)
+    bpy.types.IMAGE_MT_image.remove(textures.draw_image_menu)
+    del bpy.types.Scene.webtoon_texture_settings
+    del bpy.types.Object.webtoon_texture_material_settings
     del bpy.types.Scene.webtoon_comic_settings
     del bpy.types.Scene.webtoon_comic_registered
     del bpy.types.Scene.webtoon_comic_views

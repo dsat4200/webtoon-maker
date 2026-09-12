@@ -1,4 +1,16 @@
 
+text edit changes:
+- add a "change color" option to the gizmos of text edit mode (to the right of italic) that brings up our custom floating color picker. if no text is selected, it should do to all text on that object. if text is selected, it should only apply to that text.
+- add a line spacing draggable handle by the size and kernel ones.
+
+comic editor texture section - new material settings dropdown
+- lets the user select a material on the object - that material is overridden (slot 1 by default) or updated if its already using our material preset
+- names the material after the texture, uses that texture in the material
+- using that material, I want the following sliders in the material dropdown (correspond to material settings):
+	- transparency - corresponds to the factor of the final mix shader node
+	- color - the color node
+	- metallic - metallic on the principled bsdf
+	- roughness - roughness on the principled bsdf
 ## thought balloons and screaming
 i still need to add border types for shapes, like round bubbly ones for thought balloons or pointy ones for screaming (or just have it be one with a sharpness value and sizing parameters... hmmm
 

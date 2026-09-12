@@ -38,6 +38,7 @@ LABELS = {
     "copy": "Copy",
     "paste": "Paste",
     "paste_as_new": "Paste as New Object",
+    "clipboard_image_history": "Clipboard Image History",
     "delete_selected": "Delete Selected",
     "clear_canvas": "Clear Canvas",
 }
