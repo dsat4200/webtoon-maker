@@ -246,27 +246,7 @@ class ViewFeatures:
         self._interactive_render = True
         self._effect_preview_channel = "overflow"
         try:
-            for page_id in reversed(self.chapter.root_page_ids):
-                page = self.chapter.layers[page_id]
-                if not page.visible or page.opacity <= 0:
-                    continue
-                # Pages permit opacity and translation but not modifiers,
-                # compound operations or parameter masks. Preserve those root
-                # properties and every descendant mask/effect, bypassing only
-                # the page's outer clip.
-                overflow.save()
-                transform = self.layer_world_transform(page_id)
-                overflow.setTransform(transform, True)
-                inverse, valid = transform.inverted()
-                local_visible = inverse.mapRect(visible) if valid else visible
-                for child in reversed(page.children):
-                    if child.kind == "layer":
-                        self._render_layer(overflow, self.chapter.layers[child.entity_id],
-                                           page.opacity, visible)
-                    else:
-                        self._render_object(overflow, self.chapter.objects[child.entity_id],
-                                            page.opacity, local_visible)
-                overflow.restore()
+            self._render_scene_layers(overflow, visible, page_contents_only=True)
         finally:
             self._interactive_render = previous
             self._effect_preview_channel = previous_channel

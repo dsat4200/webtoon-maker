@@ -9,13 +9,14 @@ import json
 from PySide6.QtCore import QBuffer, QByteArray, QIODevice, QObject, QPoint, QPointF, QRectF, QSize, Qt, QTimer, QUrl, Signal
 from PySide6.QtGui import QColor, QCursor, QIcon, QImage, QImageReader, QPainter, QPixmap, QTransform
 from PySide6.QtWidgets import QDialog, QLabel, QListWidget, QListWidgetItem, QVBoxLayout
-from PySide6.QtNetwork import QNetworkAccessManager, QNetworkReply, QNetworkRequest
+from PySide6.QtNetwork import QNetworkReply, QNetworkRequest
 
 from comic_editor.core.assets import _collect_subtree, _translate_object, extract_asset, instantiate_asset, entity_visual_bounds
 from comic_editor.core.commands import CallbackCommand
 from comic_editor.core.images import ImageStore
 from comic_editor.core.models import ChapterDocument, ImageObject, RasterObject, VectorDrawingObject
 from comic_editor.core.tiles import TileStore
+from comic_editor.ui.network import create_network_manager
 
 
 MAX_HISTORY_ITEMS = 30
@@ -29,7 +30,7 @@ class ExternalClipboardReader(QObject):
     def __init__(self, canvas, parent=None):
         super().__init__(parent)
         self.canvas = canvas
-        self.manager = QNetworkAccessManager(self)
+        self.manager = create_network_manager(self)
         self.entries = []
         self.replies = set()
 

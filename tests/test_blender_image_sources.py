@@ -293,6 +293,57 @@ def test_copy_as_asset_freezes_linked_source_and_preserves_transform(qapp):
     assert asset_images.source(obj.object_id).filename == "Panel 12.png"
 
 
+def test_source_undo_redo_reactivates_connected_view_and_preserves_cached_frame(qapp, monkeypatch):
+    chapter, _page, objects, images = _chapter_with_linked_images()
+    obj = objects[0]
+    original_cache = images.source(obj.object_id).data
+    original_quad = list(obj.transform_quad)
+    window = MainWindow()
+    activated, statuses = [], []
+    try:
+        window._set_chapter(chapter, TileStore(), images)
+        window.canvas.set_selection("object", obj.object_id)
+        first = ComicViewInfo(PROJECT_UUID, VIEW_UUID, "Original", 2, 640, 360,
+                             False, QImage(), "")
+        second = ComicViewInfo(PROJECT_UUID, OTHER_VIEW_UUID, "Other", 2, 640, 360,
+                              False, QImage(), "")
+        window.blender_sources._views = {VIEW_UUID: first, OTHER_VIEW_UUID: second}
+        monkeypatch.setattr(window.blender_sources.client, "activate_view",
+                            lambda identifier: (activated.append(identifier), True)[1])
+        window.blender_sources.statusChanged.connect(statuses.append)
+        with patch.object(BlenderSourceClient, "connected", new_callable=PropertyMock,
+                          return_value=True):
+            window._begin_relink_selected_blender_source()
+            window._add_blender_comic_view(second)
+            activated.clear()
+            window.canvas.command_stack.undo()
+            assert activated == [VIEW_UUID]
+            assert window.canvas.chapter.objects[obj.object_id].source.view_uuid == VIEW_UUID
+            activated.clear()
+            window.canvas.command_stack.redo()
+            assert activated == [OTHER_VIEW_UUID]
+
+            window._detach_selected_blender_source()
+            activated.clear()
+            window.canvas.command_stack.undo()
+            assert activated == [OTHER_VIEW_UUID]
+            assert window.canvas.chapter.objects[obj.object_id].is_blender_linked
+            activated.clear()
+            window.canvas.command_stack.redo()
+            assert not activated
+            assert not window.canvas.chapter.objects[obj.object_id].is_blender_linked
+            assert statuses[-1] == "connected"
+        restored = window.canvas.chapter.objects[obj.object_id]
+        assert restored.transform_quad == original_quad
+        assert (restored.pixel_width, restored.pixel_height) == (640, 360)
+        assert window.canvas.images.source(obj.object_id).data == original_cache
+    finally:
+        window.autosave_timer.stop()
+        window.blender_sources.shutdown()
+        window._dirty = False
+        window.deleteLater()
+
+
 def test_relink_is_undoable_and_render_once_ui_is_removed(qapp, tmp_path):
     chapter, _page, objects, images = _chapter_with_linked_images()
     obj = objects[0]

@@ -83,6 +83,33 @@ def perlin(x, y, seed):
     return np.clip(((a*(1-u)+b*u)*(1-v)+(c*(1-u)+d*u)*v)*1.5, -1, 1)
 
 
+def _angular_scream_points(points, cumulative, phase, count, height, outward):
+    """Join valleys and tips by chords, retaining source-sample correspondence.
+
+    Offsetting every point along a curved contour's normal bends a triangular
+    wave's sides. Snap its half-period landmarks to source samples and linearly
+    interpolate between them instead. Keeping the sample count and order also
+    preserves material warps, masks and per-node outline attribution.
+    """
+    landmarks = np.arange(count * 2, dtype=np.float64) * .5
+    sample_positions = np.interp(
+        landmarks, np.r_[phase, float(count)], np.arange(len(points) + 1))
+    indexes, first = np.unique(
+        np.rint(sample_positions).astype(np.int64) % len(points), return_index=True)
+    if len(indexes) < 3:
+        # Very sparse input loops can snap several landmarks to the same
+        # sample. Keep their original polygon vertices instead of reducing a
+        # closed shape to a doubled line.
+        triangle = 1 - np.abs((phase % 1) * 2 - 1)
+        return points + outward * (height * triangle)[:, None]
+    peaks = (first % 2).astype(np.float64)
+    vertices = points[indexes] + outward[indexes] * (height[indexes] * peaks)[:, None]
+    closed = np.vstack((vertices, vertices[0]))
+    positions = np.r_[cumulative[indexes], cumulative[-1]]
+    return np.column_stack([
+        np.interp(cumulative[:-1], positions, closed[:, axis]) for axis in (0, 1)])
+
+
 def deform_loop(loop, modifier, parameter):
     """Return render samples, never modifying the document's editable points."""
     points = loop.points
@@ -93,11 +120,26 @@ def deform_loop(loop, modifier, parameter):
         rates = lengths/np.maximum(4, parameter("width"))
         total = max(float(rates.sum()), 1e-9)
         count = max(1, round(total))
-        phase = np.r_[0., np.cumsum(rates[:-1])] * count/total % 1
-        triangle = 1-np.abs(phase*2-1)
-        rounded = np.sqrt(np.maximum(0., 1-(phase*2-1)**2))
+        phase = np.r_[0., np.cumsum(rates[:-1])] * count/total
+        rounded = np.sqrt(np.maximum(0., 1-((phase % 1)*2-1)**2))
         roundness = parameter("roundness")/100
-        offset = (triangle*(1-roundness)+rounded*roundness)*parameter("height")*strength
+        height = parameter("height")
+        if not np.any(height * strength):
+            return loop, opacity
+        outward = normals(points)
+        # One angular repeat has only a valley and a tip, so it cannot enclose
+        # a fill. Keep at least two repeats in the angular profile, independently
+        # of the rounded profile's existing period count.
+        angular_count = min(max(2, len(points)//2), max(2, count))
+        angular_phase = phase * angular_count / count
+        angular = _angular_scream_points(
+            points, cumulative, angular_phase, angular_count, height, outward)
+        offset = ((angular-points)*(1-roundness)[:, None]
+                  + outward*(rounded*roundness*height)[:, None]) * strength[:, None]
+        # A zero-height parameter-mask region is an explicit local no-op,
+        # including the chord correction that straightens fully active spikes.
+        offset[height == 0] = 0
+        return StrokeLoop(points+offset, loop.width), opacity
     elif isinstance(modifier, WobbleModifier):
         length = max(cumulative[-1], 1e-9)
         angle = 2*np.pi*(cumulative[:-1]+parameter("noise_offset"))/length

@@ -15,6 +15,7 @@ from comic_editor.ui.layer_settings import LayerSettingsPanel
 from comic_editor.ui.tool_ribbon_pages import RasterObjectControls
 from comic_editor.ui.icons import iconoir
 from comic_editor.ui.mask_controls import DualEndpointSlider, MaskButton
+from comic_editor.ui.show_on_top_controls import set_show_on_top
 
 
 class SelectionCommonControls(QWidget):
@@ -821,8 +822,17 @@ class SelectionSettingsPanel(QWidget):
         parent: QWidget | None = None,
     ):
         super().__init__(parent)
+        self.canvas = canvas
+        self._updating = False
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
+        self.object_show_on_top = QCheckBox("Show on top", self)
+        self.object_show_on_top.setToolTip(
+            "Show this object above the rest of the document, including during solo."
+        )
+        self.object_show_on_top.setContentsMargins(8, 4, 8, 0)
+        layout.addWidget(self.object_show_on_top)
+        self.object_show_on_top.toggled.connect(self._object_show_on_top_changed)
         self.stack = QStackedWidget(self)
         layout.addWidget(self.stack)
         self.layer_page = LayerSettingsPanel(
@@ -867,6 +877,10 @@ class SelectionSettingsPanel(QWidget):
         self.image_controls.changed.connect(self.changed)
         self.refresh()
 
+    def _object_show_on_top_changed(self, enabled: bool) -> None:
+        if not self._updating and self.canvas.selected_kind == "object":
+            set_show_on_top(self.canvas, "object", self.canvas.selected_id, enabled)
+
     def refresh(self) -> None:
         chapter = self.layer_page.canvas.chapter
         target = (
@@ -875,6 +889,12 @@ class SelectionSettingsPanel(QWidget):
             and self.layer_page.canvas.selected_kind == "object"
             else None
         )
+        self._updating = True
+        self.object_show_on_top.setVisible(target is not None)
+        self.object_show_on_top.setEnabled(target is not None)
+        self.object_show_on_top.setChecked(target.show_on_top if target is not None else False)
+        self._updating = False
+        self.layer_page.show_on_top.setVisible(target is None)
         if isinstance(target, RasterObject):
             self.raster_controls.refresh()
             self.stack.setCurrentWidget(self.raster_page)

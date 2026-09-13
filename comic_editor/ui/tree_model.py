@@ -22,13 +22,16 @@ class TreeItem:
     entity_id: str
     parent: "TreeItem | None" = None
     children: list["TreeItem"] = field(default_factory=list)
+    row: int = 0
 
 
 class HierarchyModel(QAbstractItemModel):
     mutationCommitted = Signal(object, object, str)
     soloToggleRequested = Signal(str, str)
+    showOnTopDisableRequested = Signal(str, str)
     SoloRole = Qt.ItemDataRole.UserRole + 1
     SoloHighlightRole = Qt.ItemDataRole.UserRole + 2
+    ShowOnTopRole = Qt.ItemDataRole.UserRole + 3
 
     MIME = "application/x-vertical-comic-entity"
     _reference_icon_cache: QIcon | None = None
@@ -83,13 +86,13 @@ class HierarchyModel(QAbstractItemModel):
             return
 
         def build_object(object_id: str, parent: TreeItem) -> TreeItem:
-            object_item = TreeItem("object", object_id, parent)
+            object_item = TreeItem("object", object_id, parent, row=len(parent.children))
             self._items[("object", object_id)] = object_item
             parent.children.append(object_item)
             return object_item
 
         def build_layer(layer_id: str, parent: TreeItem) -> TreeItem:
-            item = TreeItem("layer", layer_id, parent)
+            item = TreeItem("layer", layer_id, parent, row=len(parent.children))
             self._items[("layer", layer_id)] = item
             parent.children.append(item)
             layer = self.chapter.layers[layer_id]
@@ -118,8 +121,10 @@ class HierarchyModel(QAbstractItemModel):
         item = self._items.get((kind, entity_id))
         if not item or item.parent is None:
             return QModelIndex()
-        row = item.parent.children.index(item)
-        return self.createIndex(row, 0, item)
+        # Rows are assigned when the model is built, and hierarchy mutations
+        # rebuild it. Looking up each sibling's position here makes a tree
+        # refresh quadratic for large pages.
+        return self.createIndex(item.row, 0, item)
 
     def index(self, row: int, column: int, parent=QModelIndex()) -> QModelIndex:
         parent_item = self.item_for_index(parent)
@@ -134,8 +139,7 @@ class HierarchyModel(QAbstractItemModel):
         parent_item = item.parent
         if parent_item is None or parent_item is self.root:
             return QModelIndex()
-        grandparent = parent_item.parent or self.root
-        return self.createIndex(grandparent.children.index(parent_item), 0, parent_item)
+        return self.createIndex(parent_item.row, 0, parent_item)
 
     def rowCount(self, parent=QModelIndex()) -> int:
         if parent.isValid() and parent.column() > 0:
@@ -167,6 +171,8 @@ class HierarchyModel(QAbstractItemModel):
             if item.kind == "layer" else self.chapter.objects[item.entity_id]
         )
         key = (item.kind, item.entity_id)
+        if role == self.ShowOnTopRole:
+            return entity.show_on_top
         if role == self.SoloRole:
             return key in self.solo_entities
         if role == self.SoloHighlightRole:
@@ -209,6 +215,8 @@ class HierarchyModel(QAbstractItemModel):
         if role == Qt.CheckStateRole and index.column() == 0:
             return Qt.Checked if entity.visible else Qt.Unchecked
         if role == Qt.ToolTipRole:
+            if entity.show_on_top:
+                return "Show on top is enabled. Click the yellow crown to disable it."
             if entity.fill_reference:
                 return "Reference layer source for Fill tools."
             if item.kind == "layer":
@@ -217,6 +225,8 @@ class HierarchyModel(QAbstractItemModel):
                 return "Editable vector strokes."
             return "Drag objects between page or container layers."
         if role == Qt.BackgroundRole:
+            if entity.show_on_top:
+                return QColor("#f53346")
             if key in self.solo_entities and key != self.current_entity:
                 return QColor("#c5a137")
             if (item.kind, item.entity_id) in self.error_highlights:
@@ -227,6 +237,8 @@ class HierarchyModel(QAbstractItemModel):
                 return QColor("#b85b12")
             return QColor("#303238") if item.kind == "layer" else QColor("#050505")
         if role == Qt.ForegroundRole:
+            if entity.show_on_top:
+                return QColor("#ffffff")
             if key in self.solo_entities and key != self.current_entity:
                 return QColor("#171717")
             return QColor("#eeeeee")
@@ -484,7 +496,8 @@ class HierarchyModel(QAbstractItemModel):
 class SoloRowDelegate(QStyledItemDelegate):
     def initStyleOption(self, option, index):
         super().initStyleOption(option, index)
-        if index.data(HierarchyModel.SoloHighlightRole):
+        if (index.data(HierarchyModel.SoloHighlightRole)
+                or index.data(HierarchyModel.ShowOnTopRole)):
             option.state &= ~QStyle.StateFlag.State_Selected
 
 
@@ -498,7 +511,8 @@ class EyeVisibilityDelegate(SoloRowDelegate):
 
     @classmethod
     def eye_rect(cls, rect: QRect, index) -> QRect:
-        offset = 22 if index.data(HierarchyModel.SoloRole) else 0
+        offset = 22 if (index.data(HierarchyModel.SoloRole)
+                        or index.data(HierarchyModel.ShowOnTopRole)) else 0
         return QRect(rect.left() + 2 + offset, rect.top() + 2, 24, rect.height() - 4)
 
     def _icons(self):
@@ -524,14 +538,20 @@ class EyeVisibilityDelegate(SoloRowDelegate):
         style.drawControl(QStyle.ControlElement.CE_ItemViewItem, opt, painter, widget)
         r = option.rect
         btn_rect = self.eye_rect(r, index)
-        if index.data(HierarchyModel.SoloRole):
+        on_top = index.data(HierarchyModel.ShowOnTopRole)
+        if on_top or index.data(HierarchyModel.SoloRole):
             center = self.star_rect(r).center()
-            points = []
-            for i in range(10):
-                angle = -math.pi / 2 + i * math.pi / 5
-                radius = 8.0 if i % 2 == 0 else 3.5
-                points.append(QPointF(center.x() + math.cos(angle) * radius,
-                                     center.y() + math.sin(angle) * radius))
+            if on_top:
+                points = [QPointF(center.x()+x, center.y()+y) for x, y in
+                          [(-8, -5), (-4, -1), (0, -7), (4, -1),
+                           (8, -5), (6, 6), (-6, 6)]]
+            else:
+                points = []
+                for i in range(10):
+                    angle = -math.pi / 2 + i * math.pi / 5
+                    radius = 8.0 if i % 2 == 0 else 3.5
+                    points.append(QPointF(center.x() + math.cos(angle) * radius,
+                                         center.y() + math.sin(angle) * radius))
             painter.save()
             painter.setRenderHint(QPainter.Antialiasing, True)
             painter.setPen(QPen(QColor("#7e6011"), 0.7))
@@ -570,6 +590,10 @@ class EyeVisibilityDelegate(SoloRowDelegate):
             r = option.rect
             btn_rect = self.eye_rect(r, index)
             pos = event.position().toPoint() if hasattr(event, "position") else event.pos()
+            if index.data(HierarchyModel.ShowOnTopRole) and self.star_rect(r).contains(pos):
+                item = model.item_for_index(index)
+                model.showOnTopDisableRequested.emit(item.kind, item.entity_id)
+                return True
             if index.data(HierarchyModel.SoloRole) and self.star_rect(r).contains(pos):
                 item = model.item_for_index(index)
                 model.soloToggleRequested.emit(item.kind, item.entity_id)

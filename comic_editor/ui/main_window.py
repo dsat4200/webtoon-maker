@@ -380,6 +380,11 @@ class MainWindow(QMainWindow):
         self.file_button.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
         self.file_button.setMenu(self.file_menu)
         self.file_toolbar.addWidget(self.file_button)
+        self.performance_monitor_action = self.file_toolbar.addAction("Performance…")
+        self.performance_monitor_action.setToolTip(
+            "Open the drawing performance monitor (off until enabled)"
+        )
+        self.performance_monitor_action.triggered.connect(self._show_performance_monitor)
         self.file_toolbar.addSeparator()
         self.undo_action = self.file_toolbar.addAction("Undo")
         self.redo_action = self.file_toolbar.addAction("Redo")
@@ -666,7 +671,7 @@ class MainWindow(QMainWindow):
             self.gradient_tools_controls.create_widget
         )
         self.gradient_type_group = self.tool_settings_page.add_group(
-            "Field & Direction", minimum_width=220
+            "Gradient", minimum_width=220
         )
         self.gradient_type_group.add_widget(
             self.gradient_tools_controls.type_parameters_widget
@@ -802,6 +807,9 @@ class MainWindow(QMainWindow):
         )
         self.settings_tabs.addTab(self.view_settings, "View Settings")
         self.tree = QTreeView()
+        # Every outliner row uses the same single-line delegates. Let Qt
+        # locate visible rows without measuring the full expanded hierarchy.
+        self.tree.setUniformRowHeights(True)
         self.tree.setSelectionMode(QTreeView.ExtendedSelection)
         self.tree.setDragDropMode(QTreeView.InternalMove)
         self.tree.setDefaultDropAction(Qt.MoveAction)
@@ -834,6 +842,7 @@ class MainWindow(QMainWindow):
         self.canvas.soloChanged.connect(self.hierarchy_model.set_solo_entities)
         self.canvas.selectionChanged.connect(self.hierarchy_model.set_current_entity)
         self.hierarchy_model.soloToggleRequested.connect(self.canvas.toggle_solo)
+        self.hierarchy_model.showOnTopDisableRequested.connect(self._disable_show_on_top)
         self.tree.viewport().installEventFilter(self)
         self.tree.setContextMenuPolicy(Qt.CustomContextMenu)
         self._tablet_outliner_press: dict | None = None
@@ -847,6 +856,13 @@ class MainWindow(QMainWindow):
             "#tabletDropIndicator { background: #ff7417; }"
         )
         self._tablet_drop_indicator.hide()
+        self._hierarchy_expanded_entities: set[tuple[str, str]] = set()
+        self.tree.expanded.connect(
+            lambda index: self._hierarchy_expansion_changed(index, True)
+        )
+        self.tree.collapsed.connect(
+            lambda index: self._hierarchy_expansion_changed(index, False)
+        )
         self._hierarchy_reset_expanded: set[str] = set()
         self._pending_hierarchy_reveal: tuple[str, str] = ("", "")
         self._tree_selection_in_progress = False
@@ -1026,6 +1042,7 @@ class MainWindow(QMainWindow):
         self.canvas.hierarchyChanged.connect(self._hierarchy_changed)
         self.canvas.selectionChanged.connect(self._canvas_selection_changed)
         self.canvas.chapterReplaced.connect(self._chapter_replaced)
+        self.canvas.objectRecordsChanged.connect(self._object_records_changed)
         self.canvas.toolChanged.connect(self._canvas_tool_changed)
         self.canvas.colorSampled.connect(self._eyedropper_preview)
         self.canvas.colorSampleCommitted.connect(self._eyedropper_commit)
@@ -1330,6 +1347,7 @@ class MainWindow(QMainWindow):
             if tool is not None:
                 self._tool_hotkey_actions[action_id] = tool
         self._command_hotkey_actions = {
+            "swap_colors": self.color_panel.swap_colors.click,
             "save": self.save,
             "undo": self._undo,
             "redo": self._redo,
@@ -1976,8 +1994,12 @@ class MainWindow(QMainWindow):
             )
         )
 
+    def _disable_show_on_top(self, kind: str, identifier: str) -> None:
+        from comic_editor.ui.show_on_top_controls import set_show_on_top
+        set_show_on_top(self.canvas, kind, identifier, False)
+
     def _handle_solo_star_event(self, watched, event) -> bool:
-        """Handle stars before row selection, pen forwarding, or mask picking."""
+        """Handle stars/crowns before row selection, pen forwarding, or mask picking."""
         event_type = event.type()
         mouse = event_type in {QEvent.MouseButtonPress, QEvent.MouseButtonRelease}
         tablet = event_type in {QEvent.TabletPress, QEvent.TabletRelease}
@@ -2003,9 +2025,12 @@ class MainWindow(QMainWindow):
             from comic_editor.ui.tree_model import EyeVisibilityDelegate
             if (index.isValid()
                     and EyeVisibilityDelegate.star_rect(self.tree.visualRect(index)).contains(point)):
-                entries = self.canvas.solo_entities
-                entries.discard(pressed)
-                self.canvas.set_solo_entities(entries)
+                if getattr(self, "_outliner_badge_press_action", "solo") == "show_on_top":
+                    self._disable_show_on_top(*pressed)
+                else:
+                    entries = self.canvas.solo_entities
+                    entries.discard(pressed)
+                    self.canvas.set_solo_entities(entries)
             event.accept()
             return True
         index = self.tree.indexAt(point)
@@ -2014,10 +2039,12 @@ class MainWindow(QMainWindow):
         from comic_editor.ui.tree_model import EyeVisibilityDelegate
         item = self.hierarchy_model.item_for_index(index)
         key = (item.kind, item.entity_id)
-        if (key not in self.canvas.solo_entities
+        on_top = index.data(HierarchyModel.ShowOnTopRole)
+        if ((not on_top and key not in self.canvas.solo_entities)
                 or not EyeVisibilityDelegate.star_rect(self.tree.visualRect(index)).contains(point)):
             return False
         self._solo_star_press = key
+        self._outliner_badge_press_action = "show_on_top" if on_top else "solo"
         if tablet:
             self._tablet_outliner_contact = True
             self._tablet_outliner_suppress_mouse_until = time.monotonic() + 0.2
@@ -2992,7 +3019,7 @@ class MainWindow(QMainWindow):
     ) -> None:
         if self.canvas.active_tone_mask_id:
             self._activate_tool(ToolKind.GRADIENT)
-            self.statusBar().showMessage("Drag to draw a mask gradient; drag either endpoint to adjust it.", 7000)
+            self.statusBar().showMessage("Drag to draw a mask gradient; use the middle handle to move both endpoints.", 7000)
             return
         parent_id = self._gradient_context_parent_id()
         if not parent_id:
@@ -3010,7 +3037,9 @@ class MainWindow(QMainWindow):
             return
         if field_type == "line":
             self.statusBar().showMessage(
-                "Draw an open gradient path; Enter or double-click confirms.",
+                "Drag from the center to the edge to draw a circular gradient."
+                if self.canvas._gradient_tool_shape == "circular"
+                else "Drag from the first color to the last to draw a linear gradient.",
                 7000,
             )
         elif field_type == "radial":
@@ -3327,11 +3356,14 @@ class MainWindow(QMainWindow):
             return changed
         if len(self.canvas.selected_entities) > 1:
             primary_raster = isinstance(selected_object, RasterObject)
-            if tool not in {ToolKind.TRANSFORM, ToolKind.CAGE_TRANSFORM, ToolKind.FILL} or (
-                tool == ToolKind.FILL and not primary_raster
-            ):
+            available = {ToolKind.TRANSFORM, ToolKind.CAGE_TRANSFORM}
+            if primary_raster:
+                available.add(ToolKind.FILL)
+            if self.canvas._drawing_selection_raster_targets():
+                available.update({ToolKind.DRAW_SELECT_RECT, ToolKind.DRAW_SELECT_LASSO})
+            if tool not in available:
                 self.statusBar().showMessage(
-                    "Use Transform, or Fill with a raster as the primary item",
+                    "Use Transform, select rasters for drawing selection, or make a raster primary for Fill",
                     3000,
                 )
                 self._sync_tool_buttons()
@@ -3448,6 +3480,7 @@ class MainWindow(QMainWindow):
         )
         if len(self.canvas.selected_entities) > 1:
             primary_raster = isinstance(selected_object, RasterObject)
+            raster_selection = bool(self.canvas._drawing_selection_raster_targets())
             for candidate, button in self.tool_buttons.items():
                 available = candidate in {ToolKind.TRANSFORM, ToolKind.CAGE_TRANSFORM} or (
                     candidate == ToolKind.FILL and primary_raster
@@ -3457,7 +3490,14 @@ class MainWindow(QMainWindow):
             self.tool_buttons[ToolKind.TRANSFORM].setChecked(
                 self.canvas.tool == ToolKind.TRANSFORM
             )
-            self.drawing_selection_category.setVisible(False)
+            self.drawing_selection_category.setVisible(raster_selection)
+            for tool, button in self.drawing_selection_buttons.items():
+                available = raster_selection and tool != ToolKind.DRAW_SELECT_STROKE
+                button.setVisible(available)
+                button.setEnabled(available)
+                button.blockSignals(True)
+                button.setChecked(self.canvas.tool == tool)
+                button.blockSignals(False)
             self.fill_tool_button.setVisible(primary_raster)
             self.selection_settings.setVisible(False)
             self._sync_contextual_ribbon()
@@ -3632,7 +3672,7 @@ class MainWindow(QMainWindow):
         creating = context == "create"
         editing = context == "color"
         self.gradient_create_group.setVisible(creating)
-        self.gradient_type_group.setVisible(editing)
+        self.gradient_type_group.setVisible(creating or editing)
         self.gradient_parameters_group.setVisible(editing)
         self.gradient_thickness_group.setVisible(False)
         self.gradient_impact_group.setVisible(False)
@@ -5405,6 +5445,19 @@ class MainWindow(QMainWindow):
         self._sync_tool_buttons()
         self._mark_dirty(None)
 
+    def _object_records_changed(self, object_ids) -> None:
+        """Refresh restored object rows without resetting or scrolling the tree."""
+        for object_id in object_ids:
+            index = self.hierarchy_model.index_for_entity("object", object_id)
+            if index.isValid():
+                self.hierarchy_model.dataChanged.emit(index, index.siblingAtColumn(2), [])
+        self.selection_common.refresh()
+        self.selection_settings.refresh()
+        self.text_object_controls.refresh()
+        self.modifier_controls.refresh()
+        self._refresh_masks_panel()
+        self._sync_tool_buttons()
+
     def _hierarchy_changed(self) -> None:
         if self.chapter is not self.canvas.chapter:
             self.chapter = self.canvas.chapter
@@ -5417,26 +5470,34 @@ class MainWindow(QMainWindow):
         self.preview.invalidate_all()
         self._sync_tool_buttons()
 
+    def _hierarchy_expansion_changed(self, index: QModelIndex, expanded: bool) -> None:
+        item = self.hierarchy_model.item_for_index(index)
+        key = (item.kind, item.entity_id)
+        if expanded:
+            self._hierarchy_expanded_entities.add(key)
+        else:
+            self._hierarchy_expanded_entities.discard(key)
+
     def _expanded_layer_ids(self) -> set[str]:
-        result: set[str] = set()
+        # Qt reports expand/collapse, including bulk operations. Preserve
+        # those rows directly instead of querying every layer and drawing on
+        # every model reset (and every session switch).
         if self.chapter is None:
-            return result
-        for layer_id in self.chapter.layers:
-            index = self.hierarchy_model.index_for_entity("layer", layer_id)
-            if index.isValid() and self.tree.isExpanded(index):
-                result.add(layer_id)
-        for object_id, obj in self.chapter.objects.items():
-            if not isinstance(obj, VectorDrawingObject):
-                continue
-            index = self.hierarchy_model.index_for_entity(
-                "object", object_id
+            return set()
+        return {
+            entity_id for kind, entity_id in self._hierarchy_expanded_entities
+            if (
+                kind == "layer" and entity_id in self.chapter.layers
+            ) or (
+                kind == "object" and isinstance(
+                    self.chapter.objects.get(entity_id), VectorDrawingObject
+                )
             )
-            if index.isValid() and self.tree.isExpanded(index):
-                result.add(object_id)
-        return result
+        }
 
     def _capture_hierarchy_view_state(self) -> None:
         self._hierarchy_reset_expanded = self._expanded_layer_ids()
+        self._hierarchy_expanded_entities.clear()
 
     def _sync_hierarchy_selection(self, *, reveal: bool = False) -> None:
         """Match canvas selection, including entities inserted before a tree reset."""
@@ -5526,6 +5587,7 @@ class MainWindow(QMainWindow):
         if obj is None or self.chapter is None:
             return
         if preset_id == BUILTIN_PRIMARY_SECONDARY_ID:
+            gradient_shape = "linear"
             primary = (
                 self.series.primary_color
                 if self.series is not None else self.color_panel.primary_color()
@@ -5544,6 +5606,7 @@ class MainWindow(QMainWindow):
             if preset is None:
                 return
             ramp = preset.ramp.copy()
+            gradient_shape = preset.gradient_shape
         before = self.chapter.to_dict()
         color_ramp = MainWindow._gradient_color_ramp(obj)
         color_ramp.stops = [
@@ -5554,8 +5617,11 @@ class MainWindow(QMainWindow):
             for stop in ramp.stops
         ]
         color_ramp.validate()
+        obj.gradient_shape = gradient_shape
         obj.loaded_preset_id = preset_id
         obj.touch_revision()
+        self.canvas.set_gradient_shape(gradient_shape)
+        self.gradient_tools_controls._touch_mask_gradient(obj)
         after = self.chapter.to_dict()
         self.canvas.push_model_change(
             before, after, "Load gradient preset"
@@ -5583,7 +5649,8 @@ class MainWindow(QMainWindow):
         while f"Gradient {number}".casefold() in used:
             number += 1
         preset = ColorGradientRampPreset(
-            name=f"Gradient {number}", ramp=MainWindow._gradient_color_ramp(obj).copy()
+            name=f"Gradient {number}", ramp=MainWindow._gradient_color_ramp(obj).copy(),
+            gradient_shape=obj.gradient_shape,
         )
         self.series.gradient_ramp_presets.append(preset)
         if self.chapter is not None:
@@ -5604,6 +5671,7 @@ class MainWindow(QMainWindow):
         if preset is None or obj is None:
             return
         preset.ramp = MainWindow._gradient_color_ramp(obj).copy()
+        preset.gradient_shape = obj.gradient_shape
         preset.validate()
         obj.loaded_preset_id = preset_id
         self._schedule_series_preferences_save(immediate=True)
@@ -6630,6 +6698,19 @@ class MainWindow(QMainWindow):
         self.add_free_text_button.setEnabled(active)
         self._sync_tool_buttons()
 
+    def _show_performance_monitor(self) -> None:
+        from comic_editor.ui.performance_monitor import PerformanceMonitorController
+        from comic_editor.ui.performance_monitor_dialog import PerformanceMonitorDialog
+
+        controller = getattr(self, "_performance_monitor_controller", None)
+        if controller is None:
+            controller = PerformanceMonitorController(self)
+            self._performance_monitor_controller = controller
+            self._performance_monitor_dialog = PerformanceMonitorDialog(controller, self)
+        self._performance_monitor_dialog.show()
+        self._performance_monitor_dialog.raise_()
+        self._performance_monitor_dialog.activateWindow()
+
     def _toggle_fullscreen(self) -> None:
         self.showNormal() if self.isFullScreen() else self.showFullScreen()
 
@@ -6656,6 +6737,9 @@ class MainWindow(QMainWindow):
         elif not self._confirm_discard_or_save():
             event.ignore()
             return
+        monitor = getattr(self, "_performance_monitor_controller", None)
+        if monitor is not None:
+            monitor.stop()
         self.autosave_timer.stop()
         self._autosave_jobs.shutdown()
         self.blender_sources.shutdown()

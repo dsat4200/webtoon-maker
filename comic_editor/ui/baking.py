@@ -160,6 +160,7 @@ def rasterize(canvas, kind, identifier):
     replacement = ImageObject(
         object_id=identifier, parent_layer_id=parent_id, name=target.name,
         custom_name=getattr(target, "custom_name", True), visible=target.visible,
+        show_on_top=target.show_on_top,
         mask_only=target.mask_only, fill_reference=target.fill_reference,
         ignore_parent_mask=getattr(target, "ignore_parent_mask", False),
         geometry_reference=getattr(target, "geometry_reference", "direct"),

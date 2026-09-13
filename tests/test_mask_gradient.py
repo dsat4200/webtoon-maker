@@ -69,7 +69,9 @@ def test_mask_gradient_mouse_creation_render_export_and_round_trip(canvas):
     assert gradient.object_id not in canvas.chapter.objects
     assert gradient.mask_only
     assert [n.position for n in gradient.line_field.geometry.nodes] == [(100, 200), (400, 200)]
-    assert len(canvas._gradient_control_points(gradient)) == 2
+    controls = canvas._gradient_control_points(gradient)
+    assert len(controls) == 3
+    assert controls["translate:"] == QPointF(250, 200)
     canvas._update_interaction_cursor(canvas.document_to_widget(QPointF(100, 200)))
     assert canvas.cursor().shape() == Qt.PointingHandCursor
     assert _field(canvas)[200, [50, 250, 450]] == pytest.approx([0, .5, 1], abs=.01)

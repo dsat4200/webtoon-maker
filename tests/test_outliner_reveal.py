@@ -139,3 +139,40 @@ def test_clicking_visible_tree_row_does_not_move_it_under_pointer(window, qapp):
     qapp.processEvents()
     assert window.tree.visualRect(index) == before
     assert window.tree.currentIndex().siblingAtColumn(0) == index
+
+
+def test_expansion_state_survives_reset_with_collapsed_ancestor(window):
+    outer = window.hierarchy_model.index_for_entity("layer", window._test_outer.layer_id)
+    inner = window.hierarchy_model.index_for_entity("layer", window._test_inner.layer_id)
+    window.tree.setExpanded(outer, True)
+    window.tree.setExpanded(inner, True)
+    window.tree.setExpanded(outer, False)
+    assert window._test_inner.layer_id in window._expanded_layer_ids()
+    assert window._test_outer.layer_id not in window._expanded_layer_ids()
+
+    window._refresh_hierarchy()
+    outer = window.hierarchy_model.index_for_entity("layer", window._test_outer.layer_id)
+    inner = window.hierarchy_model.index_for_entity("layer", window._test_inner.layer_id)
+    assert not window.tree.isExpanded(outer)
+    assert window.tree.isExpanded(inner)
+
+
+def test_bulk_expansion_and_collapsing_update_saved_state(window):
+    window.tree.expandAll()
+    assert set(window.chapter.layers) == window._expanded_layer_ids()
+    window.tree.collapseAll()
+    assert window._expanded_layer_ids() == set()
+    window._refresh_hierarchy()
+    assert window._expanded_layer_ids() == set()
+
+
+def test_expansion_snapshot_does_not_query_every_tree_row(window, monkeypatch):
+    window.tree.collapseAll()
+    index = window.hierarchy_model.index_for_entity("layer", window._test_outer.layer_id)
+    window.tree.setExpanded(index, True)
+
+    def unexpected_query(*_):
+        raise AssertionError("Expansion capture should use tree expansion events")
+
+    monkeypatch.setattr(window.tree, "isExpanded", unexpected_query)
+    assert window._expanded_layer_ids() == {window._test_outer.layer_id}

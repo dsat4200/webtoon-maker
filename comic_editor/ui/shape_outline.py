@@ -31,14 +31,25 @@ def path_key(path):
 
 def _size(value):
     """Conservative accounting including Python keys and Qt path storage."""
-    if isinstance(value, QPainterPath):
-        return 256 + value.elementCount() * 32
-    if isinstance(value, (tuple, list)):
-        return sys.getsizeof(value) + sum(_size(v) for v in value)
-    if hasattr(value, "__dataclass_fields__"):
-        return sys.getsizeof(value) + sum(_size(getattr(value, k))
-                                         for k in value.__dataclass_fields__)
-    return sys.getsizeof(value)
+    total, pending = 0, [value]
+    scalars = (float, int, str, bool, bytes, type(None))
+    sizeof = sys.getsizeof
+    while pending:
+        item = pending.pop()
+        kind = type(item)
+        if kind in scalars:
+            total += sizeof(item)
+        elif isinstance(item, QPainterPath):
+            total += 256 + item.elementCount() * 32
+        elif isinstance(item, (tuple, list)):
+            total += sizeof(item)
+            pending.extend(item)
+        else:
+            total += sizeof(item)
+            fields = getattr(item, "__dataclass_fields__", None)
+            if fields is not None:
+                pending.extend(getattr(item, name) for name in fields)
+    return total
 
 
 class OutlineCache:
@@ -84,7 +95,12 @@ def _cached(cache, key, build):
 
 
 def _area(points):
-    return sum(a.x() * b.y() - b.x() * a.y()
+    if not points:
+        return 0.
+    # Translation must not change winding. Large chapter coordinates otherwise
+    # lose the sign of tiny join sectors through cancellation in x*y products.
+    x, y = points[0].x(), points[0].y()
+    return sum((a.x()-x)*(b.y()-y) - (b.x()-x)*(a.y()-y)
                for a, b in zip(points, points[1:] + points[:1]))
 
 
@@ -167,7 +183,14 @@ def clip_coverage(coverage, fill, core=None, tolerance=.125):
     # Qt's boolean operator flattens curves in its input coordinate system.
     # Work at output precision, not fixed document precision when zoomed in.
     scale = max(1., .25 / tolerance)
-    mapping = QTransform.fromScale(scale, scale)
+    # Long chapters put tiny outline joins thousands of units from the origin.
+    # Qt's Boolean normalization can then drop the inner contour of a stroke,
+    # painting the whole fill. An integer local origin keeps those operations
+    # numerically stable while preserving the binary snapping grid below.
+    center = coverage.controlPointRect().center()
+    origin_x, origin_y = round(center.x()), round(center.y())
+    mapping = (QTransform.fromTranslate(-origin_x, -origin_y)
+               * QTransform.fromScale(scale, scale))
     # Canonicalize overlapping winding pieces ONCE before Qt's clipper. Its
     # intersection fast path otherwise loses lobes where wide caps overlap
     # their own strips. Incremental unions have the same failure, plus O(n²)
@@ -175,7 +198,9 @@ def clip_coverage(coverage, fill, core=None, tolerance=.125):
     coverage = _snap_boolean_vertices(mapping.map(coverage)).simplified()
     result = (coverage.subtracted(_snap_boolean_vertices(mapping.map(core))) if core is not None
               else coverage.intersected(_snap_boolean_vertices(mapping.map(fill))))
-    return QTransform.fromScale(1/scale, 1/scale).map(result)
+    restore = (QTransform.fromScale(1/scale, 1/scale)
+               * QTransform.fromTranslate(origin_x, origin_y))
+    return restore.map(result)
 
 
 def _snap_boolean_vertices(path):
@@ -327,10 +352,32 @@ def round_join(point, radius, incoming, outgoing):
         return QPainterPath()
     side = -1 if angle > 0 else 1
     normal = QPointF(-incoming.y(), incoming.x())*side
-    result = QPainterPath(point)
+    # Give the sector a tiny overlap inside both adjoining strips. Snapping
+    # their opposite endpoints to the boolean grid can move an otherwise
+    # shared radial edge off the snapped center by a few millionths of a pixel.
+    overlap = min(radius/8, 1/4096)
+    result = QPainterPath(point-incoming*overlap)
     result.lineTo(point+normal*radius)
-    result.arcTo(QRectF(point.x()-radius, point.y()-radius, 2*radius, 2*radius),
-                 math.degrees(math.atan2(-normal.y(), normal.x())), -math.degrees(angle))
+    # Qt's arcTo approximates non-cardinal start/end positions. Those points
+    # can miss the adjoining strips by several thousandths of a pixel, leaving
+    # a radial crack that becomes a visible interior line when the core is
+    # outlined. Build circular cubics with the strips' exact shared endpoints.
+    count = max(1, math.ceil(abs(angle) / (math.pi/2)))
+    step = angle / count
+    factor = 4/3 * math.tan(step/4)
+    start = normal
+    for index in range(count):
+        if index == count-1:
+            end = QPointF(-outgoing.y(), outgoing.x())*side
+        else:
+            sweep = (index+1)*step
+            end = QPointF(normal.x()*math.cos(sweep)-normal.y()*math.sin(sweep),
+                          normal.x()*math.sin(sweep)+normal.y()*math.cos(sweep))
+        first = point + (start+QPointF(-start.y(), start.x())*factor)*radius
+        second = point + (end-QPointF(-end.y(), end.x())*factor)*radius
+        result.cubicTo(first, second, point+end*radius)
+        start = end
+    result.lineTo(point+outgoing*overlap)
     result.closeSubpath()
     return positive_path(result)
 

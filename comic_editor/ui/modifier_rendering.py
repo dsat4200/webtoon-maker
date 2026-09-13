@@ -648,7 +648,7 @@ def apply_modifier_stack(
                 inner = modifier.focal_radius * modifier.focal_ramp
                 denominator = max(1e-6, modifier.focal_radius - inner)
                 mask = np.clip((distance - inner) / denominator, 0.0, 1.0)
-                mask = mask[..., None] * amount
+                mask = mask * amount
             else:
                 mask = amount
         elif isinstance(modifier, RadialBlurModifier):

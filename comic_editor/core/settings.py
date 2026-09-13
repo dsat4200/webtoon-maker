@@ -20,6 +20,7 @@ def default_hotkeys() -> dict[str, str]:
         "object_select": "S",
         "transform": "T",
         "eyedropper": "I",
+        "swap_colors": "",
         "shape_edit": "B",
         "vector_redraw": "",
         "vector_connect": "",

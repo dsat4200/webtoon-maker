@@ -17,7 +17,10 @@ from comic_editor.core.stroke_geometry import (
 )
 from comic_editor.ui.shape_contours import compile_bound, geometry_key
 from comic_editor.ui.shape_outline import path_key
-from comic_editor.ui.shape_outline_compound import compound_outline, transform_key
+from comic_editor.ui.shape_outline_compound import (
+    compound_outline, transform_key, _uniform_compound_outline,
+)
+from comic_editor.ui.compound_outline_painting import prepare_outline_raster
 from comic_editor.ui.stroke_rendering import mask_parameters, nearest_coordinates
 from comic_editor.ui.effect_pipeline import empty_image, aligned
 from comic_editor.ui.modifier_rendering import _qimage_premultiplied, _premultiplied_qimage
@@ -51,13 +54,25 @@ class Appearance:
 
 def _outline_styles(bound, loops):
     """Carry per-anchor width and enabled flags onto the derived render samples."""
+    styles = {
+        (node.outline_multiplier, node.outline_enabled)
+        for contour in bound.iter_contours() for node in contour.nodes
+    }
+    if len(styles) == 1:
+        # Uniform outlines need no geometric attribution. This is also exact
+        # for non-default widths and disabled outlines, including multiple
+        # contours: every nearest source sample would return this same pair.
+        width, enabled = next(iter(styles))
+        return [(np.full(len(loop.points), width),
+                 np.full(len(loop.points), enabled, dtype=bool)) for loop in loops]
     samples, widths, enabled = [], [], []
     for contour, source in zip(compile_bound(bound), bound.iter_contours()):
         for edge in contour.edges:
             first, last = source.nodes[edge.index], source.nodes[(edge.index+1) % len(source.nodes)]
-            count = min(8192, max(2, int(edge.path.length()*2)+1))
+            length = edge.path.length()
+            count = min(8192, max(2, int(length*2)+1))
             for fraction in np.linspace(0, 1, count, endpoint=False):
-                samples.append(edge.path.pointAtPercent(edge.path.percentAtLength(edge.path.length()*fraction)).toTuple())
+                samples.append(edge.path.pointAtPercent(edge.path.percentAtLength(length*fraction)).toTuple())
                 widths.append(first.outline_multiplier+(last.outline_multiplier-first.outline_multiplier)*fraction)
                 enabled.append(first.outline_enabled)
     if not samples:
@@ -66,6 +81,28 @@ def _outline_styles(bound, loops):
     widths, enabled = np.asarray(widths), np.asarray(enabled)
     return [(widths[indexes], enabled[indexes]) for loop in loops
             for indexes in [tree.query(loop.points)[1]]]
+
+
+def _boundary_indexes(loop, style):
+    """Omit redundant straight-span vertices from constant-style boundaries.
+
+    All deformation, mask, opacity and dash samples remain in the full loop.
+    This only removes collinear polygon anchors at floating-point precision;
+    the distance threshold is independent of zoom and preview quality.
+    """
+    points = loop.points
+    if len(points) < 4 or not (np.all(style[0] == style[0][0])
+                               and np.all(style[1] == style[1][0])):
+        return np.arange(len(points))
+    incoming, outgoing = points-np.roll(points, 1, axis=0), np.roll(points, -1, axis=0)-points
+    chord = incoming+outgoing
+    length = np.linalg.norm(chord, axis=1)
+    cross = incoming[:, 0]*outgoing[:, 1]-incoming[:, 1]*outgoing[:, 0]
+    roundoff = np.finfo(float).eps * max(1., float(np.max(np.abs(points)))) * 32
+    redundant = ((np.abs(cross) <= roundoff*length)
+                 & (np.sum(incoming*outgoing, axis=1) >= 0) & (length > roundoff))
+    indexes = np.flatnonzero(~redundant)
+    return indexes if len(indexes) >= 3 else np.arange(len(points))
 
 
 def appearance(canvas, layer, document=None):
@@ -78,10 +115,14 @@ def appearance(canvas, layer, document=None):
         return None
     mapping = canvas._document_layer_world_transform(document, layer.layer_id)
     mask_signature = canvas._modifier_parameter_signature([m.modifier_id for m in effects]) if document is canvas.chapter else ()
-    key = (geometry_key(layer.bound), layer.border_width,
+    # Unmasked stroke effects are defined in the owner's local geometry.
+    # Translation/affine placement cannot change these samples; world-space
+    # parameter masks still require the complete placement in their key.
+    placement = transform_key(mapping) if any(m.parameter_masks for m in effects) else ()
+    key = (geometry_key(layer.bound), layer.vertex_radius, layer.border_width,
            tuple(tuple((n.outline_multiplier, n.outline_enabled) for n in contour.nodes)
                  for contour in layer.bound.iter_contours()),
-           tuple(repr(m.to_dict()) for m in effects), mask_signature, transform_key(mapping))
+           tuple(repr(m.to_dict()) for m in effects), mask_signature, placement)
     cache = getattr(canvas, "_compound_stroke_appearances", None)
     if cache is None:
         cache = canvas._compound_stroke_appearances = {}
@@ -119,8 +160,9 @@ def appearance(canvas, layer, document=None):
         else:
             styles = _outline_styles(layer.bound, original)
             contours = [PathContour(nodes=[PathNode(node_id=f"stroke:{layer.layer_id}:{ci}:{pi}",
-                x=float(point[0]), y=float(point[1]), outline_multiplier=float(width), outline_enabled=bool(enabled))
-                for pi, (point, width, enabled) in enumerate(zip(loop.points, style[0], style[1]))], closed=True)
+                x=float(loop.points[pi, 0]), y=float(loop.points[pi, 1]),
+                outline_multiplier=float(style[0][pi]), outline_enabled=bool(style[1][pi]))
+                for pi in _boundary_indexes(loop, style)], closed=True)
                 for ci, (loop, style) in enumerate(zip(loops, styles))]
             bound = BoundGeometry(nodes=contours[0].nodes, closed=True, primitive="custom", additional_contours=contours[1:])
             path = canvas.bound_path(bound)
@@ -194,9 +236,31 @@ def paint_outline(canvas, painter, layer, path, sources, tolerance=.125):
             modified[index] = value
     ordinary = tuple(index for index in range(len(sources)) if index not in modified)
     color = QColor(layer.border_color)
+    indices = (*ordinary, -1)
+    # A short final boundary can still produce hundreds of overlapping pieces
+    # from a curved/tapered contributor. Qt's geometric clip can lose the inner
+    # contour of that coverage, filling the entire bubble with outline color.
+    # Judge complexity from the generated coverage, not the final boundary.
+    # Complete uniform outlines retain their native cached geometry.
+    raster = (prepare_outline_raster(painter, path)
+              if not _uniform_compound_outline(
+                  layer.border_width, sources, indices) else None)
+    if raster is not None and raster.bounds.isEmpty():
+        return
     base = compound_outline(path, layer.border_width, sources, canvas._outline_cache, tolerance,
-                            source_indices=(*ordinary, -1))
-    painter.fillPath(base, color)
+                            source_indices=indices, clip=raster is None)
+    if raster is not None and base.elementCount() <= 128:
+        # Simple variable-width shapes must retain the same geometric edge
+        # pixels as their standalone form. The raw build above shares cached
+        # attribution/edge meshes with this clipped result.
+        raster = None
+        base = compound_outline(path, layer.border_width, sources, canvas._outline_cache, tolerance,
+                                source_indices=indices, clip=True)
+    if raster is None:
+        painter.fillPath(base, color)
+    else:
+        raster.paint(painter, base, path, color)
+        del raster
     for index, value in modified.items():
         coverage = compound_outline(path, layer.border_width, sources, canvas._outline_cache, tolerance,
                                     source_indices=(index,))

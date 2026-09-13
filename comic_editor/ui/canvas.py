@@ -36,7 +36,7 @@ from PySide6.QtGui import (
     QTextCursor, QTextDocument, QTransform, QValidator,
 )
 from PySide6.QtOpenGLWidgets import QOpenGLWidget
-from PySide6.QtNetwork import QNetworkAccessManager, QNetworkReply, QNetworkRequest
+from PySide6.QtNetwork import QNetworkReply, QNetworkRequest
 from PySide6.QtWidgets import (
     QAbstractSpinBox, QApplication, QHBoxLayout, QSpinBox, QToolButton, QWidget,
 )
@@ -103,6 +103,10 @@ from comic_editor.ui.tiling_features import TilingFeatures
 from comic_editor.ui.mask_gradient import MaskGradientFeatures
 from comic_editor.ui.mask_selection import MaskSelectionFeatures
 from comic_editor.ui.solo_features import SoloFeatures
+from comic_editor.ui.show_on_top_features import ShowOnTopFeatures
+from comic_editor.ui.scene_culling import SceneRenderBounds
+from comic_editor.ui.network import create_network_manager
+from comic_editor.ui.multi_raster_selection import MultiRasterSelectionFeatures
 
 
 class ToolKind(Enum):
@@ -563,6 +567,7 @@ class CanvasPerformanceMonitor:
     """Small bounded recorder for drawing-handler and frame timings."""
 
     def __init__(self, capacity: int = 512) -> None:
+        self.enabled = False
         self.input_ms: deque[float] = deque(maxlen=capacity)
         self.submit_ms: deque[float] = deque(maxlen=capacity)
         self.frame_ms: deque[float] = deque(maxlen=capacity)
@@ -589,7 +594,7 @@ class CanvasPerformanceMonitor:
         }
 
 
-class _CanvasLogic(SoloFeatures, ViewFeatures, MaskSelectionFeatures, MaskGradientFeatures, TilingFeatures, CageFeatures, ArrayFeatures, SpatialModifierFeatures, TextFeatures):
+class _CanvasLogic(MultiRasterSelectionFeatures, ShowOnTopFeatures, SoloFeatures, ViewFeatures, MaskSelectionFeatures, MaskGradientFeatures, TilingFeatures, CageFeatures, ArrayFeatures, SpatialModifierFeatures, TextFeatures):
     documentChanged = Signal(object)
     viewSettingsChanged = Signal()
     visualChanged = Signal(object)
@@ -598,6 +603,7 @@ class _CanvasLogic(SoloFeatures, ViewFeatures, MaskSelectionFeatures, MaskGradie
     soloChanged = Signal(object)
     hierarchyChanged = Signal()
     chapterReplaced = Signal(object)
+    objectRecordsChanged = Signal(object)
     cameraChanged = Signal()
     interactionFinished = Signal()
     maskContentChanged = Signal()
@@ -740,6 +746,8 @@ class _CanvasLogic(SoloFeatures, ViewFeatures, MaskSelectionFeatures, MaskGradie
         self._outline_distance_cache = OutlineDistanceCache()
         self._blur_pyramid_cache = BlurPyramidCache()
         self._rendering_compound_references = False
+        self._rendering_halftone_source = False
+        self._tiling_capture_geometry = None
         self._rendering_outward_gradient = False
         self._live_underlay_object_id = ""
         self._live_underlay_amount = 0.0
@@ -809,6 +817,9 @@ class _CanvasLogic(SoloFeatures, ViewFeatures, MaskSelectionFeatures, MaskGradie
         self._gradient_creation_family = "color_fill"
         self._gradient_creation_before: dict | None = None
         self._gradient_tool_field_type = "line"
+        self._gradient_tool_shape = "linear"
+        self._gradient_drag_nodes = ()
+        self._gradient_last_pointer_doc = None
         self._selected_shape_node_id = ""
         self._selected_shape_node_ids: set[str] = set()
         self._shape_drag_nodes: dict[str, dict] = {}
@@ -831,6 +842,7 @@ class _CanvasLogic(SoloFeatures, ViewFeatures, MaskSelectionFeatures, MaskGradie
             str, list[tuple[float, float]]
         ] = {}
         self._shape_control_dragged = False
+        self._shape_last_pointer_doc: QPointF | None = None
         self._shape_hover_insert: tuple[int, float, QPointF] | None = None
         self._shape_hover_target: dict | None = None
         self._pending_primitive_insert: (
@@ -870,6 +882,7 @@ class _CanvasLogic(SoloFeatures, ViewFeatures, MaskSelectionFeatures, MaskGradie
         self._compound_path_cache: dict[str, QPainterPath] = {}
         self._outline_cache = OutlineCache()
         self._compound_geometry_signature = None
+        self._compound_geometry_dirty = True
         # Stroke images are deliberately cached independently.  A drawing can
         # contain thousands of strokes, so editing one must not evict every
         # unrelated image.  The tuple key is intentionally permissive because
@@ -943,6 +956,8 @@ class _CanvasLogic(SoloFeatures, ViewFeatures, MaskSelectionFeatures, MaskGradie
         self._selection_vector_preview_revision = 0
         self._selection_shape_nodes: dict[str, dict] = {}
         self._selection_before_tiles: dict[tuple[int, int], QImage] | None = None
+        self._selection_raster_states: dict[str, dict] = {}
+        self._selection_raster_snapshot: dict | None = None
         self._selection_overlay_tiles: (
             dict[tuple[int, int], QImage] | None
         ) = None
@@ -1002,13 +1017,14 @@ class _CanvasLogic(SoloFeatures, ViewFeatures, MaskSelectionFeatures, MaskGradie
         self._external_drag_replies: dict[QNetworkReply, tuple[int, dict]] = {}
         self._pending_external_drop: dict | None = None
         self._external_drag_widget = QPointF()
-        self._network_manager = QNetworkAccessManager(self)
+        self._network_manager = create_network_manager(self)
         self._asset_drag_image = QImage()
         self._asset_drag_world = QPointF()
         self._asset_drag_parent_id = ""
         self._asset_drag_valid = False
         self._asset_drag_clip_cache: dict[str, QPainterPath | None] = {}
         self._scene_cache = QImage()
+        self._render_bounds = SceneRenderBounds(self)
         self._scene_cache_key: tuple | None = None
         self._scene_dirty_full = True
         self._scene_dirty_widget = QRect()
@@ -1022,6 +1038,8 @@ class _CanvasLogic(SoloFeatures, ViewFeatures, MaskSelectionFeatures, MaskGradie
         self.documentChanged.connect(self._clear_compound_path_cache)
         self.documentChanged.connect(self._document_visual_changed)
         self.documentChanged.connect(self._invalidate_fill_reference_cache)
+        self.documentChanged.connect(self._render_bounds.clear)
+        self.hierarchyChanged.connect(self._render_bounds.clear)
         self.hierarchyChanged.connect(self._clear_compound_path_cache)
         self.hierarchyChanged.connect(self._invalidate_scene_cache)
         self.setMinimumSize(480, 480)
@@ -1417,8 +1435,14 @@ class _CanvasLogic(SoloFeatures, ViewFeatures, MaskSelectionFeatures, MaskGradie
         self._scene_dirty_full = False
         self._scene_dirty_widget = QRect()
 
-    def _render_scene_cache_rect(self, dirty: QRect) -> None:
-        painter = QPainter(self._scene_cache)
+    def _invalidate_render_bounds(self, kind: str, entity_id: str) -> None:
+        self._render_bounds.invalidate(kind, entity_id)
+
+    def _render_scene_cache_rect(
+        self, dirty: QRect, *, target: QImage | None = None, live_ink=False,
+    ) -> None:
+        self._render_bounds.prepare()
+        painter = QPainter(self._scene_cache if target is None else target)
         painter.setClipRect(dirty)
         painter.fillRect(dirty, QColor("#242428"))
         painter.setRenderHint(QPainter.Antialiasing, True)
@@ -1445,13 +1469,9 @@ class _CanvasLogic(SoloFeatures, ViewFeatures, MaskSelectionFeatures, MaskGradie
         # Keep glyphs in the ordinary hierarchy on every typing/deletion frame;
         # only caret/selection are painted later as an editing overlay.
         try:
-            for page_id in reversed(self.chapter.root_page_ids):
-                self._render_layer(
-                    painter, self.chapter.layers[page_id], 1.0, visible
-                )
+            self._render_scene_layers(painter, visible, underlay=True, live_ink=live_ink)
         finally:
             self._interactive_render = previous_interactive
-        self._render_selected_drawing_underlay(painter, visible)
         self._clear_live_underlay_context()
         self._draw_grid(painter, visible)
         painter.restore()
@@ -1468,6 +1488,10 @@ class _CanvasLogic(SoloFeatures, ViewFeatures, MaskSelectionFeatures, MaskGradie
             self.set_export_rect_editing(False)
         self._view_overflow_image = QImage()
         self._mask_selection_gesture = None
+        self._active_gradient_control = None
+        self._gradient_drag_nodes = ()
+        self._gradient_last_pointer_doc = None
+        self._gradient_preview_active = False
         self._effect_jobs.cancel()
         self._clear_creation_gesture()
         self._cancel_text_features()
@@ -1674,6 +1698,8 @@ class _CanvasLogic(SoloFeatures, ViewFeatures, MaskSelectionFeatures, MaskGradie
             self._selection_before_model = None
             self._selection_before_tiles = None
             self._selection_overlay_tiles = None
+            self._selection_raster_states.clear()
+            self._selection_raster_snapshot = None
             self._selection_vector_preview.clear()
             self._selection_vector_preview_revision += 1
             self._selection_vector_points.clear()
@@ -1818,10 +1844,18 @@ class _CanvasLogic(SoloFeatures, ViewFeatures, MaskSelectionFeatures, MaskGradie
         self.active_color_slot = slot
 
     def replace_chapter(self, state: dict) -> None:
+        self._restore_history_state(state)
+
+    def _restore_history_state(self, state: dict, *, objects_only: bool = False) -> None:
+        """Restore history, optionally retaining an unchanged document graph."""
         self._reset_export_rect_editor()
         self._cancel_mask_selection()
         self._mask_gradient_drag = None
         self._cage_timer.stop()
+        self._active_gradient_control = None
+        self._gradient_drag_nodes = ()
+        self._gradient_last_pointer_doc = None
+        self._gradient_preview_active = False
         self._cage_session = self._cage_edit_before = self._cage_drag = self._cage_pending = None
         self._effect_jobs.cancel()
         self._radial_handle_timer.stop()
@@ -1837,7 +1871,10 @@ class _CanvasLogic(SoloFeatures, ViewFeatures, MaskSelectionFeatures, MaskGradie
         self._clear_page_gap_editor()
         self.pageGapConfirmationChanged.emit(False)
         self.pageGapModeChanged.emit(False)
-        self.chapter = ChapterDocument.from_dict(state)
+        if objects_only:
+            self._restore_vector_payloads(state)
+        else:
+            self.chapter = ChapterDocument.from_dict(state)
         self.viewSettingsChanged.emit()
         self._compound_path_cache.clear()
         self._gradient_geometry_cache.clear()
@@ -1872,13 +1909,56 @@ class _CanvasLogic(SoloFeatures, ViewFeatures, MaskSelectionFeatures, MaskGradie
             self.selected_entities = restored
         self._restore_modifier_selection()
         self._sync_selection_levels()
-        self.chapterReplaced.emit(self.chapter)
-        self.hierarchyChanged.emit()
-        self.selectionChanged.emit(self.selected_kind, self.selected_id)
-        self.selectionSetChanged.emit(list(self.selected_entities))
+        if objects_only:
+            self.objectRecordsChanged.emit(tuple(state))
+            self.documentChanged.emit(QRectF())
+        else:
+            self.chapterReplaced.emit(self.chapter)
+            self.hierarchyChanged.emit()
+            self.selectionChanged.emit(self.selected_kind, self.selected_id)
+            self.selectionSetChanged.emit(list(self.selected_entities))
         self.update()
 
     def push_model_change(self, before: dict, after: dict, label: str) -> None:
+        # Most transforms and object-property edits leave the hierarchy and
+        # every other chapter record unchanged. Retain only those object
+        # records for history, avoiding whole-chapter parsing on every undo.
+        # Structural edits and vector hierarchy edits use the full fallback.
+        # Image source changes also retain the full restore notifications so
+        # linked Blender views reconnect and reconcile their cached frame.
+        if (
+            before.keys() == after.keys()
+            and all(before[key] == after[key] for key in before if key != "objects")
+        ):
+            before_objects = {item["id"]: item for item in before.get("objects", [])}
+            after_objects = {item["id"]: item for item in after.get("objects", [])}
+            changed = {
+                identifier for identifier in before_objects.keys() | after_objects.keys()
+                if before_objects.get(identifier) != after_objects.get(identifier)
+            }
+            if changed and all(
+                identifier in before_objects and identifier in after_objects
+                and before_objects[identifier].get("type")
+                    == after_objects[identifier].get("type")
+                and after_objects[identifier].get("type") in {"raster", "image", "text"}
+                and before_objects[identifier].get("parent_layer_id")
+                    == after_objects[identifier].get("parent_layer_id")
+                and (
+                    after_objects[identifier].get("type") != "image"
+                    or all(before_objects[identifier].get(field)
+                           == after_objects[identifier].get(field)
+                           for field in ("source", "source_filename", "source_mime_type"))
+                )
+                for identifier in changed
+            ):
+                old_records = {identifier: before_objects[identifier] for identifier in changed}
+                new_records = {identifier: after_objects[identifier] for identifier in changed}
+                self.command_stack.push(CallbackCommand(
+                    label,
+                    lambda: self._restore_history_state(new_records, objects_only=True),
+                    lambda: self._restore_history_state(old_records, objects_only=True),
+                ), already_done=True)
+                return
         self.command_stack.push(
             CallbackCommand(
                 label,
@@ -2078,38 +2158,44 @@ class _CanvasLogic(SoloFeatures, ViewFeatures, MaskSelectionFeatures, MaskGradie
     def _vector_changed(
         self, hierarchy: bool = False,
         changed_stroke_ids: set[str] | None = None,
+        *, changed_drawing_ids: set[str] | None = None,
     ) -> None:
         """Notify vector consumers and invalidate only affected stroke images.
 
-        ``changed_stroke_ids`` is supplied by live editing paths.  A missing
-        value means a structural restore (undo/redo, deletion, or hierarchy
-        change), for which clearing the drawing cache is the safe fallback.
-        This keeps the old behaviour for model restores while making pointer
-        updates cheap for large drawings.
+        Live edits and focused history commands supply the changed strokes.
+        Unspecified changes retain the conservative full-cache fallback.
+        History also identifies its drawings because the current selection
+        can have changed before undo/redo runs.
         """
+        drawing = self._active_vector_drawing()
+        drawing_ids = (
+            changed_drawing_ids if changed_drawing_ids is not None
+            else {drawing.object_id} if drawing is not None else set()
+        )
         if changed_stroke_ids is None:
             self._clear_vector_render_cache()
             self._vector_spatial_indexes.clear()
-        elif changed_stroke_ids:
+        else:
             self._invalidate_vector_cache_strokes(changed_stroke_ids)
-            drawing = self._active_vector_drawing()
-            if drawing is not None:
-                self._vector_spatial_indexes.pop(drawing.object_id, None)
-        drawing = self._active_vector_drawing()
+            for drawing_id in drawing_ids:
+                self._vector_spatial_indexes.pop(drawing_id, None)
+        for drawing_id in drawing_ids:
+            self._invalidate_render_bounds("object", drawing_id)
         if drawing is not None:
-            live_strokes = {stroke.stroke_id for stroke in drawing.strokes}
-            live_points = {
-                point.point_id
-                for stroke in drawing.strokes
-                for point in stroke.points
-            }
-            self._selected_vector_stroke_ids &= live_strokes
+            if self._selected_vector_stroke_ids:
+                self._selected_vector_stroke_ids.intersection_update(
+                    stroke.stroke_id for stroke in drawing.strokes
+                )
             if self.tool == ToolKind.DRAW_SELECT_STROKE:
                 self._selected_vector_point_ids = self._point_ids_for_strokes(
                     drawing, self._selected_vector_stroke_ids
                 )
-            else:
-                self._selected_vector_point_ids &= live_points
+            elif self._selected_vector_point_ids:
+                self._selected_vector_point_ids.intersection_update(
+                    point.point_id
+                    for stroke in drawing.strokes
+                    for point in stroke.points
+                )
         else:
             self._selected_vector_stroke_ids.clear()
             self._selected_vector_point_ids.clear()
@@ -2151,45 +2237,91 @@ class _CanvasLogic(SoloFeatures, ViewFeatures, MaskSelectionFeatures, MaskGradie
         }
         if before == after:
             return False
+        # A vector edit used to evict every drawing's rasterized strokes.
+        # Compare the records already captured for undo instead of touching
+        # unrelated drawings or discarding their warm render/spatial caches.
+        changed_stroke_ids: set[str] = set()
+        for drawing_id in drawing_ids:
+            before_strokes = {
+                stroke["id"]: stroke
+                for stroke in (before.get(drawing_id) or {}).get("strokes", [])
+            }
+            after_strokes = {
+                stroke["id"]: stroke
+                for stroke in (after.get(drawing_id) or {}).get("strokes", [])
+            }
+            changed_stroke_ids.update(
+                stroke_id for stroke_id in before_strokes.keys() | after_strokes.keys()
+                if before_strokes.get(stroke_id) != after_strokes.get(stroke_id)
+            )
+
+        def notify_change() -> None:
+            self._vector_changed(
+                hierarchy, changed_stroke_ids,
+                changed_drawing_ids=drawing_ids,
+            )
+
         self.command_stack.push(
             CallbackCommand(
                 label,
                 lambda: (
-                    self._restore_vector_payloads(after),
-                    self._vector_changed(hierarchy),
+                    self._restore_vector_payloads(
+                        after, changed_stroke_ids=changed_stroke_ids,
+                    ),
+                    notify_change(),
                 ),
                 lambda: (
-                    self._restore_vector_payloads(before),
-                    self._vector_changed(hierarchy),
+                    self._restore_vector_payloads(
+                        before, changed_stroke_ids=changed_stroke_ids,
+                    ),
+                    notify_change(),
                 ),
             ),
             already_done=True,
         )
-        self._vector_changed(hierarchy)
+        notify_change()
         return True
 
     def _restore_vector_payloads(
         self, payloads: dict[str, dict | None],
+        *, changed_stroke_ids: set[str] | None = None,
     ) -> None:
         for object_id, payload in payloads.items():
             if payload is None:
                 self.chapter.objects.pop(object_id, None)
                 continue
-            replacement = object_from_dict(payload)
             current = self.chapter.objects.get(object_id)
+            existing_strokes = (
+                {stroke.stroke_id: stroke for stroke in current.strokes}
+                if isinstance(current, VectorDrawingObject) else {}
+            )
+            unchanged = {
+                stroke_id: stroke for stroke_id, stroke in existing_strokes.items()
+                if changed_stroke_ids is not None and stroke_id not in changed_stroke_ids
+            }
+            parse_payload = payload
+            if unchanged and payload.get("type") == "vector_drawing":
+                parse_payload = dict(payload)
+                parse_payload["strokes"] = [
+                    item for item in payload.get("strokes", []) if item["id"] not in unchanged
+                ]
+            replacement = object_from_dict(parse_payload)
+            if unchanged and isinstance(replacement, VectorDrawingObject):
+                parsed = {stroke.stroke_id: stroke for stroke in replacement.strokes}
+                replacement.strokes = [
+                    unchanged.get(item["id"]) or parsed[item["id"]]
+                    for item in payload.get("strokes", [])
+                ]
             if (
                 isinstance(current, VectorDrawingObject)
                 and isinstance(replacement, VectorDrawingObject)
             ):
-                existing_strokes = {
-                    stroke.stroke_id: stroke for stroke in current.strokes
-                }
                 restored_strokes: list[VectorStroke] = []
                 for replacement_stroke in replacement.strokes:
                     stroke = existing_strokes.get(
                         replacement_stroke.stroke_id
                     )
-                    if stroke is None:
+                    if stroke is None or stroke is replacement_stroke:
                         restored_strokes.append(replacement_stroke)
                         continue
                     existing_points = {
@@ -2416,7 +2548,9 @@ class _CanvasLogic(SoloFeatures, ViewFeatures, MaskSelectionFeatures, MaskGradie
             except Exception:
                 self.active_page_id = ""
         self.selected_entities = ordered
-        if self.tool != ToolKind.TRANSFORM:
+        keep_area_tool = self.tool in {ToolKind.DRAW_SELECT_RECT, ToolKind.DRAW_SELECT_LASSO} \
+            and bool(self._drawing_selection_raster_targets())
+        if self.tool != ToolKind.TRANSFORM and not keep_area_tool:
             self.tool = ToolKind.TRANSFORM
             self.toolChanged.emit(self.tool)
         self._restore_modifier_selection()
@@ -2642,6 +2776,13 @@ class _CanvasLogic(SoloFeatures, ViewFeatures, MaskSelectionFeatures, MaskGradie
             ToolKind.DRAW_SELECT_LASSO,
             ToolKind.DRAW_SELECT_STROKE,
         }:
+            multi_raster = len(self.selected_entities) > 1 and bool(
+                self._drawing_selection_raster_targets()
+            )
+            if len(self.selected_entities) > 1 and (
+                not multi_raster or tool == ToolKind.DRAW_SELECT_STROKE
+            ):
+                return False
             selected = (
                 self.chapter.objects.get(self.selected_object_id)
                 if self.chapter is not None else None
@@ -2655,7 +2796,7 @@ class _CanvasLogic(SoloFeatures, ViewFeatures, MaskSelectionFeatures, MaskGradie
                 and layer.bound.primitive == "custom"
             )
             if not isinstance(selected, (RasterObject, VectorDrawingObject)) \
-                    and not custom_shape:
+                    and not custom_shape and not multi_raster:
                 return False
             if (
                 tool == ToolKind.DRAW_SELECT_STROKE
@@ -2690,6 +2831,16 @@ class _CanvasLogic(SoloFeatures, ViewFeatures, MaskSelectionFeatures, MaskGradie
                 self.set_selection(
                     "layer", self.active_page_id, activate_default_tool=False
                 )
+        if tool != self.tool and self._selection_raster_states:
+            # Pixels are still in the tile store until release; cancel only
+            # the preview when switching tools or pressing Escape.
+            self._selection_transform_quad = list(self._selection_transform_start_quad or []) or None
+            self._selection_transform_mode = None
+            self._selection_raster_states.clear()
+            self._selection_raster_snapshot = None
+            self._selection_before_tiles = None
+            self._selection_overlay_tiles = None
+            self._invalidate_scene_cache()
         self.tool = tool
         self.toolChanged.emit(tool)
         self._invalidate_scene_cache()
@@ -2802,32 +2953,8 @@ class _CanvasLogic(SoloFeatures, ViewFeatures, MaskSelectionFeatures, MaskGradie
 
     def sample_composited_color(self, world: QPointF) -> str | None:
         """Sample one full-resolution chapter pixel without UI overlays."""
-        if self.chapter is None:
-            return None
-        sample_x, sample_y = math.floor(world.x()), math.floor(world.y())
-        if not (
-            0 <= sample_x < self.chapter.width
-            and 0 <= sample_y < self.chapter.height
-        ):
-            return None
-        image = QImage(3, 3, QImage.Format_ARGB32_Premultiplied)
-        image.fill(QColor(self.chapter.background))
-        painter = QPainter(image)
-        try:
-            painter.setRenderHint(QPainter.Antialiasing, True)
-            transform = QTransform()
-            transform.translate(1 - sample_x, 1 - sample_y)
-            painter.setTransform(transform)
-            visible = QRectF(sample_x - 1, sample_y - 1, 3, 3)
-            for page_id in reversed(self.chapter.root_page_ids):
-                self._render_layer(
-                    painter, self.chapter.layers[page_id], 1.0, visible
-                )
-        finally:
-            painter.end()
-        return image.pixelColor(1, 1).name(
-            QColor.NameFormat.HexArgb
-        ).upper()
+        from comic_editor.ui.eyedropper_sampling import sample_color
+        return sample_color(self, world)
 
     def entity_world_rect(
         self, kind: str, entity_id: str,
@@ -2851,11 +2978,19 @@ class _CanvasLogic(SoloFeatures, ViewFeatures, MaskSelectionFeatures, MaskGradie
         ).boundingRect()
 
     def _sample_eyedropper(self, world: QPointF) -> bool:
-        color = self.sample_composited_color(world)
+        from comic_editor.ui.eyedropper_sampling import EyedropperSampler
+        sampler = getattr(self, "_eyedropper_sampler", None)
+        if sampler is None:
+            sampler = self._eyedropper_sampler = EyedropperSampler(self)
+        if not self._eyedropper_sampling:
+            sampler.clear()
+        color = sampler.sample(world)
         if color is None:
             return False
+        changed = color != self._eyedropper_last_color
         self._eyedropper_last_color = color
-        self.colorSampled.emit(color)
+        if changed:
+            self.colorSampled.emit(color)
         self.update()
         return True
 
@@ -2920,6 +3055,14 @@ class _CanvasLogic(SoloFeatures, ViewFeatures, MaskSelectionFeatures, MaskGradie
         return cls.bound_path(layer.bound, layer.vertex_radius)
 
     def _clear_compound_path_cache(self, *args) -> None:
+        # Most edits do not need any compound shape. Defer the document-wide
+        # signature until a compound path is actually requested for drawing.
+        self._compound_geometry_dirty = True
+        self._asset_drag_clip_cache.clear()
+
+    def _validate_compound_path_cache(self) -> None:
+        if not self._compound_geometry_dirty:
+            return
         # Styling is deliberately absent: width/color/visibility edits do not
         # change the compound fill, its intersections, or its attribution.
         signature = None if self.chapter is None else tuple(
@@ -2946,7 +3089,7 @@ class _CanvasLogic(SoloFeatures, ViewFeatures, MaskSelectionFeatures, MaskGradie
         if signature != self._compound_geometry_signature:
             self._compound_path_cache.clear()
             self._compound_geometry_signature = signature
-        self._asset_drag_clip_cache.clear()
+        self._compound_geometry_dirty = False
 
     def _layer_operand_path(self, layer: LayerNode, document=None) -> QPainterPath:
         if layer.bound is None:
@@ -2977,6 +3120,9 @@ class _CanvasLogic(SoloFeatures, ViewFeatures, MaskSelectionFeatures, MaskGradie
         layer = document.layers[layer_id]
         if not layer.compound_enabled:
             return self._layer_operand_path(layer, document) if layer.layer_kind != "open_shape" else self.layer_shape_path(layer)
+        if (document is getattr(self, "chapter", None)
+                and cache is getattr(self, "_compound_path_cache", None)):
+            self._validate_compound_path_cache()
         cached = cache.get(layer_id)
         if cached is not None:
             return QPainterPath(cached)
@@ -3063,7 +3209,7 @@ class _CanvasLogic(SoloFeatures, ViewFeatures, MaskSelectionFeatures, MaskGradie
         )
 
     def paintEvent(self, event) -> None:  # noqa: N802
-        frame_started = time.perf_counter_ns()
+        frame_started = time.perf_counter_ns() if self._performance.enabled else None
         self._update_text_gizmo_overlay()
         painter = QPainter(self)
         painter.fillRect(self.rect(), QColor("#242428"))
@@ -3071,9 +3217,10 @@ class _CanvasLogic(SoloFeatures, ViewFeatures, MaskSelectionFeatures, MaskGradie
         if self.chapter is None:
             painter.setPen(QColor("#8e8e96"))
             painter.drawText(self.rect(), Qt.AlignCenter, "Create or open a series to begin")
-            self._performance.frame_ms.append(
-                (time.perf_counter_ns() - frame_started) / 1_000_000
-            )
+            if frame_started is not None:
+                self._performance.frame_ms.append(
+                    (time.perf_counter_ns() - frame_started) / 1_000_000
+                )
             return
         if (
             not self._transform_static_cache.isNull()
@@ -3112,9 +3259,10 @@ class _CanvasLogic(SoloFeatures, ViewFeatures, MaskSelectionFeatures, MaskGradie
             self._draw_selection(painter)
             self._draw_focal_modifier_handles(painter)
             self._draw_export_rect(painter)
-            self._performance.frame_ms.append(
-                (time.perf_counter_ns() - frame_started) / 1_000_000
-            )
+            if frame_started is not None:
+                self._performance.frame_ms.append(
+                    (time.perf_counter_ns() - frame_started) / 1_000_000
+                )
             return
         live_vector_eraser = (
             self._vector_gesture_mode == "eraser"
@@ -3145,14 +3293,24 @@ class _CanvasLogic(SoloFeatures, ViewFeatures, MaskSelectionFeatures, MaskGradie
         else:
             self._ensure_scene_cache()
             painter.setTransform(QTransform())
-            painter.drawImage(0, 0, self._scene_cache)
+            promoted_ink = self._show_on_top_live_ink()
+            if promoted_ink:
+                # Keep prediction and unfinished vector ink out of the reusable
+                # scene image, while compositing them below on-top artwork.
+                frame = QImage(self._scene_cache.size(), self._scene_cache.format())
+                frame.setDevicePixelRatio(self._scene_cache.devicePixelRatioF())
+                self._render_scene_cache_rect(self.rect(), target=frame, live_ink=True)
+                painter.drawImage(0, 0, frame)
+            else:
+                painter.drawImage(0, 0, self._scene_cache)
             painter.setTransform(self.camera_transform())
             painter.save()
             painter.setClipRect(
                 QRectF(0, 0, self.chapter.width, self.chapter.height)
             )
-            self._draw_predictive_ink(painter)
-            self._draw_live_vector_gesture(painter)
+            if not promoted_ink:
+                self._draw_predictive_ink(painter)
+                self._draw_live_vector_gesture(painter)
             selected_live = self.chapter.objects.get(
                 self.selected_object_id
             )
@@ -3177,9 +3335,10 @@ class _CanvasLogic(SoloFeatures, ViewFeatures, MaskSelectionFeatures, MaskGradie
         self._draw_tablet_hover(painter)
         self._draw_simplify_hover(painter)
         self._draw_eyedropper_swatch(painter)
-        self._performance.frame_ms.append(
-            (time.perf_counter_ns() - frame_started) / 1_000_000
-        )
+        if frame_started is not None:
+            self._performance.frame_ms.append(
+                (time.perf_counter_ns() - frame_started) / 1_000_000
+            )
 
     def _draw_asset_drag_preview(self, painter: QPainter) -> None:
         if (
@@ -4287,6 +4446,7 @@ class _CanvasLogic(SoloFeatures, ViewFeatures, MaskSelectionFeatures, MaskGradie
         previous = (
             self.chapter, self.tiles, self.images,
             self._compound_path_cache, self._vector_render_cache,
+            self._compound_geometry_signature, self._compound_geometry_dirty,
             self._vector_render_cache_bytes, self._vector_spatial_indexes,
             self._vector_render_scale_override,
             self._vector_render_scale_owner,
@@ -4298,6 +4458,8 @@ class _CanvasLogic(SoloFeatures, ViewFeatures, MaskSelectionFeatures, MaskGradie
                 document, tiles, images or ImageStore()
             )
             self._compound_path_cache = {}
+            self._compound_geometry_signature = None
+            self._compound_geometry_dirty = True
             self._vector_render_cache = {}
             self._vector_render_cache_bytes = 0
             self._vector_spatial_indexes = {}
@@ -4337,6 +4499,7 @@ class _CanvasLogic(SoloFeatures, ViewFeatures, MaskSelectionFeatures, MaskGradie
             (
                 self.chapter, self.tiles, self.images,
                 self._compound_path_cache, self._vector_render_cache,
+                self._compound_geometry_signature, self._compound_geometry_dirty,
                 self._vector_render_cache_bytes,
                 self._vector_spatial_indexes,
                 self._vector_render_scale_override,
@@ -4404,8 +4567,7 @@ class _CanvasLogic(SoloFeatures, ViewFeatures, MaskSelectionFeatures, MaskGradie
             # effect-source signatures, so cached parent effects stay correct.
             for obj in guides:
                 obj.visible = False
-            for page_id in reversed(self.chapter.root_page_ids):
-                self._render_layer(painter, self.chapter.layers[page_id], 1.0, source)
+            self._render_scene_layers(painter, source)
         finally:
             for obj in guides:
                 obj.visible = True
@@ -4423,6 +4585,8 @@ class _CanvasLogic(SoloFeatures, ViewFeatures, MaskSelectionFeatures, MaskGradie
             layer.opacity <= 0 and layer.opacity_mask is None
             and not self._render_base_alpha
         ):
+            return
+        if not self._render_bounds.layer_visible(layer, visible_world):
             return
         if (
             (
@@ -4611,6 +4775,10 @@ class _CanvasLogic(SoloFeatures, ViewFeatures, MaskSelectionFeatures, MaskGradie
             self._render_mirror_target(painter, layer, parent_opacity, visible_world)
             return
         world_bounds = self.entity_world_rect("layer", layer.layer_id)
+        selection_bounds = self._raster_selection_capture_bounds("layer", layer.layer_id)
+        if not selection_bounds.isEmpty():
+            world_bounds = (selection_bounds if world_bounds is None else
+                            world_bounds.united(selection_bounds))
         modifiers = self._active_modifier_instances(
             layer.modifier_ids,
             suppress_outline=getattr(
@@ -4736,7 +4904,7 @@ class _CanvasLogic(SoloFeatures, ViewFeatures, MaskSelectionFeatures, MaskGradie
                     world_to_image, capture_world,
                 ),
                 cache_key=("interactive-stack", cache_key),
-                scope=("layer", layer.layer_id, getattr(self, "_effect_preview_channel", "canvas")),
+                scope=self._effect_request_scope("layer", layer.layer_id),
                 upstream_provisional=source_provisional,
             )
             if layer.opacity_mask is not None:
@@ -4772,10 +4940,31 @@ class _CanvasLogic(SoloFeatures, ViewFeatures, MaskSelectionFeatures, MaskGradie
         if not valid:
             return [] if sources_only else QPainterPath()
 
+        local_mappings = {}
+
+        def operand_mapping(item, post):
+            if not post.isIdentity():
+                # Reflections are defined in document space, so their
+                # conjugation must retain the complete world transform.
+                return self.layer_world_transform(item.layer_id) * post * root_inverse
+            cached = local_mappings.get(item.layer_id)
+            if cached is not None:
+                return cached
+            # Compose only the descendant chain. Multiplying a moving root
+            # by its inverse introduces tiny rounding differences every frame
+            # and needlessly rebuilds the entire attributed outline.
+            mapping = QTransform()
+            cursor = item
+            while cursor.layer_id != layer.layer_id:
+                mapping = mapping * self._layer_parent_transform(cursor)
+                cursor = self.chapter.layers[cursor.parent_id]
+            local_mappings[item.layer_id] = mapping
+            return mapping
+
         def operand_sources(item, post):
             result = []
             if item.bound is not None:
-                mapping = self.layer_world_transform(item.layer_id) * post * root_inverse
+                mapping = operand_mapping(item, post)
                 if item.layer_kind == "open_shape":
                     source = ribbon_source(item.bound, item.border_width, mapping,
                         item.shape_style.base_thickness, item.shape_style.start_cap,
@@ -4896,6 +5085,9 @@ class _CanvasLogic(SoloFeatures, ViewFeatures, MaskSelectionFeatures, MaskGradie
         visible_world: QRectF,
     ) -> None:
         if not layer.visible or not self._solo_branch_visible(layer.layer_id):
+            return
+        if self._show_on_top_standalone_contributor(layer):
+            self._render_layer(painter, layer, parent_opacity, visible_world)
             return
         if ("layer", layer.layer_id) not in self._render_modifier_sources and any(isinstance(modifier, (MirrorModifier, ArrayModifier, RadialBlurModifier, CageTransformModifier, HalftoneModifier, PixelateModifier)) for modifier in self._active_modifier_instances(layer.modifier_ids)):
             self._render_mirror_target(painter, layer, parent_opacity, visible_world)
@@ -5839,6 +6031,23 @@ class _CanvasLogic(SoloFeatures, ViewFeatures, MaskSelectionFeatures, MaskGradie
         result[values >= positions[-1]] = colors[-1]
         return np.clip(np.rint(result), 0, 255).astype(np.uint8)
 
+    def _cached_gradient_ramp_lut(
+        self, ramp: ColorGradientRamp, size: int = 1024,
+    ) -> np.ndarray:
+        # Pure ramp data can survive document/preview cache resets. Geometry
+        # drags and separate gradients sharing a preset reuse the same sampler.
+        ramp.validate()
+        key = (size, tuple((stop.position, stop.color) for stop in ramp.stops))
+        cache = getattr(self, "_gradient_ramp_cache", None)
+        if cache is None:
+            cache = self._gradient_ramp_cache = {}
+        cached = cache.get(key)
+        if cached is not None:
+            return cached
+        return self._cache_gradient_value(
+            cache, key, self._gradient_ramp_lut(ramp, size),
+        )
+
     def _gradient_image_from_scalar(
         self, scalar: np.ndarray, coverage: np.ndarray,
         ramp: ColorGradientRamp, bounds: QRectF, scalar_key: tuple,
@@ -5848,7 +6057,7 @@ class _CanvasLogic(SoloFeatures, ViewFeatures, MaskSelectionFeatures, MaskGradie
         cached = self._gradient_render_cache.get(key)
         if cached is not None:
             return cached
-        lut = self._gradient_ramp_lut(ramp)
+        lut = self._cached_gradient_ramp_lut(ramp)
         indices = np.clip(
             np.rint(np.clip(scalar, 0.0, 1.0) * (len(lut) - 1)),
             0, len(lut) - 1,
@@ -6076,11 +6285,17 @@ class _CanvasLogic(SoloFeatures, ViewFeatures, MaskSelectionFeatures, MaskGradie
             return None
         width, height = self._gradient_grid_for_preview(bounds)
         field = obj.line_field
-        signature = self._gradient_path_signature(path)
+        circular = obj.gradient_shape == "circular"
+        if circular:
+            first, second = field.geometry.nodes[0], field.geometry.nodes[-1]
+            signature = (first.x, first.y, second.x, second.y)
+        else:
+            signature = self._gradient_path_signature(path)
         scalar_key = (
-            "line", signature, width, height, field.direction_mode,
+            "circular" if circular else "line", signature, width, height,
+            None if circular else field.direction_mode,
             field.reverse_direction,
-            round(field.perpendicular_distance, 4),
+            None if circular else round(field.perpendicular_distance, 4),
             round(bounds.x(), 3), round(bounds.y(), 3),
             round(bounds.width(), 3), round(bounds.height(), 3),
         )
@@ -6090,17 +6305,25 @@ class _CanvasLogic(SoloFeatures, ViewFeatures, MaskSelectionFeatures, MaskGradie
             return self._gradient_image_from_scalar(
                 scalar, coverage, obj.ramp, cached_bounds, scalar_key
             )
-        amount, signed, _distance = self._path_projection_arrays(
-            path, bounds, width, height
-        )
-        if field.direction_mode == "perpendicular":
-            direction = 1.0 if field.perpendicular_distance > 0 else -1.0
+        if circular:
+            grid_x, grid_y = self._gradient_coordinates(bounds, width, height)
+            radius = max(math.hypot(second.x - first.x, second.y - first.y), 1e-6)
             scalar = np.clip(
-                signed * direction / abs(field.perpendicular_distance),
+                np.hypot(grid_x - first.x, grid_y - first.y) / radius,
                 0.0, 1.0,
             )
         else:
-            scalar = amount
+            amount, signed, _distance = self._path_projection_arrays(
+                path, bounds, width, height
+            )
+            if field.direction_mode == "perpendicular":
+                direction = 1.0 if field.perpendicular_distance > 0 else -1.0
+                scalar = np.clip(
+                    signed * direction / abs(field.perpendicular_distance),
+                    0.0, 1.0,
+                )
+            else:
+                scalar = amount
         if field.reverse_direction:
             scalar = 1.0 - scalar
         coverage = np.ones_like(scalar, dtype=bool)
@@ -6200,7 +6423,8 @@ class _CanvasLogic(SoloFeatures, ViewFeatures, MaskSelectionFeatures, MaskGradie
             return
         if obj.field_type == "line":
             rendered = self._line_gradient_image(
-                obj, self.bound_path(obj.line_field.geometry),
+                obj, QPainterPath() if obj.gradient_shape == "circular"
+                else self.bound_path(obj.line_field.geometry),
                 parent_path.boundingRect(),
             )
             if rendered is not None:
@@ -7261,6 +7485,8 @@ class _CanvasLogic(SoloFeatures, ViewFeatures, MaskSelectionFeatures, MaskGradie
             return
         if not obj.visible:
             return
+        if not self._render_bounds.object_visible(obj, local_visible):
+            return
         if (
             isinstance(obj, GradientObject)
             and self._is_outward_gradient(obj)
@@ -7382,6 +7608,22 @@ class _CanvasLogic(SoloFeatures, ViewFeatures, MaskSelectionFeatures, MaskGradie
                         entity.object_id
                     ).items()
                 ))
+                preview = self._raster_selection_preview_state(entity)
+                if preview is not None:
+                    before_tiles, moving_tiles, source_path, _transform, copying = preview
+                    # A mask contributor can be another selected raster whose
+                    # committed tiles have not changed during the drag. Keep
+                    # its preview in dependent modifier keys without recursing
+                    # through the contributor's modifier/mask signatures.
+                    pixels = (pixels, (
+                        "raster-selection", self._gradient_path_signature(source_path),
+                        tuple(self._selection_transform_start_quad),
+                        tuple(self._selection_transform_quad), copying,
+                        tuple(sorted((key, int(image.cacheKey()))
+                                     for key, image in before_tiles.items())),
+                        tuple(sorted((key, int(image.cacheKey()))
+                                     for key, image in moving_tiles.items())),
+                    ))
             elif isinstance(entity, ImageObject):
                 pixels = (int(self.images.image(entity.object_id).cacheKey()),)
             elif (
@@ -7737,22 +7979,36 @@ class _CanvasLogic(SoloFeatures, ViewFeatures, MaskSelectionFeatures, MaskGradie
             # stored frame and typography have not changed.
             pixels = ("text-layout", self._rect_signature(self._strict_text_rect(obj)))
         live = ()
-        if obj.object_id == self.selected_object_id:
-            selection_preview = ()
+        selection_preview = ()
+        if isinstance(obj, RasterObject):
+            raster_state = self.__dict__.get("_selection_raster_states", {}).get(obj.object_id)
+            if raster_state is not None:
+                before_tiles = raster_state["before_tiles"]
+                source_path = raster_state["source_path"]
+                overlay_tiles = raster_state.get("overlay_tiles")
+            elif obj.object_id == self.selected_object_id:
+                before_tiles = self._selection_before_tiles
+                source_path = self._drawing_selection_path
+                overlay_tiles = self._selection_overlay_tiles
+            else:
+                before_tiles = None
             if (
-                isinstance(obj, RasterObject)
-                and self._selection_before_tiles is not None
+                before_tiles is not None
                 and self._selection_transform_start_quad
                 and self._selection_transform_quad
-                and not self._drawing_selection_path.isEmpty()
+                and not source_path.isEmpty()
             ):
                 selection_preview = (
-                    self._gradient_path_signature(
-                        self._drawing_selection_path
-                    ),
+                    self._gradient_path_signature(source_path),
                     tuple(self._selection_transform_start_quad),
                     tuple(self._selection_transform_quad),
+                    tuple(sorted((key, int(image.cacheKey()))
+                                 for key, image in before_tiles.items())),
+                    None if overlay_tiles is None else tuple(sorted(
+                        (key, int(image.cacheKey()))
+                        for key, image in overlay_tiles.items())),
                 )
+        if obj.object_id == self.selected_object_id:
             live = (
                 self._vector_eraser_preview_revision,
                 tuple(sorted(
@@ -7765,7 +8021,12 @@ class _CanvasLogic(SoloFeatures, ViewFeatures, MaskSelectionFeatures, MaskGradie
                     obj.object_id, ()
                 )),
                 selection_preview,
+                tuple(self._transform_preview_quad or ()),
             )
+        elif selection_preview:
+            live = ("raster-selection", selection_preview)
+        if obj.object_id != self.selected_object_id and obj.object_id in self._multi_transform_preview_quads:
+            live = (*live, ("object-transform", tuple(self._multi_transform_preview_quads[obj.object_id])))
         if self._cage_session is not None and ("object", obj.object_id) in self._cage_session["targets"]:
             live = (*live, repr(self._cage_session["grid"].grid_dict()))
         if getattr(self, "_tiling_capture_geometry", None) is not None:
@@ -7796,7 +8057,7 @@ class _CanvasLogic(SoloFeatures, ViewFeatures, MaskSelectionFeatures, MaskGradie
                 ))
         preview = (
             tuple(self._transform_preview_quad or ())
-            if self._geometry_transform_target == ("layer_group", layer_id)
+            if self._geometry_transform_target in {("layer_group", layer_id), ("layer", layer_id)}
             else ()
         )
         if self._render_excluded_object_id:
@@ -7808,6 +8069,8 @@ class _CanvasLogic(SoloFeatures, ViewFeatures, MaskSelectionFeatures, MaskGradie
             # Source caches consume this preview portion independently of the
             # owner's modifier parameters, including mirror and blur captures.
             preview = (*preview, ("solo", self._solo_signature()))
+        if self._show_on_top_signature():
+            preview = (*preview, ("show-on-top", self._show_on_top_signature()))
         return (
             json.dumps(
                 layer.to_dict(), sort_keys=True, separators=(",", ":")
@@ -7992,7 +8255,7 @@ class _CanvasLogic(SoloFeatures, ViewFeatures, MaskSelectionFeatures, MaskGradie
                     world_to_image, world_bounds,
                 ),
                 cache_key=("interactive-stack", cache_key),
-                scope=("object", obj.object_id, getattr(self, "_effect_preview_channel", "canvas")),
+                scope=self._effect_request_scope("object", obj.object_id),
                 upstream_provisional=source_provisional,
             )
             if obj.opacity_mask is not None:
@@ -8021,13 +8284,14 @@ class _CanvasLogic(SoloFeatures, ViewFeatures, MaskSelectionFeatures, MaskGradie
     def _render_mirror_target(self, painter, target, parent_opacity, visible):
         layer = isinstance(target, LayerNode)
         kind, identifier = ("layer", target.layer_id) if layer else ("object", target.object_id)
-        request_scope = (kind, identifier, getattr(self, "_effect_preview_channel", "canvas"))
+        request_scope = self._effect_request_scope(kind, identifier)
         parent_id = target.parent_id if layer else target.parent_layer_id
         mapping = self.layer_world_transform(parent_id) if parent_id else QTransform()
         inverse, valid = mapping.inverted()
         if not valid:
             return
         world = entity_visual_bounds(self.chapter, self.tiles, kind, identifier)
+        world = world.united(self._raster_selection_capture_bounds(kind, identifier))
         if layer:
             from comic_editor.ui.baking import visual_bounds
             for child in target.children:
@@ -8057,7 +8321,10 @@ class _CanvasLogic(SoloFeatures, ViewFeatures, MaskSelectionFeatures, MaskGradie
                   if isinstance(target, ColorFillGradientObject)
                   else aligned(inverse.mapRect(world)))
         signature = self._modifier_layer_signature(identifier) if layer else self._modifier_object_signature(target)
-        key = ("mirror-source", kind, identifier, signature[0], signature[3], signature[4], self._rect_signature(bounds), tuple(self._transform_preview_quad or ()), self._render_exclude_text)
+        # Live transforms are scoped by the target/subtree signature. A global
+        # preview quad would evict unrelated artwork's source and every later
+        # effect stage whenever another layer is dragged.
+        key = ("mirror-source", kind, identifier, signature[0], signature[3], signature[4], self._rect_signature(bounds), self._render_exclude_text)
         if layer and scoped(self, target):
             key = (*key, self._modifier_parameter_signature([mid for mid in target.modifier_ids
                 if isinstance(self.chapter.modifiers.get(mid), StrokeModifier)]))
@@ -8203,15 +8470,24 @@ class _CanvasLogic(SoloFeatures, ViewFeatures, MaskSelectionFeatures, MaskGradie
         dict[tuple[int, int], QImage], dict[tuple[int, int], QImage],
         QPainterPath, QTransform, bool,
     ] | None:
-        before_tiles = self._selection_before_tiles
+        raster_state = self.__dict__.get("_selection_raster_states", {}).get(obj.object_id)
+        if raster_state is not None:
+            before_tiles = raster_state["before_tiles"]
+            source_path = raster_state["source_path"]
+            overlay_tiles = raster_state.get("overlay_tiles")
+        elif obj.object_id == self.selected_object_id:
+            before_tiles = self._selection_before_tiles
+            source_path = self._drawing_selection_path
+            overlay_tiles = self._selection_overlay_tiles
+        else:
+            return None
         source_quad = self._selection_transform_start_quad
         destination_quad = self._selection_transform_quad
         if (
-            obj.object_id != self.selected_object_id
-            or before_tiles is None
+            before_tiles is None
             or not source_quad
             or not destination_quad
-            or self._drawing_selection_path.isEmpty()
+            or source_path.isEmpty()
         ):
             return None
         local_to_world = self._drawing_local_to_world_transform(obj)
@@ -8231,10 +8507,10 @@ class _CanvasLogic(SoloFeatures, ViewFeatures, MaskSelectionFeatures, MaskGradie
         )
         if not transform.isInvertible():
             return None
-        moving = self._selection_overlay_tiles or before_tiles
+        moving = before_tiles if overlay_tiles is None else overlay_tiles
         return (
-            before_tiles, moving, QPainterPath(self._drawing_selection_path),
-            transform, self._selection_overlay_tiles is not None,
+            before_tiles, moving, QPainterPath(source_path),
+            transform, overlay_tiles is not None,
         )
 
     @staticmethod
@@ -8325,6 +8601,43 @@ class _CanvasLogic(SoloFeatures, ViewFeatures, MaskSelectionFeatures, MaskGradie
         return self._drawing_local_to_world_transform(obj).map(
             target_path
         ).boundingRect()
+
+    def _raster_selection_capture_bounds(self, kind: str, entity_id: str) -> QRectF:
+        """Include moved raster pixels when capturing an object or ancestor effect."""
+        if not self._selection_transform_start_quad or not self._selection_transform_quad:
+            return QRectF()
+        states = self.__dict__.get("_selection_raster_states", {})
+        identifiers = states if states else (self.selected_object_id,)
+        result = QRectF()
+        for object_id in identifiers:
+            obj = self.chapter.objects.get(object_id)
+            if not isinstance(obj, RasterObject):
+                continue
+            if kind == "object" and object_id != entity_id:
+                continue
+            ancestors = self.chapter.ancestor_layers(obj.parent_layer_id)
+            if kind == "layer" and not any(layer.layer_id == entity_id for layer in ancestors):
+                continue
+            bounds = self._raster_selection_preview_world_bounds(obj)
+            if bounds is None or bounds.isEmpty():
+                continue
+            if kind == "layer":
+                # Child effects are already applied in this source. Expand in
+                # each owner's coordinate space, stopping before this capture's
+                # own modifiers (which run after its source has been painted).
+                for target in (obj, *reversed(ancestors)):
+                    if isinstance(target, LayerNode) and target.layer_id == entity_id:
+                        break
+                    parent_id = (target.parent_id if isinstance(target, LayerNode)
+                                 else target.parent_layer_id)
+                    mapping = self.layer_world_transform(parent_id) if parent_id else QTransform()
+                    inverse, valid = mapping.inverted()
+                    if valid:
+                        bounds = mapping.mapRect(effect_bounds(
+                            inverse.mapRect(bounds),
+                            self._active_modifier_instances(target.modifier_ids), mapping))
+            result = result.united(bounds)
+        return result
 
     def _text_document(
         self, obj: TextObject, width: float, *, editing_overlay: bool = False,
@@ -8427,6 +8740,22 @@ class _CanvasLogic(SoloFeatures, ViewFeatures, MaskSelectionFeatures, MaskGradie
     def _quad_transform(
         source: QRectF, quad: list[tuple[float, float]],
     ) -> QTransform:
+        if len(quad) == 4 and source.width() != 0 and source.height() != 0:
+            a, b, c, d = quad
+            # Affine quads should stay affine. Qt's general projective solver
+            # introduces tiny perspective terms even for translations, which
+            # defeats source caches and changes their sampling precision.
+            roundoff_x = max(math.ulp(float(point[0])) for point in quad) * 8
+            roundoff_y = max(math.ulp(float(point[1])) for point in quad) * 8
+            if (abs((b[0]-a[0])-(c[0]-d[0])) <= roundoff_x
+                    and abs((d[1]-a[1])-(c[1]-b[1])) <= roundoff_y
+                    and abs((d[0]-a[0])-(c[0]-b[0])) <= roundoff_x
+                    and abs((b[1]-a[1])-(c[1]-d[1])) <= roundoff_y):
+                xx, xy = (b[0]-a[0])/source.width(), (b[1]-a[1])/source.width()
+                yx, yy = (d[0]-a[0])/source.height(), (d[1]-a[1])/source.height()
+                return QTransform(xx, xy, yx, yy,
+                    a[0]-source.left()*xx-source.top()*yx,
+                    a[1]-source.left()*xy-source.top()*yy)
         source_quad = QPolygonF([
             source.topLeft(), source.topRight(), source.bottomRight(), source.bottomLeft()
         ])
@@ -8944,7 +9273,8 @@ class _CanvasLogic(SoloFeatures, ViewFeatures, MaskSelectionFeatures, MaskGradie
     def _draw_selection(self, painter: QPainter) -> None:
         if self._active_cage() is not None:
             return
-        if self.selected_id and not self._solo_content_visible(self.selected_kind, self.selected_id):
+        if self.selected_id and not self._solo_content_visible(self.selected_kind, self.selected_id) \
+                and not (len(self.selected_entities) > 1 and self._drawing_selection_raster_targets()):
             return
         if self.tool in {
             ToolKind.DRAW_SELECT_RECT,
@@ -9028,6 +9358,7 @@ class _CanvasLogic(SoloFeatures, ViewFeatures, MaskSelectionFeatures, MaskGradie
                         self.tool == ToolKind.BOUND_EDIT
                         or (
                             layer.bound.primitive == "custom"
+                            and len(self.selected_entities) <= 1
                             and self.tool in {
                                 ToolKind.DRAW_SELECT_RECT,
                                 ToolKind.DRAW_SELECT_LASSO,
@@ -9233,14 +9564,53 @@ class _CanvasLogic(SoloFeatures, ViewFeatures, MaskSelectionFeatures, MaskGradie
             origin[1] + vector[0] * sine + vector[1] * cosine,
         )
 
+    def _uses_gradient_endpoint_handles(self, obj) -> bool:
+        if not isinstance(obj, ColorFillGradientObject) or obj.field_type != "line":
+            return False
+        if obj.gradient_shape == "circular":
+            return True
+        nodes = obj.line_field.geometry.nodes
+        return (self.tool == ToolKind.GRADIENT and len(nodes) == 2
+                and all(node.incoming is None and node.outgoing is None
+                        and not node.roundness_enabled for node in nodes))
+
+    def _draw_endpoint_gradient_handles(self, painter, obj) -> None:
+        controls = self._gradient_control_points(obj)
+        if len(controls) != 3:
+            return
+        first, last = obj.line_field.geometry.nodes[0], obj.line_field.geometry.nodes[-1]
+        a, b = controls[f"node:{first.node_id}"], controls[f"node:{last.node_id}"]
+        scale = max(self.scale, .05)
+        painter.save()
+        painter.setPen(QPen(QColor("#ff9f22"), 2/scale))
+        painter.drawLine(a, b)
+        for point, position in ((a, 0.), (b, 1.)):
+            if obj.line_field.reverse_direction:
+                position = 1-position
+            painter.setBrush(self._sample_color_ramp(obj.ramp, position))
+            painter.drawEllipse(point, 7/scale, 7/scale)
+        midpoint = controls["translate:"]
+        painter.setBrush(QColor("#333333"))
+        painter.drawEllipse(midpoint, 7/scale, 7/scale)
+        radius = 4/scale
+        painter.drawLine(midpoint-QPointF(radius, 0), midpoint+QPointF(radius, 0))
+        painter.drawLine(midpoint-QPointF(0, radius), midpoint+QPointF(0, radius))
+        painter.restore()
+
     def _gradient_control_points(
         self, obj: GradientObject,
     ) -> dict[str, QPointF]:
-        if obj is self.active_mask_gradient():
-            return {
-                f"node:{node.node_id}": QPointF(*node.position)
-                for node in obj.line_field.geometry.nodes
-            }
+        if obj is self.active_mask_gradient() or self._uses_gradient_endpoint_handles(obj):
+            nodes = obj.line_field.geometry.nodes
+            if len(nodes) < 2:
+                return {}
+            mask = obj is self.active_mask_gradient()
+            first, last = nodes[0], nodes[-1]
+            a, b = (QPointF(*node.position) if mask else
+                    self._gradient_local_to_world(obj, node.position)
+                    for node in (first, last))
+            return {f"node:{first.node_id}": a, f"node:{last.node_id}": b,
+                    "translate:": (a+b)/2}
         result: dict[str, QPointF] = {}
         if obj.field_type == "line":
             geometry = obj.line_field.geometry
@@ -9391,6 +9761,9 @@ class _CanvasLogic(SoloFeatures, ViewFeatures, MaskSelectionFeatures, MaskGradie
     ) -> None:
         if obj is self.active_mask_gradient():
             self._draw_mask_gradient_handles(painter, obj)
+            return
+        if self._uses_gradient_endpoint_handles(obj):
+            self._draw_endpoint_gradient_handles(painter, obj)
             return
         scale = max(self.scale, 0.05)
         controls = self._gradient_control_points(obj)
@@ -9573,7 +9946,7 @@ class _CanvasLogic(SoloFeatures, ViewFeatures, MaskSelectionFeatures, MaskGradie
         # Action and Bézier controls win over anchors.
         priority = {
             "toggle": 0, "incoming": 1, "outgoing": 1,
-            "center": 2, "rotate": 2, "radius_x": 2,
+            "center": 2, "rotate": 2, "radius_x": 2, "translate": 4,
             "radius_y": 2, "origin": 3, "node": 4,
             "type": 0, "delete": 0, "lock": 0, "roundness": 0,
             "direction": 0, "flow": 0, "distance": 2, "insert": 5,
@@ -9689,6 +10062,11 @@ class _CanvasLogic(SoloFeatures, ViewFeatures, MaskSelectionFeatures, MaskGradie
             return True
         self._model_before = self.chapter.to_dict()
         self._active_gradient_control = hit
+        self._gradient_last_pointer_doc = QPointF(point)
+        self._gradient_drag_nodes = tuple(
+            (node, node.position, node.incoming, node.outgoing)
+            for node in obj.line_field.geometry.nodes
+        ) if kind == "translate" else ()
         self._gradient_preview_active = True
         self._shape_control_dragged = False
         self._drag_start_doc = QPointF(point)
@@ -9696,6 +10074,7 @@ class _CanvasLogic(SoloFeatures, ViewFeatures, MaskSelectionFeatures, MaskGradie
             self._selected_shape_node_id = node_id
         self.setToolTip({
             "node": "Move gradient path point",
+            "translate": "Move both gradient handles",
             "incoming": "Move incoming Bézier control",
             "outgoing": "Move outgoing Bézier control",
             "origin": "Move radial gradient origin",
@@ -9715,9 +10094,27 @@ class _CanvasLogic(SoloFeatures, ViewFeatures, MaskSelectionFeatures, MaskGradie
     def _update_gradient_edit(
         self, obj: GradientObject, world_point: QPointF,
     ) -> None:
-        if self._active_gradient_control is None:
+        if self._active_gradient_control is None or world_point == self._gradient_last_pointer_doc:
             return
+        self._gradient_last_pointer_doc = QPointF(world_point)
         kind, node_id = self._active_gradient_control
+        if kind == "translate" and self._gradient_drag_nodes:
+            original = self._gradient_drag_nodes
+            start = self._gradient_world_to_local(obj, self._drag_start_doc)
+            end = self._gradient_world_to_local(obj, world_point)
+            midpoint = (QPointF(*original[0][1])+QPointF(*original[-1][1]))/2
+            target = self._gradient_local_to_world(obj, (midpoint+end-start).toTuple())
+            if self.settings.snap_to_grid:
+                target = self._snap(target, obj.parent_layer_id)
+            delta = self._gradient_world_to_local(obj, target)-midpoint
+            for node, position, incoming, outgoing in original:
+                node.position = (QPointF(*position)+delta).toTuple()
+                node.incoming = (QPointF(*incoming)+delta).toTuple() if incoming is not None else None
+                node.outgoing = (QPointF(*outgoing)+delta).toTuple() if outgoing is not None else None
+            obj.touch_revision()
+            self.documentChanged.emit(QRectF())
+            self.update()
+            return
         snapped_world = (
             self._snap(world_point, obj.parent_layer_id)
             if self.settings.snap_to_grid else world_point
@@ -11954,6 +12351,7 @@ class _CanvasLogic(SoloFeatures, ViewFeatures, MaskSelectionFeatures, MaskGradie
             not raw
             and self.chapter.contributing_compound_ancestor(layer_id)
             is not None
+            and not self._is_show_on_top("layer", layer_id)
         ):
             return False
         path = (
@@ -12006,7 +12404,8 @@ class _CanvasLogic(SoloFeatures, ViewFeatures, MaskSelectionFeatures, MaskGradie
                     )
                 ):
                     result.append({"kind": "layer", "id": entity_id})
-        return result
+        order = self._show_on_top_ordered([(item["kind"], item["id"]) for item in result])
+        return [{"kind": kind, "id": identifier} for kind, identifier in order]
 
     def hit_test_entities(self, point: QPointF) -> list[dict[str, str]]:
         if self.chapter is None:
@@ -12019,7 +12418,7 @@ class _CanvasLogic(SoloFeatures, ViewFeatures, MaskSelectionFeatures, MaskGradie
                 candidates.append(("layer", page_id))
             candidates.extend(self._entities_front_to_back(page_id))
         hits: list[dict[str, str]] = []
-        for kind, entity_id in candidates:
+        for kind, entity_id in self._show_on_top_ordered(candidates):
             if kind == "layer":
                 layer = self.chapter.layers[entity_id]
                 if (
@@ -12049,7 +12448,7 @@ class _CanvasLogic(SoloFeatures, ViewFeatures, MaskSelectionFeatures, MaskGradie
             for object_id in self._objects_front_to_back(page_id)
         ]
         hits: list[str] = []
-        for object_id in candidates:
+        for _, object_id in self._show_on_top_ordered([("object", identifier) for identifier in candidates]):
             obj = self.chapter.objects[object_id]
             if text_only and not isinstance(obj, TextObject):
                 continue
@@ -13054,10 +13453,10 @@ class _CanvasLogic(SoloFeatures, ViewFeatures, MaskSelectionFeatures, MaskGradie
             self._update_creation_hover(world)
         elif self.tool == ToolKind.SHAPE_EDIT and self._active_shape_control is None:
             self._update_shape_hover(world)
-        input_started = time.perf_counter_ns()
+        input_started = time.perf_counter_ns() if self._performance.enabled else None
         self._tool_move(event.position(), 1.0)
         self._update_interaction_cursor(event.position())
-        if self._drawing or self._vector_gesture_mode in {"pencil", "eraser"}:
+        if input_started is not None and (self._drawing or self._vector_gesture_mode in {"pencil", "eraser"}):
             elapsed = (time.perf_counter_ns() - input_started) / 1_000_000
             self._performance.input_ms.append(elapsed)
             self._performance.submit_ms.append(elapsed)
@@ -13084,8 +13483,7 @@ class _CanvasLogic(SoloFeatures, ViewFeatures, MaskSelectionFeatures, MaskGradie
             self._move_mask_selection(world)
             self._queue_free_text_drag(world)
             self._text_placement_move(world)
-            if self._active_shape_control == "outline_width":
-                self._outline_pending_point = self.widget_to_document(event.position())
+            self._finish_shape_pointer(world)
             self._tool_release()
             self._update_interaction_cursor(event.position())
 
@@ -13189,6 +13587,14 @@ class _CanvasLogic(SoloFeatures, ViewFeatures, MaskSelectionFeatures, MaskGradie
             event.accept()
             return
         if event.key() == Qt.Key_Escape and self._finish_mask_gradient(False):
+            event.accept()
+            return
+        if (event.key() == Qt.Key_Escape and self._model_before is not None
+                and self._active_gradient_control is not None):
+            before, self._model_before = self._model_before, None
+            self._shape_control_dragged = False
+            self.replace_chapter(before)
+            self.interactionFinished.emit()
             event.accept()
             return
         if event.key() == Qt.Key_Escape and self._modifier_handle_drag and any(
@@ -13499,11 +13905,13 @@ class _CanvasLogic(SoloFeatures, ViewFeatures, MaskSelectionFeatures, MaskGradie
             if self._nav_mode:
                 self._queue_navigation_update(event.position())
             elif self._pen_contact_active:
-                input_started = time.perf_counter_ns()
+                input_started = time.perf_counter_ns() if self._performance.enabled else None
                 self._tool_move(event.position(), event.pressure())
                 if (
-                    self._drawing
-                    or self._vector_gesture_mode in {"pencil", "eraser"}
+                    input_started is not None and (
+                        self._drawing
+                        or self._vector_gesture_mode in {"pencil", "eraser"}
+                    )
                 ):
                     elapsed = (
                         time.perf_counter_ns() - input_started
@@ -13526,8 +13934,7 @@ class _CanvasLogic(SoloFeatures, ViewFeatures, MaskSelectionFeatures, MaskGradie
                 self._move_mask_selection(world)
                 self._queue_free_text_drag(world)
                 self._text_placement_move(world)
-                if self._active_shape_control == "outline_width":
-                    self._outline_pending_point = self.widget_to_document(event.position())
+                self._finish_shape_pointer(world)
                 self._tool_release()
         if self._nav_mode is None:
             self._update_interaction_cursor(event.position())
@@ -14119,6 +14526,9 @@ class _CanvasLogic(SoloFeatures, ViewFeatures, MaskSelectionFeatures, MaskGradie
 
     # ---- drawing selections -------------------------------------------
     def _clear_drawing_selection(self, *, reset_pivot: bool = True) -> None:
+        self._selection_raster_states.clear()
+        self._selection_raster_snapshot = None
+        self._selection_before_tiles = None
         self._raster_paste_overlay = None
         self._selection_overlay_tiles = None
         self._drawing_selection_path = QPainterPath()
@@ -14147,6 +14557,10 @@ class _CanvasLogic(SoloFeatures, ViewFeatures, MaskSelectionFeatures, MaskGradie
     ) -> RasterObject | VectorDrawingObject | LayerNode | None:
         if self.chapter is None:
             return None
+        if len(self.selected_entities) > 1:
+            targets = self._drawing_selection_raster_targets()
+            return next((obj for obj in targets if obj.object_id == self.selected_object_id),
+                        targets[0] if targets else None)
         if self.selected_kind == "layer":
             layer = self.chapter.layers.get(self.selected_id)
             if (
@@ -14337,7 +14751,9 @@ class _CanvasLogic(SoloFeatures, ViewFeatures, MaskSelectionFeatures, MaskGradie
         self._selection_transform_start = QPointF(world)
         self._selection_transform_start_quad = list(quad)
         self._selection_rotate_quad = list(quad)
-        self._selection_before_model = self.chapter.to_dict()
+        self._selection_before_model = (
+            None if isinstance(obj, RasterObject) else self.chapter.to_dict()
+        )
         self._selection_vector_points = {}
         self._selection_shape_nodes = {}
         self._selection_vector_preview.clear()
@@ -14376,6 +14792,7 @@ class _CanvasLogic(SoloFeatures, ViewFeatures, MaskSelectionFeatures, MaskGradie
                     obj.object_id
                 )
                 self._selection_overlay_tiles = None
+            self._prepare_multi_raster_selection(obj)
         self._selection_rotate_start = math.atan2(
             world.y() - pivot.y(), world.x() - pivot.x()
         )
@@ -14520,9 +14937,11 @@ class _CanvasLogic(SoloFeatures, ViewFeatures, MaskSelectionFeatures, MaskGradie
             QPointF(*candidate) for candidate in target
         ]).boundingRect()).adjusted(-3, -3, 3, 3)
         if isinstance(obj, RasterObject):
-            if self._object_is_mask_contributor(obj.object_id):
+            targets = self._selection_raster_states or {obj.object_id: None}
+            if any(self._object_is_mask_contributor(identifier) for identifier in targets):
                 self._invalidate_tone_mask_overlay()
-            dirty = self.modifier_expanded_dirty(obj.object_id, dirty)
+            for identifier in targets:
+                dirty = dirty.united(self.modifier_expanded_dirty(identifier, dirty))
         elif isinstance(obj, LayerNode):
             dirty = self._entity_expanded_dirty(
                 "layer", obj.layer_id, dirty
@@ -14555,6 +14974,8 @@ class _CanvasLogic(SoloFeatures, ViewFeatures, MaskSelectionFeatures, MaskGradie
         self._selection_transform_mode = None
         self._selection_transform_handle = None
         if mode == "pivot":
+            self._selection_raster_states.clear()
+            self._selection_raster_snapshot = None
             self._selection_before_model = None
             self._selection_before_tiles = None
             self._selection_overlay_tiles = None
@@ -14647,6 +15068,10 @@ class _CanvasLogic(SoloFeatures, ViewFeatures, MaskSelectionFeatures, MaskGradie
                     )
                     self.documentChanged.emit(QRectF())
                     self.hierarchyChanged.emit()
+        elif self._selection_raster_states:
+            self._finish_multi_raster_selection(obj)
+            self._selection_before_tiles = None
+            self._selection_overlay_tiles = None
         elif self._selection_before_tiles is not None:
             self._commit_raster_selection_transform(
                 obj, self._selection_before_tiles,
@@ -14662,12 +15087,16 @@ class _CanvasLogic(SoloFeatures, ViewFeatures, MaskSelectionFeatures, MaskGradie
         self, obj: RasterObject,
         before_tiles: dict[tuple[int, int], QImage],
         overlay_tiles: dict[tuple[int, int], QImage] | None = None,
-    ) -> None:
+        *, source_path: QPainterPath | None = None, record: bool = True,
+    ) -> TilePatchCommand | None:
+        source_path = QPainterPath(
+            self._drawing_selection_path if source_path is None else source_path
+        )
         start = self._selection_transform_start_quad
         destination = self._selection_transform_quad
         if (
             not start or not destination
-            or self._drawing_selection_path.isEmpty()
+            or source_path.isEmpty()
         ):
             return
         local_to_world = self._drawing_local_to_world_transform(obj)
@@ -14686,15 +15115,18 @@ class _CanvasLogic(SoloFeatures, ViewFeatures, MaskSelectionFeatures, MaskGradie
         )
         if not transform.isInvertible():
             return
-        source_path = QPainterPath(self._drawing_selection_path)
         target_path = transform.map(source_path)
         current_tiles = self.tiles.object_tiles(obj.object_id)
         result = {
             key: QImage(image) for key, image in before_tiles.items()
         }
-        moving_tiles = overlay_tiles or before_tiles
+        source_keys = self.tiles.keys_for_rect(source_path.boundingRect())
+        moving_tiles = {
+            key: image for key, image in (
+                before_tiles if overlay_tiles is None else overlay_tiles
+            ).items() if key in source_keys
+        }
         if overlay_tiles is None:
-            source_keys = self.tiles.keys_for_rect(source_path.boundingRect())
             for key in source_keys:
                 image = result.get(key)
                 if image is None:
@@ -14753,7 +15185,16 @@ class _CanvasLogic(SoloFeatures, ViewFeatures, MaskSelectionFeatures, MaskGradie
                 self._raster_paste_overlay
             ),
         }
-        self.tiles.replace_object_tiles(obj.object_id, result)
+        # History and bounds updates touch only tiles changed by this region.
+        # Unrelated tiles can number in the thousands in a long chapter.
+        changed_keys = {
+            key for key in source_keys | target_keys
+            if current_tiles.get(key) != result.get(key)
+        }
+        if not changed_keys:
+            return None
+        for key in changed_keys:
+            self.tiles.set_tile(obj.object_id, key, result.get(key))
         content = self.tiles.content_bounds(obj.object_id)
         if content is not None:
             frame = content.adjusted(
@@ -14786,36 +15227,36 @@ class _CanvasLogic(SoloFeatures, ViewFeatures, MaskSelectionFeatures, MaskGradie
                 if overlay_tiles is not None else None
             ),
         }
-        all_keys = set(current_tiles) | set(result)
         before_patch = {
-            key: current_tiles.get(key) for key in all_keys
+            key: current_tiles.get(key) for key in changed_keys
         }
-        after_patch = {key: result.get(key) for key in all_keys}
-        self.command_stack.push(
-            TilePatchCommand(
+        after_patch = {key: result.get(key) for key in changed_keys}
+        dirty = self.modifier_expanded_dirty(obj.object_id,
+            local_to_world.map(source_path).boundingRect().united(
+                local_to_world.map(target_path).boundingRect()))
+        command = TilePatchCommand(
                 "Transform raster selection", self.tiles, obj.object_id,
                 before_patch, after_patch,
-                lambda: (
-                    self.documentChanged.emit(QRectF()), self.update()
-                ),
+                (lambda: (self.documentChanged.emit(dirty), self.update())) if record else None,
                 before_state, after_state,
                 lambda state, object_id=obj.object_id:
                 self._restore_raster_selection_transform_state(
-                    object_id, state
+                    object_id, state, restore_selection=record
                 ),
-            ),
-            already_done=True,
         )
-        self._drawing_selection_path = target_path
-        self._raster_paste_overlay = self._clone_raster_overlay(
-            after_state["overlay"]
-        )
-        self.documentChanged.emit(QRectF())
+        if record:
+            self.command_stack.push(command, already_done=True)
+            self._drawing_selection_path = target_path
+            self._raster_paste_overlay = self._clone_raster_overlay(after_state["overlay"])
+            self.documentChanged.emit(dirty)
+        return command
 
     def _restore_raster_selection_transform_state(
-        self, object_id: str, state: dict,
+        self, object_id: str, state: dict, *, restore_selection: bool = True,
     ) -> None:
         self._restore_raster_frame(object_id, state["frame"])
+        if not restore_selection:
+            return
         self._drawing_selection_path = QPainterPath(state["path"])
         self._selection_transform_quad = list(state["quad"])
         pivot = state.get("pivot")
@@ -14859,6 +15300,15 @@ class _CanvasLogic(SoloFeatures, ViewFeatures, MaskSelectionFeatures, MaskGradie
                 bounds = QRectF(*obj.interaction_rect)
             path = QPainterPath()
             path.addRect(bounds)
+            if len(self.selected_entities) > 1:
+                inverse, valid = self._drawing_local_to_world_transform(obj).inverted()
+                if valid:
+                    for target in self._drawing_selection_raster_targets():
+                        target_path = QPainterPath()
+                        target_path.addRect(self.tiles.content_bounds(target.object_id)
+                                            or QRectF(*target.interaction_rect))
+                        path = path.united(inverse.map(
+                            self._drawing_local_to_world_transform(target).map(target_path)))
             self._drawing_selection_path = path
         self._refresh_drawing_selection_transform()
         self.update()
@@ -19561,7 +20011,7 @@ class _CanvasLogic(SoloFeatures, ViewFeatures, MaskSelectionFeatures, MaskGradie
                 self.chapter.objects.get(self.selected_object_id)
                 if self.chapter is not None else None
             )
-            if self._is_transformable_object(selected_raster):
+            if len(self.selected_entities) <= 1 and self._is_transformable_object(selected_raster):
                 quad = self.object_world_quad(selected_raster.object_id)
                 if quad:
                     raster_mode, _ = self._raster_transform_control_hit(
@@ -19572,6 +20022,7 @@ class _CanvasLogic(SoloFeatures, ViewFeatures, MaskSelectionFeatures, MaskGradie
                         return
             if (
                 drawing is not None
+                and len(self.selected_entities) <= 1
                 and not self._point_inside_drawing_bounds(drawing, point)
             ):
                 self._pending_drawing_selection_press = (
@@ -20444,6 +20895,8 @@ class _CanvasLogic(SoloFeatures, ViewFeatures, MaskSelectionFeatures, MaskGradie
             before, self._model_before = self._model_before, None
             gradient_control = self._active_gradient_control
             self._active_gradient_control = None
+            self._gradient_drag_nodes = ()
+            self._gradient_last_pointer_doc = None
             self._gradient_preview_active = False
             # Preview tiles are intentionally low resolution; discard them so
             # the next paint builds final-resolution visible tiles.
@@ -20464,8 +20917,8 @@ class _CanvasLogic(SoloFeatures, ViewFeatures, MaskSelectionFeatures, MaskGradie
                         self._toggle_shape_node_roundness(
                             selected.line_field.geometry, node
                         )
+                        selected.touch_revision()
                 selected.validate_gradient()
-                selected.touch_revision()
             self._shape_control_dragged = False
             after = self.chapter.to_dict()
             if before != after:
@@ -20613,6 +21066,10 @@ class _CanvasLogic(SoloFeatures, ViewFeatures, MaskSelectionFeatures, MaskGradie
         if not self._creation_points:
             self._gradient_creation_type = ""
 
+    def set_gradient_shape(self, shape: str) -> None:
+        if shape in {"linear", "circular"}:
+            self._gradient_tool_shape = shape
+
     def _gradient_tool_parent_id(self) -> str:
         if self.chapter is None:
             return ""
@@ -20662,6 +21119,7 @@ class _CanvasLogic(SoloFeatures, ViewFeatures, MaskSelectionFeatures, MaskGradie
         obj = ColorFillGradientObject(
             name=f"Gradient {count}",
             field_type=field_type,
+            gradient_shape=self._gradient_tool_shape,
             ramp=ColorGradientRamp(stops=[
                 ColorGradientStop(
                     position=0.0, color=self.primary_color
@@ -21053,6 +21511,7 @@ class _CanvasLogic(SoloFeatures, ViewFeatures, MaskSelectionFeatures, MaskGradie
         kind = hit["kind"]
         if kind == "interior" and not allow_interior:
             return False
+        self._shape_last_pointer_doc = QPointF(world_point)
         if kind == "gizmo":
             selected = self._selected_shape_node(bound)
             if selected is None:
@@ -21318,6 +21777,34 @@ class _CanvasLogic(SoloFeatures, ViewFeatures, MaskSelectionFeatures, MaskGradie
             index, percent, insert_point, world_point
         )
 
+    def _finish_shape_pointer(self, world_point: QPointF) -> None:
+        if self._mask_gradient_drag is not None:
+            self._mask_gradient_move(world_point)
+        elif self._active_gradient_control is not None:
+            obj = self.chapter.objects.get(self.selected_object_id) if self.chapter else None
+            if isinstance(obj, GradientObject) and world_point != self._gradient_last_pointer_doc:
+                self._update_gradient_edit(obj, world_point)
+        elif (self.tool == ToolKind.GRADIENT and self._gradient_creation_parent_id
+              and len(self._creation_points) == 2):
+            self._creation_points[-1] = self._snap(
+                world_point, self._gradient_creation_parent_id).toTuple()
+        if self._active_shape_control == "outline_width":
+            self._outline_pending_point = QPointF(world_point)
+        elif world_point != self._shape_last_pointer_doc:
+            # A release can be the only packet at the final position. Keep
+            # clicks untouched, including fractional node positions and the
+            # roundness click toggle, while finishing active continuous edits.
+            if self._model_before is not None and self._active_shape_control in {
+                "node", "translate", "thickness",
+            }:
+                self._update_shape_edit(world_point)
+            elif (
+                self._geometry_transform_target is not None
+                and self._geometry_transform_target[0] in {"layer", "layer_group"}
+                and self._transform_drag_mode in {"translate", "handle", "rotate"}
+            ):
+                self._update_geometry_transform_preview(world_point)
+
     def _flush_outline_edit(self):
         self._outline_edit_timer.stop()
         point, self._outline_pending_point = self._outline_pending_point, None
@@ -21328,6 +21815,7 @@ class _CanvasLogic(SoloFeatures, ViewFeatures, MaskSelectionFeatures, MaskGradie
         target = self._shape_edit_target()
         if target is None:
             return
+        self._shape_last_pointer_doc = QPointF(world_point)
         dirty_before = entity_visual_bounds(
             self.chapter, self.tiles, self.selected_kind, self.selected_id,
             geometry_cache=self._outline_cache,
@@ -22437,10 +22925,13 @@ class _CanvasLogic(SoloFeatures, ViewFeatures, MaskSelectionFeatures, MaskGradie
             )
         frame_after = tuple(obj.interaction_rect)
         after = self.tiles.snapshot(obj.object_id, keys)
+        stroke_dirty = QRectF(self._stroke_dirty_world)
         command = TilePatchCommand(
             "Raster stroke", self.tiles, obj.object_id,
             self._stroke_before, after,
-            lambda: (self.update(), self.documentChanged.emit(QRectF())),
+            lambda object_id=obj.object_id, dirty=stroke_dirty: (
+                self._raster_fill_visual_changed(object_id, dirty)
+            ),
             frame_before, frame_after,
             lambda frame, object_id=obj.object_id: (
                 self._restore_raster_frame(object_id, frame),
@@ -22503,6 +22994,7 @@ class _CanvasLogic(SoloFeatures, ViewFeatures, MaskSelectionFeatures, MaskGradie
             frame.left(), frame.top(), max(1.0, frame.width()),
             max(1.0, frame.height()),
         )
+        self._invalidate_render_bounds("object", obj.object_id)
         world = self.modifier_expanded_dirty(
             obj.object_id,
             self._drawing_local_rect_to_world(obj, local),
@@ -22769,6 +23261,7 @@ class _CanvasLogic(SoloFeatures, ViewFeatures, MaskSelectionFeatures, MaskGradie
         self._geometry_transform_target = target
         self._transform_handle_index = handle
         self._transform_drag_mode = mode
+        self._shape_last_pointer_doc = QPointF(point)
         self._model_before = self.chapter.to_dict()
         self._drag_start_doc = QPointF(point)
         self._transform_start_quad = list(local_quad)
@@ -22796,6 +23289,7 @@ class _CanvasLogic(SoloFeatures, ViewFeatures, MaskSelectionFeatures, MaskGradie
         return obj.parent_layer_id if obj is not None else ""
 
     def _update_geometry_transform_preview(self, point: QPointF) -> None:
+        self._shape_last_pointer_doc = QPointF(point)
         if self._geometry_transform_target == ("multi", ""):
             self._update_multi_transform_preview(point)
             return
@@ -23023,7 +23517,10 @@ class _CanvasLogic(SoloFeatures, ViewFeatures, MaskSelectionFeatures, MaskGradie
         return bool(
             isinstance(obj, GradientObject)
             and obj.field_type == "line"
-            and len(obj.line_field.geometry.nodes) == 2
+            and (len(obj.line_field.geometry.nodes) == 2 or (
+                isinstance(obj, ColorFillGradientObject)
+                and obj.gradient_shape == "circular"
+            ))
         )
 
     def _object_transform_cage_visible(
@@ -23475,6 +23972,7 @@ class _CanvasLogic(SoloFeatures, ViewFeatures, MaskSelectionFeatures, MaskGradie
         if (
             self.chapter is None or self.chapter.view_overflow > 0 or not object_id
             or self.width() <= 0 or self.height() <= 0
+            or self._show_on_top_plan().entries
         ):
             return QImage()
         ratio = max(1.0, float(self.devicePixelRatioF()))
@@ -23502,10 +24000,7 @@ class _CanvasLogic(SoloFeatures, ViewFeatures, MaskSelectionFeatures, MaskGradie
                 )
                 self._render_excluded_object_id = object_id
                 visible = self.visible_document_rect()
-                for page_id in reversed(self.chapter.root_page_ids):
-                    self._render_layer(
-                        painter, self.chapter.layers[page_id], 1.0, visible
-                    )
+                self._render_scene_layers(painter, visible)
                 self._draw_grid(painter, visible)
             finally:
                 painter.restore()

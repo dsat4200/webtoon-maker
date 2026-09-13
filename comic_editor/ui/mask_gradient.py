@@ -1,4 +1,4 @@
-"""Private, chapter-space line gradients owned by tone masks."""
+"""Private, chapter-space endpoint gradients owned by tone masks."""
 from __future__ import annotations
 
 import math
@@ -6,7 +6,7 @@ import math
 import numpy as np
 
 from PySide6.QtCore import QPointF, QRectF, Qt
-from PySide6.QtGui import QColor, QPainter, QPen, QTransform
+from PySide6.QtGui import QPainter, QTransform
 
 from comic_editor.core.models import (
     BoundGeometry, ColorFillGradientObject, ColorGradientRamp,
@@ -35,6 +35,9 @@ class MaskGradientFeatures:
             "revision": mask.revision,
             "start": QPointF(point),
             "node": hit[1] if hit else "",
+            "control": hit[0] if hit else "",
+            "nodes": tuple((node, node.position) for node in obj.line_field.geometry.nodes) if obj else (),
+            "last_point": QPointF(point),
             "moved": False,
         }
 
@@ -47,16 +50,24 @@ class MaskGradientFeatures:
         mask = self.chapter.masks.get(state["mask_id"])
         if mask is None:
             return
+        if point == state["last_point"]:
+            return
+        state["last_point"] = QPointF(point)
         if not state["moved"]:
             distance = math.dist(point.toTuple(), state["start"].toTuple())
             if distance * self.scale < 3:
                 return
             state["moved"] = True
-        if not state["node"]:
+        if state["control"] == "translate":
+            delta = point-state["start"]
+            for node, position in state["nodes"]:
+                node.position = (QPointF(*position)+delta).toTuple()
+        elif not state["node"]:
             start = state["start"]
             if obj is None:
                 obj = ColorFillGradientObject(
                     name="Mask Gradient", mask_only=True,
+                    gradient_shape=self._gradient_tool_shape,
                     ramp=ColorGradientRamp(stops=[
                         ColorGradientStop(position=0, color="#00FFFFFF"),
                         ColorGradientStop(position=1, color="#FFFFFFFF"),
@@ -71,6 +82,7 @@ class MaskGradientFeatures:
                 reverse_direction=obj.line_field.reverse_direction,
             )
             state["node"] = obj.line_field.geometry.nodes[-1].node_id
+            state["control"] = "node"
         else:
             node = next(
                 n for n in obj.line_field.geometry.nodes
@@ -92,7 +104,8 @@ class MaskGradientFeatures:
         hit = self._gradient_control_hit(obj, point) if obj else None
         self.setCursor(Qt.PointingHandCursor if hit else Qt.CrossCursor)
         self.setToolTip(
-            "Drag to move this gradient endpoint" if hit
+            "Drag to move both gradient handles" if hit and hit[0] == "translate"
+            else "Drag to move this gradient endpoint" if hit
             else "Drag to draw a mask gradient"
         )
 
@@ -125,17 +138,7 @@ class MaskGradientFeatures:
     def _draw_mask_gradient_handles(
         self, painter: QPainter, obj: ColorFillGradientObject,
     ) -> None:
-        scale = max(self.scale, 0.05)
-        first, second = obj.line_field.geometry.nodes
-        painter.save()
-        painter.setPen(QPen(QColor("#ff9f22"), 2 / scale))
-        painter.drawLine(QPointF(*first.position), QPointF(*second.position))
-        for node, position in ((first, 0.0), (second, 1.0)):
-            if obj.line_field.reverse_direction:
-                position = 1.0 - position
-            painter.setBrush(self._sample_color_ramp(obj.ramp, position))
-            painter.drawEllipse(QPointF(*node.position), 7 / scale, 7 / scale)
-        painter.restore()
+        self._draw_endpoint_gradient_handles(painter, obj)
 
     def _render_mask_gradient_field(
         self, obj: ColorFillGradientObject, width: int, height: int,
@@ -145,25 +148,40 @@ class MaskGradientFeatures:
         inverse, valid = world_to_image.inverted()
         if not valid:
             return np.zeros((height, width), dtype=np.float32)
-        x = np.arange(width, dtype=np.float32)[None, :] + .5
-        y = np.arange(height, dtype=np.float32)[:, None] + .5
-        divisor = inverse.m13() * x + inverse.m23() * y + inverse.m33()
-        with np.errstate(divide="ignore", invalid="ignore"):
-            world_x = (inverse.m11() * x + inverse.m21() * y + inverse.dx()) / divisor
-            world_y = (inverse.m12() * x + inverse.m22() * y + inverse.dy()) / divisor
-        first, second = obj.line_field.geometry.nodes
+        first, second = obj.line_field.geometry.nodes[0], obj.line_field.geometry.nodes[-1]
         dx, dy = second.x - first.x, second.y - first.y
-        scalar = np.clip(
-            ((world_x - first.x) * dx + (world_y - first.y) * dy)
-            / max(dx * dx + dy * dy, 1e-12), 0, 1,
-        )
-        if obj.line_field.reverse_direction:
-            scalar = 1 - scalar
         # Use the standard gradient ramp sampler to preserve coincident stops.
-        lut = self._gradient_ramp_lut(obj.ramp)
-        indices = np.rint(np.nan_to_num(scalar) * (len(lut) - 1)).astype(np.int32)
-        coverage = (
-            (world_x >= 0) & (world_x < self.chapter.width)
-            & (world_y >= 0) & (world_y < self.chapter.height)
-        )
-        return np.where(coverage, lut[indices, 3] / np.float32(255), 0)
+        lut = self._cached_gradient_ramp_lut(obj.ramp)
+        circular = obj.gradient_shape == "circular"
+        radius = max(math.hypot(dx, dy), 1e-6)
+        result = np.empty((height, width), dtype=np.float32)
+        x = np.arange(width, dtype=np.float32)[None, :] + .5
+        # Export tiles can be much larger than the editing preview. Keep the
+        # coordinate and distance temporaries bounded, without downsampling.
+        rows = max(1, 262144 // max(width, 1))
+        for start in range(0, height, rows):
+            end = min(height, start + rows)
+            y = np.arange(start, end, dtype=np.float32)[:, None] + .5
+            divisor = inverse.m13() * x + inverse.m23() * y + inverse.m33()
+            with np.errstate(divide="ignore", invalid="ignore"):
+                world_x = (inverse.m11() * x + inverse.m21() * y + inverse.dx()) / divisor
+                world_y = (inverse.m12() * x + inverse.m22() * y + inverse.dy()) / divisor
+                if circular:
+                    scalar = np.clip(
+                        np.hypot(world_x - first.x, world_y - first.y) / radius,
+                        0, 1,
+                    )
+                else:
+                    scalar = np.clip(
+                        ((world_x - first.x) * dx + (world_y - first.y) * dy)
+                        / max(dx * dx + dy * dy, 1e-12), 0, 1,
+                    )
+            if obj.line_field.reverse_direction:
+                scalar = 1 - scalar
+            indices = np.rint(np.nan_to_num(scalar) * (len(lut) - 1)).astype(np.int32)
+            coverage = (
+                (world_x >= 0) & (world_x < self.chapter.width)
+                & (world_y >= 0) & (world_y < self.chapter.height)
+            )
+            result[start:end] = np.where(coverage, lut[indices, 3] / np.float32(255), 0)
+        return result

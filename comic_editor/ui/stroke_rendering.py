@@ -12,7 +12,7 @@ from PySide6.QtGui import QImage, QPainter, QPainterPath, QTransform
 
 from comic_editor.core.models import (
     LayerNode, StrokeModifier, DotDashModifier, MirrorModifier, ArrayModifier,
-    CageTransformModifier,
+    CageTransformModifier, BlurModifier,
 )
 from comic_editor.core.stroke_geometry import (
     StrokeLoop, sample_path, normals, deform_loop, dot_dash_path, loop_path,
@@ -178,6 +178,13 @@ def transformed_loops(loops, modifier, mapping):
     return loops
 
 
+def _stroke_stage_key(canvas, source_key, tiled, prefix, bounds, mapping):
+    return ("stroke-material-stage", source_key, tiled, repr([m.to_dict() for m in prefix]),
+            canvas._modifier_parameter_signature([m.modifier_id for m in prefix]),
+            canvas._rect_signature(bounds),
+            tuple(getattr(mapping, f"m{i}{j}")() for i in range(1, 4) for j in range(1, 4)))
+
+
 def render_stroke_stack(canvas, target, image, bounds, modifiers, mapping, source_key, request_scope,
                         *, tiled=False, provisional=False):
     kind, identifier = ("layer", target.layer_id) if isinstance(target, LayerNode) else ("object", target.object_id)
@@ -208,6 +215,30 @@ def render_stroke_stack(canvas, target, image, bounds, modifiers, mapping, sourc
         cached = retained[0] if retained is not None else None
     if cached is not None:
         return cached, final_bounds
+    # A later exact material/fill result already contains every earlier stage.
+    # Resume there even if cache pressure evicted that earlier work. Replaying
+    # only the contour transforms avoids scheduling an endless alternating pair
+    # of jobs when two completed stages cannot fit in the retained image cache.
+    resume_index, resume = -1, None
+    if not provisional and request_scope is not None:
+        from comic_editor.ui.interactive_strokes import cached_stroke
+        stage_bounds = QRectF(bounds)
+        for index, modifier in enumerate(modifiers):
+            if modifier.muted or modifier.intensity <= 0 and "intensity" not in modifier.parameter_masks:
+                continue
+            stage_bounds = aligned(effect_bounds(stage_bounds, [modifier], mapping))
+            if isinstance(modifier, (StrokeModifier, BlurModifier)) and not isinstance(modifier, DotDashModifier):
+                stage_key = _stroke_stage_key(canvas, source_key, tiled,
+                    modifiers[:index + 1], stage_bounds, mapping)
+                if isinstance(modifier, BlurModifier):
+                    from comic_editor.ui.interactive_stroke_blur import cached_blur
+                    result = cached_blur(canvas,
+                        (*request_scope, "stroke-blur", modifier.modifier_id), stage_key)
+                else:
+                    result = cached_stroke(canvas,
+                        (*request_scope, "stroke-warp", modifier.modifier_id), stage_key)
+                if result is not None:
+                    resume_index, resume = index, result
     background_key = ("stroke-fill-source", source_key, tiled, canvas._rect_signature(bounds))
     background = None if provisional else canvas._modifier_source_cache_get(background_key)
     background_provisional = provisional
@@ -240,8 +271,39 @@ def render_stroke_stack(canvas, target, image, bounds, modifiers, mapping, sourc
     if not background_provisional:
         canvas._modifier_source_cache_put(background_key, background)
     provisional |= background_provisional
+    if provisional:
+        resume_index, resume = -1, None
     for index, modifier in enumerate(modifiers):
         if modifier.muted or modifier.intensity <= 0 and "intensity" not in modifier.parameter_masks:
+            continue
+        if index <= resume_index:
+            bounds = aligned(effect_bounds(bounds, [modifier], mapping))
+            if isinstance(modifier, StrokeModifier):
+                if not isinstance(modifier, DotDashModifier):
+                    parameters = mask_parameters(canvas, modifier, loops, bounds, mapping)
+                    loops = [deform_loop(loop, modifier, parameter)[0]
+                             for loop, parameter in zip(loops, parameters)]
+            else:
+                loops = transformed_loops(loops, modifier, mapping)
+            if index == resume_index:
+                image, background = resume
+            continue
+        if isinstance(modifier, BlurModifier):
+            from comic_editor.ui.interactive_stroke_blur import render_stroke_blur
+            expanded = aligned(effect_bounds(bounds, [modifier], mapping))
+            image, background = placed(image, bounds, expanded), placed(background, bounds, expanded)
+            bounds = expanded
+            stage_key = _stroke_stage_key(canvas, source_key, tiled,
+                modifiers[:index + 1], bounds, mapping)
+            image, background, stage_provisional = render_stroke_blur(
+                canvas, image, background, bounds, modifier, mapping,
+                cache_key=stage_key,
+                scope=(*request_scope, "stroke-blur", modifier.modifier_id)
+                if request_scope is not None else None,
+                provisional=provisional,
+            )
+            provisional |= stage_provisional
+            background_provisional |= stage_provisional
             continue
         if not isinstance(modifier, StrokeModifier):
             old_bounds = QRectF(bounds)
@@ -265,10 +327,7 @@ def render_stroke_stack(canvas, target, image, bounds, modifiers, mapping, sourc
         image, background = placed(image, bounds, expanded), placed(background, bounds, expanded)
         bounds = expanded
         prefix = modifiers[:index + 1]
-        stage_key = ("stroke-material-stage", source_key, tiled, repr([m.to_dict() for m in prefix]),
-                     canvas._modifier_parameter_signature([m.modifier_id for m in prefix]),
-                     canvas._rect_signature(bounds),
-                     tuple(getattr(mapping, f"m{i}{j}")() for i in range(1, 4) for j in range(1, 4)))
+        stage_key = _stroke_stage_key(canvas, source_key, tiled, prefix, bounds, mapping)
         material = None if provisional else canvas._modifier_cache_get(stage_key)
         fill = None if provisional else canvas._modifier_cache_get(("stroke-background-stage", stage_key))
         if isinstance(modifier, DotDashModifier) and material is not None and fill is not None:
@@ -283,9 +342,17 @@ def render_stroke_stack(canvas, target, image, bounds, modifiers, mapping, sourc
             if material is not None and fill is not None:
                 image, background, loops = material, fill, moved
                 continue
-            image, background = warp_material(image, background, bounds, loops, moved)
+            from comic_editor.ui.interactive_strokes import render_interactive_stroke
+            image, background, stage_provisional = render_interactive_stroke(
+                canvas, image, background, bounds, loops, moved, opacity,
+                cache_key=stage_key,
+                scope=(*request_scope, "stroke-warp", modifier.modifier_id)
+                if request_scope is not None else None,
+                provisional=provisional,
+            )
+            provisional |= stage_provisional
+            background_provisional |= stage_provisional
             loops = moved
-            image = opacity_noise(image, background, bounds, loops, opacity)
         if not provisional:
             canvas._modifier_cache_put(stage_key, image)
             canvas._modifier_cache_put(("stroke-background-stage", stage_key), background)

@@ -18,6 +18,7 @@ LABELS = {
     "object_select": "Object Select",
     "transform": "Transform",
     "eyedropper": "Eyedropper",
+    "swap_colors": "Swap Primary / Secondary Colors",
     "shape_edit": "Shape Edit",
     "vector_redraw": "Redraw Vector Thickness / Opacity",
     "vector_connect": "Connect Vector Line",

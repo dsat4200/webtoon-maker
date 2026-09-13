@@ -66,8 +66,10 @@ class SoloFeatures:
         return tuple(sorted(self._solo_filter_entries()))
 
     def _solo_content_visible(self, kind: str, identifier: str) -> bool:
+        if not self._show_on_top_content_visible(kind, identifier):
+            return False
         entries = self._solo_filter_entries()
-        if not entries or (kind, identifier) in entries:
+        if not entries or (kind, identifier) in entries or self._is_show_on_top(kind, identifier):
             return True
         entity = (self.chapter.layers.get(identifier) if kind == "layer"
                   else self.chapter.objects.get(identifier))
@@ -82,7 +84,11 @@ class SoloFeatures:
         return False
 
     def _solo_branch_visible(self, layer_id: str) -> bool:
+        if not self._show_on_top_branch_visible(layer_id):
+            return False
         if self._solo_content_visible("layer", layer_id):
+            return True
+        if self._show_on_top_solo_branch(layer_id):
             return True
         for kind, identifier in self._solo_filter_entries():
             entity = (self.chapter.layers[identifier] if kind == "layer"

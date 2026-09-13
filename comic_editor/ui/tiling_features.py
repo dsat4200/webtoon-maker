@@ -404,7 +404,7 @@ class TilingFeatures:
         provisional = revision != getattr(self, "_effect_provisional_revision", 0)
         kind, identifier = ("layer", target.layer_id) if isinstance(target, LayerNode) else ("object", target.object_id)
         if rest:
-            scope = (kind, identifier, getattr(self, "_effect_preview_channel", "canvas"))
+            scope = self._effect_request_scope(kind, identifier)
             signature = (self._modifier_layer_signature(identifier) if kind == "layer"
                          else self._modifier_object_signature(target))
             source_key = ("tiled-stages", kind, identifier, signature,

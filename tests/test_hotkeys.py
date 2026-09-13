@@ -7,7 +7,7 @@ from PySide6.QtTest import QTest
 
 from comic_editor.core import settings as settings_module
 from comic_editor.core.models import (
-    BoundGeometry, ChapterDocument, RasterObject, TextObject,
+    BoundGeometry, ChapterDocument, RasterObject, SeriesDocument, TextObject,
     VectorDrawingObject, VectorStroke, VectorStrokePoint,
 )
 from comic_editor.core.settings import (
@@ -134,6 +134,9 @@ def test_hotkey_dialog_has_hold_only_for_tools_and_rejects_duplicates(qapp):
     dialog = HotkeysDialog(settings.hotkeys, settings.hotkey_hold)
     assert set(dialog.hold_checks) == set(default_hotkey_hold())
     assert "save" not in dialog.hold_checks
+    assert settings.hotkeys["swap_colors"] == ""
+    assert dialog.editors["swap_colors"].chord() == ""
+    assert "swap_colors" not in dialog.hold_checks
     assert dialog.editors["deselect"].chord() == "Ctrl+D"
     dialog.editors["save"].setChord("P")
     dialog.editors["raster_pencil"].setChord("P")
@@ -164,6 +167,98 @@ def test_hotkey_dialog_resizes_with_actions_always_reachable(qapp):
     finally:
         dialog.close()
         dialog.deleteLater()
+
+
+def test_swap_hotkey_preserves_alpha_and_active_slot_across_series_and_canvas(qapp):
+    window = _window_with_shape()
+    window.series = SeriesDocument(primary_color="#40112233", secondary_color="#80445566")
+    window._sync_series_color_ui()
+    window.settings.hotkeys["swap_colors"] = "X"
+    window._install_shortcuts()
+    swaps = []
+    window.color_panel.colorsSwapped.connect(lambda first, second: swaps.append((first, second)))
+    window.show()
+    try:
+        for slot in ("primary", "secondary"):
+            window.color_panel.set_active_slot(slot)
+            expected = (window.series.secondary_color, window.series.primary_color)
+            window.canvas.setFocus()
+            qapp.processEvents()
+            QTest.keyClick(window.canvas, Qt.Key_X)
+            assert (window.series.primary_color, window.series.secondary_color) == expected
+            assert (window.canvas.primary_color, window.canvas.secondary_color) == expected
+            assert (window.color_panel.primary_color(), window.color_panel.secondary_color()) == expected
+            assert window.color_panel.active_slot() == window.canvas.active_color_slot == slot
+            assert window.color_panel.picker.color_argb() == expected[slot == "secondary"]
+            assert window._hotkey_active_hold is None
+        assert swaps == [("#80445566", "#40112233"), ("#40112233", "#80445566")]
+    finally:
+        window.hide()
+        window.deleteLater()
+
+
+def test_swap_hotkey_can_be_assigned_reassigned_and_cleared_through_dialog(qapp, monkeypatch, tmp_path):
+    monkeypatch.setattr(settings_module, "settings_path", lambda: tmp_path / "settings.json")
+    window = _window_with_shape()
+    swaps = []
+    window.color_panel.colorsSwapped.connect(lambda first, second: swaps.append((first, second)))
+    window.show()
+    try:
+        for chord, key, previous in (("F8", Qt.Key_F8, None), ("F9", Qt.Key_F9, Qt.Key_F8), ("", None, Qt.Key_F9)):
+            def edit_dialog():
+                dialog = QApplication.activeModalWidget()
+                assert isinstance(dialog, HotkeysDialog)
+                dialog.editors["swap_colors"].setChord(chord)
+                dialog.accept()
+
+            QTimer.singleShot(20, edit_dialog)
+            window._edit_hotkeys()
+            assert load_settings().hotkeys["swap_colors"] == chord
+            reopened = HotkeysDialog(load_settings().hotkeys)
+            assert reopened.editors["swap_colors"].chord() == chord
+            reopened.deleteLater()
+            window.canvas.setFocus()
+            qapp.processEvents()
+            count = len(swaps)
+            if previous is not None:
+                QTest.keyClick(window.canvas, previous)
+                assert len(swaps) == count
+            if key is not None:
+                QTest.keyClick(window.canvas, key)
+                assert len(swaps) == count + 1
+        assert "swap_colors" not in window._hotkey_bindings
+    finally:
+        window.hide()
+        window.deleteLater()
+
+
+def test_swap_letter_hotkey_yields_to_canvas_and_native_text_entry(qapp):
+    window = _window_with_shape()
+    window.settings.hotkeys["swap_colors"] = "X"
+    window._install_shortcuts()
+    text = window.chapter.add_object(window.chapter.root_page_ids[0], TextObject(text="abc"))
+    colors = (window.color_panel.primary_color(), window.color_panel.secondary_color())
+    window.show()
+    try:
+        window.canvas.set_selection("object", text.object_id)
+        window.canvas.start_text_edit()
+        window.canvas._text_cursor_position = window.canvas._text_selection_anchor = len(text.text)
+        window.canvas.setFocus()
+        qapp.processEvents()
+        QTest.keyClicks(window.canvas, "x")
+        assert text.text == "abcx"
+        assert (window.color_panel.primary_color(), window.color_panel.secondary_color()) == colors
+        window.canvas.commit_active_text_edit()
+        field = QLineEdit(window)
+        field.show()
+        field.setFocus()
+        qapp.processEvents()
+        QTest.keyClicks(field, "x")
+        assert field.text() == "x"
+        assert (window.color_panel.primary_color(), window.color_panel.secondary_color()) == colors
+    finally:
+        window.hide()
+        window.deleteLater()
 
 
 def test_deselect_hotkey_clears_drawing_selection_but_keeps_object(qapp):

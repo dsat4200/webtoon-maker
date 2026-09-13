@@ -199,7 +199,6 @@ class GradientToolsControls(QWidget):
         self.field_type.addItem("Circle / Ellipse", "radial")
         self.field_type.addItem("Parent Shape", "parent_shape")
         type_row.addWidget(self.field_type, 1)
-        create.addLayout(type_row)
         button_row = QHBoxLayout()
         self.create_color = QPushButton("Add Color Fill", self.create_widget)
         self.create_speed = QPushButton("Add Speed Lines", self.create_widget)
@@ -220,6 +219,17 @@ class GradientToolsControls(QWidget):
         self.type_parameters_widget = QWidget(self)
         type_parameters = QVBoxLayout(self.type_parameters_widget)
         type_parameters.setContentsMargins(0, 0, 0, 0)
+        shape_row = QHBoxLayout()
+        shape_row.addWidget(QLabel("Gradient type", self.type_parameters_widget))
+        self.gradient_shape = QComboBox(self.type_parameters_widget)
+        self.gradient_shape.addItem("Linear", "linear")
+        self.gradient_shape.addItem("Circular", "circular")
+        self.gradient_shape.setToolTip(
+            "Circular gradients use the first endpoint as the center and the second as the radius."
+        )
+        shape_row.addWidget(self.gradient_shape, 1)
+        type_parameters.addLayout(shape_row)
+        type_parameters.addLayout(type_row)
         self.mask_hint = QLabel(
             "Stop opacity controls mask strength.\nDrag on the canvas to redraw the gradient.",
             self.type_parameters_widget,
@@ -417,6 +427,7 @@ class GradientToolsControls(QWidget):
             )
         )
         self.field_type.currentIndexChanged.connect(self._field_changed)
+        self.gradient_shape.currentIndexChanged.connect(self._gradient_shape_changed)
         self.select_gradient.clicked.connect(self._select_matching_gradient)
         self.direction_mode.currentIndexChanged.connect(
             self._type_parameter_changed
@@ -537,7 +548,11 @@ class GradientToolsControls(QWidget):
         self.field_type.setEnabled(bool(context_parent))
         self.parameters_widget.setEnabled(enabled)
         self.presets_widget.setEnabled(enabled)
-        self.type_parameters_widget.setEnabled(enabled)
+        self.type_parameters_widget.setEnabled(enabled or bool(context_parent) or mask_active)
+        self.gradient_shape.setCurrentIndex(max(0, self.gradient_shape.findData(
+            obj.gradient_shape if isinstance(obj, ColorFillGradientObject)
+            else self.canvas._gradient_tool_shape
+        )))
         if obj is not None:
             self.opacity_lock.setChecked(obj.opacity_locked)
             self.field_type.setCurrentIndex(max(
@@ -609,6 +624,7 @@ class GradientToolsControls(QWidget):
         self.center_shape_button.setEnabled(is_speed)
         self.direction_row.setVisible(
             obj is not None and obj.field_type == "line"
+            and getattr(obj, "gradient_shape", "linear") != "circular"
         )
         radial_or_shape = (
             obj is not None
@@ -651,6 +667,7 @@ class GradientToolsControls(QWidget):
             and (
                 (
                     obj.field_type == "line"
+                    and getattr(obj, "gradient_shape", "linear") != "circular"
                     and (
                         obj.line_field.direction_mode == "perpendicular"
                     )
@@ -684,6 +701,7 @@ class GradientToolsControls(QWidget):
             else "Distance"
         )
         selected_type = str(self.field_type.currentData() or "line")
+        self.gradient_shape.setEnabled(selected_type == "line" or mask_active)
         matches = (
             self.canvas.chapter.gradient_children(
                 context_parent, selected_type
@@ -742,6 +760,27 @@ class GradientToolsControls(QWidget):
             self.objectChanged.emit()
         self.canvas.documentChanged.emit(QRectF())
         self.canvas.update()
+
+    def _touch_mask_gradient(self, obj: ColorFillGradientObject) -> None:
+        mask = self.canvas.chapter.masks.get(self.canvas.active_tone_mask_id)
+        if mask is not None and mask.gradient is obj:
+            mask.touch()
+            self.canvas._invalidate_tone_mask_overlay()
+
+    def _gradient_shape_changed(self) -> None:
+        if self._loading:
+            return
+        shape = str(self.gradient_shape.currentData() or "linear")
+        self.canvas.set_gradient_shape(shape)
+        obj = self.selected_gradient()
+        if not isinstance(obj, ColorFillGradientObject) or obj.gradient_shape == shape:
+            return
+        before = self.canvas.chapter.to_dict()
+        obj.gradient_shape = shape
+        obj.touch_revision()
+        self._touch_mask_gradient(obj)
+        self._commit_change(before, "Change gradient type")
+        self.refresh()
 
     def _field_changed(self) -> None:
         if self._loading or self.canvas.active_tone_mask_id:

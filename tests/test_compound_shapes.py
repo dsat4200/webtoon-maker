@@ -31,6 +31,53 @@ def _compound_canvas():
     return canvas, chapter, page, root
 
 
+def test_compound_geometry_scan_waits_for_a_path_request(qapp, monkeypatch):
+    import comic_editor.ui.canvas as canvas_module
+
+    canvas, chapter, page, root = _compound_canvas()
+    calls = []
+    original = canvas_module.geometry_key
+    monkeypatch.setattr(canvas_module, "geometry_key", lambda bound: (
+        calls.append(bound), original(bound)
+    )[1])
+    try:
+        for _ in range(5):
+            canvas.documentChanged.emit(None)
+        assert not calls
+        first = canvas.layer_effective_path(root.layer_id)
+        assert first.contains(QPointF(150, 150))
+        assert calls
+        calls.clear()
+        root.bound = BoundGeometry.rectangle(500, 100, 300, 300)
+        canvas.documentChanged.emit(None)
+        assert not calls
+        moved = canvas.layer_effective_path(root.layer_id)
+        assert not moved.contains(QPointF(150, 150))
+        assert moved.contains(QPointF(550, 150))
+        assert calls
+    finally:
+        canvas.deleteLater()
+
+
+def test_asset_crop_preserves_pending_compound_geometry_invalidation(qapp):
+    canvas, chapter, page, root = _compound_canvas()
+    try:
+        canvas.layer_effective_path(root.layer_id)
+        root.bound = BoundGeometry.rectangle(500, 100, 300, 300)
+        canvas.documentChanged.emit(None)
+        asset = ChapterDocument.from_dict(chapter.to_dict())
+        asset.layers[root.layer_id].bound = BoundGeometry.rectangle(800, 100, 200, 200)
+        assert not canvas._render_entity_crop(
+            asset, TileStore(), "layer", root.layer_id,
+        ).isNull()
+        path = canvas.layer_effective_path(root.layer_id)
+        assert path.contains(QPointF(550, 150))
+        assert not path.contains(QPointF(850, 150))
+        assert not path.contains(QPointF(150, 150))
+    finally:
+        canvas.deleteLater()
+
+
 def test_compound_fields_and_multiple_contours_round_trip():
     chapter = ChapterDocument()
     page = chapter.add_page()

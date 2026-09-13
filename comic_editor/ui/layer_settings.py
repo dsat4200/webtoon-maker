@@ -10,6 +10,7 @@ from PySide6.QtWidgets import (
 )
 
 from comic_editor.core.models import GridSettings
+from comic_editor.ui.show_on_top_controls import set_show_on_top
 
 
 class LayerSettingsPanel(QGroupBox):
@@ -46,6 +47,12 @@ class LayerSettingsPanel(QGroupBox):
         common_layout.addWidget(self.opacity, 1)
         self.form.addRow(self.common_row)
         self.common_row.setVisible(show_common)
+        self.show_on_top = QCheckBox("Show on top")
+        self.show_on_top.setToolTip(
+            "Show this layer and its contents above the rest of the document, including during solo."
+        )
+        self.form.addRow(self.show_on_top)
+        self.show_on_top.toggled.connect(self._show_on_top_changed)
         self.ignore_parent_mask = QCheckBox("Ignore direct parent mask")
         self.ignore_parent_mask.setToolTip(
             "Allow this layer and its descendants outside its direct parent "
@@ -255,7 +262,7 @@ class LayerSettingsPanel(QGroupBox):
                 self.border_color, self.grid_override, self.grid_size,
                 self.grid_divisions, self.compound_enabled,
                 self.compound_operation, self.flatten_compound,
-                self.ignore_parent_mask,
+                self.ignore_parent_mask, self.show_on_top,
             ):
                 widget.setEnabled(False)
             self._updating = False
@@ -267,13 +274,14 @@ class LayerSettingsPanel(QGroupBox):
             self.border_color, self.grid_override, self.grid_size,
             self.grid_divisions, self.compound_enabled,
             self.compound_operation, self.flatten_compound,
-            self.ignore_parent_mask,
+            self.ignore_parent_mask, self.show_on_top,
         ):
             widget.setEnabled(True)
         self.type_label.setText(self._layer_title(layer))
         self.name.setText(layer.name)
         self.visible.setChecked(layer.visible)
         self.opacity.setValue(round(layer.opacity * 100))
+        self.show_on_top.setChecked(layer.show_on_top)
         self.ignore_parent_mask.setVisible(not layer.is_page)
         self.ignore_parent_mask.setChecked(layer.ignore_parent_mask)
 
@@ -430,6 +438,10 @@ class LayerSettingsPanel(QGroupBox):
             self.canvas.push_model_change(
                 before, after, "Edit layer settings"
             )
+
+    def _show_on_top_changed(self, enabled: bool) -> None:
+        if not self._updating:
+            set_show_on_top(self.canvas, "layer", self.canvas.active_layer_id, enabled)
 
     def _apply(self, *args, push_undo: bool = True) -> None:
         chapter = self.canvas.chapter

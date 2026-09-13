@@ -77,6 +77,7 @@ def make_canvas(kind: str, *, eraser: bool = False):
         vector_eraser_mode="point",
     )
     canvas = CanvasWidget(settings)
+    canvas._performance.enabled = True  # This opt-in benchmark requests timings.
     canvas.resize(1000, 800)
     canvas.set_document(chapter, tiles)
     canvas.center_x = 500
@@ -198,6 +199,7 @@ def run_text_transform() -> dict[str, float]:
         snap_to_grid=False, canvas_renderer="raster"
     )
     canvas = CanvasWidget(settings)
+    canvas._performance.enabled = True
     canvas.resize(1000, 800)
     canvas.set_document(chapter, TileStore())
     canvas.center_x = 600
@@ -271,6 +273,7 @@ def run_dense_vector_navigation() -> dict[str, float]:
         snap_to_grid=False, predictive_ink=False,
         canvas_renderer="raster",
     ))
+    canvas._performance.enabled = True
     canvas.resize(1000, 800)
     canvas.set_document(chapter, TileStore())
     canvas.center_x, canvas.center_y, canvas.scale = 800, 700, 0.75

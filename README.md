@@ -47,6 +47,8 @@ workflow.
 - Pixel-snapped pan, zoom, rotation, and aspect-preserving chapter preview navigation
 - Touch navigation controlled only by Tablet Navigation mode
 - Command-based undo/redo and atomic autosave recovery
+- Opt-in drawing performance monitor beside File, with automatic per-run
+  diagnostic logs; see [monitor and eyedropper notes](docs/drawing-performance-monitor.md)
 - Blender 5.2 and 4.5 LTS Comic Views as disk-published transparent image sources with
   persistent offline PNG caches
 
@@ -491,6 +493,13 @@ or press **S** again to remove it from solo. Removing the last entry restores
 normal visibility. Solo is remembered per open project tab, preserves the eye
 settings, and affects the canvas and navigator without changing exported art.
 
+Enable **Show on top** in an object's or layer's settings to keep its artwork
+above ordinary content, including during solos and in exports. Enabling it on
+a layer includes its descendants. These entries have bright red outliner rows
+and a yellow crown in place of the solo star; click the crown to disable the
+option. Eye visibility, parent clipping, transforms, and opacity still apply.
+The setting is saved with the document and supports undo/redo.
+
 Use **Add Page** after selecting a page or one of its descendants, then draw
 the new page as a rectangle, circle, or closed custom shape below the active
 page. It is inserted immediately after that page in the outliner without
@@ -691,6 +700,12 @@ The Drawing Selection disclosure provides Rectangle and Lasso selection for
 raster pixels, vector points, or anchors on any custom-path layer (including
 open paths, pages, and additional contours). Stroke selection remains exclusive
 to Vector Drawings.
+Select multiple raster objects in the outliner, then choose **Drawing Selection
+→ Lasso** (or Rectangle) to move the enclosed pixels on all selected drawings
+together. Selected container layers include their visible raster descendants.
+The drawings remain separate, pixels outside the selection stay put, and one
+Undo restores the whole move. Escape cancels a move before release.
+
 Shift adds, Ctrl removes, and an unmodified gesture replaces the selection;
 the configurable Select All command defaults to `Ctrl+A`. Selected content
 uses eight free/uniform transform handles plus edge translation, rotation, and
@@ -741,8 +756,10 @@ center.
 Gradient ramps support translucent ARGB stops and reusable per-series
 presets. **Primary to Secondary** is a built-in, read-only preset that copies
 the current color wells when loaded. The square swap control between those
-wells exchanges the active primary and secondary colors. Gradient geometry,
-scalar distance fields, and ramp colors are cached independently so moving a
+wells exchanges the active primary and secondary colors. You can assign
+**Swap Primary / Secondary Colors** in **Hotkeys**; it has no default binding.
+Gradient geometry, scalar distance fields, and ramp colors are cached
+independently so moving a
 center or editing ramp colors updates interactively without rebuilding the
 parent boundary.
 
@@ -772,7 +789,10 @@ for controls and measurements.
 ## Test
 
 See [editing performance notes](docs/editor-performance.md) for measured
-modifier, drawing, fill, and autosave responsiveness and reproducible benchmarks.
+modifier, drawing, fill, autosave, and large-document responsiveness and
+reproducible benchmarks. The canvas automatically skips offscreen artwork and
+renders it again when you scroll back. Vector edits retain unrelated drawing
+caches, and outliner refreshes avoid repeated whole-document searches.
 
 ```powershell
 python -m pytest -q

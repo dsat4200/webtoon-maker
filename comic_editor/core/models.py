@@ -1630,6 +1630,7 @@ class LayerNode:
     transform_frame: tuple[float, float, float, float] | None = None
     transform_quad: list[tuple[float, float]] | None = None
     opacity_mask: ParameterMaskBinding | None = None
+    show_on_top: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -1639,6 +1640,7 @@ class LayerNode:
             "parent_id": self.parent_id,
             "children": [item.to_dict() for item in self.children],
             "visible": self.visible, "opacity": self.opacity,
+            "show_on_top": bool(self.show_on_top),
             "mask_only": self.mask_only,
             "fill_reference": self.fill_reference,
             "translation": [self.translate_x, self.translate_y],
@@ -1676,6 +1678,7 @@ class LayerNode:
             text_transform_behavior=str(data.get("text_transform_behavior", "bounds")),
             children=[ChildRef.from_dict(item) for item in data.get("children", [])],
             visible=bool(data.get("visible", True)),
+            show_on_top=bool(data.get("show_on_top", False)),
             opacity=float(data.get("opacity", 1.0)),
             mask_only=bool(data.get("mask_only", False)),
             fill_reference=bool(data.get("fill_reference", False)),
@@ -1779,6 +1782,7 @@ class DocumentObject:
     underlay_opacity: float = 0.0
     modifier_ids: list[str] = field(default_factory=list)
     opacity_mask: ParameterMaskBinding | None = None
+    show_on_top: bool = False
 
     def common_dict(self) -> dict[str, Any]:
         return {
@@ -1786,6 +1790,7 @@ class DocumentObject:
             "custom_name": self.custom_name,
             "parent_layer_id": self.parent_layer_id, "position": [self.x, self.y],
             "visible": self.visible, "opacity": self.opacity,
+            "show_on_top": bool(self.show_on_top),
             "mask_only": self.mask_only,
             "fill_reference": self.fill_reference,
             "opacity_locked": self.opacity_locked,
@@ -2466,10 +2471,13 @@ class ColorFillGradientObject(GradientObject):
     name: str = "Color Gradient"
     ramp: ColorGradientRamp = field(default_factory=ColorGradientRamp)
     loaded_preset_id: str = ""
+    gradient_shape: Literal["linear", "circular"] = "linear"
 
     def validate_gradient(self) -> None:
         super().validate_gradient()
         self.gradient_type = "color_fill"
+        if self.gradient_shape not in ("linear", "circular"):
+            self.gradient_shape = "linear"
         self.ramp.validate()
         self.loaded_preset_id = str(self.loaded_preset_id or "")
 
@@ -2478,6 +2486,7 @@ class ColorFillGradientObject(GradientObject):
         result.update({
             "ramp": self.ramp.to_dict(),
             "loaded_preset_id": self.loaded_preset_id,
+            "gradient_shape": self.gradient_shape,
         })
         return result
 
@@ -2794,6 +2803,7 @@ def object_from_dict(data: dict[str, Any]) -> ObjectEntity:
         custom_name=bool(data.get("custom_name", False)),
         parent_layer_id=str(data.get("parent_layer_id", "")), x=float(position[0]),
         y=float(position[1]), visible=bool(data.get("visible", True)),
+        show_on_top=bool(data.get("show_on_top", False)),
         opacity=float(data.get("opacity", 1.0)),
         mask_only=bool(data.get("mask_only", False)),
         fill_reference=bool(data.get("fill_reference", False)),
@@ -2824,6 +2834,7 @@ def object_from_dict(data: dict[str, Any]) -> ObjectEntity:
                 **gradient_common,
                 ramp=ColorGradientRamp.from_dict(data.get("ramp")),
                 loaded_preset_id=str(data.get("loaded_preset_id", "")),
+                gradient_shape=data.get("gradient_shape", "linear"),
             )
             result.validate_gradient()
             return result
@@ -3057,6 +3068,7 @@ def _migrate_legacy_fill_records(
             "parent_layer_id": parent_id,
             "position": [0.0, 0.0],
             "visible": bool(item.get("visible", True)),
+            "show_on_top": bool(item.get("show_on_top", False)),
             "opacity": float(item.get("opacity", 1.0)),
             "mask_only": bool(item.get("mask_only", False)),
             "opacity_locked": False,
@@ -3141,6 +3153,7 @@ def _migrate_legacy_fill_records(
                 "parent_layer_id": parent_id,
                 "position": [float(position[0]), float(position[1])],
                 "visible": bool(original.get("visible", True)),
+                "show_on_top": bool(original.get("show_on_top", False)),
                 "opacity": float(original.get("opacity", 1.0)),
                 "mask_only": bool(original.get("mask_only", False)),
                 "opacity_locked": bool(
@@ -3259,6 +3272,7 @@ class ChapterDocument:
                 raise ValueError("Root entries must be parentless page layers")
             referenced.add(("layer", page_id))
         for layer in self.layers.values():
+            layer.show_on_top = bool(layer.show_on_top)
             layer.ignore_parent_mask = bool(layer.ignore_parent_mask)
             layer.mask_only = bool(layer.mask_only and not layer.is_page)
             layer.fill_reference = bool(
@@ -3369,6 +3383,7 @@ class ChapterDocument:
                 else:
                     raise ValueError(f"Unknown child kind: {child.kind}")
         for obj in self.objects.values():
+            obj.show_on_top = bool(obj.show_on_top)
             obj.mask_only = bool(
                 obj.mask_only and isinstance(
                     obj,
@@ -4672,9 +4687,12 @@ class ColorGradientRampPreset:
     preset_id: str = field(default_factory=new_id)
     name: str = "Default"
     ramp: ColorGradientRamp = field(default_factory=ColorGradientRamp)
+    gradient_shape: Literal["linear", "circular"] = "linear"
 
     def validate(self) -> None:
         self.name = str(self.name).strip() or "Gradient"
+        if self.gradient_shape not in ("linear", "circular"):
+            self.gradient_shape = "linear"
         self.ramp.validate()
 
     def to_dict(self) -> dict[str, Any]:
@@ -4683,6 +4701,7 @@ class ColorGradientRampPreset:
             "id": self.preset_id,
             "name": self.name,
             "ramp": self.ramp.to_dict(),
+            "gradient_shape": self.gradient_shape,
         }
 
     @classmethod
@@ -4693,6 +4712,7 @@ class ColorGradientRampPreset:
             preset_id=str(data.get("id") or new_id()),
             name=str(data.get("name", "Gradient")),
             ramp=ColorGradientRamp.from_dict(data.get("ramp")),
+            gradient_shape=data.get("gradient_shape", "linear"),
         )
         result.validate()
         return result
