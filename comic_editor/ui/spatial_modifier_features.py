@@ -60,6 +60,15 @@ class SpatialModifierFeatures:
                 source.end()
             self._modifier_source_cache_put(key, image)
         required = inverse.mapRect(visible)
+        viewport_world = self._modifier_viewport_region(QRectF())
+        if not viewport_world.isEmpty():
+            # A stroke dirty rectangle limits painting, while an unchanged
+            # raster effect retains one window for the full canvas viewport.
+            # Map world to tile space once: rotating a bounding rectangle to
+            # the parent and back would produce different capture extents.
+            world_inverse, world_valid = mapping.inverted()
+            if world_valid:
+                required = world_inverse.mapRect(viewport_world)
         if getattr(self, "_effect_preview_channel", "canvas") == "navigator":
             required = None
         elif thumbnail_scale < 1.:

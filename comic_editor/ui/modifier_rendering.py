@@ -21,6 +21,17 @@ from comic_editor.core.effect_geometry import reflection_transform
 from comic_editor.core.curves import apply_curves, curves_is_neutral
 
 
+def modifier_render_settings(modifier):
+    """Serializable pixel dependencies, excluding modifier-card presentation."""
+    settings = modifier.to_dict()
+    settings.pop("name", None)
+    settings.pop("expanded", None)
+    if isinstance(modifier, CurvesModifier):
+        # Selecting a graph channel does not enable or disable its curve.
+        settings.pop("channel", None)
+    return settings
+
+
 def _qimage_premultiplied(image: QImage) -> np.ndarray:
     converted = image.convertToFormat(
         QImage.Format.Format_RGBA8888_Premultiplied

@@ -216,13 +216,29 @@ class TilingFeatures:
             self._rendering_compound_references = old_reference
             painter.restore()
 
-    def _tiling_source(self, target, bounds):
+    def _tiling_target_signature(self, target):
+        """World-space source dependencies, independent of allocated QImages."""
         layer = isinstance(target, LayerNode)
         kind, identifier = ("layer", target.layer_id) if layer else ("object", target.object_id)
         signature = self._modifier_layer_signature(identifier) if layer else self._modifier_object_signature(target)
-        key = ("tiling-source", kind, identifier, repr(signature), self._rect_signature(bounds),
-               self._render_exclude_text, self._render_base_alpha, self._render_excluded_object_id,
-               self._rendering_mask_contributor, self._rendering_compound_references)
+        mapping = self.layer_world_transform(identifier if layer else target.parent_layer_id)
+        excluded_id = self._render_excluded_object_id
+        excluded = self.chapter.objects.get(excluded_id)
+        if excluded_id != identifier and not (layer and excluded is not None and any(
+                parent.layer_id == identifier
+                for parent in self.chapter.ancestor_layers(excluded.parent_layer_id))):
+            excluded_id = None
+        return (kind, identifier, signature,
+                tuple(getattr(mapping, f"m{i}{j}")() for i in range(1, 4) for j in range(1, 4)),
+                self._render_exclude_text, self._render_base_alpha, excluded_id,
+                self._rendering_mask_contributor, self._rendering_compound_references,
+                getattr(self, "_stroke_hide_border_id", None),
+                getattr(self, "_effect_preview_channel", "canvas"))
+
+    def _tiling_source(self, target, bounds):
+        layer = isinstance(target, LayerNode)
+        kind, identifier = ("layer", target.layer_id) if layer else ("object", target.object_id)
+        key = ("tiling-source", self._tiling_target_signature(target), self._rect_signature(bounds))
         cached = self._modifier_source_cache_get(key)
         if cached is not None:
             return cached
@@ -340,21 +356,30 @@ class TilingFeatures:
         bounds = aligned(boundary.boundingRect())
         if required is not None:
             bounds = aligned(bounds.intersected(required))
+        # Rebuilt source captures have new QImage identities but unchanged
+        # pixels. Check the semantic output before capturing or repeating them.
+        signature = self._tiling_target_signature(target)
+        key = ("tiling-output", signature, self._rect_signature(bounds),
+               tuple((boundary.elementAt(i).x, boundary.elementAt(i).y, boundary.elementAt(i).type)
+                     for i in range(boundary.elementCount())))
+        scope = ("tiling-output", self._effect_request_scope(*signature[:2]))
+        retain = (self._interactive_render and not self._render_base_alpha
+                  and self._rendering_mask_contributor <= 0
+                  and getattr(self, "_effect_preview_channel", "canvas") != "navigator")
+        cached = self._modifier_cache_get(key)
+        if cached is None:
+            completed = self._effect_jobs.retained_get(scope, key)
+            cached = completed[0] if completed is not None else None
+        if cached is not None:
+            if retain:
+                self._effect_jobs.retained_put(scope, key, cached)
+            return cached, bounds
         source_bounds = aligned(geometry.bounds().adjusted(-2, -2, 2, 2))
         source_mapping = QTransform()
         if isinstance(target, RasterObject):
             source, source_bounds, source_mapping = self._tiling_raster_pixels(target, geometry)
         else:
             source = self._tiling_source(target, source_bounds)
-        key = ("tiling-output", source.cacheKey(), repr(modifier.to_dict()), self._rect_signature(bounds), getattr(self, "_stroke_hide_border_id", None),
-               self._modifier_parameter_signature([modifier.modifier_id]),
-               repr(target.to_dict()), boundary)
-        # QPainterPath isn't hashable; serialize its geometry into the key.
-        key = (*key[:-1], tuple((boundary.elementAt(i).x, boundary.elementAt(i).y, boundary.elementAt(i).type)
-                               for i in range(boundary.elementCount())))
-        cached = self._modifier_cache_get(key)
-        if cached is not None:
-            return cached, bounds
         if not hasattr(self, "_tiling_sampling_cache"):
             self._tiling_sampling_cache = RepeatMapCache()
         repeated = repeat_image(source, source_bounds, geometry, bounds, source_mapping,
@@ -384,6 +409,8 @@ class TilingFeatures:
         painter.end()
         if revision == getattr(self, "_effect_provisional_revision", 0):
             self._modifier_cache_put(key, result)
+            if retain:
+                self._effect_jobs.retained_put(scope, key, result)
         return result, bounds
 
     def _render_tiled_target(self, painter, target, parent_opacity, visible_world):
@@ -399,17 +426,15 @@ class TilingFeatures:
         if self._render_base_alpha:
             rest = []
         # Other spatial effects may pull any part of the finite tiled fill.
+        required = self._modifier_viewport_region(visible_world)
         revision = getattr(self, "_effect_provisional_revision", 0)
-        image, bounds = self._tiling_stage(target, None if rest else visible_world)
+        image, bounds = self._tiling_stage(target, None if rest else required)
         provisional = revision != getattr(self, "_effect_provisional_revision", 0)
         kind, identifier = ("layer", target.layer_id) if isinstance(target, LayerNode) else ("object", target.object_id)
         if rest:
             scope = self._effect_request_scope(kind, identifier)
-            signature = (self._modifier_layer_signature(identifier) if kind == "layer"
-                         else self._modifier_object_signature(target))
-            source_key = ("tiled-stages", kind, identifier, signature,
-                          self._rect_signature(bounds), self._render_exclude_text,
-                          self._render_excluded_object_id, getattr(self, "_stroke_hide_border_id", None))
+            source_key = ("tiled-stages", self._tiling_target_signature(target),
+                          self._rect_signature(bounds))
             if any(isinstance(effect, StrokeModifier) for effect in rest):
                 from comic_editor.ui.stroke_rendering import render_stroke_stack
                 image, bounds = render_stroke_stack(self, target, image, bounds, rest,
@@ -417,7 +442,7 @@ class TilingFeatures:
                     provisional=provisional)
             else:
                 image, bounds = render_stages(self, image, bounds, rest, QTransform(),
-                    nearest=isinstance(target, RasterObject), required=visible_world, request_scope=scope,
+                    nearest=isinstance(target, RasterObject), required=required, request_scope=scope,
                     provisional=provisional, source_key=source_key)
         if target.opacity_mask is not None:
             binding = target.opacity_mask

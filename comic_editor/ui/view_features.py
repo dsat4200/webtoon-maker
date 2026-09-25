@@ -243,13 +243,16 @@ class ViewFeatures:
         overflow.setClipPath(outside, Qt.ClipOperation.IntersectClip)
         previous = self._interactive_render
         previous_channel = getattr(self, "_effect_preview_channel", "canvas")
+        previous_effect_viewport = getattr(self, "_effect_viewport_world", None)
         self._interactive_render = True
         self._effect_preview_channel = "overflow"
+        self._effect_viewport_world = self.visible_document_rect()
         try:
             self._render_scene_layers(overflow, visible, page_contents_only=True)
         finally:
             self._interactive_render = previous
             self._effect_preview_channel = previous_channel
+            self._effect_viewport_world = previous_effect_viewport
             overflow.end()
         painter.save()
         painter.setTransform(QTransform())

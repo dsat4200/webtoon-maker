@@ -19,7 +19,9 @@ from comic_editor.core.stroke_geometry import (
 )
 from comic_editor.core.effect_geometry import effect_bounds, reflection_transform, array_indices, array_transform
 from comic_editor.ui.effect_pipeline import render_stages, aligned, empty_image
-from comic_editor.ui.modifier_rendering import _qimage_premultiplied, _premultiplied_qimage
+from comic_editor.ui.modifier_rendering import (
+    _qimage_premultiplied, _premultiplied_qimage, modifier_render_settings,
+)
 
 
 def target_loops(canvas, target):
@@ -179,7 +181,7 @@ def transformed_loops(loops, modifier, mapping):
 
 
 def _stroke_stage_key(canvas, source_key, tiled, prefix, bounds, mapping):
-    return ("stroke-material-stage", source_key, tiled, repr([m.to_dict() for m in prefix]),
+    return ("stroke-material-stage", source_key, tiled, repr([modifier_render_settings(m) for m in prefix]),
             canvas._modifier_parameter_signature([m.modifier_id for m in prefix]),
             canvas._rect_signature(bounds),
             tuple(getattr(mapping, f"m{i}{j}")() for i in range(1, 4) for j in range(1, 4)))
@@ -203,7 +205,7 @@ def render_stroke_stack(canvas, target, image, bounds, modifiers, mapping, sourc
     for modifier in modifiers:
         if not modifier.muted:
             final_bounds = aligned(effect_bounds(final_bounds, [modifier], mapping))
-    key = ("stroke-stack", source_key, tiled, repr([m.to_dict() for m in modifiers]),
+    key = ("stroke-stack", source_key, tiled, repr([modifier_render_settings(m) for m in modifiers]),
            canvas._modifier_parameter_signature(target.modifier_ids), canvas._rect_signature(final_bounds),
            tuple(getattr(mapping, f"m{i}{j}")() for i in range(1, 4) for j in range(1, 4)))
     cached = None if provisional else canvas._modifier_cache_get(key)
@@ -214,6 +216,8 @@ def render_stroke_stack(canvas, target, image, bounds, modifiers, mapping, sourc
         retained = canvas._effect_jobs.retained_get(retention_scope, key)
         cached = retained[0] if retained is not None else None
     if cached is not None:
+        if retain:
+            canvas._effect_jobs.retained_put(retention_scope, key, cached)
         return cached, final_bounds
     # A later exact material/fill result already contains every earlier stage.
     # Resume there even if cache pressure evicted that earlier work. Replaying
@@ -307,7 +311,7 @@ def render_stroke_stack(canvas, target, image, bounds, modifiers, mapping, sourc
             continue
         if not isinstance(modifier, StrokeModifier):
             old_bounds = QRectF(bounds)
-            prefix_key = (source_key, tiled, repr([m.to_dict() for m in modifiers[:index]]),
+            prefix_key = (source_key, tiled, repr([modifier_render_settings(m) for m in modifiers[:index]]),
                           canvas._modifier_parameter_signature([m.modifier_id for m in modifiers[:index]]))
             revision = getattr(canvas, "_effect_provisional_revision", 0)
             image, bounds = render_stages(canvas, image, old_bounds, [modifier], mapping,

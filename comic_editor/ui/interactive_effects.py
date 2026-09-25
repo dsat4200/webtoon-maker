@@ -83,14 +83,18 @@ def render_interactive_stack(canvas, image, modifiers, world_origin, mask_fields
     revision and avoid caching those captures as exact source images.
     """
     fields = mask_fields or {}
+    interactive = (canvas._interactive_render and not canvas._render_base_alpha
+                   and canvas._rendering_mask_contributor <= 0)
+    retain_exact = (interactive
+                    and getattr(canvas, "_effect_preview_channel", "canvas") != "navigator")
     if not upstream_provisional:
         cached = canvas._effect_jobs.result(scope, cache_key)
         if cached is None:
             cached = canvas._modifier_cache_get(cache_key)
+            if cached is not None and retain_exact:
+                canvas._effect_jobs.retained_put(("result", scope), cache_key, cached)
         if cached is not None:
             return cached, False
-    interactive = (canvas._interactive_render and not canvas._render_base_alpha
-                   and canvas._rendering_mask_contributor <= 0)
     pixels = image.width() * image.height()
     preview_only = (interactive and pixels > 16384
                     and getattr(canvas, "_effect_preview_channel", "canvas") == "navigator")
@@ -128,7 +132,10 @@ def render_interactive_stack(canvas, image, modifiers, world_origin, mask_fields
             canvas._modifier_cache_put(draft_key, result)
         canvas._effect_provisional_revision = getattr(canvas, "_effect_provisional_revision", 0) + 1
         return result.scaled(image.size(), Qt.IgnoreAspectRatio, Qt.FastTransformation), True
-    return apply_modifier_stack(image, modifiers, world_origin, fields,
+    result = apply_modifier_stack(image, modifiers, world_origin, fields,
         world_to_image=world_to_image, nearest=nearest,
         outline_distance_cache=canvas._outline_distance_cache,
-        blur_pyramid_cache=canvas._blur_pyramid_cache), upstream_provisional
+        blur_pyramid_cache=canvas._blur_pyramid_cache)
+    if retain_exact and not upstream_provisional:
+        canvas._effect_jobs.retained_put(("result", scope), cache_key, result)
+    return result, upstream_provisional

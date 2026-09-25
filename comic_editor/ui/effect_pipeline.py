@@ -1,6 +1,7 @@
 """Stage-wise effect rendering with explicit image placement."""
 import math
 import copy
+from dataclasses import dataclass
 import numpy as np
 from PySide6.QtCore import QRectF, Qt
 from PySide6.QtGui import QImage, QPainter, QTransform
@@ -9,7 +10,7 @@ from comic_editor.core.models import (ArrayModifier, MirrorModifier, RadialBlurM
     OutlineModifier, DistortModifier)
 from comic_editor.core.color_smoothing import simplify_padding
 from comic_editor.core.effect_geometry import effect_bounds, reflection_transform, array_indices, array_transform, array_input_bounds, outline_blur_padding
-from comic_editor.ui.modifier_rendering import apply_modifier_stack, _qimage_premultiplied, _premultiplied_qimage, _parameter_field
+from comic_editor.ui.modifier_rendering import apply_modifier_stack, _qimage_premultiplied, _premultiplied_qimage, _parameter_field, modifier_render_settings
 
 
 def aligned(bounds):
@@ -75,27 +76,25 @@ def _color_signature(canvas, modifier):
     return ()
 
 
-def render_stages(canvas, image, bounds, modifiers, local_to_world, *, nearest=False,
-                  required=None, request_scope=None, provisional=False, source_key=None):
-    bounds = QRectF(bounds)
+@dataclass(frozen=True)
+class _StagePlan:
+    signatures: tuple
+    transform_signature: tuple
+    placement: tuple
+    geometry: tuple
+    targets: tuple
+    key: tuple
+
+
+def _stage_plan(canvas, bounds, modifiers, local_to_world, source_identity, nearest, required):
+    """Describe exact stage dependencies without allocating source pixels."""
     initial_bounds = canvas._rect_signature(bounds)
     transform_signature = tuple(getattr(local_to_world, f"m{i}{j}")()
                                 for i in range(1, 4) for j in range(1, 4))
-    signatures = tuple((repr(modifier.to_dict()),
+    signatures = tuple((repr(modifier_render_settings(modifier)),
                         canvas._modifier_parameter_signature([modifier.modifier_id]),
                         _color_signature(canvas, modifier)) for modifier in modifiers)
-    source_identity = source_key if source_key is not None else int(image.cacheKey())
-    placement = (initial_bounds, transform_signature, nearest,
-                 canvas._rect_signature(required) if required is not None else None)
-    pipeline_key = ("stage-stack", source_identity, signatures, placement)
-    navigator = (canvas._interactive_render
-                 and getattr(canvas, "_effect_preview_channel", "canvas") == "navigator")
-    checkpoint_scope = ("pipeline", request_scope)
-    checkpointing = (request_scope is not None and canvas._interactive_render and not navigator
-                     and not provisional and not canvas._render_base_alpha
-                     and canvas._rendering_mask_contributor <= 0)
-    start = 0
-    inverse, valid = local_to_world.inverted()
+    placement = (initial_bounds, transform_signature, nearest)
     requirements = [None] * len(modifiers)
     if required is not None:
         needed = QRectF(required)
@@ -113,6 +112,70 @@ def render_stages(canvas, image, bounds, modifiers, local_to_world, *, nearest=F
             if isinstance(modifiers[index], PosterizeModifier) and not modifiers[index].muted:
                 padding = simplify_padding(modifiers[index])
                 needed = needed.adjusted(-padding, -padding, padding, padding)
+    # The camera request is not a pixel dependency when it leaves every actual
+    # stage extent unchanged. Keep the concrete prefix extents instead: an
+    # earlier crop can change later pixels even if a later warp expands back
+    # to the same rectangle. Plan once, then use these rectangles for rendering.
+    geometry, targets = [], []
+    incoming_bounds = QRectF(bounds)
+    for index, modifier in enumerate(modifiers):
+        skipped = (modifier.muted or modifier.intensity <= 0 and "intensity" not in modifier.parameter_masks
+                   or isinstance(modifier, RadialBlurModifier) and modifier.angle <= 0
+                   and "angle" not in modifier.parameter_masks)
+        target = QRectF(incoming_bounds) if skipped else effect_bounds(incoming_bounds, [modifier], local_to_world)
+        if not skipped:
+            if requirements[index] is not None:
+                target = target.intersected(requirements[index])
+            target = aligned(target)
+        geometry.append((canvas._rect_signature(incoming_bounds), canvas._rect_signature(target)))
+        targets.append(target)
+        incoming_bounds = target
+    geometry = tuple(geometry)
+    pipeline_key = ("stage-stack", source_identity, signatures, placement, geometry)
+    return _StagePlan(signatures, transform_signature, placement, geometry, tuple(targets), pipeline_key)
+
+
+def _checkpoint_enabled(canvas, request_scope, provisional=False):
+    return (request_scope is not None and canvas._interactive_render
+            and getattr(canvas, "_effect_preview_channel", "canvas") != "navigator"
+            and not provisional and not canvas._render_base_alpha
+            and canvas._rendering_mask_contributor <= 0)
+
+
+def cached_stage_output(canvas, bounds, modifiers, local_to_world, *, nearest=False,
+                        required=None, request_scope=None, source_key=None):
+    """Return a completed exact checkpoint before recapturing unchanged artwork.
+
+    The caller must supply the same semantic source key and capture bounds used
+    by render_stages. Partial checkpoints still require their incoming source;
+    drafts and special-purpose captures never qualify for this fast path.
+    """
+    if source_key is None or not _checkpoint_enabled(canvas, request_scope):
+        return None
+    plan = _stage_plan(canvas, bounds, modifiers, local_to_world, source_key, nearest, required)
+    checkpoint = canvas._effect_jobs.retained_get(("pipeline", request_scope), plan.key)
+    if checkpoint is None:
+        return None
+    image, (completed, placement) = checkpoint
+    if completed != len(modifiers):
+        return None
+    return image, QRectF(placement)
+
+
+def render_stages(canvas, image, bounds, modifiers, local_to_world, *, nearest=False,
+                  required=None, request_scope=None, provisional=False, source_key=None):
+    bounds = QRectF(bounds)
+    source_identity = source_key if source_key is not None else int(image.cacheKey())
+    plan = _stage_plan(canvas, bounds, modifiers, local_to_world, source_identity, nearest, required)
+    signatures, transform_signature = plan.signatures, plan.transform_signature
+    placement, geometry, targets = plan.placement, plan.geometry, plan.targets
+    pipeline_key = plan.key
+    navigator = (canvas._interactive_render
+                 and getattr(canvas, "_effect_preview_channel", "canvas") == "navigator")
+    checkpoint_scope = ("pipeline", request_scope)
+    checkpointing = _checkpoint_enabled(canvas, request_scope, provisional)
+    start = 0
+    inverse, valid = local_to_world.inverted()
     if checkpointing:
         checkpoint = canvas._effect_jobs.retained_get(checkpoint_scope, pipeline_key)
         if checkpoint is not None:
@@ -127,17 +190,15 @@ def render_stages(canvas, image, bounds, modifiers, local_to_world, *, nearest=F
             continue
         if isinstance(modifier, RadialBlurModifier) and modifier.angle <= 0 and "angle" not in modifier.parameter_masks:
             continue
-        target = effect_bounds(bounds, [modifier], local_to_world)
-        if requirements[index] is not None:
-            target = target.intersected(requirements[index])
-        target = aligned(target)
+        target = targets[index]
         if target.isEmpty():
             image, bounds = empty_image(QRectF(0, 0, 1, 1)), target
             continue
         # A semantic capture key survives source-LRU eviction. Only the exact
         # upstream prefix contributes, so editing a later slider still reuses
         # every earlier stage.
-        upstream_key = ("stage-input", source_identity, signatures[:index], placement) if source_key is not None else int(image.cacheKey())
+        upstream_key = ("stage-input", source_identity, signatures[:index], placement,
+                        geometry[:index]) if source_key is not None else int(image.cacheKey())
         key = ("stage", upstream_key, canvas._rect_signature(bounds),
                canvas._rect_signature(target),
                signatures[index][0], signatures[index][1],
@@ -283,10 +344,10 @@ def render_stages(canvas, image, bounds, modifiers, local_to_world, *, nearest=F
                 if amount.ndim == 2:
                     amount = amount[..., None]
                 incoming, base, cage = QImage(image), QImage(source), copy.deepcopy(modifier)
-                source_bounds, output_bounds, placement = QRectF(bounds), QRectF(target), QTransform(local_to_world)
+                source_bounds, output_bounds, cage_mapping = QRectF(bounds), QRectF(target), QTransform(local_to_world)
                 def compute(cancelled=None, pixel_scale=1., incoming=incoming, base=base, cage=cage,
-                            source_bounds=source_bounds, output_bounds=output_bounds, placement=placement, amount=amount):
-                    result = warp_image(incoming, source_bounds, cage, placement, output_bounds, cancelled, pixel_scale=pixel_scale)
+                            source_bounds=source_bounds, output_bounds=output_bounds, cage_mapping=cage_mapping, amount=amount):
+                    result = warp_image(incoming, source_bounds, cage, cage_mapping, output_bounds, cancelled, pixel_scale=pixel_scale)
                     if result is None:
                         return None
                     warped = result[0]
@@ -310,7 +371,7 @@ def render_stages(canvas, image, bounds, modifiers, local_to_world, *, nearest=F
                     and source.width()*source.height() > 128*128)
                 from comic_editor.ui.gpu_textures import renderer_for
                 gpu = renderer_for(canvas)
-                warped = gpu.cage(incoming, source_bounds, cage, placement, output_bounds) if gpu is not None else None
+                warped = gpu.cage(incoming, source_bounds, cage, cage_mapping, output_bounds) if gpu is not None else None
                 if warped is not None:
                     cached = warped if np.ndim(amount) == 0 and float(amount) == 1. else _premultiplied_qimage(
                         _qimage_premultiplied(base)*(1-amount)+_qimage_premultiplied(warped)*amount)

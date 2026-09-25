@@ -23,7 +23,9 @@ from comic_editor.ui.shape_outline_compound import (
 from comic_editor.ui.compound_outline_painting import prepare_outline_raster
 from comic_editor.ui.stroke_rendering import mask_parameters, nearest_coordinates
 from comic_editor.ui.effect_pipeline import empty_image, aligned
-from comic_editor.ui.modifier_rendering import _qimage_premultiplied, _premultiplied_qimage
+from comic_editor.ui.modifier_rendering import (
+    _qimage_premultiplied, _premultiplied_qimage, modifier_render_settings,
+)
 
 
 def scoped(canvas, layer, document=None):
@@ -122,7 +124,7 @@ def appearance(canvas, layer, document=None):
     key = (geometry_key(layer.bound), layer.vertex_radius, layer.border_width,
            tuple(tuple((n.outline_multiplier, n.outline_enabled) for n in contour.nodes)
                  for contour in layer.bound.iter_contours()),
-           tuple(repr(m.to_dict()) for m in effects), mask_signature, placement)
+           tuple(repr(modifier_render_settings(m)) for m in effects), mask_signature, placement)
     cache = getattr(canvas, "_compound_stroke_appearances", None)
     if cache is None:
         cache = canvas._compound_stroke_appearances = {}

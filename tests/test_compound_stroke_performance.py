@@ -118,6 +118,26 @@ def test_world_mask_placement_and_geometry_edits_invalidate_appearance(bubble):
     assert compound_strokes.appearance(canvas, layer) is not resized
 
 
+def test_compound_card_metadata_reuses_geometry_but_effect_parameter_invalidates(bubble, monkeypatch):
+    canvas, _chapter, layer, modifier = bubble
+    original = compound_strokes.appearance(canvas, layer)
+    expected = _pixels(canvas)
+    calls = []
+    deform = compound_strokes.deform_loop
+    monkeypatch.setattr(compound_strokes, "deform_loop", lambda *args, **kwargs:
+        (calls.append(True), deform(*args, **kwargs))[1])
+    modifier.name = "My bubble border"
+    modifier.expanded = not modifier.expanded
+    assert compound_strokes.appearance(canvas, layer) is original
+    assert np.array_equal(_pixels(canvas), expected)
+    assert not calls
+    modifier.height += 7
+    assert compound_strokes.appearance(canvas, layer) is not original
+    assert calls
+    canvas._clear_compound_path_cache()
+    assert not np.array_equal(_pixels(canvas), expected)
+
+
 @pytest.mark.parametrize("operation", ["add", "subtract", "none"])
 def test_direct_line_iteration_preserves_final_pixels(bubble, monkeypatch, operation):
     from comic_editor.core.vector_geometry import flatten_cubic

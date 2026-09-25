@@ -1467,7 +1467,9 @@ class _CanvasLogic(MultiRasterSelectionFeatures, ShowOnTopFeatures, SoloFeatures
         )
         self._set_live_underlay_context()
         previous_interactive = self._interactive_render
+        previous_effect_viewport = getattr(self, "_effect_viewport_world", None)
         self._interactive_render = True
+        self._effect_viewport_world = self.visible_document_rect()
         # Editing changes the text's content, not its place in the scene.
         # Keep glyphs in the ordinary hierarchy on every typing/deletion frame;
         # only caret/selection are painted later as an editing overlay.
@@ -1475,6 +1477,7 @@ class _CanvasLogic(MultiRasterSelectionFeatures, ShowOnTopFeatures, SoloFeatures
             self._render_scene_layers(painter, visible, underlay=True, live_ink=live_ink)
         finally:
             self._interactive_render = previous_interactive
+            self._effect_viewport_world = previous_effect_viewport
         self._clear_live_underlay_context()
         self._draw_grid(painter, visible)
         painter.restore()
@@ -4848,7 +4851,8 @@ class _CanvasLogic(MultiRasterSelectionFeatures, ShowOnTopFeatures, SoloFeatures
             return
         from comic_editor.ui.interactive_effects import outline_capture_bounds
         bounds = outline_capture_bounds(
-            self, painter, bounds, parent_inverse.mapRect(visible_world), modifiers)
+            self, painter, bounds,
+            parent_inverse.mapRect(self._modifier_viewport_region(visible_world)), modifiers)
         capture_world = parent_transform.mapRect(bounds)
         world_origin = parent_transform.map(bounds.topLeft())
         layer_signature = self._modifier_layer_signature(layer.layer_id)
@@ -4857,15 +4861,22 @@ class _CanvasLogic(MultiRasterSelectionFeatures, ShowOnTopFeatures, SoloFeatures
             layer_signature,
             self._render_exclude_text,
             self._rect_signature(bounds), world_origin.toTuple(),
+            self._modifier_mapping_signature(parent_transform),
         )
         from comic_editor.ui.interactive_effects import render_interactive_stack
         processed = self._modifier_cache_get(cache_key)
+        provisional = False
+        if processed is None:
+            processed = self._cached_modifier_output(
+                cache_key, self._effect_request_scope("layer", layer.layer_id),
+                layer.opacity_mask, bounds, parent_transform, capture_world)
         if processed is None:
             source_key = (
                 "layer-source", layer.layer_id,
                 layer_signature[0], layer_signature[3], layer_signature[4],
                 self._render_exclude_text,
                 self._rect_signature(bounds), world_origin.toTuple(),
+                self._modifier_mapping_signature(parent_transform),
             )
             source_provisional = False
             image = self._modifier_source_cache_get(source_key)
@@ -4941,6 +4952,8 @@ class _CanvasLogic(MultiRasterSelectionFeatures, ShowOnTopFeatures, SoloFeatures
                 )
             if not provisional:
                 self._modifier_cache_put(cache_key, processed)
+        if not provisional:
+            self._retain_modifier_output(cache_key, self._effect_request_scope("layer", layer.layer_id), processed)
         painter.save()
         painter.setOpacity(parent_opacity * layer.opacity)
         outline_overflows = any(
@@ -7576,7 +7589,25 @@ class _CanvasLogic(MultiRasterSelectionFeatures, ShowOnTopFeatures, SoloFeatures
             round(rect.width(), 5), round(rect.height(), 5),
         )
 
+    @staticmethod
+    def _modifier_mapping_signature(mapping: QTransform) -> tuple:
+        return tuple(getattr(mapping, f"m{i}{j}")()
+                     for i in range(1, 4) for j in range(1, 4))
+
+    def _modifier_viewport_region(self, fallback_world: QRectF) -> QRectF:
+        """Dirty rectangles clip painting, not an unchanged effect's cache window."""
+        viewport = getattr(self, "_effect_viewport_world", None)
+        if (viewport is not None and self._interactive_render
+                and getattr(self, "_effect_preview_channel", "canvas") in {"canvas", "overflow"}
+                and not self._render_modifier_sources and not self._render_base_alpha
+                and self._rendering_mask_contributor <= 0 and not self._render_cage_source
+                and not getattr(self, "_rendering_halftone_source", False)
+                and getattr(self, "_tiling_capture_geometry", None) is None):
+            return QRectF(viewport)
+        return QRectF(fallback_world)
+
     def _modifier_parameter_signature(self, ids: Iterable[str]) -> tuple[str, ...]:
+        from comic_editor.ui.modifier_rendering import modifier_render_settings
         result: list[str] = []
         capturing_colors = getattr(self, "_rendering_halftone_source", False)
         if capturing_colors:
@@ -7587,7 +7618,7 @@ class _CanvasLogic(MultiRasterSelectionFeatures, ShowOnTopFeatures, SoloFeatures
             if modifier is None or modifier.muted:
                 continue
             result.append(json.dumps(
-                modifier.to_dict(), sort_keys=True, separators=(",", ":"),
+                modifier_render_settings(modifier), sort_keys=True, separators=(",", ":"),
             ))
             if (isinstance(modifier, HalftoneModifier)
                     and modifier.color_mode == "target_layer" and not capturing_colors):
@@ -7616,12 +7647,13 @@ class _CanvasLogic(MultiRasterSelectionFeatures, ShowOnTopFeatures, SoloFeatures
         capturing_colors = getattr(self, "_rendering_halftone_source", False)
 
         def modifier_signature(modifier):
+            from comic_editor.ui.modifier_rendering import modifier_render_settings
             source = ()
             if (isinstance(modifier, HalftoneModifier)
                     and modifier.color_mode == "target_layer" and not capturing_colors):
                 from comic_editor.ui.halftone_source import source_signature
                 source = source_signature(self, modifier.target_layer_id)
-            return (json.dumps(modifier.to_dict(), sort_keys=True,
+            return (json.dumps(modifier_render_settings(modifier), sort_keys=True,
                                separators=(",", ":")), source)
 
         def entity_signature(kind: str, entity_id: str) -> tuple:
@@ -7654,21 +7686,11 @@ class _CanvasLogic(MultiRasterSelectionFeatures, ShowOnTopFeatures, SoloFeatures
                     ))
             elif isinstance(entity, ImageObject):
                 pixels = (int(self.images.image(entity.object_id).cacheKey()),)
-            elif (
-                isinstance(entity, VectorDrawingObject)
-                and entity.object_id == self.selected_object_id
-            ):
-                pixels = (
-                    self._vector_eraser_preview_revision,
-                    tuple(sorted(
-                        (key, int(image.cacheKey()))
-                        for key, image in self._vector_preview_tiles.object_tiles(
-                            self._vector_preview_id
-                        ).items()
-                    )),
-                )
+            if isinstance(entity, DocumentObject):
+                pixels = (pixels, self._modifier_object_preview_signature(entity))
             children: tuple = ()
             if isinstance(entity, LayerNode):
+                pixels = (pixels, self._modifier_layer_preview_signature(entity.layer_id))
                 children = tuple(
                     entity_signature(child.kind, child.entity_id)
                     for child in entity.children
@@ -7682,7 +7704,8 @@ class _CanvasLogic(MultiRasterSelectionFeatures, ShowOnTopFeatures, SoloFeatures
                 )
             ancestors = tuple(
                 (
-                    json.dumps(layer.to_dict(), sort_keys=True),
+                    json.dumps(self._modifier_entity_settings(layer), sort_keys=True),
+                    self._modifier_layer_preview_signature(layer.layer_id),
                     tuple(
                         modifier_signature(modifier)
                         for modifier in self._active_modifier_instances(
@@ -7705,7 +7728,7 @@ class _CanvasLogic(MultiRasterSelectionFeatures, ShowOnTopFeatures, SoloFeatures
                 )
             return (
                 kind, entity_id,
-                json.dumps(entity.to_dict(), sort_keys=True),
+                json.dumps(self._modifier_entity_settings(entity), sort_keys=True),
                 tuple(
                     modifier_signature(modifier)
                     for modifier in entity_modifiers
@@ -7986,6 +8009,59 @@ class _CanvasLogic(MultiRasterSelectionFeatures, ShowOnTopFeatures, SoloFeatures
             and self.selected_kind == kind and self.selected_id == identifier
         )
 
+    @staticmethod
+    def _modifier_entity_settings(entity) -> dict:
+        """Saved editor bookkeeping does not change captured artwork."""
+        settings = entity.to_dict()
+        for name in ("name", "custom_name", "fill_reference", "grid_override", "last_raster_id"):
+            settings.pop(name, None)
+        return settings
+
+    def _modifier_object_preview_signature(self, obj: DocumentObject) -> tuple:
+        """Only a live preview that changes this object's pixels is a dependency."""
+        live = ()
+        selection_preview = ()
+        if isinstance(obj, RasterObject):
+            raster_state = self.__dict__.get("_selection_raster_states", {}).get(obj.object_id)
+            if raster_state is not None:
+                before_tiles = raster_state["before_tiles"]
+                source_path = raster_state["source_path"]
+                overlay_tiles = raster_state.get("overlay_tiles")
+            elif obj.object_id == self.selected_object_id:
+                before_tiles = self._selection_before_tiles
+                source_path = self._drawing_selection_path
+                overlay_tiles = self._selection_overlay_tiles
+            else:
+                before_tiles = None
+            if (before_tiles is not None and self._selection_transform_start_quad
+                    and self._selection_transform_quad and not source_path.isEmpty()):
+                selection_preview = (
+                    self._gradient_path_signature(source_path),
+                    tuple(self._selection_transform_start_quad),
+                    tuple(self._selection_transform_quad),
+                    tuple(sorted((key, int(image.cacheKey())) for key, image in before_tiles.items())),
+                    None if overlay_tiles is None else tuple(sorted(
+                        (key, int(image.cacheKey())) for key, image in overlay_tiles.items())),
+                )
+        if selection_preview:
+            live = (*live, ("raster-selection", selection_preview))
+        if obj.object_id == self.selected_object_id:
+            if isinstance(obj, VectorDrawingObject):
+                if self._vector_gesture_mode == "eraser" and self._vector_eraser_preview:
+                    live = (*live, ("vector-eraser", self._vector_eraser_preview_revision))
+                if self._vector_gesture_mode == "pencil" and self._vector_samples:
+                    preview = tuple(sorted((key, int(image.cacheKey())) for key, image
+                        in self._vector_preview_tiles.object_tiles(self._vector_preview_id).items()))
+                    if preview:
+                        live = (*live, ("vector-pencil", preview))
+            if self._transform_preview_quad:
+                live = (*live, ("transform", tuple(self._transform_preview_quad)))
+        if obj.object_id in self._multi_transform_preview_quads:
+            live = (*live, ("object-transform", tuple(self._multi_transform_preview_quads[obj.object_id])))
+        if self._cage_session is not None and ("object", obj.object_id) in self._cage_session["targets"]:
+            live = (*live, repr(self._cage_session["grid"].grid_dict()))
+        return live
+
     def _modifier_object_signature(self, obj: DocumentObject) -> tuple:
         pixels: tuple = ()
         if isinstance(obj, RasterObject):
@@ -8006,70 +8082,27 @@ class _CanvasLogic(MultiRasterSelectionFeatures, ShowOnTopFeatures, SoloFeatures
             # Strict wrapping follows the parent, even when the text's own
             # stored frame and typography have not changed.
             pixels = ("text-layout", self._rect_signature(self._strict_text_rect(obj)))
-        live = ()
-        selection_preview = ()
-        if isinstance(obj, RasterObject):
-            raster_state = self.__dict__.get("_selection_raster_states", {}).get(obj.object_id)
-            if raster_state is not None:
-                before_tiles = raster_state["before_tiles"]
-                source_path = raster_state["source_path"]
-                overlay_tiles = raster_state.get("overlay_tiles")
-            elif obj.object_id == self.selected_object_id:
-                before_tiles = self._selection_before_tiles
-                source_path = self._drawing_selection_path
-                overlay_tiles = self._selection_overlay_tiles
-            else:
-                before_tiles = None
-            if (
-                before_tiles is not None
-                and self._selection_transform_start_quad
-                and self._selection_transform_quad
-                and not source_path.isEmpty()
-            ):
-                selection_preview = (
-                    self._gradient_path_signature(source_path),
-                    tuple(self._selection_transform_start_quad),
-                    tuple(self._selection_transform_quad),
-                    tuple(sorted((key, int(image.cacheKey()))
-                                 for key, image in before_tiles.items())),
-                    None if overlay_tiles is None else tuple(sorted(
-                        (key, int(image.cacheKey()))
-                        for key, image in overlay_tiles.items())),
-                )
-        if obj.object_id == self.selected_object_id:
-            live = (
-                self._vector_eraser_preview_revision,
-                tuple(sorted(
-                    (key, int(image.cacheKey()))
-                    for key, image in self._vector_preview_tiles.object_tiles(
-                        self._vector_preview_id
-                    ).items()
-                )),
-                tuple(self._multi_transform_preview_quads.get(
-                    obj.object_id, ()
-                )),
-                selection_preview,
-                tuple(self._transform_preview_quad or ()),
-            )
-        elif selection_preview:
-            live = ("raster-selection", selection_preview)
-        if obj.object_id != self.selected_object_id and obj.object_id in self._multi_transform_preview_quads:
-            live = (*live, ("object-transform", tuple(self._multi_transform_preview_quads[obj.object_id])))
-        if self._cage_session is not None and ("object", obj.object_id) in self._cage_session["targets"]:
-            live = (*live, repr(self._cage_session["grid"].grid_dict()))
+        live = self._modifier_object_preview_signature(obj)
         if getattr(self, "_tiling_capture_geometry", None) is not None:
             live = (*live, repr(self._tiling_capture_geometry))
         if obj.mask_only:
             live = (*live, ("mask-only-visible", self._mask_only_render_visible("object", obj.object_id)))
         return (
             json.dumps(
-                obj.to_dict(), sort_keys=True, separators=(",", ":")
+                self._modifier_entity_settings(obj), sort_keys=True, separators=(",", ":")
             ),
             self._modifier_parameter_signature(obj.modifier_ids),
             self._tone_mask_signature(obj.opacity_mask.mask_id)
             if obj.opacity_mask is not None else (),
             pixels, live,
         )
+
+    def _modifier_layer_preview_signature(self, layer_id: str) -> tuple:
+        if (self._transform_preview_quad and self._geometry_transform_target
+                in {("layer_group", layer_id), ("layer", layer_id)}):
+            return (self._geometry_transform_target[0],
+                    tuple(self._transform_start_quad or ()), tuple(self._transform_preview_quad))
+        return ()
 
     def _modifier_layer_signature(self, layer_id: str) -> tuple:
         layer = self.chapter.layers[layer_id]
@@ -8083,12 +8116,10 @@ class _CanvasLogic(MultiRasterSelectionFeatures, ShowOnTopFeatures, SoloFeatures
                 children.append(self._modifier_object_signature(
                     self.chapter.objects[reference.entity_id]
                 ))
-        preview = (
-            tuple(self._transform_preview_quad or ())
-            if self._geometry_transform_target in {("layer_group", layer_id), ("layer", layer_id)}
-            else ()
-        )
-        if self._render_excluded_object_id:
+        preview = self._modifier_layer_preview_signature(layer_id)
+        excluded = self.chapter.objects.get(self._render_excluded_object_id)
+        if excluded is not None and any(parent.layer_id == layer_id
+                for parent in self.chapter.ancestor_layers(excluded.parent_layer_id)):
             # Background captures must not become the cached visible subtree.
             preview = (*preview, ("excluded-object", self._render_excluded_object_id))
         if layer.mask_only:
@@ -8101,13 +8132,39 @@ class _CanvasLogic(MultiRasterSelectionFeatures, ShowOnTopFeatures, SoloFeatures
             preview = (*preview, ("show-on-top", self._show_on_top_signature()))
         return (
             json.dumps(
-                layer.to_dict(), sort_keys=True, separators=(",", ":")
+                self._modifier_entity_settings(layer), sort_keys=True, separators=(",", ":")
             ),
             self._modifier_parameter_signature(layer.modifier_ids),
             self._tone_mask_signature(layer.opacity_mask.mask_id)
             if layer.opacity_mask is not None else (),
             tuple(children), preview,
         )
+
+    def _cached_modifier_output(self, key, scope, opacity_mask, bounds, mapping, world_bounds):
+        """Recover completed pixels before allocating another source or mask field."""
+        completed = self._effect_jobs.retained_get(("output", scope), key)
+        if completed is not None:
+            return completed[0]
+        processed = self._effect_jobs.result(scope, ("interactive-stack", key))
+        if processed is None:
+            return None
+        if opacity_mask is not None:
+            width, height = processed.width(), processed.height()
+            world_to_image = self._world_to_image_transform(mapping, bounds, width, height)
+            processed = apply_opacity_mask(processed, self.render_tone_mask_field(
+                opacity_mask.mask_id, width, height, world_to_image, world_bounds),
+                opacity_mask.black_value, opacity_mask.white_value)
+        self._modifier_cache_put(key, processed)
+        return processed
+
+    def _retain_modifier_output(self, key, scope, image):
+        if (self._interactive_render and not self._render_base_alpha
+                and self._rendering_mask_contributor <= 0
+                and getattr(self, "_effect_preview_channel", "canvas") != "navigator"):
+            # Keep the latest displayed exact output separate from temporary
+            # captures/drafts. This also promotes a synchronous export/cache hit
+            # when it is next displayed, without making exports evict the view.
+            self._effect_jobs.retained_put(("output", scope), key, image)
 
     def _modifier_cache_get(self, key: tuple) -> QImage | None:
         image = self._modifier_render_cache.pop(key, None)
@@ -8235,16 +8292,25 @@ class _CanvasLogic(MultiRasterSelectionFeatures, ShowOnTopFeatures, SoloFeatures
             return
         from comic_editor.ui.interactive_effects import outline_capture_bounds
         if isinstance(obj, RasterObject):
-            bounds = outline_capture_bounds(self, painter, bounds, local_visible, modifiers)
+            viewport_world = self._modifier_viewport_region(QRectF())
+            viewport_local = (layer_inverse.mapRect(viewport_world)
+                              if not viewport_world.isEmpty() else local_visible)
+            bounds = outline_capture_bounds(self, painter, bounds, viewport_local, modifiers)
         world_origin = layer_transform.map(bounds.topLeft())
         object_signature = self._modifier_object_signature(obj)
         cache_key = (
             "object", obj.object_id,
             object_signature,
             self._rect_signature(bounds), world_origin.toTuple(),
+            self._modifier_mapping_signature(layer_transform),
         )
         from comic_editor.ui.interactive_effects import render_interactive_stack
         processed = self._modifier_cache_get(cache_key)
+        provisional = False
+        if processed is None:
+            processed = self._cached_modifier_output(
+                cache_key, self._effect_request_scope("object", obj.object_id),
+                obj.opacity_mask, bounds, layer_transform, world_bounds)
         if processed is None:
             source_key = (
                 "object-source", obj.object_id,
@@ -8305,6 +8371,8 @@ class _CanvasLogic(MultiRasterSelectionFeatures, ShowOnTopFeatures, SoloFeatures
                 )
             if not provisional:
                 self._modifier_cache_put(cache_key, processed)
+        if not provisional:
+            self._retain_modifier_output(cache_key, self._effect_request_scope("object", obj.object_id), processed)
         opacity = parent_opacity if self._render_base_alpha else (
             parent_opacity
             if obj.opacity_locked else parent_opacity * obj.opacity
@@ -8373,13 +8441,38 @@ class _CanvasLogic(MultiRasterSelectionFeatures, ShowOnTopFeatures, SoloFeatures
         # preview quad would evict unrelated artwork's source and every later
         # effect stage whenever another layer is dragged.
         key = ("mirror-source", kind, identifier, signature[0], signature[3], signature[4], self._rect_signature(bounds), self._render_exclude_text)
+        if layer:
+            # Descendant masks and spatial effects are sampled in world space.
+            # Parent transforms can change their pixels without changing this
+            # subtree's local bounds or stored layer records.
+            key = (*key, self._modifier_mapping_signature(mapping))
         if navigator:
             key = ("navigator-source", thumbnail_scale, key)
         if layer and scoped(self, target):
             key = (*key, self._modifier_parameter_signature([mid for mid in target.modifier_ids
                 if isinstance(self.chapter.modifiers.get(mid), StrokeModifier)]))
+        has_stroke = any(isinstance(modifier, StrokeModifier) for modifier in modifiers)
+        opacity = target.opacity if layer or not target.opacity_locked else 1.0
+        direct_mirror = (not has_stroke and modifiers and isinstance(modifiers[-1], MirrorModifier)
+                         and not modifiers[-1].parameter_masks and target.opacity_mask is None
+                         and parent_opacity * opacity == 1)
+        # Preserve the full gradient frame through projective transforms; other
+        # stage captures can limit their output to the requested visible area.
+        viewport_world = self._modifier_viewport_region(QRectF())
+        required = (None if isinstance(target, ColorFillGradientObject)
+                    else inverse.mapRect(viewport_world) if not viewport_world.isEmpty()
+                    else inverse.mapRect(visible) if layer else visible)
+        if getattr(self, "_effect_preview_channel", "canvas") == "navigator":
+            required = None
+        if thumbnail_scale < 1. and required is not None:
+            required = QTransform.fromScale(thumbnail_scale, thumbnail_scale).mapRect(required)
+        from comic_editor.ui.effect_pipeline import cached_stage_output
+        completed = (cached_stage_output(self, bounds, modifiers, stage_mapping,
+            nearest=isinstance(target, RasterObject), required=required,
+            request_scope=request_scope, source_key=key)
+            if not has_stroke and not direct_mirror else None)
         source_provisional = False
-        image = self._modifier_source_cache_get(key)
+        image = completed[0] if completed is not None else self._modifier_source_cache_get(key)
         if image is None:
             revision = getattr(self, "_effect_provisional_revision", 0)
             image = empty_image(bounds)
@@ -8409,9 +8502,7 @@ class _CanvasLogic(MultiRasterSelectionFeatures, ShowOnTopFeatures, SoloFeatures
             if not source_provisional:
                 self._modifier_source_cache_put(key, image)
         source_provisional |= navigator
-        has_stroke = any(isinstance(modifier, StrokeModifier) for modifier in modifiers)
-        opacity = target.opacity if layer or not target.opacity_locked else 1.0
-        if not has_stroke and modifiers and isinstance(modifiers[-1], MirrorModifier) and not modifiers[-1].parameter_masks and target.opacity_mask is None and parent_opacity * opacity == 1:
+        if direct_mirror:
             # Axis dragging reuses the source stages without allocating the gap.
             image, bounds = render_stages(self, image, bounds, modifiers[:-1], stage_mapping, nearest=isinstance(target, RasterObject), request_scope=request_scope, provisional=source_provisional, source_key=key)
             if thumbnail_scale < 1.:
@@ -8435,16 +8526,9 @@ class _CanvasLogic(MultiRasterSelectionFeatures, ShowOnTopFeatures, SoloFeatures
             from comic_editor.ui.stroke_rendering import render_stroke_stack
             image, bounds = render_stroke_stack(self, target, image, bounds, modifiers, mapping, key, request_scope,
                                                 provisional=source_provisional)
+        elif completed is not None:
+            image, bounds = completed
         else:
-            # Keep the cached gradient output intact. Cropping its image before
-            # a projective parent transform changes Qt's edge resampling as the
-            # viewport moves; the destination painter already clips the view.
-            required = (None if isinstance(target, ColorFillGradientObject)
-                        else inverse.mapRect(visible) if layer else visible)
-            if getattr(self, "_effect_preview_channel", "canvas") == "navigator":
-                required = None
-            if thumbnail_scale < 1. and required is not None:
-                required = QTransform.fromScale(thumbnail_scale, thumbnail_scale).mapRect(required)
             image, bounds = render_stages(self, image, bounds, modifiers, stage_mapping, nearest=isinstance(target, RasterObject), required=required, request_scope=request_scope, provisional=source_provisional, source_key=key)
         if thumbnail_scale < 1.:
             bounds = QTransform.fromScale(1/thumbnail_scale, 1/thumbnail_scale).mapRect(bounds)

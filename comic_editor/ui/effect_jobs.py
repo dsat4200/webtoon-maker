@@ -9,7 +9,8 @@ from comic_editor.ui.radial_blur import RadialRenderCancelled
 
 
 class EffectJobs(QObject):
-    def __init__(self, canvas, budget=256 * 1024 * 1024, retained_budget=256 * 1024 * 1024):
+    def __init__(self, canvas, budget=256 * 1024 * 1024, retained_budget=256 * 1024 * 1024,
+                 retained_limit=512):
         super().__init__(canvas)
         self.canvas = canvas
         self.budget = budget
@@ -22,6 +23,8 @@ class EffectJobs(QObject):
         self.retained = OrderedDict()
         self.retained_bytes = 0
         self.retained_budget = retained_budget
+        self.retained_limit = max(1, int(retained_limit))
+        self._retained_images = {}
         self.executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="effect-preview")
         self.stopped = Event()
         self.timer = QTimer(self)
@@ -49,21 +52,40 @@ class EffectJobs(QObject):
         from PySide6.QtGui import QImage
         self.retained_remove(scope)
         size = int(image.sizeInBytes())
-        # As with the canvas cache, one oversized image may reside alone.
-        # There is no new supported-image-size cutoff or per-target leak.
-        while self.retained and self.retained_bytes + size > self.retained_budget:
-            _, entry = self.retained.popitem(last=False)
-            self.retained_bytes -= entry[3]
+        storage = int(image.cacheKey())
+        # QImage copies share pixels until edited. A completed worker image
+        # often becomes a pipeline checkpoint before its result scope is
+        # removed; counting that handoff twice evicts unrelated exact artwork.
+        # Bound both unique pixel storage and the number of scope records.
+        while self.retained and (
+            self.retained_bytes + (0 if storage in self._retained_images else size)
+                > max(self.retained_budget, size)
+            or len(self.retained) >= self.retained_limit
+        ):
+            oldest = next(iter(self.retained))
+            self.retained_remove(oldest)
         self.retained[scope] = (key, QImage(image), state, size)
-        self.retained_bytes += size
+        if storage in self._retained_images:
+            self._retained_images[storage][1] += 1
+        else:
+            self._retained_images[storage] = [size, 1]
+            self.retained_bytes += size
 
     def retained_remove(self, scope, key=None):
         entry = self.retained.get(scope)
         if entry is not None and (key is None or entry[0] == key):
             self.retained.pop(scope)
-            self.retained_bytes -= entry[3]
+            storage = int(entry[1].cacheKey())
+            self._retained_images[storage][1] -= 1
+            if not self._retained_images[storage][1]:
+                self.retained_bytes -= self._retained_images.pop(storage)[0]
 
     def result(self, scope, key):
+        job = self.running
+        if job is not None and job[:2] == (scope, key) and job[3].done():
+            # A paint may arrive between worker completion and the 16 ms timer.
+            # Adopt its exact pixels now instead of flashing another draft.
+            self.poll()
         entry = self.retained_get(("result", scope), key)
         return entry[0] if entry is not None else None
 
@@ -79,6 +101,13 @@ class EffectJobs(QObject):
         if self.running and self.running[0] == scope:
             self.running[2].set()
         self.pending.pop(scope, None)
+        if self.running and self.running[4] + size > self.budget:
+            # This request cannot start until the running snapshot releases.
+            # Keep unrelated queued work instead of evicting it for a snapshot
+            # we cannot retain yet. A repaint asks for the latest state later.
+            self.retry_on_release = True
+            self.timer.start()
+            return True
         if oversized:
             # A large fallback gets the worker exclusively. Its computation
             # already needed this working memory in the synchronous renderer;
@@ -86,21 +115,8 @@ class EffectJobs(QObject):
             # retain a second large snapshot while an
             # old job is still unwinding or computing another visible target.
             self.pending.clear()
-            if self.running:
-                self.retry_on_release = True
-                self.timer.start()
-                return True
         while self.pending and self.bytes_in_flight + size > self.budget:
             self.pending.popitem(last=False)
-        if not oversized and self.bytes_in_flight + size > self.budget:
-            # The old worker still owns its snapshot until cancellation is
-            # observed. Do not run the new expensive effect on the UI thread
-            # just because both snapshots cannot fit at the same time.
-            # Retain no new arrays; repaint after release asks for the latest
-            # document state and can then enqueue it within the same budget.
-            self.retry_on_release = True
-            self.timer.start()
-            return True
         # A canceled running job releases its arrays before the next starts.
         self.pending[scope] = (scope, key, Event(), compute, size)
         self._start()
@@ -154,6 +170,7 @@ class EffectJobs(QObject):
         self.retry_on_release = False
         self.retained.clear()
         self.retained_bytes = 0
+        self._retained_images.clear()
         if self.running:
             self.running[2].set()
         else:

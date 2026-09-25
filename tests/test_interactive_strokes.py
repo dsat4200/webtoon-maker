@@ -256,3 +256,42 @@ def test_queued_stroke_worker_keeps_full_resolution_fill(scene, qapp):
     assert canvas._effect_jobs.running is not None
     canvas._effect_jobs.running[3].result(timeout=5)
     np.testing.assert_array_equal(pixels(settle(canvas, qapp)), expected)
+
+
+def test_displayed_synchronous_stroke_output_is_protected_from_scene_lru_churn(scene, monkeypatch):
+    canvas, _layer, _scream = scene
+    expected = render(canvas, False)
+    np.testing.assert_array_equal(pixels(render(canvas, True)), pixels(expected))
+    clear(canvas)
+
+    def unexpected_warp(*args, **kwargs):
+        pytest.fail("Displayed exact stroke material was rebuilt after unrelated LRU churn")
+
+    monkeypatch.setattr(interactive_strokes, "warp_material", unexpected_warp)
+    np.testing.assert_array_equal(pixels(render(canvas, True)), pixels(expected))
+    assert canvas._effect_jobs.submitted == 0
+
+
+def test_stroke_card_metadata_reuses_exact_pixels_but_geometry_edit_invalidates(scene, qapp, monkeypatch):
+    canvas, _layer, scream = scene
+    expected = settle(canvas, qapp)
+    submitted = canvas._effect_jobs.submitted
+    calls = []
+    original = interactive_strokes.warp_material
+    monkeypatch.setattr(interactive_strokes, "warp_material", lambda *args, **kwargs:
+        (calls.append(args[0].size()), original(*args, **kwargs))[1])
+    scream.name = "My speech bubble"
+    scream.expanded = not scream.expanded
+    clear(canvas)
+    np.testing.assert_array_equal(pixels(render(canvas, True)), pixels(expected))
+    assert not calls
+    assert canvas._effect_jobs.submitted == submitted
+
+    scream.height += 8
+    render(canvas, True)
+    assert calls
+    assert canvas._effect_jobs.submitted > submitted
+    actual = settle(canvas, qapp)
+    clear(canvas)
+    np.testing.assert_array_equal(pixels(actual), pixels(render(canvas, False)))
+    assert not np.array_equal(pixels(actual), pixels(expected))

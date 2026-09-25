@@ -404,7 +404,7 @@ def test_exact_retention_replaces_scopes_is_byte_bounded_and_detaches_reads(qapp
     jobs = EffectJobs(owner, retained_budget=2 * size)
     try:
         for index in range(3):
-            jobs.retained_put((index,), ("pixels",), source)
+            jobs.retained_put((index,), ("pixels",), source.copy())
         assert len(jobs.retained) == 2 and jobs.retained_bytes == 2 * size
         assert jobs.retained_get((0,), ("pixels",)) is None
         detached, _ = jobs.retained_get((2,), ("pixels",))
