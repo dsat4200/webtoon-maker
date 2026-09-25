@@ -15,7 +15,7 @@ from PySide6.QtGui import QImage, QPolygonF, QTransform
 from .models import (
     BoundGeometry, ChapterDocument, ChildRef, ColorFillGradientObject,
     DocumentObject, EmbeddedImageSourceDescriptor, GradientObject, ImageObject,
-    LayerNode, RasterObject, ShapeStyle, ArrayModifier, MirrorModifier, RadialBlurModifier, CageTransformModifier, TilingModifier, HalftoneModifier,
+    LayerNode, RasterObject, ShapeStyle, DistortModifier, ArrayModifier, MirrorModifier, RadialBlurModifier, CageTransformModifier, TilingModifier, HalftoneModifier,
     SpeedLineCenterObject, SpeedLinesGradientObject, TextObject,
     ToneMask, VectorDrawingObject, modifier_from_dict, new_id,
     object_from_dict,
@@ -715,6 +715,10 @@ def extract_asset(
     for modifier in asset.modifiers.values():
         if isinstance(modifier, CageTransformModifier):
             _translate_cage(modifier, dx, dy)
+        if isinstance(modifier, DistortModifier):
+            modifier.center = (modifier.center[0] + dx, modifier.center[1] + dy)
+            x, y, w, h = modifier.frame
+            modifier.frame = (x + dx, y + dy, w, h)
         if isinstance(modifier, (RadialBlurModifier, TilingModifier, ArrayModifier)):
             modifier.center = (modifier.center[0]+dx, modifier.center[1]+dy)
         if isinstance(modifier, (MirrorModifier, ArrayModifier)):
@@ -866,6 +870,10 @@ def instantiate_asset(
         modifier = target.modifiers[modifier_id]
         if isinstance(modifier, CageTransformModifier):
             _translate_cage(modifier, dx, dy)
+        if isinstance(modifier, DistortModifier):
+            modifier.center = (modifier.center[0] + dx, modifier.center[1] + dy)
+            x, y, w, h = modifier.frame
+            modifier.frame = (x + dx, y + dy, w, h)
         if isinstance(modifier, (RadialBlurModifier, TilingModifier, ArrayModifier)):
             modifier.center = (modifier.center[0]+dx, modifier.center[1]+dy)
         if isinstance(modifier, (MirrorModifier, ArrayModifier)):

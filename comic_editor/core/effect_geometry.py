@@ -3,7 +3,7 @@ import math
 from PySide6.QtCore import QPointF, QRectF
 from PySide6.QtGui import QTransform
 
-from comic_editor.core.models import ArrayModifier, BlurModifier, MirrorModifier, OutlineModifier, RadialBlurModifier, CageTransformModifier, ScreamModifier, WobbleModifier
+from comic_editor.core.models import ArrayModifier, BlurModifier, MirrorModifier, OutlineModifier, RadialBlurModifier, CageTransformModifier, ScreamModifier, WobbleModifier, DistortModifier
 
 
 def array_indices(modifier):
@@ -69,6 +69,16 @@ def radial_sweep_bounds(bounds, center, angle):
                   QPointF(max(p.x() for p in points), max(p.y() for p in points))).united(bounds)
 
 
+def outline_blur_padding(modifier):
+    """Finite Gaussian support, including both endpoints of parameter masks."""
+    def maximum(name):
+        value = getattr(modifier, name)
+        binding = modifier.parameter_masks.get(name)
+        return max(value, binding.black_value, binding.white_value) if binding else value
+
+    return math.ceil(3.0 * maximum("blur_radius")) if maximum("blur_strength") > 0 else 0
+
+
 def effect_bounds(bounds, modifiers, local_to_world=None):
     result = QRectF(bounds)
     transform = local_to_world or QTransform()
@@ -85,6 +95,9 @@ def effect_bounds(bounds, modifiers, local_to_world=None):
             amount = modifier.parameter_masks.get("intensity")
             padding *= max(modifier.intensity, amount.black_value, amount.white_value)/100 if amount else modifier.intensity/100
             result.adjust(-padding-2, -padding-2, padding+2, padding+2)
+        elif isinstance(modifier, DistortModifier):
+            from comic_editor.ui.distort_rendering import distort_bounds
+            result = distort_bounds(result, modifier, transform)
         elif isinstance(modifier, CageTransformModifier) and valid:
             from comic_editor.core.cage import deformed_bounds
             result = result.united(inverse.mapRect(QRectF(*deformed_bounds(modifier))))
@@ -112,7 +125,9 @@ def effect_bounds(bounds, modifiers, local_to_world=None):
                 padding = max(padding, binding.black_value, binding.white_value)
             if isinstance(modifier, BlurModifier):
                 padding *= 3
-            elif not isinstance(modifier, OutlineModifier):
+            elif isinstance(modifier, OutlineModifier):
+                padding += outline_blur_padding(modifier)
+            else:
                 padding = 0
             result.adjust(-padding, -padding, padding, padding)
     return result

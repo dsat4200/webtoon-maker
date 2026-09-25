@@ -851,6 +851,106 @@ class HueSaturationLightnessModifier:
 
 
 @dataclass
+class BrightnessContrastModifier:
+    """A shared RGB adjustment that preserves incoming transparency."""
+
+    modifier_id: str = field(default_factory=new_id)
+    modifier_type: Literal["brightness_contrast"] = "brightness_contrast"
+    name: str = "Brightness / Contrast"
+    intensity: float = 100.0
+    expanded: bool = True
+    muted: bool = False
+    brightness: float = 0.0
+    contrast: float = 0.0
+    parameter_masks: dict[str, ParameterMaskBinding] = field(default_factory=dict)
+
+    def validate(self) -> None:
+        self.name = str(self.name or "Brightness / Contrast")
+        self.expanded, self.muted = bool(self.expanded), bool(self.muted)
+        values = tuple(float(value) for value in (
+            self.intensity, self.brightness, self.contrast))
+        if not all(math.isfinite(value) for value in values):
+            raise ValueError("Brightness / Contrast values must be finite")
+        self.intensity = max(0.0, min(100.0, values[0]))
+        self.brightness = max(-100.0, min(100.0, values[1]))
+        self.contrast = max(-100.0, min(100.0, values[2]))
+        _validate_parameter_masks(self.parameter_masks, {
+            "intensity": (0.0, 100.0),
+            "brightness": (-100.0, 100.0),
+            "contrast": (-100.0, 100.0),
+        })
+
+    def to_dict(self) -> dict[str, Any]:
+        self.validate()
+        return {
+            "id": self.modifier_id, "type": self.modifier_type,
+            "name": self.name, "intensity": self.intensity,
+            "expanded": self.expanded, "muted": self.muted,
+            "brightness": self.brightness, "contrast": self.contrast,
+            "parameter_masks": _parameter_masks_to_dict(self.parameter_masks),
+        }
+
+
+@dataclass
+class CurvesModifier:
+    """Shared smooth color-channel curves with a selectable graph range."""
+
+    modifier_id: str = field(default_factory=new_id)
+    modifier_type: Literal["curves"] = "curves"
+    name: str = "Curves"
+    intensity: float = 100.0
+    expanded: bool = True
+    muted: bool = False
+    color_mode: str = "rgb"
+    channel: str = "master"
+    curves: dict[str, list[tuple[float, float]]] = field(default_factory=dict)
+    input_min: float = 0.0
+    input_max: float = 1.0
+    blend_mode: str = "normal"
+    parameter_masks: dict[str, ParameterMaskBinding] = field(default_factory=dict)
+
+    def validate(self) -> None:
+        from comic_editor.core.curves import CURVE_CHANNELS, CURVE_BLEND_MODES, validate_curve_points
+        self.name = str(self.name or "Curves")
+        self.expanded, self.muted = bool(self.expanded), bool(self.muted)
+        self.color_mode = str(self.color_mode).lower()
+        if self.color_mode == "grey":
+            self.color_mode = "gray"
+        if self.color_mode not in CURVE_CHANNELS:
+            raise ValueError("Unknown Curves color mode")
+        if self.channel not in CURVE_CHANNELS[self.color_mode]:
+            self.channel = "master"
+        if self.blend_mode not in CURVE_BLEND_MODES:
+            raise ValueError("Unknown Curves blend mode")
+        values = tuple(float(value) for value in (self.intensity, self.input_min, self.input_max))
+        if not all(math.isfinite(value) for value in values):
+            raise ValueError("Curves values must be finite")
+        self.intensity = max(0., min(100., values[0]))
+        self.input_min = max(0., min(16., values[1]))
+        self.input_max = max(0., min(16., values[2]))
+        if self.input_max - self.input_min < 1e-6:
+            raise ValueError("Curves maximum input must exceed minimum input")
+        if not isinstance(self.curves, dict):
+            raise ValueError("Curves channels must be a mapping")
+        valid = {mode + ":" + channel for mode, channels in CURVE_CHANNELS.items() for channel in channels}
+        if set(self.curves) - valid:
+            raise ValueError("Unknown Curves channel")
+        self.curves = {key: validate_curve_points(points) for key, points in self.curves.items()}
+        _validate_parameter_masks(self.parameter_masks, {"intensity": (0., 100.)})
+
+    def to_dict(self) -> dict[str, Any]:
+        self.validate()
+        return {
+            "id": self.modifier_id, "type": self.modifier_type, "name": self.name,
+            "intensity": self.intensity, "expanded": self.expanded, "muted": self.muted,
+            "color_mode": self.color_mode, "channel": self.channel,
+            "curves": {key: [list(point) for point in points] for key, points in self.curves.items()},
+            "input_min": self.input_min, "input_max": self.input_max, "blend_mode": self.blend_mode,
+            "parameter_masks": _parameter_masks_to_dict(self.parameter_masks),
+        }
+
+
+@dataclass
 class BlurModifier:
     """A full-frame or document-space focal blur."""
 
@@ -928,24 +1028,32 @@ class OutlineModifier:
     opacity: float = 100.0
     color: str = "#FF000000"
     parameter_masks: dict[str, ParameterMaskBinding] = field(default_factory=dict)
+    antialiasing: bool = True
+    blur_radius: float = 0.0
+    blur_strength: float = 0.0
 
     def validate(self) -> None:
         self.name = str(self.name or "Outline")
         self.expanded = bool(self.expanded)
         self.muted = bool(self.muted)
+        self.antialiasing = bool(self.antialiasing)
         values = tuple(float(value) for value in (
-            self.intensity, self.thickness, self.opacity,
+            self.intensity, self.thickness, self.opacity, self.blur_radius, self.blur_strength,
         ))
         if not all(math.isfinite(value) for value in values):
             raise ValueError("Outline modifier values must be finite")
         self.intensity = max(0.0, min(100.0, values[0]))
         self.thickness = max(0.0, min(25.0, values[1]))
         self.opacity = max(0.0, min(100.0, values[2]))
+        self.blur_radius = max(0.0, min(100.0, values[3]))
+        self.blur_strength = max(0.0, min(100.0, values[4]))
         self.color = canonical_argb(self.color)
         _validate_parameter_masks(self.parameter_masks, {
             "intensity": (0.0, 100.0),
             "thickness": (0.0, 25.0),
             "opacity": (0.0, 100.0),
+            "blur_radius": (0.0, 100.0),
+            "blur_strength": (0.0, 100.0),
         })
 
     def to_dict(self) -> dict[str, Any]:
@@ -960,6 +1068,9 @@ class OutlineModifier:
             "thickness": self.thickness,
             "opacity": self.opacity,
             "color": self.color,
+            "antialiasing": self.antialiasing,
+            "blur_radius": self.blur_radius,
+            "blur_strength": self.blur_strength,
             "parameter_masks": _parameter_masks_to_dict(self.parameter_masks),
         }
 
@@ -1509,10 +1620,74 @@ STROKE_MODIFIER_TYPES = {"stroke_scream": ScreamModifier,
                          "stroke_dot_dash": DotDashModifier}
 
 
-ModifierInstance = HueSaturationLightnessModifier | BlurModifier | OutlineModifier | MirrorModifier | ArrayModifier | RadialBlurModifier | CageTransformModifier | PosterizeModifier | PosterizeValueModifier | TilingModifier | ScreamModifier | WobbleModifier | DotDashModifier | HalftoneModifier | PixelateModifier
+@dataclass
+class DistortModifier:
+    """Nondestructive pixel remapping with world-space handles and portable settings."""
+
+    modifier_id: str = field(default_factory=new_id)
+    modifier_type: str = "distort_twirl"
+    name: str = ""
+    intensity: float = 100.
+    expanded: bool = True
+    muted: bool = False
+    parameters: dict[str, Any] = field(default_factory=dict)
+    frame: tuple[float, float, float, float] = (0., 0., 100., 100.)
+    center: tuple[float, float] = (50., 50.)
+    radius: float = 50.
+    points: list[tuple[float, float]] = field(default_factory=list)
+    source_points: list[tuple[float, float]] = field(default_factory=list)
+    parameter_masks: dict[str, ParameterMaskBinding] = field(default_factory=dict)
+
+    def validate(self):
+        from comic_editor.core.distort import DISTORT_TYPES, initial_points, validate_parameters
+        self.parameters = validate_parameters(self.modifier_type, self.parameters)
+        self.name = str(self.name or DISTORT_TYPES[self.modifier_type]["name"])
+        self.intensity, self.radius = float(self.intensity), float(self.radius)
+        self.center = _point(self.center)
+        if not isinstance(self.frame, (list, tuple)) or len(self.frame) != 4:
+            raise ValueError("Distortion frame requires x, y, width, height")
+        self.frame = tuple(float(value) for value in self.frame)
+        if not all(math.isfinite(value) for value in (*self.frame, *self.center, self.radius, self.intensity)):
+            raise ValueError("Distortion geometry must be finite")
+        if self.frame[2] <= 0 or self.frame[3] <= 0 or self.radius <= 0:
+            raise ValueError("Distortion dimensions and radius must be positive")
+        self.intensity = max(0., min(100., self.intensity))
+        self.expanded, self.muted = bool(self.expanded), bool(self.muted)
+        if not isinstance(self.points, (list, tuple)) or not isinstance(self.source_points, (list, tuple)):
+            raise ValueError("Distortion handles must be lists")
+        if len(self.points) > 4096 or len(self.source_points) > 4096:
+            raise ValueError("Too many distortion handles")
+        if not self.points and not self.source_points:
+            self.points = initial_points(self.modifier_type, self.parameters)
+            self.source_points = list(self.points)
+        self.points = [_point(point) for point in self.points]
+        self.source_points = [_point(point) for point in self.source_points]
+        if len(self.points) != len(self.source_points):
+            raise ValueError("Distortion source and destination handles must match")
+        if not all(math.isfinite(value) for point in [*self.points, *self.source_points] for value in point):
+            raise ValueError("Distortion handles must be finite")
+        if self.modifier_type == "distort_perspective" and len(self.points) != 4:
+            raise ValueError("Perspective requires four corners")
+        if self.modifier_type == "distort_mesh_warp" and len(self.points) != self.parameters["rows"] * self.parameters["columns"]:
+            raise ValueError("Mesh handles must match its row and column counts")
+        _validate_parameter_masks(self.parameter_masks, {"intensity": (0., 100.)})
+
+    def to_dict(self):
+        self.validate()
+        return dict(id=self.modifier_id, type=self.modifier_type, name=self.name,
+                    intensity=self.intensity, expanded=self.expanded, muted=self.muted,
+                    parameters=copy.deepcopy(self.parameters), frame=list(self.frame),
+                    center=list(self.center), radius=self.radius,
+                    points=[list(point) for point in self.points],
+                    source_points=[list(point) for point in self.source_points],
+                    parameter_masks=_parameter_masks_to_dict(self.parameter_masks))
+
+
+ModifierInstance = HueSaturationLightnessModifier | BrightnessContrastModifier | CurvesModifier | BlurModifier | OutlineModifier | MirrorModifier | ArrayModifier | RadialBlurModifier | CageTransformModifier | PosterizeModifier | PosterizeValueModifier | TilingModifier | ScreamModifier | WobbleModifier | DotDashModifier | HalftoneModifier | PixelateModifier | DistortModifier
 
 
 def modifier_from_dict(data: dict[str, Any]) -> ModifierInstance:
+    from comic_editor.core.distort import DISTORT_TYPES
     modifier_type = str(data.get("type", ""))
     common = {
         "modifier_id": str(data.get("id") or new_id()),
@@ -1524,7 +1699,13 @@ def modifier_from_dict(data: dict[str, Any]) -> ModifierInstance:
             data.get("parameter_masks")
         ),
     }
-    if modifier_type in STROKE_MODIFIER_TYPES or modifier_type in {"halftone", "pixelate"}:
+    if modifier_type in DISTORT_TYPES:
+        result = DistortModifier(**common, modifier_type=modifier_type,
+            parameters=copy.deepcopy(data.get("parameters", {})),
+            frame=data.get("frame", (0., 0., 100., 100.)),
+            center=data.get("center", (50., 50.)), radius=data.get("radius", 50.),
+            points=data.get("points", []), source_points=data.get("source_points", []))
+    elif modifier_type in STROKE_MODIFIER_TYPES or modifier_type in {"halftone", "pixelate"}:
         factory = ({"halftone": HalftoneModifier, "pixelate": PixelateModifier}.get(modifier_type)
                    or STROKE_MODIFIER_TYPES[modifier_type])
         defaults = factory().to_dict()
@@ -1560,6 +1741,16 @@ def modifier_from_dict(data: dict[str, Any]) -> ModifierInstance:
                            range_id=str(item.get("id") or new_id()))
             for item in data.get("ranges", [{"start": 0.}])
         ])
+    elif modifier_type == "curves":
+        result = CurvesModifier(
+            **common, color_mode=str(data.get("color_mode", "rgb")),
+            channel=str(data.get("channel", "master")), curves=copy.deepcopy(data.get("curves", {})),
+            input_min=float(data.get("input_min", 0.)), input_max=float(data.get("input_max", 1.)),
+            blend_mode=str(data.get("blend_mode", "normal")))
+    elif modifier_type == "brightness_contrast":
+        result = BrightnessContrastModifier(
+            **common, brightness=float(data.get("brightness", 0.0)),
+            contrast=float(data.get("contrast", 0.0)))
     elif modifier_type == "hsl":
         result: ModifierInstance = HueSaturationLightnessModifier(
             **common,
@@ -1597,6 +1788,9 @@ def modifier_from_dict(data: dict[str, Any]) -> ModifierInstance:
             thickness=float(data.get("thickness", 8.0)),
             opacity=float(data.get("opacity", 100.0)),
             color=str(data.get("color", "#FF000000")),
+            antialiasing=bool(data.get("antialiasing", True)),
+            blur_radius=float(data.get("blur_radius", 0.0)),
+            blur_strength=float(data.get("blur_strength", 0.0)),
         )
     else:
         raise ValueError(f"Unknown modifier type: {modifier_type}")
@@ -3317,7 +3511,8 @@ class ChapterDocument:
                 layer.ignore_parent_mask = False
                 layer.mask_only = False
                 layer.fill_reference = False
-                layer.modifier_ids.clear()
+                layer.modifier_ids = [mid for mid in layer.modifier_ids
+                                      if isinstance(self.modifiers[mid], CurvesModifier)]
                 layer.transform_frame = None
                 layer.transform_quad = None
                 layer.opacity_mask = None
@@ -3398,12 +3593,17 @@ class ChapterDocument:
                 str(item) for item in obj.modifier_ids
                 if str(item) in self.modifiers
             ))
+            if not isinstance(obj, (RasterObject, ImageObject)):
+                for mid in obj.modifier_ids:
+                    if isinstance(self.modifiers[mid], DistortModifier):
+                        raise ValueError(self.modifier_compatibility_message(
+                            self.modifiers[mid], [("object", obj.object_id)]))
             if isinstance(obj, ColorFillGradientObject):
                 obj.modifier_ids = [mid for mid in obj.modifier_ids
-                                    if isinstance(self.modifiers[mid], (PosterizeModifier, HalftoneModifier))]
+                                    if isinstance(self.modifiers[mid], (PosterizeModifier, HalftoneModifier, CurvesModifier))]
             elif isinstance(obj, TextObject):
                 obj.modifier_ids = [mid for mid in obj.modifier_ids
-                                    if isinstance(self.modifiers[mid], OutlineModifier)]
+                                    if isinstance(self.modifiers[mid], (OutlineModifier, BrightnessContrastModifier, CurvesModifier))]
             elif not isinstance(
                 obj, (RasterObject, VectorDrawingObject, ImageObject)
             ):
@@ -3520,7 +3720,7 @@ class ChapterDocument:
             if modifier.modifier_id != modifier_id:
                 modifier.modifier_id = modifier_id
             modifier.validate()
-            if isinstance(modifier, (CageTransformModifier, TilingModifier)):
+            if isinstance(modifier, (CageTransformModifier, TilingModifier, DistortModifier)):
                 incompatible = self.incompatible_modifier_targets(modifier, self.modifier_target_ids(modifier_id))
                 if incompatible:
                     raise ValueError(self.modifier_compatibility_message(modifier, incompatible))
@@ -3703,7 +3903,7 @@ class ChapterDocument:
         if kind == "layer":
             layer = self.layers.get(entity_id)
             if (
-                layer is not None and not layer.is_page
+                layer is not None
                 and (layer.bound is not None or layer.layer_kind == "text_container")
             ):
                 return layer
@@ -3769,6 +3969,8 @@ class ChapterDocument:
         for ref in targets:
             target = self.modifier_target(*ref)
             compatible = target is not None
+            if isinstance(modifier, DistortModifier):
+                compatible = isinstance(target, (RasterObject, ImageObject))
             if isinstance(modifier, StrokeModifier):
                 compatible = self.stroke_modifier_target(*ref)
             if isinstance(modifier, CageTransformModifier):
@@ -3783,9 +3985,13 @@ class ChapterDocument:
                 compatible = compatible and not any(self._tiling_related(ref, other)
                     for other in occupied + [other for other in targets if other != ref])
             if isinstance(target, ColorFillGradientObject):
-                compatible = compatible and isinstance(modifier, (PosterizeModifier, HalftoneModifier))
+                compatible = compatible and isinstance(modifier, (PosterizeModifier, HalftoneModifier, CurvesModifier))
             if isinstance(target, TextObject):
-                compatible = compatible and isinstance(modifier, OutlineModifier)
+                compatible = compatible and isinstance(modifier, (OutlineModifier, BrightnessContrastModifier, CurvesModifier))
+            # Pages now expose Curves without opening geometry effects or the
+            # existing object-only adjustments to a new target category.
+            if isinstance(target, LayerNode) and target.is_page:
+                compatible = compatible and isinstance(modifier, CurvesModifier)
             if not compatible:
                 result.append(ref)
         return result
@@ -3796,26 +4002,32 @@ class ChapterDocument:
             entity = (self.layers if kind == "layer" else self.objects).get(identifier)
             names.append(entity.name if entity else identifier)
         message = f"{modifier.name} is not compatible with: " + (", ".join(names) or "this selection") + "."
+        if isinstance(modifier, DistortModifier):
+            message += " Distort modifiers support raster drawings, images, and Blender renders only."
         if isinstance(modifier, StrokeModifier):
             message += " Stroke modifiers require closed shapes or drawings with closed vector strokes. Open shapes are not supported."
         if isinstance(modifier, CageTransformModifier):
             message += " Use the Cage Transform tool to transform raster and vector drawings. Select only drawings, or only images and shapes."
         if isinstance(modifier, TilingModifier):
             message += " Tiling requires a drawing, image, or non-page shape, with only one tiling setup per hierarchy branch (including muted setups)."
-        if not isinstance(modifier, (PosterizeModifier, HalftoneModifier)) and any(
+        if not isinstance(modifier, (PosterizeModifier, HalftoneModifier, CurvesModifier)) and any(
                 kind == "object" and isinstance(self.objects.get(identifier), ColorFillGradientObject)
                 for kind, identifier in targets):
-            message += " Color gradients support Posterize, Posterize Value, and Halftone."
-        if not isinstance(modifier, OutlineModifier) and any(
+            message += " Color gradients support Posterize, Posterize Value, Halftone, and Curves."
+        if not isinstance(modifier, (OutlineModifier, BrightnessContrastModifier, CurvesModifier)) and any(
                 kind == "object" and isinstance(self.objects.get(identifier), TextObject)
                 for kind, identifier in targets):
-            message += " Text boxes support Outline. Apply other supported effects to their text container."
+            message += " Text boxes support Outline, Brightness / Contrast, and Curves. Apply other supported effects to their text container."
+        if not isinstance(modifier, CurvesModifier) and any(
+                kind == "layer" and self.layers.get(identifier) is not None
+                and self.layers[identifier].is_page for kind, identifier in targets):
+            message += " Pages support Curves."
         return message
 
     def stroke_modifier_target(self, kind, identifier):
         target = self.modifier_target(kind, identifier)
         if isinstance(target, LayerNode):
-            return bool(target.bound is not None and target.bound.closed
+            return bool(not target.is_page and target.bound is not None and target.bound.closed
                         and target.layer_kind == "bounded")
         if isinstance(target, VectorDrawingObject):
             return bool(target.strokes and all(stroke.closed and len(stroke.points) >= 3

@@ -146,9 +146,10 @@ def test_native_qt_paints_are_timed_and_stop_restores_every_probe(editor, contro
     # grab() asks Qt to deliver a real paintEvent; do not invoke the patched
     # Python method directly, which would miss virtual-dispatch regressions.
     assert not canvas.grab().isNull()
+    window.navigator_panel.setExpanded(True, emit=False)
     window.preview.invalidate_all()
     assert not window.preview.grab().isNull()
-    qapp.processEvents()
+    QTest.qWait(window.preview.REFRESH_DELAY_MS + 30)
     phases = _phases(controller)
     assert phases["canvas.paintEvent"]["count"] >= 1
     assert phases["canvas.ensure_scene_cache"]["count"] >= 1

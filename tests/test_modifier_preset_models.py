@@ -5,7 +5,7 @@ import json
 import pytest
 
 from comic_editor.core.models import (
-    ArrayModifier, BlurModifier, BoundGeometry, CageTransformModifier, ChapterDocument,
+    ArrayModifier, BlurModifier, BoundGeometry, BrightnessContrastModifier, CageTransformModifier, ChapterDocument,
     DotDashModifier, HalftoneModifier, HueSaturationLightnessModifier, MirrorModifier,
     ModifierPreset, OutlineModifier, ParameterMaskBinding, PixelateModifier,
     PosterizeModifier, PosterizeRange, PosterizeValueModifier, RadialBlurModifier,
@@ -18,6 +18,7 @@ from comic_editor.core.persistence import SeriesRepository
 
 
 MODIFIERS = [
+    BrightnessContrastModifier(brightness=23, contrast=-46),
     HueSaturationLightnessModifier(hue=45, saturation=30, lightness=-20),
     BlurModifier(strength=24, mode="focal", focal_center=(15, 25), focal_radius=47, focal_ramp=.2, focal_angle=16),
     BlurModifier(strength=17, algorithm="legacy"),

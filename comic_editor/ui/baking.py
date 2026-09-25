@@ -7,7 +7,7 @@ from PySide6.QtGui import QPainter, QTransform
 from comic_editor.core.assets import entity_visual_bounds
 from comic_editor.core.commands import CallbackCommand
 from comic_editor.core.models import (ChildRef, ImageObject, LayerNode, ArrayModifier, ColorFillGradientObject,
-    MirrorModifier, RasterObject, RadialBlurModifier, TilingModifier,
+    MirrorModifier, RasterObject, RadialBlurModifier, TilingModifier, DistortModifier,
     HalftoneModifier, PixelateModifier)
 from comic_editor.core.effect_geometry import effect_bounds
 from comic_editor.ui.effect_pipeline import aligned, empty_image, render_stages
@@ -258,7 +258,7 @@ def apply_raster_modifiers(canvas, modifier_id):
             obj.interaction_rect = canvas._rect_signature(bounds)
             obj.modifier_source_frame = canvas._rect_signature(bounds)
         if obj.modifier_source_frame is not None or any(
-            isinstance(chapter.modifiers[mid], (RadialBlurModifier, ArrayModifier, HalftoneModifier, PixelateModifier)) and not chapter.modifiers[mid].muted
+            isinstance(chapter.modifiers[mid], (RadialBlurModifier, ArrayModifier, HalftoneModifier, PixelateModifier, DistortModifier)) and not chapter.modifiers[mid].muted
             for mid in obj.modifier_ids
         ):
             obj.modifier_source_frame = canvas._rect_signature(bounds)

@@ -112,7 +112,7 @@ def test_actual_controls_add_gradient_posterize_and_undo(gradient_editor, monkey
     assert controls.add_button.isEnabled()
     assert controls.summary.text() == "Gradient modifiers"
     visible = {action.text() for action in controls.add_button.menu().actions() if action.isVisible()}
-    assert visible == {"Posterize…", "Posterize Value…", "Halftone"}
+    assert visible == {"Posterize…", "Posterize Value…", "Halftone", "Curves"}
     controls.add_modifier(kind)
     modifier = canvas.chapter.modifiers[gradient.modifier_ids[-1]]
     assert modifier.modifier_type == kind

@@ -52,8 +52,8 @@ from comic_editor.core.models import (
     ColorGradientRamp, ColorGradientStop, DocumentObject, GradientObject,
     GridSettings, LineGradientField, LayerNode, RadialGradientField,
     ImageObject, PathContour, PathNode, RasterObject, ShapeStyle, TextObject,
-    BlurModifier, OutlineModifier, MirrorModifier, ArrayModifier, RadialBlurModifier, ToneMask, StrokeModifier,
-    HalftoneModifier, PixelateModifier,
+    BlurModifier, OutlineModifier, MirrorModifier, ArrayModifier, RadialBlurModifier, ToneMask, StrokeModifier, CurvesModifier,
+    HalftoneModifier, PixelateModifier, DistortModifier,
     SpeedLineCenterObject, SpeedLinesGradientObject, VectorDrawingObject,
     VectorStroke, VectorStrokePoint, new_id,
     ImageSourceDescriptor, canonical_argb, image_source_from_dict,
@@ -83,7 +83,7 @@ from comic_editor.ui.modifier_rendering import (
     BlurPyramidCache, OutlineDistanceCache,
     apply_opacity_mask,
 )
-from comic_editor.core.effect_geometry import effect_bounds, reflection_transform
+from comic_editor.core.effect_geometry import effect_bounds, reflection_transform, outline_blur_padding
 from comic_editor.ui.effect_pipeline import render_stages, empty_image, aligned
 from comic_editor.ui.shape_contours import (
     compile_contour, bound_path as compiled_bound_path, geometry_key, transform_stretch,
@@ -93,6 +93,8 @@ from comic_editor.ui.shape_outline import (
     OutlineCache, core_mesh, outline_mesh, remove_nodes,
 )
 from comic_editor.ui.shape_outline_compound import OutlineSource, compound_outline, ribbon_source
+from comic_editor.ui.distort_features import DistortFeatures
+from comic_editor.ui.curves_features import CurvesFeatures
 from comic_editor.ui.spatial_modifier_features import SpatialModifierFeatures
 from comic_editor.ui.array_features import ArrayFeatures
 from comic_editor.ui.text_features import TextFeatures
@@ -594,7 +596,7 @@ class CanvasPerformanceMonitor:
         }
 
 
-class _CanvasLogic(MultiRasterSelectionFeatures, ShowOnTopFeatures, SoloFeatures, ViewFeatures, MaskSelectionFeatures, MaskGradientFeatures, TilingFeatures, CageFeatures, ArrayFeatures, SpatialModifierFeatures, TextFeatures):
+class _CanvasLogic(MultiRasterSelectionFeatures, ShowOnTopFeatures, SoloFeatures, ViewFeatures, MaskSelectionFeatures, MaskGradientFeatures, TilingFeatures, CageFeatures, ArrayFeatures, SpatialModifierFeatures, DistortFeatures, CurvesFeatures, TextFeatures):
     documentChanged = Signal(object)
     viewSettingsChanged = Signal()
     visualChanged = Signal(object)
@@ -628,6 +630,7 @@ class _CanvasLogic(MultiRasterSelectionFeatures, ShowOnTopFeatures, SoloFeatures
     incompatibleSelection = Signal(object)
     operationError = Signal(str, str)
     modifierSelectionChanged = Signal(str)
+    curvesPointSelected = Signal(str, str, int)
 
     def __init__(self, settings: EditorSettings, parent=None):
         super().__init__(parent)
@@ -1277,7 +1280,7 @@ class _CanvasLogic(MultiRasterSelectionFeatures, ShowOnTopFeatures, SoloFeatures
             world = self._tiling_boundary(context[0]).boundingRect()
         for layer in reversed(self.chapter.ancestor_layers(obj.parent_layer_id)):
             modifier_ids.extend(layer.modifier_ids)
-        if any(isinstance(m, (HalftoneModifier, PixelateModifier))
+        if any(isinstance(m, (HalftoneModifier, PixelateModifier, DistortModifier))
                for m in self._active_modifier_instances(modifier_ids)):
             # A new stroke can change the reference frame or a neighboring
             # cell's sample. Refresh the visible document, not only its pixels.
@@ -1291,7 +1294,7 @@ class _CanvasLogic(MultiRasterSelectionFeatures, ShowOnTopFeatures, SoloFeatures
             if isinstance(modifier, BlurModifier)
             else self._modifier_maximum(
                 modifier, "thickness", modifier.thickness
-            )
+            ) + outline_blur_padding(modifier)
             if isinstance(modifier, OutlineModifier)
             else 0.0
             for modifier_id in modifier_ids
@@ -1357,7 +1360,7 @@ class _CanvasLogic(MultiRasterSelectionFeatures, ShowOnTopFeatures, SoloFeatures
             parent = self.chapter.layers[parent_id]
             modifier_ids.extend(parent.modifier_ids)
             parent_id = parent.parent_id
-        if any(isinstance(m, (HalftoneModifier, PixelateModifier))
+        if any(isinstance(m, (HalftoneModifier, PixelateModifier, DistortModifier))
                for m in self._active_modifier_instances(modifier_ids)):
             return QRectF(0, 0, self.chapter.width, self.chapter.height).united(world)
         if any(isinstance(self.chapter.modifiers.get(mid), (MirrorModifier, ArrayModifier, RadialBlurModifier, CageTransformModifier, StrokeModifier)) for mid in modifier_ids):
@@ -1369,7 +1372,7 @@ class _CanvasLogic(MultiRasterSelectionFeatures, ShowOnTopFeatures, SoloFeatures
             if isinstance(modifier, BlurModifier)
             else self._modifier_maximum(
                 modifier, "thickness", modifier.thickness
-            )
+            ) + outline_blur_padding(modifier)
             if isinstance(modifier, OutlineModifier)
             else 0.0
             for modifier_id in modifier_ids
@@ -4547,6 +4550,8 @@ class _CanvasLogic(MultiRasterSelectionFeatures, ShowOnTopFeatures, SoloFeatures
         # Match canvas/bake shape coverage. Raster objects explicitly disable
         # antialiasing in their own rendering branch and remain nearest-sampled.
         painter.setRenderHint(QPainter.Antialiasing, True)
+        painter.setRenderHint(QPainter.SmoothPixmapTransform,
+                              self._interactive_render and getattr(self, "_effect_preview_channel", "canvas") == "navigator")
         painter.setCompositionMode(QPainter.CompositionMode_Source)
         if clip is not None:
             painter.setClipRect(clip)
@@ -4560,6 +4565,15 @@ class _CanvasLogic(MultiRasterSelectionFeatures, ShowOnTopFeatures, SoloFeatures
         transform.scale(image.width() / source.width(), image.height() / source.height())
         transform.translate(-source.x(), -source.y())
         painter.setTransform(transform)
+        visible = source
+        if self._interactive_render:
+            self._render_bounds.prepare()
+            self._render_bounds.margin = 2.0 * max(
+                source.width() / image.width(), source.height() / image.height())
+            if clip is not None:
+                inverse, valid = transform.inverted()
+                if valid:
+                    visible = inverse.mapRect(QRectF(clip.adjusted(-2, -2, 2, 2)))
         guides = [obj for obj in self.chapter.objects.values()
                   if getattr(obj, "reference_role", "") == "uv_map" and obj.visible]
         try:
@@ -4567,7 +4581,7 @@ class _CanvasLogic(MultiRasterSelectionFeatures, ShowOnTopFeatures, SoloFeatures
             # effect-source signatures, so cached parent effects stay correct.
             for obj in guides:
                 obj.visible = False
-            self._render_scene_layers(painter, source)
+            self._render_scene_layers(painter, visible)
         finally:
             for obj in guides:
                 obj.visible = True
@@ -4731,11 +4745,14 @@ class _CanvasLogic(MultiRasterSelectionFeatures, ShowOnTopFeatures, SoloFeatures
                     [OutlineSource(styled.bound, layer.border_width, QTransform(), owner_id=layer.layer_id)],
                     self._outline_tolerance(painter, layer_path.controlPointRect()))
             else:
-                painter.fillPath(outline_mesh(
+                from comic_editor.ui.compound_outline_painting import paint_closed_shape_outline
+                paint_closed_shape_outline(
+                    painter,
                     layer.bound, layer.border_width, layer_path,
+                    QColor(layer.border_color),
                     cache=self._outline_cache,
                     tolerance=self._outline_tolerance(painter, layer_path.controlPointRect()),
-                ), QColor(layer.border_color))
+                )
             painter.restore()
         painter.restore()
         for child in reversed(layer.children):
@@ -4771,7 +4788,9 @@ class _CanvasLogic(MultiRasterSelectionFeatures, ShowOnTopFeatures, SoloFeatures
             return
         if self._render_tiled_target(painter, layer, parent_opacity, visible_world):
             return
-        if layer.layer_kind == "text_container" or any(isinstance(m, (MirrorModifier, ArrayModifier, RadialBlurModifier, CageTransformModifier, StrokeModifier, HalftoneModifier, PixelateModifier)) for m in self._active_modifier_instances(layer.modifier_ids)):
+        # Curves affects the complete subtree, including children outside a
+        # page/shape mask. The staged capture includes their visual bounds.
+        if layer.layer_kind == "text_container" or any(isinstance(m, (MirrorModifier, ArrayModifier, RadialBlurModifier, CageTransformModifier, StrokeModifier, HalftoneModifier, PixelateModifier, DistortModifier, CurvesModifier)) for m in self._active_modifier_instances(layer.modifier_ids)):
             self._render_mirror_target(painter, layer, parent_opacity, visible_world)
             return
         world_bounds = self.entity_world_rect("layer", layer.layer_id)
@@ -4814,7 +4833,7 @@ class _CanvasLogic(MultiRasterSelectionFeatures, ShowOnTopFeatures, SoloFeatures
                 modifier, "strength", modifier.strength
             ) * 3.0
             if isinstance(modifier, BlurModifier)
-            else 25.0
+            else 25.0 + outline_blur_padding(modifier)
             if isinstance(modifier, OutlineModifier)
             else 0.0
             for modifier in modifiers
@@ -4827,6 +4846,9 @@ class _CanvasLogic(MultiRasterSelectionFeatures, ShowOnTopFeatures, SoloFeatures
         )
         if not bounds.intersects(parent_inverse.mapRect(visible_world)):
             return
+        from comic_editor.ui.interactive_effects import outline_capture_bounds
+        bounds = outline_capture_bounds(
+            self, painter, bounds, parent_inverse.mapRect(visible_world), modifiers)
         capture_world = parent_transform.mapRect(bounds)
         world_origin = parent_transform.map(bounds.topLeft())
         layer_signature = self._modifier_layer_signature(layer.layer_id)
@@ -5089,7 +5111,13 @@ class _CanvasLogic(MultiRasterSelectionFeatures, ShowOnTopFeatures, SoloFeatures
         if self._show_on_top_standalone_contributor(layer):
             self._render_layer(painter, layer, parent_opacity, visible_world)
             return
-        if ("layer", layer.layer_id) not in self._render_modifier_sources and any(isinstance(modifier, (MirrorModifier, ArrayModifier, RadialBlurModifier, CageTransformModifier, HalftoneModifier, PixelateModifier)) for modifier in self._active_modifier_instances(layer.modifier_ids)):
+        # Compound operands bypass _render_layer, so their color adjustment
+        # needs its own isolated-content route; geometry-only captures skip it.
+        if ("layer", layer.layer_id) not in self._render_modifier_sources and any(
+                isinstance(modifier, (MirrorModifier, ArrayModifier, RadialBlurModifier,
+                    CageTransformModifier, HalftoneModifier, PixelateModifier, DistortModifier))
+                or isinstance(modifier, CurvesModifier) and not self._render_base_alpha
+                for modifier in self._active_modifier_instances(layer.modifier_ids)):
             self._render_mirror_target(painter, layer, parent_opacity, visible_world)
             return
         painter.save()
@@ -8143,10 +8171,14 @@ class _CanvasLogic(MultiRasterSelectionFeatures, ShowOnTopFeatures, SoloFeatures
         if self._cage_session is not None and ("object", obj.object_id) in self._cage_session["targets"]:
             self._render_mirror_target(painter, obj, parent_opacity, local_visible)
             return
-        if isinstance(obj, RasterObject) and (obj.modifier_source_frame is not None or any(isinstance(m, (RadialBlurModifier, ArrayModifier, HalftoneModifier, PixelateModifier)) for m in self._active_modifier_instances(obj.modifier_ids))):
+        if isinstance(obj, RasterObject) and (obj.modifier_source_frame is not None or any(isinstance(m, (RadialBlurModifier, ArrayModifier, HalftoneModifier, PixelateModifier, DistortModifier, CurvesModifier)) for m in self._active_modifier_instances(obj.modifier_ids))):
             self._render_radial_raster(painter, obj, parent_opacity, local_visible)
             return
-        if any(isinstance(m, (MirrorModifier, ArrayModifier, RadialBlurModifier, CageTransformModifier, StrokeModifier, HalftoneModifier, PixelateModifier)) for m in self._active_modifier_instances(obj.modifier_ids)):
+        if any(isinstance(m, (MirrorModifier, ArrayModifier, RadialBlurModifier, CageTransformModifier, StrokeModifier, HalftoneModifier, PixelateModifier, DistortModifier)) for m in self._active_modifier_instances(obj.modifier_ids)):
+            self._render_mirror_target(painter, obj, parent_opacity, local_visible)
+            return
+        if (isinstance(obj, RasterObject) and self._interactive_render
+                and getattr(self, "_effect_preview_channel", "canvas") == "navigator"):
             self._render_mirror_target(painter, obj, parent_opacity, local_visible)
             return
         modifiers = self._active_modifier_instances(
@@ -8188,7 +8220,7 @@ class _CanvasLogic(MultiRasterSelectionFeatures, ShowOnTopFeatures, SoloFeatures
                 modifier, "strength", modifier.strength
             ) * 3.0
             if isinstance(modifier, BlurModifier)
-            else 25.0
+            else 25.0 + outline_blur_padding(modifier)
             if isinstance(modifier, OutlineModifier)
             else 0.0
             for modifier in modifiers
@@ -8201,6 +8233,9 @@ class _CanvasLogic(MultiRasterSelectionFeatures, ShowOnTopFeatures, SoloFeatures
         )
         if not bounds.intersects(local_visible):
             return
+        from comic_editor.ui.interactive_effects import outline_capture_bounds
+        if isinstance(obj, RasterObject):
+            bounds = outline_capture_bounds(self, painter, bounds, local_visible, modifiers)
         world_origin = layer_transform.map(bounds.topLeft())
         object_signature = self._modifier_object_signature(obj)
         cache_key = (
@@ -8320,11 +8355,26 @@ class _CanvasLogic(MultiRasterSelectionFeatures, ShowOnTopFeatures, SoloFeatures
         bounds = (aligned(self._color_gradient_local_bounds(target))
                   if isinstance(target, ColorFillGradientObject)
                   else aligned(inverse.mapRect(world)))
+        modifiers = self._active_modifier_instances(target.modifier_ids, suppress_outline=self._suppress_outline_for_mask)
+        if layer and scoped(self, target):
+            modifiers = [modifier for modifier in modifiers if not isinstance(modifier, StrokeModifier)]
+        from comic_editor.ui.thumbnail_effects import capture_scale, scaled_modifiers
+        thumbnail_scale = capture_scale(self, bounds, modifiers)
+        navigator = self._interactive_render and getattr(self, "_effect_preview_channel", "canvas") == "navigator"
+        stage_mapping = mapping
+        capture_bounds = bounds
+        if thumbnail_scale < 1.:
+            bounds = aligned(QTransform.fromScale(thumbnail_scale, thumbnail_scale).mapRect(bounds))
+            capture_bounds = QTransform.fromScale(1/thumbnail_scale, 1/thumbnail_scale).mapRect(bounds)
+            stage_mapping = QTransform.fromScale(1/thumbnail_scale, 1/thumbnail_scale) * mapping
+            modifiers = scaled_modifiers(modifiers, thumbnail_scale)
         signature = self._modifier_layer_signature(identifier) if layer else self._modifier_object_signature(target)
         # Live transforms are scoped by the target/subtree signature. A global
         # preview quad would evict unrelated artwork's source and every later
         # effect stage whenever another layer is dragged.
         key = ("mirror-source", kind, identifier, signature[0], signature[3], signature[4], self._rect_signature(bounds), self._render_exclude_text)
+        if navigator:
+            key = ("navigator-source", thumbnail_scale, key)
         if layer and scoped(self, target):
             key = (*key, self._modifier_parameter_signature([mid for mid in target.modifier_ids
                 if isinstance(self.chapter.modifiers.get(mid), StrokeModifier)]))
@@ -8335,16 +8385,17 @@ class _CanvasLogic(MultiRasterSelectionFeatures, ShowOnTopFeatures, SoloFeatures
             image = empty_image(bounds)
             source = QPainter(image)
             source.setRenderHint(QPainter.Antialiasing, True)
-            source.translate(-bounds.left(), -bounds.top())
+            source.setTransform(QTransform.fromScale(thumbnail_scale, thumbnail_scale)
+                                * QTransform.fromTranslate(-bounds.left(), -bounds.top()))
             self._render_modifier_sources.add((kind, identifier))
             try:
                 if layer:
                     if self.chapter.contributing_compound_ancestor(identifier) is not None:
-                        self._render_compound_contributor(source, target, 1.0, mapping.mapRect(bounds))
+                        self._render_compound_contributor(source, target, 1.0, mapping.mapRect(capture_bounds))
                     else:
-                        self._render_layer(source, target, 1.0, mapping.mapRect(bounds))
+                        self._render_layer(source, target, 1.0, mapping.mapRect(capture_bounds))
                 else:
-                    self._render_object_content(source, target, bounds)
+                    self._render_object_content(source, target, capture_bounds)
                 if includes_preview and not layer:
                     self._render_modified_vector_pencil_preview(source, parent_id)
                 elif includes_preview and not self._has_active_modifiers(drawing.modifier_ids):
@@ -8357,25 +8408,27 @@ class _CanvasLogic(MultiRasterSelectionFeatures, ShowOnTopFeatures, SoloFeatures
             source_provisional = revision != getattr(self, "_effect_provisional_revision", 0)
             if not source_provisional:
                 self._modifier_source_cache_put(key, image)
-        modifiers = self._active_modifier_instances(target.modifier_ids, suppress_outline=self._suppress_outline_for_mask)
-        if layer and scoped(self, target):
-            modifiers = [modifier for modifier in modifiers if not isinstance(modifier, StrokeModifier)]
+        source_provisional |= navigator
         has_stroke = any(isinstance(modifier, StrokeModifier) for modifier in modifiers)
         opacity = target.opacity if layer or not target.opacity_locked else 1.0
         if not has_stroke and modifiers and isinstance(modifiers[-1], MirrorModifier) and not modifiers[-1].parameter_masks and target.opacity_mask is None and parent_opacity * opacity == 1:
             # Axis dragging reuses the source stages without allocating the gap.
-            image, bounds = render_stages(self, image, bounds, modifiers[:-1], mapping, nearest=isinstance(target, RasterObject), request_scope=request_scope, provisional=source_provisional, source_key=key)
+            image, bounds = render_stages(self, image, bounds, modifiers[:-1], stage_mapping, nearest=isinstance(target, RasterObject), request_scope=request_scope, provisional=source_provisional, source_key=key)
+            if thumbnail_scale < 1.:
+                bounds = QTransform.fromScale(1/thumbnail_scale, 1/thumbnail_scale).mapRect(bounds)
             mirror = modifiers[-1]
             painter.save()
-            painter.setRenderHint(QPainter.SmoothPixmapTransform, not isinstance(target, RasterObject))
+            painter.setRenderHint(QPainter.SmoothPixmapTransform,
+                                  not isinstance(target, RasterObject)
+                                  or getattr(self, "_effect_preview_channel", "canvas") == "navigator")
             painter.setRenderHint(QPainter.Antialiasing, not isinstance(target, RasterObject))
             painter.setOpacity(mirror.intensity / 100)
             painter.setTransform(mapping * reflection_transform(mirror) * inverse, True)
-            painter.drawImage(bounds.topLeft(), image)
+            painter.drawImage(bounds, image)
             painter.restore()
             painter.save()
             painter.setOpacity(1)
-            painter.drawImage(bounds.topLeft(), image)
+            painter.drawImage(bounds, image)
             painter.restore()
             return
         if has_stroke:
@@ -8388,11 +8441,20 @@ class _CanvasLogic(MultiRasterSelectionFeatures, ShowOnTopFeatures, SoloFeatures
             # viewport moves; the destination painter already clips the view.
             required = (None if isinstance(target, ColorFillGradientObject)
                         else inverse.mapRect(visible) if layer else visible)
-            image, bounds = render_stages(self, image, bounds, modifiers, mapping, nearest=isinstance(target, RasterObject), required=required, request_scope=request_scope, provisional=source_provisional, source_key=key)
+            if getattr(self, "_effect_preview_channel", "canvas") == "navigator":
+                required = None
+            if thumbnail_scale < 1. and required is not None:
+                required = QTransform.fromScale(thumbnail_scale, thumbnail_scale).mapRect(required)
+            image, bounds = render_stages(self, image, bounds, modifiers, stage_mapping, nearest=isinstance(target, RasterObject), required=required, request_scope=request_scope, provisional=source_provisional, source_key=key)
+        if thumbnail_scale < 1.:
+            bounds = QTransform.fromScale(1/thumbnail_scale, 1/thumbnail_scale).mapRect(bounds)
         if target.opacity_mask is not None:
-            binding = target.opacity_mask
-            field = self.render_tone_mask_field(binding.mask_id, image.width(), image.height(), self._world_to_image_transform(mapping, bounds, image.width(), image.height()), mapping.mapRect(bounds))
-            image = apply_opacity_mask(image, field, binding.black_value, binding.white_value)
+            from comic_editor.ui.viewport_masking import mask_output
+            image, bounds = mask_output(
+                self, image, bounds, mapping, target.opacity_mask,
+                inverse.mapRect(visible) if layer else visible, painter)
+            if image is None:
+                return
         opacity = target.opacity if layer or not target.opacity_locked else 1.0
         painter.save()
         painter.setOpacity(parent_opacity * opacity)
@@ -8400,7 +8462,7 @@ class _CanvasLogic(MultiRasterSelectionFeatures, ShowOnTopFeatures, SoloFeatures
             self._set_crisp_raster_transform(painter)
         elif has_stroke:
             painter.setRenderHint(QPainter.SmoothPixmapTransform, True)
-        painter.drawImage(bounds.topLeft(), image)
+        painter.drawImage(bounds, image)
         painter.restore()
 
     def _render_raster_content(
@@ -8542,10 +8604,11 @@ class _CanvasLogic(MultiRasterSelectionFeatures, ShowOnTopFeatures, SoloFeatures
                 continue
             painter.drawImage(target.topLeft(), image)
 
-    @staticmethod
-    def _set_crisp_raster_transform(painter: QPainter) -> None:
+    def _set_crisp_raster_transform(self, painter: QPainter) -> None:
         painter.setRenderHint(
-            QPainter.RenderHint.SmoothPixmapTransform, False
+            QPainter.RenderHint.SmoothPixmapTransform,
+            self._interactive_render and getattr(self, "_effect_preview_channel", "canvas") == "navigator"
+            and not self._render_modifier_sources
         )
         painter.setRenderHint(QPainter.RenderHint.Antialiasing, False)
 
@@ -8732,6 +8795,16 @@ class _CanvasLogic(MultiRasterSelectionFeatures, ShowOnTopFeatures, SoloFeatures
         ]
 
     def _text_quad(self, obj: TextObject) -> list[tuple[float, float]]:
+        if obj.layout_mode == "free":
+            if obj.object_id in self._multi_transform_preview_quads:
+                return list(self._multi_transform_preview_quads[obj.object_id])
+            if (obj.object_id == self.selected_object_id
+                    and self._geometry_transform_target is None
+                    and self._transform_preview_quad is not None
+                    and self._transform_start_quad is not None):
+                # Promoted artwork prevents the cached-background fast path.
+                # Normal traversal and effect captures need the same live quad.
+                return list(self._transform_preview_quad)
         if obj.transform_quad is None:
             obj.transform_quad = self._rect_quad(QRectF(obj.x, obj.y, obj.width, obj.height))
         return list(obj.transform_quad)
@@ -10803,6 +10876,9 @@ class _CanvasLogic(MultiRasterSelectionFeatures, ShowOnTopFeatures, SoloFeatures
             return
         for modifier_id in target.modifier_ids:
             modifier = self.chapter.modifiers.get(modifier_id)
+            if isinstance(modifier, DistortModifier) and len(self.chapter.modifier_target_ids(modifier_id)) == 1:
+                self._transform_distort_modifier(modifier, transform)
+                continue
             if isinstance(modifier, TilingModifier) and len(self.chapter.modifier_target_ids(modifier_id)) == 1:
                 a, b = transform.map(QPointF(1, 0))-transform.map(QPointF()), transform.map(QPointF(0, 1))-transform.map(QPointF())
                 length_a, length_b = math.hypot(a.x(), a.y()), math.hypot(b.x(), b.y())
@@ -10845,6 +10921,8 @@ class _CanvasLogic(MultiRasterSelectionFeatures, ShowOnTopFeatures, SoloFeatures
             modifier.focal_angle = math.atan2(delta.y(), delta.x())
 
     def _draw_focal_modifier_handles(self, painter: QPainter) -> None:
+        if self._draw_distort_handles(painter):
+            return
         self._draw_tiling_handles(painter)
         if self._draw_cage_handles(painter):
             return
@@ -12354,10 +12432,57 @@ class _CanvasLogic(MultiRasterSelectionFeatures, ShowOnTopFeatures, SoloFeatures
             and not self._is_show_on_top("layer", layer_id)
         ):
             return False
-        path = (
-            self.layer_shape_path(layer)
-            if raw else self.layer_effective_path(layer_id)
-        )
+        transform = self.layer_world_transform(layer_id)
+        tolerance = 12.0 / max(self.scale, 0.05)
+
+        def outside(bounds: QRectF) -> bool:
+            # Bounds remain conservative under affine camera-independent
+            # placement. Projective shapes keep the exact path test below.
+            if not transform.isAffine():
+                return False
+            world = transform.mapRect(bounds)
+            return (all(math.isfinite(value) for value in world.getRect())
+                    and not world.adjusted(-tolerance, -tolerance,
+                                           tolerance, tolerance).contains(point))
+
+        if raw:
+            bounds = QRectF(*layer.bound.bbox())
+            padding = 2.0
+            if layer.layer_kind == "open_shape":
+                style = layer.shape_style
+                width = max((node.width_multiplier
+                             for contour in layer.bound.iter_contours()
+                             for node in contour.nodes), default=1.0)
+                # Square caps can extend diagonally beyond the centerline.
+                padding += style.base_thickness * width + 2 * style.outline_thickness
+            if outside(bounds.adjusted(-padding, -padding, padding, padding)):
+                return False
+            style = layer.shape_style
+            key = ("hit_shape", geometry_key(layer.bound), layer.layer_kind,
+                   layer.vertex_radius, style.base_thickness,
+                   style.outline_thickness, style.start_cap, style.end_cap,
+                   tuple(node.width_multiplier
+                         for contour in layer.bound.iter_contours()
+                         for node in contour.nodes))
+            path = self._outline_cache.get(key, lambda: self.layer_shape_path(layer))
+        else:
+            path = self.layer_effective_path(layer_id)
+            padding = 2.0
+            bounds = path.controlPointRect()
+            if layer.layer_kind == "open_shape":
+                nodes = [node for contour in layer.bound.iter_contours()
+                         for node in contour.nodes]
+                style = layer.shape_style
+                padding += style.base_thickness * max(
+                    (node.width_multiplier for node in nodes), default=1.0)
+                padding += 2 * style.outline_thickness * max(
+                    (node.outline_multiplier for node in nodes), default=1.0)
+                bounds = bounds.united(QRectF(*layer.bound.bbox()))
+            bounds = bounds.adjusted(-padding, -padding, padding, padding)
+            # Closed and compound outline coverage is clipped to this fill.
+            # Reject distant shapes before constructing their outline mesh.
+            if outside(bounds):
+                return False
         visual_coverage = False
         if not raw and layer.border_width > 0:
             if layer.compound_enabled:
@@ -12377,9 +12502,9 @@ class _CanvasLogic(MultiRasterSelectionFeatures, ShowOnTopFeatures, SoloFeatures
                 path = outline_mesh(layer.bound, layer.border_width, path,
                                     cache=self._outline_cache)
             visual_coverage = True
-        world_path = self.layer_world_transform(layer_id).map(path)
+        world_path = transform.map(path)
         stroker = QPainterPathStroker()
-        stroker.setWidth(24.0 / max(self.scale, 0.05))
+        stroker.setWidth(tolerance * 2)
         border = stroker.createStroke(world_path)
         return border.contains(point) or (
             (visual_coverage or layer.layer_kind == "open_shape") and world_path.contains(point)
@@ -12740,7 +12865,7 @@ class _CanvasLogic(MultiRasterSelectionFeatures, ShowOnTopFeatures, SoloFeatures
                 elif isinstance(modifier, OutlineModifier):
                     padding += self._modifier_maximum(
                         modifier, "thickness", modifier.thickness
-                    )
+                    ) + outline_blur_padding(modifier)
             return padding
 
         def ancestor_padding(kind: str, entity_id: str) -> float:
@@ -13478,6 +13603,7 @@ class _CanvasLogic(MultiRasterSelectionFeatures, ShowOnTopFeatures, SoloFeatures
             event.accept()
             return
         if event.button() == Qt.LeftButton:
+            self._move_distort_handle(event.position())
             self._queue_radial_handle(event.position())
             world = self.widget_to_document(event.position())
             self._move_mask_selection(world)
@@ -13598,7 +13724,7 @@ class _CanvasLogic(MultiRasterSelectionFeatures, ShowOnTopFeatures, SoloFeatures
             event.accept()
             return
         if event.key() == Qt.Key_Escape and self._modifier_handle_drag and any(
-            key in self._modifier_handle_drag for key in ("tiling", "array")
+            key in self._modifier_handle_drag for key in ("tiling", "array", "distort")
         ):
             before = self._modifier_handle_drag["before"]
             self._modifier_handle_drag = None
@@ -13929,6 +14055,7 @@ class _CanvasLogic(MultiRasterSelectionFeatures, ShowOnTopFeatures, SoloFeatures
             elif self._pen_contact_active:
                 self._pen_contact_active = False
                 self._tablet_tool_active = False
+                self._move_distort_handle(event.position())
                 self._queue_radial_handle(event.position())
                 world = self.widget_to_document(event.position())
                 self._move_mask_selection(world)
@@ -19775,6 +19902,8 @@ class _CanvasLogic(MultiRasterSelectionFeatures, ShowOnTopFeatures, SoloFeatures
 
     # ---- tool actions --------------------------------------------------
     def _begin_modifier_handle(self, widget_point: QPointF) -> bool:
+        if self._begin_distort_handle(widget_point):
+            return True
         if self._begin_array_handle(widget_point):
             return True
         if self._begin_tiling_handle(widget_point):
@@ -19817,6 +19946,8 @@ class _CanvasLogic(MultiRasterSelectionFeatures, ShowOnTopFeatures, SoloFeatures
         return True
 
     def _move_modifier_handle(self, widget_point: QPointF) -> bool:
+        if self._move_distort_handle(widget_point):
+            return True
         if self._move_array_handle(widget_point):
             return True
         if self._move_tiling_handle(widget_point):
@@ -19886,7 +20017,7 @@ class _CanvasLogic(MultiRasterSelectionFeatures, ShowOnTopFeatures, SoloFeatures
         after = self.chapter.to_dict()
         if state["before"] != after:
             self.push_model_change(
-                state["before"], after, "Edit array" if "array" in state else "Edit tiling" if "tiling" in state else "Edit radial blur" if "radial" in state else "Edit mirror" if "mirror" in state else "Edit focal blur"
+                state["before"], after, "Edit distortion" if "distort" in state else "Edit array" if "array" in state else "Edit tiling" if "tiling" in state else "Edit radial blur" if "radial" in state else "Edit mirror" if "mirror" in state else "Edit focal blur"
             )
         self.interactionFinished.emit()
         return True
@@ -21285,12 +21416,15 @@ class _CanvasLogic(MultiRasterSelectionFeatures, ShowOnTopFeatures, SoloFeatures
     def _request_object_selection(
         self, point: QPointF, widget_point: QPointF,
     ) -> None:
+        modifiers = self._input_press_modifiers
+        if modifiers is None:
+            modifiers = QGuiApplication.keyboardModifiers()
         hits = self.hit_test_entities(point)
         hits.sort(key=lambda hit: not (
             hit["kind"] == "object" and isinstance(self.chapter.objects.get(hit["id"]), TextObject)))
         if (
             len(hits) > 1
-            and QGuiApplication.keyboardModifiers() & Qt.ControlModifier
+            and modifiers & Qt.ControlModifier
         ):
             self.selectionCandidatesRequested.emit(
                 hits, self.mapToGlobal(widget_point.toPoint())

@@ -9,15 +9,16 @@ import sys
 import numpy as np
 from PIL import Image
 from PySide6.QtGui import QImage, QPainter, QTransform
-from PySide6.QtCore import Qt
-from scipy.ndimage import distance_transform_edt
+from PySide6.QtCore import Qt, QRectF
+from scipy.ndimage import distance_transform_edt, gaussian_filter
 
 from comic_editor.core.models import (
-    BlurModifier, HueSaturationLightnessModifier, ModifierInstance,
+    BlurModifier, HueSaturationLightnessModifier, BrightnessContrastModifier, CurvesModifier, ModifierInstance,
     OutlineModifier, MirrorModifier, RadialBlurModifier, PosterizeModifier, PosterizeValueModifier,
-    HalftoneModifier, PixelateModifier,
+    HalftoneModifier, PixelateModifier, DistortModifier,
 )
 from comic_editor.core.effect_geometry import reflection_transform
+from comic_editor.core.curves import apply_curves, curves_is_neutral
 
 
 def _qimage_premultiplied(image: QImage) -> np.ndarray:
@@ -52,6 +53,24 @@ def _straight(premultiplied: np.ndarray) -> np.ndarray:
         out=np.zeros_like(premultiplied[..., :3]), where=alpha > 1e-6,
     )
     return np.concatenate((rgb, alpha), axis=2)
+
+
+def _brightness_contrast_effect(original, brightness, contrast):
+    """Adjust straight RGB around midgray, preserving premultiplied alpha."""
+    straight = _straight(original)
+    rgb = straight[..., :3]
+    gain = 1.0 + np.asarray(contrast, dtype=np.float32) / 100.0
+    offset = np.asarray(brightness, dtype=np.float32) / 100.0
+    if gain.ndim:
+        gain = gain[..., None]
+    if offset.ndim:
+        offset = offset[..., None]
+    rgb -= .5
+    rgb *= gain
+    rgb += .5 + offset
+    np.clip(rgb, 0.0, 1.0, out=rgb)
+    rgb *= original[..., 3:4]
+    return straight
 
 
 def _hsl_effect(
@@ -380,6 +399,7 @@ def _outline_effect(
     original: np.ndarray, thickness, opacity, color: str,
     distance_cache: OutlineDistanceCache | None = None,
     amount=1.0,
+    *, antialiasing: bool = True, blur_radius=0.0, blur_strength=0.0, blur_radius_limit=None,
 ) -> np.ndarray:
     alpha = original[..., 3]
     distance = (
@@ -387,7 +407,9 @@ def _outline_effect(
         if distance_cache is not None else _outside_distance(alpha)
     )
     rgba = _outline_color(color)
-    coverage = _outline_coverage(alpha, distance, thickness, opacity, rgba[3], amount)
+    coverage = _outline_coverage(alpha, distance, thickness, opacity, rgba[3], amount,
+                                 antialiasing=antialiasing, blur_radius=blur_radius,
+                                 blur_strength=blur_strength, blur_radius_limit=blur_radius_limit)
     result = original.copy()
     for channel in range(3):
         result[..., channel] += coverage * rgba[channel]
@@ -402,18 +424,82 @@ def _outline_color(color: str) -> tuple[float, float, float, float]:
     return 0.0, 0.0, 0.0, 1.0
 
 
-def _outline_coverage(alpha, distance, thickness, opacity, color_alpha, amount=1.0):
+def _outline_blurred_alpha(alpha, radius, radius_limit=None):
+    """Blur constant-color premultiplied outline alpha without blurring its source.
+
+    A uniform radius uses an exact Gaussian. Radius masks interpolate Gaussian
+    levels, just as a variable blur pyramid does, without allocating RGBA levels.
+    Every level has finite three-sigma support.
+    """
+    radius = np.clip(np.asarray(radius, dtype=np.float32), 0.0, 100.0)
+    minimum, maximum = float(np.min(radius)), float(np.max(radius))
+    if radius.ndim == 0:
+        return (gaussian_filter(alpha, maximum, mode="constant", truncate=3.0)
+                if maximum > 0.0 else alpha.copy())
+    # Use the modifier's mask endpoints, never this capture's observed range:
+    # panning or cropping must not change the interpolated kernel at a pixel.
+    limit = maximum if radius_limit is None else max(maximum, float(radius_limit))
+    levels = sorted({0.0, limit, *(r for r in (.5, 1., 2., 4., 8., 16., 32., 64.)
+                                  if r < limit)})
+    result = np.zeros_like(alpha)
+    for index, level in enumerate(levels):
+        lower = levels[max(0, index - 1)]
+        upper = levels[min(len(levels) - 1, index + 1)]
+        if upper < minimum or lower > maximum:
+            continue
+        weight = np.ones_like(radius)
+        if index:
+            np.minimum(weight, (radius - lower) / (level - lower), out=weight)
+        if index + 1 < len(levels):
+            np.minimum(weight, (upper - radius) / (upper - level), out=weight)
+        np.clip(weight, 0.0, 1.0, out=weight)
+        if np.any(weight):
+            blurred = (gaussian_filter(alpha, level, mode="constant", truncate=3.0)
+                       if level else alpha)
+            result += blurred * weight
+    return result
+
+
+def _outline_blur_fringe(fields):
+    return (math.ceil(3.0 * fields["blur_radius_limit"])
+            if np.max(fields["blur_strength"]) > 0.0 else 0)
+
+
+def _outline_radius_limit(modifier):
+    binding = modifier.parameter_masks.get("blur_radius")
+    return (max(modifier.blur_radius, binding.black_value, binding.white_value)
+            if binding else modifier.blur_radius)
+
+
+def _outline_coverage(alpha, distance, thickness, opacity, color_alpha, amount=1.0,
+                      *, antialiasing: bool = True, blur_radius=0.0, blur_strength=0.0,
+                      blur_radius_limit=None):
     """One-channel premultiplied contribution, including intensity blending."""
-    coverage = np.asarray(thickness, dtype=np.float32) + 0.5 - distance
-    np.clip(coverage, 0.0, 1.0, out=coverage)
+    thickness = np.asarray(thickness, dtype=np.float32)
+    if antialiasing:
+        coverage = thickness + 0.5 - distance
+        np.clip(coverage, 0.0, 1.0, out=coverage)
+    else:
+        # Threshold only geometric coverage; opacity and masks still blend normally.
+        coverage = np.asarray(distance <= thickness, dtype=np.float32)
     transparent = np.clip(1.0 - alpha, 0.0, 1.0)
     # Preserve the existing outside-only coverage and source-over treatment
     # of partially transparent antialiased edges.
     coverage *= transparent
     coverage *= np.clip(np.asarray(opacity, dtype=np.float32) / 100.0, 0.0, 1.0)
     coverage *= color_alpha
+    # Blur the separate outline component before compositing it under the
+    # unchanged source. Constant RGB makes blurring alpha premultiplied-safe.
+    wet = None
+    if np.max(blur_radius) > 0.0 and np.max(blur_strength) > 0.0:
+        wet = _outline_blurred_alpha(coverage, blur_radius, blur_radius_limit)
+        wet *= transparent
+        wet *= amount
     coverage *= transparent
     coverage *= amount
+    if wet is not None:
+        strength = np.clip(np.asarray(blur_strength, dtype=np.float32) / 100.0, 0.0, 1.0)
+        coverage += (wet - coverage) * strength
     return coverage
 
 
@@ -433,8 +519,9 @@ def _outline_qimage(
     shape = (height, width)
     fields = {
         name: _parameter_field(modifier, name, getattr(modifier, name), shape, mask_fields)
-        for name in ("thickness", "opacity", "intensity")
+        for name in ("thickness", "opacity", "intensity", "blur_radius", "blur_strength")
     }
+    fields["blur_radius_limit"] = _outline_radius_limit(modifier)
     rgba = _outline_color(modifier.color)
     if (rgba[3] <= 0.0 or np.max(fields["opacity"]) <= 0.0
             or np.max(fields["intensity"]) <= 0.0):
@@ -446,6 +533,7 @@ def _outline_qimage(
     channels = (2, 1, 0, 3) if sys.byteorder == "little" else (1, 2, 3, 0)
     alpha = pixels[..., channels[3]]
     padding = max(0, math.ceil(float(np.max(fields["thickness"])) + 0.5))
+    padding += _outline_blur_fringe(fields)
     # Quantized padding keeps the expensive distance field reusable throughout
     # the full legal 0..25px thickness range, including thickness masks.
     cache_margin = max(32, math.ceil(padding / 32) * 32)
@@ -466,6 +554,9 @@ def _outline_qimage(
         alpha[region].astype(np.float32) / 255.0, distance,
         fields["thickness"], fields["opacity"], rgba[3],
         np.asarray(fields["intensity"], dtype=np.float32) / 100.0,
+        antialiasing=modifier.antialiasing,
+        blur_radius=fields["blur_radius"], blur_strength=fields["blur_strength"],
+        blur_radius_limit=fields["blur_radius_limit"],
     )
     coverage *= 255.0
     result = source.copy()
@@ -494,10 +585,12 @@ def _outline_stack_qimage(
         modifier.validate()
         fields = {
             name: _parameter_field(modifier, name, getattr(modifier, name), shape, mask_fields)
-            for name in ("thickness", "opacity", "intensity")
+            for name in ("thickness", "opacity", "intensity", "blur_radius", "blur_strength")
         }
+        fields["blur_radius_limit"] = _outline_radius_limit(modifier)
         parameters.append(fields)
         fringe = max(0, math.ceil(float(np.max(fields["thickness"])) + 0.5))
+        fringe += _outline_blur_fringe(fields)
         padding += max(32, math.ceil(fringe / 32) * 32)
     source = image.convertToFormat(QImage.Format.Format_ARGB32_Premultiplied)
     pixels = np.frombuffer(source.constBits(), dtype=np.uint8).reshape(
@@ -521,7 +614,11 @@ def _outline_stack_qimage(
         if np.max(amount) <= 0.0:
             continue
         current = _outline_effect(current, fields["thickness"], fields["opacity"],
-                                  modifier.color, distance_cache, amount)
+                                  modifier.color, distance_cache, amount,
+                                  antialiasing=modifier.antialiasing,
+                                  blur_radius=fields["blur_radius"],
+                                  blur_strength=fields["blur_strength"],
+                                  blur_radius_limit=fields["blur_radius_limit"])
     result = source.copy()
     painter = QPainter(result)
     painter.setCompositionMode(QPainter.CompositionMode.CompositionMode_Source)
@@ -571,6 +668,16 @@ def apply_modifier_stack(
     nearest: bool = False,
 ) -> QImage:
     active_modifiers = [modifier for modifier in modifiers if not modifier.muted]
+    for modifier in active_modifiers:
+        if isinstance(modifier, (BrightnessContrastModifier, CurvesModifier)):
+            modifier.validate()
+    active_modifiers = [modifier for modifier in active_modifiers if not (
+        isinstance(modifier, BrightnessContrastModifier)
+        and modifier.brightness == 0 and modifier.contrast == 0
+        and not {"brightness", "contrast"}.intersection(modifier.parameter_masks))]
+    active_modifiers = [modifier for modifier in active_modifiers if not (
+        isinstance(modifier, CurvesModifier) and (curves_is_neutral(modifier)
+        or modifier.intensity <= 0 and "intensity" not in modifier.parameter_masks))]
     if image.isNull() or not active_modifiers:
         return image
     if len(active_modifiers) == 1 and isinstance(active_modifiers[0], OutlineModifier):
@@ -594,6 +701,25 @@ def apply_modifier_stack(
             effect = _qimage_premultiplied(apply_pattern_effect(
                 _premultiplied_qimage(current), modifier))
             mask = amount
+        elif isinstance(modifier, CurvesModifier):
+            effect = apply_curves(current, modifier)
+            if amount.ndim == 2:
+                amount = amount[..., None]
+            current += (effect - current) * amount
+            continue
+        elif isinstance(modifier, BrightnessContrastModifier):
+            effect = _brightness_contrast_effect(
+                current,
+                _parameter_field(modifier, "brightness", modifier.brightness,
+                                 (height, width), mask_fields),
+                _parameter_field(modifier, "contrast", modifier.contrast,
+                                 (height, width), mask_fields))
+            if amount.ndim == 2:
+                amount = amount[..., None]
+            # The adjustment cannot change coverage. Blend only RGB so an
+            # intensity slider does not round antialiased alpha downward.
+            current[..., :3] += (effect[..., :3] - current[..., :3]) * amount
+            continue
         elif isinstance(modifier, HueSaturationLightnessModifier):
             effect = _hsl_effect(
                 current,
@@ -651,6 +777,16 @@ def apply_modifier_stack(
                 mask = mask * amount
             else:
                 mask = amount
+        elif isinstance(modifier, DistortModifier):
+            from comic_editor.ui.distort_rendering import render_distort
+            mapping = world_to_image or QTransform.fromTranslate(-world_origin[0], -world_origin[1])
+            inverse, valid = mapping.inverted()
+            if not valid:
+                continue
+            warped = render_distort(_premultiplied_qimage(current), QRectF(0, 0, width, height),
+                                     modifier, inverse, QRectF(0, 0, width, height))
+            effect = _qimage_premultiplied(warped)
+            mask = amount
         elif isinstance(modifier, RadialBlurModifier):
             from comic_editor.ui.radial_blur import radial_blur
             effect = radial_blur(current, modifier.center,
@@ -688,6 +824,14 @@ def apply_modifier_stack(
                 modifier.color,
                 outline_distance_cache,
                 amount,
+                antialiasing=modifier.antialiasing,
+                blur_radius=_parameter_field(
+                    modifier, "blur_radius", modifier.blur_radius, (height, width), mask_fields,
+                ),
+                blur_strength=_parameter_field(
+                    modifier, "blur_strength", modifier.blur_strength, (height, width), mask_fields,
+                ),
+                blur_radius_limit=_outline_radius_limit(modifier),
             )
             current = effect
             continue
@@ -706,19 +850,57 @@ def apply_opacity_mask(
     image: QImage, mask: np.ndarray, black_value: float,
     white_value: float,
 ) -> QImage:
-    """Apply a spatial opacity map to an already isolated render pass."""
+    """Mask premultiplied bytes in bounded strips, preserving float32 rounding.
+
+    All four channels receive the same opacity, so native ARGB byte order is
+    sufficient. Most painted masks are opaque/transparent apart from a small
+    antialiased edge; only fractional pixels need floating-point arithmetic.
+    """
     if image.isNull():
         return image
-    current = _qimage_premultiplied(image)
     normalized = np.asarray(mask, dtype=np.float32)
-    if normalized.shape != current.shape[:2]:
+    width, height = image.width(), image.height()
+    if normalized.shape != (height, width):
         return image
-    opacity = np.clip(
-        float(black_value)
-        + np.clip(normalized, 0.0, 1.0)
-        * (float(white_value) - float(black_value)),
-        0.0, 1.0,
-    )[..., None]
-    current[..., :3] *= opacity
-    current[..., 3:4] *= opacity
-    return _premultiplied_qimage(np.clip(current, 0.0, 1.0))
+    black, white = float(black_value), float(white_value)
+    converted = image.convertToFormat(QImage.Format.Format_ARGB32_Premultiplied)
+    result = QImage(width, height, QImage.Format.Format_ARGB32_Premultiplied)
+    # Copy bytes into an ordinary document-pixel image, like the legacy helper.
+    # This intentionally does not inherit a source's device-pixel ratio or color
+    # space. The caller's source and mask stay unchanged throughout processing.
+    data = np.frombuffer(result.bits(), dtype=np.uint8, count=result.sizeInBytes()).reshape(height, result.bytesPerLine())
+    pixels = data[:, :width * 4].reshape(height, width, 4)
+    source = np.frombuffer(converted.constBits(), dtype=np.uint8, count=converted.sizeInBytes()).reshape(height, converted.bytesPerLine())
+    pixels[:] = source[:, :width * 4].reshape(height, width, 4)
+    packed = pixels.view(np.uint32).reshape(height, width)
+    rows = max(1, min(128, 131072 // width))
+    for top in range(0, height, rows):
+        bottom = min(height, top + rows)
+        opacity = np.clip(normalized[top:bottom], 0.0, 1.0)
+        opacity *= white - black
+        opacity += black
+        np.clip(opacity, 0.0, 1.0, out=opacity)
+        target = pixels[top:bottom]
+        fractional = (opacity > 0.0) & (opacity < 1.0)
+        count = np.count_nonzero(fractional)
+        if count <= opacity.size // 4:
+            # Clear transparent pixels without converting opaque artwork, then
+            # process only the antialiased edge when that edge is sparse.
+            packed[top:bottom][~(opacity > 0.0)] = 0
+            if not count:
+                continue
+            current = target[fractional].astype(np.float32)
+            current /= 255.0
+            current *= opacity[fractional, None]
+            current *= 255.0
+            target[fractional] = current.astype(np.uint8)
+        else:
+            current = target.astype(np.float32)
+            current /= 255.0
+            current *= opacity[..., None]
+            # Preserve the legacy arithmetic order. Replacing these with
+            # byte*opacity can round integer boundaries differently by one.
+            # Opacity is already clipped, so channel clipping is redundant.
+            current *= 255.0
+            np.copyto(target, current, casting="unsafe")
+    return result

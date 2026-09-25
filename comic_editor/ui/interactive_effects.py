@@ -1,14 +1,42 @@
 """Bounded editing previews with exact, detached background rendering."""
 from copy import deepcopy
+import math
 
 import numpy as np
-from PySide6.QtCore import Qt
+from PySide6.QtCore import QRectF, Qt
 from PySide6.QtGui import QImage, QTransform
 
 from comic_editor.core.models import BlurModifier, OutlineModifier
+from comic_editor.core.effect_geometry import outline_blur_padding
 from comic_editor.ui.modifier_rendering import (
     BlurPyramidCache, OutlineDistanceCache, apply_modifier_stack,
 )
+
+
+def outline_capture_bounds(canvas, painter, bounds, visible, modifiers):
+    """Keep long drawings from replacing the entire effect LRU on every pan.
+
+    Outlines have finite support. A guarded source window gives the same
+    visible pixels; full captures and exports still use the complete image.
+    Snap the window outward to reduce recapture during small camera changes.
+    """
+    if not (modifiers and all(isinstance(m, OutlineModifier) for m in modifiers)
+            and canvas._interactive_render
+            and getattr(canvas, "_effect_preview_channel", "canvas") != "navigator"
+            and painter.combinedTransform().type().value <= QTransform.TransformationType.TxScale.value
+            and not canvas._render_modifier_sources
+            and not canvas._render_base_alpha
+            and not canvas._rendering_mask_contributor
+            and not canvas._render_cage_source
+            and not getattr(canvas, "_rendering_halftone_source", False)
+            and getattr(canvas, "_tiling_capture_geometry", None) is None):
+        return bounds
+    padding = 4. + sum(canvas._modifier_maximum(m, "thickness", m.thickness) + outline_blur_padding(m)
+                       for m in modifiers)
+    needed = visible.adjusted(-padding, -padding, padding, padding)
+    left, top = math.floor(needed.left() / 256) * 256, math.floor(needed.top() / 256) * 256
+    right, bottom = math.ceil(needed.right() / 256) * 256, math.ceil(needed.bottom() / 256) * 256
+    return bounds.intersected(QRectF(left, top, right-left, bottom-top))
 
 
 def _draft(image, modifiers, origin, fields, mapping, nearest):
@@ -27,6 +55,11 @@ def _draft(image, modifiers, origin, fields, mapping, nearest):
         elif isinstance(modifier, OutlineModifier):
             parameter = "thickness"
             modifier.thickness *= scale
+            modifier.blur_radius *= scale
+            radius_mask = modifier.parameter_masks.get("blur_radius")
+            if radius_mask is not None:
+                radius_mask.black_value *= scale
+                radius_mask.white_value *= scale
         if parameter in modifier.parameter_masks:
             binding = modifier.parameter_masks[parameter]
             binding.black_value *= scale
@@ -63,7 +96,8 @@ def render_interactive_stack(canvas, image, modifiers, world_origin, mask_fields
                     and getattr(canvas, "_effect_preview_channel", "canvas") == "navigator")
     active = [modifier for modifier in modifiers if not modifier.muted]
     # The cropped outline kernel is already fast at ordinary text sizes.
-    inexpensive = not active or pixels <= 16384 or (all(isinstance(m, OutlineModifier) for m in active)
+    inexpensive = not active or pixels <= 16384 or (all(isinstance(m, OutlineModifier)
+                                      and outline_blur_padding(m) == 0 for m in active)
                                       and pixels <= 2 * 1024 * 1024)
     asynchronous = interactive and not inexpensive and not upstream_provisional and not preview_only
     if asynchronous:

@@ -99,6 +99,24 @@ def test_text_outline_follows_glyphs_preserves_ink_and_mutes(canvas, target_kind
 
 
 @pytest.mark.parametrize("target_kind", ["object", "container"])
+def test_text_outline_antialiasing_invalidates_render_but_reuses_source(canvas, target_kind):
+    _, _, target = add_text(canvas, target_kind)
+    modifier = outline(canvas, target)
+    smooth = rgba(render(canvas))
+    source_keys = set(canvas._modifier_source_cache)
+    builds = canvas._outline_distance_cache.computations
+    modifier.antialiasing = False
+    hard = rgba(render(canvas))
+    assert not np.array_equal(hard, smooth)
+    assert set(canvas._modifier_source_cache) == source_keys
+    assert canvas._outline_distance_cache.computations == builds
+    clear_effect_images(canvas)
+    np.testing.assert_array_equal(rgba(render(canvas)), hard)
+    modifier.antialiasing = True
+    np.testing.assert_array_equal(rgba(render(canvas)), smooth)
+
+
+@pytest.mark.parametrize("target_kind", ["object", "container"])
 def test_text_outline_slider_edits_reuse_source_and_distance(canvas, target_kind):
     _, _, target = add_text(canvas, target_kind)
     modifier = outline(canvas, target)
@@ -211,7 +229,8 @@ def test_text_outline_live_caret_selection_typing_and_clean_export(canvas, qapp,
 
 
 @pytest.mark.parametrize("target_kind", ["object", "container"])
-def test_transformed_text_outline_rasterization_preserves_pixels_and_undo(canvas, target_kind):
+@pytest.mark.parametrize("blurred", [False, True])
+def test_transformed_text_outline_rasterization_preserves_pixels_and_undo(canvas, target_kind, blurred):
     obj, parent, target = add_text(canvas, target_kind)
     obj.transform_quad = [(80, 65), (370, 95), (355, 215), (65, 175)]
     if target_kind == "container":
@@ -219,7 +238,7 @@ def test_transformed_text_outline_rasterization_preserves_pixels_and_undo(canvas
         parent.opacity = .7
     else:
         obj.opacity_locked, obj.opacity = False, .7
-    outline(canvas, target)
+    outline(canvas, target, blur_radius=6 if blurred else 0, blur_strength=75 if blurred else 0)
     before = rgba(render(canvas))
     rasterize(canvas, *target)
     after = rgba(render(canvas))

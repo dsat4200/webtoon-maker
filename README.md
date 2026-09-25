@@ -23,8 +23,9 @@ workflow.
 - Non-destructive hierarchical masks
 - Chapter-local reusable tone masks for opacity and modifier parameters, with
   live contributor alpha, raster paint, and a translucent blue edit overlay
-- Linked non-destructive HSL, blur, exact outside-outline, and hue-based Posterize modifier stacks
+- Linked non-destructive HSL, Brightness / Contrast, blur, exact outside-outline, and hue-based Posterize modifier stacks
 - GPU-accelerated Halftone and Pixelate modifiers with editable colors and pre-filter blur
+- Raster distortion modifiers with editable canvas handles and mode-specific controls
 - Sparse 256×256 raster tiles
 - Explicit, non-clipping raster interaction frames with drag-to-create
 - Named pressure-curve pencil presets, independent pressure channels,
@@ -42,7 +43,8 @@ workflow.
 - Rounded layer masks, optional fills/borders, and boundless fill leaves
 - Unified rectangle, circle, and open/closed vector-Bézier Shape paths
 - Per-point width, roundness, linked controls, outlines, and endpoint caps
-- Frontmost-first layer/page selection with Ctrl-click candidate menus
+- Frontmost-first layer/page selection with Ctrl-click candidate menus, temporary
+  solo previews on hover, and pen selection support
 - User grid defaults with optional document and per-layer overrides
 - Pixel-snapped pan, zoom, rotation, and aspect-preserving chapter preview navigation
 - Touch navigation controlled only by Tablet Navigation mode
@@ -51,6 +53,94 @@ workflow.
   diagnostic logs; see [monitor and eyedropper notes](docs/drawing-performance-monitor.md)
 - Blender 5.2 and 4.5 LTS Comic Views as disk-published transparent image sources with
   persistent offline PNG caches
+
+## Distort modifiers
+
+Select a Raster drawing, image, or Blender render and choose **Modifiers → Add
+Modifier → Distort**. The category includes Deform, Perspective, Twirl,
+Pinch / Punch, Spherical, Ripple, Lens Distortion, Lens Correction,
+Rectangular to Polar, Polar to Rectangular, Pixelate, Displace, Glitch, Shear,
+Mirror Distort, Affine, Equations, and Mesh Warp. Shapes, vector drawings,
+gradients, and text are excluded for now.
+
+Drag the orange canvas handles to move an effect's center, adjust its radius,
+reshape perspective corners or mesh points, or position Deform pins. Deform
+has Add, Move, and Remove pin modes. Perspective and Mesh Warp include source
+editing, a grid, reset, and source/destination synchronization. Escape cancels
+a handle drag; undo restores completed edits. Shear has editable horizontal
+and vertical curves. Mirror Distort has its own mirror count and input/output
+angles, separate from the existing Mirror modifier.
+
+Glitch exposes controls for its selected mode, including independent horizontal
+and vertical strengths for Shred, Blast, and Warp. Displace can load an image
+or capture the visible layers beneath its target; captured maps are embedded
+in the document. Lens Correction uses a small bundled selection of genuine
+Lensfun camera/lens profiles, with focal-length interpolation and optional
+Lensfun XML import. Attribution and license are in
+`comic_editor/core/data/lensfun/`.
+
+Distort supports interpolation and edge handling, stack intensity and masks,
+linked eligible targets, presets, assets, save/reopen, export, and Raster
+**Apply**. Large interactive edits use a quick preview followed by the exact
+result; exports and baking use full quality. Equations use a restricted math
+expression language and cannot execute Python code.
+
+Spatial distortions expand their output to retain artwork beyond the original
+image rectangle, including intermediate results in a stack. Radial warps,
+displacement, moving Glitch modes, and partial Pixelate blocks keep their full
+finite output. Parent layer masks still define intentional clipping. Equations
+and Polar to Rectangular keep their defined output frame because their mappings
+can repeat indefinitely.
+
+These are independently implemented Affinity-inspired effects. Lens Correction
+applies calibrated geometric distortion, and Mesh Warp uses a smooth control
+grid; results are not guaranteed to be pixel-identical to Affinity.
+
+## Brightness / Contrast
+
+Choose **Modifiers → Add Modifier → Brightness / Contrast** with a drawing,
+image, text box, or layer selected. Brightness and Contrast both range from
+−100 to 100, with 0 leaving the image unchanged. Brightness offsets the color;
+Contrast expands or compresses its range around middle gray. Transparency stays
+unchanged, including antialiased edges, and text remains editable.
+
+The modifier supports intensity, parameter masks, linked targets, presets,
+undo/redo, save/reopen, assets, export, and Raster **Apply**. Each slider drag is
+one undo step, and modifiers run in their displayed stack order.
+
+## Curves
+
+Choose **Modifiers → Add Modifier → Curves** for pages, bounded/open/compound
+layers, text containers, raster and vector drawings, images and Blender sources,
+text, or color gradients. Mask-only artwork remains hidden during normal export.
+The modifier keeps the source editable and follows the displayed stack order.
+
+Choose **GREY**, **RGB**, **CMYK**, or **LAB**, then edit Master, an individual
+color channel, or Alpha. Master affects the color channels before their individual
+curves; Alpha is independent. Click the graph to add a point, drag it, or enter
+precise **X/Y** coordinates. Endpoints can move inward to set black and white
+thresholds. Delete or right-click removes a point; Escape cancels a drag.
+**Reset channel** restores one curve, while **Reset all** clears every curve.
+
+The histogram samples selected linked artwork before this modifier and later
+modifiers, with transparent pixels weighted by coverage. The **+** picker adds a
+point from the canvas; drag up or down after clicking to adjust its output.
+Black Point, White Point, Gray Point, and White Balance pickers also sample the
+isolated input. Each completed gesture is one undo step.
+
+**Min/Max** set the graph's input and output range, normally 0–1; Max can extend
+to 16. The document still uses RGBA8, so this does not add HDR storage. The default
+diagonal curve with Normal blending leaves pixels exactly unchanged, including
+when the graph range changes. **Intensity** supports masks, and ten blend modes
+are available. Curves supports linking, saved modifier presets, undo/redo,
+save/reopen, assets, export, rasterization, and Raster **Apply**.
+
+GREY adjusts luminance while preserving color ratios. CMYK uses an unprofiled
+conversion, and LAB uses CIELAB with a D65 white point; these modes do not simulate
+an ICC print profile. Alpha curves remap existing coverage and keep completely
+transparent source pixels transparent. This is an independent implementation,
+informed by the [Affinity Curves guide](https://www.affinity.studio/help/adjustments-adjustment-curves/)
+and Ryan Tuscher's [How to Use the Curves Tool in Affinity Photo](https://www.youtube.com/watch?v=9bAZgM3KPOw).
 
 ## Modifier presets
 
@@ -85,6 +175,15 @@ Select a text box or Free Text container, then choose **Modifiers → Add
 Modifier → Outline**. The outline follows the letters, including wrapped and
 transformed text. Text stays editable, and outlines support linked targets,
 parameter masks, presets, undo/redo, assets, and export.
+
+Use **Antialiasing** in the Outline modifier to switch between smooth edges
+(on by default) and hard pixel edges. Opacity and intensity still apply in either mode.
+
+**Blur radius** sets a Gaussian radius (sigma) from 0–100 pixels, and **Blur
+strength** mixes the original outline with the blurred outline from 0–100%.
+The source artwork stays sharp. Both controls support masks; setting either
+control to zero preserves the original outline. Blur starts disabled and is
+included in previews, saved presets, export, and baking.
 
 Live width, color, opacity, and intensity edits reuse the source silhouette and
 its exact distance field. Rendering limits pixel calculations to the lettering
@@ -584,11 +683,11 @@ gesture adds to the mask. Hold **Ctrl** while drawing a lasso or clicking the
 wand to remove that region, including coverage from linked contributors.
 These edits support Undo and Redo and are saved with the mask.
 
-HSL, Blur, Radial Blur, Outline, and Mirror modifiers remain attached to their objects rather than
+HSL, Brightness / Contrast, Blur, Radial Blur, Outline, and Mirror modifiers remain attached to their objects rather than
 appearing in the outliner. Their processed results are cached separately from
 their isolated source images. Outline color, thickness, opacity, intensity,
-and parameter-mask edits therefore reuse the same exact alpha distance field;
-only source-alpha changes rebuild it.
+and masks reuse the exact alpha distance field while its capture bounds stay
+the same. Changing the blur radius can expand those bounds for the soft halo.
 
 **Stroke modifiers** appear under **Add Modifier** for closed shapes and vector
 drawings whose strokes are closed. **Scream / Thought** adds adjustable spikes;

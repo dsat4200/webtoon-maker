@@ -12,6 +12,28 @@ from PySide6.QtWidgets import QWidget
 MAX_RASTER_PIXELS = 4 * 1024 * 1024
 
 
+def paint_closed_shape_outline(painter, bound, baseline, fill, color, *,
+                               cache=None, tolerance=.125):
+    """Avoid whole-path Boolean normalization for complex standalone outlines."""
+    from comic_editor.ui.shape_outline import customized, outline_mesh
+
+    raster = (prepare_outline_raster(painter, fill)
+              if customized(bound) and painter.testRenderHint(QPainter.Antialiasing)
+              else None)
+    if raster is not None and raster.bounds.isEmpty():
+        return
+    coverage = outline_mesh(bound, baseline, fill, cache=cache,
+                            tolerance=tolerance, clip=raster is None)
+    if raster is not None and coverage.elementCount() <= 128:
+        raster = None
+        coverage = outline_mesh(bound, baseline, fill, cache=cache,
+                                tolerance=tolerance)
+    if raster is None:
+        painter.fillPath(coverage, color)
+    else:
+        raster.paint(painter, coverage, fill, color)
+
+
 @dataclass
 class OutlineRaster:
     bounds: QRect

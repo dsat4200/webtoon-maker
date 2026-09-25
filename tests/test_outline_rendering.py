@@ -47,6 +47,8 @@ def reference_outline_array(original, modifier, masks):
         for name in ("thickness", "opacity", "intensity")
     }
     coverage = np.clip(fields["thickness"] + 0.5 - distance, 0, 1)
+    if not modifier.antialiasing:
+        coverage = (coverage >= 0.5).astype(np.float32)
     coverage *= np.clip(1 - alpha, 0, 1)
     coverage *= np.clip(np.asarray(fields["opacity"], dtype=np.float32) / 100, 0, 1)
     color = modifier.color.lstrip("#")
@@ -63,13 +65,15 @@ def reference_outline_array(original, modifier, masks):
 
 
 @pytest.mark.parametrize("masked", [False, True])
+@pytest.mark.parametrize("antialiasing", [False, True])
 @pytest.mark.parametrize("thickness,color", [
     (0, "#FF000000"), (0.8, "#803366EE"), (3.25, "#BBD09020"), (25, "#FFFFFFFF"),
 ])
-def test_fast_outline_matches_exact_outside_reference(text_outline_font_family, masked, thickness, color):
+def test_fast_outline_matches_exact_outside_reference(text_outline_font_family, masked, antialiasing, thickness, color):
     image = text_image(text_outline_font_family)
     before = rgba8(image)
-    modifier = OutlineModifier(thickness=thickness, color=color, opacity=63, intensity=71)
+    modifier = OutlineModifier(thickness=thickness, color=color, opacity=63, intensity=71,
+                               antialiasing=antialiasing)
     masks = {}
     if masked:
         rng = np.random.default_rng(882)
@@ -88,9 +92,11 @@ def test_fast_outline_matches_exact_outside_reference(text_outline_font_family, 
     np.testing.assert_array_equal(rgba8(image), before)
 
 
-def test_single_outline_and_mixed_stack_paths_match(text_outline_font_family):
+@pytest.mark.parametrize("antialiasing", [False, True])
+def test_single_outline_and_mixed_stack_paths_match(text_outline_font_family, antialiasing):
     image = text_image(text_outline_font_family)
-    modifier = OutlineModifier(thickness=7.2, color="#AAB123FF", intensity=53)
+    modifier = OutlineModifier(thickness=7.2, color="#AAB123FF", intensity=53,
+                               antialiasing=antialiasing)
     direct = apply_modifier_stack(image, [modifier], (0, 0))
     generic = apply_modifier_stack(
         image, [HueSaturationLightnessModifier(intensity=0), modifier], (0, 0)
@@ -112,10 +118,11 @@ def test_fast_outline_preserves_edge_pixels_and_image_formats(image_format):
     np.testing.assert_allclose(rgba8(actual), rgba8(expected), atol=1)
 
 
-def test_outline_stack_uses_each_preceding_silhouette(text_outline_font_family):
+@pytest.mark.parametrize("antialiasing", [(True, True), (False, False), (True, False), (False, True)])
+def test_outline_stack_uses_each_preceding_silhouette(text_outline_font_family, antialiasing):
     image = text_image(text_outline_font_family)
-    first = OutlineModifier(thickness=2, color="#FFFF0000")
-    second = OutlineModifier(thickness=3, color="#FF0000FF", intensity=74)
+    first = OutlineModifier(thickness=2, color="#FFFF0000", antialiasing=antialiasing[0])
+    second = OutlineModifier(thickness=3, color="#FF0000FF", intensity=74, antialiasing=antialiasing[1])
     cache = OutlineDistanceCache()
     actual = apply_modifier_stack(image, [first, second], (0, 0),
                                   outline_distance_cache=cache)
@@ -160,6 +167,28 @@ def test_distance_cache_reuses_only_identical_silhouettes():
     assert cache.computations == 2
     assert first[40, 69] == 1
     assert changed[40, 69] == 0
+
+
+def test_antialiasing_toggle_changes_edge_coverage_and_reuses_distance():
+    image = QImage(31, 31, QImage.Format.Format_ARGB32_Premultiplied)
+    image.fill(Qt.GlobalColor.transparent)
+    image.setPixelColor(15, 15, QColor("white"))
+    before = rgba8(image)
+    modifier = OutlineModifier(thickness=4)
+    cache = OutlineDistanceCache()
+    smooth = rgba8(apply_modifier_stack(image, [modifier], (0, 0), outline_distance_cache=cache))
+    modifier.antialiasing = False
+    hard = rgba8(apply_modifier_stack(image, [modifier], (0, 0), outline_distance_cache=cache))
+    assert np.any((smooth[..., 3] > 0) & (smooth[..., 3] < 255))
+    assert set(np.unique(hard[..., 3])) == {0, 255}
+    assert hard[15, 19, 3] == 255
+    assert hard[15, 20, 3] == 0
+    assert not np.array_equal(smooth, hard)
+    assert cache.computations == 1
+    modifier.antialiasing = True
+    np.testing.assert_array_equal(rgba8(apply_modifier_stack(
+        image, [modifier], (0, 0), outline_distance_cache=cache)), smooth)
+    np.testing.assert_array_equal(rgba8(image), before)
 
 
 def test_bounded_distance_field_is_exact_and_omits_empty_canvas():

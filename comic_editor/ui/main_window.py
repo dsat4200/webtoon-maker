@@ -80,6 +80,7 @@ from comic_editor.ui.tool_ribbon_pages import (
     TextObjectControls, ToolSettingsControls, VectorToolsControls,
 )
 from comic_editor.ui.modifier_controls import ModifierControls
+from comic_editor.ui.selection_candidates import SelectionCandidateMenu
 from comic_editor.ui.mask_controls import MaskButton, MasksPanel
 from comic_editor.ui.tree_model import HierarchyModel
 from comic_editor.ui.asset_library import AssetLibraryWidget
@@ -1672,6 +1673,10 @@ class MainWindow(QMainWindow):
             QEvent.TabletMove, QEvent.TabletPress, QEvent.TabletRelease,
         }:
             return False
+        popup = QApplication.activePopupWidget()
+        if isinstance(popup, SelectionCandidateMenu) and popup.parentWidget() is self:
+            popup.tabletEvent(event)
+            return True
         global_position = QPointF(event.globalPosition())
         target = QApplication.widgetAt(global_position.toPoint())
         if target is None and isinstance(watched, QWidget):
@@ -5311,7 +5316,7 @@ class MainWindow(QMainWindow):
     def _show_selection_candidates(self, candidates, global_point) -> None:
         if self.chapter is None:
             return
-        menu = QMenu(self)
+        menu = SelectionCandidateMenu(self.canvas, self)
         for candidate in candidates:
             kind = candidate.get("kind", "")
             entity_id = candidate.get("id", "")
@@ -5338,6 +5343,7 @@ class MainWindow(QMainWindow):
                     + (f"  ·  {parent.name}" if parent else "")
                 )
             action = menu.addAction(label)
+            action.setData((kind, entity_id))
             action.triggered.connect(
                 lambda checked=False, selected_kind=kind,
                 selected_id=entity_id:
@@ -5346,7 +5352,17 @@ class MainWindow(QMainWindow):
                 )
             )
         if not menu.isEmpty():
-            menu.exec(global_point)
+            # The opening canvas press is complete; subsequent pen input belongs
+            # to the chooser, including the release that ends that original tap.
+            self.canvas._pen_contact_active = False
+            self.canvas._tablet_tool_active = False
+            try:
+                menu.exec(global_point)
+            finally:
+                menu.restore_preview()
+                menu.deleteLater()
+        else:
+            menu.deleteLater()
 
     def _canvas_selection_changed(self, kind: str, entity_id: str) -> None:
         if (

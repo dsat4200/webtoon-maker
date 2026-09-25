@@ -3,6 +3,7 @@ from __future__ import annotations
 import pytest
 from PySide6.QtCore import QPointF
 from PySide6.QtGui import QColor, QImage
+from PySide6.QtTest import QTest
 
 from comic_editor.core.models import (
     BoundGeometry, ChapterDocument, PathContour, PathNode, RasterObject,
@@ -202,7 +203,10 @@ def test_open_shape_cap_pairs_render_in_compound_and_chapter_preview(
     preview = ChapterPreview(canvas)
     preview.resize(92, 240)
     preview.show()
-    qapp.processEvents()
+    for _ in range(100):
+        QTest.qWait(10)
+        if not preview._cache.isNull():
+            break
     preview_image = preview.grab().toImage()
     assert not canvas_image.isNull()
     assert not preview_image.isNull()

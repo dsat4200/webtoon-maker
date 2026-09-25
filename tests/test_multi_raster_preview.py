@@ -113,12 +113,35 @@ def test_viewport_retains_all_active_rasters_and_their_ancestors(preview_scene):
         assert ("layer", obj.parent_layer_id) in canvas._render_bounds.live_branches
     canvas._interactive_render = True
     try:
+        assert canvas._render_bounds.usable()
         assert canvas._render_bounds.object_visible(b, QRectF(900, 900, 20, 20))
     finally:
         canvas._interactive_render = False
     canvas._ensure_scene_cache()
     assert canvas._scene_cache.pixelColor(180, 130) == QColor("red")
     assert canvas._scene_cache.pixelColor(300, 250) == QColor("blue")
+
+
+def test_multi_raster_selection_preview_culls_unrelated_drawings(preview_scene, monkeypatch):
+    canvas, chapter, _a, _b = preview_scene
+    distant = chapter.add_object(chapter.root_page_ids[0], RasterObject(x=850, y=600))
+    canvas.tiles.paint_dab(distant.object_id, QPointF(10, 10), 20, QColor("green"))
+    original = canvas._render_raster_content
+    calls = []
+    monkeypatch.setattr(canvas, "_render_raster_content", lambda painter, obj, *args, **kwargs:
+                        (calls.append(obj.object_id), original(painter, obj, *args, **kwargs))[1])
+    canvas._ensure_scene_cache()
+    assert distant.object_id not in calls
+    culled = QImage(canvas._scene_cache)
+    prepare = canvas._render_bounds.prepare
+    def disabled():
+        prepare()
+        canvas._render_bounds.enabled = False
+    monkeypatch.setattr(canvas._render_bounds, "prepare", disabled)
+    canvas._invalidate_scene_cache()
+    canvas._ensure_scene_cache()
+    assert distant.object_id in calls
+    assert culled == canvas._scene_cache
 
 
 @pytest.mark.parametrize("scope,modifier", [

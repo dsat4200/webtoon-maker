@@ -2,11 +2,12 @@
 from __future__ import annotations
 
 import pytest
+from PySide6.QtWidgets import QCheckBox
 
 from comic_editor.core.assets import extract_asset, instantiate_asset
 from comic_editor.core.models import (
     BlurModifier, BoundGeometry, ChapterDocument, HueSaturationLightnessModifier,
-    OutlineModifier, RasterObject, TextObject,
+    OutlineModifier, RasterObject, TextObject, modifier_from_dict,
 )
 from comic_editor.core.modifier_presets import preset_from_modifier
 from comic_editor.core.persistence import SeriesRepository
@@ -75,7 +76,7 @@ def test_direct_text_rejects_other_modifiers_and_sanitizes_old_invalid_links(mod
 
 def test_text_outline_controls_add_edit_link_remove_and_undo(editor):
     canvas, controls, text_id = editor
-    assert [action.text() for action in controls.add_button.menu().actions() if action.isVisible()] == ["Outline"]
+    assert [action.text() for action in controls.add_button.menu().actions() if action.isVisible()] == ["Brightness / Contrast", "Curves", "Outline"]
     controls.add_modifier("outline")
     modifier_id = controls.common_ids()[0]
     assert canvas.chapter.objects[text_id].modifier_ids == [modifier_id]
@@ -122,12 +123,14 @@ def test_loading_text_outline_preset_retains_text_and_is_undoable(editor, tmp_pa
     controller = ModifierPresetController(controls, lambda: (series, repository))
     controls.add_modifier("outline")
     modifier_id = controls.common_ids()[0]
-    preset = preset_from_modifier("Blue caption", OutlineModifier(thickness=11, color="#FF0022FF", opacity=64))
+    preset = preset_from_modifier("Blue caption", OutlineModifier(
+        thickness=11, color="#FF0022FF", opacity=64, antialiasing=False))
     series.modifier_presets.append(preset)
     before = canvas.chapter.to_dict()
     assert controller.load(modifier_id, preset.preset_id)
     loaded = canvas.chapter.modifiers[modifier_id]
     assert (loaded.thickness, loaded.color, loaded.opacity) == (11, "#FF0022FF", 64)
+    assert loaded.antialiasing is False
     assert canvas.chapter.objects[text_id].modifier_ids == [modifier_id]
     assert canvas.chapter.objects[text_id].text == "Editable outline"
     canvas.command_stack.undo()
@@ -136,11 +139,12 @@ def test_loading_text_outline_preset_retains_text_and_is_undoable(editor, tmp_pa
     restored = ChapterDocument.from_dict(canvas.chapter.to_dict())
     assert restored.objects[text_id].modifier_ids == [modifier_id]
     assert restored.modifier_preset_ids[modifier_id] == preset.preset_id
+    assert restored.modifiers[modifier_id].antialiasing is False
 
 
 def test_text_outline_asset_round_trip_preserves_editable_text_and_remaps_modifier():
     chapter, _, text = text_document()
-    outline = OutlineModifier(thickness=9)
+    outline = OutlineModifier(thickness=9, antialiasing=False)
     chapter.add_modifier(outline, [("object", text.object_id)])
     manifest, tiles = extract_asset(chapter, TileStore(), "object", text.object_id, "Caption")
     asset_outline_id = manifest.document.objects[text.object_id].modifier_ids[0]
@@ -152,3 +156,52 @@ def test_text_outline_asset_round_trip_preserves_editable_text_and_remaps_modifi
     assert len(clone.modifier_ids) == 1
     assert clone.modifier_ids[0] not in {outline.modifier_id, asset_outline_id}
     assert target.modifiers[clone.modifier_ids[0]].thickness == 9
+    assert target.modifiers[clone.modifier_ids[0]].antialiasing is False
+
+
+def test_outline_antialiasing_legacy_default_and_round_trip():
+    assert modifier_from_dict({"type": "outline"}).antialiasing is True
+    for enabled in (False, True):
+        modifier = OutlineModifier(antialiasing=enabled)
+        assert modifier_from_dict(modifier.to_dict()).antialiasing is enabled
+
+
+def test_outline_antialiasing_checkbox_commits_and_undoes(editor):
+    canvas, controls, _ = editor
+    controls.add_modifier("outline")
+    modifier_id = controls.common_ids()[0]
+
+    def checkbox():
+        return controls._cards[modifier_id].findChild(QCheckBox, "outlineAntialiasing")
+
+    assert checkbox().isChecked()
+    revision = canvas.command_stack.revision
+    checkbox().click()
+    assert canvas.chapter.modifiers[modifier_id].antialiasing is False
+    assert canvas.command_stack.revision == revision + 1
+    canvas.command_stack.undo()
+    assert canvas.chapter.modifiers[modifier_id].antialiasing is True
+    assert checkbox().isChecked()
+    canvas.command_stack.redo()
+    assert canvas.chapter.modifiers[modifier_id].antialiasing is False
+    assert not checkbox().isChecked()
+
+
+def test_outline_blur_controls_commit_and_undo_independently(editor):
+    from PySide6.QtWidgets import QLabel, QSpinBox
+    canvas, controls, _ = editor
+    controls.add_modifier("outline")
+    modifier_id = controls.common_ids()[0]
+    for label, attribute, value in (("Blur radius", "blur_radius", 12),
+                                     ("Blur strength", "blur_strength", 67)):
+        card = controls._cards[modifier_id]
+        title = next(item for item in card.findChildren(QLabel) if item.text() == label)
+        spin = title.parentWidget().findChild(QSpinBox)
+        assert (spin.minimum(), spin.maximum()) == (0, 100)
+        spin.setValue(value)
+        spin.editingFinished.emit()
+        assert getattr(canvas.chapter.modifiers[modifier_id], attribute) == value
+        canvas.command_stack.undo()
+        assert getattr(canvas.chapter.modifiers[modifier_id], attribute) == 0
+        canvas.command_stack.redo()
+        assert getattr(canvas.chapter.modifiers[modifier_id], attribute) == value

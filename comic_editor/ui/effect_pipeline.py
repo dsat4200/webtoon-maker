@@ -6,9 +6,9 @@ from PySide6.QtCore import QRectF, Qt
 from PySide6.QtGui import QImage, QPainter, QTransform
 from comic_editor.core.models import (ArrayModifier, MirrorModifier, RadialBlurModifier,
     CageTransformModifier, PosterizeModifier, HalftoneModifier, PixelateModifier,
-    OutlineModifier)
+    OutlineModifier, DistortModifier)
 from comic_editor.core.color_smoothing import simplify_padding
-from comic_editor.core.effect_geometry import effect_bounds, reflection_transform, array_indices, array_transform, array_input_bounds
+from comic_editor.core.effect_geometry import effect_bounds, reflection_transform, array_indices, array_transform, array_input_bounds, outline_blur_padding
 from comic_editor.ui.modifier_rendering import apply_modifier_stack, _qimage_premultiplied, _premultiplied_qimage, _parameter_field
 
 
@@ -32,9 +32,8 @@ def empty_image(bounds):
     return image
 
 
-def _pattern_draft(source, modifier, fields, color_source):
-    """Bound interactive fallback work while the exact CPU image is pending."""
-    from comic_editor.ui.modifier_rendering import apply_pattern_modifier
+def _pattern_draft_source(source, modifier):
+    """Choose the bounded working image before sampling any parameter maps."""
     complex_pattern = isinstance(modifier, HalftoneModifier) and (
         modifier.grid_type in {"radial", "stippling"} or modifier.size > 1.5
         or modifier.dot_style in {"blob", "liquid", "delaunay"})
@@ -43,12 +42,20 @@ def _pattern_draft(source, modifier, fields, color_source):
                 math.sqrt(pixels / (source.width() * source.height())))
     width, height = max(1, round(source.width() * scale)), max(1, round(source.height() * scale))
     image = source.scaled(width, height, Qt.IgnoreAspectRatio, Qt.SmoothTransformation)
-    colors = (color_source.scaled(image.size(), Qt.IgnoreAspectRatio, Qt.SmoothTransformation)
-              if color_source is not None else None)
     draft = copy.deepcopy(modifier)
     if isinstance(draft, PixelateModifier):
         draft.pixel_size *= scale
         draft.blur *= scale
+    return image, draft
+
+
+def _pattern_draft(source, modifier, fields, color_source):
+    """Bound interactive fallback work while the exact CPU image is pending."""
+    from comic_editor.ui.modifier_rendering import apply_pattern_modifier
+    image, draft = _pattern_draft_source(source, modifier)
+    width, height = image.width(), image.height()
+    colors = (color_source.scaled(image.size(), Qt.IgnoreAspectRatio, Qt.SmoothTransformation)
+              if color_source is not None else None)
     # Pattern masks currently bind intensity. Preserve their source-frame
     # coordinates in the draft; the worker retains the original full field.
     xs = np.minimum(((np.arange(width) + .5) * source.width() / width).astype(int), source.width() - 1)
@@ -94,7 +101,7 @@ def render_stages(canvas, image, bounds, modifiers, local_to_world, *, nearest=F
         needed = QRectF(required)
         for index in range(len(modifiers) - 1, -1, -1):
             requirements[index] = needed
-            if isinstance(modifiers[index], (CageTransformModifier, HalftoneModifier, PixelateModifier)):
+            if isinstance(modifiers[index], (CageTransformModifier, HalftoneModifier, PixelateModifier, DistortModifier)):
                 # A displaced cage can pull source pixels from anywhere in the
                 # incoming stage. Pattern effects also need the full frame:
                 # cropping first changes their grid origin and reference scale.
@@ -140,6 +147,34 @@ def render_stages(canvas, image, bounds, modifiers, local_to_world, *, nearest=F
         cached = None if provisional else canvas._modifier_cache_get(key)
         if cached is None and not provisional and stage_scope is not None:
             cached = canvas._effect_jobs.result(stage_scope, key)
+        if cached is None and navigator and isinstance(modifier, (HalftoneModifier, PixelateModifier)):
+            # The navigator is a thumbnail. A full-size GPU render and readback
+            # can stall input for a second, even when its destination is only
+            # a few pixels wide. Bound masks and target-layer captures before
+            # either is allocated; this draft never enters the exact cache.
+            draft_key = ("navigator-pattern-draft", key)
+            draft = canvas._modifier_cache_get(draft_key)
+            if draft is None:
+                from comic_editor.ui.modifier_rendering import apply_pattern_modifier
+                from comic_editor.ui.halftone_source import render_color_source
+                working, effect = _pattern_draft_source(image, modifier)
+                mapping = canvas._world_to_image_transform(
+                    local_to_world, bounds, working.width(), working.height())
+                fields = canvas._modifier_mask_fields([modifier], working.width(),
+                    working.height(), mapping, local_to_world.mapRect(bounds))
+                revision = getattr(canvas, "_effect_provisional_revision", 0)
+                colors = (render_color_source(canvas, modifier, working, bounds, local_to_world)
+                          if isinstance(modifier, HalftoneModifier) else None)
+                draft = apply_pattern_modifier(working, effect, fields, color_source=colors)
+                if revision == getattr(canvas, "_effect_provisional_revision", 0):
+                    canvas._modifier_cache_put(draft_key, draft)
+            cached = draft.scaled(image.size(), Qt.IgnoreAspectRatio, Qt.FastTransformation)
+            if bounds != target:
+                cropped = QRectF(target)
+                cropped.translate(-bounds.topLeft())
+                cached = cached.copy(cropped.toAlignedRect())
+            image, bounds, provisional = cached, target, True
+            continue
         if cached is None:
             work_target = target
             pattern = isinstance(modifier, (HalftoneModifier, PixelateModifier))
@@ -150,7 +185,8 @@ def render_stages(canvas, image, bounds, modifiers, local_to_world, *, nearest=F
                 # Width, opacity, color and viewport edits share the same alpha
                 # source and exact distance field. Crop only the finished stage;
                 # changing its input padding would force another distance build.
-                work_target = aligned(bounds.adjusted(-25, -25, 25, 25))
+                padding = 25 + outline_blur_padding(modifier)
+                work_target = aligned(bounds.adjusted(-padding, -padding, padding, padding))
             if isinstance(modifier, PosterizeModifier):
                 padding = simplify_padding(modifier)
                 work_target = aligned(target.adjusted(-padding, -padding, padding, padding).intersected(bounds))
@@ -229,6 +265,14 @@ def render_stages(canvas, image, bounds, modifiers, local_to_world, *, nearest=F
                     cropped = QRectF(target)
                     cropped.translate(-work_target.topLeft())
                     cached = cached.copy(cropped.toAlignedRect())
+            elif isinstance(modifier, DistortModifier):
+                from comic_editor.ui.distort_pipeline import render_distort_stage
+                painter = QPainter(source)
+                painter.drawImage(bounds.topLeft() - target.topLeft(), image)
+                painter.end()
+                cached, provisional = render_distort_stage(
+                    canvas, image, source, bounds, target, modifier,
+                    local_to_world, fields, key, stage_scope, provisional, navigator)
             elif isinstance(modifier, CageTransformModifier) and valid:
                 from comic_editor.ui.cage_rendering import warp_image
                 painter = QPainter(source)

@@ -4,20 +4,22 @@ from __future__ import annotations
 from PySide6.QtCore import QPoint, Qt, Signal
 from PySide6.QtGui import QColor, QMouseEvent
 from PySide6.QtWidgets import (
-    QComboBox, QFrame, QHBoxLayout, QLabel, QMenu, QPushButton,
+    QCheckBox, QComboBox, QFrame, QHBoxLayout, QLabel, QMenu, QPushButton,
     QSlider, QSpinBox, QToolButton, QVBoxLayout, QWidget, QSizePolicy,
     QInputDialog, QMessageBox, QLineEdit,
 )
 
 from comic_editor.core.models import (
-    BlurModifier, HueSaturationLightnessModifier, ModifierInstance,
+    BlurModifier, HueSaturationLightnessModifier, BrightnessContrastModifier, ModifierInstance,
     OutlineModifier, MirrorModifier, RadialBlurModifier, RasterObject, LayerNode,
     canonical_argb, TilingModifier, ArrayModifier,
     CageTransformModifier, PosterizeModifier, PosterizeValueModifier, POSTERIZE_MAX_COLORS,
     HalftoneModifier, PixelateModifier,
     ColorFillGradientObject, TextObject,
     StrokeModifier, ScreamModifier, WobbleModifier, DotDashModifier, STROKE_MODIFIER_TYPES,
+    DistortModifier, ImageObject, CurvesModifier,
 )
+from comic_editor.core.distort import DISTORT_TYPES
 from comic_editor.ui.icons import iconoir
 from comic_editor.ui.mask_controls import DualEndpointSlider, MaskButton
 
@@ -201,6 +203,12 @@ class ModifierCard(QFrame):
                     randomize.setToolTip(f"Seed: {seed}")
                 randomize.clicked.connect(randomize_seed)
                 form.addWidget(randomize)
+        elif isinstance(modifier, DistortModifier):
+            from comic_editor.ui.distort_controls import DistortControls
+            form.addWidget(DistortControls(modifier, owner, body))
+        elif isinstance(modifier, CurvesModifier):
+            from comic_editor.ui.curves_controls import CurvesControls
+            form.addWidget(CurvesControls(owner, modifier, body))
         elif isinstance(modifier, (HalftoneModifier, PixelateModifier)):
             from comic_editor.ui.pattern_controls import HalftoneControls, PixelateControls
             factory = HalftoneControls if isinstance(modifier, HalftoneModifier) else PixelateControls
@@ -217,6 +225,11 @@ class ModifierCard(QFrame):
         elif isinstance(modifier, PosterizeModifier):
             from comic_editor.ui.posterize_controls import PosterizeControls
             form.addWidget(PosterizeControls(modifier, owner, body))
+        elif isinstance(modifier, BrightnessContrastModifier):
+            form.addWidget(self._slider_row(
+                "Brightness", -100, 100, round(modifier.brightness), "brightness", "%"))
+            form.addWidget(self._slider_row(
+                "Contrast", -100, 100, round(modifier.contrast), "contrast", "%"))
         elif isinstance(modifier, HueSaturationLightnessModifier):
             form.addWidget(self._slider_row(
                 "Hue", -180, 180, round(modifier.hue), "hue", "°"
@@ -252,6 +265,14 @@ class ModifierCard(QFrame):
         elif isinstance(modifier, RadialBlurModifier):
             form.addWidget(self._slider_row("Angle", 0, 360, round(modifier.angle), "angle", "°"))
         elif isinstance(modifier, OutlineModifier):
+            antialiasing = QCheckBox("Antialiasing", body)
+            antialiasing.setObjectName("outlineAntialiasing")
+            antialiasing.setToolTip("Smooth the outline edges. Turn off for hard pixel edges.")
+            antialiasing.setChecked(modifier.antialiasing)
+            antialiasing.toggled.connect(lambda checked: owner.set_parameter(
+                modifier.modifier_id, "antialiasing", checked, True
+            ))
+            form.addWidget(antialiasing)
             form.addWidget(self._slider_row(
                 "Thickness", 0, 25, round(modifier.thickness),
                 "thickness", " px",
@@ -260,6 +281,16 @@ class ModifierCard(QFrame):
                 "Opacity", 0, 100, round(modifier.opacity),
                 "opacity", "%",
             ))
+            radius = self._slider_row(
+                "Blur radius", 0, 100, round(modifier.blur_radius), "blur_radius", " px",
+            )
+            radius.setToolTip("Gaussian blur radius (sigma) in pixels, applied only to the outline.")
+            form.addWidget(radius)
+            strength = self._slider_row(
+                "Blur strength", 0, 100, round(modifier.blur_strength), "blur_strength", "%",
+            )
+            strength.setToolTip("Blend the original outline with its blurred version. Source pixels stay sharp.")
+            form.addWidget(strength)
             color_row = QWidget(body)
             color_layout = QHBoxLayout(color_row)
             color_layout.setContentsMargins(0, 0, 0, 0)
@@ -464,6 +495,9 @@ class ModifierControls(QWidget):
         menu.addAction("Hue / Saturation / Lightness").triggered.connect(
             lambda: self.add_modifier("hsl")
         )
+        menu.addAction("Brightness / Contrast").triggered.connect(
+            lambda: self.add_modifier("brightness_contrast"))
+        menu.addAction("Curves").triggered.connect(lambda: self.add_modifier("curves"))
         self.blurs_menu = QMenu("Blurs", menu)
         menu.addMenu(self.blurs_menu)
         blurs = self.blurs_menu
@@ -476,6 +510,11 @@ class ModifierControls(QWidget):
             lambda: self.add_modifier("outline")
         )
         menu.addAction("Mirror").triggered.connect(lambda: self.add_modifier("mirror"))
+        self.distort_menu = menu.addMenu("Distort")
+        self.distort_menu.setObjectName("distortModifierMenu")
+        for modifier_type, spec in DISTORT_TYPES.items():
+            self.distort_menu.addAction(spec["name"]).triggered.connect(
+                lambda _checked=False, kind=modifier_type: self.add_modifier(kind))
         menu.addAction("Array").triggered.connect(lambda: self.add_modifier("array"))
         menu.addAction("Tiling").triggered.connect(lambda: self.add_modifier("tiling"))
         menu.addAction("Posterize…").triggered.connect(lambda: self.add_modifier("posterize"))
@@ -568,19 +607,25 @@ class ModifierControls(QWidget):
         self.add_button.setEnabled(bool(self.canvas.selected_entities))
         has_gradient = any(isinstance(chapter.modifier_target(*ref), ColorFillGradientObject) for ref in targets) if chapter else False
         has_text = any(isinstance(chapter.modifier_target(*ref), TextObject) for ref in targets) if chapter else False
+        has_page = any(kind == "layer" and chapter.layers[identifier].is_page
+                       for kind, identifier in targets) if chapter else False
         for action in self.add_button.menu().actions():
             action.setVisible(
-                (not has_gradient or action.text() in {"Posterize…", "Posterize Value…", "Halftone"})
-                and (not has_text or action.text() == "Outline")
+                (not has_gradient or action.text() in {"Posterize…", "Posterize Value…", "Halftone", "Curves"})
+                and (not has_text or action.text() in {"Outline", "Brightness / Contrast", "Curves"})
+                and (not has_page or action.text() == "Curves")
             )
         self.add_button.setToolTip(
-            "Text boxes support Outline." if has_text else
-            "Color gradients support Posterize, Posterize Value, and Halftone." if has_gradient else ""
+            "Pages support Curves." if has_page else
+            "Text boxes support Outline, Brightness / Contrast, and Curves." if has_text else
+            "Color gradients support Posterize, Posterize Value, Halftone, and Curves." if has_gradient else ""
         )
         self.stroke_menu.menuAction().setVisible(bool(eligible and all(
             chapter.stroke_modifier_target(*ref) for ref in targets)))
+        self.distort_menu.menuAction().setVisible(bool(eligible and all(
+            isinstance(chapter.modifier_target(*ref), (RasterObject, ImageObject)) for ref in targets)))
         if not eligible:
-            self.summary.setText("Select a drawing, image, gradient, text, or bounded shape.")
+            self.summary.setText("Select a drawing, image, gradient, text, layer, or page.")
             return
         ids = self.common_ids()
         self.summary.setText(
@@ -629,7 +674,14 @@ class ModifierControls(QWidget):
         if chapter is None or not targets:
             return
         before = chapter.to_dict()
-        if modifier_type in STROKE_MODIFIER_TYPES:
+        if modifier_type in DISTORT_TYPES:
+            bounds = self._default_bounds()
+            frame = (self.canvas._rect_signature(bounds) if bounds is not None and not bounds.isEmpty()
+                     else (0., 0., 100., 100.))
+            modifier = DistortModifier(modifier_type=modifier_type, name=DISTORT_TYPES[modifier_type]["name"],
+                frame=frame, center=(frame[0] + frame[2] / 2, frame[1] + frame[3] / 2),
+                radius=max(1., min(frame[2], frame[3]) / 2))
+        elif modifier_type in STROKE_MODIFIER_TYPES:
             modifier = STROKE_MODIFIER_TYPES[modifier_type]()
         elif modifier_type in {"halftone", "pixelate"}:
             modifier = HalftoneModifier() if modifier_type == "halftone" else PixelateModifier()
@@ -658,6 +710,10 @@ class ModifierControls(QWidget):
             except (ValueError, MemoryError) as error:
                 QMessageBox.warning(self, modifier.name, str(error))
                 return
+        elif modifier_type == "brightness_contrast":
+            modifier = BrightnessContrastModifier()
+        elif modifier_type == "curves":
+            modifier = CurvesModifier()
         elif modifier_type == "hsl":
             modifier: ModifierInstance = HueSaturationLightnessModifier()
         elif modifier_type in {"blur", "blur_legacy"}:

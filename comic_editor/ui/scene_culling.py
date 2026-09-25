@@ -13,7 +13,7 @@ from PySide6.QtGui import QPolygonF, QTransform
 
 from comic_editor.core.effect_geometry import effect_bounds
 from comic_editor.core.models import (
-    BlurModifier, GradientObject, HalftoneModifier, ImageObject, LayerNode,
+    BlurModifier, BrightnessContrastModifier, CurvesModifier, GradientObject, HalftoneModifier, ImageObject, LayerNode,
     OutlineModifier, PixelateModifier, RasterObject, TextObject, VectorDrawingObject,
 )
 
@@ -26,7 +26,7 @@ class SceneRenderBounds:
         self.bounds: dict[tuple[str, str], QRectF | None] = {}
         self.transforms: dict[str, QTransform] = {}
         self.live_branches: set[tuple[str, str]] = set()
-        self.prepared_preview_layer = None
+        self.prepared_preview_targets = None
         self.enabled = False
         self.exact_sampling = False
         self.margin = 2.0
@@ -52,13 +52,12 @@ class SceneRenderBounds:
         if self.document is not canvas.chapter or self.tiles is not canvas.tiles:
             self.document, self.tiles = canvas.chapter, canvas.tiles
             self.clear()
-        preview_layer = self._preview_layer()
-        self.prepared_preview_layer = preview_layer
-        # A layer transform only changes its subtree. Retain that whole branch
-        # below, while unrelated artwork can still use its static footprint.
+        preview_targets = self._preview_targets()
+        self.prepared_preview_targets = preview_targets
+        # Transform previews only change their target branches. Their old
+        # bounds stay cached, but are never used until the preview ends.
         self.enabled = not (
-            (canvas._transform_preview_quad is not None and not preview_layer)
-            or canvas._multi_transform_preview_quads
+            preview_targets is None
             or canvas._cage_session is not None
             or canvas._page_gap_draft is not None
         )
@@ -73,19 +72,20 @@ class SceneRenderBounds:
         retained = [(kind, identifier)] if identifier else []
         retained.extend(("object", object_id) for object_id in
                         canvas.__dict__.get("_selection_raster_states", {}))
-        pending = [("layer", preview_layer)] if preview_layer else []
-        geometry_layer_id = preview_layer or (identifier if kind == "layer" else None)
-        layer = (canvas.chapter.layers.get(geometry_layer_id)
-                 if canvas.chapter is not None else None)
-        while layer is not None:
-            if layer.compound_enabled:
-                # Editing an operand also changes the compound's effective
-                # geometry. Sibling images fitted to that geometry can move
-                # into view even though their own models/transforms are still
-                # unchanged. Retain each affected compound subtree, including
-                # outer compounds that use a nested compound as an operand.
-                pending.append(("layer", layer.layer_id))
-            layer = canvas.chapter.layers.get(layer.parent_id)
+        retained.extend(preview_targets or ())
+        pending = [key for key in preview_targets or () if key[0] == "layer"]
+        for affected_kind, affected_id in retained if canvas.chapter is not None else []:
+            entity = (canvas.chapter.layers if affected_kind == "layer" else
+                      canvas.chapter.objects).get(affected_id)
+            layer = (entity if affected_kind == "layer" else
+                     canvas.chapter.layers.get(entity.parent_layer_id)
+                     if entity is not None else None)
+            while layer is not None:
+                if layer.compound_enabled:
+                    # A changed operand can move sibling images fitted to
+                    # the effective compound, including nested compounds.
+                    pending.append(("layer", layer.layer_id))
+                layer = canvas.chapter.layers.get(layer.parent_id)
         if pending:
             seen = set()
             while pending:
@@ -108,23 +108,43 @@ class SceneRenderBounds:
                 self.live_branches.add(("layer", parent_id))
                 parent_id = canvas.chapter.layers[parent_id].parent_id
 
-    def _preview_layer(self):
-        target = self.canvas._geometry_transform_target
-        return (target[1] if self.canvas._transform_preview_quad is not None
-                and target is not None and target[0] == "layer_group"
-                and self.canvas.chapter is not None
-                and target[1] in self.canvas.chapter.layers else None)
+    def _preview_targets(self):
+        """None means an unknown preview; an empty set means no transform."""
+        canvas = self.canvas
+        targets = {("object", identifier) for identifier in canvas._multi_transform_preview_quads}
+        if canvas._selection_transform_quad is not None:
+            targets.update(("object", identifier) for identifier in
+                           canvas.__dict__.get("_selection_raster_states", {}))
+        if canvas._transform_preview_quad is not None:
+            target = canvas._geometry_transform_target
+            if target is None:
+                targets.add(("object", canvas.selected_object_id))
+            elif target[0] in {"layer", "layer_group"}:
+                targets.add(("layer", target[1]))
+            elif target[0] == "object":
+                targets.add(target)
+            elif target[0] == "multi":
+                targets.update(("object", identifier)
+                               for identifier in canvas._multi_transform_start_world_quads)
+                targets.update(canvas.selected_entities)
+            else:
+                return None
+            if not targets:
+                return None
+        for kind, identifier in targets:
+            if canvas.chapter is None or kind not in {"object", "layer"}:
+                return None
+            if identifier not in (canvas.chapter.objects if kind == "object" else canvas.chapter.layers):
+                return None
+        return frozenset(targets)
 
     def usable(self):
         canvas = self.canvas
         return bool(
             self.enabled and (canvas._interactive_render or self.exact_sampling)
-            and (canvas._transform_preview_quad is None or (
-                self._preview_layer() is not None
-                and self._preview_layer() == self.prepared_preview_layer))
-            and not canvas._multi_transform_preview_quads
-            and not (len(canvas.__dict__.get("_selection_raster_states", {})) > 1
-                     and canvas._selection_transform_quad is not None)
+            # A selection/preview may start before the next full scene paint.
+            # Captured backgrounds must not use unprepared target bounds.
+            and self._preview_targets() == self.prepared_preview_targets
             and canvas._cage_session is None
             and canvas._page_gap_draft is None
             and canvas.chapter is self.document and canvas.tiles is self.tiles
@@ -180,7 +200,7 @@ class SceneRenderBounds:
         # fall back to rendering rather than recurse in the visibility query.
         self.bounds[key] = None
         modifiers = self.canvas._active_modifier_instances(target.modifier_ids)
-        bounded_effects = (BlurModifier, OutlineModifier)
+        bounded_effects = (BlurModifier, BrightnessContrastModifier, CurvesModifier, OutlineModifier)
         if isinstance(target, ImageObject):
             # These image effects are clipped to the complete source image
             # frame. They cannot bring a distant image into the current view.

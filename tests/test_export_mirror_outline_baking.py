@@ -175,6 +175,25 @@ def test_raster_apply_prefix_retains_muted_shared_and_undo(scene):
     assert canvas.chapter.objects[obj.object_id].modifier_ids == [muted.modifier_id, later.modifier_id]
 
 
+@pytest.mark.parametrize("outline_first", [False, True])
+def test_blurred_outline_mirror_stack_bakes_complete_halo(scene, outline_first):
+    canvas, chapter, _page = scene
+    obj = raster(scene)
+    mirror = MirrorModifier(axis_start=(64, 0), axis_end=(64, 128))
+    outline = OutlineModifier(thickness=4, color="#FF2244CC", blur_radius=3, blur_strength=100)
+    stack = [outline, mirror] if outline_first else [mirror, outline]
+    for modifier in stack:
+        chapter.add_modifier(modifier, [("object", obj.object_id)])
+    image = render(canvas)
+    assert image.pixelColor(15, 30).alpha() > 0
+    assert image.pixelColor(113, 30).alpha() > 0
+    before = pixels(image)
+    apply_raster_modifiers(canvas, stack[-1].modifier_id)
+    np.testing.assert_allclose(pixels(render(canvas)).astype(int), before.astype(int), atol=2)
+    canvas.command_stack.undo()
+    np.testing.assert_array_equal(pixels(render(canvas)), before)
+
+
 def test_rasterize_image_undo_resources_and_opacity(scene):
     canvas, chapter, page = scene
     obj = raster(scene)

@@ -31,24 +31,44 @@ class SpatialModifierFeatures:
         if selection is not None:
             bounds = bounds.united(selection[3].map(selection[2]).boundingRect())
         bounds = aligned(bounds)
+        modifiers = self._active_modifier_instances(obj.modifier_ids, suppress_outline=self._suppress_outline_for_mask)
+        from comic_editor.ui.thumbnail_effects import capture_scale, scaled_modifiers
+        thumbnail_scale = capture_scale(self, bounds, modifiers)
+        navigator = self._interactive_render and getattr(self, "_effect_preview_channel", "canvas") == "navigator"
+        stage_mapping = mapping
+        capture_bounds = bounds
+        if thumbnail_scale < 1.:
+            bounds = aligned(QTransform.fromScale(thumbnail_scale, thumbnail_scale).mapRect(bounds))
+            capture_bounds = QTransform.fromScale(1/thumbnail_scale, 1/thumbnail_scale).mapRect(bounds)
+            stage_mapping = QTransform.fromScale(1/thumbnail_scale, 1/thumbnail_scale) * mapping
+            modifiers = scaled_modifiers(modifiers, thumbnail_scale)
         signature = self._modifier_object_signature(obj)
         key = ("radial-raster-source", obj.object_id, signature[0], signature[3], signature[4], self._rect_signature(bounds))
+        if navigator:
+            key = ("navigator-source", thumbnail_scale, key)
         image = self._modifier_source_cache_get(key)
         if image is None:
             image = empty_image(bounds)
             source = QPainter(image)
-            source.translate(-bounds.left(), -bounds.top())
+            source.setTransform(QTransform.fromScale(thumbnail_scale, thumbnail_scale)
+                                * QTransform.fromTranslate(-bounds.left(), -bounds.top()))
             try:
-                if not self._render_raster_selection_preview(source, obj, bounds):
-                    for (x, y), tile in self.tiles.iter_tiles(obj.object_id, bounds):
+                if not self._render_raster_selection_preview(source, obj, capture_bounds):
+                    for (x, y), tile in self.tiles.iter_tiles(obj.object_id, capture_bounds):
                         source.drawImage(x*obj.tile_size, y*obj.tile_size, tile)
             finally:
                 source.end()
             self._modifier_source_cache_put(key, image)
-        modifiers = self._active_modifier_instances(obj.modifier_ids, suppress_outline=self._suppress_outline_for_mask)
-        image, bounds = render_stages(self, image, bounds, modifiers, mapping, nearest=True,
-            required=inverse.mapRect(visible), source_key=key,
+        required = inverse.mapRect(visible)
+        if getattr(self, "_effect_preview_channel", "canvas") == "navigator":
+            required = None
+        elif thumbnail_scale < 1.:
+            required = QTransform.fromScale(thumbnail_scale, thumbnail_scale).mapRect(required)
+        image, bounds = render_stages(self, image, bounds, modifiers, stage_mapping, nearest=True,
+            required=required, source_key=key, provisional=navigator,
             request_scope=("object", obj.object_id, getattr(self, "_effect_preview_channel", "canvas")))
+        if thumbnail_scale < 1.:
+            bounds = QTransform.fromScale(1/thumbnail_scale, 1/thumbnail_scale).mapRect(bounds)
         if obj.opacity_mask is not None:
             binding = obj.opacity_mask
             field = self.render_tone_mask_field(binding.mask_id, image.width(), image.height(),
@@ -61,7 +81,7 @@ class SpatialModifierFeatures:
         self._set_crisp_raster_transform(painter)
         painter.setTransform(placement, True)
         painter.setOpacity(opacity)
-        painter.drawImage(bounds.topLeft(), image)
+        painter.drawImage(bounds, image)
         painter.restore()
 
     def _init_spatial_features(self):

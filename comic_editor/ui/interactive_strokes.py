@@ -35,7 +35,10 @@ def _unpack(image):
 
 
 def cached_stroke(canvas, scope, cache_key):
-    result = canvas._effect_jobs.result(scope, ("stroke-warp", cache_key))
+    key = ("stroke-warp", cache_key)
+    result = canvas._effect_jobs.result(scope, key) if scope is not None else None
+    if result is None:
+        result = canvas._modifier_cache_get(key)
     return _unpack(result) if result is not None else None
 
 

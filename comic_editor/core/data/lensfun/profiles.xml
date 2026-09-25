@@ -1,0 +1,255 @@
+<?xml version='1.0' encoding='utf-8'?>
+<lensdatabase version="2">
+  <!-- Lensfun database subset, CC BY-SA 3.0. See ATTRIBUTION.md and COPYING.CC_BY-SA_3.0. -->
+  <!-- Source revision: bbd4332a9ec566fd9aa548c9e0d8ced238c56261. Camera/lens subset; retained geometric distortion data only. -->
+  <mount>
+    <name>Canon EF-S</name>
+    <compat>Canon EF</compat>
+    <compat>M42</compat>
+    <compat>M39/1</compat>
+    <compat>DKL</compat>
+    <compat>T2</compat>
+    <compat>Tamron Adaptall</compat>
+    <compat>Generic</compat>
+  </mount>
+  <mount>
+    <name>Canon EF</name>
+    <compat>M42</compat>
+    <compat>M39/1</compat>
+    <compat>DKL</compat>
+    <compat>T2</compat>
+    <compat>Tamron Adaptall</compat>
+    <compat>Generic</compat>
+  </mount>
+  <mount>
+    <name>Canon FD</name>
+    <compat>Canon FL</compat>
+    <compat>M42</compat>
+    <compat>M39/1</compat>
+    <compat>DKL</compat>
+    <compat>T2</compat>
+    <compat>Tamron Adaptall</compat>
+    <compat>Generic</compat>
+  </mount>
+  <mount>
+    <name>Canon FL</name>
+    <compat>M42</compat>
+    <compat>M39/1</compat>
+    <compat>DKL</compat>
+    <compat>T2</compat>
+    <compat>Generic</compat>
+  </mount>
+  <camera>
+    <maker>Canon</maker>
+    <model>Canon EOS 5D Mark III</model>
+    <model lang="en">EOS 5D Mark III</model>
+    <mount>Canon EF</mount>
+    <cropfactor>1</cropfactor>
+  </camera>
+  <camera>
+    <maker>Canon</maker>
+    <model>Canon EOS 80D</model>
+    <model lang="en">EOS 80D</model>
+    <mount>Canon EF-S</mount>
+    <cropfactor>1.613</cropfactor>
+  </camera>
+  <lens>
+    <maker>Canon</maker>
+    <model>Canon EF-S 10-22mm f/3.5-4.5 USM</model>
+    <mount>Canon EF-S</mount>
+    <cropfactor>1.613</cropfactor>
+    <calibration>
+      <!-- Taken with Canon 650D -->
+      <distortion model="ptlens" focal="10" a="0.01986" b="-0.06874" c="0.05166" />
+      <distortion model="ptlens" focal="12" a="0.0077" b="-0.03199" c="0.02557" />
+      <distortion model="ptlens" focal="14" a="0.003" b="-0.00133" c="-0.01649" />
+      <distortion model="ptlens" focal="22" a="0.00459" b="-0.00356" c="-0.01271" />
+      <!-- Taken with Canon 500D -->
+    </calibration>
+  </lens>
+  <lens>
+    <maker>Canon</maker>
+    <model>Canon EF-S 18-55mm f/3.5-5.6 IS II</model>
+    <mount>Canon EF-S</mount>
+    <!-- Average crop factor of Canon APS-C cameras -->
+    <cropfactor>1.611</cropfactor>
+    <calibration>
+      <distortion model="ptlens" focal="18" a="0.02504" b="-0.06883" c="0.01502" />
+      <distortion model="ptlens" focal="24" a="0.0203" b="-0.06514" c="0.04768" />
+      <distortion model="ptlens" focal="29" a="0.00854" b="-0.01505" c="-0.00639" />
+      <distortion model="ptlens" focal="35" a="-0.01582" b="0.04918" c="-0.05313" />
+      <distortion model="ptlens" focal="41" a="-0.00694" b="0.02694" c="-0.03595" />
+      <distortion model="ptlens" focal="46" a="-0.01908" b="0.07131" c="-0.08927" />
+      <distortion model="ptlens" focal="55" a="-0.00098" b="0.01803" c="-0.04704" />
+      <!-- Taken with Canon 60D -->
+    </calibration>
+  </lens>
+  <lens>
+    <maker>Canon</maker>
+    <model>Canon EF 24-70mm f/2.8L USM</model>
+    <mount>Canon EF</mount>
+    <cropfactor>1</cropfactor>
+    <calibration>
+      <distortion model="ptlens" focal="24" a="0.015298" b="-0.039413" c="0" />
+      <distortion model="ptlens" focal="27" a="0.014041" b="-0.034436" c="0" />
+      <distortion model="ptlens" focal="30" a="0.013341" b="-0.031051" c="0" />
+      <distortion model="ptlens" focal="34" a="0.006539" b="-0.01539" c="0" />
+      <distortion model="ptlens" focal="38" a="0.003138" b="-0.007742" c="0" />
+      <distortion model="ptlens" focal="43" a="0" b="0.000233" c="0" />
+      <distortion model="ptlens" focal="48" a="0" b="0.00151" c="0" />
+      <distortion model="ptlens" focal="55" a="0" b="0.003988" c="0" />
+      <distortion model="ptlens" focal="64" a="0" b="0.005787" c="0" />
+      <distortion model="ptlens" focal="70" a="0" b="0.006294" c="0" />
+      <!-- Taken with Canon 5D -->
+    </calibration>
+  </lens>
+  <lens>
+    <maker>Canon</maker>
+    <model>Canon EF 50mm f/1.4 USM</model>
+    <mount>Canon EF</mount>
+    <cropfactor>1</cropfactor>
+    <calibration>
+      <!-- Taken with Canon 5D Mark III -->
+      <distortion model="ptlens" focal="50" a="0.00225" b="-0.01104" c="0.00161" />
+    </calibration>
+  </lens>
+  <lens>
+    <maker>Canon</maker>
+    <model>Canon EF 50mm f/1.4 USM</model>
+    <mount>Canon EF</mount>
+    <!-- Average crop factor of Canon APS-C cameras -->
+    <cropfactor>1.611</cropfactor>
+    <calibration>
+      <distortion model="poly3" focal="50" k1="-0.002987" />
+      <!-- Taken with Canon EOS 80D -->
+    </calibration>
+  </lens>
+  <mount>
+    <name>Nikon F</name>
+    <compat>Nikon F AI</compat>
+    <compat>Nikon F AI-S</compat>
+    <compat>Nikon F AF</compat>
+    <compat>M42</compat>
+    <compat>M39/1</compat>
+    <compat>DKL</compat>
+    <compat>T2</compat>
+    <compat>Tamron Adaptall</compat>
+    <compat>Generic</compat>
+  </mount>
+  <mount>
+    <name>Nikon F AI</name>
+    <compat>Nikon F</compat>
+    <compat>Nikon F AI-S</compat>
+    <compat>Nikon F AF</compat>
+    <compat>M42</compat>
+    <compat>M39/1</compat>
+    <compat>DKL</compat>
+    <compat>T2</compat>
+    <compat>Tamron Adaptall</compat>
+    <compat>Generic</compat>
+  </mount>
+  <mount>
+    <name>Nikon F AI-S</name>
+    <compat>Nikon F</compat>
+    <compat>Nikon F AI</compat>
+    <compat>Nikon F AF</compat>
+    <compat>M42</compat>
+    <compat>M39/1</compat>
+    <compat>DKL</compat>
+    <compat>T2</compat>
+    <compat>Tamron Adaptall</compat>
+    <compat>Generic</compat>
+  </mount>
+  <mount>
+    <name>Nikon F AF</name>
+    <compat>Nikon F</compat>
+    <compat>Nikon F AI</compat>
+    <compat>Nikon F AI-S</compat>
+    <compat>M42</compat>
+    <compat>M39/1</compat>
+    <compat>DKL</compat>
+    <compat>T2</compat>
+    <compat>Generic</compat>
+  </mount>
+  <camera>
+    <maker>Nikon Corporation</maker>
+    <maker lang="en">Nikon</maker>
+    <model>Nikon D750</model>
+    <model lang="en">D750</model>
+    <mount>Nikon F AF</mount>
+    <cropfactor>1</cropfactor>
+  </camera>
+  <camera>
+    <maker>Nikon Corporation</maker>
+    <maker lang="en">Nikon</maker>
+    <model>Nikon D5300</model>
+    <model lang="en">D5300</model>
+    <mount>Nikon F AF</mount>
+    <cropfactor>1.534</cropfactor>
+  </camera>
+  <lens>
+    <maker>Nikon</maker>
+    <model>Nikon AF-S DX Zoom-Nikkor 12-24mm f/4G IF-ED</model>
+    <model lang="en">Nikkor AF-S 12-24mm f/4G DX IF-ED</model>
+    <mount>Nikon F AF</mount>
+    <!-- Average crop factor of Nikon APS-C cameras -->
+    <cropfactor>1.528</cropfactor>
+    <calibration>
+      <distortion model="ptlens" focal="12" a="-0.016006" b="0.024041" c="0" />
+      <distortion model="ptlens" focal="13" a="-0.017096" b="0.030498" c="0" />
+      <distortion model="ptlens" focal="14" a="-0.01773" b="0.031719" c="0" />
+      <distortion model="ptlens" focal="15" a="-0.013174" b="0.027255" c="0" />
+      <distortion model="ptlens" focal="16" a="-0.009629" b="0.021705" c="0" />
+      <distortion model="ptlens" focal="17" a="-0.006736" b="0.016621" c="0" />
+      <distortion model="ptlens" focal="18" a="-0.007763" b="0.019343" c="0" />
+      <distortion model="ptlens" focal="19" a="-0.005218" b="0.014696" c="0" />
+      <distortion model="ptlens" focal="20" a="-0.005775" b="0.015956" c="0" />
+      <distortion model="ptlens" focal="22" a="-0.005197" b="0.015329" c="0" />
+      <distortion model="ptlens" focal="24" a="-0.007101" b="0.018378" c="0" />
+    </calibration>
+  </lens>
+  <lens>
+    <maker>Nikon</maker>
+    <model>Nikon AF-S DX Zoom-Nikkor 18-55mm f/3.5-5.6G VR</model>
+    <model lang="en">Nikkor AF-S 18-55mm f/3.5-5.6G DX VR</model>
+    <mount>Nikon F AF</mount>
+    <!-- Average crop factor of Nikon APS-C cameras -->
+    <cropfactor>1.528</cropfactor>
+    <calibration>
+      <distortion model="ptlens" focal="18" a="0.000658776" b="-0.0150048" c="-0.00123339" />
+      <distortion model="ptlens" focal="20" a="0.0154927" b="-0.0685976" c="0.0638405" />
+      <distortion model="ptlens" focal="22" a="0.00163489" b="-0.0157578" c="0.0044202" />
+      <distortion model="ptlens" focal="24" a="0.0238367" b="-0.102409" c="0.124563" />
+      <distortion model="ptlens" focal="29" a="-5.82382e-05" b="0.0021913" c="-0.0142704" />
+      <distortion model="ptlens" focal="35" a="0.00346406" b="-0.0126111" c="0.013148" />
+      <distortion model="ptlens" focal="45" a="-0.000340008" b="-0.000412014" c="0.00561741" />
+      <distortion model="ptlens" focal="55" a="-0.000340008" b="-0.000412014" c="0.00561741" />
+    </calibration>
+  </lens>
+  <lens>
+    <maker>Nikon</maker>
+    <model>Nikon AF Zoom-Nikkor 24-50mm f/3.3-4.5D</model>
+    <model lang="en">Nikkor AF 24-50mm f/3.3-4.5D</model>
+    <mount>Nikon F AF</mount>
+    <!-- Average crop factor of Nikon APS-C cameras -->
+    <cropfactor>1.528</cropfactor>
+    <calibration>
+      <distortion model="poly3" focal="24" k1="-0.010413" />
+      <distortion model="poly3" focal="29" k1="-0.006777" />
+      <distortion model="poly3" focal="38" k1="-0.003447" />
+      <distortion model="poly3" focal="50" k1="-0.003329" />
+    </calibration>
+  </lens>
+  <lens>
+    <maker>Nikon</maker>
+    <model>Nikon AF Nikkor 50mm f/1.4D</model>
+    <model lang="en">Nikkor AF 50mm f/1.4D</model>
+    <mount>Nikon F AF</mount>
+    <cropfactor>1</cropfactor>
+    <calibration>
+      <distortion model="poly3" focal="50" k1="-0.004672" />
+      <!-- Taken with Nikon D800 -->
+      <!-- Taken with Nikon D610 -->
+    </calibration>
+  </lens>
+</lensdatabase>
