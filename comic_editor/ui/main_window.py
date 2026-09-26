@@ -18,7 +18,7 @@ from PySide6.QtCore import (
     Signal,
 )
 from PySide6.QtGui import (
-    QAction, QCloseEvent, QCursor, QImage, QImageReader, QKeySequence,
+    QAction, QCloseEvent, QColor, QCursor, QImage, QImageReader, QKeySequence,
     QMouseEvent, QShortcut, QTransform,
 )
 from PySide6.QtWidgets import (
@@ -424,6 +424,7 @@ class MainWindow(QMainWindow):
         labels = [
             (ToolKind.OBJECT_SELECT, "Object Select", "cursor-pointer"),
             (ToolKind.RASTER_PENCIL, "Pencil", "design-pencil"),
+            (ToolKind.BRUSH, "Brush", "design-pencil"),
             (ToolKind.RASTER_ERASER, "Eraser", "erase"),
         ]
         fill_tool = getattr(ToolKind, "FILL", None)
@@ -1330,6 +1331,7 @@ class MainWindow(QMainWindow):
     def _install_shortcuts(self) -> None:
         self._tool_hotkey_actions = {
             "raster_pencil": ToolKind.RASTER_PENCIL,
+            "brush": ToolKind.BRUSH,
             "raster_eraser": ToolKind.RASTER_ERASER,
             "object_select": ToolKind.OBJECT_SELECT,
             "transform": ToolKind.TRANSFORM,
@@ -1497,7 +1499,7 @@ class MainWindow(QMainWindow):
                 activated and not tap
                 and self.settings.hotkey_hold.get(action_id, False)
             ):
-                if action_id == "raster_eraser" and previous != ToolKind.RASTER_PENCIL:
+                if action_id == "raster_eraser" and previous not in {ToolKind.RASTER_PENCIL, ToolKind.BRUSH}:
                     return
                 self._hotkey_active_hold = {
                     "action": action_id,
@@ -2060,6 +2062,10 @@ class MainWindow(QMainWindow):
         return True
 
     def eventFilter(self, watched, event) -> bool:  # noqa: N802
+        if event.type() == QEvent.ApplicationDeactivate or (
+            event.type() == QEvent.WindowDeactivate and watched is self
+        ):
+            self.canvas._interrupt_paint_brush()
         if (event.type() == QEvent.ApplicationDeactivate
                 or (event.type() == QEvent.KeyPress and event.key() == Qt.Key_Escape)):
             self._solo_star_press = None
@@ -3238,6 +3244,7 @@ class MainWindow(QMainWindow):
     def _clear_canvas(self) -> None:
         if self.chapter is None or self.canvas.chapter is None:
             return
+        self.canvas._finish_paint_brush()
         if self.canvas.clear_selected_drawing_content():
             return
         entities = list(self.canvas.selected_entities) if len(self.canvas.selected_entities) > 1 else ([(self.canvas.selected_kind, self.canvas.selected_id)] if self.canvas.selected_id else [])
@@ -3385,7 +3392,7 @@ class MainWindow(QMainWindow):
                 self.gradient_tools_controls.field_type.currentData()
                 or "line"
             ))
-        if tool in {ToolKind.RASTER_PENCIL, ToolKind.RASTER_ERASER}:
+        if tool in {ToolKind.RASTER_PENCIL, ToolKind.RASTER_ERASER, ToolKind.BRUSH}:
             if (
                 self.chapter and self.canvas.selected_kind == "layer"
                 and not vector_selected
@@ -3396,7 +3403,8 @@ class MainWindow(QMainWindow):
                     self.canvas.set_selection("object", raster_id)
             if not self.canvas.set_tool(tool):
                 self.statusBar().showMessage(
-                    "Select a Raster or Vector Drawing, or create one first",
+                    "Select a Raster, or create one first" if tool == ToolKind.BRUSH
+                    else "Select a Raster or Vector Drawing, or create one first",
                     4000,
                 )
                 self._sync_tool_buttons()
@@ -3558,6 +3566,8 @@ class MainWindow(QMainWindow):
         self.tool_buttons[ToolKind.RASTER_PENCIL].setEnabled(
             raster_selected or vector_selected
         )
+        self.tool_buttons[ToolKind.BRUSH].setEnabled(raster_selected)
+        self.tool_buttons[ToolKind.BRUSH].setVisible(raster_selected)
         self.tool_buttons[ToolKind.RASTER_ERASER].setEnabled(
             raster_selected or vector_selected
         )
@@ -5409,7 +5419,7 @@ class MainWindow(QMainWindow):
             self._select_ribbon_page("tool_settings")
         if (
             self.canvas.tool in {
-                ToolKind.RASTER_PENCIL, ToolKind.RASTER_ERASER,
+                ToolKind.RASTER_PENCIL, ToolKind.RASTER_ERASER, ToolKind.BRUSH,
             }
             and isinstance(selected_object, (RasterObject, VectorDrawingObject))
         ):
@@ -5429,7 +5439,7 @@ class MainWindow(QMainWindow):
         self._sync_tool_buttons()
         if tool in {
             ToolKind.RASTER_PENCIL, ToolKind.RASTER_ERASER, ToolKind.TEXT_EDIT,
-            ToolKind.FILL, ToolKind.GRADIENT,
+            ToolKind.FILL, ToolKind.GRADIENT, ToolKind.BRUSH,
         }:
             # _sync_tool_buttons() refreshes contextual pages first.  Select
             # Tool Settings afterward so entering a raster/vector context
@@ -5792,6 +5802,18 @@ class MainWindow(QMainWindow):
         else:
             self.canvas.refresh_brush_settings()
             self.canvas.update()
+        self._refresh_paint_brush_preview_colors()
+
+    def _refresh_paint_brush_preview_colors(self) -> None:
+        controls = getattr(self, "tool_settings_controls", None)
+        page = getattr(controls, "brush_page", None)
+        if page is None:
+            return
+        primary = self.color_panel.primary_color()
+        secondary = self.color_panel.secondary_color()
+        if self.color_panel.active_slot() == "secondary":
+            primary = secondary
+        page.set_preview_colors(QColor(primary), QColor(secondary))
 
     def _series_color_changed(self, slot: str, color: str) -> None:
         color = canonical_argb(color)
@@ -5814,6 +5836,7 @@ class MainWindow(QMainWindow):
 
     def _active_color_slot_changed(self, slot: str) -> None:
         self.canvas.set_active_color_slot(slot)
+        self._refresh_paint_brush_preview_colors()
         self.palette_editor.set_new_swatch_color(
             self.color_panel.active_color()
         )
@@ -6028,6 +6051,7 @@ class MainWindow(QMainWindow):
         self._refresh_actions()
 
     def save(self) -> bool:
+        self.canvas._finish_paint_brush()
         if self.canvas.page_gap_mode_active():
             self.statusBar().showMessage(
                 "Confirm or cancel the page gap before saving", 4000
@@ -6276,6 +6300,9 @@ class MainWindow(QMainWindow):
                 deferred.append(30-(now-last))
                 continue
             chapter = session.chapter if session is not None else self.chapter
+            if self.canvas._paint_brush_stroke is not None and chapter is self.canvas.chapter:
+                deferred.append(.25)
+                continue
             tiles = session.tiles if session is not None else self.canvas.tiles
             images = session.images if session is not None else self.canvas.images
             asset = session.asset_manifest if session is not None and session.kind == "asset" else None
@@ -6448,6 +6475,7 @@ class MainWindow(QMainWindow):
 
     def _undo(self) -> None:
         """Undo on the command stack owned by the currently active canvas."""
+        self.canvas._finish_paint_brush()
         if self.canvas._cage_session is not None or self.canvas._cage_edit_before is not None:
             self.canvas.finish_cage(False)
             return
@@ -6455,6 +6483,7 @@ class MainWindow(QMainWindow):
 
     def _redo(self) -> None:
         """Redo on the command stack owned by the currently active canvas."""
+        self.canvas._finish_paint_brush()
         if self.canvas._cage_session is not None or self.canvas._cage_edit_before is not None:
             self.canvas.finish_cage(False)
         self.canvas.command_stack.redo()
@@ -6541,9 +6570,11 @@ class MainWindow(QMainWindow):
             )
 
     def _save_if_dirty(self) -> bool:
+        self.canvas._finish_paint_brush()
         return not self._dirty or self.save()
 
     def _confirm_discard_or_save(self) -> bool:
+        self.canvas._finish_paint_brush()
         if not self._dirty:
             return True
         answer = QMessageBox.question(
@@ -6601,6 +6632,7 @@ class MainWindow(QMainWindow):
 
     def _write_export_image(self, destination: Path, image_format: str | None = None) -> bool:
         try:
+            self.canvas._finish_paint_brush()
             image_format = image_format or EXPORT_FORMATS.get(destination.suffix.lower())
             if image_format is None:
                 raise ValueError(f"Unsupported export format: {destination.suffix}")

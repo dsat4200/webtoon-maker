@@ -3,17 +3,24 @@ from __future__ import annotations
 
 import json
 import dataclasses
+import math
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 from PySide6.QtCore import QStandardPaths
 from PySide6.QtGui import QColor
 from comic_editor.core.pressure import BrushPreset, default_pencil_presets
+from comic_editor.core.brushes import BrushDefinition, default_brushes
+
+
+def default_paint_brush_presets() -> list[dict]:
+    return [brush.to_dict() for brush in default_brushes()]
 
 
 def default_hotkeys() -> dict[str, str]:
     return {
         "raster_pencil": "P",
+        "brush": "Shift+B",
         "raster_eraser": "E",
         "fill": "F",
         "gradient": "G",
@@ -50,6 +57,7 @@ def default_hotkeys() -> dict[str, str]:
 def default_hotkey_hold() -> dict[str, bool]:
     return {
         "raster_pencil": False,
+        "brush": False,
         "raster_eraser": False,
         "fill": False,
         "gradient": False,
@@ -177,7 +185,7 @@ def default_fill_profiles() -> dict[str, dict[str, object]]:
 @dataclass
 class EditorSettings:
     export_destinations: dict[str, str] = field(default_factory=dict)
-    settings_version: int = 22
+    settings_version: int = 23
     tablet_mode: bool = False
     brush_size: int = 12
     eraser_size: int = 28
@@ -204,6 +212,10 @@ class EditorSettings:
     preview_font_names: bool = False
     pencil_presets: list[dict] = field(default_factory=default_pencil_presets)
     active_pencil_preset: str = "Linear"
+    brush_presets: list[dict] = field(default_factory=default_paint_brush_presets)
+    active_brush_id: str = ""
+    brush_size_px: float = 24.0
+    brush_opacity: float = 1.0
     pencil_size_px: dict[str, int] = field(default_factory=lambda: {
         "small": 4, "medium": 12, "large": 22,
     })
@@ -259,7 +271,28 @@ class EditorSettings:
         self.clamp()
 
     def clamp(self) -> None:
-        self.settings_version = 22
+        self.settings_version = 23
+        normalized_brushes: list[dict] = []
+        brush_ids: set[str] = set()
+        for item in self.brush_presets if isinstance(self.brush_presets, list) else []:
+            try:
+                brush = BrushDefinition.from_dict(item)
+            except (TypeError, ValueError, KeyError, AttributeError):
+                continue
+            if brush.id not in brush_ids:
+                normalized_brushes.append(brush.to_dict())
+                brush_ids.add(brush.id)
+        self.brush_presets = normalized_brushes or default_paint_brush_presets()
+        if self.active_brush_id not in {item["id"] for item in self.brush_presets}:
+            self.active_brush_id = self.brush_presets[0]["id"]
+        self.brush_size_px = float(self.brush_size_px)
+        if not math.isfinite(self.brush_size_px):
+            self.brush_size_px = 24.0
+        self.brush_size_px = max(0.1, min(4096.0, self.brush_size_px))
+        self.brush_opacity = float(self.brush_opacity)
+        if not math.isfinite(self.brush_opacity):
+            self.brush_opacity = 1.0
+        self.brush_opacity = max(0.0, min(1.0, self.brush_opacity))
         self.export_destinations = {
             str(key): str(value) for key, value in self.export_destinations.items()
             if isinstance(key, str) and isinstance(value, str) and value
@@ -576,6 +609,15 @@ class EditorSettings:
             self.pencil_presets[0],
         ))
 
+    def active_paint_brush(self) -> BrushDefinition:
+        """Snapshot the separate raster Brush preset and current size/opacity."""
+        data = next(
+            (item for item in self.brush_presets if item.get("id") == self.active_brush_id),
+            self.brush_presets[0],
+        )
+        brush = BrushDefinition.from_dict(data)
+        return dataclasses.replace(brush.with_size(self.brush_size_px), opacity=self.brush_opacity)
+
     def active_eraser_pixels(self) -> int:
         return self.eraser_size_px[self.active_eraser_size]
 
@@ -595,6 +637,10 @@ def load_settings() -> EditorSettings:
             raw = json.loads(path.read_text(encoding="utf-8"))
             if not isinstance(raw, dict):
                 raise TypeError("Settings must be an object")
+            from .brush_storage import decode_brush_assets
+            asset_cache = {}
+            if "brush_presets" in raw:
+                raw["brush_presets"], asset_cache = decode_brush_assets(raw["brush_presets"], path)
             if int(raw.get("settings_version", 1)) < 2:
                 raw.setdefault("page_scope_select", True)
                 raw.setdefault("transform_mode", "free")
@@ -731,12 +777,14 @@ def load_settings() -> EditorSettings:
                 for preset in stored_presets:
                     if isinstance(preset, dict):
                         preset.pop("transform_snap", None)
-            raw["settings_version"] = 22
+            raw["settings_version"] = 23
             valid = {item.name for item in dataclasses.fields(EditorSettings)}
             result = EditorSettings(**{
                 key: value for key, value in raw.items() if key in valid
             })
             result.clamp()
+            result._brush_asset_cache = asset_cache
+            result._brush_asset_path = path.resolve()
             return result
         except (OSError, TypeError, ValueError, json.JSONDecodeError):
             pass
@@ -746,7 +794,21 @@ def load_settings() -> EditorSettings:
 def save_settings(settings: EditorSettings) -> None:
     settings.clamp()
     path = settings_path()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_suffix(".tmp")
-    temporary.write_text(json.dumps(asdict(settings), indent=2), encoding="utf-8")
-    temporary.replace(path)
+    from .brush_storage import atomic_write, encode_brush_assets, preserve_inline_backup
+    cache = (getattr(settings, "_brush_asset_cache", {})
+             if getattr(settings, "_brush_asset_path", None) == path.resolve() else {})
+    presets, cache = encode_brush_assets(settings.brush_presets, path, cache)
+    # Do not expand the entire embedded library through asdict/json.dumps.
+    # Strings remain in the portable in-memory model; disk uses image refs.
+    raw = {"brush_asset_storage": 1}
+    raw.update({item.name: getattr(settings, item.name) for item in dataclasses.fields(settings)
+                if item.name != "brush_presets"})
+    raw["brush_presets"] = presets
+    if cache:
+        preserve_inline_backup(path)
+    def write(stream):
+        for chunk in json.JSONEncoder(indent=2).iterencode(raw):
+            stream.write(chunk.encode("utf-8"))
+    atomic_write(path, write)
+    settings._brush_asset_cache = cache
+    settings._brush_asset_path = path.resolve()

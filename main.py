@@ -10,6 +10,7 @@ from PySide6.QtGui import QSurfaceFormat
 from PySide6.QtWidgets import QApplication, QMessageBox
 
 from comic_editor.launch import FileLaunchBroker
+from comic_editor.core.brush_storage import BrushAssetError
 
 
 def main() -> int:
@@ -66,7 +67,12 @@ def main() -> int:
 
     broker.files_requested.connect(open_files)
     from comic_editor.ui.main_window import MainWindow
-    window = MainWindow()
+    try:
+        window = MainWindow()
+    except BrushAssetError as error:
+        broker.close()
+        QMessageBox.critical(None, "Brush images unavailable", str(error))
+        return 1
     window.show()
     QTimer.singleShot(0, lambda: open_files([]))
     return app.exec()

@@ -34,6 +34,7 @@ from comic_editor.core.settings import (
     FILL_BLEND_MODES, FILL_SUBTOOLS, TextPreset,
 )
 from comic_editor.ui.mask_controls import MaskAlphaSlider
+from comic_editor.ui.brush_controls import BrushControls
 
 
 def _tool_value(tool: object) -> str:
@@ -221,6 +222,9 @@ class ToolSettingsControls(QWidget):
         self.stack.addWidget(self.empty_page)
         self.pencil_page = self._build_pencil_page()
         self.stack.addWidget(self.pencil_page)
+        self.brush_page = BrushControls(settings, self)
+        self.brush_page.settingsChanged.connect(self.settingsChanged.emit)
+        self.stack.addWidget(self.brush_page)
         self.mask_pencil_page = self._build_mask_pencil_page()
         self.stack.addWidget(self.mask_pencil_page)
         self.mask_select_page = QLabel(
@@ -660,6 +664,9 @@ class ToolSettingsControls(QWidget):
         elif value == "mask_wand" and mask_active:
             self.context_label.setText("Magic Wand")
             self.stack.setCurrentWidget(self.mask_wand_page)
+        elif value == "brush":
+            self.context_label.setText("Brush")
+            self.stack.setCurrentWidget(self.brush_page)
         elif value == "raster_pencil":
             if mask_active:
                 self.context_label.setText("Mask Pencil")
@@ -694,7 +701,7 @@ class ToolSettingsControls(QWidget):
         self.close_shape_button.setEnabled(value == "shape_edit" and can_close_shape)
         # Inactive pages have wide controls; compact pages use the sidebar width.
         self.stack.setSizePolicy(
-            QSizePolicy.Ignored if value == "shape_edit" or (value == "mask_wand" and mask_active)
+            QSizePolicy.Ignored if value in {"shape_edit", "brush"} or (value == "mask_wand" and mask_active)
             else QSizePolicy.Preferred,
             QSizePolicy.Preferred,
         )
@@ -708,6 +715,7 @@ class ToolSettingsControls(QWidget):
 
     def refresh(self) -> None:
         self._loading = True
+        self.brush_page.refresh()
         self.pencil_preset.clear()
         self.pencil_preset.addItems(
             [item["name"] for item in self.settings.pencil_presets]

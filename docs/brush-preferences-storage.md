@@ -1,0 +1,15 @@
+# Brush preferences and image storage
+
+Application preferences store large brush PNGs in a sibling `brush-assets` folder. Each image is named by its SHA-256 digest and shared by every matching tip or texture, including secondary brushes. The JSON file stores relative content references instead of repeatedly embedding the same image. Ordinary size, opacity and color changes update the compact preferences file without decoding or rewriting unchanged images.
+
+Copy **the preferences JSON and its sibling `brush-assets` folder together** when moving or backing up preferences. The folder name stays the same even if the JSON file is renamed. `BrushDefinition.to_dict()` and the in-memory preset library remain self-contained with embedded PNG strings; the storage representation does not change portable brush definitions or source provenance.
+
+Older preferences containing embedded PNGs remain readable. On the first save that externalizes their images, the writer preserves an exact `<preferences-filename>.inline-backup` before replacing the original JSON. It publishes and flushes every required image first, then flushes a unique sibling temporary preferences file and atomically replaces the destination. A failed image or preferences write leaves the previous preferences intact. Existing backups are not overwritten, and old image files are never automatically deleted.
+
+Referenced images are checked against their digest on load. Missing, corrupt or invalid references raise an explicit error rather than loading default brushes and risking an overwrite. Restore the matching image folder or use the retained inline backup to recover. During an open session, changed image-file size/timestamps trigger validation; if the full original image is still in memory, saving repairs a missing or damaged managed image.
+
+The measured 34-brush inline preferences contained 142,137,918 bytes. Images accounted for 140,119,228 base64 characters across 134 references, but only 121 unique images totaling 74,007,076 characters. Three isolated ordinary saves took 463–489 ms; one breakdown measured 227 ms JSON serialization and 160 ms UTF-8 writing. Source files and user artwork were not changed by the measurements. A full-format comparison was deferred when host commit headroom became too small to load the legacy file safely; fresh libraries can be written directly in the compact format.
+
+The fresh compact library subsequently measured **1,988,194 bytes**. Loading and validating all 34 brushes took 277 ms; three isolated ordinary saves took **105–109 ms**, with image files reused. This includes validation and durable settings publication, not only JSON serialization. The profile wrote a separate benchmark preferences file and left the original preferences and project untouched (`.artifacts/brush-engine/compact-storage-profile.json`).
+
+Regression coverage verifies image deduplication, exact pixel and metadata round trips, copying the preferences folder, legacy backups, failed writes, changed and missing assets, invalid paths, and ordinary edits that never re-decode unchanged images.

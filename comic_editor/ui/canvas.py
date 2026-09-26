@@ -111,11 +111,13 @@ from comic_editor.ui.document_projection_features import DocumentProjectionFeatu
 from comic_editor.ui.scene_culling import SceneRenderBounds
 from comic_editor.ui.network import create_network_manager
 from comic_editor.ui.multi_raster_selection import MultiRasterSelectionFeatures
+from comic_editor.ui.brush_features import BrushFeatures
 
 
 class ToolKind(Enum):
     OBJECT_SELECT = "object_select"
     RASTER_PENCIL = "raster_pencil"
+    BRUSH = "brush"
     RASTER_ERASER = "raster_eraser"
     EYEDROPPER = "eyedropper"
     FILL = "fill"
@@ -598,7 +600,7 @@ class CanvasPerformanceMonitor:
         }
 
 
-class _CanvasLogic(DocumentProjectionFeatures, MultiRasterSelectionFeatures, ShowOnTopFeatures, SoloFeatures, ViewFeatures, MaskSelectionFeatures, MaskGradientFeatures, TilingFeatures, CageFeatures, ArrayFeatures, SpatialModifierFeatures, DistortFeatures, CurvesFeatures, TextFeatures):
+class _CanvasLogic(BrushFeatures, DocumentProjectionFeatures, MultiRasterSelectionFeatures, ShowOnTopFeatures, SoloFeatures, ViewFeatures, MaskSelectionFeatures, MaskGradientFeatures, TilingFeatures, CageFeatures, ArrayFeatures, SpatialModifierFeatures, DistortFeatures, CurvesFeatures, TextFeatures):
     documentChanged = Signal(object)
     viewSettingsChanged = Signal()
     visualChanged = Signal(object)
@@ -714,6 +716,7 @@ class _CanvasLogic(DocumentProjectionFeatures, MultiRasterSelectionFeatures, Sho
         self._stroke_base_size = float(settings.pencil_size())
         self._stroke_dirty_world = QRectF()
         self._gc_was_enabled = False
+        self._init_brush_features()
         self._pending_raster_transform_press: tuple[
             QPointF, QPointF
         ] | None = None
@@ -1545,6 +1548,7 @@ class _CanvasLogic(DocumentProjectionFeatures, MultiRasterSelectionFeatures, Sho
 
     def _clear_detached_input_state(self) -> None:
         """Reset transient pointer state that cannot survive without a document."""
+        self._cancel_paint_brush()
         self._projection_completed_view = None
         self._mesh_warp_parameter_drag_id = None
         self._smudge_parameter_drag_id = None
@@ -1702,6 +1706,7 @@ class _CanvasLogic(DocumentProjectionFeatures, MultiRasterSelectionFeatures, Sho
         """Detach the committed document state without discarding warm caches."""
         if self.chapter is None:
             return None
+        self._finish_paint_brush()
         self.set_export_rect_editing(False)
         if self._cage_session is not None:
             self.finish_cage(False)
@@ -1922,6 +1927,7 @@ class _CanvasLogic(DocumentProjectionFeatures, MultiRasterSelectionFeatures, Sho
 
     def _restore_history_state(self, state: dict, *, objects_only: bool = False) -> None:
         """Restore history, optionally retaining an unchanged document graph."""
+        self._cancel_paint_brush()
         self._reset_export_rect_editor()
         self._cancel_mask_selection()
         self._mask_gradient_drag = None
@@ -2463,6 +2469,8 @@ class _CanvasLogic(DocumentProjectionFeatures, MultiRasterSelectionFeatures, Sho
         if self.chapter is None:
             return
         if (kind, entity_id) != (self.selected_kind, self.selected_id):
+            self._finish_paint_brush()
+        if (kind, entity_id) != (self.selected_kind, self.selected_id):
             if self._cage_session is not None:
                 self.finish_cage(False)
             elif self._cage_edit_before is not None:
@@ -2513,7 +2521,10 @@ class _CanvasLogic(DocumentProjectionFeatures, MultiRasterSelectionFeatures, Sho
             self.active_layer_id = obj.parent_layer_id
             self.active_page_id = self.chapter.page_for_layer(obj.parent_layer_id).layer_id
             if activate_default_tool and isinstance(obj, RasterObject):
-                self.tool = ToolKind.RASTER_PENCIL
+                self.tool = (
+                    ToolKind.BRUSH if previous_tool == ToolKind.BRUSH
+                    else ToolKind.RASTER_PENCIL
+                )
                 self.chapter.layers[obj.parent_layer_id].last_raster_id = obj.object_id
             elif activate_default_tool and isinstance(
                 obj, VectorDrawingObject
@@ -2583,6 +2594,7 @@ class _CanvasLogic(DocumentProjectionFeatures, MultiRasterSelectionFeatures, Sho
             else:
                 return False
         ordered = filtered
+        self._finish_paint_brush()
         if set(ordered) != set(self.selected_entities):
             self.active_modifier_id = ""
         primary = primary if primary in ordered else ordered[-1]
@@ -2645,6 +2657,7 @@ class _CanvasLogic(DocumentProjectionFeatures, MultiRasterSelectionFeatures, Sho
         """Clear the current entity and notify every selection consumer."""
         if self.chapter is None:
             return
+        self._finish_paint_brush()
         if self._cage_session is not None:
             self.finish_cage(False)
         elif self._cage_edit_before is not None:
@@ -2738,6 +2751,14 @@ class _CanvasLogic(DocumentProjectionFeatures, MultiRasterSelectionFeatures, Sho
         ), already_done=True)
 
     def set_tool(self, tool: ToolKind) -> bool:
+        if tool == ToolKind.BRUSH and (
+            self.chapter is None or self.active_tone_mask_id
+            or len(self.selected_entities) > 1
+            or not isinstance(self.chapter.objects.get(self.selected_object_id), RasterObject)
+        ):
+            return False
+        if tool != self.tool:
+            self._finish_paint_brush()
         if tool in {ToolKind.MASK_SELECT, ToolKind.MASK_WAND} and not self.active_tone_mask_id:
             return False
         if tool != self.tool:
@@ -9487,27 +9508,35 @@ class _CanvasLogic(DocumentProjectionFeatures, MultiRasterSelectionFeatures, Sho
         painter.restore()
 
     def _draw_tablet_hover(self, painter: QPainter) -> None:
+        center = self._tablet_hover_widget
+        if self.tool == ToolKind.BRUSH and center is None:
+            center = self._pointer_hover_widget
         if (
-            self._tablet_hover_widget is None
+            center is None
             or self._tablet_tool_active
             or self._nav_mode is not None
             or self.tool not in {
-                ToolKind.RASTER_PENCIL, ToolKind.RASTER_ERASER
+                ToolKind.RASTER_PENCIL, ToolKind.RASTER_ERASER, ToolKind.BRUSH
             }
         ):
             return
         size = (
             self.settings.active_eraser_pixels()
             if self.tool == ToolKind.RASTER_ERASER
+            else self.settings.brush_size_px if self.tool == ToolKind.BRUSH
             else self.settings.pencil_size()
         )
         radius = max(2.0, size * self.scale / 2)
-        center = self._tablet_hover_widget
         painter.save()
         painter.setTransform(QTransform())
         painter.setBrush(Qt.BrushStyle.NoBrush)
         painter.setPen(QPen(QColor("#E8F5FF"), 1.25))
-        painter.drawEllipse(center, radius, radius)
+        if self.tool == ToolKind.BRUSH:
+            path = self._paint_brush_cursor_path(center)
+            painter.drawPath(path)
+            radius = max(2.0, min(path.boundingRect().width(), path.boundingRect().height()) / 2)
+        else:
+            painter.drawEllipse(center, radius, radius)
         cross = min(6.0, max(3.0, radius * 0.35))
         painter.drawLine(
             QPointF(center.x() - cross, center.y()),
@@ -13684,6 +13713,7 @@ class _CanvasLogic(DocumentProjectionFeatures, MultiRasterSelectionFeatures, Sho
         if self._is_touch_mouse(event) or self._tablet_tool_active:
             event.accept()
             return
+        self._capture_paint_brush_packet(event)
         if event.button() != Qt.LeftButton:
             return
         nav = self._navigation_mode()
@@ -13710,6 +13740,7 @@ class _CanvasLogic(DocumentProjectionFeatures, MultiRasterSelectionFeatures, Sho
         if self._is_touch_mouse(event) or self._tablet_tool_active:
             event.accept()
             return
+        self._capture_paint_brush_packet(event)
         if self._nav_mode:
             self._queue_navigation_update(event.position())
             return
@@ -13739,6 +13770,7 @@ class _CanvasLogic(DocumentProjectionFeatures, MultiRasterSelectionFeatures, Sho
         if self._is_touch_mouse(event) or self._tablet_tool_active:
             event.accept()
             return
+        self._capture_paint_brush_packet(event)
         if self._nav_mode:
             self._end_navigation(event.position())
             return
@@ -13751,6 +13783,8 @@ class _CanvasLogic(DocumentProjectionFeatures, MultiRasterSelectionFeatures, Sho
             self._move_distort_handle(event.position())
             self._queue_radial_handle(event.position())
             world = self.widget_to_document(event.position())
+            if self._paint_brush_stroke is not None:
+                self._continue_paint_brush(world, 1.0)
             self._move_mask_selection(world)
             self._queue_free_text_drag(world)
             self._text_placement_move(world)
@@ -13869,6 +13903,11 @@ class _CanvasLogic(DocumentProjectionFeatures, MultiRasterSelectionFeatures, Sho
             event.accept()
             return
         if event.key() == Qt.Key_Escape and self._cancel_smudge_gesture():
+            event.accept()
+            return
+        if event.key() == Qt.Key_Escape and self._paint_brush_stroke is not None:
+            self._cancel_paint_brush()
+            self.interactionFinished.emit()
             event.accept()
             return
         if event.key() == Qt.Key_Delete and self._active_smudge_modifier() is not None:
@@ -14079,6 +14118,7 @@ class _CanvasLogic(DocumentProjectionFeatures, MultiRasterSelectionFeatures, Sho
         event.accept()
 
     def tabletEvent(self, event) -> None:  # noqa: N802
+        self._capture_paint_brush_packet(event, tablet=True)
         device = event.pointingDevice()
         if device is not None:
             self._device_supports_pressure = bool(
@@ -14211,6 +14251,8 @@ class _CanvasLogic(DocumentProjectionFeatures, MultiRasterSelectionFeatures, Sho
                 self._queue_radial_handle(event.position())
                 world = self.widget_to_document(event.position())
                 self._move_mask_selection(world)
+                if self._paint_brush_stroke is not None:
+                    self._continue_paint_brush(world, self._paint_brush_sample.pressure)
                 self._queue_free_text_drag(world)
                 self._text_placement_move(world)
                 self._finish_shape_pointer(world)
@@ -14225,6 +14267,8 @@ class _CanvasLogic(DocumentProjectionFeatures, MultiRasterSelectionFeatures, Sho
         event.accept()
 
     def event(self, event) -> bool:
+        if event.type() in {QEvent.UngrabMouse, QEvent.WindowDeactivate}:
+            self._interrupt_paint_brush()
         if event.type() == QEvent.Type.Leave:
             self._tablet_hover_widget = None
             self.update()
@@ -20200,6 +20244,9 @@ class _CanvasLogic(DocumentProjectionFeatures, MultiRasterSelectionFeatures, Sho
         point = self.widget_to_document(widget_point)
         self._press_widget_point = QPointF(widget_point)
         self._press_document_point = QPointF(point)
+        if self.tool == ToolKind.BRUSH:
+            self._begin_paint_brush(point, pressure)
+            return
         if self.active_tone_mask_id and self.tool == ToolKind.MASK_WAND:
             self._mask_wand_press(point, modifiers)
             return
@@ -20679,6 +20726,9 @@ class _CanvasLogic(DocumentProjectionFeatures, MultiRasterSelectionFeatures, Sho
             self._clear_detached_input_state()
             return
         point = self.widget_to_document(widget_point)
+        if self._paint_brush_stroke is not None:
+            self._continue_paint_brush(point, pressure)
+            return
         if self.active_tone_mask_id and self.tool == ToolKind.MASK_WAND:
             return
         if self.active_tone_mask_id and self.tool == ToolKind.MASK_SELECT:
@@ -20972,6 +21022,9 @@ class _CanvasLogic(DocumentProjectionFeatures, MultiRasterSelectionFeatures, Sho
             self._update_shape_hover(point)
 
     def _tool_release(self) -> None:
+        if self._paint_brush_stroke is not None:
+            self._finish_paint_brush()
+            return
         if self.active_tone_mask_id and self.tool == ToolKind.MASK_WAND:
             return
         if self._finish_mask_selection():
@@ -23863,6 +23916,8 @@ class _CanvasLogic(DocumentProjectionFeatures, MultiRasterSelectionFeatures, Sho
         self, obj: DocumentObject | None,
     ) -> bool:
         if not self._is_transformable_object(obj):
+            return False
+        if self.tool == ToolKind.BRUSH:
             return False
         if isinstance(obj, ImageObject) and obj.placement_mode == "fit_parent":
             return False

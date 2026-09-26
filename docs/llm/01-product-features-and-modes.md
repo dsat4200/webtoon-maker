@@ -243,6 +243,7 @@ The Fill tool now targets shapes and raster content; owned vector fills no longe
 | Tool value | UI/context | Behavior and availability |
 | --- | --- | --- |
 | `object_select` | Object Select, default; S | Selects shape borders or objects. Ctrl-click requests an overlap menu. Selection can automatically route to Shape Edit, Text Edit, Pencil, Fill, or gradient Shape Edit according to entity type. |
+| `brush` | Brush; Shift+B | Raster-only material/dynamics brush with SUT import, editable library, and live renderer-backed stroke previews. Vector and tone-mask targets are unavailable. |
 | `raster_pencil` | Pencil; P | Draws sparse bitmap dabs on Raster objects, fitted cubic strokes on Vector Drawings, or mask paint while a tone mask is active. Requires an eligible object or mask. |
 | `raster_eraser` | Eraser; E | Clears sparse raster pixels, performs the chosen vector eraser mode, or erases tone-mask paint. |
 | `eyedropper` | Color-panel footer button; I (Hold) | Samples the composited chapter color under the cursor, live-previews it into the active color well, and commits to color history on release. |
@@ -306,6 +307,7 @@ These are not separate `ToolKind` values but materially change behavior.
 
 ## Default keyboard controls
 
+- Shift+B: Brush (raster only)
 - P: Pencil
 - E: Eraser
 - F: Fill

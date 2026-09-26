@@ -1,0 +1,19 @@
+# Continuous paint scheduling
+
+CSP describes continuous spraying as accumulating paint while the pen is held still and making a slower moving stroke darker. It also disables the setting while Post correction is active. Those behaviors are explicit in the [official Stroke settings](https://help.clip-studio.com/en-us/manual_en/810_subtools/S.htm). The public documentation does not specify its sampling cadence or the mathematical relationship between time and distance contributions.
+
+The earlier Webtoon Maker scheduler handled elapsed time only for stationary packets and reset its next clock event on every movement. Consequently, the same moving path emitted the same number of tips at every speed. `BrushStroke` now combines two persistent schedules:
+
+- Distance events retain the existing spacing, pressure response, taper and independent random-gap stream.
+- Time events are anchored to the pen-down timestamp and the preset's `continuous_rate`. They add paint on moving and stationary segments. Each uses interpolated position, pressure, tilt and rotation; velocity comes from that input segment.
+- Events are emitted in time order. A time event coincident with a distance event contributes its own dab, after the distance dab. The initial dab is emitted once. Coalescing later coincidences would cause sharp density drops at speeds where the two event grids align.
+
+Time events do not reset the distance phase or consume random-gap choices. Tip ordering, spray particles, color variation and other per-dab randomness follow the merged event order. Each brush in a dual brush retains its own clock, distance phase and random seed. The canvas timer runs when either effective scheduler needs continuous input, and all existing stroke termination paths stop it.
+
+Equivalent subdivisions of a piecewise linear position/time/sensor path produce equivalent dabs, apart from floating-point roundoff, when stabilization is off and each input interval is at most one second. The existing live stabilization filter itself depends on input packets; this change does not claim to correct that separate limitation. A pause or lost-input interval longer than one second catches up only the latest second of timed paint, with at most 241 time events at the maximum supported 240 Hz. Its clock phase is retained. Distance events are still preserved. Backward timestamps cannot replay old clock events. This guard intentionally differs from replaying a long pause as many timely packets.
+
+Post correction takes precedence for the complete main/secondary stroke. Its effective schedulers disable continuous paint both during drawing and after the final corrected-path replay. The UI explains that conflict and preserves both saved values. Percentage or length taper by itself does not disable continuous paint. A secondary brush's stored Post correction value remains dormant because the primary controls final path correction.
+
+`BrushContinuousPlot` still imports as the continuous flag. There is no verified SUT cadence mapping; the existing 60-dab/second default and additive time/distance flow model remain approximations requiring controlled native CSP comparisons. Ribbons preserve their continuous setting, but timed ribbon accumulation is currently dormant and explicitly identified in the UI as unsupported. The official Stroke page does not forbid that combination, so it remains an implementation gap, not a user-approved exclusion.
+
+Regression coverage includes slower moving raster buildup, movement/pause transitions, interpolated sensor values, input-subdivision invariance with random spacing and spray, nonzero device-clock origins after extended uptime, coincident-event aliasing, bounded long pauses, the secondary-only canvas timer, exact undo/redo, post-correction replay, and preview/reference pixel equality. Three complete pre-change dab-stream hashes protect ordinary pen, spray and ribbon behavior with continuous paint disabled.

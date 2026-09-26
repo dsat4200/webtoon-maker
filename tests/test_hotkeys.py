@@ -133,6 +133,7 @@ def test_hotkey_dialog_has_hold_only_for_tools_and_rejects_duplicates(qapp):
     settings = EditorSettings()
     dialog = HotkeysDialog(settings.hotkeys, settings.hotkey_hold)
     assert set(dialog.hold_checks) == set(default_hotkey_hold())
+    assert dialog.editors["brush"].chord() == "Shift+B"
     assert "save" not in dialog.hold_checks
     assert settings.hotkeys["swap_colors"] == ""
     assert dialog.editors["swap_colors"].chord() == ""
