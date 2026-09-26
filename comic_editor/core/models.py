@@ -10,7 +10,7 @@ from comic_editor.core.cage import CageGrid
 
 
 SCHEMA_VERSION = 25
-SERIES_SCHEMA_VERSION = 17
+SERIES_SCHEMA_VERSION = 18
 CHAPTER_WIDTH = 1080
 DEFAULT_CHAPTER_HEIGHT = 3240
 GROWTH_MARGIN = 1080
@@ -5026,6 +5026,7 @@ class SeriesDocument:
         default_factory=lambda: [default_gradient_ramp_preset()]
     )
     modifier_presets: list[ModifierPreset] = field(default_factory=list)
+    smudge_tool_presets: list[dict[str, Any]] = field(default_factory=list)
     schema_version: int = SERIES_SCHEMA_VERSION
 
     def validate(self) -> None:
@@ -5073,6 +5074,8 @@ class SeriesDocument:
             if preset.preset_id in modifier_preset_ids:
                 raise ValueError("Modifier presets require unique IDs")
             modifier_preset_ids.add(preset.preset_id)
+        from comic_editor.core.smudge import validate_tool_presets
+        self.smudge_tool_presets = validate_tool_presets(self.smudge_tool_presets)
 
     def to_dict(self) -> dict[str, Any]:
         self.validate()
@@ -5088,6 +5091,7 @@ class SeriesDocument:
                 preset.to_dict() for preset in self.gradient_ramp_presets
             ],
             "modifier_presets": [preset.to_dict() for preset in self.modifier_presets],
+            "smudge_tool_presets": copy.deepcopy(self.smudge_tool_presets),
         }
 
     @classmethod
@@ -5128,6 +5132,7 @@ class SeriesDocument:
                 or [default_gradient_ramp_preset(primary, secondary)]
             ),
             modifier_presets=[ModifierPreset.from_dict(item) for item in raw_modifier_presets],
+            smudge_tool_presets=data.get("smudge_tool_presets", []),
             schema_version=SERIES_SCHEMA_VERSION,
         )
         result.validate()

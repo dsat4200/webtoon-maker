@@ -725,6 +725,12 @@ def extract_asset(
             modifier.center = (modifier.center[0] + dx, modifier.center[1] + dy)
             x, y, w, h = modifier.frame
             modifier.frame = (x + dx, y + dy, w, h)
+            if modifier.modifier_type == "distort_smudge":
+                from comic_editor.core.smudge import transform_strokes
+                modifier.parameters["strokes"] = transform_strokes(
+                    modifier.parameters.get("strokes", []),
+                    lambda point: (point[0] + dx, point[1] + dy),
+                )
         if isinstance(modifier, (RadialBlurModifier, TilingModifier, ArrayModifier)):
             modifier.center = (modifier.center[0]+dx, modifier.center[1]+dy)
         if isinstance(modifier, (MirrorModifier, ArrayModifier)):
@@ -880,6 +886,12 @@ def instantiate_asset(
             modifier.center = (modifier.center[0] + dx, modifier.center[1] + dy)
             x, y, w, h = modifier.frame
             modifier.frame = (x + dx, y + dy, w, h)
+            if modifier.modifier_type == "distort_smudge":
+                from comic_editor.core.smudge import transform_strokes
+                modifier.parameters["strokes"] = transform_strokes(
+                    modifier.parameters.get("strokes", []),
+                    lambda point: (point[0] + dx, point[1] + dy),
+                )
         if isinstance(modifier, (RadialBlurModifier, TilingModifier, ArrayModifier)):
             modifier.center = (modifier.center[0]+dx, modifier.center[1]+dy)
         if isinstance(modifier, (MirrorModifier, ArrayModifier)):

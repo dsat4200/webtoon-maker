@@ -41,8 +41,10 @@ def render_distort_stage(canvas, image, base, bounds, target, modifier,
     interactive = (canvas._interactive_render and not canvas._render_base_alpha
                    and canvas._rendering_mask_contributor <= 0)
     mesh_preview = (not exact and interactive and not navigator
-                    and modifier.modifier_type == "distort_mesh_warp"
-                    and getattr(canvas, "_mesh_warp_preview_id", None) == modifier.modifier_id
+                    and ((modifier.modifier_type == "distort_mesh_warp"
+                          and getattr(canvas, "_mesh_warp_preview_id", None) == modifier.modifier_id)
+                         or (modifier.modifier_type == "distort_smudge"
+                             and getattr(canvas, "_smudge_preview_id", None) == modifier.modifier_id))
                     and getattr(canvas, "_effect_preview_channel", "canvas") in {"canvas", "overflow"})
     deferred = (projection_deferred(canvas) and large and scope is not None
                 and not provisional and not navigator)

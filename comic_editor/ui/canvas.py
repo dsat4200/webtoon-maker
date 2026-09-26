@@ -633,6 +633,8 @@ class _CanvasLogic(DocumentProjectionFeatures, MultiRasterSelectionFeatures, Sho
     operationError = Signal(str, str)
     modifierSelectionChanged = Signal(str)
     curvesPointSelected = Signal(str, str, int)
+    smudgeSelectedChanged = Signal()
+    smudgePointChanged = Signal()
 
     def __init__(self, settings: EditorSettings, parent=None):
         super().__init__(parent)
@@ -650,6 +652,8 @@ class _CanvasLogic(DocumentProjectionFeatures, MultiRasterSelectionFeatures, Sho
         self.selected_entities: list[tuple[str, str]] = []
         self._solo_entities: set[tuple[str, str]] = set()
         self.active_modifier_id = ""
+        self.smudge_selected_stroke_id = ""
+        self.smudge_selected_point_index = 0
         self.active_tone_mask_id = ""
         self._mask_gradient_drag = None
         self._mask_selection_gesture = None
@@ -1543,6 +1547,9 @@ class _CanvasLogic(DocumentProjectionFeatures, MultiRasterSelectionFeatures, Sho
         """Reset transient pointer state that cannot survive without a document."""
         self._projection_completed_view = None
         self._mesh_warp_parameter_drag_id = None
+        self._smudge_parameter_drag_id = None
+        self.smudge_selected_stroke_id = ""
+        self.smudge_selected_point_index = 0
         self._mesh_warp_preview_session_id = None
         self._mesh_warp_preview_presented = False
         self._projection_frame_pending = False
@@ -2734,6 +2741,7 @@ class _CanvasLogic(DocumentProjectionFeatures, MultiRasterSelectionFeatures, Sho
         if tool in {ToolKind.MASK_SELECT, ToolKind.MASK_WAND} and not self.active_tone_mask_id:
             return False
         if tool != self.tool:
+            self._cancel_smudge_gesture()
             self._cancel_mask_selection()
             self._finish_mask_gradient()
             if self.active_tone_mask_id and self._drawing:
@@ -13860,6 +13868,13 @@ class _CanvasLogic(DocumentProjectionFeatures, MultiRasterSelectionFeatures, Sho
             self.interactionFinished.emit()
             event.accept()
             return
+        if event.key() == Qt.Key_Escape and self._cancel_smudge_gesture():
+            event.accept()
+            return
+        if event.key() == Qt.Key_Delete and self._active_smudge_modifier() is not None:
+            if self.smudge_delete_selected_stroke():
+                event.accept()
+                return
         if event.key() == Qt.Key_Escape and self._modifier_handle_drag and any(
             key in self._modifier_handle_drag for key in ("tiling", "array", "distort")
         ):
@@ -20038,8 +20053,8 @@ class _CanvasLogic(DocumentProjectionFeatures, MultiRasterSelectionFeatures, Sho
             self._finish_vector_simplify_gesture(drawing)
 
     # ---- tool actions --------------------------------------------------
-    def _begin_modifier_handle(self, widget_point: QPointF) -> bool:
-        if self._begin_distort_handle(widget_point):
+    def _begin_modifier_handle(self, widget_point: QPointF, pressure: float = 1.) -> bool:
+        if self._begin_distort_handle(widget_point, pressure):
             return True
         if self._begin_array_handle(widget_point):
             return True
@@ -20082,8 +20097,8 @@ class _CanvasLogic(DocumentProjectionFeatures, MultiRasterSelectionFeatures, Sho
         }
         return True
 
-    def _move_modifier_handle(self, widget_point: QPointF) -> bool:
-        if self._move_distort_handle(widget_point):
+    def _move_modifier_handle(self, widget_point: QPointF, pressure=None) -> bool:
+        if self._move_distort_handle(widget_point, pressure):
             return True
         if self._move_array_handle(widget_point):
             return True
@@ -20146,6 +20161,8 @@ class _CanvasLogic(DocumentProjectionFeatures, MultiRasterSelectionFeatures, Sho
         return True
 
     def _finish_modifier_handle(self) -> bool:
+        if self._finish_smudge_handle():
+            return True
         self._flush_radial_handle()
         self._flush_tiling_handle()
         state, self._modifier_handle_drag = self._modifier_handle_drag, None
@@ -20217,7 +20234,7 @@ class _CanvasLogic(DocumentProjectionFeatures, MultiRasterSelectionFeatures, Sho
             return
         if self._begin_cage_handle(widget_point, modifiers):
             return
-        if self._begin_modifier_handle(widget_point):
+        if self._begin_modifier_handle(widget_point, pressure):
             return
         if self.tool == ToolKind.TRANSFORM and self._begin_multi_transform(point):
             return
@@ -20691,7 +20708,7 @@ class _CanvasLogic(DocumentProjectionFeatures, MultiRasterSelectionFeatures, Sho
             return
         if self._move_cage_handle(widget_point):
             return
-        if self._move_modifier_handle(widget_point):
+        if self._move_modifier_handle(widget_point, pressure):
             return
         if self.tool == ToolKind.VECTOR_EDIT and self._vector_before is None:
             drawing = self._selected_vector_drawing()

@@ -269,6 +269,9 @@ def _glitch_extent(parameters, frame):
 def distort_bounds(bounds: QRectF, modifier, local_to_world: QTransform | None = None) -> QRectF:
     """Include the source and expanded geometry, so partial intensity never clips."""
     transform = local_to_world or QTransform()
+    if modifier.modifier_type == "distort_smudge":
+        from comic_editor.ui.smudge_rendering import smudge_bounds
+        return smudge_bounds(bounds, modifier, transform)
     inverse, valid = transform.inverted()
     if not valid:
         raise ValueError("Cannot distort an object with a singular placement")
@@ -749,6 +752,10 @@ def render_distort(image: QImage, bounds: QRectF, modifier, local_to_world: QTra
     width, height = max(1, math.ceil(output_bounds.width() * pixel_scale)), max(1, math.ceil(output_bounds.height() * pixel_scale))
     if width * height > _MAX_PIXELS:
         raise ValueError("Distortion result is too large; reduce the deformation or layer size")
+    if effect == "smudge":
+        from comic_editor.ui.smudge_rendering import render_smudge
+        return render_smudge(image, bounds, modifier, transform, output_bounds, cancelled,
+                             pixel_scale=pixel_scale, preparation_cache=preparation_cache)
     source_native_size = (image.width(), image.height())
     # Drag previews need bounded preprocessing as well as a small output. The
     # capture still spans exactly the same local bounds after downsampling.

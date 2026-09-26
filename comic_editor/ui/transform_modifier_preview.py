@@ -19,6 +19,12 @@ _RIG_TYPES = (ArrayModifier, BlurModifier, CageTransformModifier, DistortModifie
 def transform_modifier_rig(canvas, modifier, transform):
     """Apply the established commit transformation to one mutable rig."""
     if isinstance(modifier, DistortModifier):
+        if modifier.modifier_type == "distort_smudge":
+            from comic_editor.core.smudge import transform_strokes
+            modifier.parameters["strokes"] = transform_strokes(
+                modifier.parameters.get("strokes", []),
+                lambda point: transform.map(QPointF(*point)).toTuple(),
+            )
         canvas._transform_distort_modifier(modifier, transform)
     elif isinstance(modifier, TilingModifier):
         a = transform.map(QPointF(1, 0)) - transform.map(QPointF())

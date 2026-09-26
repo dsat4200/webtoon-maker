@@ -121,6 +121,9 @@ class ModifierCard(QFrame):
         preset_menu.aboutToShow.connect(lambda: owner.populate_preset_menu(preset_menu, modifier.modifier_id))
         self.preset_button.setMenu(preset_menu)
         title.layout().insertWidget(1, self.preset_button)
+        if modifier.modifier_type == "distort_smudge":
+            # Smudge presets intentionally store defaults, never drawn paths.
+            self.preset_button.hide()
         self.mute_button = self._title_button(
             "eye-closed" if modifier.muted else "eye",
             "Unmute modifier" if modifier.muted else "Mute modifier",
@@ -160,10 +163,11 @@ class ModifierCard(QFrame):
             from comic_editor.ui.posterize_controls import SimplifyColorsControls
             form.addWidget(SimplifyColorsControls(modifier, owner, body))
             form.addWidget(QLabel("Posterization", body))
-        form.addWidget(self._slider_row(
-            "Strength" if isinstance(modifier, StrokeModifier) else "Intensity", 0, 100, round(modifier.intensity),
-            "intensity", "%",
-        ))
+        if modifier.modifier_type != "distort_smudge":
+            form.addWidget(self._slider_row(
+                "Strength" if isinstance(modifier, StrokeModifier) else "Intensity", 0, 100, round(modifier.intensity),
+                "intensity", "%",
+            ))
         if isinstance(modifier, StrokeModifier):
             labels = {"height": "Spike height", "width": "Spike width", "roundness": "Roundness",
                       "position": "Position", "strength": "Opacity noise", "noise_scale": "Noise scale",
@@ -204,8 +208,12 @@ class ModifierCard(QFrame):
                 randomize.clicked.connect(randomize_seed)
                 form.addWidget(randomize)
         elif isinstance(modifier, DistortModifier):
-            from comic_editor.ui.distort_controls import DistortControls
-            form.addWidget(DistortControls(modifier, owner, body))
+            if modifier.modifier_type == "distort_smudge":
+                from comic_editor.ui.smudge_controls import SmudgeControls
+                form.addWidget(SmudgeControls(modifier, owner, body))
+            else:
+                from comic_editor.ui.distort_controls import DistortControls
+                form.addWidget(DistortControls(modifier, owner, body))
         elif isinstance(modifier, CurvesModifier):
             from comic_editor.ui.curves_controls import CurvesControls
             form.addWidget(CurvesControls(owner, modifier, body))
@@ -480,6 +488,7 @@ class ModifierControls(QWidget):
         self.preset_controller = None
         self._parameter_before = None
         self._mesh_warp_parameter_chapter = None
+        self._smudge_parameter_chapter = None
         self._reorder_before = None
         self._cards: dict[str, ModifierCard] = {}
         layout = QVBoxLayout(self)
@@ -589,7 +598,7 @@ class ModifierControls(QWidget):
         return [item for item in primary.modifier_ids if item in common]
 
     def refresh(self) -> None:
-        if self._mesh_warp_parameter_chapter is not None:
+        if self._mesh_warp_parameter_chapter is not None or self._smudge_parameter_chapter is not None:
             # Replacing a slider can destroy it before sliderReleased fires.
             # Finish its transient preview before rebuilding the controls.
             self.finish_parameter_drag()
@@ -813,6 +822,10 @@ class ModifierControls(QWidget):
                 and modifier.modifier_type == "distort_mesh_warp"):
             self.canvas._mesh_warp_parameter_drag_id = modifier_id
             self._mesh_warp_parameter_chapter = chapter
+        if (self._parameter_before is not None
+                and modifier.modifier_type == "distort_smudge"):
+            self.canvas._smudge_parameter_drag_id = modifier_id
+            self._smudge_parameter_chapter = chapter
         setattr(modifier, attribute, value)
         modifier.validate()
         if attribute == "muted" or not modifier.muted:
@@ -828,13 +841,17 @@ class ModifierControls(QWidget):
     def finish_parameter_drag(self) -> None:
         before, self._parameter_before = self._parameter_before, None
         chapter, self._mesh_warp_parameter_chapter = self._mesh_warp_parameter_chapter, None
+        smudge_chapter, self._smudge_parameter_chapter = self._smudge_parameter_chapter, None
+        chapter = chapter if chapter is not None else smudge_chapter
         mesh_preview = getattr(self.canvas, "_mesh_warp_parameter_drag_id", None)
+        smudge_preview = getattr(self.canvas, "_smudge_parameter_drag_id", None)
         self.canvas._mesh_warp_parameter_drag_id = None
+        self.canvas._smudge_parameter_drag_id = None
         # Undo/document replacement may already have restored another model.
         # Never append the abandoned gesture to that model's history.
         if before is not None and (chapter is None or chapter is self.canvas.chapter):
             self._push(before, "Edit modifier")
-        if mesh_preview is not None:
+        if mesh_preview is not None or smudge_preview is not None:
             self.canvas._invalidate_scene_cache()
             self.canvas.update()
 

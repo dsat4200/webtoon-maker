@@ -3,6 +3,7 @@ from __future__ import annotations
 import pytest
 
 from comic_editor.core.models import (
+    SERIES_SCHEMA_VERSION,
     BoundGeometry, ChapterDocument, GridSettings, PathNode, RasterObject,
     SeriesDocument, TextObject, VectorDrawingObject, object_from_dict,
 )
@@ -25,7 +26,7 @@ def test_series_color_history_migrates_deduplicates_and_caps():
         ),
     ]
     loaded = SeriesDocument.from_dict(data)
-    assert loaded.schema_version == 17
+    assert loaded.schema_version == SERIES_SCHEMA_VERSION
     assert loaded.color_history[0] == "#FF112233"
     assert len(loaded.color_history) == 24
     assert len(set(loaded.color_history)) == 24

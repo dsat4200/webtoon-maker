@@ -4,6 +4,8 @@ from __future__ import annotations
 import copy
 import math
 
+from comic_editor.core.smudge import default_tool_settings, validate_strokes, validate_tool_settings
+
 
 def number(label, default, low, high, suffix="", decimals=2):
     return dict(label=label, default=default, minimum=low, maximum=high,
@@ -23,6 +25,11 @@ def effect(name, parameters=None, gizmo="center", description=""):
 
 
 DISTORT_TYPES = {
+    "distort_smudge": effect("Smudge Modifier", {
+        "opacity": number("Opacity", 100., 0., 100., "%"),
+        "strokes": dict(label="Strokes", default=[], kind="smudge_strokes"),
+        "tool_settings": dict(label="Smudge tool", default=default_tool_settings(), kind="smudge_settings"),
+    }, "smudge", "Paint editable smudge strokes on the image."),
     "distort_deform": effect("Deform", {
         "amount": number("Amount", 100., 0., 100., "%"),
         "mode": choice("Constraints", "rigid", {"rigid": "Rigid", "similarity": "Similarity"}),
@@ -155,6 +162,10 @@ def validate_parameters(modifier_type, parameters):
                 raise ValueError(f"Unknown distortion {key}")
         elif spec["kind"] == "bool":
             value = bool(value)
+        elif spec["kind"] == "smudge_strokes":
+            value = validate_strokes(value)
+        elif spec["kind"] == "smudge_settings":
+            value = validate_tool_settings(value)
         elif spec["kind"] in {"text", "image", "profile", "data"}:
             if not isinstance(value, str):
                 raise ValueError(f"Distortion {key} must be text")

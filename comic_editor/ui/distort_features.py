@@ -6,17 +6,21 @@ from PySide6.QtGui import QColor, QImage, QPen, QTransform
 
 from comic_editor.core.distort import gizmo_kind
 from comic_editor.core.models import DistortModifier
+from comic_editor.ui.smudge_features import SmudgeFeatures
 
 
-class DistortFeatures:
+class DistortFeatures(SmudgeFeatures):
     def _mesh_warp_preview_modifier(self):
         if self.chapter is None:
             return None
         drag = self._modifier_handle_drag or {}
-        identifier = drag.get("distort") or getattr(self, "_mesh_warp_parameter_drag_id", None)
+        if drag.get("smudge") and drag.get("mode") == "draw":
+            return None
+        identifier = (drag.get("distort") or getattr(self, "_mesh_warp_parameter_drag_id", None)
+                      or getattr(self, "_smudge_parameter_drag_id", None))
         modifier = self.chapter.modifiers.get(identifier)
         if (isinstance(modifier, DistortModifier) and not modifier.muted
-                and modifier.modifier_type == "distort_mesh_warp"):
+                and modifier.modifier_type in {"distort_mesh_warp", "distort_smudge"}):
             return modifier
         return None
 
@@ -33,13 +37,16 @@ class DistortFeatures:
         image.fill(Qt.transparent)
         previous = (getattr(self, "_projection_exact", False),
                     getattr(self, "_effect_region_requests", False),
-                    getattr(self, "_mesh_warp_preview_id", None))
+                    getattr(self, "_mesh_warp_preview_id", None),
+                    getattr(self, "_smudge_preview_id", None))
         self._projection_exact = self._effect_region_requests = False
         self._mesh_warp_preview_id = modifier.modifier_id
+        self._smudge_preview_id = modifier.modifier_id if modifier.modifier_type == "distort_smudge" else None
         try:
             self._render_scene_cache_rect(self.rect(), target=image, projection=False)
         finally:
-            self._projection_exact, self._effect_region_requests, self._mesh_warp_preview_id = previous
+            (self._projection_exact, self._effect_region_requests,
+             self._mesh_warp_preview_id, self._smudge_preview_id) = previous
         painter.drawImage(0, 0, image)
         self._mesh_warp_preview_presented = True
         self._projection_frame_pending = True
@@ -93,6 +100,8 @@ class DistortFeatures:
         modifier = self._active_distort_modifier()
         if modifier is None:
             return False
+        if modifier.modifier_type == "distort_smudge":
+            return self._draw_smudge_handles(painter, modifier)
         kind = gizmo_kind(modifier.modifier_type, modifier.parameters)
         handles = self._distort_handle_points(modifier)
         painter.save()
@@ -142,10 +151,12 @@ class DistortFeatures:
         painter.restore()
         return True
 
-    def _begin_distort_handle(self, point):
+    def _begin_distort_handle(self, point, pressure=1.):
         modifier = self._active_distort_modifier()
         if modifier is None:
             return False
+        if modifier.modifier_type == "distort_smudge":
+            return self._begin_smudge_handle(point, pressure)
         kind = gizmo_kind(modifier.modifier_type, modifier.parameters)
         nearby = [(math.dist(candidate.toTuple(), point.toTuple()), key)
                   for key, candidate in self._distort_handle_points(modifier)]
@@ -183,8 +194,10 @@ class DistortFeatures:
         self.documentChanged.emit(None)
         self.update()
 
-    def _move_distort_handle(self, point):
+    def _move_distort_handle(self, point, pressure=None):
         state = self._modifier_handle_drag
+        if state and state.get("smudge"):
+            return self._move_smudge_handle(point, pressure)
         if not state or "distort" not in state or self.chapter is None:
             return False
         modifier = self.chapter.modifiers.get(state["distort"])

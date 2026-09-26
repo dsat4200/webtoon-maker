@@ -85,7 +85,8 @@ def test_invalid_distortion_data_is_rejected(values):
 
 
 @pytest.fixture
-def editor(qapp):
+def editor(qapp, monkeypatch):
+    monkeypatch.setattr("comic_editor.ui.canvas.create_network_manager", lambda *_: None)
     chapter, layer, objects = document()
     canvas = CanvasWidget(EditorSettings(canvas_renderer="raster"))
     canvas.set_document(chapter, TileStore())
@@ -118,8 +119,14 @@ def test_each_distort_creates_usable_card_and_world_geometry(editor, kind):
     assert modifier.frame == pytest.approx((bounds.x(), bounds.y(), bounds.width(), bounds.height()))
     assert modifier.center == pytest.approx((bounds.center().x(), bounds.center().y()))
     assert modifier.radius == min(bounds.width(), bounds.height()) / 2
-    assert controls._cards[modifier.modifier_id].findChild(QComboBox, "distortChoice_interpolation") is not None
-    assert controls._cards[modifier.modifier_id].findChild(QComboBox, "distortChoice_edges") is not None
+    card = controls._cards[modifier.modifier_id]
+    if kind == "distort_smudge":
+        assert card.findChild(QDoubleSpinBox, "smudgeValue_opacity") is not None
+        assert card.findChild(QComboBox, "smudgeSelectedPoint") is not None
+        assert card.findChild(QDoubleSpinBox, "smudgeValue_tool_strength") is not None
+    else:
+        assert card.findChild(QComboBox, "distortChoice_interpolation") is not None
+        assert card.findChild(QComboBox, "distortChoice_edges") is not None
 
 
 def test_number_control_changes_parameters_in_one_undoable_action(editor, monkeypatch):
@@ -399,7 +406,8 @@ def test_distort_cards_fit_narrow_vertical_ribbon_and_scroll_to_last_control(edi
         card = controls._cards[canvas.active_modifier_id]
         assert page.groups_container.minimumSizeHint().width() <= page.viewport().width()
         last = (card.findChild(QSlider, "distortRadiusSlider")
-                or card.findChild(QComboBox, "distortChoice_edges"))
+                or card.findChild(QComboBox, "distortChoice_edges")
+                or card.findChild(QPushButton, "smudgeSaveToolPreset"))
         page.ensureWidgetVisible(last, 0, last.height() + 5)
         qapp.processEvents()
         position = last.mapTo(page.viewport(), QPoint(0, 0))
