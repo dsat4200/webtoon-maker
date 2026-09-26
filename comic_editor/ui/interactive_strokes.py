@@ -7,6 +7,7 @@ from PySide6.QtGui import QImage, QPainter
 
 from comic_editor.core.stroke_geometry import StrokeLoop
 from comic_editor.ui.stroke_rendering import opacity_noise, warp_material
+from comic_editor.ui.effect_regions import projection_requires_exact
 
 
 def _render(image, background, bounds, before, after, opacity):
@@ -70,8 +71,15 @@ def render_interactive_stroke(canvas, image, background, bounds, before, after,
             return (*cached, False)
     interactive = (canvas._interactive_render and not canvas._render_base_alpha
                    and canvas._rendering_mask_contributor <= 0)
-    if not interactive or image.width() * image.height() <= 16384:
-        return (*_render(image, background, bounds, before, after, opacity), provisional)
+    exact = projection_requires_exact(canvas)
+    if not interactive or exact or image.width() * image.height() <= 16384:
+        material, fill = _render(image, background, bounds, before, after, opacity)
+        if exact and not provisional:
+            packed = _pack(material, fill)
+            canvas._modifier_cache_put(key, packed)
+            if scope is not None:
+                jobs.retained_put(("result", scope), key, packed)
+        return material, fill, provisional
     navigator = getattr(canvas, "_effect_preview_channel", "canvas") == "navigator"
     asynchronous = not provisional and not navigator and scope is not None
     if asynchronous:

@@ -1,3 +1,11 @@
+
+
+add a blur feature to the outline modifier - with a radius and a strength. this blur applies only to the outline, not the source
+
+
+add a brightness/contrast modifier.
+
+
 mask edit mode:
 - add a magic wand tool for selections. in tool settings, lets the user set color tolerance.
 - holding control should remove from selection in magic wand, lasso mask edit tools

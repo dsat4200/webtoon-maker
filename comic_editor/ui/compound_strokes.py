@@ -244,7 +244,7 @@ def paint_outline(canvas, painter, layer, path, sources, tolerance=.125):
     # contour of that coverage, filling the entire bubble with outline color.
     # Judge complexity from the generated coverage, not the final boundary.
     # Complete uniform outlines retain their native cached geometry.
-    raster = (prepare_outline_raster(painter, path)
+    raster = (prepare_outline_raster(painter, path, cache=canvas._outline_cache)
               if not _uniform_compound_outline(
                   layer.border_width, sources, indices) else None)
     if raster is not None and raster.bounds.isEmpty():
@@ -261,7 +261,10 @@ def paint_outline(canvas, painter, layer, path, sources, tolerance=.125):
     if raster is None:
         painter.fillPath(base, color)
     else:
-        raster.paint(painter, base, path, color)
+        if not raster.paint(painter, base, path, color):
+            base = compound_outline(path, layer.border_width, sources, canvas._outline_cache,
+                                    tolerance, source_indices=indices, clip=True)
+            painter.fillPath(base, color)
         del raster
     for index, value in modified.items():
         coverage = compound_outline(path, layer.border_width, sources, canvas._outline_cache, tolerance,

@@ -737,9 +737,17 @@ class TileStore:
             return matching
 
         connected: dict[tuple[int, int], np.ndarray] = {}
-        keys = self.keys_for_rect(frame)
+        # The fill frame is half-open. A tile beginning exactly at its right
+        # or bottom edge has no valid pixels and must not trigger an expensive
+        # reference render merely to discover that its coverage is empty.
+        keys = {(x, y)
+                for y in range(top // tile_size, bottom // tile_size + 1)
+                for x in range(left // tile_size, right // tile_size + 1)}
         if not bool(profile.get("connected_pixels_only", True)) or point is None:
-            connected = {key: matching_for(key).copy() for key in keys}
+            # Read neighboring reference tiles together. An arbitrary set
+            # order can repeatedly evict whole-image effects on long chapters.
+            ordered_keys = sorted(keys, key=lambda key: (key[1], key[0]))
+            connected = {key: matching_for(key).copy() for key in ordered_keys}
         else:
             label_cache: dict[tuple[int, int], np.ndarray] = {}
 

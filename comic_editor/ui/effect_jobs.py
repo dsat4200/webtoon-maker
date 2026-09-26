@@ -8,6 +8,9 @@ from PySide6.QtCore import QObject, QTimer
 from comic_editor.ui.radial_blur import RadialRenderCancelled
 
 
+_MISSING = object()
+
+
 class EffectJobs(QObject):
     def __init__(self, canvas, budget=256 * 1024 * 1024, retained_budget=256 * 1024 * 1024,
                  retained_limit=512):
@@ -15,8 +18,10 @@ class EffectJobs(QObject):
         self.canvas = canvas
         self.budget = budget
         self.pending = OrderedDict()
+        self.waiting = OrderedDict()
         self.running = None
         self.retry_on_release = False
+        self.exact_failures = OrderedDict()
         # The ordinary scene LRU also contains previews and source images.
         # Exact worker results and the latest completed stage need a separate
         # handoff so repainting another target cannot restart a whole stack.
@@ -25,6 +30,12 @@ class EffectJobs(QObject):
         self.retained_budget = retained_budget
         self.retained_limit = max(1, int(retained_limit))
         self._retained_images = {}
+        # Shared stage prefixes have many regional consumers. Protect a bounded
+        # portion of the existing pool from one-use viewport captures, rather
+        # than growing the pool or pinning a whole frame without a byte limit.
+        self._retained_shared = OrderedDict()
+        self._retained_shared_images = {}
+        self.retained_shared_bytes = 0
         self.executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="effect-preview")
         self.stopped = Event()
         self.timer = QTimer(self)
@@ -46,23 +57,53 @@ class EffectJobs(QObject):
         if entry is None or entry[0] != key:
             return None
         self.retained.move_to_end(scope)
+        if scope in self._retained_shared:
+            self._retained_shared.move_to_end(scope)
         return QImage(entry[1]), entry[2]
 
-    def retained_put(self, scope, key, image, state=None):
+    def _retained_unprotect(self, scope):
+        storage = self._retained_shared.pop(scope, None)
+        if storage is not None:
+            self._retained_shared_images[storage][1] -= 1
+            if not self._retained_shared_images[storage][1]:
+                self.retained_shared_bytes -= self._retained_shared_images.pop(storage)[0]
+
+    def retained_put(self, scope, key, image, state=None, *, shared=False, force=False):
         from PySide6.QtGui import QImage
         self.retained_remove(scope)
         size = int(image.sizeInBytes())
         storage = int(image.cacheKey())
+        shared_budget = max(0, self.retained_budget // 2)
+        shared_limit = max(1, self.retained_limit // 2)
+        shared = bool(shared and size <= shared_budget)
+        extra_shared = lambda: size if shared and storage not in self._retained_shared_images else 0
+        while self._retained_shared and (
+            self.retained_shared_bytes + extra_shared() > shared_budget
+            or len(self._retained_shared) + int(shared) > shared_limit
+        ):
+            self._retained_unprotect(next(iter(self._retained_shared)))
+        # A one-use oversized image must not flush every reusable prefix. The
+        # caller still owns its exact output when admission is declined. Keep
+        # the established single-oversized-entry behavior in an unprotected pool.
+        budget = self.retained_budget if self._retained_shared and not force else max(self.retained_budget, size)
+        if (not force and self._retained_shared and storage not in self._retained_shared_images
+                and self.retained_shared_bytes + size > budget):
+            return False
         # QImage copies share pixels until edited. A completed worker image
         # often becomes a pipeline checkpoint before its result scope is
         # removed; counting that handoff twice evicts unrelated exact artwork.
         # Bound both unique pixel storage and the number of scope records.
         while self.retained and (
             self.retained_bytes + (0 if storage in self._retained_images else size)
-                > max(self.retained_budget, size)
+                > budget
             or len(self.retained) >= self.retained_limit
         ):
-            oldest = next(iter(self.retained))
+            oldest = next((item for item in self.retained if item not in self._retained_shared), _MISSING)
+            if oldest is _MISSING:
+                if not force:
+                    return False
+                oldest = next(iter(self._retained_shared))
+                self._retained_unprotect(oldest)
             self.retained_remove(oldest)
         self.retained[scope] = (key, QImage(image), state, size)
         if storage in self._retained_images:
@@ -70,11 +111,20 @@ class EffectJobs(QObject):
         else:
             self._retained_images[storage] = [size, 1]
             self.retained_bytes += size
+        if shared:
+            self._retained_shared[scope] = storage
+            if storage in self._retained_shared_images:
+                self._retained_shared_images[storage][1] += 1
+            else:
+                self._retained_shared_images[storage] = [size, 1]
+                self.retained_shared_bytes += size
+        return True
 
     def retained_remove(self, scope, key=None):
         entry = self.retained.get(scope)
         if entry is not None and (key is None or entry[0] == key):
             self.retained.pop(scope)
+            self._retained_unprotect(scope)
             storage = int(entry[1].cacheKey())
             self._retained_images[storage][1] -= 1
             if not self._retained_images[storage][1]:
@@ -86,17 +136,32 @@ class EffectJobs(QObject):
             # A paint may arrive between worker completion and the 16 ms timer.
             # Adopt its exact pixels now instead of flashing another draft.
             self.poll()
+        failure = self.exact_failures.get(scope)
+        if failure is not None and failure[0] == key:
+            from comic_editor.ui.async_projection import ProjectionFailed
+            raise ProjectionFailed(scope, key, failure[1])
         entry = self.retained_get(("result", scope), key)
         return entry[0] if entry is not None else None
 
-    def request(self, scope, key, compute, size, *, allow_oversized=False):
+    def request(self, scope, key, compute, size, *, allow_oversized=False, require_exact=False):
+        self.waiting.pop(scope, None)
+        failure = self.exact_failures.get(scope)
+        if failure is not None:
+            if failure[0] == key and require_exact:
+                from comic_editor.ui.async_projection import ProjectionFailed
+                raise ProjectionFailed(scope, key, failure[1])
+            self.exact_failures.pop(scope)
         oversized = size > self.budget
         if oversized and not allow_oversized:
             return False
         if self.running and self.running[:2] == (scope, key) and not self.running[2].is_set():
+            if require_exact:
+                self.running = (*self.running[:5], True)
             return True
         existing = self.pending.get(scope)
         if existing and existing[1] == key:
+            if require_exact:
+                self.pending[scope] = (*existing[:5], True)
             return True
         if self.running and self.running[0] == scope:
             self.running[2].set()
@@ -106,6 +171,10 @@ class EffectJobs(QObject):
             # Keep unrelated queued work instead of evicting it for a snapshot
             # we cannot retain yet. A repaint asks for the latest state later.
             self.retry_on_release = True
+            if require_exact:
+                self.waiting[scope] = key
+                while len(self.waiting) > self.retained_limit:
+                    self.waiting.popitem(last=False)
             self.timer.start()
             return True
         if oversized:
@@ -118,7 +187,7 @@ class EffectJobs(QObject):
         while self.pending and self.bytes_in_flight + size > self.budget:
             self.pending.popitem(last=False)
         # A canceled running job releases its arrays before the next starts.
-        self.pending[scope] = (scope, key, Event(), compute, size)
+        self.pending[scope] = (scope, key, Event(), compute, size, require_exact)
         self._start()
         self.timer.start()
         return True
@@ -127,50 +196,91 @@ class EffectJobs(QObject):
         if self.running is not None or not self.pending:
             return
         _, job = self.pending.popitem(last=False)
-        scope, key, token, compute, size = job
+        scope, key, token, compute, size, require_exact = job
         stopped = self.stopped
         cancelled = lambda: token.is_set() or stopped.is_set()
-        self.running = (scope, key, token, self.executor.submit(compute, cancelled), size)
+        self.running = (scope, key, token, self.executor.submit(compute, cancelled), size, require_exact)
         self.submitted += 1
 
     def poll(self):
         job = self.running
         if job is not None and job[3].done():
             self.running = None
+            self.waiting.clear()
+            failure = "The exact effect returned no image"
             try:
                 result = job[3].result()
             except RadialRenderCancelled:
                 result = None
-            except Exception:
+            except Exception as error:
                 # Keep exceptions visible for diagnostics without taking down
                 # the UI event loop. Exports still render synchronously.
                 import logging
                 logging.getLogger(__name__).exception("Effect preview failed")
+                failure = str(error)[:300] or type(error).__name__
                 result = None
+            if job[5] and result is not None and result.isNull():
+                result = None
+                failure = "The exact effect returned an empty image"
             if result is not None and not job[2].is_set():
-                self.retained_put(("result", job[0]), job[1], result)
+                # Exact projections cannot advance past a draft. Admission of
+                # their newly completed result takes priority over an older
+                # retained prefix, including the existing oversized-image case.
+                self.retained_put(("result", job[0]), job[1], result, force=job[5])
                 self.canvas._modifier_cache_put(job[1], result)
-                self.canvas._invalidate_scene_cache()
+                ready = getattr(self.canvas, "_effect_result_ready", None)
+                if ready is not None:
+                    ready(job[0], job[1])
+                else:
+                    self.canvas._invalidate_scene_cache()
                 self.canvas.visualChanged.emit(None)
                 self.canvas.update()
                 self.completed += 1
             else:
                 self.discarded += 1
+                if job[5] and not job[2].is_set():
+                    self.exact_failures[job[0]] = (job[1], failure)
+                    self.exact_failures.move_to_end(job[0])
+                    while len(self.exact_failures) > self.retained_limit:
+                        self.exact_failures.popitem(last=False)
+                    ready = getattr(self.canvas, "_effect_result_ready", None)
+                    if ready is not None:
+                        ready(job[0], job[1])
+                    self.canvas.update()
+                elif job[5] and not self.retry_on_release:
+                    # A canceled exact capture may have left the projection
+                    # waiting on this worker. Release that wait even when no
+                    # replacement snapshot could be queued before cancellation.
+                    # Its obsolete pixels and failures must never be adopted.
+                    ready = getattr(self.canvas, "_effect_result_ready", None)
+                    if ready is not None:
+                        ready(None, None)
+                    self.canvas.update()
             if self.retry_on_release:
                 self.retry_on_release = False
-                self.canvas._invalidate_scene_cache()
+                ready = getattr(self.canvas, "_effect_result_ready", None)
+                if ready is not None:
+                    ready(None, None)
+                else:
+                    self.canvas._invalidate_scene_cache()
                 self.canvas.visualChanged.emit(None)
                 self.canvas.update()
         self._start()
         if self.running is None and not self.pending:
             self.timer.stop()
 
-    def cancel(self):
+    def cancel(self, *, clear_retained=True):
         self.pending.clear()
+        self.waiting.clear()
         self.retry_on_release = False
-        self.retained.clear()
-        self.retained_bytes = 0
-        self._retained_images.clear()
+        self.exact_failures.clear()
+        if clear_retained:
+            self.retained.clear()
+            self.retained_bytes = 0
+            self._retained_images.clear()
+            self._retained_shared.clear()
+            self._retained_shared_images.clear()
+            self.retained_shared_bytes = 0
         if self.running:
             self.running[2].set()
         else:

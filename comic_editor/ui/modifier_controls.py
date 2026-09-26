@@ -479,6 +479,7 @@ class ModifierControls(QWidget):
         self._target_layer_pick_chapter = None
         self.preset_controller = None
         self._parameter_before = None
+        self._mesh_warp_parameter_chapter = None
         self._reorder_before = None
         self._cards: dict[str, ModifierCard] = {}
         layout = QVBoxLayout(self)
@@ -588,6 +589,10 @@ class ModifierControls(QWidget):
         return [item for item in primary.modifier_ids if item in common]
 
     def refresh(self) -> None:
+        if self._mesh_warp_parameter_chapter is not None:
+            # Replacing a slider can destroy it before sliderReleased fires.
+            # Finish its transient preview before rebuilding the controls.
+            self.finish_parameter_drag()
         if self.target_layer_pick_id:
             modifier = self.canvas.chapter.modifiers.get(self.target_layer_pick_id) if self.canvas.chapter else None
             if (not isinstance(modifier, HalftoneModifier) or modifier.color_mode != "target_layer"
@@ -804,6 +809,10 @@ class ModifierControls(QWidget):
         if modifier is None or not hasattr(modifier, attribute):
             return
         before = chapter.to_dict() if commit and self._parameter_before is None else None
+        if (self._parameter_before is not None
+                and modifier.modifier_type == "distort_mesh_warp"):
+            self.canvas._mesh_warp_parameter_drag_id = modifier_id
+            self._mesh_warp_parameter_chapter = chapter
         setattr(modifier, attribute, value)
         modifier.validate()
         if attribute == "muted" or not modifier.muted:
@@ -818,8 +827,16 @@ class ModifierControls(QWidget):
 
     def finish_parameter_drag(self) -> None:
         before, self._parameter_before = self._parameter_before, None
-        if before is not None:
+        chapter, self._mesh_warp_parameter_chapter = self._mesh_warp_parameter_chapter, None
+        mesh_preview = getattr(self.canvas, "_mesh_warp_parameter_drag_id", None)
+        self.canvas._mesh_warp_parameter_drag_id = None
+        # Undo/document replacement may already have restored another model.
+        # Never append the abandoned gesture to that model's history.
+        if before is not None and (chapter is None or chapter is self.canvas.chapter):
             self._push(before, "Edit modifier")
+        if mesh_preview is not None:
+            self.canvas._invalidate_scene_cache()
+            self.canvas.update()
 
     def request_mask(self, context: tuple) -> None:
         self.maskRequested.emit(context)

@@ -12,7 +12,8 @@ from comic_editor.ui.canvas import CanvasWidget
 
 
 @pytest.mark.parametrize("finish", [False, True], ids=["cancel", "commit"])
-def test_live_vector_stroke_stays_below_promoted_artwork(qapp, finish):
+@pytest.mark.parametrize("projection", [False, True], ids=["legacy", "projection"])
+def test_live_vector_stroke_stays_below_promoted_artwork(qapp, finish, projection):
     chapter = ChapterDocument(height=480)
     page = chapter.add_page("Page", BoundGeometry.rectangle(0, 0, 1080, 480))
     page.fill_color, page.border_width = None, 0
@@ -21,6 +22,7 @@ def test_live_vector_stroke_stays_below_promoted_artwork(qapp, finish):
     canvas = CanvasWidget(EditorSettings(grid_overlay_visible=False))
     canvas.resize(480, 480)
     canvas.set_document(chapter, TileStore())
+    canvas._document_projection_enabled = projection
     canvas.tiles.paint_dab(top.object_id, QPointF(240, 240), 60, QColor("red"))
     canvas.center_x, canvas.center_y, canvas.scale = 240, 240, 1
     canvas.set_selection("object", drawing.object_id)

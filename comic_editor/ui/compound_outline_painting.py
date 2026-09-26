@@ -3,7 +3,7 @@ from dataclasses import dataclass
 import math
 
 from PySide6.QtCore import QRect, QRectF, Qt
-from PySide6.QtGui import QImage, QPainter, QPixmap, QTransform
+from PySide6.QtGui import QBrush, QImage, QPainter, QPixmap, QTransform
 from PySide6.QtWidgets import QWidget
 
 
@@ -15,23 +15,28 @@ MAX_RASTER_PIXELS = 4 * 1024 * 1024
 def paint_closed_shape_outline(painter, bound, baseline, fill, color, *,
                                cache=None, tolerance=.125):
     """Avoid whole-path Boolean normalization for complex standalone outlines."""
-    from comic_editor.ui.shape_outline import customized, outline_mesh
+    from comic_editor.ui.shape_outline import customized, outline_result
 
-    raster = (prepare_outline_raster(painter, fill)
+    raster = (prepare_outline_raster(painter, fill, cache=cache)
               if customized(bound) and painter.testRenderHint(QPainter.Antialiasing)
               else None)
     if raster is not None and raster.bounds.isEmpty():
         return
-    coverage = outline_mesh(bound, baseline, fill, cache=cache,
+    result = outline_result(bound, baseline, fill, cache=cache,
                             tolerance=tolerance, clip=raster is None)
+    coverage = result.coverage
     if raster is not None and coverage.elementCount() <= 128:
         raster = None
-        coverage = outline_mesh(bound, baseline, fill, cache=cache,
-                                tolerance=tolerance)
+        coverage = outline_result(bound, baseline, fill, cache=cache,
+                                  tolerance=tolerance).coverage
     if raster is None:
         painter.fillPath(coverage, color)
     else:
-        raster.paint(painter, coverage, fill, color)
+        if not raster.paint(painter, coverage, fill, color, cache_key=result.signature):
+            # Allocation failure retains the pre-existing geometric fallback.
+            coverage = outline_result(bound, baseline, fill, cache=cache,
+                                      tolerance=tolerance).coverage
+            painter.fillPath(coverage, color)
 
 
 @dataclass
@@ -40,11 +45,60 @@ class OutlineRaster:
     mapping: QTransform
     image: QImage
     mask: QImage
+    cache: object = None
 
-    def paint(self, painter, coverage, fill, color):
+    def paint(self, painter, coverage, fill, color, *, cache_key=None):
         if self.bounds.isEmpty() or coverage.isEmpty():
-            return
+            return True
         antialias = painter.testRenderHint(QPainter.Antialiasing)
+        brush = QBrush(color)
+        if self.cache is not None and brush.style() == Qt.SolidPattern:
+            from comic_editor.ui.shape_outline import path_key
+
+            mapping = self.mapping
+            rgba = brush.color().rgba64()
+            key = ("outline_raster",
+                   cache_key if cache_key is not None else (path_key(coverage), path_key(fill)),
+                   (mapping.m11(), mapping.m12(), mapping.m13(), mapping.m21(),
+                    mapping.m22(), mapping.m23(), mapping.m31(), mapping.m32(), mapping.m33()),
+                   self.bounds.width(), self.bounds.height(), bool(antialias),
+                   (rgba.red(), rgba.green(), rgba.blue(), rgba.alpha()))
+            def build():
+                image = self._render(coverage, fill, color, antialias)
+                if image is None or image.isNull():
+                    # A temporary allocation failure must not become a cached
+                    # blank result for the unchanged outline's next redraw.
+                    raise MemoryError("Could not allocate outline scratch pixels")
+                return image
+
+            try:
+                image = self.cache.get(key, build)
+            except MemoryError:
+                return False
+            if image is None or image.isNull():
+                return False
+            # Never give later scratch painting mutable ownership of a cached
+            # image. Qt's implicit sharing keeps this copy allocation-free.
+            self.image = QImage(image)
+        else:
+            image = self._render(coverage, fill, color, antialias)
+            if image is None or image.isNull():
+                return False
+        painter.save()
+        painter.resetTransform()
+        ratio = painter.device().devicePixelRatioF()
+        painter.scale(1 / ratio, 1 / ratio)
+        painter.setRenderHint(QPainter.SmoothPixmapTransform, False)
+        # Existing clip, composition and parent opacity apply once, here.
+        painter.drawImage(self.bounds.topLeft(), self.image)
+        painter.restore()
+        return True
+
+    def _render(self, coverage, fill, color, antialias):
+        self.image = QImage(self.bounds.size(), QImage.Format_ARGB32_Premultiplied)
+        self.mask = QImage(self.bounds.size(), QImage.Format_ARGB32_Premultiplied)
+        if self.image.isNull() or self.mask.isNull():
+            return None
         for image, path, brush in ((self.image, coverage, color),
                                    (self.mask, fill, Qt.white)):
             image.fill(Qt.transparent)
@@ -64,22 +118,16 @@ class OutlineRaster:
         # the fill path with DestinationIn would leave that coverage intact.
         source.drawImage(0, 0, self.mask)
         source.end()
-        painter.save()
-        painter.resetTransform()
-        ratio = painter.device().devicePixelRatioF()
-        painter.scale(1 / ratio, 1 / ratio)
-        painter.setRenderHint(QPainter.SmoothPixmapTransform, False)
-        # Existing clip, composition and parent opacity apply once, here.
-        painter.drawImage(self.bounds.topLeft(), self.image)
-        painter.restore()
+        return self.image
 
 
-def prepare_outline_raster(painter, fill):
-    """Preflight output bounds and allocate before requesting an unclipped mesh.
+def prepare_outline_raster(painter, fill, *, cache=None):
+    """Preflight output bounds before requesting an unclipped mesh.
 
     None means use geometric clipping. Vector/high-depth output stays vector or
     high-depth, and composition modes that erase transparent pixels keep their
-    original path semantics.
+    original path semantics. Scratch pixels are allocated only on a raster
+    cache miss, after determining whether this shape needs raster clipping.
     """
     device = painter.device()
     if not isinstance(device, (QImage, QPixmap, QWidget)):
@@ -105,13 +153,9 @@ def prepare_outline_raster(painter, fill):
         clip = mapping.mapRect(painter.clipBoundingRect()).adjusted(-1, -1, 1, 1)
         area = area.intersected(clip)
     if area.isEmpty():
-        return OutlineRaster(QRect(), mapping, QImage(), QImage())
+        return OutlineRaster(QRect(), mapping, QImage(), QImage(), cache)
     bounds = area.toAlignedRect()
     if bounds.width()*bounds.height() > MAX_RASTER_PIXELS:
         return None
-    image = QImage(bounds.size(), QImage.Format_ARGB32_Premultiplied)
-    mask = QImage(bounds.size(), QImage.Format_ARGB32_Premultiplied)
-    if image.isNull() or mask.isNull():
-        return None
     mapping *= QTransform.fromTranslate(-bounds.left(), -bounds.top())
-    return OutlineRaster(bounds, mapping, image, mask)
+    return OutlineRaster(bounds, mapping, QImage(), QImage(), cache)

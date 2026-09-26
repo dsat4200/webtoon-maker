@@ -3513,8 +3513,11 @@ class ChapterDocument:
                 layer.fill_reference = False
                 layer.modifier_ids = [mid for mid in layer.modifier_ids
                                       if isinstance(self.modifiers[mid], CurvesModifier)]
-                layer.transform_frame = None
-                layer.transform_quad = None
+                # Ctrl+T moves the page and its descendants through this
+                # transform. Preserve it during save/load and history restore;
+                # dropping it leaves document-space effect rigs at the moved
+                # position while their artwork jumps back. Validate the pair
+                # below just as for other layers.
                 layer.opacity_mask = None
             if layer.transform_frame is not None:
                 if len(layer.transform_frame) != 4 or not all(
@@ -4611,25 +4614,47 @@ class ChapterDocument:
                 if obj.opacity_locked:
                     obj.opacity = layer.opacity
 
+    def _layer_bottom_for_height(self, layer_id: str, padding: float = 0.0) -> float:
+        """Conservative stored world-space bottom, including layer quads."""
+        layer = self.layers[layer_id]
+        left, top, width, height = layer.bound.bbox()
+        points = [(left - padding, top - padding),
+                  (left + width + padding, top - padding),
+                  (left + width + padding, top + height + padding),
+                  (left - padding, top + height + padding)]
+        for ancestor in reversed(self.ancestor_layers(layer_id)):
+            if ancestor.transform_frame is not None and ancestor.transform_quad is not None:
+                from comic_editor.core.cage import homography, project
+                x, y, w, h = ancestor.transform_frame
+                normalized = [((px - x) / w, (py - y) / h) for px, py in points]
+                try:
+                    points = project(homography(ancestor.transform_quad), normalized).tolist()
+                except ValueError:
+                    # Match the renderer's identity fallback for a singular
+                    # saved quad; its translation is superseded by that quad.
+                    pass
+            else:
+                points = [(x + ancestor.translate_x, y + ancestor.translate_y)
+                          for x, y in points]
+        return max(point[1] for point in points)
+
     def ensure_height_for(self, layer_id: str) -> bool:
         if self.document_kind == "image":
             return False
         layer = self.layers[layer_id]
         if layer.bound is None:
             return False
-        wx, wy = self.layer_world_translation(layer_id)
-        _, top, _, height = layer.bound.bbox()
-        bottom = wy + top + height
+        padding = 0.0
         if layer.layer_kind == "open_shape":
             maximum = max(
                 (node.width_multiplier for node in layer.bound.nodes),
                 default=1.0,
             )
-            bottom += (
+            padding = (
                 layer.shape_style.base_thickness * maximum / 2
                 + layer.shape_style.outline_thickness
             )
-        needed = int(math.ceil(bottom))
+        needed = int(math.ceil(self._layer_bottom_for_height(layer_id, padding)))
         if needed <= self.height:
             return False
         self.height = needed + GROWTH_MARGIN
@@ -4641,8 +4666,7 @@ class ChapterDocument:
             page = self.layers[page_id]
             if page.bound is None:
                 continue
-            _, top, _, height = page.bound.bbox()
-            bottom = max(bottom, page.translate_y + top + height)
+            bottom = max(bottom, self._layer_bottom_for_height(page_id))
         return int(math.ceil(bottom))
 
     def trim_height(self, height: int) -> None:

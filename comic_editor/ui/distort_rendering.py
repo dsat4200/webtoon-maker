@@ -8,6 +8,8 @@ large outputs are processed in cancellable strips.
 from __future__ import annotations
 
 import base64
+from collections import OrderedDict
+from dataclasses import dataclass
 import math
 
 import numpy as np
@@ -142,29 +144,50 @@ def _mls(query, source, destination, mode="rigid"):
         return query.copy()
     if len(source) == 1:
         return query + destination[0] - source[0]
+    source, destination = np.asarray(source), np.asarray(destination)
     shape = query.shape
     query = query.reshape(-1, 2)
+    # Work on contiguous coordinate columns. The two-column reductions below
+    # used to allocate and traverse several Nx2 arrays per pin, twice. Keeping
+    # the same operation order in scalar columns preserves the float64 mapping
+    # while substantially reducing allocation and memory traffic.
+    x, y = np.ascontiguousarray(query[:, 0]), np.ascontiguousarray(query[:, 1])
     total = np.zeros(len(query))
-    pstar, qstar = np.zeros_like(query), np.zeros_like(query)
+    px, py, qx, qy = (np.zeros_like(x) for _ in range(4))
     for p, q in zip(source, destination):
-        weights = 1. / np.maximum(np.sum((query - p) ** 2, axis=1), 1e-10)
+        # Explicit array promotion also preserves the previous behavior when
+        # callers supply float32 queries and float64 pin coordinates.
+        dtype = np.result_type(query.dtype, p.dtype)
+        dx, dy = x.astype(dtype, copy=False) - p[0], y.astype(dtype, copy=False) - p[1]
+        weights = 1. / np.maximum(dx ** 2 + dy ** 2, 1e-10)
         total += weights
-        pstar += weights[:, None] * p
-        qstar += weights[:, None] * q
-    pstar /= total[:, None]
-    qstar /= total[:, None]
+        px += weights * p[0]
+        py += weights * p[1]
+        qweights = weights.astype(np.result_type(weights.dtype, q.dtype), copy=False)
+        qx += qweights * q[0]
+        qy += qweights * q[1]
+    del qweights
+    px /= total
+    py /= total
+    qx /= total
+    qy /= total
     real, imag, denominator = np.zeros(len(query)), np.zeros(len(query)), np.zeros(len(query))
     for p, q in zip(source, destination):
-        weights = 1. / np.maximum(np.sum((query - p) ** 2, axis=1), 1e-10)
-        pp, qq = p - pstar, q - qstar
-        real += weights * np.sum(pp * qq, axis=1)
-        imag += weights * (pp[:, 0] * qq[:, 1] - pp[:, 1] * qq[:, 0])
-        denominator += weights * np.sum(pp * pp, axis=1)
+        dtype = np.result_type(query.dtype, p.dtype)
+        dx, dy = x.astype(dtype, copy=False) - p[0], y.astype(dtype, copy=False) - p[1]
+        weights = 1. / np.maximum(dx ** 2 + dy ** 2, 1e-10)
+        ppx, ppy = p[0] - px.astype(dtype, copy=False), p[1] - py.astype(dtype, copy=False)
+        qdtype = np.result_type(query.dtype, q.dtype)
+        qqx, qqy = q[0] - qx.astype(qdtype, copy=False), q[1] - qy.astype(qdtype, copy=False)
+        real += weights * (ppx * qqx + ppy * qqy)
+        imag += weights * (ppx * qqy - ppy * qqx)
+        denominator += weights * (ppx * ppx + ppy * ppy)
     normal = denominator if mode == "similarity" else np.hypot(real, imag)
     real = np.divide(real, normal, out=np.ones_like(real), where=normal > 1e-14)
     imag = np.divide(imag, normal, out=np.zeros_like(imag), where=normal > 1e-14)
-    delta = query - pstar
-    result = qstar + np.stack((real * delta[:, 0] - imag * delta[:, 1], imag * delta[:, 0] + real * delta[:, 1]), axis=-1)
+    dx, dy = x - px, y - py
+    result = np.stack((qx + (real * dx - imag * dy),
+                       qy + (imag * dx + real * dy)), axis=-1)
     return result.reshape(shape)
 
 
@@ -397,18 +420,136 @@ class _Sampler:
         return result
 
 
+def _array_storage_bytes(arrays):
+    """Count retained NumPy allocations once, including shared channel views."""
+    owners = {}
+    for array in arrays:
+        owner = array
+        while isinstance(owner.base, np.ndarray):
+            owner = owner.base
+        owners[id(owner)] = owner.nbytes
+    return sum(owners.values())
+
+
+@dataclass(frozen=True)
+class PreparedDistort:
+    pixels: np.ndarray
+    sampler: _Sampler
+
+
+class PreparedDistortCache:
+    """Bounded immutable source/mesh setup reused by exact region requests.
+
+    Owned and used by the GUI's synchronous projection path only; background
+    jobs never receive this cache. Entries contain detached NumPy allocations,
+    not Qt images or canvas state. Output coordinates and effect parameters
+    remain per request, so region reuse cannot reuse another region's pixels.
+    """
+
+    def __init__(self, budget=96 * 1024 * 1024, *, entry_limit=64):
+        self.budget = max(0, int(budget))
+        self.entry_limit = max(1, int(entry_limit))
+        self.bytes = self.hits = self.misses = self.evictions = 0
+        self._entries = OrderedDict()
+
+    def _get(self, key):
+        entry = self._entries.pop(key, None)
+        if entry is None:
+            self.misses += 1
+            return None
+        self.hits += 1
+        self._entries[key] = entry
+        return entry[0]
+
+    def _put(self, key, value, arrays):
+        size = _array_storage_bytes(arrays)
+        for array in arrays:
+            array.setflags(write=False)
+        if size > self.budget:
+            return value
+        while self._entries and (self.bytes + size > self.budget
+                                 or len(self._entries) >= self.entry_limit):
+            _, (_, removed) = self._entries.popitem(last=False)
+            self.bytes -= removed
+            self.evictions += 1
+        self._entries[key] = value, size
+        self.bytes += size
+        return value
+
+    def source(self, image, interpolation="bilinear", edges="transparent"):
+        key = ("source", int(image.cacheKey()), image.width(), image.height(),
+               image.format().value, interpolation, edges)
+        prepared = self._get(key)
+        if prepared is not None:
+            return prepared
+        pixels = _rgba(image)
+        sampler = _Sampler(pixels, interpolation, edges)
+        sampler.filtered = tuple(sampler.filtered)
+        return self._put(key, PreparedDistort(pixels, sampler),
+                         (pixels, *sampler.filtered))
+
+    def mesh(self, modifier, frame, parameters):
+        key = ("mesh", tuple(frame), int(parameters.get("rows", 4)),
+               int(parameters.get("columns", 4)), float(parameters.get("smoothness", 50.)),
+               tuple(tuple(point) for point in (getattr(modifier, "source_points", None) or ())),
+               tuple(tuple(point) for point in (getattr(modifier, "points", None) or ())))
+        prepared = self._get(key)
+        if prepared is not None:
+            return prepared
+        prepared = _mesh(modifier, frame, parameters)
+        return self._put(key, prepared, prepared)
+
+    def clear(self):
+        self._entries.clear()
+        self.bytes = 0
+
+
 def _triangle_map(query, source, destination, faces):
     """Inverse mesh with stable overlapping-face order and transparent holes."""
     result = np.full_like(query, np.nan)
+    if not len(faces):
+        return result
     flat = query.reshape(-1, 2)
     output = result.reshape(-1, 2)
     qlow, qhigh = flat.min(axis=0), flat.max(axis=0)
-    for face in faces:
-        tri = destination[face]
-        low, high = tri.min(axis=0), tri.max(axis=0)
-        if np.any(high < qlow) or np.any(low > qhigh):
-            continue
-        selected = np.flatnonzero(np.all((flat >= low - 1e-8) & (flat <= high + 1e-8), axis=1))
+    blocks = None
+    if query.ndim == 3 and len(flat) > 4096 and len(faces) > 16 and np.isfinite(query).all():
+        # A tessellated 4x4 mesh has hundreds of faces. Scanning every pixel
+        # for every face made small unchanged backgrounds take seconds. Bound
+        # the exact query points in small grid blocks; only blocks intersecting
+        # a face can contain its pixels. This also works for projective grids,
+        # folded faces and overlap because it changes neither coordinates nor
+        # the original face order.
+        height, width = query.shape[:2]
+        blocks, lows, highs = [], [], []
+        for top in range(0, height, 32):
+            for left in range(0, width, 32):
+                bottom, right = min(top + 32, height), min(left + 32, width)
+                points = query[top:bottom, left:right].reshape(-1, 2)
+                lows.append(points.min(axis=0))
+                highs.append(points.max(axis=0))
+                blocks.append((np.arange(top, bottom)[:, None] * width
+                               + np.arange(left, right)).ravel())
+        lows, highs = np.asarray(lows), np.asarray(highs)
+    # Reject unrelated faces together. Native tiles usually intersect only a
+    # few faces; walking the whole tessellation in Python for every strip made
+    # final mesh edits much more expensive than their actual sampling work.
+    triangles = destination[faces]
+    face_lows, face_highs = triangles.min(axis=1), triangles.max(axis=1)
+    candidate_faces = np.flatnonzero(~(np.any(face_highs < qlow, axis=1)
+                                       | np.any(face_lows > qhigh, axis=1)))
+    for face_index in candidate_faces:
+        face, tri = faces[face_index], triangles[face_index]
+        low, high = face_lows[face_index], face_highs[face_index]
+        if blocks is None:
+            selected = np.flatnonzero(np.all((flat >= low - 1e-8) & (flat <= high + 1e-8), axis=1))
+        else:
+            intersecting = np.flatnonzero(np.all((highs >= low - 1e-8) & (lows <= high + 1e-8), axis=1))
+            if not len(intersecting):
+                continue
+            candidates = np.concatenate([blocks[index] for index in intersecting])
+            points = flat[candidates]
+            selected = candidates[np.all((points >= low - 1e-8) & (points <= high + 1e-8), axis=1)]
         if not len(selected):
             continue
         matrix = np.column_stack((tri[1] - tri[0], tri[2] - tri[0]))
@@ -585,7 +726,8 @@ def _glitch_map(world, frame, center, parameters, channel=1):
 
 
 def render_distort(image: QImage, bounds: QRectF, modifier, local_to_world: QTransform | None = None,
-                   output_bounds: QRectF | None = None, cancelled=None, pixel_scale=1., *, displacement_image: QImage | None = None):
+                   output_bounds: QRectF | None = None, cancelled=None, pixel_scale=1., *,
+                   displacement_image: QImage | None = None, preparation_cache=None):
     """Return a full-strength distortion, or ``None`` when cancelled.
 
     ``pixel_scale`` controls output resolution only. The source image always
@@ -612,8 +754,13 @@ def render_distort(image: QImage, bounds: QRectF, modifier, local_to_world: QTra
     # capture still spans exactly the same local bounds after downsampling.
     if pixel_scale < 1. and max(source_native_size) > 512:
         image = image.scaled(512, 512, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
-    pixels = _rgba(image)
-    sampler = _Sampler(pixels, parameters.get("interpolation", "bilinear"), parameters.get("edges", "transparent"))
+    interpolation, edges = parameters.get("interpolation", "bilinear"), parameters.get("edges", "transparent")
+    if preparation_cache is None:
+        pixels = _rgba(image)
+        sampler = _Sampler(pixels, interpolation, edges)
+    else:
+        prepared = preparation_cache.source(image, interpolation, edges)
+        pixels, sampler = prepared.pixels, prepared.sampler
     output = np.zeros((height, width, 4), np.uint8)
     image_scale = np.asarray((image.width() / bounds.width(), image.height() / bounds.height()))
 
@@ -631,7 +778,8 @@ def render_distort(image: QImage, bounds: QRectF, modifier, local_to_world: QTra
             matrix, offset = np.eye(2), np.zeros(2)
         context.update(matrix=np.linalg.inv(matrix), offset=offset)
     elif effect == "mesh_warp":
-        context["mesh"] = _mesh(modifier, frame, parameters)
+        context["mesh"] = (_mesh(modifier, frame, parameters) if preparation_cache is None
+                           else preparation_cache.mesh(modifier, frame, parameters))
     elif effect == "deform":
         src, dst = _anchors(modifier, frame)
         context["pins"] = (src, src + (dst - src) * float(parameters.get("amount", 100.)) / 100.)

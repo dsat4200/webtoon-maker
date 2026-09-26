@@ -106,6 +106,8 @@ from comic_editor.ui.mask_gradient import MaskGradientFeatures
 from comic_editor.ui.mask_selection import MaskSelectionFeatures
 from comic_editor.ui.solo_features import SoloFeatures
 from comic_editor.ui.show_on_top_features import ShowOnTopFeatures
+from comic_editor.ui.document_projection import DocumentProjection
+from comic_editor.ui.document_projection_features import DocumentProjectionFeatures
 from comic_editor.ui.scene_culling import SceneRenderBounds
 from comic_editor.ui.network import create_network_manager
 from comic_editor.ui.multi_raster_selection import MultiRasterSelectionFeatures
@@ -596,7 +598,7 @@ class CanvasPerformanceMonitor:
         }
 
 
-class _CanvasLogic(MultiRasterSelectionFeatures, ShowOnTopFeatures, SoloFeatures, ViewFeatures, MaskSelectionFeatures, MaskGradientFeatures, TilingFeatures, CageFeatures, ArrayFeatures, SpatialModifierFeatures, DistortFeatures, CurvesFeatures, TextFeatures):
+class _CanvasLogic(DocumentProjectionFeatures, MultiRasterSelectionFeatures, ShowOnTopFeatures, SoloFeatures, ViewFeatures, MaskSelectionFeatures, MaskGradientFeatures, TilingFeatures, CageFeatures, ArrayFeatures, SpatialModifierFeatures, DistortFeatures, CurvesFeatures, TextFeatures):
     documentChanged = Signal(object)
     viewSettingsChanged = Signal()
     visualChanged = Signal(object)
@@ -1027,6 +1029,7 @@ class _CanvasLogic(MultiRasterSelectionFeatures, ShowOnTopFeatures, SoloFeatures
         self._asset_drag_valid = False
         self._asset_drag_clip_cache: dict[str, QPainterPath | None] = {}
         self._scene_cache = QImage()
+        self._document_projection = DocumentProjection()
         self._render_bounds = SceneRenderBounds(self)
         self._scene_cache_key: tuple | None = None
         self._scene_dirty_full = True
@@ -1119,10 +1122,12 @@ class _CanvasLogic(MultiRasterSelectionFeatures, ShowOnTopFeatures, SoloFeatures
         self._predictive = None
         self._restore_gc_after_stroke()
 
-    def _invalidate_scene_cache(self, *args) -> None:
+    def _invalidate_scene_cache(self, *args, projection=True) -> None:
         self._scene_dirty_full = True
         self._scene_dirty_widget = QRect()
         self._scene_cache_key = None
+        if projection:
+            self._document_projection.invalidate()
 
     def _invalidate_tone_mask_overlay(self, *, contributors: bool = True) -> None:
         if contributors:
@@ -1146,6 +1151,7 @@ class _CanvasLogic(MultiRasterSelectionFeatures, ShowOnTopFeatures, SoloFeatures
         return mapped.toAlignedRect().intersected(self.rect())
 
     def _mark_scene_dirty_world(self, world: QRectF) -> QRect:
+        self._document_projection.invalidate(world)
         widget = self._world_dirty_to_widget(world)
         if widget.isEmpty():
             return widget
@@ -1222,6 +1228,7 @@ class _CanvasLogic(MultiRasterSelectionFeatures, ShowOnTopFeatures, SoloFeatures
     def _active_modifier_instances(
         self, modifier_ids: Iterable[str], *, suppress_outline: bool = False,
     ) -> list:
+        from comic_editor.ui.transform_modifier_preview import effective_preview_modifier
         if self.chapter is None:
             return []
         result = []
@@ -1237,7 +1244,7 @@ class _CanvasLogic(MultiRasterSelectionFeatures, ShowOnTopFeatures, SoloFeatures
                     continue
             if suppress_outline and isinstance(modifier, OutlineModifier):
                 continue
-            result.append(modifier)
+            result.append(effective_preview_modifier(self, modifier))
         return result
 
     def _has_active_modifiers(self, modifier_ids: Iterable[str]) -> bool:
@@ -1274,12 +1281,11 @@ class _CanvasLogic(MultiRasterSelectionFeatures, ShowOnTopFeatures, SoloFeatures
             return QRectF(
                 0, 0, self.chapter.width, self.chapter.height
             )
-        modifier_ids = list(obj.modifier_ids)
+        owners = [obj, *reversed(self.chapter.ancestor_layers(obj.parent_layer_id))]
+        modifier_ids = [mid for owner in owners for mid in owner.modifier_ids]
         context = self._drawing_tiling(obj)
         if context:
             world = self._tiling_boundary(context[0]).boundingRect()
-        for layer in reversed(self.chapter.ancestor_layers(obj.parent_layer_id)):
-            modifier_ids.extend(layer.modifier_ids)
         if any(isinstance(m, (HalftoneModifier, PixelateModifier, DistortModifier))
                for m in self._active_modifier_instances(modifier_ids)):
             # A new stroke can change the reference frame or a neighboring
@@ -1287,21 +1293,68 @@ class _CanvasLogic(MultiRasterSelectionFeatures, ShowOnTopFeatures, SoloFeatures
             return QRectF(0, 0, self.chapter.width, self.chapter.height).united(world)
         if any(isinstance(self.chapter.modifiers.get(mid), (MirrorModifier, ArrayModifier, RadialBlurModifier, CageTransformModifier, StrokeModifier)) for mid in modifier_ids):
             return effect_bounds(world, self._active_modifier_instances(modifier_ids))
-        padding = max((
-            self._modifier_maximum(
-                modifier, "strength", modifier.strength
-            ) * 3.0
-            if isinstance(modifier, BlurModifier)
-            else self._modifier_maximum(
-                modifier, "thickness", modifier.thickness
-            ) + outline_blur_padding(modifier)
-            if isinstance(modifier, OutlineModifier)
-            else 0.0
-            for modifier_id in modifier_ids
-            if (modifier := self.chapter.modifiers.get(modifier_id)) is not None
-            and not modifier.muted and modifier.intensity > 0
-        ), default=0.0)
-        return QRectF(world).adjusted(-padding, -padding, padding, padding)
+        return self._finite_effect_expanded_dirty(world, owners)
+
+    def _finite_effect_expanded_dirty(
+        self, world: QRectF, owners: list[LayerNode | DocumentObject],
+    ) -> QRectF:
+        """Accumulate local effect support in each owner's rendering frame."""
+        result = QRectF(world)
+        for owner in owners:
+            modifiers = self._active_modifier_instances(owner.modifier_ids)
+            padding = sum(
+                self._modifier_maximum(modifier, "strength", modifier.strength) * 3.0
+                if isinstance(modifier, BlurModifier)
+                else self._modifier_maximum(modifier, "thickness", modifier.thickness)
+                + outline_blur_padding(modifier)
+                if isinstance(modifier, OutlineModifier)
+                else 0.0
+                for modifier in modifiers
+                if modifier.intensity > 0 or "intensity" in modifier.parameter_masks
+            )
+            if padding <= 0:
+                continue
+            parent_id = (owner.parent_id if isinstance(owner, LayerNode)
+                         else owner.parent_layer_id)
+            mapping = self.layer_world_transform(parent_id) if parent_id else QTransform()
+            if isinstance(owner, RasterObject) and (
+                owner.modifier_source_frame is not None
+                or any(isinstance(modifier, (RadialBlurModifier, ArrayModifier,
+                    HalftoneModifier, PixelateModifier, DistortModifier, CurvesModifier))
+                    for modifier in modifiers)
+            ):
+                # Staged raster effects run before placement; generic object
+                # and layer effects run after placement in the parent's frame.
+                destination = self._multi_transform_preview_quads.get(owner.object_id)
+                if destination is None and owner.object_id == self.selected_object_id:
+                    destination = self._transform_preview_quad
+                mapping = (QTransform.fromTranslate(owner.x, owner.y)
+                           * self._drawing_object_transform(owner, destination) * mapping)
+            if mapping.isAffine():
+                # Transform only the support vectors. Mapping a rotated dirty
+                # rectangle out and back needlessly expands all its contents.
+                dx = padding * (abs(mapping.m11()) + abs(mapping.m21()))
+                dy = padding * (abs(mapping.m12()) + abs(mapping.m22()))
+                result.adjust(-dx, -dy, dx, dy)
+            else:
+                inverse, valid = mapping.inverted()
+                if not valid:
+                    return QRectF(0, 0, self.chapter.width, self.chapter.height).united(result)
+                inverse_denominators = [inverse.m13()*x + inverse.m23()*y + inverse.m33()
+                                        for x in (result.left(), result.right())
+                                        for y in (result.top(), result.bottom())]
+                if min(inverse_denominators) <= 0 <= max(inverse_denominators):
+                    return QRectF(0, 0, self.chapter.width, self.chapter.height).united(result)
+                local = inverse.mapRect(result).adjusted(-padding, -padding, padding, padding)
+                # A projective horizon has unbounded support. Use the same
+                # conservative document fallback as nonlocal effect paths.
+                denominators = [mapping.m13()*x + mapping.m23()*y + mapping.m33()
+                                for x in (local.left(), local.right())
+                                for y in (local.top(), local.bottom())]
+                if min(denominators) <= 0 <= max(denominators):
+                    return QRectF(0, 0, self.chapter.width, self.chapter.height).united(result)
+                result = result.united(mapping.mapRect(local))
+        return result
 
     def _entity_expanded_dirty(
         self, kind: str, entity_id: str, world: QRectF,
@@ -1318,7 +1371,6 @@ class _CanvasLogic(MultiRasterSelectionFeatures, ShowOnTopFeatures, SoloFeatures
             layer = self.chapter.layers.get(layer_id)
             if layer is None:
                 return
-            targets.append(layer)
             for child in layer.children:
                 if child.kind == "layer":
                     collect_layer(child.entity_id)
@@ -1326,6 +1378,7 @@ class _CanvasLogic(MultiRasterSelectionFeatures, ShowOnTopFeatures, SoloFeatures
                     obj = self.chapter.objects.get(child.entity_id)
                     if obj is not None:
                         targets.append(obj)
+            targets.append(layer)
 
         if kind == "layer":
             collect_layer(entity_id)
@@ -1333,19 +1386,6 @@ class _CanvasLogic(MultiRasterSelectionFeatures, ShowOnTopFeatures, SoloFeatures
             obj = self.chapter.objects.get(entity_id)
             if obj is not None:
                 targets.append(obj)
-        target_keys = {
-            (
-                "layer" if isinstance(target, LayerNode) else "object",
-                target.layer_id if isinstance(target, LayerNode)
-                else target.object_id,
-            )
-            for target in targets
-        }
-        if any(
-            target_keys.intersection(mask.contributors)
-            for mask in self.chapter.masks.values()
-        ):
-            return QRectF(0, 0, self.chapter.width, self.chapter.height)
         modifier_ids: list[str] = []
         for target in targets:
             modifier_ids.extend(target.modifier_ids)
@@ -1359,27 +1399,29 @@ class _CanvasLogic(MultiRasterSelectionFeatures, ShowOnTopFeatures, SoloFeatures
         while parent_id:
             parent = self.chapter.layers[parent_id]
             modifier_ids.extend(parent.modifier_ids)
+            targets.append(parent)
             parent_id = parent.parent_id
+        # A changed descendant also changes the rendered mask of any ancestor
+        # registered as a contributor, including dependants outside this area.
+        target_keys = {
+            (
+                "layer" if isinstance(target, LayerNode) else "object",
+                target.layer_id if isinstance(target, LayerNode)
+                else target.object_id,
+            )
+            for target in targets
+        }
+        if any(
+            target_keys.intersection(mask.contributors)
+            for mask in self.chapter.masks.values()
+        ):
+            return QRectF(0, 0, self.chapter.width, self.chapter.height)
         if any(isinstance(m, (HalftoneModifier, PixelateModifier, DistortModifier))
                for m in self._active_modifier_instances(modifier_ids)):
             return QRectF(0, 0, self.chapter.width, self.chapter.height).united(world)
         if any(isinstance(self.chapter.modifiers.get(mid), (MirrorModifier, ArrayModifier, RadialBlurModifier, CageTransformModifier, StrokeModifier)) for mid in modifier_ids):
             return effect_bounds(world, self._active_modifier_instances(modifier_ids))
-        padding = max((
-            self._modifier_maximum(
-                modifier, "strength", modifier.strength
-            ) * 3.0
-            if isinstance(modifier, BlurModifier)
-            else self._modifier_maximum(
-                modifier, "thickness", modifier.thickness
-            ) + outline_blur_padding(modifier)
-            if isinstance(modifier, OutlineModifier)
-            else 0.0
-            for modifier_id in modifier_ids
-            if (modifier := self.chapter.modifiers.get(modifier_id)) is not None
-            and not modifier.muted and modifier.intensity > 0
-        ), default=0.0)
-        return QRectF(world).adjusted(-padding, -padding, padding, padding)
+        return self._finite_effect_expanded_dirty(world, targets)
 
     def _flush_visual_dirty(self) -> None:
         world = QRectF(self._visual_pending_world)
@@ -1442,8 +1484,17 @@ class _CanvasLogic(MultiRasterSelectionFeatures, ShowOnTopFeatures, SoloFeatures
         self._render_bounds.invalidate(kind, entity_id)
 
     def _render_scene_cache_rect(
-        self, dirty: QRect, *, target: QImage | None = None, live_ink=False,
+        self, dirty: QRect, *, target: QImage | None = None, live_ink=False, projection=True,
     ) -> None:
+        if projection and self._uses_document_projection() and not live_ink:
+            painter = QPainter(self._scene_cache if target is None else target)
+            try:
+                painter.setClipRect(dirty)
+                painter.fillRect(dirty, QColor("#242428"))
+                self._paint_document_projection(painter)
+            finally:
+                painter.end()
+            return
         self._render_bounds.prepare()
         painter = QPainter(self._scene_cache if target is None else target)
         painter.setClipRect(dirty)
@@ -1490,6 +1541,16 @@ class _CanvasLogic(MultiRasterSelectionFeatures, ShowOnTopFeatures, SoloFeatures
 
     def _clear_detached_input_state(self) -> None:
         """Reset transient pointer state that cannot survive without a document."""
+        self._projection_completed_view = None
+        self._mesh_warp_parameter_drag_id = None
+        self._mesh_warp_preview_session_id = None
+        self._mesh_warp_preview_presented = False
+        self._projection_frame_pending = False
+        self._projection_work_waiting = False
+        self._projection_render_error = None
+        prepared_distort = getattr(self, "_distort_preparation_cache", None)
+        if prepared_distort is not None:
+            prepared_distort.clear()
         if self.export_rect_editing:
             self.set_export_rect_editing(False)
         self._view_overflow_image = QImage()
@@ -1892,6 +1953,9 @@ class _CanvasLogic(MultiRasterSelectionFeatures, ShowOnTopFeatures, SoloFeatures
         self._modifier_source_cache_bytes = 0
         self._outline_distance_cache.clear()
         self._blur_pyramid_cache.clear()
+        prepared_distort = getattr(self, "_distort_preparation_cache", None)
+        if prepared_distort is not None:
+            prepared_distort.clear()
         self._invalidate_tone_mask_overlay()
         self._promoted_vector_preview = None
         self._invalidate_scene_cache()
@@ -2471,7 +2535,7 @@ class _CanvasLogic(MultiRasterSelectionFeatures, ShowOnTopFeatures, SoloFeatures
         self._restore_modifier_selection()
         self.selectionChanged.emit(kind, entity_id)
         self.selectionSetChanged.emit(list(self.selected_entities))
-        self._invalidate_scene_cache()
+        self._invalidate_selection_scene_cache()
         self.update()
 
     def set_selection_set(
@@ -2565,7 +2629,7 @@ class _CanvasLogic(MultiRasterSelectionFeatures, ShowOnTopFeatures, SoloFeatures
         # Re-emit after installing the complete set so tree synchronization
         # cannot collapse the selection to the primary row.
         self.selectionChanged.emit(*primary)
-        self._invalidate_scene_cache()
+        self._invalidate_selection_scene_cache()
         self.update()
         return True
 
@@ -2600,7 +2664,7 @@ class _CanvasLogic(MultiRasterSelectionFeatures, ShowOnTopFeatures, SoloFeatures
         self.vectorSelectionChanged.emit(set(), set())
         self.selectionChanged.emit("", "")
         self.selectionSetChanged.emit([])
-        self._invalidate_scene_cache()
+        self._invalidate_selection_scene_cache()
         self.update()
 
     def _selection_snapshot(self):
@@ -2849,7 +2913,7 @@ class _CanvasLogic(MultiRasterSelectionFeatures, ShowOnTopFeatures, SoloFeatures
             self._invalidate_scene_cache()
         self.tool = tool
         self.toolChanged.emit(tool)
-        self._invalidate_scene_cache()
+        self._invalidate_selection_scene_cache()
         self.update()
         return True
 
@@ -2952,7 +3016,7 @@ class _CanvasLogic(MultiRasterSelectionFeatures, ShowOnTopFeatures, SoloFeatures
         if abs(self.rotation) <= 1e-9:
             return
         self.rotation = 0.0
-        self._invalidate_scene_cache()
+        self._invalidate_scene_cache(projection=False)
         self.update()
         self.cameraChanged.emit()
         self.interactionFinished.emit()
@@ -3297,10 +3361,17 @@ class _CanvasLogic(MultiRasterSelectionFeatures, ShowOnTopFeatures, SoloFeatures
             self._draw_page_gap_overlay(painter)
             painter.restore()
         else:
-            self._ensure_scene_cache()
             painter.setTransform(QTransform())
             promoted_ink = self._show_on_top_live_ink()
-            if promoted_ink:
+            mesh_preview = self._mesh_warp_preview_modifier()
+            if mesh_preview is None:
+                self._finish_mesh_warp_preview()
+            if mesh_preview is not None:
+                self._paint_mesh_warp_preview(painter, mesh_preview)
+            elif self._uses_document_projection():
+                self._paint_document_projection(painter, live_ink=promoted_ink)
+            elif promoted_ink:
+                self._ensure_scene_cache()
                 # Keep prediction and unfinished vector ink out of the reusable
                 # scene image, while compositing them below on-top artwork.
                 frame = QImage(self._scene_cache.size(), self._scene_cache.format())
@@ -3308,6 +3379,7 @@ class _CanvasLogic(MultiRasterSelectionFeatures, ShowOnTopFeatures, SoloFeatures
                 self._render_scene_cache_rect(self.rect(), target=frame, live_ink=True)
                 painter.drawImage(0, 0, frame)
             else:
+                self._ensure_scene_cache()
                 painter.drawImage(0, 0, self._scene_cache)
             painter.setTransform(self.camera_transform())
             painter.save()
@@ -4605,6 +4677,8 @@ class _CanvasLogic(MultiRasterSelectionFeatures, ShowOnTopFeatures, SoloFeatures
             return
         if not self._render_bounds.layer_visible(layer, visible_world):
             return
+        if not self._render_bounds.layer_clip_visible(painter, layer, visible_world):
+            return
         if (
             (
                 self._has_active_modifiers(layer.modifier_ids)
@@ -4855,6 +4929,8 @@ class _CanvasLogic(MultiRasterSelectionFeatures, ShowOnTopFeatures, SoloFeatures
             parent_inverse.mapRect(self._modifier_viewport_region(visible_world)), modifiers)
         capture_world = parent_transform.mapRect(bounds)
         world_origin = parent_transform.map(bounds.topLeft())
+        from comic_editor.ui.effect_regions import region_scope
+        request_scope = region_scope(self, self._effect_request_scope("layer", layer.layer_id), bounds)
         layer_signature = self._modifier_layer_signature(layer.layer_id)
         cache_key = (
             "layer", layer.layer_id,
@@ -4868,7 +4944,7 @@ class _CanvasLogic(MultiRasterSelectionFeatures, ShowOnTopFeatures, SoloFeatures
         provisional = False
         if processed is None:
             processed = self._cached_modifier_output(
-                cache_key, self._effect_request_scope("layer", layer.layer_id),
+                cache_key, request_scope,
                 layer.opacity_mask, bounds, parent_transform, capture_world)
         if processed is None:
             source_key = (
@@ -4937,7 +5013,7 @@ class _CanvasLogic(MultiRasterSelectionFeatures, ShowOnTopFeatures, SoloFeatures
                     world_to_image, capture_world,
                 ),
                 cache_key=("interactive-stack", cache_key),
-                scope=self._effect_request_scope("layer", layer.layer_id),
+                scope=request_scope,
                 upstream_provisional=source_provisional,
             )
             if layer.opacity_mask is not None:
@@ -4953,7 +5029,7 @@ class _CanvasLogic(MultiRasterSelectionFeatures, ShowOnTopFeatures, SoloFeatures
             if not provisional:
                 self._modifier_cache_put(cache_key, processed)
         if not provisional:
-            self._retain_modifier_output(cache_key, self._effect_request_scope("layer", layer.layer_id), processed)
+            self._retain_modifier_output(cache_key, request_scope, processed)
         painter.save()
         painter.setOpacity(parent_opacity * layer.opacity)
         outline_overflows = any(
@@ -7528,6 +7604,8 @@ class _CanvasLogic(MultiRasterSelectionFeatures, ShowOnTopFeatures, SoloFeatures
             return
         if not self._render_bounds.object_visible(obj, local_visible):
             return
+        if not self._render_bounds.painter_clip_visible(painter, local_visible):
+            return
         if (
             isinstance(obj, GradientObject)
             and self._is_outward_gradient(obj)
@@ -7608,6 +7686,7 @@ class _CanvasLogic(MultiRasterSelectionFeatures, ShowOnTopFeatures, SoloFeatures
 
     def _modifier_parameter_signature(self, ids: Iterable[str]) -> tuple[str, ...]:
         from comic_editor.ui.modifier_rendering import modifier_render_settings
+        from comic_editor.ui.transform_modifier_preview import effective_preview_modifier
         result: list[str] = []
         capturing_colors = getattr(self, "_rendering_halftone_source", False)
         if capturing_colors:
@@ -7617,6 +7696,7 @@ class _CanvasLogic(MultiRasterSelectionFeatures, ShowOnTopFeatures, SoloFeatures
             modifier = self.chapter.modifiers.get(item)
             if modifier is None or modifier.muted:
                 continue
+            modifier = effective_preview_modifier(self, modifier)
             result.append(json.dumps(
                 modifier_render_settings(modifier), sort_keys=True, separators=(",", ":"),
             ))
@@ -8158,7 +8238,8 @@ class _CanvasLogic(MultiRasterSelectionFeatures, ShowOnTopFeatures, SoloFeatures
         return processed
 
     def _retain_modifier_output(self, key, scope, image):
-        if (self._interactive_render and not self._render_base_alpha
+        from comic_editor.ui.effect_regions import exact_reference_sampling
+        if ((self._interactive_render or exact_reference_sampling(self)) and not self._render_base_alpha
                 and self._rendering_mask_contributor <= 0
                 and getattr(self, "_effect_preview_channel", "canvas") != "navigator"):
             # Keep the latest displayed exact output separate from temporary
@@ -8297,6 +8378,8 @@ class _CanvasLogic(MultiRasterSelectionFeatures, ShowOnTopFeatures, SoloFeatures
                               if not viewport_world.isEmpty() else local_visible)
             bounds = outline_capture_bounds(self, painter, bounds, viewport_local, modifiers)
         world_origin = layer_transform.map(bounds.topLeft())
+        from comic_editor.ui.effect_regions import region_scope
+        request_scope = region_scope(self, self._effect_request_scope("object", obj.object_id), bounds)
         object_signature = self._modifier_object_signature(obj)
         cache_key = (
             "object", obj.object_id,
@@ -8309,7 +8392,7 @@ class _CanvasLogic(MultiRasterSelectionFeatures, ShowOnTopFeatures, SoloFeatures
         provisional = False
         if processed is None:
             processed = self._cached_modifier_output(
-                cache_key, self._effect_request_scope("object", obj.object_id),
+                cache_key, request_scope,
                 obj.opacity_mask, bounds, layer_transform, world_bounds)
         if processed is None:
             source_key = (
@@ -8356,7 +8439,7 @@ class _CanvasLogic(MultiRasterSelectionFeatures, ShowOnTopFeatures, SoloFeatures
                     world_to_image, world_bounds,
                 ),
                 cache_key=("interactive-stack", cache_key),
-                scope=self._effect_request_scope("object", obj.object_id),
+                scope=request_scope,
                 upstream_provisional=source_provisional,
             )
             if obj.opacity_mask is not None:
@@ -8372,7 +8455,7 @@ class _CanvasLogic(MultiRasterSelectionFeatures, ShowOnTopFeatures, SoloFeatures
             if not provisional:
                 self._modifier_cache_put(cache_key, processed)
         if not provisional:
-            self._retain_modifier_output(cache_key, self._effect_request_scope("object", obj.object_id), processed)
+            self._retain_modifier_output(cache_key, request_scope, processed)
         opacity = parent_opacity if self._render_base_alpha else (
             parent_opacity
             if obj.opacity_locked else parent_opacity * obj.opacity
@@ -8393,7 +8476,8 @@ class _CanvasLogic(MultiRasterSelectionFeatures, ShowOnTopFeatures, SoloFeatures
         inverse, valid = mapping.inverted()
         if not valid:
             return
-        world = entity_visual_bounds(self.chapter, self.tiles, kind, identifier)
+        world = entity_visual_bounds(self.chapter, self.tiles, kind, identifier,
+                                     layer_mapping=self.layer_world_transform)
         world = world.united(self._raster_selection_capture_bounds(kind, identifier))
         if layer:
             from comic_editor.ui.baking import visual_bounds
@@ -9088,7 +9172,7 @@ class _CanvasLogic(MultiRasterSelectionFeatures, ShowOnTopFeatures, SoloFeatures
         return grid
 
     def refresh_grid_settings(self) -> None:
-        self._invalidate_scene_cache()
+        self._invalidate_scene_cache(projection=False)
         self.update()
 
     def _draw_grid(self, painter: QPainter, visible: QRectF) -> None:
@@ -10952,6 +11036,7 @@ class _CanvasLogic(MultiRasterSelectionFeatures, ShowOnTopFeatures, SoloFeatures
         self, kind: str, entity_id: str, transform: QTransform,
     ) -> None:
         """Keep a sole target's document-space focal rig attached to it."""
+        from comic_editor.ui.transform_modifier_preview import transform_modifier_rig
         if kind == "layer" and entity_id in self.chapter.layers:
             for child in self.chapter.layers[entity_id].children:
                 self._transform_single_target_focal_modifiers(child.kind, child.entity_id, transform)
@@ -10960,49 +11045,8 @@ class _CanvasLogic(MultiRasterSelectionFeatures, ShowOnTopFeatures, SoloFeatures
             return
         for modifier_id in target.modifier_ids:
             modifier = self.chapter.modifiers.get(modifier_id)
-            if isinstance(modifier, DistortModifier) and len(self.chapter.modifier_target_ids(modifier_id)) == 1:
-                self._transform_distort_modifier(modifier, transform)
-                continue
-            if isinstance(modifier, TilingModifier) and len(self.chapter.modifier_target_ids(modifier_id)) == 1:
-                a, b = transform.map(QPointF(1, 0))-transform.map(QPointF()), transform.map(QPointF(0, 1))-transform.map(QPointF())
-                length_a, length_b = math.hypot(a.x(), a.y()), math.hypot(b.x(), b.y())
-                if transform.isAffine() and abs(length_a-length_b) < 1e-6 and abs(a.x()*b.x()+a.y()*b.y()) < 1e-6 and transform.determinant() > 0:
-                    modifier.center = transform.map(QPointF(*modifier.center)).toTuple()
-                    modifier.side = max(1., modifier.side*length_a)
-                    modifier.rotation = (modifier.rotation+math.degrees(math.atan2(a.y(), a.x()))) % 360
-                continue
-            if isinstance(modifier, CageTransformModifier) and len(self.chapter.modifier_target_ids(modifier_id)) == 1:
-                rest = modifier.rest_points().reshape(modifier.rows, modifier.columns, 2)
-                corners = [rest[0, 0], rest[0, -1], rest[-1, -1], rest[-1, 0]]
-                modifier.source_quad = [transform.map(QPointF(*p)).toTuple() for p in corners]
-                modifier.points = [transform.map(QPointF(*p)).toTuple() for p in modifier.points]
-                modifier.pivot = transform.map(QPointF(*modifier.pivot)).toTuple()
-                continue
-            if isinstance(modifier, ArrayModifier) and len(self.chapter.modifier_target_ids(modifier_id)) == 1:
-                modifier.axis_start = transform.map(QPointF(*modifier.axis_start)).toTuple()
-                modifier.axis_end = transform.map(QPointF(*modifier.axis_end)).toTuple()
-                modifier.center = transform.map(QPointF(*modifier.center)).toTuple()
-                continue
-            if isinstance(modifier, RadialBlurModifier) and len(self.chapter.modifier_target_ids(modifier_id)) == 1:
-                modifier.center = transform.map(QPointF(*modifier.center)).toTuple()
-                continue
-            if isinstance(modifier, MirrorModifier) and len(self.chapter.modifier_target_ids(modifier_id)) == 1:
-                modifier.axis_start = transform.map(QPointF(*modifier.axis_start)).toTuple()
-                modifier.axis_end = transform.map(QPointF(*modifier.axis_end)).toTuple()
-                continue
-            if not isinstance(modifier, BlurModifier) or len(
-                self.chapter.modifier_target_ids(modifier_id)
-            ) != 1:
-                continue
-            center, _ramp, end = self._focal_points(modifier)
-            mapped_center = transform.map(center)
-            mapped_end = transform.map(end)
-            delta = mapped_end - mapped_center
-            modifier.focal_center = mapped_center.toTuple()
-            modifier.focal_radius = max(
-                1.0, math.hypot(delta.x(), delta.y())
-            )
-            modifier.focal_angle = math.atan2(delta.y(), delta.x())
+            if len(self.chapter.modifier_target_ids(modifier_id)) == 1:
+                transform_modifier_rig(self, modifier, transform)
 
     def _draw_focal_modifier_handles(self, painter: QPainter) -> None:
         if self._draw_distort_handles(painter):
@@ -12727,9 +12771,8 @@ class _CanvasLogic(MultiRasterSelectionFeatures, ShowOnTopFeatures, SoloFeatures
             return QRectF()
         page = self.chapter.layers[page_id]
         left, top, width, height = page.bound.bbox()
-        return QRectF(
-            page.translate_x + left, page.translate_y + top,
-            width, height,
+        return self.layer_world_transform(page_id).mapRect(
+            QRectF(left, top, width, height)
         )
 
     def physically_ordered_pages(self) -> list[str]:
@@ -13425,8 +13468,18 @@ class _CanvasLogic(MultiRasterSelectionFeatures, ShowOnTopFeatures, SoloFeatures
         minimum_top = min(rect.top() for rect in bounds)
         if minimum_top < 0:
             correction = 120 - minimum_top
+            translation = QTransform.fromTranslate(0.0, correction)
             for page_id in self.chapter.root_page_ids:
-                self.chapter.layers[page_id].translate_y += correction
+                page = self.chapter.layers[page_id]
+                self._transform_single_target_focal_modifiers(
+                    "layer", page_id, translation
+                )
+                if page.transform_frame is not None and page.transform_quad is not None:
+                    page.transform_quad = [
+                        (x, y + correction) for x, y in page.transform_quad
+                    ]
+                else:
+                    page.translate_y += correction
             self.chapter.height += math.ceil(correction)
             bounds = [
                 self.page_world_bounds(page_id)
@@ -14259,7 +14312,7 @@ class _CanvasLogic(MultiRasterSelectionFeatures, ShowOnTopFeatures, SoloFeatures
         self._vector_render_scale_owner = None
         self._vector_render_scale_override = None
         if redraw and self.chapter is not None:
-            self._invalidate_scene_cache()
+            self._invalidate_scene_cache(projection=False)
             self.update()
 
     def _settle_wheel_zoom(self) -> None:
@@ -20104,6 +20157,10 @@ class _CanvasLogic(MultiRasterSelectionFeatures, ShowOnTopFeatures, SoloFeatures
                 state["before"], after, "Edit distortion" if "distort" in state else "Edit array" if "array" in state else "Edit tiling" if "tiling" in state else "Edit radial blur" if "radial" in state else "Edit mirror" if "mirror" in state else "Edit focal blur"
             )
         self.interactionFinished.emit()
+        if "distort" in state and getattr(self, "_mesh_warp_preview_session_id", None) is not None:
+            # A stationary release may have no pending move repaint. Replace
+            # the transient mesh preview even when no further input arrives.
+            self.update()
         return True
 
     def _dispatch_tool_press(
@@ -23910,7 +23967,7 @@ class _CanvasLogic(MultiRasterSelectionFeatures, ShowOnTopFeatures, SoloFeatures
         obj = self.chapter.objects[self.selected_object_id]
         old_preview = (
             list(self._transform_preview_quad)
-            if isinstance(obj, ImageObject) and self._transform_preview_quad
+            if self._transform_preview_quad
             else None
         )
         parent_transform = self.layer_world_transform(obj.parent_layer_id)
@@ -23998,16 +24055,16 @@ class _CanvasLogic(MultiRasterSelectionFeatures, ShowOnTopFeatures, SoloFeatures
                         start[index][1] + edge_dy,
                     )
         if self._quad_is_valid(candidate):
+            old_world = parent_transform.map(QPolygonF([
+                QPointF(x, y) for x, y in (old_preview or start)
+            ])).boundingRect()
+            old_dirty = self._entity_expanded_dirty("object", obj.object_id, old_world)
             self._transform_preview_quad = candidate
-            if isinstance(obj, ImageObject) and old_preview is not None:
-                polygons = []
-                for quad in (old_preview, candidate):
-                    polygons.append(parent_transform.map(QPolygonF([
-                        QPointF(x, y) for x, y in quad
-                    ])).boundingRect())
-                self._queue_visual_dirty(
-                    polygons[0].united(polygons[1]), notify_preview=False
-                )
+            new_world = parent_transform.map(QPolygonF([
+                QPointF(x, y) for x, y in candidate
+            ])).boundingRect()
+            new_dirty = self._entity_expanded_dirty("object", obj.object_id, new_world)
+            self._queue_visual_dirty(old_dirty.united(new_dirty), notify_preview=False)
 
     def _update_multi_transform_preview(self, point: QPointF) -> None:
         start = list(self._transform_start_quad or [])
@@ -25018,6 +25075,8 @@ class RasterCanvasWidget(_CanvasLogic, QWidget):
 
 class GpuCanvasWidget(_CanvasLogic, QOpenGLWidget):
     """OpenGL-backed presentation using the same sparse document renderer."""
+
+    _document_projection_enabled = True
 
     def __init__(self, settings: EditorSettings, parent=None):
         super().__init__(settings, parent)

@@ -246,7 +246,7 @@ class ToolSettingsControls(QWidget):
         layout = QVBoxLayout(page)
         layout.setContentsMargins(0, 0, 0, 0)
         description = QLabel(
-            "Click to add a connected area of similar color from the visible artwork.\n\n"
+            "Click to add similar colors from the visible artwork.\n\n"
             "Control: Remove\nShift: Add", page,
         )
         description.setWordWrap(True)
@@ -277,6 +277,20 @@ class ToolSettingsControls(QWidget):
             "0 selects an exact color; higher values include more similar colors (up to 255)."
         )
         layout.addWidget(group)
+        self.mask_wand_connected = QCheckBox("Connected", page)
+        self.mask_wand_connected.setObjectName("maskWandConnected")
+        self.mask_wand_connected.setToolTip(
+            "Select only the connected region. Turn off to select matching colors throughout the document."
+        )
+        self.mask_wand_connected.toggled.connect(self._mask_wand_connected_changed)
+        layout.addWidget(self.mask_wand_connected)
+        self.mask_wand_ignore_other_layers = QCheckBox("Ignore other layers", page)
+        self.mask_wand_ignore_other_layers.setObjectName("maskWandIgnoreOtherLayers")
+        self.mask_wand_ignore_other_layers.setToolTip(
+            "Sample only the selected image or object, or the contents of the selected layer."
+        )
+        self.mask_wand_ignore_other_layers.toggled.connect(self._mask_wand_ignore_other_layers_changed)
+        layout.addWidget(self.mask_wand_ignore_other_layers)
         layout.addStretch(1)
         self.mask_wand_tolerance.valueChanged.connect(self._mask_wand_tolerance_changed)
         return page
@@ -286,6 +300,18 @@ class ToolSettingsControls(QWidget):
             return
         self.settings.mask_wand_tolerance = value
         self.settings.clamp()
+        self.settingsChanged.emit()
+
+    def _mask_wand_connected_changed(self, checked: bool) -> None:
+        if self._loading:
+            return
+        self.settings.mask_wand_connected = checked
+        self.settingsChanged.emit()
+
+    def _mask_wand_ignore_other_layers_changed(self, checked: bool) -> None:
+        if self._loading:
+            return
+        self.settings.mask_wand_ignore_other_layers = checked
         self.settingsChanged.emit()
 
     def _build_pencil_page(self) -> QWidget:
@@ -698,6 +724,8 @@ class ToolSettingsControls(QWidget):
             self.settings.mask_pencil_to_alpha,
         )
         self.mask_wand_tolerance.setValue(self.settings.mask_wand_tolerance)
+        self.mask_wand_connected.setChecked(self.settings.mask_wand_connected)
+        self.mask_wand_ignore_other_layers.setChecked(self.settings.mask_wand_ignore_other_layers)
         self.pencil_transform_handles.setChecked(
             self.settings.pencil_transform_handles_visible
         )

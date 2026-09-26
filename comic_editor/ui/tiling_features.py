@@ -18,10 +18,14 @@ class TilingFeatures:
     def _own_tiling(self, target):
         if not self.chapter or target is None:
             return None
-        return next((m for mid in target.modifier_ids
+        modifier = next((m for mid in target.modifier_ids
                      if isinstance(m := self.chapter.modifiers.get(mid), TilingModifier)
                      and not m.muted and (m.intensity > 0 or any(
                          max(b.black_value, b.white_value) > 0 for b in m.parameter_masks.values()))), None)
+        if modifier is not None:
+            from comic_editor.ui.transform_modifier_preview import effective_preview_modifier
+            modifier = effective_preview_modifier(self, modifier)
+        return modifier
 
     def _drawing_tiling(self, drawing):
         if drawing is None or self.active_tone_mask_id:

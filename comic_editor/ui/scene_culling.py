@@ -158,6 +158,14 @@ class SceneRenderBounds:
         )
 
     def _transform(self, layer_id):
+        # Bounds are bypassed for live branches, but inherited clip rejection
+        # also maps the requested region through its parent's transform. That
+        # mapping must follow the preview without replacing the committed
+        # cached matrix needed when a drag is canceled.
+        preview = self.canvas._geometry_transform_target
+        if (preview is not None and preview[0] == "layer_group"
+                and ("layer", layer_id) in self.live_branches):
+            return self.canvas.layer_world_transform(layer_id)
         if layer_id not in self.transforms:
             self.transforms[layer_id] = self.canvas.layer_world_transform(layer_id)
         return self.transforms[layer_id]
@@ -187,6 +195,35 @@ class SceneRenderBounds:
         visible = self._mapped(self._transform(obj.parent_layer_id), local_visible)
         return visible is None or bounds.intersects(visible.adjusted(
             -self.margin, -self.margin, self.margin, self.margin))
+
+    def painter_clip_visible(self, painter, local_visible):
+        """Reject work already excluded by an inherited scene clip.
+
+        A parent can remain visible because one child escapes its mask, while
+        ordinary siblings (including effects with unknown bounds) are wholly
+        clipped. Compare conservative rectangles in device coordinates so the
+        antialiasing guard remains two pixels under scaled/rotated parents.
+        Independent effect-source captures must still render their full input.
+        """
+        if not self.usable() or not painter.hasClipping():
+            return True
+        mapping = painter.combinedTransform()
+        clip = self._mapped(mapping, painter.clipBoundingRect())
+        visible = self._mapped(mapping, local_visible)
+        if clip is None or visible is None:
+            return True
+        return clip.intersects(visible.adjusted(-2., -2., 2., 2.))
+
+    def layer_clip_visible(self, painter, layer, visible_world):
+        # Before _render_layer applies its own transform, the painter uses the
+        # parent's logical coordinates. Escaped children arrive after that
+        # parent's clip is restored, so this never reinstates an ignored mask.
+        if not self.usable() or not painter.hasClipping():
+            return True
+        parent = self._transform(layer.parent_id) if layer.parent_id else QTransform()
+        inverse, valid = parent.inverted()
+        visible = self._mapped(inverse, visible_world) if valid else None
+        return visible is None or self.painter_clip_visible(painter, visible)
 
     def entity_bounds(self, kind, identifier):
         key = (kind, identifier)

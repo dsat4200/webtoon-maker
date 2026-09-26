@@ -1,14 +1,56 @@
 """Document-space distortion handles shared by mouse and tablet input."""
 import math
 
-from PySide6.QtCore import QPointF, QRectF, Qt
-from PySide6.QtGui import QColor, QPen, QTransform
+from PySide6.QtCore import QPointF, QRectF, QSize, Qt
+from PySide6.QtGui import QColor, QImage, QPen, QTransform
 
 from comic_editor.core.distort import gizmo_kind
 from comic_editor.core.models import DistortModifier
 
 
 class DistortFeatures:
+    def _mesh_warp_preview_modifier(self):
+        if self.chapter is None:
+            return None
+        drag = self._modifier_handle_drag or {}
+        identifier = drag.get("distort") or getattr(self, "_mesh_warp_parameter_drag_id", None)
+        modifier = self.chapter.modifiers.get(identifier)
+        if (isinstance(modifier, DistortModifier) and not modifier.muted
+                and modifier.modifier_type == "distort_mesh_warp"):
+            return modifier
+        return None
+
+    def _paint_mesh_warp_preview(self, painter, modifier):
+        # A temporary viewport image may contain draft pixels; the retained
+        # document projection must only ever contain finished artwork.
+        if getattr(self, "_mesh_warp_preview_session_id", None) != modifier.modifier_id:
+            self._effect_jobs.cancel(clear_retained=False)
+            self._mesh_warp_preview_session_id = modifier.modifier_id
+        ratio = max(1., self.devicePixelRatioF())
+        image = QImage(QSize(round(self.width() * ratio), round(self.height() * ratio)),
+                       QImage.Format_ARGB32_Premultiplied)
+        image.setDevicePixelRatio(ratio)
+        image.fill(Qt.transparent)
+        previous = (getattr(self, "_projection_exact", False),
+                    getattr(self, "_effect_region_requests", False),
+                    getattr(self, "_mesh_warp_preview_id", None))
+        self._projection_exact = self._effect_region_requests = False
+        self._mesh_warp_preview_id = modifier.modifier_id
+        try:
+            self._render_scene_cache_rect(self.rect(), target=image, projection=False)
+        finally:
+            self._projection_exact, self._effect_region_requests, self._mesh_warp_preview_id = previous
+        painter.drawImage(0, 0, image)
+        self._mesh_warp_preview_presented = True
+        self._projection_frame_pending = True
+
+    def _finish_mesh_warp_preview(self):
+        if getattr(self, "_mesh_warp_preview_session_id", None) is not None:
+            self._mesh_warp_preview_session_id = None
+            self._effect_jobs.cancel(clear_retained=False)
+            self._invalidate_scene_cache()
+        self._mesh_warp_preview_presented = False
+
     def _active_distort_modifier(self):
         modifier = self.chapter.modifiers.get(self.active_modifier_id) if self.chapter else None
         if (self.modifier_mode and isinstance(modifier, DistortModifier) and not modifier.muted

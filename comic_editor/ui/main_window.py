@@ -5314,7 +5314,7 @@ class MainWindow(QMainWindow):
             self._tree_selection_in_progress = False
 
     def _show_selection_candidates(self, candidates, global_point) -> None:
-        if self.chapter is None:
+        if self.chapter is None or getattr(self, "_selection_candidate_menu", None) is not None:
             return
         menu = SelectionCandidateMenu(self.canvas, self)
         for candidate in candidates:
@@ -5356,9 +5356,11 @@ class MainWindow(QMainWindow):
             # to the chooser, including the release that ends that original tap.
             self.canvas._pen_contact_active = False
             self.canvas._tablet_tool_active = False
+            self._selection_candidate_menu = menu
             try:
                 menu.exec(global_point)
             finally:
+                self._selection_candidate_menu = None
                 menu.restore_preview()
                 menu.deleteLater()
         else:

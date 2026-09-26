@@ -8,6 +8,7 @@ from PySide6.QtGui import QImage, QTransform
 from comic_editor.ui.interactive_effects import _draft
 from comic_editor.ui.interactive_strokes import _pack, _unpack
 from comic_editor.ui.modifier_rendering import apply_modifier_stack
+from comic_editor.ui.effect_regions import projection_requires_exact
 
 
 def cached_blur(canvas, scope, cache_key):
@@ -33,7 +34,8 @@ def render_stroke_blur(canvas, image, background, bounds, modifier, mapping,
     interactive = (canvas._interactive_render and not canvas._render_base_alpha
                    and canvas._rendering_mask_contributor <= 0)
     navigator = getattr(canvas, "_effect_preview_channel", "canvas") == "navigator"
-    draft_only = interactive and image.width() * image.height() > 16384
+    exact = projection_requires_exact(canvas)
+    draft_only = interactive and not exact and image.width() * image.height() > 16384
     asynchronous = draft_only and not provisional and not navigator and scope is not None
     if asynchronous:
         incoming, fill = QImage(image), QImage(background)
@@ -74,5 +76,8 @@ def render_stroke_blur(canvas, image, background, bounds, modifier, mapping,
     base = apply_modifier_stack(background, [modifier], origin, fields,
         world_to_image=world_to_image, blur_pyramid_cache=canvas._blur_pyramid_cache)
     if not provisional:
-        canvas._modifier_cache_put(("stroke-blur", cache_key), _pack(material, base))
+        packed = _pack(material, base)
+        canvas._modifier_cache_put(("stroke-blur", cache_key), packed)
+        if exact and scope is not None:
+            canvas._effect_jobs.retained_put(("result", scope), ("stroke-blur", cache_key), packed)
     return material, base, provisional

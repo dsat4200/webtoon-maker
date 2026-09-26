@@ -67,7 +67,8 @@ def visual_bounds(canvas, kind, identifier):
     """Conservative document-space bounds including each subtree effect stage."""
     chapter = canvas.chapter
     target = chapter.layers[identifier] if kind == "layer" else chapter.objects[identifier]
-    result = entity_visual_bounds(chapter, canvas.tiles, kind, identifier)
+    result = entity_visual_bounds(chapter, canvas.tiles, kind, identifier,
+                                  layer_mapping=canvas.layer_world_transform)
     if kind == "layer":
         for ref in target.children:
             result = result.united(visual_bounds(canvas, ref.kind, ref.entity_id))
@@ -81,7 +82,7 @@ def visual_bounds(canvas, kind, identifier):
     if not valid:
         raise ValueError("Cannot bake a singular transform")
     return mapping.mapRect(effect_bounds(inverse.mapRect(result),
-        [chapter.modifiers[mid] for mid in target.modifier_ids if mid in chapter.modifiers], mapping))
+        canvas._active_modifier_instances(target.modifier_ids), mapping))
 
 
 def snapshot(canvas, object_ids):

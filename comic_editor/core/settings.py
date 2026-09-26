@@ -241,6 +241,8 @@ class EditorSettings:
     mask_pencil_from_alpha: float = 0.0
     mask_pencil_to_alpha: float = 1.0
     mask_wand_tolerance: int = 16
+    mask_wand_connected: bool = True
+    mask_wand_ignore_other_layers: bool = False
     draw_shape_simplify: float = 2.0
     ui_splitter_sizes: dict[str, list[int]] = field(default_factory=dict)
     navigator_expanded: bool = False
@@ -546,6 +548,8 @@ class EditorSettings:
             0.0, min(1.0, float(self.mask_pencil_to_alpha))
         )
         self.mask_wand_tolerance = max(0, min(255, int(self.mask_wand_tolerance)))
+        self.mask_wand_connected = bool(self.mask_wand_connected)
+        self.mask_wand_ignore_other_layers = bool(self.mask_wand_ignore_other_layers)
         try:
             self.draw_shape_simplify = max(0.5, min(5.0, float(self.draw_shape_simplify)))
         except Exception:

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import math
+from contextlib import contextmanager
 
 import numpy as np
 from PySide6.QtCore import QPointF, QRectF, Qt
@@ -12,6 +13,50 @@ from comic_editor.core.tiles import TileStore
 
 
 class MaskSelectionFeatures:
+    def _mask_wand_source_entities(self):
+        if not self.settings.mask_wand_ignore_other_layers:
+            return None
+        candidates = (self.selected_entities or [(self.selected_kind, self.selected_id)])
+        result = {(kind, identifier) for kind, identifier in candidates
+                  if kind in {"layer", "object"} and identifier in
+                  (self.chapter.layers if kind == "layer" else self.chapter.objects)}
+        if not result and self.active_layer_id in self.chapter.layers:
+            result.add(("layer", self.active_layer_id))
+        return frozenset(result)
+
+    @contextmanager
+    def _mask_wand_reference_render(self, entities=None):
+        """Sample finished artwork with reusable setup and local scene culling.
+
+        Keep export-style sampling: interactive captures may change image
+        resolution or use previews. Exactness independently enables immutable
+        Distort preparation reuse across the flood fill's adjacent tiles, and
+        completed effects share the existing bounded retention pool.
+        """
+        names = ("_interactive_render", "_projection_exact", "_projection_defer_effects",
+                 "_exact_reference_render")
+        previous = tuple(getattr(self, name, False) for name in names)
+        previous_entities = getattr(self, "_mask_wand_sample_entities", None)
+        bounds = self._render_bounds
+        previous_bounds = bounds.exact_sampling, bounds.margin
+        self._interactive_render = False
+        self._projection_exact = True
+        self._projection_defer_effects = False
+        self._exact_reference_render = True
+        self._mask_wand_sample_entities = entities
+        try:
+            # A click can follow a direct model change before the next paint.
+            bounds.clear()
+            bounds.exact_sampling = True
+            bounds.prepare()
+            bounds.margin = 2.0
+            yield
+        finally:
+            for name, value in zip(names, previous):
+                setattr(self, name, value)
+            bounds.exact_sampling, bounds.margin = previous_bounds
+            self._mask_wand_sample_entities = previous_entities
+
     def _mask_wand_press(self, point: QPointF, modifiers) -> None:
         mask = (
             self.chapter.masks.get(self.active_tone_mask_id)
@@ -21,6 +66,9 @@ class MaskSelectionFeatures:
             return
         frame = QRectF(0, 0, self.chapter.width, self.chapter.height)
         if not frame.contains(point):
+            return
+        entities = self._mask_wand_source_entities()
+        if entities is not None and not entities:
             return
         remove = bool(modifiers & Qt.ControlModifier)
         size = self.tiles.tile_size
@@ -36,20 +84,16 @@ class MaskSelectionFeatures:
             ))
             return image
 
-        previous_interactive = self._interactive_render
-        self._interactive_render = False
-        try:
+        with self._mask_wand_reference_render(entities):
             selected.advanced_fill(
                 mask.mask_id, point, frame, QColor("white"),
                 {
                     "tolerance": self.settings.mask_wand_tolerance,
-                    "connected_pixels_only": True,
+                    "connected_pixels_only": self.settings.mask_wand_connected,
                     "antialiasing": False,
                 },
                 reference_tile=reference_tile,
             )
-        finally:
-            self._interactive_render = previous_interactive
         before, after = {}, {}
         for key, coverage in selected.object_tiles(mask.mask_id).items():
             if remove:

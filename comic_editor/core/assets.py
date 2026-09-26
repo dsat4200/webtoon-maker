@@ -428,8 +428,14 @@ def _object_local_bounds(obj: DocumentObject, document: ChapterDocument,
 
 def entity_visual_bounds(document: ChapterDocument, tiles: TileStore,
                          kind: str, entity_id: str, *, include_effects=False,
-                         geometry_cache=None) -> QRectF:
-    """Return a conservative world-space bound for an entity subtree."""
+                         geometry_cache=None, layer_mapping=None) -> QRectF:
+    """Return a conservative world-space bound for an entity subtree.
+
+    A renderer can supply its live layer mapping so a transform preview's
+    capture bounds use the same coordinates as the artwork being captured.
+    Asset operations use the stored document transforms by default.
+    """
+    mapping_for_layer = layer_mapping or (lambda identifier: _layer_world_transform(document, identifier))
     def expanded(rect, target, parent_id):
         if not include_effects:
             return rect
@@ -440,7 +446,7 @@ def entity_visual_bounds(document: ChapterDocument, tiles: TileStore,
                 owner = document.layers.get(owner.parent_id)
             if owner is not None:
                 rect = _tiling_boundary_path(document, owner).boundingRect()
-        mapping = _layer_world_transform(document, parent_id) if parent_id else QTransform()
+        mapping = mapping_for_layer(parent_id) if parent_id else QTransform()
         inverse, valid = mapping.inverted()
         if not valid:
             return rect
@@ -448,13 +454,13 @@ def entity_visual_bounds(document: ChapterDocument, tiles: TileStore,
     if kind == "object":
         obj = document.objects[entity_id]
         result = _mapped_rect(
-            _layer_world_transform(document, obj.parent_layer_id),
+            mapping_for_layer(obj.parent_layer_id),
             _object_local_bounds(obj, document, tiles),
         )
         return expanded(result, obj, obj.parent_layer_id)
 
     layer = document.layers[entity_id]
-    world_transform = _layer_world_transform(document, entity_id)
+    world_transform = mapping_for_layer(entity_id)
     result = QRectF()
     found = False
     if layer.bound is not None:
@@ -482,7 +488,7 @@ def entity_visual_bounds(document: ChapterDocument, tiles: TileStore,
     for child in layer.children:
         child_bounds = entity_visual_bounds(
             document, tiles, child.kind, child.entity_id, include_effects=include_effects,
-            geometry_cache=geometry_cache,
+            geometry_cache=geometry_cache, layer_mapping=layer_mapping,
         )
         result = child_bounds if not found else result.united(child_bounds)
         found = True

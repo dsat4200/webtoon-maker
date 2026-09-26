@@ -12,7 +12,7 @@ from collections import OrderedDict
 from dataclasses import dataclass
 
 from PySide6.QtCore import QPointF, QRectF, Qt
-from PySide6.QtGui import QPainterPath, QPainterPathStroker, QPolygonF, QTransform
+from PySide6.QtGui import QImage, QPainterPath, QPainterPathStroker, QPolygonF, QTransform
 
 from comic_editor.core.vector_geometry import cubic_derivative, flatten_cubic, rdp_indices
 from comic_editor.ui.shape_contours import compile_bound, geometry_key, path_segments
@@ -30,7 +30,7 @@ def path_key(path):
 
 
 def _size(value):
-    """Conservative accounting including Python keys and Qt path storage."""
+    """Conservative accounting including Python keys, Qt paths and pixel data."""
     total, pending = 0, [value]
     scalars = (float, int, str, bool, bytes, type(None))
     sizeof = sys.getsizeof
@@ -41,6 +41,8 @@ def _size(value):
             total += sizeof(item)
         elif isinstance(item, QPainterPath):
             total += 256 + item.elementCount() * 32
+        elif isinstance(item, QImage):
+            total += sizeof(item) + item.sizeInBytes()
         elif isinstance(item, (tuple, list)):
             total += sizeof(item)
             pending.extend(item)

@@ -125,9 +125,11 @@ class ShowOnTopFeatures:
             self._active_top_plan, self._show_on_top_phase = previous
 
     def _render_scene_layers(self, painter, visible_world, *, underlay=False,
-                             page_contents_only=False, live_ink=False):
+                             page_contents_only=False, live_ink=False, only_phase=None):
         with self._show_on_top_scene() as phases:
             for phase in phases:
+                if only_phase is not None and phase != only_phase:
+                    continue
                 self._show_on_top_phase = phase
                 for page_id in reversed(self.chapter.root_page_ids):
                     page = self.chapter.layers[page_id]

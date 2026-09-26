@@ -137,6 +137,9 @@ class PerformanceMonitorController(QObject):
             "effect_jobs": {"pending": len(jobs.pending), "running": jobs.running is not None,
                             "bytes_in_flight": jobs.bytes_in_flight,
                             "retained_bytes": jobs.retained_bytes, "budget_bytes": jobs.budget,
+                            "retained_budget_bytes": jobs.retained_budget,
+                            "shared_retained_bytes": jobs.retained_shared_bytes,
+                            "shared_entries": len(jobs._retained_shared),
                             "submitted": jobs.submitted, "completed": jobs.completed,
                             "discarded": jobs.discarded},
             "gpu_patterns": {"available": bool(gpu and gpu.available),
@@ -145,6 +148,39 @@ class PerformanceMonitorController(QObject):
                              "target_uploads": getattr(gpu, "color_uploads", 0)},
             "legacy_input": canvas.performance_snapshot(),
         }
+        projection = getattr(canvas, "_document_projection", None)
+        if projection is not None:
+            # Read only the fixed scalar counters. Never retain configuration
+            # keys, tile records, image handles, or future snapshot content.
+            snapshot = projection.snapshot()
+            data["projection"] = {
+                name: snapshot[name] for name in (
+                    "tiles", "active_tiles", "configurations", "bytes", "hits",
+                    "renders", "incomplete", "evictions",
+                ) if type(snapshot.get(name)) is int
+            }
+            data["projection"].update(
+                enabled=bool(getattr(canvas, "_document_projection_enabled", False)),
+                budget_bytes=projection.budget, tile_size=projection.tile_size,
+                revision=projection.revision,
+                frame_pending=bool(getattr(canvas, "_projection_frame_pending", False)),
+                render_failed=bool(getattr(canvas, "_projection_render_error", None)),
+                presented_revision=getattr(canvas, "_projection_presented_revision", -1),
+            )
+        presentation = getattr(canvas, "_document_presentation_stats", None)
+        if presentation is not None:
+            data["presentation"] = {
+                "backend": str(presentation.backend)[:32],
+                "tiles": presentation.tiles, "uploads": presentation.uploads,
+                "texture_bytes": presentation.texture_bytes,
+            }
+        preparation = getattr(canvas, "_distort_preparation_cache", None)
+        if preparation is not None:
+            data["distort_preparation"] = {
+                name: getattr(preparation, name)
+                for name in ("bytes", "budget", "hits", "misses", "evictions", "entry_limit")
+            }
+            data["distort_preparation"]["entries"] = len(preparation._entries)
         if self._resources is not None:
             data["process"] = self._resources.sample()
         stores = getattr(canvas.tiles, "_tiles", {})
@@ -186,6 +222,26 @@ class PerformanceMonitorController(QObject):
             details["entity"] = {"id": args[0], "type": "layer"}
         if name == "_render_scene_cache_rect" and args:
             details["dirty_widget_rect"] = _rect(args[0])
+        if name == "_paint_document_projection":
+            details["live_ink"] = bool(kwargs.get("live_ink", False))
+        elif name == "_collect_document_projection":
+            details["projection_phase"] = args[0] if args else kwargs.get("phase")
+        elif name == "_render_document_tiles" and args and isinstance(args[0], (list, tuple)):
+            details["requested_tiles"] = len(args[0])
+        elif name == "_render_document_region" and len(args) >= 3:
+            details.update(world_rect=_rect(args[0]), pixel_scale=args[1],
+                           output_size=[args[2].width(), args[2].height()],
+                           exact=bool(kwargs.get("exact", False)),
+                           requested_world_rect=_rect(kwargs.get("requested")))
+        if name in {"_draw_predictive_ink", "_draw_live_vector_gesture", "_render_document_region"}:
+            details["projection_phase"] = getattr(
+                self.canvas, "_show_on_top_phase" if name.startswith("_draw") else "_projection_capture_phase", None)
+        if name == "render_distort":
+            modifier = args[2] if len(args) > 2 else kwargs.get("modifier")
+            if modifier is not None:
+                details["modifier"] = {"id": modifier.modifier_id,
+                                       "type": modifier.modifier_type}
+            details["pixel_scale"] = args[6] if len(args) > 6 else kwargs.get("pixel_scale", 1.)
         details["channel"] = getattr(self.canvas, "_effect_preview_channel", "canvas")
         return details
 
@@ -227,6 +283,9 @@ class PerformanceMonitorController(QObject):
             self._patch(canvas, name, "canvas." + name, transition=True)
         phases = (
             "paintEvent", "_ensure_scene_cache", "_render_scene_cache_rect", "render_preview",
+            "_paint_document_projection", "_collect_document_projection",
+            "_render_document_tiles", "_render_document_region", "_show_on_top_plan",
+            "_draw_predictive_ink", "_draw_live_vector_gesture",
             "_draw_selection", "_draw_focal_modifier_handles", "_flush_visual_dirty",
             "_render_modified_layer", "_render_modified_object", "_render_mirror_target",
             "_modifier_layer_signature", "_modifier_object_signature", "_modifier_mask_fields",
@@ -254,10 +313,16 @@ class PerformanceMonitorController(QObject):
         # Class functions cover lazily created GL renderers. Existing signal-bound
         # callbacks remain intact; enclosing spans plus sampling include their cost.
         from comic_editor.ui.gpu_pattern_effects import GpuPatternRenderer
-        from comic_editor.ui import modifier_rendering
+        from comic_editor.ui import distort_rendering, modifier_rendering
         self._patch(GpuPatternRenderer, "render", "gpu.pattern_wall_time")
         for name in ("apply_modifier_stack", "apply_opacity_mask", "apply_pattern_modifier"):
             self._patch(modifier_rendering, name, "effects." + name)
+        # Distort's worker closure imports this function when its stage is
+        # requested. Patch the source module so both GUI and worker work is
+        # observed without instrumenting per-strip or per-pixel inner loops.
+        self._patch(distort_rendering, "render_distort", "effects.render_distort")
+        for name in ("_outline_qimage", "_outline_stack_qimage", "_outline_effect"):
+            self._patch(modifier_rendering, name, "effects." + name.lstrip("_"))
         for name in ("documentChanged", "visualChanged", "hierarchyChanged", "toolChanged",
                      "selectionChanged", "soloChanged", "interactionFinished", "cameraChanged"):
             signal = getattr(canvas, name)

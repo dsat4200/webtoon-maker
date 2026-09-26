@@ -1,9 +1,4 @@
 
-add a blur feature to the outline modifier - with a radius and a strength. this blur applies only to the outline, not the source
-
-
-add a brightness/contrast modifier.
-
 
 - distortion bounds fix - adding a bunch of distortions gets cropped by some invisible boundary around the image.
 - ![[Pasted image 20260924202219.png]]

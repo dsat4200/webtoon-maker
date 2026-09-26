@@ -11,6 +11,10 @@ from comic_editor.core.effect_geometry import outline_blur_padding
 from comic_editor.ui.modifier_rendering import (
     BlurPyramidCache, OutlineDistanceCache, apply_modifier_stack,
 )
+from comic_editor.ui.effect_regions import projection_requires_exact, exact_reference_sampling
+from comic_editor.ui.async_projection import (
+    ProjectionPending, projection_deferred, projection_result_or_pending,
+)
 
 
 def outline_capture_bounds(canvas, painter, bounds, visible, modifiers):
@@ -83,12 +87,15 @@ def render_interactive_stack(canvas, image, modifiers, world_origin, mask_fields
     revision and avoid caching those captures as exact source images.
     """
     fields = mask_fields or {}
+    exact = projection_requires_exact(canvas)
+    deferred = projection_deferred(canvas) and scope is not None and not upstream_provisional
     interactive = (canvas._interactive_render and not canvas._render_base_alpha
                    and canvas._rendering_mask_contributor <= 0)
-    retain_exact = (interactive
+    retain_exact = ((interactive or exact_reference_sampling(canvas))
                     and getattr(canvas, "_effect_preview_channel", "canvas") != "navigator")
     if not upstream_provisional:
-        cached = canvas._effect_jobs.result(scope, cache_key)
+        cached = (projection_result_or_pending(canvas, scope, cache_key) if deferred
+                  else canvas._effect_jobs.result(scope, cache_key))
         if cached is None:
             cached = canvas._modifier_cache_get(cache_key)
             if cached is not None and retain_exact:
@@ -96,14 +103,15 @@ def render_interactive_stack(canvas, image, modifiers, world_origin, mask_fields
         if cached is not None:
             return cached, False
     pixels = image.width() * image.height()
-    preview_only = (interactive and pixels > 16384
+    preview_only = (interactive and not exact and pixels > 16384
                     and getattr(canvas, "_effect_preview_channel", "canvas") == "navigator")
     active = [modifier for modifier in modifiers if not modifier.muted]
     # The cropped outline kernel is already fast at ordinary text sizes.
     inexpensive = not active or pixels <= 16384 or (all(isinstance(m, OutlineModifier)
                                       and outline_blur_padding(m) == 0 for m in active)
                                       and pixels <= 2 * 1024 * 1024)
-    asynchronous = interactive and not inexpensive and not upstream_provisional and not preview_only
+    asynchronous = (deferred and pixels > 16384 or
+                    interactive and not exact and not inexpensive and not upstream_provisional and not preview_only)
     if asynchronous:
         incoming, effects = QImage(image), deepcopy(modifiers)
         masks = {key: np.array(value, copy=True) for key, value in fields.items()}
@@ -123,8 +131,11 @@ def render_interactive_stack(canvas, image, modifiers, world_origin, mask_fields
             return None if cancelled() else result
 
         size = int(image.sizeInBytes()) * 32 + sum(value.nbytes for value in masks.values())
-        asynchronous = jobs.request(scope, cache_key, compute, size, allow_oversized=True)
-    if asynchronous or preview_only or (interactive and upstream_provisional):
+        asynchronous = jobs.request(scope, cache_key, compute, size, allow_oversized=True,
+                                    require_exact=deferred)
+        if deferred:
+            raise ProjectionPending(scope, cache_key)
+    if not exact and (asynchronous or preview_only or (interactive and upstream_provisional)):
         draft_key = ("interactive-draft", cache_key, int(image.cacheKey()))
         result = canvas._modifier_cache_get(draft_key)
         if result is None:

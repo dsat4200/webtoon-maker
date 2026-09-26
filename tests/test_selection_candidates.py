@@ -103,6 +103,27 @@ def hover(menu, action):
     ))
 
 
+def test_selection_chooser_cannot_reenter_while_its_popup_loop_is_active(chooser_window, monkeypatch):
+    window = chooser_window
+    candidates = [{"kind": kind, "id": identifier} for kind, identifier in window._test_candidates]
+    opened = []
+
+    def execute(menu, position):
+        opened.append(menu)
+        if len(opened) == 1:
+            # A canvas tablet press delivered during a nested popup event loop
+            # must not recursively create another modal chooser.
+            window._show_selection_candidates(candidates, position)
+
+    monkeypatch.setattr(SelectionCandidateMenu, "exec", execute)
+    position = window.canvas.mapToGlobal(QPoint(40, 40))
+    window._show_selection_candidates(candidates, position)
+    assert len(opened) == 1
+    # Finishing the chooser releases the guard for the next deliberate tap.
+    window._show_selection_candidates(candidates, position)
+    assert len(opened) == 2
+
+
 @pytest.mark.parametrize("existing_solo", [False, True])
 def test_hover_isolates_object_or_layer_and_restores_on_leave_and_escape(chooser_window, existing_solo):
     window, canvas = chooser_window, chooser_window.canvas
