@@ -53,7 +53,7 @@ from comic_editor.core.models import (
     GridSettings, LineGradientField, LayerNode, RadialGradientField,
     ImageObject, PathContour, PathNode, RasterObject, ShapeStyle, TextObject,
     BlurModifier, OutlineModifier, MirrorModifier, ArrayModifier, RadialBlurModifier, ToneMask, StrokeModifier, CurvesModifier,
-    HalftoneModifier, PixelateModifier, DistortModifier,
+    HalftoneModifier, PixelateModifier, DistortModifier, KuwaharaModifier, DitheringModifier, SharpnessModifier,
     SpeedLineCenterObject, SpeedLinesGradientObject, VectorDrawingObject,
     VectorStroke, VectorStrokePoint, new_id,
     ImageSourceDescriptor, canonical_argb, image_source_from_dict,
@@ -1293,7 +1293,8 @@ class _CanvasLogic(BrushFeatures, DocumentProjectionFeatures, MultiRasterSelecti
         context = self._drawing_tiling(obj)
         if context:
             world = self._tiling_boundary(context[0]).boundingRect()
-        if any(isinstance(m, (HalftoneModifier, PixelateModifier, DistortModifier))
+        if any(isinstance(m, (HalftoneModifier, PixelateModifier, DistortModifier,
+                              KuwaharaModifier, DitheringModifier, SharpnessModifier))
                for m in self._active_modifier_instances(modifier_ids)):
             # A new stroke can change the reference frame or a neighboring
             # cell's sample. Refresh the visible document, not only its pixels.
@@ -1327,7 +1328,8 @@ class _CanvasLogic(BrushFeatures, DocumentProjectionFeatures, MultiRasterSelecti
             if isinstance(owner, RasterObject) and (
                 owner.modifier_source_frame is not None
                 or any(isinstance(modifier, (RadialBlurModifier, ArrayModifier,
-                    HalftoneModifier, PixelateModifier, DistortModifier, CurvesModifier))
+                    HalftoneModifier, PixelateModifier, DistortModifier, CurvesModifier,
+                    KuwaharaModifier, DitheringModifier, SharpnessModifier))
                     for modifier in modifiers)
             ):
                 # Staged raster effects run before placement; generic object
@@ -1423,7 +1425,8 @@ class _CanvasLogic(BrushFeatures, DocumentProjectionFeatures, MultiRasterSelecti
             for mask in self.chapter.masks.values()
         ):
             return QRectF(0, 0, self.chapter.width, self.chapter.height)
-        if any(isinstance(m, (HalftoneModifier, PixelateModifier, DistortModifier))
+        if any(isinstance(m, (HalftoneModifier, PixelateModifier, DistortModifier,
+                              KuwaharaModifier, DitheringModifier, SharpnessModifier))
                for m in self._active_modifier_instances(modifier_ids)):
             return QRectF(0, 0, self.chapter.width, self.chapter.height).united(world)
         if any(isinstance(self.chapter.modifiers.get(mid), (MirrorModifier, ArrayModifier, RadialBlurModifier, CageTransformModifier, StrokeModifier)) for mid in modifier_ids):
@@ -4896,7 +4899,7 @@ class _CanvasLogic(BrushFeatures, DocumentProjectionFeatures, MultiRasterSelecti
             return
         # Curves affects the complete subtree, including children outside a
         # page/shape mask. The staged capture includes their visual bounds.
-        if layer.layer_kind == "text_container" or any(isinstance(m, (MirrorModifier, ArrayModifier, RadialBlurModifier, CageTransformModifier, StrokeModifier, HalftoneModifier, PixelateModifier, DistortModifier, CurvesModifier)) for m in self._active_modifier_instances(layer.modifier_ids)):
+        if layer.layer_kind == "text_container" or any(isinstance(m, (MirrorModifier, ArrayModifier, RadialBlurModifier, CageTransformModifier, StrokeModifier, HalftoneModifier, PixelateModifier, DistortModifier, CurvesModifier, KuwaharaModifier, DitheringModifier, SharpnessModifier)) for m in self._active_modifier_instances(layer.modifier_ids)):
             self._render_mirror_target(painter, layer, parent_opacity, visible_world)
             return
         world_bounds = self.entity_world_rect("layer", layer.layer_id)
@@ -5234,7 +5237,8 @@ class _CanvasLogic(BrushFeatures, DocumentProjectionFeatures, MultiRasterSelecti
         if ("layer", layer.layer_id) not in self._render_modifier_sources and any(
                 isinstance(modifier, (MirrorModifier, ArrayModifier, RadialBlurModifier,
                     CageTransformModifier, HalftoneModifier, PixelateModifier, DistortModifier))
-                or isinstance(modifier, CurvesModifier) and not self._render_base_alpha
+                or isinstance(modifier, (CurvesModifier, KuwaharaModifier, DitheringModifier,
+                                         SharpnessModifier)) and not self._render_base_alpha
                 for modifier in self._active_modifier_instances(layer.modifier_ids)):
             self._render_mirror_target(painter, layer, parent_opacity, visible_world)
             return
@@ -8024,6 +8028,12 @@ class _CanvasLogic(BrushFeatures, DocumentProjectionFeatures, MultiRasterSelecti
                 )
                 painter.end()
                 result += self._image_alpha_array(image)
+            for limited in mask.limited_gradients:
+                contribution = self._render_mask_gradient_field(
+                    limited.gradient, width, height, world_to_image, limited,
+                )
+                result = np.clip(result, 0.0, 1.0)
+                result += contribution * (-1 if limited.operation == "subtract" else 1)
             result = np.clip(result, 0.0, 1.0)
             size = int(result.nbytes)
             if 0 < size <= self._tone_mask_contributor_cache_budget:
@@ -8338,10 +8348,10 @@ class _CanvasLogic(BrushFeatures, DocumentProjectionFeatures, MultiRasterSelecti
         if self._cage_session is not None and ("object", obj.object_id) in self._cage_session["targets"]:
             self._render_mirror_target(painter, obj, parent_opacity, local_visible)
             return
-        if isinstance(obj, RasterObject) and (obj.modifier_source_frame is not None or any(isinstance(m, (RadialBlurModifier, ArrayModifier, HalftoneModifier, PixelateModifier, DistortModifier, CurvesModifier)) for m in self._active_modifier_instances(obj.modifier_ids))):
+        if isinstance(obj, RasterObject) and (obj.modifier_source_frame is not None or any(isinstance(m, (RadialBlurModifier, ArrayModifier, HalftoneModifier, PixelateModifier, DistortModifier, CurvesModifier, KuwaharaModifier, DitheringModifier, SharpnessModifier)) for m in self._active_modifier_instances(obj.modifier_ids))):
             self._render_radial_raster(painter, obj, parent_opacity, local_visible)
             return
-        if any(isinstance(m, (MirrorModifier, ArrayModifier, RadialBlurModifier, CageTransformModifier, StrokeModifier, HalftoneModifier, PixelateModifier, DistortModifier)) for m in self._active_modifier_instances(obj.modifier_ids)):
+        if any(isinstance(m, (MirrorModifier, ArrayModifier, RadialBlurModifier, CageTransformModifier, StrokeModifier, HalftoneModifier, PixelateModifier, DistortModifier, KuwaharaModifier, DitheringModifier, SharpnessModifier)) for m in self._active_modifier_instances(obj.modifier_ids)):
             self._render_mirror_target(painter, obj, parent_opacity, local_visible)
             return
         if (isinstance(obj, RasterObject) and self._interactive_render

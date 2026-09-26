@@ -19,6 +19,8 @@ from comic_editor.core.models import (
 )
 from comic_editor.core.effect_geometry import reflection_transform
 from comic_editor.core.curves import apply_curves, curves_is_neutral
+from comic_editor.core.models import KuwaharaModifier
+from comic_editor.core.models import DitheringModifier, SharpnessModifier
 
 
 def modifier_render_settings(modifier):
@@ -435,6 +437,31 @@ def _outline_color(color: str) -> tuple[float, float, float, float]:
     return 0.0, 0.0, 0.0, 1.0
 
 
+def _brush_outline_effect(original, modifier, thickness, opacity, amount,
+                          blur_radius, blur_strength, distance_cache=None):
+    """Paint real material strokes along source contours, then place below it."""
+    from comic_editor.core.brush_outline import render_brush_outline
+    alpha = original[..., 3]
+    if float(np.max(thickness)) <= 0:
+        return original
+    ink = render_brush_outline(alpha, thickness, modifier)
+    distance = distance_cache.distance(alpha) if distance_cache else _outside_distance(alpha)
+    # The thickness field controls both each brush dab and its outside envelope.
+    # This makes an exact zero mask truly zero and bounds unusual/spray tips.
+    coverage = (np.clip(np.asarray(thickness)+.5-distance, 0., 1.)
+                if modifier.antialiasing else np.asarray(distance <= thickness, np.float32))
+    coverage *= np.asarray(thickness) > 0
+    coverage *= (1.-alpha) * np.clip(np.asarray(opacity)/100., 0., 1.)
+    ink *= coverage[..., None]
+    if np.max(blur_radius) > 0 and np.max(blur_strength) > 0:
+        blend = np.clip(np.asarray(blur_strength)/100., 0., 1.)
+        for channel in range(4):
+            wet = _outline_blurred_alpha(ink[..., channel], blur_radius, _outline_radius_limit(modifier))
+            ink[..., channel] += (wet-ink[..., channel])*blend
+    ink *= ((1.-alpha)*amount)[..., None]
+    return original+ink
+
+
 def _outline_blurred_alpha(alpha, radius, radius_limit=None):
     """Blur constant-color premultiplied outline alpha without blurring its source.
 
@@ -677,6 +704,7 @@ def apply_modifier_stack(
     blur_pyramid_cache: BlurPyramidCache | None = None,
     world_to_image: QTransform | None = None,
     nearest: bool = False,
+    cancelled=None,
 ) -> QImage:
     active_modifiers = [modifier for modifier in modifiers if not modifier.muted]
     for modifier in active_modifiers:
@@ -691,14 +719,18 @@ def apply_modifier_stack(
         or modifier.intensity <= 0 and "intensity" not in modifier.parameter_masks))]
     if image.isNull() or not active_modifiers:
         return image
-    if len(active_modifiers) == 1 and isinstance(active_modifiers[0], OutlineModifier):
+    if (len(active_modifiers) == 1 and isinstance(active_modifiers[0], OutlineModifier)
+            and active_modifiers[0].style == "solid"):
         return _outline_qimage(image, active_modifiers[0], mask_fields or {}, outline_distance_cache)
-    if all(isinstance(modifier, OutlineModifier) for modifier in active_modifiers):
+    if all(isinstance(modifier, OutlineModifier) and modifier.style == "solid"
+           for modifier in active_modifiers):
         return _outline_stack_qimage(image, active_modifiers, mask_fields or {}, outline_distance_cache)
     current = _qimage_premultiplied(image)
     height, width = current.shape[:2]
     mask_fields = mask_fields or {}
     for modifier in active_modifiers:
+        if cancelled is not None and cancelled():
+            return None
         modifier.validate()
         amount = _parameter_field(
             modifier, "intensity", modifier.intensity,
@@ -712,11 +744,34 @@ def apply_modifier_stack(
             effect = _qimage_premultiplied(apply_pattern_effect(
                 _premultiplied_qimage(current), modifier))
             mask = amount
+        elif isinstance(modifier, KuwaharaModifier):
+            from comic_editor.core.kuwahara import apply_kuwahara
+            effect = apply_kuwahara(current, modifier,
+                size=_parameter_field(modifier, "size", modifier.size, (height, width), mask_fields),
+                strength=_parameter_field(modifier, "strength", modifier.strength, (height, width), mask_fields),
+                cancelled=cancelled)
+            if effect is None:
+                return None
+            if amount.ndim == 2:
+                amount = amount[..., None]
+            current[..., :3] += (effect[..., :3] - current[..., :3]) * amount
+            continue
         elif isinstance(modifier, CurvesModifier):
             effect = apply_curves(current, modifier)
             if amount.ndim == 2:
                 amount = amount[..., None]
             current += (effect - current) * amount
+            continue
+        elif isinstance(modifier, (DitheringModifier, SharpnessModifier)):
+            from comic_editor.core.image_filters import dither, sharpen
+            names = ("strength", "levels", "pixel_size") if isinstance(modifier, DitheringModifier) else ("strength", "radius", "threshold")
+            parameters = {name: _parameter_field(modifier, name, getattr(modifier, name),
+                                               (height, width), mask_fields) for name in names}
+            effect = (dither(current, modifier, **parameters) if isinstance(modifier, DitheringModifier)
+                      else sharpen(current, **parameters))
+            if amount.ndim == 2:
+                amount = amount[..., None]
+            current[..., :3] += (effect[..., :3] - current[..., :3]) * amount
             continue
         elif isinstance(modifier, BrightnessContrastModifier):
             effect = _brightness_contrast_effect(
@@ -822,6 +877,13 @@ def apply_modifier_stack(
             effect = current + reflection * (1.0 - current[..., 3:4])
             mask = amount
         elif isinstance(modifier, OutlineModifier):
+            if modifier.style == "brush":
+                fields = {name: _parameter_field(modifier, name, getattr(modifier, name),
+                                                (height, width), mask_fields)
+                          for name in ("thickness", "opacity", "blur_radius", "blur_strength")}
+                current = _brush_outline_effect(current, modifier, amount=amount,
+                                                 distance_cache=outline_distance_cache, **fields)
+                continue
             effect = _outline_effect(
                 current,
                 _parameter_field(

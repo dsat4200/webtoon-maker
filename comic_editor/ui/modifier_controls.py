@@ -20,6 +20,8 @@ from comic_editor.core.models import (
     DistortModifier, ImageObject, CurvesModifier,
 )
 from comic_editor.core.distort import DISTORT_TYPES
+from comic_editor.core.models import KuwaharaModifier
+from comic_editor.core.models import DitheringModifier, SharpnessModifier
 from comic_editor.ui.icons import iconoir
 from comic_editor.ui.mask_controls import DualEndpointSlider, MaskButton
 
@@ -214,6 +216,9 @@ class ModifierCard(QFrame):
             else:
                 from comic_editor.ui.distort_controls import DistortControls
                 form.addWidget(DistortControls(modifier, owner, body))
+        elif isinstance(modifier, KuwaharaModifier):
+            from comic_editor.ui.kuwahara_controls import KuwaharaControls
+            form.addWidget(KuwaharaControls(modifier, owner, self, body))
         elif isinstance(modifier, CurvesModifier):
             from comic_editor.ui.curves_controls import CurvesControls
             form.addWidget(CurvesControls(owner, modifier, body))
@@ -233,6 +238,41 @@ class ModifierCard(QFrame):
         elif isinstance(modifier, PosterizeModifier):
             from comic_editor.ui.posterize_controls import PosterizeControls
             form.addWidget(PosterizeControls(modifier, owner, body))
+        elif isinstance(modifier, DitheringModifier):
+            method = QComboBox(body)
+            method.setObjectName("ditheringMethod")
+            method.addItem("Ordered (Bayer)", "ordered")
+            method.addItem("Noise", "noise")
+            method.setCurrentIndex(method.findData(modifier.method))
+            method.currentIndexChanged.connect(lambda _index: (
+                owner.set_parameter(modifier.modifier_id, "method", method.currentData(), True), owner.refresh()))
+            form.addWidget(method)
+            for label, low, high, attribute, suffix in (
+                    ("Levels", 2, 256, "levels", ""), ("Dither strength", 0, 100, "strength", "%"),
+                    ("Pattern size", 1, 32, "pixel_size", " px")):
+                form.addWidget(self._slider_row(label, low, high, round(getattr(modifier, attribute)), attribute, suffix))
+            if modifier.method == "ordered":
+                matrix = QComboBox(body)
+                matrix.setObjectName("ditheringMatrixSize")
+                for side in (2, 4, 8):
+                    matrix.addItem(f"{side} × {side} matrix", side)
+                matrix.setCurrentIndex(matrix.findData(modifier.matrix_size))
+                matrix.currentIndexChanged.connect(lambda _index: owner.set_parameter(
+                    modifier.modifier_id, "matrix_size", matrix.currentData(), True))
+                form.addWidget(matrix)
+            else:
+                seed = QPushButton("New noise pattern", body)
+                seed.clicked.connect(lambda: owner.set_parameter(modifier.modifier_id, "seed", modifier.seed + 1, True))
+                form.addWidget(seed)
+            gray = QCheckBox("Monochrome", body)
+            gray.setChecked(modifier.monochrome)
+            gray.toggled.connect(lambda value: owner.set_parameter(modifier.modifier_id, "monochrome", value, True))
+            form.addWidget(gray)
+        elif isinstance(modifier, SharpnessModifier):
+            for label, low, high, attribute, suffix in (
+                    ("Strength", 0, 500, "strength", "%"), ("Radius", 0, 20, "radius", " px"),
+                    ("Threshold", 0, 100, "threshold", "%")):
+                form.addWidget(self._slider_row(label, low, high, round(getattr(modifier, attribute)), attribute, suffix))
         elif isinstance(modifier, BrightnessContrastModifier):
             form.addWidget(self._slider_row(
                 "Brightness", -100, 100, round(modifier.brightness), "brightness", "%"))
@@ -273,6 +313,8 @@ class ModifierCard(QFrame):
         elif isinstance(modifier, RadialBlurModifier):
             form.addWidget(self._slider_row("Angle", 0, 360, round(modifier.angle), "angle", "°"))
         elif isinstance(modifier, OutlineModifier):
+            from comic_editor.ui.outline_brush_controls import OutlineBrushControls
+            form.addWidget(OutlineBrushControls(modifier, owner, body))
             antialiasing = QCheckBox("Antialiasing", body)
             antialiasing.setObjectName("outlineAntialiasing")
             antialiasing.setToolTip("Smooth the outline edges. Turn off for hard pixel edges.")
@@ -508,7 +550,15 @@ class ModifierControls(QWidget):
         menu.addAction("Brightness / Contrast").triggered.connect(
             lambda: self.add_modifier("brightness_contrast"))
         menu.addAction("Curves").triggered.connect(lambda: self.add_modifier("curves"))
+        menu.addAction("Dithering").triggered.connect(lambda: self.add_modifier("dithering"))
+        menu.addAction("Sharpness").triggered.connect(lambda: self.add_modifier("sharpness"))
         self.blurs_menu = QMenu("Blurs", menu)
+        self.kuwahara_menu = QMenu("Kuwahara", menu)
+        menu.addMenu(self.kuwahara_menu)
+        from comic_editor.core.kuwahara import KUWAHARA_VARIANTS
+        for variant, name in KUWAHARA_VARIANTS.items():
+            self.kuwahara_menu.addAction(name).triggered.connect(
+                lambda _checked=False, kind=variant: self.add_modifier("kuwahara_"+kind))
         menu.addMenu(self.blurs_menu)
         blurs = self.blurs_menu
         blurs.addAction("Blur").triggered.connect(
@@ -724,6 +774,14 @@ class ModifierControls(QWidget):
             except (ValueError, MemoryError) as error:
                 QMessageBox.warning(self, modifier.name, str(error))
                 return
+        elif modifier_type == "dithering":
+            modifier = DitheringModifier()
+        elif modifier_type == "sharpness":
+            modifier = SharpnessModifier()
+        elif modifier_type.startswith("kuwahara_") or modifier_type == "kuwahara":
+            from comic_editor.core.kuwahara import KUWAHARA_VARIANTS
+            variant = modifier_type.removeprefix("kuwahara_") if modifier_type != "kuwahara" else "anisotropic"
+            modifier = KuwaharaModifier(variant=variant, name=KUWAHARA_VARIANTS[variant])
         elif modifier_type == "brightness_contrast":
             modifier = BrightnessContrastModifier()
         elif modifier_type == "curves":

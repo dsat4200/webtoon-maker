@@ -237,7 +237,9 @@ class SceneRenderBounds:
         # fall back to rendering rather than recurse in the visibility query.
         self.bounds[key] = None
         modifiers = self.canvas._active_modifier_instances(target.modifier_ids)
-        bounded_effects = (BlurModifier, BrightnessContrastModifier, CurvesModifier, OutlineModifier)
+        from comic_editor.core.models import KuwaharaModifier, DitheringModifier, SharpnessModifier
+        bounded_effects = (BlurModifier, BrightnessContrastModifier, CurvesModifier, OutlineModifier,
+                           KuwaharaModifier, DitheringModifier, SharpnessModifier)
         if isinstance(target, ImageObject):
             # These image effects are clipped to the complete source image
             # frame. They cannot bring a distant image into the current view.

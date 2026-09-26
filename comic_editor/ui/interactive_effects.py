@@ -6,7 +6,7 @@ import numpy as np
 from PySide6.QtCore import QRectF, Qt
 from PySide6.QtGui import QImage, QTransform
 
-from comic_editor.core.models import BlurModifier, OutlineModifier
+from comic_editor.core.models import BlurModifier, OutlineModifier, KuwaharaModifier, SharpnessModifier, DitheringModifier
 from comic_editor.core.effect_geometry import outline_blur_padding
 from comic_editor.ui.modifier_rendering import (
     BlurPyramidCache, OutlineDistanceCache, apply_modifier_stack,
@@ -24,7 +24,7 @@ def outline_capture_bounds(canvas, painter, bounds, visible, modifiers):
     visible pixels; full captures and exports still use the complete image.
     Snap the window outward to reduce recapture during small camera changes.
     """
-    if not (modifiers and all(isinstance(m, OutlineModifier) for m in modifiers)
+    if not (modifiers and all(isinstance(m, OutlineModifier) and m.style == "solid" for m in modifiers)
             and canvas._interactive_render
             and getattr(canvas, "_effect_preview_channel", "canvas") != "navigator"
             and painter.combinedTransform().type().value <= QTransform.TransformationType.TxScale.value
@@ -57,6 +57,8 @@ def _draft(image, modifiers, origin, fields, mapping, nearest):
             modifier.focal_center = tuple(value * scale for value in modifier.focal_center)
             modifier.focal_radius *= scale
         elif isinstance(modifier, OutlineModifier):
+            from comic_editor.core.brush_outline import scale_outline_brush
+            scale_outline_brush(modifier, scale)
             parameter = "thickness"
             modifier.thickness *= scale
             modifier.blur_radius *= scale
@@ -64,6 +66,17 @@ def _draft(image, modifiers, origin, fields, mapping, nearest):
             if radius_mask is not None:
                 radius_mask.black_value *= scale
                 radius_mask.white_value *= scale
+        elif isinstance(modifier, KuwaharaModifier):
+            parameter = "size"
+            modifier.size *= scale
+            modifier.tensor_radius *= scale
+            modifier.quality = "draft"
+        elif isinstance(modifier, SharpnessModifier):
+            parameter = "radius"
+            modifier.radius *= scale
+        elif isinstance(modifier, DitheringModifier):
+            parameter = "pixel_size"
+            modifier.pixel_size *= scale
         if parameter in modifier.parameter_masks:
             binding = modifier.parameter_masks[parameter]
             binding.black_value *= scale
@@ -107,7 +120,7 @@ def render_interactive_stack(canvas, image, modifiers, world_origin, mask_fields
                     and getattr(canvas, "_effect_preview_channel", "canvas") == "navigator")
     active = [modifier for modifier in modifiers if not modifier.muted]
     # The cropped outline kernel is already fast at ordinary text sizes.
-    inexpensive = not active or pixels <= 16384 or (all(isinstance(m, OutlineModifier)
+    inexpensive = not active or pixels <= 16384 or (all(isinstance(m, OutlineModifier) and m.style == "solid"
                                       and outline_blur_padding(m) == 0 for m in active)
                                       and pixels <= 2 * 1024 * 1024)
     asynchronous = (deferred and pixels > 16384 or
@@ -127,7 +140,8 @@ def render_interactive_stack(canvas, image, modifiers, world_origin, mask_fields
                 return None
             result = apply_modifier_stack(incoming, effects, world_origin, masks,
                 world_to_image=mapping, nearest=nearest,
-                outline_distance_cache=outline_cache, blur_pyramid_cache=blur_cache)
+                outline_distance_cache=outline_cache, blur_pyramid_cache=blur_cache,
+                cancelled=cancelled)
             return None if cancelled() else result
 
         size = int(image.sizeInBytes()) * 32 + sum(value.nbytes for value in masks.values())

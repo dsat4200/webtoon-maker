@@ -3689,7 +3689,7 @@ class MainWindow(QMainWindow):
             return
         creating = context == "create"
         editing = context == "color"
-        self.gradient_create_group.setVisible(creating)
+        self.gradient_create_group.setVisible(creating or bool(self.canvas.active_tone_mask_id))
         self.gradient_type_group.setVisible(creating or editing)
         self.gradient_parameters_group.setVisible(editing)
         self.gradient_thickness_group.setVisible(False)
@@ -4988,7 +4988,7 @@ class MainWindow(QMainWindow):
         self._mask_original_contributors = list(mask.contributors)
         self.canvas.set_tone_mask_mode(mask_id)
         self.canvas.set_tool(
-            ToolKind.GRADIENT if mask.gradient is not None else ToolKind.RASTER_PENCIL
+            ToolKind.GRADIENT if mask.gradient is not None or mask.limited_gradients else ToolKind.RASTER_PENCIL
         )
         self.hierarchy_model.set_mask_highlights(set(mask.contributors))
         self.masks_panel.set_active(mask_id)

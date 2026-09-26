@@ -670,6 +670,58 @@ class ParameterMaskBinding:
 
 
 @dataclass
+class LimitedMaskGradient:
+    """A private gradient clipped to an oriented strip or circular annulus.
+
+    Bounds are multiples of the endpoint distance, so moving either endpoint
+    also moves the extent of the gradient. Feather and half-width are pixels.
+    """
+
+    gradient: ColorFillGradientObject = field(default_factory=lambda: ColorFillGradientObject(mask_only=True))
+    start_bound: float = 0.0
+    end_bound: float = 1.0
+    half_width: float = 100.0
+    feather: float = 0.0
+    operation: Literal["add", "subtract"] = "add"
+
+    def validate(self) -> None:
+        for key, default in (("start_bound", 0.0), ("end_bound", 1.0), ("half_width", 100.0), ("feather", 0.0)):
+            value = float(getattr(self, key))
+            setattr(self, key, value if math.isfinite(value) else default)
+        self.start_bound = max(-1000.0, min(1000.0, self.start_bound))
+        self.end_bound = max(self.start_bound + .001, min(1000.0, self.end_bound))
+        if self.gradient.gradient_shape == "circular":
+            self.start_bound = max(0.0, self.start_bound)
+            self.end_bound = max(self.start_bound + .001, self.end_bound)
+        self.half_width = max(.01, min(100000.0, self.half_width))
+        self.feather = max(0.0, min(100000.0, self.feather))
+        if self.operation not in {"add", "subtract"}:
+            self.operation = "add"
+
+    def to_dict(self) -> dict[str, Any]:
+        self.validate()
+        return {
+            "gradient": self.gradient.to_dict(),
+            "start_bound": self.start_bound, "end_bound": self.end_bound,
+            "half_width": self.half_width, "feather": self.feather,
+            "operation": self.operation,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "LimitedMaskGradient":
+        result = cls(
+            gradient=object_from_dict(data["gradient"]),
+            start_bound=float(data.get("start_bound", 0)),
+            end_bound=float(data.get("end_bound", 1)),
+            half_width=float(data.get("half_width", 100)),
+            feather=float(data.get("feather", 0)),
+            operation=data.get("operation", "add"),
+        )
+        result.validate()
+        return result
+
+
+@dataclass
 class ToneMask:
     """Chapter-local tone map made from contributors and raster paint."""
 
@@ -681,6 +733,7 @@ class ToneMask:
     # Owned by this mask, outside the drawable hierarchy. Coordinates are
     # chapter-local, just like the mask's painted tiles.
     gradient: ColorFillGradientObject | None = None
+    limited_gradients: list[LimitedMaskGradient] = field(default_factory=list)
     # Signed paint keeps cutouts editable without baking linked mask sources.
     paint_has_subtractions: bool = False
 
@@ -707,8 +760,12 @@ class ToneMask:
             canonical.append(item)
         self.contributors = canonical
         self.revision = max(0, int(self.revision))
-        if self.gradient is not None:
-            gradient = self.gradient
+        for limited in self.limited_gradients:
+            limited.validate()
+        gradients = ([self.gradient] if self.gradient is not None else []) + [
+            limited.gradient for limited in self.limited_gradients
+        ]
+        for gradient in gradients:
             gradient.field_type = "line"
             gradient.parent_layer_id = ""
             gradient.mask_only = True
@@ -740,6 +797,7 @@ class ToneMask:
             ],
             "revision": self.revision,
             "gradient": self.gradient.to_dict() if self.gradient else None,
+            "limited_gradients": [item.to_dict() for item in self.limited_gradients],
             "paint_has_subtractions": self.paint_has_subtractions,
         }
 
@@ -758,6 +816,14 @@ class ToneMask:
             ],
             revision=int(data.get("revision", 0)),
             paint_has_subtractions=bool(data.get("paint_has_subtractions", False)),
+            limited_gradients=[
+                LimitedMaskGradient.from_dict(item)
+                for item in data.get("limited_gradients", [])
+                if isinstance(item, dict)
+                and isinstance(item.get("gradient"), dict)
+                and item["gradient"].get("type") == "gradient"
+                and item["gradient"].get("gradient_type") == "color_fill"
+            ],
             gradient=(
                 object_from_dict(data["gradient"])
                 if isinstance(data.get("gradient"), dict)
@@ -892,6 +958,90 @@ class BrightnessContrastModifier:
 
 
 @dataclass
+class DitheringModifier:
+    """Repeatable ordered or noise dithering, with spatial parameter masks."""
+
+    modifier_id: str = field(default_factory=new_id)
+    modifier_type: str = "dithering"
+    name: str = "Dithering"
+    intensity: float = 100.0
+    expanded: bool = True
+    muted: bool = False
+    method: str = "ordered"
+    levels: int = 4
+    strength: float = 100.0
+    pixel_size: float = 1.0
+    matrix_size: int = 4
+    seed: int = 0
+    monochrome: bool = False
+    parameter_masks: dict[str, ParameterMaskBinding] = field(default_factory=dict)
+
+    def validate(self) -> None:
+        self.name = str(self.name or "Dithering")
+        self.expanded, self.muted = bool(self.expanded), bool(self.muted)
+        self.monochrome = bool(self.monochrome)
+        if self.method not in {"ordered", "noise"}:
+            raise ValueError("Unknown dithering method")
+        for name, (low, high) in {"intensity": (0., 100.), "levels": (2., 256.),
+                "strength": (0., 100.), "pixel_size": (1., 32.)}.items():
+            value = float(getattr(self, name))
+            if not math.isfinite(value):
+                raise ValueError("Dithering values must be finite")
+            setattr(self, name, max(low, min(high, value)))
+        self.levels = round(self.levels)
+        self.matrix_size = int(self.matrix_size)
+        if self.matrix_size not in {2, 4, 8}:
+            raise ValueError("Dither matrix size must be 2, 4, or 8")
+        self.seed = int(self.seed) % (2 ** 32)
+        _validate_parameter_masks(self.parameter_masks, {
+            "intensity": (0., 100.), "strength": (0., 100.),
+            "levels": (2., 256.), "pixel_size": (1., 32.)})
+
+    def to_dict(self) -> dict[str, Any]:
+        self.validate()
+        result = {item.name: getattr(self, item.name) for item in fields(self)
+                  if item.name not in {"modifier_id", "modifier_type", "parameter_masks"}}
+        result.update(id=self.modifier_id, type=self.modifier_type,
+                      parameter_masks=_parameter_masks_to_dict(self.parameter_masks))
+        return result
+
+
+@dataclass
+class SharpnessModifier:
+    """Alpha-normalized unsharp mask; radius and threshold preserve coverage."""
+
+    modifier_id: str = field(default_factory=new_id)
+    modifier_type: str = "sharpness"
+    name: str = "Sharpness"
+    intensity: float = 100.0
+    expanded: bool = True
+    muted: bool = False
+    strength: float = 100.0
+    radius: float = 2.0
+    threshold: float = 0.0
+    parameter_masks: dict[str, ParameterMaskBinding] = field(default_factory=dict)
+
+    def validate(self) -> None:
+        self.name = str(self.name or "Sharpness")
+        self.expanded, self.muted = bool(self.expanded), bool(self.muted)
+        ranges = {"intensity": (0., 100.), "strength": (0., 500.),
+                  "radius": (0., 20.), "threshold": (0., 100.)}
+        for name, (low, high) in ranges.items():
+            value = float(getattr(self, name))
+            if not math.isfinite(value):
+                raise ValueError("Sharpness values must be finite")
+            setattr(self, name, max(low, min(high, value)))
+        _validate_parameter_masks(self.parameter_masks, ranges)
+
+    def to_dict(self) -> dict[str, Any]:
+        self.validate()
+        return {"id": self.modifier_id, "type": self.modifier_type, "name": self.name,
+                "intensity": self.intensity, "expanded": self.expanded, "muted": self.muted,
+                "strength": self.strength, "radius": self.radius, "threshold": self.threshold,
+                "parameter_masks": _parameter_masks_to_dict(self.parameter_masks)}
+
+
+@dataclass
 class CurvesModifier:
     """Shared smooth color-channel curves with a selectable graph range."""
 
@@ -948,6 +1098,61 @@ class CurvesModifier:
             "input_min": self.input_min, "input_max": self.input_max, "blend_mode": self.blend_mode,
             "parameter_masks": _parameter_masks_to_dict(self.parameter_masks),
         }
+
+
+@dataclass
+class KuwaharaModifier:
+    """Edge-preserving painterly filtering with spatially variable support."""
+
+    modifier_id: str = field(default_factory=new_id)
+    modifier_type: Literal["kuwahara"] = "kuwahara"
+    name: str = "Anisotropic Kuwahara"
+    intensity: float = 100.0
+    expanded: bool = True
+    muted: bool = False
+    variant: str = "anisotropic"
+    size: float = 6.0
+    strength: float = 100.0
+    sharpness: float = 8.0
+    hardness: float = 8.0
+    overlap: float = 33.0
+    anisotropy: float = 100.0
+    tensor_radius: float = 2.0
+    iterations: int = 1
+    quality: str = "balanced"
+    processing_scale: float = 100.0
+    parameter_masks: dict[str, ParameterMaskBinding] = field(default_factory=dict)
+
+    def validate(self) -> None:
+        from comic_editor.core.kuwahara import KUWAHARA_VARIANTS, KUWAHARA_QUALITY
+        if self.variant not in KUWAHARA_VARIANTS:
+            raise ValueError("Unknown Kuwahara variant")
+        if self.quality not in KUWAHARA_QUALITY:
+            raise ValueError("Unknown Kuwahara sampling quality")
+        self.name = str(self.name or KUWAHARA_VARIANTS[self.variant])
+        self.expanded, self.muted = bool(self.expanded), bool(self.muted)
+        ranges = {"intensity": (0., 100.), "size": (0., 64.),
+                  "strength": (0., 100.), "sharpness": (1., 16.),
+                  "hardness": (1., 100.), "overlap": (1., 100.),
+                  "anisotropy": (0., 100.), "tensor_radius": (.25, 8.),
+                  "iterations": (1., 4.), "processing_scale": (25., 100.)}
+        for attribute, (minimum, maximum) in ranges.items():
+            value = float(getattr(self, attribute))
+            if not math.isfinite(value):
+                raise ValueError("Kuwahara parameters must be finite")
+            setattr(self, attribute, max(minimum, min(maximum, value)))
+        self.iterations = int(self.iterations)
+        _validate_parameter_masks(self.parameter_masks, {
+            name: ranges[name] for name in ("intensity", "size", "strength")})
+
+    def to_dict(self) -> dict[str, Any]:
+        self.validate()
+        result = {name: getattr(self, name) for name in (
+            "name", "intensity", "expanded", "muted", "variant", "size", "strength",
+            "sharpness", "hardness", "overlap", "anisotropy", "tensor_radius",
+            "iterations", "quality", "processing_scale")}
+        return dict(result, id=self.modifier_id, type=self.modifier_type,
+                    parameter_masks=_parameter_masks_to_dict(self.parameter_masks))
 
 
 @dataclass
@@ -1031,12 +1236,31 @@ class OutlineModifier:
     antialiasing: bool = True
     blur_radius: float = 0.0
     blur_strength: float = 0.0
+    style: Literal["solid", "brush"] = "solid"
+    brush: dict[str, Any] | None = None
+    brush_spacing: float = 100.0
+    brush_angle: float = 0.0
+    brush_follow_contour: bool = True
+    brush_seed: int = 0
 
     def validate(self) -> None:
         self.name = str(self.name or "Outline")
         self.expanded = bool(self.expanded)
         self.muted = bool(self.muted)
         self.antialiasing = bool(self.antialiasing)
+        if self.style not in {"solid", "brush"}:
+            raise ValueError("Unknown outline style")
+        if self.brush is not None and not isinstance(self.brush, dict):
+            raise ValueError("Outline brush must be a portable brush definition")
+        if self.brush is not None:
+            from comic_editor.core.brushes import BrushDefinition
+            self.brush = BrushDefinition.from_dict(self.brush).to_dict()
+        self.brush_follow_contour = bool(self.brush_follow_contour)
+        if not all(math.isfinite(float(value)) for value in (self.brush_spacing, self.brush_angle, self.brush_seed)):
+            raise ValueError("Outline brush values must be finite")
+        self.brush_spacing = max(10.0, min(400.0, float(self.brush_spacing)))
+        self.brush_angle = max(-180.0, min(180.0, float(self.brush_angle)))
+        self.brush_seed = int(self.brush_seed) % (2**32)
         values = tuple(float(value) for value in (
             self.intensity, self.thickness, self.opacity, self.blur_radius, self.blur_strength,
         ))
@@ -1071,6 +1295,12 @@ class OutlineModifier:
             "antialiasing": self.antialiasing,
             "blur_radius": self.blur_radius,
             "blur_strength": self.blur_strength,
+            "style": self.style,
+            "brush": copy.deepcopy(self.brush),
+            "brush_spacing": self.brush_spacing,
+            "brush_angle": self.brush_angle,
+            "brush_follow_contour": self.brush_follow_contour,
+            "brush_seed": self.brush_seed,
             "parameter_masks": _parameter_masks_to_dict(self.parameter_masks),
         }
 
@@ -1683,7 +1913,7 @@ class DistortModifier:
                     parameter_masks=_parameter_masks_to_dict(self.parameter_masks))
 
 
-ModifierInstance = HueSaturationLightnessModifier | BrightnessContrastModifier | CurvesModifier | BlurModifier | OutlineModifier | MirrorModifier | ArrayModifier | RadialBlurModifier | CageTransformModifier | PosterizeModifier | PosterizeValueModifier | TilingModifier | ScreamModifier | WobbleModifier | DotDashModifier | HalftoneModifier | PixelateModifier | DistortModifier
+ModifierInstance = HueSaturationLightnessModifier | BrightnessContrastModifier | CurvesModifier | BlurModifier | OutlineModifier | MirrorModifier | ArrayModifier | RadialBlurModifier | CageTransformModifier | PosterizeModifier | PosterizeValueModifier | TilingModifier | ScreamModifier | WobbleModifier | DotDashModifier | HalftoneModifier | PixelateModifier | DistortModifier | KuwaharaModifier | DitheringModifier | SharpnessModifier
 
 
 def modifier_from_dict(data: dict[str, Any]) -> ModifierInstance:
@@ -1741,12 +1971,23 @@ def modifier_from_dict(data: dict[str, Any]) -> ModifierInstance:
                            range_id=str(item.get("id") or new_id()))
             for item in data.get("ranges", [{"start": 0.}])
         ])
+    elif modifier_type == "kuwahara":
+        defaults = KuwaharaModifier().to_dict()
+        values = {key: data.get(key, value) for key, value in defaults.items()
+                  if key not in {"id", "type", "name", "intensity", "expanded", "muted", "parameter_masks"}}
+        result = KuwaharaModifier(**common, **values)
     elif modifier_type == "curves":
         result = CurvesModifier(
             **common, color_mode=str(data.get("color_mode", "rgb")),
             channel=str(data.get("channel", "master")), curves=copy.deepcopy(data.get("curves", {})),
             input_min=float(data.get("input_min", 0.)), input_max=float(data.get("input_max", 1.)),
             blend_mode=str(data.get("blend_mode", "normal")))
+    elif modifier_type in {"dithering", "sharpness"}:
+        factory = DitheringModifier if modifier_type == "dithering" else SharpnessModifier
+        values = {item.name: copy.deepcopy(data[item.name]) for item in fields(factory)
+                  if item.name not in common and item.name not in {"modifier_type"}
+                  and item.name in data}
+        result = factory(**common, **values)
     elif modifier_type == "brightness_contrast":
         result = BrightnessContrastModifier(
             **common, brightness=float(data.get("brightness", 0.0)),
@@ -1791,6 +2032,12 @@ def modifier_from_dict(data: dict[str, Any]) -> ModifierInstance:
             antialiasing=bool(data.get("antialiasing", True)),
             blur_radius=float(data.get("blur_radius", 0.0)),
             blur_strength=float(data.get("blur_strength", 0.0)),
+            style=str(data.get("style", "solid")),
+            brush=copy.deepcopy(data.get("brush")),
+            brush_spacing=float(data.get("brush_spacing", 100.0)),
+            brush_angle=float(data.get("brush_angle", 0.0)),
+            brush_follow_contour=bool(data.get("brush_follow_contour", True)),
+            brush_seed=int(data.get("brush_seed", 0)),
         )
     else:
         raise ValueError(f"Unknown modifier type: {modifier_type}")

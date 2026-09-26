@@ -54,6 +54,14 @@ workflow.
 - Blender 5.2 and 4.5 LTS Comic Views as disk-published transparent image sources with
   persistent offline PNG caches
 
+## Painterly modifiers
+
+**Modifiers → Add Modifier → Kuwahara** offers Original, Papari Generalized,
+and Anisotropic filters with editable sampling size, strength, and quality.
+Limited linear/circular gradients in mask edit mode can vary actual filter size
+or outline thickness around focal areas. Dithering, Sharpness, and material-brush
+outlines are also available. See the [controls and focal-mask guide](docs/painterly-modifiers.md).
+
 ## Distort modifiers
 
 Select a Raster drawing, image, or Blender render and choose **Modifiers → Add

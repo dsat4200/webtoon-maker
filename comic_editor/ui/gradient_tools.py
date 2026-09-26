@@ -216,6 +216,29 @@ class GradientToolsControls(QWidget):
         button_row.addWidget(self.select_gradient)
         create.addLayout(button_row)
 
+        self.mask_gradients_widget = QWidget(self.create_widget)
+        mask_gradients_layout = QVBoxLayout(self.mask_gradients_widget)
+        mask_gradients_layout.setContentsMargins(0, 0, 0, 0)
+        add_limited_row = QVBoxLayout()
+        self.add_limited_linear = QPushButton("+ Limited Linear", self.mask_gradients_widget)
+        self.add_limited_circular = QPushButton("+ Limited Circular", self.mask_gradients_widget)
+        self.add_limited_linear.setToolTip("Add a ramp clipped to an adjustable strip. Blue handles change its bounds.")
+        self.add_limited_circular.setToolTip(
+            "Add a focal gradient: white at its center, black beyond its outer bound. "
+            "For fine detail at a face, set the parameter's White value low and Black value high."
+        )
+        add_limited_row.addWidget(self.add_limited_linear)
+        add_limited_row.addWidget(self.add_limited_circular)
+        mask_gradients_layout.addLayout(add_limited_row)
+        select_limited_row = QHBoxLayout()
+        self.mask_gradient_selector = QComboBox(self.mask_gradients_widget)
+        self.mask_gradient_selector.setToolTip("Select a mask gradient to edit its ramp, endpoints, and bounds")
+        self.remove_mask_gradient = QPushButton("Remove", self.mask_gradients_widget)
+        select_limited_row.addWidget(self.mask_gradient_selector, 1)
+        select_limited_row.addWidget(self.remove_mask_gradient)
+        mask_gradients_layout.addLayout(select_limited_row)
+        create.addWidget(self.mask_gradients_widget)
+
         self.type_parameters_widget = QWidget(self)
         type_parameters = QVBoxLayout(self.type_parameters_widget)
         type_parameters.setContentsMargins(0, 0, 0, 0)
@@ -237,6 +260,33 @@ class GradientToolsControls(QWidget):
         self.mask_hint.setWordWrap(True)
         self.mask_hint.hide()
         type_parameters.addWidget(self.mask_hint)
+        self.limited_bounds_widget = QWidget(self.type_parameters_widget)
+        bounds_layout = QGridLayout(self.limited_bounds_widget)
+        bounds_layout.setContentsMargins(0, 0, 0, 0)
+        self.limited_bounds_controls = {}
+        for index, (key, title, minimum, maximum, suffix) in enumerate((
+            ("start_bound", "Start bound", -100000, 100000, "%"),
+            ("end_bound", "End bound", -100000, 100000, "%"),
+            ("half_width", "Half-width", .01, 100000, " px"),
+            ("feather", "Edge feather", 0, 100000, " px"),
+        )):
+            label = QLabel(title, self.limited_bounds_widget)
+            control = QDoubleSpinBox(self.limited_bounds_widget)
+            control.setRange(minimum, maximum)
+            control.setDecimals(1)
+            control.setSuffix(suffix)
+            control.setKeyboardTracking(False)
+            control.setToolTip("Application bound as a percentage of the start-to-end distance" if key.endswith("bound") else "Distance in chapter pixels")
+            bounds_layout.addWidget(label, index, 0)
+            bounds_layout.addWidget(control, index, 1)
+            self.limited_bounds_controls[key] = control
+            control.valueChanged.connect(self._limited_bounds_changed)
+        self.limited_operation = QComboBox(self.limited_bounds_widget)
+        self.limited_operation.addItem("Add to mask", "add")
+        self.limited_operation.addItem("Subtract from mask", "subtract")
+        self.limited_operation.currentIndexChanged.connect(self._limited_bounds_changed)
+        bounds_layout.addWidget(self.limited_operation, 4, 0, 1, 2)
+        type_parameters.addWidget(self.limited_bounds_widget)
         self.opacity_lock = QCheckBox(
             "Lock opacity", self.type_parameters_widget
         )
@@ -428,6 +478,10 @@ class GradientToolsControls(QWidget):
         )
         self.field_type.currentIndexChanged.connect(self._field_changed)
         self.gradient_shape.currentIndexChanged.connect(self._gradient_shape_changed)
+        self.add_limited_linear.clicked.connect(lambda: self._add_limited_gradient("linear"))
+        self.add_limited_circular.clicked.connect(lambda: self._add_limited_gradient("circular"))
+        self.mask_gradient_selector.currentIndexChanged.connect(self._mask_gradient_selected)
+        self.remove_mask_gradient.clicked.connect(self._remove_mask_gradient)
         self.select_gradient.clicked.connect(self._select_matching_gradient)
         self.direction_mode.currentIndexChanged.connect(
             self._type_parameter_changed
@@ -543,6 +597,30 @@ class GradientToolsControls(QWidget):
         context_changed = context_kind != self._context_kind
         self._context_kind = context_kind
         self._loading = True
+        self.mask_gradients_widget.setVisible(mask_active)
+        limited = self.canvas.active_limited_mask_gradient() if mask_active and obj is not None else None
+        self.limited_bounds_widget.setVisible(limited is not None)
+        self.mask_hint.setText(
+            "Opacity controls mask value. Orange handles edit the ramp; blue handles limit its area."
+            if limited is not None else
+            "Stop opacity controls mask strength.\nDrag on the canvas to redraw the gradient."
+        )
+        self.mask_gradient_selector.clear()
+        mask = self.canvas.chapter.masks.get(self.canvas.active_tone_mask_id) if mask_active else None
+        if mask is not None:
+            if mask.gradient is not None:
+                self.mask_gradient_selector.addItem("Unbounded gradient", mask.gradient.object_id)
+            for entry in mask.limited_gradients:
+                self.mask_gradient_selector.addItem(entry.gradient.name, entry.gradient.object_id)
+        if obj is not None:
+            self.mask_gradient_selector.setCurrentIndex(self.mask_gradient_selector.findData(obj.object_id))
+        self.remove_mask_gradient.setEnabled(obj is not None)
+        if limited is not None:
+            for key, control in self.limited_bounds_controls.items():
+                control.setValue(getattr(limited, key) * (100 if key.endswith("bound") else 1))
+            self.limited_bounds_controls["half_width"].setEnabled(obj.gradient_shape == "linear")
+            self.limited_bounds_controls["start_bound"].setMinimum(0 if obj.gradient_shape == "circular" else -100000)
+            self.limited_operation.setCurrentIndex(max(0, self.limited_operation.findData(limited.operation)))
         enabled = obj is not None
         context_parent = self.context_parent_id()
         self.field_type.setEnabled(bool(context_parent))
@@ -763,9 +841,48 @@ class GradientToolsControls(QWidget):
 
     def _touch_mask_gradient(self, obj: ColorFillGradientObject) -> None:
         mask = self.canvas.chapter.masks.get(self.canvas.active_tone_mask_id)
-        if mask is not None and mask.gradient is obj:
+        if mask is not None and (mask.gradient is obj or any(entry.gradient is obj for entry in mask.limited_gradients)):
             mask.touch()
             self.canvas._invalidate_tone_mask_overlay()
+
+    def _add_limited_gradient(self, shape: str) -> None:
+        if not self.canvas.active_tone_mask_id:
+            return
+        from comic_editor.ui.canvas import ToolKind
+        self.canvas.set_tool(ToolKind.GRADIENT)
+        self.canvas.add_limited_mask_gradient(shape)
+        self.refresh()
+        self.objectChanged.emit()
+
+    def _mask_gradient_selected(self) -> None:
+        if self._loading or not self.canvas.active_tone_mask_id:
+            return
+        from comic_editor.ui.canvas import ToolKind
+        object_id = str(self.mask_gradient_selector.currentData() or "")
+        self.canvas.set_tool(ToolKind.GRADIENT)
+        self.canvas.select_mask_gradient(object_id)
+        self.refresh()
+
+    def _remove_mask_gradient(self) -> None:
+        self.canvas.remove_active_mask_gradient()
+        self.refresh()
+        self.objectChanged.emit()
+
+    def _limited_bounds_changed(self, *args) -> None:
+        if self._loading:
+            return
+        limited = self.canvas.active_limited_mask_gradient()
+        if limited is None:
+            return
+        before = self.canvas.chapter.to_dict()
+        for key, control in self.limited_bounds_controls.items():
+            setattr(limited, key, control.value() / (100 if key.endswith("bound") else 1))
+        limited.operation = str(self.limited_operation.currentData() or "add")
+        limited.validate()
+        limited.gradient.touch_revision()
+        self._touch_mask_gradient(limited.gradient)
+        self._commit_change(before, "Change limited gradient bounds")
+        self.refresh()
 
     def _gradient_shape_changed(self) -> None:
         if self._loading:

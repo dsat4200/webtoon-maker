@@ -4,7 +4,7 @@ import math
 
 from comic_editor.core.models import (
     ArrayModifier, BlurModifier, BrightnessContrastModifier, CurvesModifier, HalftoneModifier, HueSaturationLightnessModifier,
-    MirrorModifier, OutlineModifier, PixelateModifier,
+    MirrorModifier, OutlineModifier, PixelateModifier, KuwaharaModifier, DitheringModifier, SharpnessModifier,
 )
 
 
@@ -15,7 +15,7 @@ def capture_scale(canvas, bounds, modifiers):
         return 1.
     supported = (ArrayModifier, BlurModifier, BrightnessContrastModifier, CurvesModifier, HalftoneModifier,
                  HueSaturationLightnessModifier, MirrorModifier, OutlineModifier,
-                 PixelateModifier)
+                 PixelateModifier, KuwaharaModifier, DitheringModifier, SharpnessModifier)
     if any(not isinstance(modifier, supported)
            or isinstance(modifier, BlurModifier) and modifier.mode == "focal"
            for modifier in modifiers):
@@ -33,8 +33,16 @@ def scaled_modifiers(modifiers, scale):
             fields = ("strength",)
         elif isinstance(modifier, OutlineModifier):
             fields = ("thickness", "blur_radius")
+            from comic_editor.core.brush_outline import scale_outline_brush
+            scale_outline_brush(modifier, scale)
         elif isinstance(modifier, PixelateModifier):
             fields = ("pixel_size", "blur")
+        elif isinstance(modifier, KuwaharaModifier):
+            fields = ("size", "tensor_radius")
+        elif isinstance(modifier, SharpnessModifier):
+            fields = ("radius",)
+        elif isinstance(modifier, DitheringModifier):
+            fields = ("pixel_size",)
         for field in fields:
             setattr(modifier, field, getattr(modifier, field) * scale)
             binding = modifier.parameter_masks.get(field)

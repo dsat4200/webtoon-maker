@@ -9,6 +9,7 @@ from comic_editor.core.models import (ArrayModifier, MirrorModifier, RadialBlurM
     CageTransformModifier, PosterizeModifier, HalftoneModifier, PixelateModifier,
     OutlineModifier, DistortModifier, BlurModifier)
 from comic_editor.core.color_smoothing import simplify_padding
+from comic_editor.core.models import KuwaharaModifier, DitheringModifier, SharpnessModifier
 from comic_editor.core.effect_geometry import effect_bounds, reflection_transform, array_indices, array_transform, array_input_bounds, outline_blur_padding
 from comic_editor.ui.modifier_rendering import apply_modifier_stack, _qimage_premultiplied, _premultiplied_qimage, _parameter_field, modifier_render_settings
 from comic_editor.ui.effect_regions import (
@@ -107,10 +108,16 @@ def _stage_plan(canvas, bounds, modifiers, local_to_world, source_identity, near
         needed = QRectF(required)
         for index in range(len(modifiers) - 1, -1, -1):
             requirements[index] = needed
-            if isinstance(modifiers[index], BlurModifier) and region_requests_enabled(canvas):
+            if (isinstance(modifiers[index], BlurModifier) and region_requests_enabled(canvas)
+                    or isinstance(modifiers[index], (KuwaharaModifier, SharpnessModifier, DitheringModifier))
+                    or isinstance(modifiers[index], OutlineModifier) and modifiers[index].style == "brush"):
                 # The existing blur pyramid is phased by the full image
                 # dimensions (including odd-size ceil-halving). A padded
-                # crop is not equivalent. Retain this stage and its incoming
+                # crop is not equivalent. Kuwahara/sharpen need the complete
+                # neighborhood and dithering needs a stable lattice origin.
+                # Brush outlines must trace complete contours so cropping does
+                # not invent boundaries or restart material repeat patterns.
+                # Retain this stage and its incoming
                 # frame intact; later pointwise stages may crop its output.
                 requirements[index] = None
                 break

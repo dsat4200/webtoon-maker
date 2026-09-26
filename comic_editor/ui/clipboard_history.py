@@ -390,6 +390,8 @@ def _translate_mask(canvas, mask_id, offset):
     mask = canvas.chapter.masks[mask_id]
     if mask.gradient is not None:
         _translate_object(mask.gradient, offset.x(), offset.y(), canvas.chapter)
+    for limited in mask.limited_gradients:
+        _translate_object(limited.gradient, offset.x(), offset.y(), canvas.chapter)
     source = canvas.tiles.object_tiles(mask_id)
     size = canvas.tiles.tile_size
     translated = {}
