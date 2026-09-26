@@ -186,7 +186,7 @@ class _FontSizeSpinBox(QSpinBox):
 
 
 class ToolSettingsControls(QWidget):
-    """Pencil, eraser, and fill controls for the Tool Settings page."""
+    """Contextual drawing and shape controls for the Tool Settings page."""
 
     settingsChanged = Signal()
     pencilPresetSelected = Signal(str)
@@ -198,6 +198,7 @@ class ToolSettingsControls(QWidget):
     fillSettingsChanged = Signal()
     fillToleranceChanged = Signal(int, bool)
     fillSelectionRequested = Signal()
+    closeShapeRequested = Signal()
 
     def __init__(self, settings, parent: QWidget | None = None):
         super().__init__(parent)
@@ -238,8 +239,30 @@ class ToolSettingsControls(QWidget):
         self.stack.addWidget(self.fill_page)
         self.draw_shape_page = self._build_draw_shape_page()
         self.stack.addWidget(self.draw_shape_page)
+        self.shape_edit_page = self._build_shape_edit_page()
+        self.stack.addWidget(self.shape_edit_page)
         self.refresh()
         self.set_context(None, False)
+
+    def _build_shape_edit_page(self) -> QWidget:
+        page = QWidget(self)
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(0, 0, 0, 0)
+        self.close_shape_button = QPushButton("Close shape", page)
+        self.close_shape_button.setObjectName("closeShapeButton")
+        self.close_shape_button.setToolTip(
+            "Join the two ends with a straight edge and enable a fill."
+        )
+        self.close_shape_button.clicked.connect(self.closeShapeRequested.emit)
+        layout.addWidget(self.close_shape_button)
+        description = QLabel(
+            "Select an open shape to connect its ends. You can change its color with Fill.", page,
+        )
+        description.setWordWrap(True)
+        description.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+        layout.addWidget(description)
+        layout.addStretch(1)
+        return page
 
     def _build_mask_wand_page(self) -> QWidget:
         page = QWidget(self)
@@ -628,6 +651,7 @@ class ToolSettingsControls(QWidget):
     def set_context(
         self, tool: object, vector_active: bool,
         raster_active: bool = False, mask_active: bool = False,
+        can_close_shape: bool = False,
     ) -> None:
         value = _tool_value(tool)
         if value == "mask_select" and mask_active:
@@ -661,13 +685,16 @@ class ToolSettingsControls(QWidget):
         elif value == "draw_shape":
             self.context_label.setText("Draw Shape")
             self.stack.setCurrentWidget(self.draw_shape_page)
+        elif value == "shape_edit":
+            self.context_label.setText("Shape Edit")
+            self.stack.setCurrentWidget(self.shape_edit_page)
         else:
             self.context_label.setText("No settings for the current tool")
             self.stack.setCurrentWidget(self.empty_page)
-        # Other, inactive tool pages have wide controls. Let the compact wand
-        # page use the sidebar width instead of inheriting their minimum width.
+        self.close_shape_button.setEnabled(value == "shape_edit" and can_close_shape)
+        # Inactive pages have wide controls; compact pages use the sidebar width.
         self.stack.setSizePolicy(
-            QSizePolicy.Ignored if value == "mask_wand" and mask_active
+            QSizePolicy.Ignored if value == "shape_edit" or (value == "mask_wand" and mask_active)
             else QSizePolicy.Preferred,
             QSizePolicy.Preferred,
         )

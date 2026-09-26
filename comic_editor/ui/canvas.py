@@ -21628,6 +21628,50 @@ class _CanvasLogic(DocumentProjectionFeatures, MultiRasterSelectionFeatures, Sho
         minimum = 3 if bound.closed else 2
         return len(bound.nodes) > minimum
 
+    def can_close_selected_shape(self) -> bool:
+        if (
+            self.tool != ToolKind.SHAPE_EDIT or self.chapter is None
+            or self.selected_kind != "layer"
+        ):
+            return False
+        layer = self.chapter.layers.get(self.selected_id)
+        return bool(
+            layer is not None and not layer.is_page
+            and layer.layer_kind == "open_shape"
+            and layer.bound is not None and not layer.bound.closed
+            and len(layer.bound.nodes) >= 2
+        )
+
+    def close_selected_shape(self) -> bool:
+        """Close the selected path with a straight seam, preserving its curves."""
+        if not self.can_close_selected_shape():
+            return False
+        before = self.chapter.to_dict()
+        layer = self.chapter.layers[self.selected_id]
+        bound = layer.bound
+        first, last = bound.nodes[0], bound.nodes[-1]
+        # Missing handles would be mirrored by normalization, curving the seam.
+        # Zero-length handles leave the existing adjacent curves untouched.
+        for node, handle in ((first, "incoming"), (last, "outgoing")):
+            if node.point_type == "bezier":
+                setattr(node, handle, node.position)
+                node.handles_locked = False
+            node.roundness_enabled = False
+        if len(bound.nodes) == 2:
+            # Closed contours require three nodes; keep the new edge collinear.
+            bound.nodes.append(PathNode(
+                x=(last.x + first.x) / 2, y=(last.y + first.y) / 2,
+            ))
+        bound.closed = True
+        layer.layer_kind = "bounded"
+        if layer.fill_color is None:
+            layer.fill_color = self.secondary_color
+        self._shape_hover_target = None
+        self._shape_hover_insert = None
+        self._push_immediate_shape_change(before, "Close shape")
+        self.interactionFinished.emit()
+        return True
+
     def _shape_edit_target(
         self,
     ) -> tuple[BoundGeometry, QTransform, ShapeStyle | None] | None:

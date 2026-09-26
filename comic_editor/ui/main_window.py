@@ -1236,6 +1236,9 @@ class MainWindow(QMainWindow):
         self.tool_settings_controls.fillSelectionRequested.connect(
             self._fill_active_selection
         )
+        self.tool_settings_controls.closeShapeRequested.connect(
+            self.canvas.close_selected_shape
+        )
         self.tool_settings_controls.fillToleranceChanged.connect(
             self.canvas.request_fill_tolerance_replay
         )
@@ -3753,6 +3756,7 @@ class MainWindow(QMainWindow):
             self.canvas.tool, vector_active=vector_tool_context,
             raster_active=isinstance(selected_object, RasterObject),
             mask_active=bool(self.canvas.active_tone_mask_id),
+            can_close_shape=self.canvas.can_close_selected_shape(),
         )
         if text_active:
             self.text_object_controls.refresh()
