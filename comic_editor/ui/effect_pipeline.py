@@ -21,6 +21,22 @@ from comic_editor.ui.async_projection import (
 )
 
 
+REGIONAL_HALFTONE_MIN_PIXELS = 2_000_000
+
+
+def _kuwahara_region_padding(modifier):
+    # A native-scale, single-pass filter has finite support. Reduced-scale
+    # filtering resamples against the complete source frame instead.
+    if modifier.processing_scale != 100 or modifier.iterations != 1:
+        return None
+    binding = modifier.parameter_masks.get("size")
+    size = max(modifier.size, binding.black_value, binding.white_value) if binding else modifier.size
+    sample = size * (1 + modifier.anisotropy / 100 if modifier.variant == "anisotropic" else 1)
+    orientation = (4 * modifier.tensor_radius + 5
+                   if modifier.variant == "anisotropic" and modifier.anisotropy > 0 else 0)
+    return math.ceil(max(sample + 2, orientation))
+
+
 def aligned(bounds):
     # Qt's integer rectangles wrap outside this range. Report an oversized
     # bake instead of producing a corrupt image after cumulative array scale.
@@ -108,6 +124,11 @@ def _stage_plan(canvas, bounds, modifiers, local_to_world, source_identity, near
         needed = QRectF(required)
         for index in range(len(modifiers) - 1, -1, -1):
             requirements[index] = needed
+            if isinstance(modifiers[index], KuwaharaModifier):
+                padding = _kuwahara_region_padding(modifiers[index])
+                if padding is not None:
+                    needed = needed.adjusted(-padding, -padding, padding, padding)
+                    continue
             if (isinstance(modifiers[index], BlurModifier) and region_requests_enabled(canvas)
                     or isinstance(modifiers[index], (KuwaharaModifier, SharpnessModifier, DitheringModifier))
                     or isinstance(modifiers[index], OutlineModifier) and modifiers[index].style == "brush"):
@@ -125,6 +146,11 @@ def _stage_plan(canvas, bounds, modifiers, local_to_world, source_identity, near
                 # A displaced cage can pull source pixels from anywhere in the
                 # incoming stage. Pattern effects also need the full frame:
                 # cropping first changes their grid origin and reference scale.
+                # A smudge computes its full stroke history even for a crop.
+                # Retain that output so a camera move can reuse the exact pixels.
+                if (isinstance(modifiers[index], DistortModifier)
+                        and modifiers[index].modifier_type == "distort_smudge"):
+                    requirements[index] = None
                 break
             if isinstance(modifiers[index], ArrayModifier) and not modifiers[index].muted:
                 needed = array_input_bounds(needed, modifiers[index], local_to_world)
@@ -244,10 +270,21 @@ def render_stages(canvas, image, bounds, modifiers, local_to_world, *, nearest=F
                transform_signature)
         stage_base_scope = (*base_request_scope, modifier.modifier_id) if base_request_scope is not None else None
         stage_scope = region_scope(canvas, stage_base_scope, target)
+        regional_halftone = (
+            exact and region_requests_enabled(canvas) and required is not None
+            and isinstance(modifier, HalftoneModifier)
+            and modifier.grid_type in {"square", "hexagonal"}
+            and modifier.dot_style != "delaunay"
+            and modifier.color_mode != "target_layer"
+            and not modifier.parameter_masks and target != bounds
+            and image.width() * image.height() >= REGIONAL_HALFTONE_MIN_PIXELS
+            and target.width() * target.height() < bounds.width() * bounds.height() / 2
+        )
         pattern_frame_key = None
         pattern_frame_scope = None
         if (isinstance(modifier, (HalftoneModifier, PixelateModifier))
-                and (region_requests_enabled(canvas) or reference)):
+                and (region_requests_enabled(canvas) or reference)
+                and not regional_halftone):
             # Pattern geometry and sampling depend on the complete incoming
             # frame. Share that exact computation across requested output
             # tiles instead of running the full kernel for every crop.
@@ -301,6 +338,36 @@ def render_stages(canvas, image, bounds, modifiers, local_to_world, *, nearest=F
             image, bounds, provisional = cached, target, True
             continue
         if cached is None:
+            if regional_halftone:
+                from comic_editor.ui.pattern_rendering import halftone_region
+                region = QRectF(target).translated(-bounds.topLeft()).toAlignedRect()
+                incoming, effect = QImage(image), copy.deepcopy(modifier)
+                def compute(cancelled=None, incoming=incoming, effect=effect,
+                            region=region):
+                    result = halftone_region(incoming, effect, region,
+                                             cancelled=cancelled)
+                    if effect.intensity < 100:
+                        original = incoming.copy(region)
+                        amount = max(0., effect.intensity / 100.)
+                        result = _premultiplied_qimage(
+                            _qimage_premultiplied(original) * (1. - amount)
+                            + _qimage_premultiplied(result) * amount)
+                    return result
+                if deferred and not provisional and stage_scope is not None:
+                    canvas._effect_jobs.request(stage_scope, key, compute,
+                        8 * int(incoming.sizeInBytes()),
+                        allow_oversized=True, require_exact=True)
+                    raise ProjectionPending(stage_scope, key)
+                cached = compute()
+                if not provisional:
+                    canvas._modifier_cache_put(key, cached)
+                image, bounds = cached, target
+                if checkpointing and not provisional:
+                    canvas._effect_jobs.retained_put(("result", stage_scope), key, image,
+                        shared=required is not None and index < len(modifiers) - 1)
+                    canvas._effect_jobs.retained_put(checkpoint_scope, pipeline_key,
+                        image, (index + 1, QRectF(bounds)))
+                continue
             work_target = target
             pattern = isinstance(modifier, (HalftoneModifier, PixelateModifier))
             if pattern:
@@ -315,6 +382,9 @@ def render_stages(canvas, image, bounds, modifiers, local_to_world, *, nearest=F
             if isinstance(modifier, PosterizeModifier):
                 padding = simplify_padding(modifier)
                 work_target = aligned(target.adjusted(-padding, -padding, padding, padding).intersected(bounds))
+            if (isinstance(modifier, KuwaharaModifier)
+                    and _kuwahara_region_padding(modifier) is not None):
+                work_target = bounds
             # Keep the upstream image identity for cached GPU uploads and blur
             # passes when a pattern slider changes.
             source = image if pattern else None

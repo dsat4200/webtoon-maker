@@ -242,13 +242,15 @@ def _parameter_field(
     field = mask_fields.get((modifier.modifier_id, attribute))
     if binding is None or field is None:
         return float(fallback)
-    normalized = np.clip(np.asarray(field, dtype=np.float32), 0.0, 1.0)
-    if normalized.shape != shape:
+    values = np.asarray(field, dtype=np.float32)
+    if values.shape != shape:
         return float(fallback)
-    return (
-        binding.black_value
-        + normalized * (binding.white_value - binding.black_value)
-    )
+    normalized = np.empty_like(values)
+    np.clip(values, 0.0, 1.0, out=normalized)
+    np.multiply(normalized, binding.white_value - binding.black_value,
+                out=normalized)
+    np.add(normalized, binding.black_value, out=normalized)
+    return normalized
 
 
 def _variable_blur(
@@ -357,8 +359,8 @@ class OutlineDistanceCache:
         """Return distances, occupied bounds, and the distance field's bounds.
 
         A bounded margin avoids running the transform across empty canvas.
-        Every occupied pixel remains inside the region, so distances within
-        that region are identical to a full-image transform.
+        Distances that can contribute to an outline within that margin are
+        identical to a full-image transform; large fields omit farther values.
         """
         key = (margin, *self._key(alpha))
         cached = self._values.pop(key, None)
@@ -381,7 +383,11 @@ class OutlineDistanceCache:
         else:
             extent = (0, 0, 0, 0)
         left, top, right, bottom = extent
-        result = (_outside_distance(alpha[top:bottom, left:right]), bounds, extent)
+        region = alpha[top:bottom, left:right]
+        distance = (_outside_distance_bounded(region, margin)
+                    if margin is not None and region.size > 1_000_000 and margin <= 256
+                    else _outside_distance(region))
+        result = (distance, bounds, extent)
         self.computations += 1
         size = int(result[0].nbytes)
         if 0 < size <= self.budget:
@@ -406,6 +412,28 @@ def _outside_distance(alpha: np.ndarray) -> np.ndarray:
     return distance_transform_edt(
         np.asarray(alpha <= 1e-6, dtype=np.uint8)
     ).astype(np.float32, copy=False)
+
+
+def _outside_distance_bounded(alpha: np.ndarray, margin: int) -> np.ndarray:
+    """Compute exact distances within the outline's finite support in small blocks."""
+    height, width = alpha.shape
+    result = np.full((height, width), np.inf, dtype=np.float32)
+    halo = math.ceil(margin) + 1
+    for top in range(0, height, 256):
+        bottom = min(height, top + 256)
+        source_top, source_bottom = max(0, top - halo), min(height, bottom + halo)
+        for left in range(0, width, 256):
+            right = min(width, left + 256)
+            source_left, source_right = max(0, left - halo), min(width, right + halo)
+            transparent = alpha[source_top:source_bottom, source_left:source_right] <= 1e-6
+            if np.all(transparent):
+                continue
+            distances = distance_transform_edt(transparent)
+            core = distances[top - source_top:bottom - source_top,
+                             left - source_left:right - source_left]
+            destination = result[top:bottom, left:right]
+            np.copyto(destination, core, where=core <= margin)
+    return result
 
 
 def _outline_effect(

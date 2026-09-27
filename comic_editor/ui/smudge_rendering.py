@@ -155,6 +155,27 @@ def _base_image(image, bounds, work, scale):
     return _rgba(result)
 
 
+def _rebase_pixels(pixels, old_work, work, scale):
+    """Move an unchanged stroke prefix onto another aligned working frame."""
+    left = (old_work.x() - work.x()) * scale
+    top = (old_work.y() - work.y()) * scale
+    if abs(left - round(left)) > 1e-8 or abs(top - round(top)) > 1e-8:
+        return None
+    left, top = round(left), round(top)
+    height = max(1, math.ceil(work.height() * scale))
+    width = max(1, math.ceil(work.width() * scale))
+    result = np.zeros((height, width, 4), pixels.dtype)
+    source_x, source_y = max(0, -left), max(0, -top)
+    target_x, target_y = max(0, left), max(0, top)
+    columns = min(pixels.shape[1] - source_x, width - target_x)
+    rows = min(pixels.shape[0] - source_y, height - target_y)
+    if columns > 0 and rows > 0:
+        result[target_y:target_y+rows, target_x:target_x+columns] = (
+            pixels[source_y:source_y+rows, source_x:source_x+columns]
+        )
+    return result
+
+
 def render_smudge(image, bounds, modifier, transform, target, cancelled=None, *,
                   pixel_scale=1., preparation_cache=None):
     """Return a faithful crop of the complete ordered smear, or cancellation."""
@@ -168,7 +189,8 @@ def render_smudge(image, bounds, modifier, transform, target, cancelled=None, *,
     if work.width()*work.height()*scale*scale > 64*1024*1024:
         raise ValueError("Smudge result is too large; reduce the layer or stroke extent")
     placement = tuple(getattr(transform, f"m{i}{j}")() for i in range(1, 4) for j in range(1, 4))
-    source_key = ("smudge", int(image.cacheKey()), bounds.getRect(), work.getRect(), scale, placement)
+    prefix_source_key = ("smudge-prefix", int(image.cacheKey()), bounds.getRect(), scale, placement)
+    source_key = (*prefix_source_key, work.getRect())
     cache = preparation_cache
     prefix = hashlib.sha256()
     opacity = min(1., max(0., float(modifier.parameters.get("opacity", 100.)) / 100.))
@@ -176,14 +198,18 @@ def render_smudge(image, bounds, modifier, transform, target, cancelled=None, *,
     keys = []
     for stroke in strokes:
         prefix.update(json.dumps(stroke, sort_keys=True, separators=(",", ":")).encode())
-        keys.append((source_key, prefix.digest()))
+        keys.append((prefix_source_key, prefix.digest()))
     # Start at the longest surviving prefix. Walking from the original source
     # would evict useful late checkpoints while rebuilding earlier ones when
     # a large image has more stroke history than the cache can retain.
     result, first = None, 0
     if cache is not None:
         for index in reversed(range(len(keys))):
-            result = cache._get(keys[index])
+            checkpoint = cache._get(keys[index])
+            if checkpoint is not None:
+                old_work, pixels = checkpoint
+                result = (pixels if old_work == work
+                          else _rebase_pixels(pixels, old_work, work, scale))
             if result is not None:
                 first = index + 1
                 break
@@ -203,7 +229,7 @@ def render_smudge(image, bounds, modifier, transform, target, cancelled=None, *,
         if not _stroke(result, strokes[index], work, scale, transform, cancelled):
             return None
         if cache is not None:
-            cache._put(keys[index], result, (result,))
+            cache._put(keys[index], (QRectF(work), result), (result,))
     if cancelled is not None and cancelled():
         return None
     width, height = max(1, math.ceil(target.width()*pixel_scale)), max(1, math.ceil(target.height()*pixel_scale))

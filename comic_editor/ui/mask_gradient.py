@@ -287,18 +287,19 @@ class MaskGradientFeatures:
         self, obj: ColorFillGradientObject, width: int, height: int,
         world_to_image: QTransform,
         limited: LimitedMaskGradient | None = None,
+        *, output: np.ndarray | None = None, subtract: bool = False,
     ) -> np.ndarray:
         """Sample at the requested resolution, including rotated export tiles."""
         inverse, valid = world_to_image.inverted()
         if not valid:
-            return np.zeros((height, width), dtype=np.float32)
+            return output if output is not None else np.zeros((height, width), dtype=np.float32)
         first, second = obj.line_field.geometry.nodes[0], obj.line_field.geometry.nodes[-1]
         dx, dy = second.x - first.x, second.y - first.y
         # Use the standard gradient ramp sampler to preserve coincident stops.
         lut = self._cached_gradient_ramp_lut(obj.ramp)
         circular = obj.gradient_shape == "circular"
         radius = max(math.hypot(dx, dy), 1e-6)
-        result = np.empty((height, width), dtype=np.float32)
+        result = output if output is not None else np.empty((height, width), dtype=np.float32)
         x = np.arange(width, dtype=np.float32)[None, :] + .5
         # Export tiles can be much larger than the editing preview. Keep the
         # coordinate and distance temporaries bounded, without downsampling.
@@ -333,5 +334,11 @@ class MaskGradientFeatures:
                     edge = np.minimum(edge, limited.half_width-cross)
                 falloff = np.clip(edge/limited.feather, 0, 1) if limited.feather > 0 else (edge >= 0)
                 alpha = alpha * falloff
-            result[start:end] = np.where(coverage, alpha, 0)
+            values = np.where(coverage, alpha, 0)
+            if output is None:
+                result[start:end] = values
+            elif subtract:
+                np.subtract(result[start:end], values, out=result[start:end])
+            else:
+                np.add(result[start:end], values, out=result[start:end])
         return result

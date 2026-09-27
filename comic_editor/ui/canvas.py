@@ -11,6 +11,7 @@ import zlib
 import json
 import mimetypes
 import re
+import sys
 import threading
 import urllib.parse
 from collections import OrderedDict, deque
@@ -1553,12 +1554,14 @@ class _CanvasLogic(BrushFeatures, DocumentProjectionFeatures, MultiRasterSelecti
         """Reset transient pointer state that cannot survive without a document."""
         self._cancel_paint_brush()
         self._projection_completed_view = None
+        self._projection_progress_view = None
         self._mesh_warp_parameter_drag_id = None
         self._smudge_parameter_drag_id = None
         self.smudge_selected_stroke_id = ""
         self.smudge_selected_point_index = 0
         self._mesh_warp_preview_session_id = None
         self._mesh_warp_preview_presented = False
+        self._smudge_preview_baseline = None
         self._projection_frame_pending = False
         self._projection_work_waiting = False
         self._projection_render_error = None
@@ -5301,7 +5304,18 @@ class _CanvasLogic(BrushFeatures, DocumentProjectionFeatures, MultiRasterSelecti
             if child.kind == "layer"
             else self.chapter.objects.get(child.entity_id)
         )
-        return bool(entity and entity.ignore_parent_mask)
+        return bool(entity and (
+            entity.ignore_parent_mask or self._entity_has_smudge_overflow(entity)
+        ))
+
+    def _entity_has_smudge_overflow(self, entity) -> bool:
+        return any(
+            isinstance(modifier, DistortModifier)
+            and modifier.modifier_type == "distort_smudge"
+            and modifier.parameters.get("strokes")
+            and modifier.intensity > 0
+            for modifier in self._active_modifier_instances(entity.modifier_ids)
+        )
 
     @staticmethod
     def _is_outward_gradient(obj: GradientObject) -> bool:
@@ -7973,16 +7987,47 @@ class _CanvasLogic(BrushFeatures, DocumentProjectionFeatures, MultiRasterSelecti
 
     @staticmethod
     def _image_alpha_array(image: QImage) -> np.ndarray:
-        converted = image.convertToFormat(QImage.Format.Format_RGBA8888)
+        if image.isNull():
+            raise MemoryError("Could not allocate tone mask image")
+        native_argb = image.format() in (
+            QImage.Format.Format_ARGB32,
+            QImage.Format.Format_ARGB32_Premultiplied,
+            QImage.Format.Format_RGB32,
+        )
+        converted = image if native_argb else image.convertToFormat(QImage.Format.Format_RGBA8888)
+        if converted.isNull():
+            raise MemoryError("Could not convert tone mask image")
+        alpha_byte = (3 if sys.byteorder == "little" else 0) if native_argb else 3
         view = np.frombuffer(
             converted.constBits(), dtype=np.uint8,
             count=converted.sizeInBytes(),
         ).reshape(converted.height(), converted.bytesPerLine())
-        return (
-            view[:, :converted.width() * 4]
-            .reshape(converted.height(), converted.width(), 4)[..., 3]
-            .astype(np.float32) / 255.0
+        return view[:, alpha_byte:converted.width() * 4:4].astype(np.float32) / 255.0
+
+    @staticmethod
+    def _add_image_alpha_to_field(field: np.ndarray, image: QImage) -> None:
+        """Accumulate a large painted mask without a second full float image."""
+        if image.isNull():
+            raise MemoryError("Could not allocate tone mask image")
+        native_argb = image.format() in (
+            QImage.Format.Format_ARGB32,
+            QImage.Format.Format_ARGB32_Premultiplied,
+            QImage.Format.Format_RGB32,
         )
+        converted = image if native_argb else image.convertToFormat(QImage.Format.Format_RGBA8888)
+        if converted.isNull():
+            raise MemoryError("Could not convert tone mask image")
+        alpha_byte = (3 if sys.byteorder == "little" else 0) if native_argb else 3
+        pixels = np.frombuffer(converted.constBits(), dtype=np.uint8,
+                               count=converted.sizeInBytes()).reshape(
+                                   converted.height(), converted.bytesPerLine())
+        alpha = pixels[:, alpha_byte:converted.width() * 4:4]
+        rows = max(1, 262144 // max(converted.width(), 1))
+        for top in range(0, converted.height(), rows):
+            bottom = min(converted.height(), top + rows)
+            values = alpha[top:bottom].astype(np.float32)
+            values *= 1. / 255.
+            np.add(field[top:bottom], values, out=field[top:bottom])
 
     def render_tone_mask_field(
         self, mask_id: str, width: int, height: int,
@@ -7998,6 +8043,16 @@ class _CanvasLogic(BrushFeatures, DocumentProjectionFeatures, MultiRasterSelecti
             world_to_image.m21(), world_to_image.m22(), world_to_image.m23(),
             world_to_image.m31(), world_to_image.m32(), world_to_image.m33(),
         ))
+        full_key = (
+            mask_id, width, height, transform_signature,
+            self._rect_signature(visible_world),
+            self._tone_mask_signature(mask_id), "complete",
+        ) if include_paint else None
+        if full_key is not None:
+            cached_full = self._tone_mask_contributor_cache.pop(full_key, None)
+            if cached_full is not None:
+                self._tone_mask_contributor_cache[full_key] = cached_full
+                return cached_full.copy()
         contributor_key = (
             mask_id, width, height, transform_signature,
             self._rect_signature(visible_world),
@@ -8009,9 +8064,8 @@ class _CanvasLogic(BrushFeatures, DocumentProjectionFeatures, MultiRasterSelecti
         if cached is None:
             result = np.zeros((height, width), dtype=np.float32)
             if mask.gradient is not None:
-                result += self._render_mask_gradient_field(
-                    mask.gradient, width, height, world_to_image
-                )
+                self._render_mask_gradient_field(
+                    mask.gradient, width, height, world_to_image, output=result)
             for kind, entity_id in mask.contributors:
                 image = QImage(
                     width, height, QImage.Format.Format_ARGB32_Premultiplied
@@ -8027,29 +8081,27 @@ class _CanvasLogic(BrushFeatures, DocumentProjectionFeatures, MultiRasterSelecti
                     painter, kind, entity_id, visible_world
                 )
                 painter.end()
-                result += self._image_alpha_array(image)
+                self._add_image_alpha_to_field(result, image)
             for limited in mask.limited_gradients:
-                contribution = self._render_mask_gradient_field(
+                np.clip(result, 0.0, 1.0, out=result)
+                self._render_mask_gradient_field(
                     limited.gradient, width, height, world_to_image, limited,
-                )
-                result = np.clip(result, 0.0, 1.0)
-                result += contribution * (-1 if limited.operation == "subtract" else 1)
-            result = np.clip(result, 0.0, 1.0)
+                    output=result, subtract=limited.operation == "subtract")
+            np.clip(result, 0.0, 1.0, out=result)
             size = int(result.nbytes)
-            if 0 < size <= self._tone_mask_contributor_cache_budget:
-                self._tone_mask_contributor_cache[
-                    contributor_key
-                ] = result.copy()
-                self._tone_mask_contributor_cache_bytes += size
-                while (
-                    self._tone_mask_contributor_cache
-                    and self._tone_mask_contributor_cache_bytes
-                    > self._tone_mask_contributor_cache_budget
-                ):
-                    _old_key, old = (
-                        self._tone_mask_contributor_cache.popitem(last=False)
-                    )
-                    self._tone_mask_contributor_cache_bytes -= int(old.nbytes)
+            if 0 < size <= min(self._tone_mask_contributor_cache_budget, 8 * 1024 * 1024):
+                try:
+                    snapshot = result.copy()
+                except MemoryError:
+                    snapshot = None
+                if snapshot is not None:
+                    self._tone_mask_contributor_cache[contributor_key] = snapshot
+                    self._tone_mask_contributor_cache_bytes += size
+                    while (self._tone_mask_contributor_cache
+                           and self._tone_mask_contributor_cache_bytes
+                           > self._tone_mask_contributor_cache_budget):
+                        _old_key, old = self._tone_mask_contributor_cache.popitem(last=False)
+                        self._tone_mask_contributor_cache_bytes -= int(old.nbytes)
         else:
             self._tone_mask_contributor_cache[contributor_key] = cached
             result = cached.copy()
@@ -8070,11 +8122,27 @@ class _CanvasLogic(BrushFeatures, DocumentProjectionFeatures, MultiRasterSelecti
                     tile,
                 )
             painter.end()
-            result += (
-                self._signed_mask_paint(paint)
-                if mask.paint_has_subtractions else self._image_alpha_array(paint)
-            )
-        return np.clip(result, 0.0, 1.0)
+            if mask.paint_has_subtractions:
+                result += self._signed_mask_paint(paint)
+            else:
+                self._add_image_alpha_to_field(result, paint)
+        np.clip(result, 0.0, 1.0, out=result)
+        if full_key is not None:
+            size = int(result.nbytes)
+            if 0 < size <= min(self._tone_mask_contributor_cache_budget, 8 * 1024 * 1024):
+                try:
+                    snapshot = result.copy()
+                except MemoryError:
+                    snapshot = None
+                if snapshot is not None:
+                    self._tone_mask_contributor_cache[full_key] = snapshot
+                    self._tone_mask_contributor_cache_bytes += size
+                    while (self._tone_mask_contributor_cache
+                           and self._tone_mask_contributor_cache_bytes
+                           > self._tone_mask_contributor_cache_budget):
+                        _old_key, old = self._tone_mask_contributor_cache.popitem(last=False)
+                        self._tone_mask_contributor_cache_bytes -= int(old.nbytes)
+        return result
 
     @staticmethod
     def _world_to_image_transform(
@@ -8579,10 +8647,22 @@ class _CanvasLogic(BrushFeatures, DocumentProjectionFeatures, MultiRasterSelecti
         direct_mirror = (not has_stroke and modifiers and isinstance(modifiers[-1], MirrorModifier)
                          and not modifiers[-1].parameter_masks and target.opacity_mask is None
                          and parent_opacity * opacity == 1)
-        # Preserve the full gradient frame through projective transforms; other
-        # stage captures can limit their output to the requested visible area.
+        # A regular halftone can use the full gradient frame for its lattice
+        # while evaluating only the requested output pixels. Other gradients
+        # keep their complete stage capture through projective transforms.
+        regional_gradient = (
+            isinstance(target, ColorFillGradientObject)
+            and self._effect_region_requests and self._projection_exact
+            and len(modifiers) == 1
+            and isinstance(modifiers[0], HalftoneModifier)
+            and modifiers[0].grid_type in {"square", "hexagonal"}
+            and modifiers[0].dot_style != "delaunay"
+            and modifiers[0].color_mode != "target_layer"
+            and not modifiers[0].parameter_masks
+        )
         viewport_world = self._modifier_viewport_region(QRectF())
         required = (None if isinstance(target, ColorFillGradientObject)
+                    and not regional_gradient
                     else inverse.mapRect(viewport_world) if not viewport_world.isEmpty()
                     else inverse.mapRect(visible) if layer else visible)
         if getattr(self, "_effect_preview_channel", "canvas") == "navigator":
@@ -12440,6 +12520,7 @@ class _CanvasLogic(BrushFeatures, DocumentProjectionFeatures, MultiRasterSelecti
                 obj is not None
                 and (
                     obj.ignore_parent_mask
+                    or self._entity_has_smudge_overflow(obj)
                     or (
                         isinstance(obj, GradientObject)
                         and self._is_outward_gradient(obj)
@@ -12449,7 +12530,7 @@ class _CanvasLogic(BrushFeatures, DocumentProjectionFeatures, MultiRasterSelecti
         )
         skipped_masks = {direct_mask_id} if direct_mask_id else set()
         for parent, child in zip(layers, layers[1:]):
-            if child.ignore_parent_mask:
+            if child.ignore_parent_mask or self._entity_has_smudge_overflow(child):
                 skipped_masks.add(parent.layer_id)
         for layer in layers:
             if not layer.visible:

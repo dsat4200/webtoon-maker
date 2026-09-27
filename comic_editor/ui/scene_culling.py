@@ -13,7 +13,7 @@ from PySide6.QtGui import QPolygonF, QTransform
 
 from comic_editor.core.effect_geometry import effect_bounds
 from comic_editor.core.models import (
-    BlurModifier, BrightnessContrastModifier, CurvesModifier, GradientObject, HalftoneModifier, ImageObject, LayerNode,
+    BlurModifier, BrightnessContrastModifier, CurvesModifier, DistortModifier, GradientObject, HalftoneModifier, ImageObject, LayerNode,
     OutlineModifier, PixelateModifier, RasterObject, TextObject, VectorDrawingObject,
 )
 
@@ -244,7 +244,11 @@ class SceneRenderBounds:
             # These image effects are clipped to the complete source image
             # frame. They cannot bring a distant image into the current view.
             bounded_effects += (HalftoneModifier, PixelateModifier)
-        if any(not isinstance(modifier, bounded_effects)
+        # Distortion output is clipped to distort_bounds by render_distort.
+        # effect_bounds uses that same rectangle, so offscreen distortion
+        # stacks can be rejected before allocating their full source frames.
+        if any(not (isinstance(modifier, bounded_effects)
+                    or isinstance(modifier, DistortModifier))
                for modifier in modifiers):
             return None
         if kind == "layer":
@@ -299,7 +303,7 @@ class SceneRenderBounds:
                 continue
             outward = isinstance(target, GradientObject) and self.canvas._is_outward_gradient(target)
             if layer.bound is not None and layer.layer_kind != "text_container" \
-                    and not target.ignore_parent_mask and not outward:
+                    and not self.canvas._child_ignores_parent_mask(child) and not outward:
                 # Ordinary descendants are clipped to this layer. Their own
                 # masks, repeats and effects cannot escape that inherited clip.
                 continue

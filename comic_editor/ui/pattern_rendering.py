@@ -9,7 +9,8 @@ from functools import lru_cache
 import math
 
 import numpy as np
-from PySide6.QtGui import QColor, QImage
+from PySide6.QtCore import QRect
+from PySide6.QtGui import QColor, QImage, QPainter
 from scipy.ndimage import gaussian_filter, map_coordinates
 from scipy.spatial import Delaunay, QhullError
 
@@ -444,7 +445,8 @@ def _delaunay(source, prepared, modifier, color_source=None, cancelled=None):
     return _composite(source, ink, coverage, modifier)
 
 
-def _cell_sample_table(prepared, color_source, cell_x, cell_y, spacing, angle, modifier, half_span):
+def _cell_sample_table(prepared, color_source, cell_x, cell_y, spacing, angle,
+                       modifier, half_span, frame_size=None, origin=(0, 0)):
     """Sample each repeated grid cell once instead of once per output pixel."""
     if modifier.grid_type not in {"square", "hexagonal", "stippling"}:
         return None
@@ -461,10 +463,11 @@ def _cell_sample_table(prepared, color_source, cell_x, cell_y, spacing, angle, m
         cx = (ix + (iy % 2.) * .5) * spacing
         cy = iy * spacing * math.sqrt(.75)
     cosine, sine = math.cos(angle), math.sin(angle)
-    height, width = prepared.shape[:2]
+    width, height = frame_size or (prepared.shape[1], prepared.shape[0])
+    ox, oy = origin
     if modifier.grid_type == "stippling":
         bx, by = cx * cosine - cy * sine + width / 2., cx * sine + cy * cosine + height / 2.
-        density, valid = _tone(_sample(prepared, bx, by), modifier)
+        density, valid = _tone(_sample(prepared, bx - ox, by - oy), modifier)
         density = np.where(valid, density, 0.)
         collision = modifier.collide_min + (modifier.collide_max - modifier.collide_min) * density
         jitter_amount = .5 + 1. / (1. + modifier.smoothing_iterations / 100.)
@@ -472,26 +475,31 @@ def _cell_sample_table(prepared, color_source, cell_x, cell_y, spacing, angle, m
                   * jitter_amount / (1. + .4 * collision[..., None]))
         cx, cy = cx + jitter[..., 0], cy + jitter[..., 1]
     sx, sy = cx * cosine - cy * sine + width / 2., cx * sine + cy * cosine + height / 2.
-    sampled = _sample(prepared, sx, sy)
+    sampled = _sample(prepared, sx - ox, sy - oy)
     level, visible = _tone(sampled, modifier)
-    colors = _sample(color_source, sx, sy) if color_source is not None else None
+    colors = _sample(color_source, sx - ox, sy - oy) if color_source is not None else None
     return ((cell_x - left).astype(np.int32), (cell_y - top).astype(np.int32),
             sx, sy, sampled, level, visible, colors)
 
 
 def _halftone(source: np.ndarray, modifier: HalftoneModifier,
-              color_source: np.ndarray | None = None, cancelled=None) -> np.ndarray:
+              color_source: np.ndarray | None = None, cancelled=None, *,
+              frame_size=None, origin=(0, 0)) -> np.ndarray:
     height, width = source.shape[:2]
-    unit = halftone_unit(width, height, modifier)
+    frame_width, frame_height = frame_size or (width, height)
+    ox, oy = origin
+    unit = halftone_unit(frame_width, frame_height, modifier)
     spacing = max(.5, modifier.spacing * unit)
     prepared = _blur(source, modifier.blur * unit)
     _check_cancelled(cancelled)
     if modifier.dot_style == "delaunay" and modifier.grid_type not in {"line", "ring"}:
+        if frame_size is not None:
+            raise ValueError("Delaunay halftones require a full frame")
         return _delaunay(source, prepared, modifier, color_source, cancelled)
     yy, xx = np.indices((height, width), dtype=np.float32)
-    xx, yy = xx + .5, yy + .5
+    xx, yy = xx + ox + .5, yy + oy + .5
     angle = math.radians(modifier.rotation)
-    px, py = xx - width / 2., yy - height / 2.
+    px, py = xx - frame_width / 2., yy - frame_height / 2.
     gx, gy = px * math.cos(angle) + py * math.sin(angle), -px * math.sin(angle) + py * math.cos(angle)
     grid = modifier.grid_type
     if grid in {"line", "ring"}:
@@ -505,15 +513,15 @@ def _halftone(source: np.ndarray, modifier: HalftoneModifier,
         else:
             theta = along / np.maximum(np.abs(band), spacing)
             cx, cy = np.cos(theta) * band, np.sin(theta) * band
-        sx = cx * math.cos(angle) - cy * math.sin(angle) + width / 2.
-        sy = cx * math.sin(angle) + cy * math.cos(angle) + height / 2.
-        sampled = _sample(prepared, sx, sy)
+        sx = cx * math.cos(angle) - cy * math.sin(angle) + frame_width / 2.
+        sy = cx * math.sin(angle) + cy * math.cos(angle) + frame_height / 2.
+        sampled = _sample(prepared, sx - ox, sy - oy)
         level, visible = _tone(sampled, modifier)
         line_level = np.clip(level * getattr(modifier, "line_level_scale", 1.), 0., 1.)
         thickness = spacing * .5 * getattr(modifier, "line_width", 1.) * (1. - modifier.scale_factor + modifier.scale_factor * line_level)
         coverage = _edge_coverage(np.abs(coordinate - band) - thickness, coordinate)
         coverage *= visible & (thickness > 1e-6)
-        color_sample = _sample(color_source, sx, sy) if color_source is not None else None
+        color_sample = _sample(color_source, sx - ox, sy - oy) if color_source is not None else None
         return _composite(source, _ink(sampled, level, modifier, color_sample), coverage, modifier)
 
     coverage = np.zeros((height, width), dtype=np.float32)
@@ -535,7 +543,8 @@ def _halftone(source: np.ndarray, modifier: HalftoneModifier,
         local_tone, local_valid = _tone(chosen, modifier)
         local_tone = np.where(local_valid, local_tone, -1.)
     cell_samples = _cell_sample_table(prepared, color_source, cell_x, cell_y,
-                                      spacing, angle, modifier, half_span)
+                                      spacing, angle, modifier, half_span,
+                                      (frame_width, frame_height), origin)
     for iy in range(-half_span, half_span + 1):
         for ix in range(-half_span, half_span + 1):
             _check_cancelled(cancelled)
@@ -559,17 +568,17 @@ def _halftone(source: np.ndarray, modifier: HalftoneModifier,
                     theta = (np.floor(np.arctan2(gy, gx) / (2. * np.pi) * count + .5) + ix) * 2. * np.pi / count
                     cx, cy = np.cos(theta) * ring * spacing, np.sin(theta) * ring * spacing
                 elif grid == "stippling":
-                    base_x = cx * math.cos(angle) - cy * math.sin(angle) + width / 2.
-                    base_y = cx * math.sin(angle) + cy * math.cos(angle) + height / 2.
-                    density, density_valid = _tone(_sample(prepared, base_x, base_y), modifier)
+                    base_x = cx * math.cos(angle) - cy * math.sin(angle) + frame_width / 2.
+                    base_y = cx * math.sin(angle) + cy * math.cos(angle) + frame_height / 2.
+                    density, density_valid = _tone(_sample(prepared, base_x - ox, base_y - oy), modifier)
                     density = np.where(density_valid, density, 0.)
                     collision = modifier.collide_min + (modifier.collide_max - modifier.collide_min) * density
                     jitter = ((_stipple_hash(index_x, index_y, modifier.stipple_seed) - .5)
                               * spacing * jitter_amount / (1. + .4 * collision[..., None]))
                     cx, cy = cx + jitter[..., 0], cy + jitter[..., 1]
-                sx = cx * math.cos(angle) - cy * math.sin(angle) + width / 2.
-                sy = cx * math.sin(angle) + cy * math.cos(angle) + height / 2.
-                sampled = _sample(prepared, sx, sy)
+                sx = cx * math.cos(angle) - cy * math.sin(angle) + frame_width / 2.
+                sy = cx * math.sin(angle) + cy * math.cos(angle) + frame_height / 2.
+                sampled = _sample(prepared, sx - ox, sy - oy)
                 level, visible = _tone(sampled, modifier)
                 visible &= candidate_valid
             mark = _dot_coverage(xx - sx, yy - sy, level, spacing, modifier) * visible
@@ -603,12 +612,104 @@ def _halftone(source: np.ndarray, modifier: HalftoneModifier,
             if chosen_tone is not None:
                 chosen_tone = np.where(replace, level, chosen_tone)
             if color_source is not None:
-                color_sample = colors[ids] if cell_samples is not None else _sample(color_source, sx, sy)
+                color_sample = colors[ids] if cell_samples is not None else _sample(color_source, sx - ox, sy - oy)
                 chosen_color = np.where(replace[..., None], color_sample, chosen_color)
     if modifier.dot_style in {"blob", "liquid"}:
         coverage = _edge_coverage(joined)
     ink = _ink(chosen, chosen_tone, modifier, chosen_color)
     return _composite(source, ink, coverage, modifier)
+
+
+def _halftone_strips(image, modifier, color_source, cancelled, *,
+                     strip_height=256, tile_width=256):
+    """Render a large regular grid in bounded tiles on its original lattice."""
+    width, height = image.width(), image.height()
+    unit = halftone_unit(width, height, modifier)
+    spacing = max(.5, modifier.spacing * unit)
+    half_span = 2 if modifier.size > 1.5 else 1
+    padding = math.ceil((half_span + 4) * spacing * math.sqrt(2)
+                        + 3 * modifier.blur * unit + 8)
+    if padding >= 1024 or (height <= strip_height + 2 * padding
+                           and width <= tile_width + 2 * padding):
+        return None
+    result = QImage(width, height, QImage.Format_ARGB32_Premultiplied)
+    if result.isNull():
+        raise MemoryError("Could not allocate halftone result")
+    result.fill(0)
+    painter = QPainter(result)
+    try:
+        for top in range(0, height, strip_height):
+            _check_cancelled(cancelled)
+            bottom = min(height, top + strip_height)
+            source_top = max(0, top - padding)
+            source_bottom = min(height, bottom + padding)
+            for left in range(0, width, tile_width):
+                right = min(width, left + tile_width)
+                source_left = max(0, left - padding)
+                source_right = min(width, right + padding)
+                crop = image.copy(source_left, source_top,
+                                  source_right - source_left, source_bottom - source_top)
+                colors = (color_source.copy(source_left, source_top,
+                          source_right - source_left, source_bottom - source_top)
+                          if color_source is not None else None)
+                pixels = _rgba(crop)
+                color_pixels = _rgba(colors) if colors is not None else None
+                rendered = _halftone(pixels, modifier, color_pixels, cancelled,
+                                     frame_size=(width, height),
+                                     origin=(source_left, source_top))
+                tile = _image(rendered[top-source_top:bottom-source_top,
+                                       left-source_left:right-source_left])
+                painter.drawImage(left, top, tile)
+                del crop, colors, pixels, color_pixels, rendered, tile
+    finally:
+        painter.end()
+    return result
+
+
+def halftone_region(image: QImage, modifier: HalftoneModifier, region: QRect,
+                    *, cancelled=None, tile_size=256) -> QImage:
+    """Evaluate a regular halftone only where it will be presented.
+
+    Each small capture carries enough source padding for cell samples and
+    blur, while the lattice still uses the complete image's coordinates.
+    """
+    if modifier.grid_type not in {"square", "hexagonal"} or modifier.dot_style == "delaunay":
+        raise ValueError("This halftone grid requires its complete frame")
+    width, height = image.width(), image.height()
+    requested = region.intersected(QRect(0, 0, width, height))
+    if requested.isEmpty():
+        return QImage()
+    unit = halftone_unit(width, height, modifier)
+    spacing = max(.5, modifier.spacing * unit)
+    half_span = 2 if modifier.size > 1.5 else 1
+    padding = math.ceil((half_span + 4) * spacing * math.sqrt(2)
+                        + 3 * modifier.blur * unit + 8)
+    result = QImage(requested.size(), QImage.Format_ARGB32_Premultiplied)
+    if result.isNull():
+        raise MemoryError("Could not allocate regional halftone result")
+    result.fill(0)
+    painter = QPainter(result)
+    try:
+        for top in range(requested.top(), requested.bottom() + 1, tile_size):
+            bottom = min(requested.bottom() + 1, top + tile_size)
+            for left in range(requested.left(), requested.right() + 1, tile_size):
+                _check_cancelled(cancelled)
+                right = min(requested.right() + 1, left + tile_size)
+                source_rect = QRect(left, top, right - left, bottom - top)
+                source_rect = source_rect.adjusted(-padding, -padding, padding, padding)
+                source_rect = source_rect.intersected(QRect(0, 0, width, height))
+                crop = image.copy(source_rect)
+                rendered = _halftone(_rgba(crop), modifier, cancelled=cancelled,
+                                     frame_size=(width, height),
+                                     origin=(source_rect.x(), source_rect.y()))
+                local_top, local_left = top - source_rect.y(), left - source_rect.x()
+                tile = _image(rendered[local_top:local_top + bottom - top,
+                                       local_left:local_left + right - left])
+                painter.drawImage(left - requested.x(), top - requested.y(), tile)
+                del crop, rendered, tile
+    finally:
+        painter.end()
+    return result
 
 
 def apply_pattern_effect(image: QImage, modifier, scale: float = 1.,
@@ -617,10 +718,20 @@ def apply_pattern_effect(image: QImage, modifier, scale: float = 1.,
     if image.isNull():
         return image.copy()
     _check_cancelled(cancelled)
-    source = _rgba(image)
     if isinstance(modifier, PixelateModifier):
+        source = _rgba(image)
         result = _pixelate(source, modifier, max(float(scale), 1e-6))
     elif isinstance(modifier, HalftoneModifier):
+        regular = modifier.grid_type in {"square", "hexagonal", "line", "ring"}
+        if (regular and modifier.dot_style != "delaunay"
+                and image.width() * image.height() > 2_000_000):
+            colors = (color_source if modifier.color_mode == "target_layer"
+                      and color_source is not None and not color_source.isNull()
+                      and color_source.size() == image.size() else None)
+            striped = _halftone_strips(image, modifier, colors, cancelled)
+            if striped is not None:
+                return striped
+        source = _rgba(image)
         colors = None
         if (modifier.color_mode == "target_layer" and color_source is not None
                 and not color_source.isNull() and color_source.size() == image.size()):

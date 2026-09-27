@@ -74,10 +74,10 @@ class SmudgeFeatures:
                     painter.setPen(QPen(QColor("#9ecde2"), 1))
                     painter.drawLine(anchor, handle)
                     painter.setBrush(QColor("#263d4a"))
-                    painter.drawEllipse(handle, 5, 5)
+                    painter.drawEllipse(handle, 12, 12)
                 painter.setPen(QPen(QColor("#183342"), 1.5))
                 painter.setBrush(QColor("#ffad42" if active and index == self.smudge_selected_point_index else "#8bd8fa"))
-                painter.drawEllipse(anchor, 6, 6)
+                painter.drawEllipse(anchor, 9, 9)
                 painter.setPen(QColor("#efefef"))
                 painter.drawText(anchor + QPointF(9, -9), "Start" if index == 0 else "End")
         state = self._modifier_handle_drag or {}
@@ -167,7 +167,7 @@ class SmudgeFeatures:
             for stroke in reversed(modifier.parameters["strokes"]):
                 for index, node in enumerate(stroke["points"]):
                     anchor = self.document_to_widget(QPointF(*node["position"]))
-                    if math.dist(anchor.toTuple(), widget_point.toTuple()) <= 10:
+                    if math.dist(anchor.toTuple(), widget_point.toTuple()) <= 18:
                         self.smudge_select(stroke["id"], index)
                         hit = ("point", index)
                         break
@@ -178,7 +178,7 @@ class SmudgeFeatures:
             if stroke:
                 for index, node in enumerate(stroke["points"]):
                     handle = self.document_to_widget(QPointF(*node["handle"]))
-                    if node["point_type"] == "bezier" and math.dist(handle.toTuple(), widget_point.toTuple()) <= 10:
+                    if node["point_type"] == "bezier" and math.dist(handle.toTuple(), widget_point.toTuple()) <= 21:
                         self.smudge_select(stroke["id"], index)
                         hit = ("handle", index)
                         break
@@ -201,6 +201,8 @@ class SmudgeFeatures:
             "samples": [(world.x(), world.y(), max(0., min(1., pressure)))],
             "tool_settings": copy.deepcopy(modifier.parameters["tool_settings"]),
         }
+        if hit is not None:
+            self._begin_smudge_preview(modifier)
         if hit and hit[0] == "parameter":
             self._move_smudge_handle(widget_point)
         self.update()

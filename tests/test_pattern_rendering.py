@@ -5,12 +5,13 @@ from dataclasses import replace
 
 import numpy as np
 import pytest
+from PySide6.QtCore import QRect
 from PySide6.QtGui import QImage
 
 from comic_editor.core.models import HALFTONE_DOT_STYLES, HALFTONE_GRIDS, HalftoneModifier, PixelateModifier
 from comic_editor.ui.pattern_rendering import (
-    apply_pattern_effect, delaunay_triangles, gradient_lut,
-    halftone_points, halftone_unit,
+    _halftone_strips, apply_pattern_effect, delaunay_triangles, gradient_lut,
+    halftone_points, halftone_region, halftone_unit,
 )
 
 
@@ -32,6 +33,47 @@ def solid(color=(96, 96, 96, 255), width=100, height=100):
 
 def halftone(**kwargs):
     return HalftoneModifier(base_resolution=100, spacing=16, blur=0, **kwargs)
+
+
+@pytest.mark.parametrize("rotation", [0, 27])
+def test_large_regular_halftone_strips_match_full_frame_exactly(rotation):
+    y, x = np.indices((720, 240))
+    data = np.zeros((720, 240, 4), dtype=np.uint8)
+    data[..., 0] = (x * 3 + y) % 256
+    data[..., 1] = (x + y * 2) % 256
+    data[..., 2] = (y * 5) % 256
+    data[..., 3] = 255
+    source = image_from_rgba(data)
+    modifier = HalftoneModifier(grid_type="square", dot_style="circle",
+                                color_mode="two", fit_mode="short",
+                                base_resolution=1000, spacing=15.4, blur=5,
+                                rotation=rotation)
+    expected = apply_pattern_effect(source, modifier)
+    actual = _halftone_strips(source, modifier, None, None,
+                              strip_height=96, tile_width=96)
+    assert actual is not None
+    np.testing.assert_array_equal(rgba_from_image(actual), rgba_from_image(expected))
+
+
+@pytest.mark.parametrize("grid,rotation", [("square", 0), ("square", 27), ("hexagonal", 17)])
+def test_regional_halftone_matches_complete_frame(grid, rotation):
+    y, x = np.indices((360, 200))
+    data = np.zeros((360, 200, 4), dtype=np.uint8)
+    data[..., 0] = (x * 3 + y) % 256
+    data[..., 1] = (x + y * 2) % 256
+    data[..., 2] = (y * 5) % 256
+    data[..., 3] = 255
+    source = image_from_rgba(data)
+    modifier = HalftoneModifier(grid_type=grid, dot_style="circle",
+                                color_mode="two", fit_mode="short",
+                                base_resolution=1000, spacing=15.4, blur=5,
+                                rotation=rotation)
+    complete = apply_pattern_effect(source, modifier)
+    for region in (QRect(0, 0, 28, 31), QRect(91, 143, 35, 42),
+                   QRect(177, 332, 23, 28)):
+        actual = halftone_region(source, modifier, region, tile_size=17)
+        np.testing.assert_array_equal(rgba_from_image(actual),
+                                      rgba_from_image(complete.copy(region)))
 
 
 @pytest.mark.parametrize("grid", HALFTONE_GRIDS)

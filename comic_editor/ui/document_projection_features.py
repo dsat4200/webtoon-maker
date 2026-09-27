@@ -94,7 +94,8 @@ class DocumentProjectionFeatures:
         self._projection_collection_complete = (
             len(tiles) == len(requests) and all(tile.valid for tile in tiles))
         return [PresentedTile((phase, tile.request.address), tile.image,
-                              tile.request.world_rect, tile.request.source_rect) for tile in tiles]
+                              tile.request.world_rect, tile.request.source_rect)
+                for tile in tiles if tile.valid]
 
     def _projection_visible_requests(self, requests, margin):
         # A tilted viewport's bounding box can cover thousands of document
@@ -126,7 +127,15 @@ class DocumentProjectionFeatures:
         # Unvisited blocks stay explicitly incomplete so collect() does not
         # immediately retry them individually in the same paint.
         result = {request.address: (QImage(), False) for request in requests}
-        for key, group in groups.items():
+        center = self.visible_document_rect().center()
+        def distance(key):
+            level, block_x, block_y = key
+            request = groups[key][0]
+            side = 4 * request.tile_size / request.scale
+            return ((block_x + .5) * side - center.x()) ** 2 + (
+                (block_y + .5) * side - center.y()) ** 2
+        for key in sorted(groups, key=distance):
+            group = groups[key]
             deadline = getattr(self, "_projection_render_deadline", None)
             if (deadline is not None and time.perf_counter() >= deadline
                     and getattr(self, "_projection_blocks_started", 0) > 0):
@@ -268,6 +277,9 @@ class DocumentProjectionFeatures:
         if previous is not None and previous[0] != configuration:
             previous = self._projection_completed_view = None
         revision = self._document_projection.revision
+        progress = getattr(self, "_projection_progress_view", None)
+        if progress is not None and (progress[0] != configuration or progress[2] != revision):
+            progress = self._projection_progress_view = None
         deferred = getattr(self, "_projection_defer_effects", False)
         jobs = self._effect_jobs
         running = jobs.running
@@ -287,6 +299,7 @@ class DocumentProjectionFeatures:
                     break
         self._projection_frame_pending = not complete
         if complete:
+            self._projection_progress_view = None
             revision = self._document_projection.revision
             # Usually these references share the projection cache's storage.
             # Keep at most one additional bounded view while it is replaced.
@@ -298,6 +311,34 @@ class DocumentProjectionFeatures:
                 self._projection_completed_view = None
             self._projection_presented_revision = revision
             return batch
+        # Opening a chapter or panning leaves the artwork revision unchanged.
+        # Present finished tiles instead of holding the whole new viewport
+        # behind its slowest effect block. Edits and layered show-on-top passes
+        # retain whole-frame publication.
+        if (deferred and phases == (None,)
+                and (previous is None or previous[2] == revision)):
+            level = self._document_projection.resolution_level(
+                self.scale * max(1., self.devicePixelRatioF()))
+            old = (previous[1][0][1] if previous is not None and previous[1]
+                   and previous[1][0][0] is None else [])
+            if not old or all(tile.key[1].level == level for tile in old):
+                coverage = self.visible_document_rect().adjusted(
+                    -self._document_projection.tile_size, -self._document_projection.tile_size,
+                    self._document_projection.tile_size, self._document_projection.tile_size)
+                merged = {tile.key: tile for tile in old if tile.world_rect.intersects(coverage)}
+                if progress is not None:
+                    merged.update((tile.key, tile) for tile in progress[1][0][1]
+                                  if tile.world_rect.intersects(coverage))
+                for _phase, tiles in batch:
+                    merged.update((tile.key, tile) for tile in tiles
+                                  if tile.world_rect.intersects(coverage))
+                visible = list(merged.values())
+                storage = {int(tile.image.cacheKey()): tile.image.sizeInBytes()
+                           for tile in visible}
+                if visible and sum(storage.values()) <= self._document_projection.budget:
+                    shown = [(None, visible)]
+                    self._projection_progress_view = (configuration, shown, revision)
+                    return shown
         return previous[1] if previous is not None else []
 
     def _paint_document_projection(self, painter, *, live_ink=False):
@@ -333,13 +374,14 @@ class DocumentProjectionFeatures:
     def _projection_can_defer_effects(self):
         # Queuing pen events is insufficient if whole-view publication hides
         # their ink. Active edits always get a finished synchronous frame.
-        # Background preparation is reserved for camera navigation and idle
-        # coverage while a matching completed view can remain visible.
+        # Initial chapter loading can publish finished tiles progressively;
+        # later navigation may also keep a matching completed view visible.
         previous = getattr(self, "_projection_completed_view", None)
-        return bool(self._projection_async_enabled and previous is not None
-                    and previous[0] == self._projection_configuration()
-                    and previous[2] == self._document_projection.revision
-                    and any(tiles for _, tiles in previous[1])
+        compatible = (previous is None or
+                      previous[0] == self._projection_configuration()
+                      and previous[2] == self._document_projection.revision
+                      and any(tiles for _, tiles in previous[1]))
+        return bool(self._projection_async_enabled and compatible
                     and not self._drawing
                     and not getattr(self, "_pen_contact_active", False)
                     and not self._projection_has_live_preview())

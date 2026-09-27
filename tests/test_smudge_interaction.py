@@ -129,3 +129,35 @@ def test_click_does_not_draw_and_escape_or_tool_switch_cancels_freehand(canvas):
         cancel()
         assert canvas._modifier_handle_drag is None
         assert not modifier.parameters["strokes"] and not canvas.command_stack.can_undo
+
+
+def test_large_bezier_handle_hit_does_not_start_another_stroke(canvas):
+    modifier = attach(canvas)
+    draw(canvas)
+    stroke = modifier.parameters["strokes"][0]
+    handle = canvas.document_to_widget(QPointF(*stroke["points"][1]["handle"]))
+    press = handle + QPointF(16, 0)
+    canvas._dispatch_tool_press(press, 1., Qt.NoModifier)
+    assert canvas._modifier_handle_drag["mode"] == "handle"
+    assert len(modifier.parameters["strokes"]) == 1
+    canvas._tool_release()
+
+
+def test_handle_drag_partial_preview_matches_full_scene(canvas, monkeypatch):
+    attach(canvas)
+    draw(canvas)
+    point = canvas.smudge_selected_point()
+    start = QPointF(*point["position"])
+    pointer(canvas, False, "press", start)
+    assert canvas._smudge_preview_baseline is not None
+    pointer(canvas, False, "move", start + QPointF(8, 12))
+    dirty = []
+    original = canvas._render_scene_cache_rect
+    monkeypatch.setattr(canvas, "_render_scene_cache_rect", lambda rect, **kwargs:
+                        (dirty.append(rect), original(rect, **kwargs))[1])
+    partial = canvas.grab().toImage()
+    assert dirty and dirty[-1].width() < canvas.width()
+    canvas._smudge_preview_baseline = None
+    complete = canvas.grab().toImage()
+    assert partial == complete
+    canvas._tool_release()

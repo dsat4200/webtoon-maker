@@ -204,6 +204,18 @@ def test_bounded_distance_field_is_exact_and_omits_empty_canvas():
     assert cache.bytes == distance.nbytes < expected.nbytes / 20
 
 
+def test_large_bounded_distance_field_is_exact_within_outline_support():
+    alpha = np.zeros((1150, 1150), dtype=np.uint8)
+    alpha[80:100, 80:100] = 255
+    alpha[1030:1050, 1030:1050] = 255
+    distance, _, extent = OutlineDistanceCache().field(alpha, margin=32)
+    left, top, right, bottom = extent
+    expected = distance_transform_edt(alpha == 0)[top:bottom, left:right]
+    relevant = expected <= 32
+    np.testing.assert_array_equal(distance[relevant], expected[relevant].astype(np.float32))
+    assert np.isinf(distance[~relevant]).all()
+
+
 def test_outline_distance_cache_evicts_and_clears_within_budget():
     alpha = np.zeros((12, 12), dtype=np.float32)
     alpha[5, 5] = 1

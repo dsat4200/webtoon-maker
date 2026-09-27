@@ -31,10 +31,22 @@ class DistortFeatures(SmudgeFeatures):
             self._effect_jobs.cancel(clear_retained=False)
             self._mesh_warp_preview_session_id = modifier.modifier_id
         ratio = max(1., self.devicePixelRatioF())
-        image = QImage(QSize(round(self.width() * ratio), round(self.height() * ratio)),
-                       QImage.Format_ARGB32_Premultiplied)
+        size = QSize(round(self.width() * ratio), round(self.height() * ratio))
+        baseline = getattr(self, "_smudge_preview_baseline", None)
+        patch = (modifier.modifier_type == "distort_smudge"
+                 and baseline is not None
+                 and baseline[0] == modifier.modifier_id
+                 and baseline[1] == self._scene_key()
+                 and baseline[2].size() == size)
+        current_bounds = self._smudge_target_bounds(modifier.modifier_id) if patch else None
+        if current_bounds is None:
+            patch = False
+        image = QImage(baseline[2]) if patch else QImage(size, QImage.Format_ARGB32_Premultiplied)
         image.setDevicePixelRatio(ratio)
-        image.fill(Qt.transparent)
+        if not patch:
+            image.fill(Qt.transparent)
+        dirty = (self._world_dirty_to_widget(baseline[3].united(current_bounds))
+                 if patch else self.rect())
         previous = (getattr(self, "_projection_exact", False),
                     getattr(self, "_effect_region_requests", False),
                     getattr(self, "_mesh_warp_preview_id", None),
@@ -43,7 +55,8 @@ class DistortFeatures(SmudgeFeatures):
         self._mesh_warp_preview_id = modifier.modifier_id
         self._smudge_preview_id = modifier.modifier_id if modifier.modifier_type == "distort_smudge" else None
         try:
-            self._render_scene_cache_rect(self.rect(), target=image, projection=False)
+            if not dirty.isEmpty():
+                self._render_scene_cache_rect(dirty, target=image, projection=False)
         finally:
             (self._projection_exact, self._effect_region_requests,
              self._mesh_warp_preview_id, self._smudge_preview_id) = previous
@@ -57,6 +70,39 @@ class DistortFeatures(SmudgeFeatures):
             self._effect_jobs.cancel(clear_retained=False)
             self._invalidate_scene_cache()
         self._mesh_warp_preview_presented = False
+        self._smudge_preview_baseline = None
+
+    def _smudge_target_bounds(self, modifier_id):
+        self._render_bounds.prepare()
+        bounds = QRectF()
+        targets = self.chapter.modifier_target_ids(modifier_id)
+        if not targets:
+            return None
+        for kind, identifier in targets:
+            target = self._render_bounds.entity_bounds(kind, identifier)
+            if target is None:
+                return None
+            bounds = bounds.united(target)
+        return bounds
+
+    def _begin_smudge_preview(self, modifier):
+        self._smudge_preview_baseline = None
+        bounds = self._smudge_target_bounds(modifier.modifier_id)
+        if bounds is None:
+            return
+        if not self._uses_document_projection():
+            self._ensure_scene_cache()
+            image = QImage(self._scene_cache)
+        else:
+            ratio = max(1., self.devicePixelRatioF())
+            image = QImage(QSize(round(self.width() * ratio), round(self.height() * ratio)),
+                           QImage.Format_ARGB32_Premultiplied)
+            image.setDevicePixelRatio(ratio)
+            image.fill(Qt.transparent)
+            self._render_scene_cache_rect(self.rect(), target=image, projection=False)
+        self._smudge_preview_baseline = (
+            modifier.modifier_id, self._scene_key(), image, bounds,
+        )
 
     def _active_distort_modifier(self):
         modifier = self.chapter.modifiers.get(self.active_modifier_id) if self.chapter else None

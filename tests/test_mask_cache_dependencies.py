@@ -49,6 +49,40 @@ def painted_mask(canvas):
     return result
 
 
+def test_painted_mask_field_reuses_complete_pixels_until_paint_changes(scene, monkeypatch):
+    canvas, _page = scene
+    mask = painted_mask(canvas)
+    calls = []
+    original = canvas._add_image_alpha_to_field
+    monkeypatch.setattr(canvas, "_add_image_alpha_to_field", lambda field, image:
+                        (calls.append(1), original(field, image))[1])
+
+    def field():
+        return canvas.render_tone_mask_field(mask.mask_id, 300, 220,
+            QTransform(), QRectF(0, 0, 300, 220))
+
+    before = field()
+    assert calls == [1]
+    np.testing.assert_array_equal(field(), before)
+    assert calls == [1]
+    canvas.tiles.paint_dab(mask.mask_id, QPointF(250, 180), 20, QColor("white"))
+    after = field()
+    assert calls == [1, 1]
+    assert not np.array_equal(before, after)
+
+
+@pytest.mark.parametrize("format", [QImage.Format_ARGB32,
+                                     QImage.Format_ARGB32_Premultiplied,
+                                     QImage.Format_RGBA8888])
+def test_mask_alpha_reads_native_image_without_changing_values(format):
+    image = QImage(7, 3, format)
+    image.fill(QColor(20, 90, 150, 117))
+    expected = image.pixelColor(0, 0).alphaF()
+    field = CanvasWidget._image_alpha_array(image)
+    assert field.shape == (3, 7)
+    np.testing.assert_allclose(field, expected, atol=1 / 255)
+
+
 def render(canvas):
     result = QImage(300, 220, QImage.Format_ARGB32_Premultiplied)
     canvas.render_preview(result)

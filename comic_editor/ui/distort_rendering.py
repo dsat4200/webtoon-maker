@@ -470,6 +470,9 @@ class PreparedDistortCache:
             array.setflags(write=False)
         if size > self.budget:
             return value
+        previous = self._entries.pop(key, None)
+        if previous is not None:
+            self.bytes -= previous[1]
         while self._entries and (self.bytes + size > self.budget
                                  or len(self._entries) >= self.entry_limit):
             _, (_, removed) = self._entries.popitem(last=False)

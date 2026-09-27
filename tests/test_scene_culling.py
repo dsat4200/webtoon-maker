@@ -8,17 +8,19 @@ from PySide6.QtGui import QColor, QImage
 
 from comic_editor.core.models import (
     ArrayModifier, BlurModifier, BoundGeometry, ChapterDocument,
-    ColorFillGradientObject, ImageObject, MirrorModifier, OutlineModifier,
+    ColorFillGradientObject, DistortModifier, ImageObject, MirrorModifier, OutlineModifier,
     PathNode, RasterObject, ShapeStyle, TextObject, TilingModifier, VectorDrawingObject, VectorStroke,
     VectorStrokePoint,
 )
 from comic_editor.core.settings import EditorSettings
+from comic_editor.core.smudge import default_tool_settings, validate_strokes
 from comic_editor.core.tiles import TileStore
 from comic_editor.ui.canvas import CanvasWidget
 
 
 @pytest.fixture
 def scene(qapp, monkeypatch):
+    monkeypatch.setattr("comic_editor.ui.canvas.create_network_manager", lambda *_: None)
     document = ChapterDocument(height=4000)
     page = document.add_page("Page", BoundGeometry.rectangle(0, 0, 1080, 4000))
     page.fill_color, page.border_width = None, 0
@@ -59,6 +61,31 @@ def image_object(canvas, document, parent, x, y, color="red"):
     image.fill(QColor(color))
     canvas.images.put_decoded(obj.object_id, "sample.png", b"", image)
     return obj
+
+
+def test_smudge_paint_extends_past_parent_mask_and_stays_cullable(scene):
+    canvas, document, page = scene
+    layer = document.add_layer(page.layer_id, "Smudge", BoundGeometry.rectangle(100, 100, 80, 80))
+    layer.fill_color, layer.border_width = None, 0
+    obj = image_object(canvas, document, layer, 110, 110)
+    points = [
+        {"position": [130, 130], "handle": [130, 130], "point_type": "vector",
+         "radius": 12, "flow": 100, "strength": 100},
+        {"position": [220, 130], "handle": [220, 130], "point_type": "vector",
+         "radius": 12, "flow": 100, "strength": 100},
+    ]
+    stroke = validate_strokes([{"id": "outside", "points": points,
+                                "pressure_settings": default_tool_settings()}])[0]
+    modifier = DistortModifier(modifier_type="distort_smudge",
+                               parameters={"strokes": [stroke]})
+    document.add_modifier(modifier, [("object", obj.object_id)])
+    expected = render(canvas, culling=False)
+    actual = render(canvas)
+    assert np.array_equal(pixels(actual), pixels(expected))
+    assert actual.pixelColor(195, 130).red() > 100
+    assert actual.pixelColor(195, 130).red() > actual.pixelColor(195, 130).blue()
+    assert canvas._point_inside_layer_masks(layer.layer_id, QPointF(195, 130), obj)
+    assert canvas._render_bounds.entity_bounds("layer", layer.layer_id).right() > 195
 
 
 def test_offscreen_layers_skip_shape_and_object_work_and_return_when_panned(scene, monkeypatch):
@@ -104,6 +131,32 @@ def test_many_objects_in_one_layer_do_not_render_offscreen_images_or_text(scene,
     monkeypatch.setattr(canvas._render_bounds, "_object_bounds", lambda _obj:
         pytest.fail("Static object bounds rebuilt during a dirty repaint"))
     canvas._render_scene_cache_rect(QRect(15, 15, 30, 30))
+
+
+def test_offscreen_distortion_stack_skips_source_capture_and_returns_when_panned(scene, monkeypatch):
+    canvas, document, page = scene
+    obj = image_object(canvas, document, page, 30, 1500)
+    document.add_modifier(DistortModifier(modifier_type="distort_mesh_warp",
+                                          frame=(30, 1500, 40, 40)),
+                          [("object", obj.object_id)])
+    document.add_modifier(DistortModifier(modifier_type="distort_twirl",
+                                          frame=(30, 1500, 40, 40), center=(50, 1520), radius=20),
+                          [("object", obj.object_id)])
+    expected = pixels(render(canvas, culling=False))
+    canvas._render_bounds.clear()
+    calls = []
+    original = canvas._render_mirror_target
+    monkeypatch.setattr(canvas, "_render_mirror_target", lambda painter, target, opacity, visible:
+                        (calls.append(target.object_id), original(painter, target, opacity, visible))[1])
+    assert np.array_equal(pixels(render(canvas)), expected)
+    assert obj.object_id not in calls
+    assert canvas._render_bounds.entity_bounds("object", obj.object_id) is not None
+
+    canvas.center_y = 1520
+    calls.clear()
+    visible = pixels(render(canvas))
+    assert obj.object_id in calls
+    assert np.array_equal(visible, pixels(render(canvas, culling=False)))
 
 
 def test_direct_mask_escape_and_transformed_layer_match_unculled_render(scene):

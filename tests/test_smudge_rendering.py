@@ -10,7 +10,9 @@ from comic_editor.core.models import DistortModifier
 from comic_editor.core.smudge import default_tool_settings, validate_strokes
 from comic_editor.ui import smudge_rendering
 from comic_editor.ui.distort_rendering import PreparedDistortCache, distort_bounds, render_distort
+from comic_editor.ui.effect_pipeline import _stage_plan
 from test_distort_projection_async import canvas as async_canvas
+from test_scene_culling import scene
 
 
 def source(width=256, height=128):
@@ -123,6 +125,43 @@ def test_output_regions_match_whole_result_and_world_translation():
         for key in ("position", "handle"):
             point[key] = [point[key][0]+35, point[key][1]-20]
     assert render_distort(image, bounds, moved, QTransform.fromTranslate(35, -20), bounds) == expected
+
+
+def test_smudge_stage_extent_and_cache_key_survive_camera_requests(scene):
+    canvas = scene[0]
+    effect = modifier(stroke())
+    bounds = QRectF(0, 0, 256, 128)
+    left = _stage_plan(canvas, bounds, [effect], QTransform(), "source", False,
+                       QRectF(0, 0, 80, 80))
+    right = _stage_plan(canvas, bounds, [effect], QTransform(), "source", False,
+                        QRectF(176, 40, 80, 80))
+    assert left.key == right.key
+    assert left.targets == right.targets
+    assert left.targets[0].contains(bounds)
+
+
+@pytest.mark.parametrize("new_end", [-30, 310])
+def test_unchanged_stroke_prefix_survives_expanded_work_bounds(monkeypatch, new_end):
+    image = source()
+    first = stroke(identifier="first")
+    second = stroke(start=(180, 64), end=(225, 64), identifier="last")
+    effect = modifier(first, second)
+    cache = PreparedDistortCache()
+    target = QRectF(-80, 0, 440, 128)
+    render_distort(image, QRectF(0, 0, 256, 128), effect,
+                   output_bounds=target, preparation_cache=cache)
+    calls = []
+    original = smudge_rendering._stroke
+    monkeypatch.setattr(smudge_rendering, "_stroke", lambda pixels, item, *args:
+                        (calls.append(item["id"]), original(pixels, item, *args))[1])
+    effect.parameters["strokes"][1]["points"][1]["position"] = [new_end, 64]
+    effect.parameters["strokes"][1]["points"][1]["handle"] = [new_end, 64]
+    cached = render_distort(image, QRectF(0, 0, 256, 128), effect,
+                            output_bounds=target, preparation_cache=cache)
+    assert calls == ["last"]
+    fresh = render_distort(image, QRectF(0, 0, 256, 128), effect,
+                           output_bounds=target)
+    assert cached == fresh
 
 
 def test_stroke_prefix_reuse_source_mutation_and_byte_budget(monkeypatch):

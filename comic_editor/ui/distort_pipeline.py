@@ -56,9 +56,10 @@ def render_distort_stage(canvas, image, base, bounds, target, modifier,
     effect = copy.deepcopy(modifier)
     source_bounds, output_bounds = QRectF(bounds), QRectF(target)
     placement = QTransform(local_to_world)
-    amount = np.array(_parameter_field(modifier, "intensity", modifier.intensity,
-                                      (base.height(), base.width()), fields),
-                      dtype=np.float32, copy=True) / 100.0
+    amount = np.asarray(_parameter_field(modifier, "intensity", modifier.intensity,
+                                        (base.height(), base.width()), fields),
+                        dtype=np.float32)
+    amount /= 100.0
     preparation_cache = None
     if (exact or mesh_preview) and not deferred:
         preparation_cache = getattr(canvas, "_distort_preparation_cache", None)

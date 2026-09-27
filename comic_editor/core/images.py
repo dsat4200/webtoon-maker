@@ -60,6 +60,20 @@ class ImageStore:
                 raise ValueError(reader.errorString() or "Unsupported or invalid image") from error
         return image.convertToFormat(QImage.Format_ARGB32_Premultiplied), detected
 
+    @staticmethod
+    def _verify(data: bytes) -> None:
+        """Check stored image bytes without retaining a full decoded frame."""
+        from io import BytesIO
+        from PIL import Image
+
+        try:
+            with Image.open(BytesIO(data)) as image:
+                image.verify()
+        except (OSError, ValueError):
+            # Qt supports some formats Pillow does not; retain its existing
+            # decoder and error handling for those files.
+            ImageStore._decode(data)
+
     def put(
         self, object_id: str, filename: str, data: bytes,
         mime_type: str = "",
@@ -220,7 +234,7 @@ class ImageStore:
             if not candidates:
                 continue
             data = candidates[0].read_bytes()
-            self._decode(data)
+            self._verify(data)
             self._sources[object_id] = ImageSource(
                 self.safe_filename(filename or candidates[0].name),
                 mime_type or mimetypes.guess_type(candidates[0].name)[0]

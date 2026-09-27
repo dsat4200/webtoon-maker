@@ -7,6 +7,8 @@ from PySide6.QtCore import QRectF
 from PySide6.QtGui import QColor, QImage, QPainter
 
 from comic_editor.ui.async_projection import ProjectionPending, ProjectionFailed
+from comic_editor.ui.document_presentation import PresentedTile
+from comic_editor.ui.document_projection import ProjectionAddress, ProjectionRequest
 from test_projection_invalidation import scene
 
 
@@ -51,6 +53,83 @@ def test_cross_block_edit_publishes_only_when_all_regions_finish(scene, monkeypa
     canvas._document_projection.clear()
     canvas._projection_defer_effects = False
     assert frame(canvas) == after
+
+
+def test_pan_presents_finished_new_tiles_while_other_blocks_wait(scene, monkeypatch):
+    canvas, _, _ = scene
+    frame(canvas)
+    previous = canvas._projection_completed_view
+    assert previous is not None
+    address = ProjectionAddress(0, 7, 0)
+    assert all(tile.key[1] != address for tile in previous[1][0][1])
+    request = ProjectionRequest(address)
+    image = QImage(request.pixel_size, request.pixel_size, QImage.Format_ARGB32_Premultiplied)
+    image.fill(QColor("red"))
+    finished = PresentedTile((None, address), image, request.world_rect, request.source_rect)
+    canvas.center_x = 1700.
+    canvas._projection_defer_effects = True
+
+    def partial(_phase):
+        canvas._projection_collection_complete = False
+        return [finished]
+
+    monkeypatch.setattr(canvas, "_collect_document_projection", partial)
+    batch = canvas._projection_phase_batch((None,))
+    assert canvas._projection_frame_pending
+    assert finished in batch[0][1]
+    assert any(tile.key != finished.key for tile in batch[0][1])
+    assert canvas._projection_completed_view is previous
+
+    # Waiting for an effect keeps the new tile visible without collecting it again.
+    monkeypatch.setattr(canvas, "_collect_document_projection", lambda _phase: [])
+    again = canvas._projection_phase_batch((None,))
+    assert finished in again[0][1]
+
+    # A content edit must not mix pixels from different revisions.
+    canvas._document_projection.invalidate()
+    after_edit = canvas._projection_phase_batch((None,))
+    assert finished not in after_edit[0][1]
+
+
+def test_initial_load_presents_finished_tiles_before_full_view(scene, monkeypatch):
+    canvas, _, _ = scene
+    assert canvas._projection_can_defer_effects()
+    address = ProjectionAddress(0, 3, 0)
+    request = ProjectionRequest(address)
+    image = QImage(request.pixel_size, request.pixel_size, QImage.Format_ARGB32_Premultiplied)
+    image.fill(QColor("blue"))
+    finished = PresentedTile((None, address), image, request.world_rect, request.source_rect)
+    canvas._projection_defer_effects = True
+
+    def partial(_phase):
+        canvas._projection_collection_complete = False
+        return [finished]
+
+    monkeypatch.setattr(canvas, "_collect_document_projection", partial)
+    batch = canvas._projection_phase_batch((None,))
+    assert batch == [(None, [finished])]
+    assert canvas._projection_frame_pending
+    assert canvas._projection_completed_view is None
+
+    monkeypatch.setattr(canvas, "_collect_document_projection", lambda _phase: [])
+    assert canvas._projection_phase_batch((None,)) == batch
+
+
+def test_missing_capture_blocks_start_near_view_center(scene, monkeypatch):
+    canvas, _, _ = scene
+    canvas.center_x = 1400.
+    requests = canvas._document_projection.requests(QRectF(0, 0, 2048, 256), 1.)
+    order = []
+
+    def capture(_bounds, _scale, size, key, **_kwargs):
+        order.append(key)
+        image = QImage(size, QImage.Format_ARGB32_Premultiplied)
+        image.fill(QColor("white"))
+        return image, True
+
+    monkeypatch.setattr(canvas, "_render_document_region", capture)
+    canvas._render_document_tiles(requests)
+    assert [key[1] for key in order] == [1, 0]
 
 
 def test_frame_budget_yields_without_falling_back_to_individual_tiles(scene, monkeypatch):
@@ -117,7 +196,7 @@ def test_canceled_running_job_does_not_block_current_capture(scene, monkeypatch)
                                      "_transform_preview_quad", "_vector_gesture_mode"])
 def test_active_edit_uses_immediate_exact_publication(scene, monkeypatch, gesture):
     canvas, obj, _ = scene
-    assert not canvas._projection_can_defer_effects()
+    assert canvas._projection_can_defer_effects()
     before = frame(canvas)
     assert canvas._projection_can_defer_effects()
     original = getattr(canvas, gesture)

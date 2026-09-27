@@ -55,6 +55,29 @@ def test_viewport_crop_does_not_move_grid_or_change_blur(pattern_scene, modifier
     assert clipped == expected
 
 
+def test_exact_projection_uses_regional_halftone_pixels(pattern_scene, monkeypatch):
+    canvas, _, _ = pattern_scene
+    image = sample_image()
+    frame = QRectF(-20, 30, 120, 90)
+    modifier = HalftoneModifier(grid_type="square", dot_style="circle",
+                                color_mode="two", base_resolution=1000,
+                                spacing=15.4, blur=5, intensity=70)
+    complete, _ = render_stages(canvas, image, frame, [modifier], QTransform())
+    canvas._interactive_render = True
+    canvas._effect_region_requests = True
+    canvas._projection_exact = True
+    import comic_editor.ui.effect_pipeline as pipeline
+    import comic_editor.ui.modifier_rendering as rendering
+    monkeypatch.setattr(pipeline, "REGIONAL_HALFTONE_MIN_PIXELS", 0)
+    monkeypatch.setattr(rendering, "apply_pattern_modifier", lambda *_a, **_k:
+                        pytest.fail("The entire pattern frame was evaluated"))
+    requested = QRectF(7, 46, 39, 43)
+    regional, placement = render_stages(canvas, image, frame, [modifier],
+        QTransform(), required=requested, request_scope=("test", "halftone"))
+    assert placement == requested
+    assert regional == complete.copy(27, 16, 39, 43)
+
+
 def test_slider_edit_reuses_original_gpu_source(pattern_scene, monkeypatch):
     canvas, _, _ = pattern_scene
     class RecordingRenderer:

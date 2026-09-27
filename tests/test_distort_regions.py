@@ -6,18 +6,20 @@ from PySide6.QtGui import QTransform
 
 from comic_editor.core.effect_geometry import effect_bounds
 from comic_editor.core.models import (
-    BoundGeometry, ChapterDocument, DistortModifier, ParameterMaskBinding, ToneMask,
+    BoundGeometry, ChapterDocument, DistortModifier, KuwaharaModifier,
+    ParameterMaskBinding, ToneMask,
 )
 from comic_editor.core.settings import EditorSettings
 from comic_editor.core.tiles import TileStore
 from comic_editor.ui.canvas import CanvasWidget
 from comic_editor.ui.distort_regions import render_mesh_regions
-from comic_editor.ui.effect_pipeline import aligned, render_stages
+from comic_editor.ui.effect_pipeline import _stage_plan, aligned, render_stages
 from comic_editor.ui.modifier_rendering import _premultiplied_qimage, modifier_render_settings
 
 
 @pytest.fixture
-def scene(qapp):
+def scene(qapp, monkeypatch):
+    monkeypatch.setattr("comic_editor.ui.canvas.create_network_manager", lambda *_: None)
     canvas = CanvasWidget(EditorSettings(canvas_renderer="raster"))
     chapter = ChapterDocument(width=800, height=600, document_kind="asset")
     chapter.add_page("Page", BoundGeometry.rectangle(0, 0, 800, 600))
@@ -78,6 +80,36 @@ def test_integrated_pipeline_reuses_mesh_pixels_when_request_extent_changes(scen
         crop = placement.translated(-frame.topLeft()).toAlignedRect()
         assert result == full.copy(crop)
         assert len(calls) == 1
+
+
+@pytest.mark.parametrize("variant", ["original", "anisotropic"])
+def test_distortion_and_kuwahara_region_matches_complete_output(scene, variant):
+    source, bounds = source_image(), QRectF(-37, -61, 331, 273)
+    mapping = QTransform()
+    warp = mesh(scene, bounds, mapping)
+    smooth = KuwaharaModifier(variant=variant, size=3, tensor_radius=1,
+                              anisotropy=60, processing_scale=100, iterations=1)
+    scene.chapter.modifiers[smooth.modifier_id] = smooth
+    modifiers = [warp, smooth]
+    full, full_bounds = render_stages(scene, source, bounds, modifiers, mapping)
+    scene._interactive_render = True
+    scene._effect_region_requests = True
+    for requested in (QRectF(40, 20, 95, 90), QRectF(-68, -72, 110, 95),
+                      QRectF(210, 145, 110, 100)):
+        plan = _stage_plan(scene, bounds, modifiers, mapping, ("kuwahara-source", variant),
+                           False, requested)
+        assert plan.targets[0].width() < full_bounds.width()
+        region, placement = render_stages(
+            scene, source, bounds, modifiers, mapping, required=requested,
+            request_scope=("object", "kuwahara", variant), source_key=("kuwahara-source", variant))
+        expected = crop(full, full_bounds, placement)
+        actual_bytes = np.frombuffer(region.constBits(), dtype=np.uint8)
+        expected_bytes = np.frombuffer(expected.constBits(), dtype=np.uint8)
+        difference = np.abs(actual_bytes.astype(np.int16) - expected_bytes.astype(np.int16))
+        # The anisotropic sector reduction can round a rare channel by one byte
+        # when the BLAS batch shape changes with the requested rectangle.
+        assert difference.max() <= 1
+        assert np.count_nonzero(difference) <= actual_bytes.size // 1000
 
 
 def regional(scene, source, bounds, modifier, mapping, requested, revision=0):
