@@ -80,7 +80,7 @@ def test_offscreen_effects_are_not_rendered_for_one_sample(scene, monkeypatch):
     (MirrorModifier(axis_start=(80, 0), axis_end=(80, 400)), QPointF(60.5, 105.5)),
     (HalftoneModifier(), QPointF(100.5, 105.5)),
 ])
-def test_exact_effect_color_matches_unculled_pixel_and_cached_tile(scene, modifier, point):
+def test_exact_effect_color_matches_unculled_pixel_and_cached_tile(scene, modifier, point, monkeypatch):
     canvas, chapter, page = scene
     obj = image_object(canvas, chapter, page, 90, 90)
     chapter.add_modifier(modifier, [("object", obj.object_id)])
@@ -88,6 +88,16 @@ def test_exact_effect_color_matches_unculled_pixel_and_cached_tile(scene, modifi
     for scale, rotation in ((0.2, 30), (1.0, 90), (3.0, -17)):
         canvas.scale, canvas.rotation = scale, rotation
         assert canvas.sample_composited_color(point) == expected
+        assert EyedropperSampler(canvas).sample(point) == expected
+    canvas._document_projection_enabled = True
+    canvas.scale, canvas.rotation = 1., 0.
+    canvas.center_x, canvas.center_y = 250., 200.
+    canvas._projection_phase_batch((None,))
+    assert canvas._projection_completed_view is not None
+    with monkeypatch.context() as patch:
+        import comic_editor.ui.eyedropper_sampling as sampling
+        patch.setattr(sampling, "render_sample_region", lambda *_a, **_k:
+                      pytest.fail("A finished effect pixel was rendered again"))
         assert EyedropperSampler(canvas).sample(point) == expected
 
 
@@ -143,6 +153,61 @@ def test_gesture_reuses_bounded_tiles_and_invalidates_on_edit_and_solo(scene, mo
     assert sampler.sample(QPointF(40, 40)) == "#FFFF0000"
     assert first != "#FF00FF00"
     canvas._tool_release()
+
+
+def test_gesture_reads_finished_composite_without_rendering_layers(scene, monkeypatch):
+    canvas, chapter, page = scene
+    back = chapter.add_layer(page.layer_id, "Back", BoundGeometry.rectangle(0, 0, 500, 400))
+    back.fill_color, back.border_width = "#FF224466", 0
+    front = chapter.add_layer(page.layer_id, "Front", BoundGeometry.rectangle(0, 0, 500, 400))
+    front.fill_color, front.border_width = "#8088CC22", 0
+    point = QPointF(100, 100)
+    expected = canvas.sample_composited_color(point)
+    canvas._document_projection_enabled = True
+    canvas.scale, canvas.center_x, canvas.center_y = 1., 250., 250.
+    canvas._projection_phase_batch((None,))
+    assert canvas._projection_completed_view is not None
+    sampler = EyedropperSampler(canvas)
+    with monkeypatch.context() as patch:
+        import comic_editor.ui.eyedropper_sampling as sampling
+        patch.setattr(sampling, "render_sample_region", lambda *_a, **_k:
+                      pytest.fail("A finished composite was rendered again"))
+        assert sampler.sample(point) == expected
+        assert sampler.sample(QPointF(101, 100)) == expected
+    front.fill_color = "#FFFF0000"
+    canvas.documentChanged.emit(QRectF(0, 0, 500, 400))
+    assert sampler.sample(point) == canvas.sample_composited_color(point)
+
+
+def test_presented_composite_is_skipped_when_view_is_not_native_resolution(scene, monkeypatch):
+    canvas, chapter, page = scene
+    layer = chapter.add_layer(page.layer_id, "Color", BoundGeometry.rectangle(0, 0, 500, 400))
+    layer.fill_color, layer.border_width = "#FF123456", 0
+    canvas._document_projection_enabled = True
+    canvas.scale, canvas.center_x, canvas.center_y = 2., 250., 250.
+    canvas._projection_phase_batch((None,))
+    assert canvas._projection_completed_view is not None
+    import comic_editor.ui.eyedropper_sampling as sampling
+    original = sampling.render_sample_region
+    calls = []
+    monkeypatch.setattr(sampling, "render_sample_region", lambda *a, **k:
+                        (calls.append(True), original(*a, **k))[1])
+    assert EyedropperSampler(canvas).sample(QPointF(250, 250)) == "#FF123456"
+    assert calls
+
+
+def test_selected_mask_only_projection_is_not_used_for_chapter_sampling(scene):
+    canvas, chapter, page = scene
+    visible = chapter.add_layer(page.layer_id, "Visible", BoundGeometry.rectangle(0, 0, 500, 400))
+    visible.fill_color, visible.border_width = "#FFFF0000", 0
+    mask = chapter.add_layer(page.layer_id, "Mask", BoundGeometry.rectangle(0, 0, 500, 400))
+    mask.fill_color, mask.border_width, mask.mask_only = "#FF0000FF", 0, True
+    canvas.set_selection("layer", mask.layer_id)
+    canvas._document_projection_enabled = True
+    canvas.scale, canvas.center_x, canvas.center_y = 1., 250., 250.
+    canvas._projection_phase_batch((None,))
+    assert canvas._projection_completed_view is not None
+    assert EyedropperSampler(canvas).sample(QPointF(100, 100)) == "#FFFF0000"
 
 
 def test_public_sampling_does_not_cache_unsignalled_pixel_changes(scene):

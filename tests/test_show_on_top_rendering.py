@@ -13,7 +13,7 @@ from comic_editor.core.models import (
 from comic_editor.core.settings import EditorSettings
 from comic_editor.core.tiles import TileStore
 from comic_editor.ui.canvas import CanvasWidget, ToolKind
-from comic_editor.ui.eyedropper_sampling import sample_color
+from comic_editor.ui.eyedropper_sampling import EyedropperSampler, sample_color
 
 
 @pytest.fixture
@@ -223,6 +223,23 @@ def test_export_and_eyedropper_match_promoted_scene_order(scene):
     assert rgb(preview(canvas)) == (255, 0, 0)
     assert rgb(canvas.render_export_image()) == (255, 0, 0)
     assert QColor(sample_color(canvas, QPointF(100, 100))) == QColor("red")
+
+
+def test_eyedropper_reads_finished_promoted_projection(scene, monkeypatch):
+    canvas, page = scene
+    back = layer(canvas, page)
+    red = ink(canvas, back, alpha=.5)
+    front = layer(canvas, page, index=0)
+    ink(canvas, front, "blue")
+    red.show_on_top = True
+    expected = sample_color(canvas, QPointF(100, 100))
+    canvas._document_projection_enabled = True
+    canvas._projection_phase_batch(("base", "top"))
+    assert canvas._projection_completed_view is not None
+    import comic_editor.ui.eyedropper_sampling as sampling
+    monkeypatch.setattr(sampling, "render_sample_region", lambda *_a, **_k:
+                        pytest.fail("A finished promoted composite was rendered again"))
+    assert EyedropperSampler(canvas).sample(QPointF(100, 100)) == expected
 
 
 def test_independent_layer_capture_keeps_promoted_descendants_and_omits_other_tops(scene):

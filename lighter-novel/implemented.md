@@ -1,3 +1,63 @@
+add a kuwahara filter category of modifier
+
+https://youtu.be/LDhN-JK3U9g
+
+https://www.youtube.com/redirect?event=video_description&redir_token=QUZZTVljSDRTcWZ4ckNkMkc0MlZOZS1QQ28yUnxBTl9pYzRlYnFIaXJ0cWcwZ3dLQlNqX2JBblV4ajdTNjl3aENUbTd1WEdwa3p2aHJBZGhUOFVTcmE1eG8zWFk4MlJObTVSOFNIdGdBbXQ3RmhHVlNWRW8xcjNCVVdjMG9RbDlL&q=https%3A%2F%2Fgithub.com%2FGarrettGunnell%2FAcerolaFX%2Fwiki&v=LDhN-JK3U9g
+
+https://www.youtube.com/redirect?event=video_description&redir_token=QUZZTVljSHp4UGNpM2xMUERaRzE0UE1icFBaSXxBTl9pYzRleU5rUEFRRGhDbXd2eG5wMEE4T0FBUmp4MUJNWE9ocUxXU2tsOXMyU0JZeDctbzV3QU5TdTFZcDNVc29Ob2lraTNjUGtRcnprVWY0UGRZWmtpeVdubElRY01BZ1d5&q=https%3A%2F%2Fgithub.com%2FGarrettGunnell%2FPost-Processing%2Ftree%2Fmain%2FAssets%2FKuwahara%2520Filter&v=LDhN-JK3U9g
+
+https://www.youtube.com/redirect?event=video_description&redir_token=QUZZTVljR096X1l4cy1jN2Q0Z01pTF9ORFVDSHxBTl9pYzRlOXZQUmp3eHNia25oSkcxeTV6WnRCc0g2SzUyUVh2WW4wZUd1c1Y4bHM0MVNSZTI5NEJFV2w3b3MwcEpueDQ0TUkxTGhXcG13X1JibHBuWVBwRTRzYW1vX2Z3ZkJF&q=http%3A%2F%2Fwww.umsl.edu%2F%7Ekangh%2FPapers%2Fkang-tpcg2010.pdf&v=LDhN-JK3U9g
+
+include the papari generalized kuwahara, the original kuwahara too, and the anisotropic kuwahara filter that acerola references.
+
+include parameters for these too.
+
+and take some performance tips from the video too.
+
+the kuwahara filter should let the user add "gradient points" - radial or linear gradients that are parameterized with gizmos that have start and end locations, that let the user adjust the strength of parameters such as size and strength, based on said gradients in a color-ramp style fashion
+
+do this by adding parameterizable "limited gradients" - line and circular gradients that work like the existing gradients do, but with additional adjustable bounds for where they apply. these should only be usable in mask edit mode. that way, they can be used for these kuwahara modifiers and for any other modifiers that already have mask support.
+
+this will allow me to do stuff like make the outside of an image have bigger kuwahara artifacts, and as the eye approaches a focal point such as the face (radial gradient as the ramp), the artifacts get smaller until it looks much more normal, for instance.
+
+as a modifier, it'll process like modifiers do. additionally, add a parameterized dithering modifier and a sharpness filter too
+
+reference the video script and description links i've pasted for more context. implement these requests.
+
+Computer Browser
+
+
+
+make documentation
+
+gif support?
+
+
+
+shift/control lasso selection check
+- in raster mode and mask selection mode
+- shift should add, control should remove
+
+autosave
+
+
+outline mode - brush based?
+- let the user pick a brush to use with the outline.
+![[Pasted image 20260926165530.png]]
+## brush overhaul
+
+
+## Stroke modifier - Set brus
+- lets the user change the brush used for that object via a modifier.
+- works on closed an open shapes too.
+- custom dot toggle.
+		- how to handle maps? assets? icon pack? stickers?
+	- angle range - slider that controls
+
+brushes
+- airbrush support
+
+if applied to a closed shape, behaves differently from on an open shape / vector object.
 
 
 - distortion bounds fix - adding a bunch of distortions gets cropped by some invisible boundary around the image.

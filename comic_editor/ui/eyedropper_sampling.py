@@ -5,6 +5,8 @@ import math
 from PySide6.QtCore import QPointF, QRectF
 from PySide6.QtGui import QColor, QImage, QPainter, QTransform
 
+from comic_editor.ui.document_projection import ProjectionAddress
+
 
 def _pixel(canvas, world):
     chapter = canvas.chapter
@@ -60,8 +62,60 @@ def sample_color(canvas, world: QPointF):
     return image.pixelColor(1, 1).name(QColor.NameFormat.HexArgb).upper()
 
 
+def _presented_color(canvas, x: int, y: int):
+    """Read a finished native-resolution document tile already on the canvas.
+
+    Projection tiles contain the composited artwork without selection or grid
+    overlays. Only a complete, current view is eligible; a pending repaint or
+    a live editing preview must use the direct compositor instead.
+    """
+    completed = getattr(canvas, "_projection_completed_view", None)
+    if (completed is None or completed[2] != canvas._document_projection.revision
+            or canvas._projection_has_live_preview()
+            or not canvas._uses_document_projection()):
+        return None
+    configuration, phases, _revision = completed
+    if configuration != canvas._projection_configuration():
+        return None
+    # The exact sampler does not render the editing underlay, selected
+    # mask-only artwork, or the optional page overflow presentation.
+    view_overflow, underlay, selected_mask_only = (
+        configuration[6], configuration[7], configuration[9])
+    if view_overflow or underlay[0] or selected_mask_only:
+        return None
+    address = ProjectionAddress(0, x // canvas._document_projection.tile_size,
+                                y // canvas._document_projection.tile_size)
+    pixels = []
+    for phase, tiles in phases:
+        tile = next((tile for tile in tiles if tile.key == (phase, address)), None)
+        if tile is None:
+            return None
+        source = tile.source_rect
+        if source is None:
+            return None
+        px = int(source.x()) + x - int(tile.world_rect.x())
+        py = int(source.y()) + y - int(tile.world_rect.y())
+        pixels.append((tile.image, px, py))
+    if not pixels:
+        return None
+    if len(pixels) == 1:
+        image, px, py = pixels[0]
+        return image.pixelColor(px, py).name(QColor.NameFormat.HexArgb).upper()
+    # Show-on-top presentation has separate base and promoted-artwork tiles.
+    # Compose their one-pixel crops in the same order as the visible canvas.
+    result = QImage(1, 1, QImage.Format_ARGB32_Premultiplied)
+    result.fill(0)
+    painter = QPainter(result)
+    try:
+        for image, px, py in pixels:
+            painter.drawImage(0, 0, image, px, py, 1, 1)
+    finally:
+        painter.end()
+    return result.pixelColor(0, 0).name(QColor.NameFormat.HexArgb).upper()
+
+
 class EyedropperSampler:
-    """Small full-resolution tile cache, reset at each gesture and visual edit.
+    """Reuse finished chapter pixels, then cache exact local renders as needed.
 
     The viewport image contains grid/selection overlays and zoomed pixels, so
     it is deliberately not used. Eight 66x66 RGBA images retain at most 140 KiB.
@@ -94,6 +148,9 @@ class EyedropperSampler:
         key = (x // self.tile_size, y // self.tile_size)
         image = self.tiles.pop(key, None)
         if image is None:
+            color = _presented_color(canvas, x, y)
+            if color is not None:
+                return color
             image = render_sample_region(canvas, key[0] * self.tile_size,
                                          key[1] * self.tile_size, self.tile_size)
         self.tiles[key] = image
