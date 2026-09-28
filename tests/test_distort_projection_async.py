@@ -206,7 +206,7 @@ def test_worker_source_and_mesh_setup_reused_without_stale_pixels_or_masks(canva
     shifted = finished("next-region")
     assert shifted != first
     assert setup == ["pixels", "mesh"]
-    assert caches[0] is caches[1] and caches[0].budget == 96 * 1024 * 1024
+    assert caches[0] is caches[1] and caches[0].budget == 256 * 1024 * 1024
     assert not hasattr(canvas, "_distort_preparation_cache")
     values[0].fill(QColor("#204080"))
     changed = finished("new-source")

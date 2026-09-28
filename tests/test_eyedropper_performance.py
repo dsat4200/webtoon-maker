@@ -179,6 +179,22 @@ def test_gesture_reads_finished_composite_without_rendering_layers(scene, monkey
     assert sampler.sample(point) == canvas.sample_composited_color(point)
 
 
+def test_gesture_reads_finished_tile_while_other_tiles_are_pending(scene, monkeypatch):
+    canvas, chapter, page = scene
+    layer = chapter.add_layer(page.layer_id, "Color", BoundGeometry.rectangle(0, 0, 500, 400))
+    layer.fill_color, layer.border_width = "#FF224466", 0
+    canvas._document_projection_enabled = True
+    canvas.scale, canvas.center_x, canvas.center_y = 1., 250., 250.
+    canvas._projection_phase_batch((None,))
+    finished = canvas._projection_completed_view
+    assert finished is not None
+    canvas._projection_progress_view = finished
+    canvas._projection_completed_view = None
+    monkeypatch.setattr("comic_editor.ui.eyedropper_sampling.render_sample_region",
+                        lambda *_a, **_k: pytest.fail("A finished tile was rendered again"))
+    assert EyedropperSampler(canvas).sample(QPointF(100, 100)) == "#FF224466"
+
+
 def test_presented_composite_is_skipped_when_view_is_not_native_resolution(scene, monkeypatch):
     canvas, chapter, page = scene
     layer = chapter.add_layer(page.layer_id, "Color", BoundGeometry.rectangle(0, 0, 500, 400))
@@ -232,3 +248,5 @@ def test_culling_scope_is_restored_if_rendering_raises(scene, monkeypatch):
         canvas.sample_composited_color(QPointF(100, 100))
     assert not canvas._interactive_render
     assert not canvas._render_bounds.exact_sampling
+    assert not canvas._effect_region_requests
+    assert not canvas._projection_exact

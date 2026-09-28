@@ -746,6 +746,8 @@ class _CanvasLogic(BrushFeatures, DocumentProjectionFeatures, MultiRasterSelecti
         self._render_modifier_sources: set[tuple[str, str]] = set()
         self._render_base_alpha = False
         self._interactive_render = False
+        self._effect_region_requests = False
+        self._projection_exact = False
         self._render_exclude_text = False
         self._rendering_mask_contributor = 0
         self._suppress_outline_for_mask = False

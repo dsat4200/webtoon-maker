@@ -19,19 +19,30 @@ def _pixel(canvas, world):
 def render_sample_region(canvas, x, y, size=1):
     """Render integer-aligned pixels with a one-pixel antialiasing guard.
 
-    Culling is enabled independently of interactive rendering. This retains
-    full-resolution effects and normal mask-only visibility, while independent
-    effect, mask, mirror and halftone source captures still bypass culling.
+    Exact region requests retain full-resolution effects without evaluating
+    distant pattern pixels. Selected mask-only artwork and live previews use
+    the ordinary compositor so sampling keeps their established visibility.
     """
     image = QImage(size + 2, size + 2, QImage.Format_ARGB32_Premultiplied)
     image.fill(QColor(canvas.chapter.background))
     bounds = canvas._render_bounds
-    previous_interactive = canvas._interactive_render
+    previous = (canvas._interactive_render, canvas._effect_region_requests,
+                canvas._projection_exact, getattr(canvas, "_effect_viewport_world", None),
+                getattr(canvas, "_projection_defer_effects", False))
     previous_exact = bounds.exact_sampling
     previous_margin = bounds.margin
     painter = QPainter(image)
     try:
-        canvas._interactive_render = False
+        visible = QRectF(x - 1, y - 1, size + 2, size + 2)
+        selected = (canvas.chapter.objects if canvas.selected_kind == "object"
+                    else canvas.chapter.layers).get(canvas.selected_id)
+        regional = (not (selected is not None and selected.mask_only)
+                    and not canvas._projection_has_live_preview())
+        canvas._interactive_render = regional
+        canvas._effect_region_requests = regional
+        canvas._projection_exact = regional
+        canvas._effect_viewport_world = visible
+        canvas._projection_defer_effects = False
         bounds.exact_sampling = True
         bounds.prepare()
         bounds.margin = 2.0  # Full-resolution pixels, independent of camera zoom.
@@ -39,13 +50,14 @@ def render_sample_region(canvas, x, y, size=1):
         transform = QTransform()
         transform.translate(1 - x, 1 - y)
         painter.setTransform(transform)
-        visible = QRectF(x - 1, y - 1, size + 2, size + 2)
         canvas._render_scene_layers(painter, visible)
     finally:
         painter.end()
         bounds.exact_sampling = previous_exact
         bounds.margin = previous_margin
-        canvas._interactive_render = previous_interactive
+        (canvas._interactive_render, canvas._effect_region_requests,
+         canvas._projection_exact, canvas._effect_viewport_world,
+         canvas._projection_defer_effects) = previous
     return image
 
 
@@ -66,36 +78,37 @@ def _presented_color(canvas, x: int, y: int):
     """Read a finished native-resolution document tile already on the canvas.
 
     Projection tiles contain the composited artwork without selection or grid
-    overlays. Only a complete, current view is eligible; a pending repaint or
-    a live editing preview must use the direct compositor instead.
+    overlays. A finished tile in a partially loaded view is exact too; live
+    editing previews still use the direct compositor.
     """
-    completed = getattr(canvas, "_projection_completed_view", None)
-    if (completed is None or completed[2] != canvas._document_projection.revision
-            or canvas._projection_has_live_preview()
-            or not canvas._uses_document_projection()):
+    if canvas._projection_has_live_preview() or not canvas._uses_document_projection():
         return None
-    configuration, phases, _revision = completed
-    if configuration != canvas._projection_configuration():
-        return None
+    configuration = canvas._projection_configuration()
     # The exact sampler does not render the editing underlay, selected
     # mask-only artwork, or the optional page overflow presentation.
-    view_overflow, underlay, selected_mask_only = (
-        configuration[6], configuration[7], configuration[9])
-    if view_overflow or underlay[0] or selected_mask_only:
+    if configuration[6] or configuration[7][0] or configuration[9]:
         return None
     address = ProjectionAddress(0, x // canvas._document_projection.tile_size,
                                 y // canvas._document_projection.tile_size)
-    pixels = []
-    for phase, tiles in phases:
-        tile = next((tile for tile in tiles if tile.key == (phase, address)), None)
-        if tile is None:
-            return None
-        source = tile.source_rect
-        if source is None:
-            return None
-        px = int(source.x()) + x - int(tile.world_rect.x())
-        py = int(source.y()) + y - int(tile.world_rect.y())
-        pixels.append((tile.image, px, py))
+    pixels = None
+    for view in (getattr(canvas, "_projection_progress_view", None),
+                 getattr(canvas, "_projection_completed_view", None)):
+        if (view is None or view[0] != configuration
+                or view[2] != canvas._document_projection.revision):
+            continue
+        candidate = []
+        for phase, tiles in view[1]:
+            tile = next((tile for tile in tiles if tile.key == (phase, address)), None)
+            if tile is None or tile.source_rect is None:
+                break
+            source = tile.source_rect
+            px = int(source.x()) + x - int(tile.world_rect.x())
+            py = int(source.y()) + y - int(tile.world_rect.y())
+            candidate.append((tile.image, px, py))
+        else:
+            if candidate:
+                pixels = candidate
+                break
     if not pixels:
         return None
     if len(pixels) == 1:

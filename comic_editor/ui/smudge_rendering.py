@@ -32,6 +32,9 @@ def smudge_bounds(bounds, modifier, transform):
 
 
 def _map(transform, x, y):
+    if transform.isAffine():
+        return (transform.m11() * x + transform.m21() * y + transform.m31(),
+                transform.m12() * x + transform.m22() * y + transform.m32())
     denominator = transform.m13() * x + transform.m23() * y + transform.m33()
     return ((transform.m11() * x + transform.m21() * y + transform.m31()) / denominator,
             (transform.m12() * x + transform.m22() * y + transform.m32()) / denominator)
@@ -44,11 +47,21 @@ def _sample(pixels, x, y):
     ix, iy = np.floor(x).astype(np.int64), np.floor(y).astype(np.int64)
     fx, fy = (x - ix).astype(np.float32), (y - iy).astype(np.float32)
     result = np.zeros((*x.shape, 4), np.float32)
+    flat = pixels.reshape(-1, 4) if pixels.flags.c_contiguous else None
+    if (flat is not None and ix.size and ix.min() >= 0 and ix.max() < w - 1
+            and iy.min() >= 0 and iy.max() < h - 1):
+        for dx, dy, weight in ((0, 0, (1-fx)*(1-fy)), (1, 0, fx*(1-fy)),
+                               (0, 1, (1-fx)*fy), (1, 1, fx*fy)):
+            result += flat.take((iy + dy) * w + ix + dx, axis=0) * weight[..., None]
+        return result
     for dx, dy, weight in ((0, 0, (1-fx)*(1-fy)), (1, 0, fx*(1-fy)),
                            (0, 1, (1-fx)*fy), (1, 1, fx*fy)):
         xx, yy = ix + dx, iy + dy
         valid = (xx >= 0) & (xx < w) & (yy >= 0) & (yy < h)
-        result += pixels[np.clip(yy, 0, h-1), np.clip(xx, 0, w-1)] * (weight * valid)[..., None]
+        clipped_y, clipped_x = np.clip(yy, 0, h-1), np.clip(xx, 0, w-1)
+        sample = (flat.take(clipped_y * w + clipped_x, axis=0) if flat is not None
+                  else pixels[clipped_y, clipped_x])
+        result += sample * (weight * valid)[..., None]
     return result
 
 
@@ -222,10 +235,15 @@ def render_smudge(image, bounds, modifier, transform, target, cancelled=None, *,
                 cache._put((source_key, "source"), original, (original,))
         if result is None:
             result = original
+    retain_strokes = cache is not None and result.nbytes <= cache.budget
     for index in range(first, len(strokes)):
         if cancelled is not None and cancelled():
             return None
-        result = result.copy()
+        # A source larger than the preparation budget cannot produce float
+        # checkpoints. Reuse its working array between strokes, preserving the
+        # original only when opacity blending still needs it.
+        if retain_strokes or index == first and (first > 0 or opacity < 1.):
+            result = result.copy()
         if not _stroke(result, strokes[index], work, scale, transform, cancelled):
             return None
         if cache is not None:

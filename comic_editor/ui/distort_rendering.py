@@ -49,6 +49,9 @@ def _transform(transform, points):
     points = np.asarray(points, np.float64)
     x, y = points[..., 0], points[..., 1]
     with np.errstate(invalid="ignore", divide="ignore"):
+        if transform.isAffine():
+            return np.stack((transform.m11() * x + transform.m21() * y + transform.m31(),
+                             transform.m12() * x + transform.m22() * y + transform.m32()), axis=-1)
         den = transform.m13() * x + transform.m23() * y + transform.m33()
         return np.stack(((transform.m11() * x + transform.m21() * y + transform.m31()) / den,
                          (transform.m12() * x + transform.m22() * y + transform.m32()) / den), axis=-1)
@@ -138,6 +141,9 @@ def _mesh(modifier, frame, parameters):
     return source, destination, faces
 
 
+_MLS_WEIGHT_CACHE_LIMIT = 64 * 1024 * 1024
+
+
 def _mls(query, source, destination, mode="rigid"):
     """Moving least squares pin warp; fixed pins constrain neighboring motion."""
     if len(source) == 0:
@@ -154,12 +160,17 @@ def _mls(query, source, destination, mode="rigid"):
     x, y = np.ascontiguousarray(query[:, 0]), np.ascontiguousarray(query[:, 1])
     total = np.zeros(len(query))
     px, py, qx, qy = (np.zeros_like(x) for _ in range(4))
+    # Reuse the second reduction's weights while keeping dense pin sets bounded.
+    pin_weights = ([] if len(query) * len(source) * 8 <= _MLS_WEIGHT_CACHE_LIMIT
+                   else None)
     for p, q in zip(source, destination):
         # Explicit array promotion also preserves the previous behavior when
         # callers supply float32 queries and float64 pin coordinates.
         dtype = np.result_type(query.dtype, p.dtype)
         dx, dy = x.astype(dtype, copy=False) - p[0], y.astype(dtype, copy=False) - p[1]
         weights = 1. / np.maximum(dx ** 2 + dy ** 2, 1e-10)
+        if pin_weights is not None:
+            pin_weights.append(weights)
         total += weights
         px += weights * p[0]
         py += weights * p[1]
@@ -172,10 +183,13 @@ def _mls(query, source, destination, mode="rigid"):
     qx /= total
     qy /= total
     real, imag, denominator = np.zeros(len(query)), np.zeros(len(query)), np.zeros(len(query))
-    for p, q in zip(source, destination):
+    for index, (p, q) in enumerate(zip(source, destination)):
         dtype = np.result_type(query.dtype, p.dtype)
-        dx, dy = x.astype(dtype, copy=False) - p[0], y.astype(dtype, copy=False) - p[1]
-        weights = 1. / np.maximum(dx ** 2 + dy ** 2, 1e-10)
+        if pin_weights is None:
+            dx, dy = x.astype(dtype, copy=False) - p[0], y.astype(dtype, copy=False) - p[1]
+            weights = 1. / np.maximum(dx ** 2 + dy ** 2, 1e-10)
+        else:
+            weights = pin_weights[index]
         ppx, ppy = p[0] - px.astype(dtype, copy=False), p[1] - py.astype(dtype, copy=False)
         qdtype = np.result_type(query.dtype, q.dtype)
         qqx, qqy = q[0] - qx.astype(qdtype, copy=False), q[1] - qy.astype(qdtype, copy=False)
@@ -416,6 +430,11 @@ class _Sampler:
 
     def __call__(self, coordinates):
         x, y = coordinates[..., 0], coordinates[..., 1]
+        if (coordinates.size and np.isfinite(coordinates).all()
+                and np.max(np.abs(coordinates)) < 1e15):
+            xy = [y + self.padding, x + self.padding]
+            return np.stack([map_coordinates(ch, xy, order=self.order, mode=self.mode,
+                             cval=self.fill, prefilter=False) for ch in self.filtered], axis=-1)
         valid = np.isfinite(x) & np.isfinite(y) & (np.abs(x) < 1e15) & (np.abs(y) < 1e15)
         xy = [np.where(valid, y + self.padding, -1e9), np.where(valid, x + self.padding, -1e9)]
         result = np.stack([map_coordinates(ch, xy, order=self.order, mode=self.mode, cval=self.fill, prefilter=False) for ch in self.filtered], axis=-1)
@@ -443,13 +462,15 @@ class PreparedDistort:
 class PreparedDistortCache:
     """Bounded immutable source/mesh setup reused by exact region requests.
 
-    Owned and used by the GUI's synchronous projection path only; background
-    jobs never receive this cache. Entries contain detached NumPy allocations,
-    not Qt images or canvas state. Output coordinates and effect parameters
-    remain per request, so region reuse cannot reuse another region's pixels.
+    The GUI and each background worker own separate instances. Entries contain
+    detached NumPy allocations, not Qt images or canvas state. Output
+    coordinates and effect parameters remain per request, so region reuse
+    cannot reuse another region's pixels.
     """
 
-    def __init__(self, budget=96 * 1024 * 1024, *, entry_limit=64):
+    # A large smudge frame and its previous stroke checkpoint can coexist,
+    # avoiding a full stroke replay when the last stroke changes.
+    def __init__(self, budget=256 * 1024 * 1024, *, entry_limit=64):
         self.budget = max(0, int(budget))
         self.entry_limit = max(1, int(entry_limit))
         self.bytes = self.hits = self.misses = self.evictions = 0
@@ -466,10 +487,10 @@ class PreparedDistortCache:
 
     def _put(self, key, value, arrays):
         size = _array_storage_bytes(arrays)
-        for array in arrays:
-            array.setflags(write=False)
         if size > self.budget:
             return value
+        for array in arrays:
+            array.setflags(write=False)
         previous = self._entries.pop(key, None)
         if previous is not None:
             self.bytes -= previous[1]
@@ -827,6 +848,10 @@ def render_distort(image: QImage, bounds: QRectF, modifier, local_to_world: QTra
             context["channel_blocks"].append(blocks)
 
     strip_height = max(1, min(128, 262144 // width))
+    needs_uv = effect in {"polar_to_rectangular", "shear", "equations", "displace"}
+    needs_delta = effect in {"twirl", "pinch_punch", "spherical", "ripple",
+                             "lens_distortion", "lens_correction", "rectangular_to_polar",
+                             "mirror", "equations"}
     for top in range(0, height, strip_height):
         if cancelled is not None and cancelled():
             return None
@@ -834,10 +859,12 @@ def render_distort(image: QImage, bounds: QRectF, modifier, local_to_world: QTra
         xx, yy = np.meshgrid(output_bounds.x() + (np.arange(width) + .5) * output_bounds.width() / width,
                              output_bounds.y() + (np.arange(top, bottom) + .5) * output_bounds.height() / height)
         world = _transform(transform, np.stack((xx, yy), axis=-1))
-        uv = (world - frame[:2]) / frame[2:]
-        delta = world - center
-        distance = np.linalg.norm(delta, axis=-1)
-        mapped = world.copy()
+        if needs_uv:
+            uv = (world - frame[:2]) / frame[2:]
+        if needs_delta:
+            delta = world - center
+            distance = np.linalg.norm(delta, axis=-1)
+        mapped = world.copy() if effect == "shear" else world
         if effect == "perspective":
             mapped = project(context["matrix"], world)
         elif effect == "affine":

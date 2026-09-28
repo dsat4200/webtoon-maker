@@ -4,7 +4,18 @@ import colorsys
 import numpy as np
 import pytest
 
-from comic_editor.ui.modifier_rendering import _hsl_effect
+from comic_editor.ui.modifier_rendering import _hsl_effect, _hsl_effect_dense
+
+
+@pytest.mark.parametrize("offsets", [(40., 0., 0.), (51., 98., -66.)])
+def test_large_sparse_hsl_matches_full_pixel_calculation(offsets):
+    rng = np.random.default_rng(415)
+    source = rng.random((256, 320, 4), dtype=np.float32)
+    source[..., 3] *= rng.random((256, 320)) < .6
+    source[..., :3] *= source[..., 3:4]
+    source[0, 0, :3] = .4  # Even invalid transparent RGB must be cleared.
+    expected = _hsl_effect_dense(source, *offsets)
+    np.testing.assert_array_equal(_hsl_effect(source, *offsets), expected)
 
 
 @pytest.mark.parametrize("offsets", [(-180, 0, 0), (180, 0, 0), (0, 0, 0),

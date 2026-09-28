@@ -89,6 +89,28 @@ def _brightness_contrast_effect(original, brightness, contrast):
 def _hsl_effect(
     original: np.ndarray, hue_delta, saturation_delta, lightness_delta,
 ) -> np.ndarray:
+    # Large painted/raster layers often have transparent padding. The dense
+    # kernel only needs visible colors; zero-alpha pixels always output black.
+    if (original.shape[0] * original.shape[1] >= 65536
+            and all(np.ndim(value) == 0 for value in
+                    (hue_delta, saturation_delta, lightness_delta))):
+        visible = original[..., 3] != 0
+        visible_count = np.count_nonzero(visible)
+        if visible_count * 5 < visible.size * 4:
+            result = original.copy()
+            result[~visible, :3] = 0
+            if visible_count:
+                selected = original[visible].reshape(-1, 1, 4)
+                result[visible] = _hsl_effect_dense(
+                    selected, hue_delta, saturation_delta, lightness_delta,
+                ).reshape(-1, 4)
+            return result
+    return _hsl_effect_dense(original, hue_delta, saturation_delta, lightness_delta)
+
+
+def _hsl_effect_dense(
+    original: np.ndarray, hue_delta, saturation_delta, lightness_delta,
+) -> np.ndarray:
     straight = _straight(original)
     rgb = straight[..., :3]
     maximum = np.max(rgb, axis=2)

@@ -360,17 +360,23 @@ def _dot_coverage(x, y, level, spacing, modifier):
     radius = spacing * .5 * modifier.size * scale
     style = modifier.dot_style
     rotation = modifier.rotation if modifier.link_rotation else modifier.dot_rotation
-    angle = math.radians(rotation)
-    px, py = x * math.cos(angle) + y * math.sin(angle), -x * math.sin(angle) + y * math.cos(angle)
+    if rotation == 0:
+        px, py = x, y
+    else:
+        angle = math.radians(rotation)
+        px, py = x * math.cos(angle) + y * math.sin(angle), -x * math.sin(angle) + y * math.cos(angle)
+    radial = None
     if style in {"circle", "blob"}:
         radius *= math.sqrt(2.)
         wobble = 1.
         if style == "blob":
             theta = np.arctan2(py, px)
             wobble = 1. + .14 * np.sin(theta * 3. + modifier.stipple_seed) + .08 * np.cos(theta * 5. - modifier.stipple_seed)
-        distance = np.hypot(px, py) - radius * wobble
+        radial = np.hypot(px, py)
+        distance = radial - radius * wobble
     elif style == "incircle":
-        distance = np.hypot(px, py) - radius
+        radial = np.hypot(px, py)
+        distance = radial - radius
     elif style == "square":
         rounding = radius * modifier.corner_rounding
         qx, qy = np.abs(px) - radius + rounding, np.abs(py) - radius + rounding
@@ -392,7 +398,8 @@ def _dot_coverage(x, y, level, spacing, modifier):
         distance = (px ** 4 + py ** 4) ** .25 - radius
     else:
         distance = np.hypot(px, py) - radius
-    aa = (np.abs(px) + np.abs(py)) / np.maximum(np.hypot(px, py), 1e-6)
+    aa = (np.abs(px) + np.abs(py)) / np.maximum(
+        radial if radial is not None else np.hypot(px, py), 1e-6)
     return _edge_coverage(distance, aa_width=aa) * (radius > 1e-6)
 
 
@@ -500,7 +507,11 @@ def _halftone(source: np.ndarray, modifier: HalftoneModifier,
     xx, yy = xx + ox + .5, yy + oy + .5
     angle = math.radians(modifier.rotation)
     px, py = xx - frame_width / 2., yy - frame_height / 2.
-    gx, gy = px * math.cos(angle) + py * math.sin(angle), -px * math.sin(angle) + py * math.cos(angle)
+    if angle == 0.:
+        gx, gy = px, py
+    else:
+        cosine, sine = math.cos(angle), math.sin(angle)
+        gx, gy = px * cosine + py * sine, -px * sine + py * cosine
     grid = modifier.grid_type
     if grid in {"line", "ring"}:
         point_spacing = max(.25, getattr(modifier, "point_spacing", 5.) * unit)
@@ -545,9 +556,21 @@ def _halftone(source: np.ndarray, modifier: HalftoneModifier,
     cell_samples = _cell_sample_table(prepared, color_source, cell_x, cell_y,
                                       spacing, angle, modifier, half_span,
                                       (frame_width, frame_height), origin)
+    circle_reach = None
+    if grid == "square" and modifier.dot_style in {"circle", "incircle"}:
+        largest_scale = math.sqrt(max(1., 1. - modifier.scale_factor))
+        circle_reach = (spacing * .5 * modifier.size * largest_scale
+                        * (math.sqrt(2.) if modifier.dot_style == "circle" else 1.))
     for iy in range(-half_span, half_span + 1):
         for ix in range(-half_span, half_span + 1):
             _check_cancelled(cancelled)
+            # A pixel belongs to its nearest square cell. Distant cells whose
+            # closest possible edge lies beyond the largest dot and its AA
+            # fringe cannot contribute to this output pixel.
+            if (circle_reach is not None
+                    and (max(abs(ix), abs(iy)) - .5) * spacing
+                    > circle_reach + max(1., spacing * 1e-4)):
+                continue
             if cell_samples is not None:
                 xids, yids, sxs, sys, samples, levels, visible_cells, colors = cell_samples
                 ids = (yids + iy, xids + ix)
@@ -667,10 +690,10 @@ def _halftone_strips(image, modifier, color_source, cancelled, *,
 
 
 def halftone_region(image: QImage, modifier: HalftoneModifier, region: QRect,
-                    *, cancelled=None, tile_size=256) -> QImage:
+                    *, cancelled=None, tile_size=1536) -> QImage:
     """Evaluate a regular halftone only where it will be presented.
 
-    Each small capture carries enough source padding for cell samples and
+    Each bounded capture carries enough source padding for cell samples and
     blur, while the lattice still uses the complete image's coordinates.
     """
     if modifier.grid_type not in {"square", "hexagonal"} or modifier.dot_style == "delaunay":

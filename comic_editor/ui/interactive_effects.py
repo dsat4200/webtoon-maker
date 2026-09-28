@@ -131,8 +131,7 @@ def render_interactive_stack(canvas, image, modifiers, world_origin, mask_fields
         mapping = QTransform(world_to_image) if world_to_image is not None else None
         jobs = canvas._effect_jobs
         if not hasattr(jobs, "stack_caches"):
-            jobs.stack_caches = (OutlineDistanceCache(16 * 1024 * 1024),
-                                 BlurPyramidCache(16 * 1024 * 1024))
+            jobs.stack_caches = (OutlineDistanceCache(), BlurPyramidCache())
         outline_cache, blur_cache = jobs.stack_caches
 
         def compute(cancelled):

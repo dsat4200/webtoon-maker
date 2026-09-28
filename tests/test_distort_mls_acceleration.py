@@ -79,3 +79,12 @@ def test_list_pins_and_coincident_constraints_keep_previous_behavior():
     for mode in ("rigid", "similarity"):
         np.testing.assert_array_equal(rendering._mls(query, source, destination, mode),
                                       reference(query, source, destination, mode))
+
+
+def test_large_pin_sets_recompute_weights_when_retaining_them_exceeds_budget(monkeypatch):
+    monkeypatch.setattr(rendering, "_MLS_WEIGHT_CACHE_LIMIT", 0)
+    query = np.array([[[1., 2.], [3., 4.]]])
+    source = np.array([[0., 0.], [5., 0.], [0., 5.]])
+    destination = source + np.array([2., -1.])
+    np.testing.assert_array_equal(rendering._mls(query, source, destination),
+                                  reference(query, source, destination))

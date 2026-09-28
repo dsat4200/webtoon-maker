@@ -208,6 +208,34 @@ def test_longest_checkpoint_survives_when_history_and_source_exceed_budget(monke
     assert actual == render(image, effect)
 
 
+@pytest.mark.parametrize("opacity", [25., 100.])
+def test_oversized_smudge_reuses_working_array_between_strokes(monkeypatch, opacity):
+    image = source()
+    effect = modifier(stroke(), stroke(start=(150, 64), end=(150, 105),
+                                       identifier="second", radius=12), opacity=opacity)
+    expected = render(image, effect)
+    calls = []
+    original = smudge_rendering._stroke
+    def counted(pixels, item, *args):
+        calls.append(id(pixels))
+        return original(pixels, item, *args)
+    monkeypatch.setattr(smudge_rendering, "_stroke", counted)
+    actual = render(image, effect, preparation_cache=PreparedDistortCache(budget=1))
+    assert actual == expected
+    assert len(calls) == 2 and calls[0] == calls[1]
+
+
+def test_smudge_sampling_matches_for_contiguous_and_strided_pixels():
+    rng = np.random.default_rng(721)
+    pixels = rng.random((9, 11, 4), dtype=np.float32)
+    padded = np.zeros((9, 22, 4), dtype=np.float32)
+    padded[:, ::2] = pixels
+    x, y = np.meshgrid(np.linspace(-1.5, 11.5, 27),
+                       np.linspace(-1.5, 9.5, 23))
+    np.testing.assert_array_equal(smudge_rendering._sample(pixels, x, y),
+                                  smudge_rendering._sample(padded[:, ::2], x, y))
+
+
 def test_pressure_response_and_endpoint_radius_affect_smear():
     image = source()
     item = stroke(pressure_enabled=True)

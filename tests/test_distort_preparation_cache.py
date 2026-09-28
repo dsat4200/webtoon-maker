@@ -171,6 +171,7 @@ def test_only_exact_synchronous_projection_receives_the_canvas_cache(monkeypatch
     stage()
     assert isinstance(observed[-1], PreparedDistortCache)
     cache = observed[-1]
+    assert cache.budget == 256 * 1024 * 1024
     stage()
     assert observed[-1] is cache and cache.hits == 1
 
