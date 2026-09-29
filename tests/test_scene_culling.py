@@ -88,6 +88,29 @@ def test_smudge_paint_extends_past_parent_mask_and_stays_cullable(scene):
     assert canvas._render_bounds.entity_bounds("layer", layer.layer_id).right() > 195
 
 
+def test_smudged_image_keeps_its_stack_position_below_higher_artwork(scene):
+    canvas, document, page = scene
+    lower = image_object(canvas, document, page, 100, 100, "red")
+    higher = image_object(canvas, document, page, 100, 100, "blue")
+    page.children.reverse()  # The first child is the uppermost in the outliner.
+    points = [
+        {"position": [110, 120], "handle": [110, 120], "point_type": "vector",
+         "radius": 8, "flow": 100, "strength": 100},
+        {"position": [135, 120], "handle": [135, 120], "point_type": "vector",
+         "radius": 8, "flow": 100, "strength": 100},
+    ]
+    stroke = validate_strokes([{"id": "drag", "points": points,
+                                "pressure_settings": default_tool_settings()}])[0]
+    document.add_modifier(DistortModifier(
+        modifier_type="distort_smudge", parameters={"strokes": [stroke]}),
+        [("object", lower.object_id)])
+
+    assert canvas._child_ignores_parent_mask(page.children[1])
+    assert not lower.ignore_parent_mask
+    image = render(canvas)
+    assert image.pixelColor(120, 120) == QColor("blue")
+
+
 def test_offscreen_layers_skip_shape_and_object_work_and_return_when_panned(scene, monkeypatch):
     canvas, document, page = scene
     for index in range(100):

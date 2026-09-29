@@ -14,7 +14,8 @@ from PySide6.QtGui import QPolygonF, QTransform
 from comic_editor.core.effect_geometry import effect_bounds
 from comic_editor.core.models import (
     BlurModifier, BrightnessContrastModifier, CurvesModifier, DistortModifier, GradientObject, HalftoneModifier, ImageObject, LayerNode,
-    OutlineModifier, PixelateModifier, RasterObject, TextObject, VectorDrawingObject,
+    OutlineModifier, PixelateModifier, PosterizeModifier, RasterObject,
+    TextObject, VectorDrawingObject,
 )
 
 
@@ -238,7 +239,8 @@ class SceneRenderBounds:
         self.bounds[key] = None
         modifiers = self.canvas._active_modifier_instances(target.modifier_ids)
         from comic_editor.core.models import KuwaharaModifier, DitheringModifier, SharpnessModifier
-        bounded_effects = (BlurModifier, BrightnessContrastModifier, CurvesModifier, OutlineModifier,
+        bounded_effects = (BlurModifier, BrightnessContrastModifier, CurvesModifier,
+                           OutlineModifier, PosterizeModifier,
                            KuwaharaModifier, DitheringModifier, SharpnessModifier)
         if isinstance(target, ImageObject):
             # These image effects are clipped to the complete source image

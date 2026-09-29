@@ -2,15 +2,19 @@
 import numpy as np
 import pytest
 from PySide6.QtCore import QPointF, QRectF
-from PySide6.QtGui import QColor, QImage
+from PySide6.QtGui import QColor, QImage, QPainter
 
 from comic_editor.core.models import (
-    BoundGeometry, ChapterDocument, ImageObject, OutlineModifier, RasterObject, TextObject,
+    BoundGeometry, ChapterDocument, DistortModifier, ImageObject,
+    OutlineModifier, PosterizeModifier, RasterObject, TextObject,
     VectorDrawingObject, VectorStroke, VectorStrokePoint,
 )
 from comic_editor.core.settings import EditorSettings
 from comic_editor.core.tiles import TileStore
 from comic_editor.ui.canvas import CanvasWidget, ToolKind
+from comic_editor.ui.document_projection import (
+    ProjectionAddress, ProjectionRequest, ProjectionTile,
+)
 
 
 @pytest.fixture
@@ -130,6 +134,71 @@ def test_multi_object_preview_retains_each_parent_but_culls_unrelated_scene(scen
     for obj in (first, second):
         assert ("object", obj.object_id) in canvas._render_bounds.live_branches
         assert ("layer", obj.parent_layer_id) in canvas._render_bounds.live_branches
+
+
+def test_multi_image_translation_keeps_distant_tiles_and_commits_image(scene, monkeypatch):
+    canvas, chapter, page, _unrelated, _font = scene
+    parent = chapter.add_layer(page.layer_id, "Moving",
+                               BoundGeometry.rectangle(0, 0, 500, 500))
+    parent.fill_color, parent.border_width = None, 0
+    first = chapter.add_object(parent.layer_id, ImageObject(
+        x=60, y=60, pixel_width=50, pixel_height=50))
+    second = chapter.add_object(parent.layer_id, RasterObject(
+        x=160, y=80, interaction_rect=(0, 0, 50, 50)))
+    image = QImage(50, 50, QImage.Format_ARGB32_Premultiplied)
+    image.fill(QColor("red"))
+    canvas.images.put_decoded(first.object_id, "moving.png", b"", image)
+    chapter.add_modifier(OutlineModifier(thickness=4), [("object", first.object_id)])
+    chapter.add_modifier(DistortModifier(frame=(0, 0, 50, 50),
+                                        center=(85, 85), radius=20),
+                         [("object", first.object_id)])
+    chapter.add_modifier(PosterizeModifier(), [("object", second.object_id)])
+    canvas.set_selection_set([("object", second.object_id),
+                              ("object", first.object_id)],
+                             ("object", first.object_id))
+    start_first = list(canvas.object_world_quad(first.object_id))
+    start_second = list(canvas.object_world_quad(second.object_id))
+    press = QPointF(105, 80)
+    assert canvas._begin_multi_transform(press)
+    assert canvas._transform_drag_mode == "translate"
+    assert canvas._multi_transform_start_render_bounds is not None
+
+    projection = canvas._document_projection
+    for y in (0, 1, 6):
+        request = ProjectionRequest(ProjectionAddress(0, 0, y))
+        image = QImage(request.pixel_size, request.pixel_size,
+                       QImage.Format_ARGB32_Premultiplied)
+        image.fill(QColor("blue"))
+        projection.tiles[request.address] = ProjectionTile(
+            request, image, projection.revision)
+    distant = projection.tiles[ProjectionAddress(0, 0, 6)]
+
+    canvas._update_multi_transform_preview(press + QPointF(30, 20))
+    assert distant.valid
+    preview = list(canvas._multi_transform_preview_quads[first.object_id])
+    assert preview == pytest.approx([(x + 30, y + 20) for x, y in start_first])
+    observed = []
+    original = canvas._quad_transform
+    monkeypatch.setattr(canvas, "_quad_transform", lambda source, quad:
+                        (observed.append(list(quad)), original(source, quad))[1])
+    target = QImage(300, 300, QImage.Format_ARGB32_Premultiplied)
+    target.fill(QColor("transparent"))
+    painter = QPainter(target)
+    try:
+        canvas._render_image_object(painter, first)
+    finally:
+        painter.end()
+    assert observed[-1] == preview
+
+    canvas._commit_geometry_transform()
+    assert distant.valid
+    assert first.transform_quad == pytest.approx(preview)
+    assert second.transform_quad == pytest.approx(
+        [(x + 30, y + 20) for x, y in start_second])
+    assert canvas.command_stack.can_undo
+    canvas.command_stack.undo()
+    assert canvas.chapter.objects[first.object_id].transform_quad is None
+    assert canvas.chapter.objects[second.object_id].transform_quad is None
 
 
 def test_object_preview_started_before_prepare_bypasses_stale_bounds(scene):

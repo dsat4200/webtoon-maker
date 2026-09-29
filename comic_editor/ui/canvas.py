@@ -856,6 +856,7 @@ class _CanvasLogic(BrushFeatures, DocumentProjectionFeatures, MultiRasterSelecti
         self._multi_transform_preview_quads: dict[
             str, list[tuple[float, float]]
         ] = {}
+        self._multi_transform_start_render_bounds: dict[str, QRectF] | None = None
         self._shape_control_dragged = False
         self._shape_last_pointer_doc: QPointF | None = None
         self._shape_hover_insert: tuple[int, float, QPointF] | None = None
@@ -4831,6 +4832,23 @@ class _CanvasLogic(BrushFeatures, DocumentProjectionFeatures, MultiRasterSelecti
         painter.setClipPath(layer_path, Qt.IntersectClip)
         for child in reversed(layer.children):
             if self._child_ignores_parent_mask(child):
+                if self._child_explicitly_ignores_parent_mask(child):
+                    continue
+                # A smudge can extend beyond this mask, but it still belongs
+                # at its ordinary position among the layer's children.
+                painter.restore()
+                if child.kind == "layer":
+                    self._render_layer(
+                        painter, self.chapter.layers[child.entity_id], opacity,
+                        visible_world,
+                    )
+                else:
+                    self._render_object(
+                        painter, self.chapter.objects[child.entity_id], opacity,
+                        local_visible,
+                    )
+                painter.save()
+                painter.setClipPath(layer_path, Qt.IntersectClip)
                 continue
             if child.kind == "layer":
                 self._render_layer(
@@ -4870,7 +4888,7 @@ class _CanvasLogic(BrushFeatures, DocumentProjectionFeatures, MultiRasterSelecti
             painter.restore()
         painter.restore()
         for child in reversed(layer.children):
-            if not self._child_ignores_parent_mask(child):
+            if not self._child_explicitly_ignores_parent_mask(child):
                 continue
             if child.kind == "layer":
                 self._render_layer(
@@ -5309,6 +5327,14 @@ class _CanvasLogic(BrushFeatures, DocumentProjectionFeatures, MultiRasterSelecti
         return bool(entity and (
             entity.ignore_parent_mask or self._entity_has_smudge_overflow(entity)
         ))
+
+    def _child_explicitly_ignores_parent_mask(self, child: ChildRef) -> bool:
+        entity = (
+            self.chapter.layers.get(child.entity_id)
+            if child.kind == "layer"
+            else self.chapter.objects.get(child.entity_id)
+        )
+        return bool(entity and entity.ignore_parent_mask)
 
     def _entity_has_smudge_overflow(self, entity) -> bool:
         return any(
@@ -9512,7 +9538,7 @@ class _CanvasLogic(BrushFeatures, DocumentProjectionFeatures, MultiRasterSelecti
         destination = self._image_local_quad(obj)
         if obj.object_id in self._multi_transform_preview_quads:
             destination = list(self._multi_transform_preview_quads[obj.object_id])
-        if (
+        elif (
             obj.object_id == self.selected_object_id
             and self._transform_preview_quad is not None
             and self._transform_start_quad is not None
@@ -23662,6 +23688,9 @@ class _CanvasLogic(BrushFeatures, DocumentProjectionFeatures, MultiRasterSelecti
         mode, handle = self._transform_control_hit(cage, point)
         if not mode:
             return False
+        self._multi_transform_start_render_bounds = (
+            self._multi_translation_render_bounds() if mode == "translate" else None
+        )
         self._geometry_transform_target = ("multi", "")
         self._transform_handle_index = handle
         self._transform_drag_mode = mode
@@ -23681,6 +23710,38 @@ class _CanvasLogic(BrushFeatures, DocumentProjectionFeatures, MultiRasterSelecti
             point.y() - pivot.y(), point.x() - pivot.x()
         )
         return True
+
+    def _multi_translation_render_bounds(self) -> dict[str, QRectF] | None:
+        """Find finite painted bounds when a move has no remote dependants."""
+        from comic_editor.ui.halftone_source import references_entity
+
+        self._render_bounds.prepare()
+        result: dict[str, QRectF] = {}
+        for kind, object_id in self.selected_entities:
+            if kind != "object" or references_entity(self, kind, object_id):
+                return None
+            obj = self.chapter.objects.get(object_id)
+            if obj is None or self._object_is_mask_contributor(object_id):
+                return None
+            # Ancestor effects can spread a changed child beyond its own
+            # rendered footprint. Keep their established full invalidation.
+            if any(layer.compound_enabled
+                   or self._has_active_modifiers(layer.modifier_ids)
+                   for layer in self.chapter.ancestor_layers(obj.parent_layer_id)):
+                return None
+            bounds = self._render_bounds.entity_bounds(kind, object_id)
+            if (bounds is None or bounds.isEmpty()
+                    or not all(math.isfinite(value) for value in bounds.getRect())):
+                return None
+            result[object_id] = QRectF(bounds)
+        return result
+
+    def _multi_translation_dirty(self, dx: float, dy: float) -> list[QRectF]:
+        bounds = self._multi_transform_start_render_bounds or {}
+        padding = max(2.0, 4.0 / max(self.scale, 0.05))
+        return [QRectF(rect).translated(dx, dy).adjusted(
+                    -padding, -padding, padding, padding)
+                for rect in bounds.values()]
 
     def _begin_geometry_transform(self, point: QPointF) -> bool:
         if self.chapter is None:
@@ -23890,12 +23951,20 @@ class _CanvasLogic(BrushFeatures, DocumentProjectionFeatures, MultiRasterSelecti
             return mapped.x(), mapped.y()
 
         kind, entity_id = target
+        localized_move = (kind == "multi" and drag_mode == "translate"
+                          and self._multi_transform_start_render_bounds is not None)
+        if localized_move:
+            dx = destination[0][0] - source[0][0]
+            dy = destination[0][1] - source[0][1]
+            dirty_regions = (self._multi_translation_dirty(0, 0)
+                             + self._multi_translation_dirty(dx, dy))
         if kind == "multi":
             for object_id, destination_quad in (
                 self._multi_transform_preview_quads.items()
             ):
                 obj = self.chapter.objects.get(object_id)
-                if not isinstance(obj, (RasterObject, VectorDrawingObject)):
+                if not isinstance(obj, (RasterObject, VectorDrawingObject,
+                                        ImageObject)):
                     continue
                 if obj.transform_frame is None:
                     obj.transform_frame = self._object_transform_frame(obj)
@@ -23905,6 +23974,7 @@ class _CanvasLogic(BrushFeatures, DocumentProjectionFeatures, MultiRasterSelecti
                 )
             self._multi_transform_start_world_quads.clear()
             self._multi_transform_preview_quads.clear()
+            self._multi_transform_start_render_bounds = None
             label = "Transform objects"
         elif kind == "layer_group":
             layer = self.chapter.layers[entity_id]
@@ -23983,11 +24053,23 @@ class _CanvasLogic(BrushFeatures, DocumentProjectionFeatures, MultiRasterSelecti
         after = self.chapter.to_dict()
         if before != after:
             self.push_model_change(before, after, label)
-            self.hierarchyChanged.emit()
+            if kind == "multi":
+                self.objectRecordsChanged.emit(tuple(
+                    object_id for selected_kind, object_id in self.selected_entities
+                    if selected_kind == "object"
+                ))
+            else:
+                self.hierarchyChanged.emit()
+        if localized_move:
+            self._preserve_scene_cache_once = True
         self.documentChanged.emit(QRectF())
         if kind in {"layer", "layer_group"}:
             self._compound_path_cache.clear()
-        self._invalidate_scene_cache()
+        if localized_move:
+            for region in dirty_regions:
+                self._queue_visual_dirty(region, notify_preview=False)
+        else:
+            self._invalidate_scene_cache()
         self.update()
 
     @staticmethod
@@ -24279,6 +24361,7 @@ class _CanvasLogic(BrushFeatures, DocumentProjectionFeatures, MultiRasterSelecti
         start = list(self._transform_start_quad or [])
         if len(start) != 4:
             return
+        previous = list(self._transform_preview_quad or start)
         if self._transform_drag_mode == "pivot":
             self._transform_pivot = QPointF(point)
             self._transform_pivot_custom = True
@@ -24346,7 +24429,17 @@ class _CanvasLogic(BrushFeatures, DocumentProjectionFeatures, MultiRasterSelecti
                 inverse.map(transform.map(QPointF(*value))).toTuple()
                 for value in quad
             ]
-        self._invalidate_scene_cache()
+        if (self._transform_drag_mode == "translate"
+                and self._multi_transform_start_render_bounds is not None):
+            old_dx = previous[0][0] - start[0][0]
+            old_dy = previous[0][1] - start[0][1]
+            new_dx = candidate[0][0] - start[0][0]
+            new_dy = candidate[0][1] - start[0][1]
+            for region in (self._multi_translation_dirty(old_dx, old_dy)
+                           + self._multi_translation_dirty(new_dx, new_dy)):
+                self._queue_visual_dirty(region, notify_preview=False)
+        else:
+            self._invalidate_scene_cache()
 
     def _commit_object_transform(self) -> None:
         object_id = self.selected_object_id
@@ -24428,6 +24521,7 @@ class _CanvasLogic(BrushFeatures, DocumentProjectionFeatures, MultiRasterSelecti
         self._geometry_transform_target = None
         self._multi_transform_start_world_quads.clear()
         self._multi_transform_preview_quads.clear()
+        self._multi_transform_start_render_bounds = None
         self._transform_static_cache = QImage()
         self._text_transform_cache = QImage()
         self._render_excluded_object_id = ""

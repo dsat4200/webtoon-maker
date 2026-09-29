@@ -5488,6 +5488,7 @@ class MainWindow(QMainWindow):
         self.text_object_controls.refresh()
         self.modifier_controls.refresh()
         self._refresh_masks_panel()
+        self.preview.invalidate_all()
         self._sync_tool_buttons()
 
     def _hierarchy_changed(self) -> None:

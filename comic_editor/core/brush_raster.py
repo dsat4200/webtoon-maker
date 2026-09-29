@@ -1275,12 +1275,13 @@ class RasterBrushStroke:
             # Completion and blurred post-stroke edges retain the full-tile
             # equation, including the established Gaussian halo behavior.
             width = height = n
-            y, x = np.mgrid[-halo:n+halo, -halo:n+halo]
-            alpha = np.zeros(x.shape, np.float32)
-            tx, ty = (x+kx*n)//n, (y+ky*n)//n
-            for iy in range(int(ty.min()), int(ty.max())+1):
-                for ix in range(int(tx.min()), int(tx.max())+1):
-                    mask = (tx == ix) & (ty == iy)
+            left, top = kx*n-halo, ky*n-halo
+            right, bottom = (kx+1)*n+halo, (ky+1)*n+halo
+            alpha = np.zeros((n+2*halo, n+2*halo), np.float32)
+            for iy in range(top//n, (bottom-1)//n+1):
+                for ix in range(left//n, (right-1)//n+1):
+                    l, t = max(left, ix*n), max(top, iy*n)
+                    r, b = min(right, (ix+1)*n), min(bottom, (iy+1)*n)
                     other = self._main_alpha_cache.get((ix, iy))
                     if other is None:
                         other = self._source_tile((ix, iy))[..., 3].copy()
@@ -1289,7 +1290,7 @@ class RasterBrushStroke:
                             self._main_alpha_cache.popitem(last=False)
                     else:
                         self._main_alpha_cache.move_to_end((ix, iy))
-                    alpha[mask] = other[(y+ky*n)[mask] % n, (x+kx*n)[mask] % n]
+                    alpha[t-top:b-top, l-left:r-left] = other[t-iy*n:b-iy*n, l-ix*n:r-ix*n]
         else:
             # A live edge can change only within its radius of changed paint.
             # Read just that output patch and its morphology halo, including
