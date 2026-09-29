@@ -1,5 +1,4 @@
 """Bridge the editor's faithful document renderer to retained presentation."""
-from collections import defaultdict
 import time
 
 from PySide6.QtCore import QRect, QRectF, QSize, Qt, QTimer
@@ -8,7 +7,9 @@ from PySide6.QtGui import QColor, QImage, QPainter, QPainterPath, QTransform
 from comic_editor.ui.document_presentation import (
     PresentedTile, PresentationStats, draw_document_tiles, draw_document_border,
 )
-from comic_editor.ui.document_projection import ProjectionAddress, ProjectionRequest
+from comic_editor.render.service import (
+    RenderDocument, RenderRequest, RenderResult, RenderQuality, RenderStatus, TileBatchPolicy,
+)
 
 
 class DocumentProjectionFeatures:
@@ -26,9 +27,12 @@ class DocumentProjectionFeatures:
         self._projection_work_waiting = False
 
     def _projection_configuration(self):
-        self._set_live_underlay_context()
-        underlay = self._live_underlay_object_id, self._live_underlay_amount
-        self._clear_live_underlay_context()
+        previous = self._live_underlay_object_id, self._live_underlay_amount
+        try:
+            self._set_live_underlay_context()
+            underlay = self._live_underlay_object_id, self._live_underlay_amount
+        finally:
+            self._live_underlay_object_id, self._live_underlay_amount = previous
         selected = (self.chapter.objects if self.selected_kind == "object"
                     else self.chapter.layers).get(self.selected_id)
         mask_only = ((self.selected_kind, self.selected_id)
@@ -65,7 +69,7 @@ class DocumentProjectionFeatures:
             self._projection_windows = {}
             self._projection_windows_configuration = view_configuration
         configuration = (*view_configuration, phase)
-        projection.configure(configuration, document=configuration[:3])
+        self._render_service.configure(configuration, document=configuration[:3])
         visible = self.visible_document_rect()
         # A guard band warms the corners exposed by canvas rotation and the
         # next small pan. Its size is tied to the stable tile grid, not an
@@ -87,7 +91,7 @@ class DocumentProjectionFeatures:
         previous_phase = getattr(self, "_projection_capture_phase", None)
         self._projection_capture_phase = phase
         try:
-            tiles = projection.collect(requests, self._render_document_tile,
+            tiles = self._render_service.collect(requests, self._render_document_tile,
                                        render_many=self._render_document_tiles)
         finally:
             self._projection_capture_phase = previous_phase
@@ -116,160 +120,56 @@ class DocumentProjectionFeatures:
             (request.address.level, request.address.x, request.address.y),
             exact=True)
 
+    def _render_document_state(self):
+        configuration = self._projection_configuration()
+        return RenderDocument(configuration[:3], configuration,
+            self._document_projection.revision, self.chapter.width, self.chapter.height,
+            self.chapter.background, self.chapter.view_overflow, configuration[7],
+            self._projection_has_live_preview())
+
     def _render_document_tiles(self, requests):
-        # The scene traversal and geometry setup are substantially more costly
-        # than slicing an image. Share them across adjacent missing tiles;
-        # retained tiles still invalidate and present independently.
-        groups = defaultdict(list)
-        for request in requests:
-            address = request.address
-            groups[(address.level, address.x // 4, address.y // 4)].append(request)
-        # Unvisited blocks stay explicitly incomplete so collect() does not
-        # immediately retry them individually in the same paint.
-        result = {request.address: (QImage(), False) for request in requests}
-        center = self.visible_document_rect().center()
-        def distance(key):
-            level, block_x, block_y = key
-            request = groups[key][0]
-            side = 4 * request.tile_size / request.scale
-            return ((block_x + .5) * side - center.x()) ** 2 + (
-                (block_y + .5) * side - center.y()) ** 2
-        for key in sorted(groups, key=distance):
-            group = groups[key]
-            deadline = getattr(self, "_projection_render_deadline", None)
-            if (deadline is not None and time.perf_counter() >= deadline
-                    and getattr(self, "_projection_blocks_started", 0) > 0):
-                self._projection_yielded = True
-                break
-            self._projection_blocks_started = getattr(self, "_projection_blocks_started", 0) + 1
-            level, block_x, block_y = key
-            # Fixed capture devices are essential: Qt's antialiased path clips
-            # can change their edge coverage when a partial redraw uses a
-            # smaller device. Always reproduce the same block before slicing.
-            block = [ProjectionRequest(ProjectionAddress(level, x, y),
-                                       group[0].tile_size, group[0].gutter)
-                     for y in range(block_y * 4, (block_y + 1) * 4)
-                     for x in range(block_x * 4, (block_x + 1) * 4)]
-            bounds = QRectF()
-            for request in block:
-                bounds = bounds.united(request.capture_rect)
-            scale = group[0].scale
-            size = QSize(round(bounds.width() * scale), round(bounds.height() * scale))
-            requested = QRectF()
-            for request in group:
-                requested = requested.united(request.capture_rect)
-            # Publication is gated across the whole requested view. Blocks may
-            # finish separately without exposing mixed revisions to the user.
-            image, exact = self._render_document_region(
-                bounds, scale, size, key, exact=True, requested=requested)
-            for request in group:
-                offset = request.capture_rect.topLeft() - bounds.topLeft()
-                crop = QRect(round(offset.x() * scale), round(offset.y() * scale),
-                             request.pixel_size, request.pixel_size)
-                result[request.address] = (image.copy(crop) if exact else QImage(), exact)
-            if (getattr(self, "_projection_defer_effects", False)
-                    and (getattr(self, "_projection_work_waiting", False)
-                         or getattr(self, "_projection_render_error", None))):
-                break
-        return result
-
-    def _render_document_region(self, rect, scale, size, key, *, exact=False, requested=None):
-        from comic_editor.ui.async_projection import ProjectionPending, ProjectionFailed
-        image = QImage(size, QImage.Format_ARGB32_Premultiplied)
-        image.fill(Qt.transparent)
-        transform = QTransform(scale, 0, 0, scale, -rect.x() * scale, -rect.y() * scale)
-        chapter_rect = QRectF(0, 0, self.chapter.width, self.chapter.height)
-        visible = rect if requested is None else requested
-        effect_region = rect
-        if self.chapter.view_overflow <= 0:
-            visible = visible.intersected(chapter_rect)
-            effect_region = effect_region.intersected(chapter_rect)
-        previous = (self._interactive_render, getattr(self, "_effect_viewport_world", None),
-                    self._vector_render_scale_override,
-                    getattr(self, "_effect_region_requests", False),
-                    getattr(self, "_projection_tile_key", None),
-                    getattr(self, "_effect_preview_channel", "canvas"),
-                    getattr(self, "_projection_exact", False))
-        provisional = getattr(self, "_effect_provisional_revision", 0)
+        document = self._render_document_state()
         phase = getattr(self, "_projection_capture_phase", None)
-        self._interactive_render = True
-        # Dirty subsets must not change background-effect source windows and
-        # keys within one fixed capture block. Scene culling can still use the
-        # requested subset without recomputing every background modifier.
-        self._effect_viewport_world = effect_region
-        self._vector_render_scale_override = scale
-        self._effect_region_requests = True
-        self._projection_tile_key = phase, key
-        self._effect_preview_channel = "canvas"
-        self._projection_exact = exact
-        self._projection_captured_live_preview = (
-            getattr(self, "_projection_captured_live_preview", False)
-            or self._projection_has_live_preview())
-        self._render_bounds.prepare()
-        painter = QPainter(image)
-        finished = True
-        try:
-            painter.setRenderHint(QPainter.Antialiasing, True)
-            painter.setTransform(transform)
-            if phase != "top":
-                painter.fillRect(chapter_rect, QColor(self.chapter.background))
-                if self.chapter.view_overflow > 0:
-                    # Both overflow passes precede all in-page artwork. Keep
-                    # their existing combined opacity/composition in the base.
-                    self._render_document_tile_overflow(painter, image.size(), transform, rect)
-            painter.setClipRect(chapter_rect)
-            self._set_live_underlay_context()
-            if not visible.isEmpty():
-                self._render_scene_layers(painter, visible, underlay=True, only_phase=phase)
-        except ProjectionPending:
-            finished = False
-            self._projection_work_waiting = True
-        except ProjectionFailed as error:
-            finished = False
-            self._projection_render_error = str(error)
-            self._projection_error_revision = self._document_projection.revision
-        finally:
-            painter.end()
-            self._clear_live_underlay_context()
-            (self._interactive_render, self._effect_viewport_world,
-             self._vector_render_scale_override, self._effect_region_requests,
-             self._projection_tile_key, self._effect_preview_channel,
-             self._projection_exact) = previous
-        exact = finished and provisional == getattr(self, "_effect_provisional_revision", 0)
-        return image if exact else QImage(), exact
+        deferred = getattr(self, "_projection_defer_effects", False)
+        center = self.visible_document_rect().center()
+        policy = TileBatchPolicy((center.x(), center.y()),
+            getattr(self, "_projection_render_deadline", None),
+            getattr(self, "_projection_blocks_started", 0))
 
-    def _render_document_tile_overflow(self, painter, size, transform, visible):
-        page_area = QPainterPath()
-        for identifier in self.chapter.root_page_ids:
-            page = self.chapter.layers[identifier]
-            if page.visible:
-                page_area = page_area.united(self.layer_world_transform(identifier).map(
-                    self.layer_effective_path(identifier)))
-        chapter_area = QPainterPath()
-        chapter_area.addRect(QRectF(0, 0, self.chapter.width, self.chapter.height))
-        area = QPainterPath()
-        area.addRect(visible)
-        outside = area.subtracted(page_area.intersected(chapter_area))
-        if outside.isEmpty():
-            return
-        image = QImage(size, QImage.Format_ARGB32_Premultiplied)
-        image.fill(Qt.transparent)
-        overflow = QPainter(image)
-        previous = self._effect_preview_channel
-        try:
-            overflow.setRenderHint(QPainter.Antialiasing, True)
-            overflow.setTransform(transform)
-            overflow.setClipPath(outside)
-            self._effect_preview_channel = "overflow"
-            self._render_scene_layers(overflow, visible, page_contents_only=True)
-        finally:
-            self._effect_preview_channel = previous
-            overflow.end()
-        painter.save()
-        painter.setTransform(QTransform())
-        painter.setOpacity(self.chapter.view_overflow)
-        painter.drawImage(0, 0, image)
-        painter.restore()
+        def capture(request):
+            # Keep this entry point visible to existing performance instrumentation.
+            result = self._render_document_region(request.bounds, request.scale,
+                QSize(*request.pixel_size), request.key,
+                exact=request.quality is RenderQuality.EXACT, requested=request.requested,
+                render_document=document, render_request=request)
+            if isinstance(result, RenderResult):
+                return result
+            # Compatibility for external instrumentation supplying image tuples.
+            image, exact = result
+            return RenderResult(request, document, image,
+                RenderStatus.EXACT if exact else RenderStatus.PROVISIONAL)
+
+        batch = self._render_service.render_tiles(document, requests, policy,
+            phase=phase, defer_effects=deferred, capture=capture)
+        self._projection_blocks_started = batch.blocks_started
+        self._projection_yielded = batch.yielded
+        return batch.tiles
+
+    def _render_document_region(self, rect, scale, size, key, *, exact=False, requested=None,
+                                render_document=None, render_request=None):
+        document = render_document or self._render_document_state()
+        request = render_request or RenderRequest(tuple(rect.getRect()), scale, (size.width(), size.height()),
+            key, document.revision, tuple(requested.getRect()) if requested is not None else None,
+            getattr(self, "_projection_capture_phase", None),
+            RenderQuality.EXACT if exact else RenderQuality.INTERACTIVE,
+            getattr(self, "_projection_defer_effects", False))
+        result = self._render_service.render_region(document, request)
+        if result.status is RenderStatus.PENDING:
+            self._projection_work_waiting = True
+        elif result.status is RenderStatus.FAILED:
+            self._projection_render_error = result.error
+            self._projection_error_revision = result.document.revision
+        return result if render_request is not None else (result.image, result.exact)
 
     def _projection_phase_batch(self, phases):
         configuration = self._projection_configuration()

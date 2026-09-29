@@ -107,7 +107,8 @@ from comic_editor.ui.mask_gradient import MaskGradientFeatures
 from comic_editor.ui.mask_selection import MaskSelectionFeatures
 from comic_editor.ui.solo_features import SoloFeatures
 from comic_editor.ui.show_on_top_features import ShowOnTopFeatures
-from comic_editor.ui.document_projection import DocumentProjection
+from comic_editor.render.service import DocumentRenderService
+from comic_editor.ui.scene_render_backend import CanvasSceneBackend
 from comic_editor.ui.document_projection_features import DocumentProjectionFeatures
 from comic_editor.ui.scene_culling import SceneRenderBounds
 from comic_editor.ui.network import create_network_manager
@@ -1040,7 +1041,11 @@ class _CanvasLogic(BrushFeatures, DocumentProjectionFeatures, MultiRasterSelecti
         self._asset_drag_valid = False
         self._asset_drag_clip_cache: dict[str, QPainterPath | None] = {}
         self._scene_cache = QImage()
-        self._document_projection = DocumentProjection()
+        self._effect_viewport_world = None
+        self._projection_tile_key = None
+        self._projection_defer_effects = False
+        self._render_service = DocumentRenderService(CanvasSceneBackend(self))
+        self._document_projection = self._render_service.projection
         self._render_bounds = SceneRenderBounds(self)
         self._scene_cache_key: tuple | None = None
         self._scene_dirty_full = True
@@ -1138,7 +1143,7 @@ class _CanvasLogic(BrushFeatures, DocumentProjectionFeatures, MultiRasterSelecti
         self._scene_dirty_widget = QRect()
         self._scene_cache_key = None
         if projection:
-            self._document_projection.invalidate()
+            self._render_service.invalidate()
 
     def _invalidate_tone_mask_overlay(self, *, contributors: bool = True) -> None:
         if contributors:
@@ -1162,7 +1167,7 @@ class _CanvasLogic(BrushFeatures, DocumentProjectionFeatures, MultiRasterSelecti
         return mapped.toAlignedRect().intersected(self.rect())
 
     def _mark_scene_dirty_world(self, world: QRectF) -> QRect:
-        self._document_projection.invalidate(world)
+        self._render_service.invalidate(world)
         widget = self._world_dirty_to_widget(world)
         if widget.isEmpty():
             return widget

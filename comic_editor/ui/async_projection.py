@@ -5,13 +5,16 @@ an immutable worker result arrives, then publishes only a complete view.
 """
 
 
-class ProjectionPending(Exception):
+from comic_editor.render.service import RenderPending, RenderFailed
+
+
+class ProjectionPending(RenderPending):
     def __init__(self, scope=None, key=None):
         super().__init__("Exact projection effect is pending")
         self.scope, self.key = scope, key
 
 
-class ProjectionFailed(RuntimeError):
+class ProjectionFailed(RenderFailed):
     def __init__(self, scope=None, key=None, message="Exact effect rendering failed"):
         super().__init__(str(message))
         self.scope, self.key = scope, key

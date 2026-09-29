@@ -30,10 +30,14 @@ webtoon-maker/
 │   ├── integrations/               # live external image-source adapters
 │   │   ├── blender_source.py       # protocol and published-frame metadata client
 │   │   └── blender_controller.py   # PNG validation, import, and repaint lifecycle
+│   ├── render/                     # document rendering independent of editor widgets
+│   │   ├── service.py              # explicit requests, region composition, tile scheduling
+│   │   └── projection.py           # retained document tile cache and revision checks
 │   └── ui/                         # PySide6 window, canvas, controls, models, theme
 │       ├── __init__.py
 │       ├── main_window.py
 │       ├── canvas.py
+│       ├── scene_render_backend.py # owning-thread adapter to legacy scene/effect kernels
 │       ├── cage_features.py        # direct/modifier transactions and gizmos
 │       ├── cage_controls.py        # shared tool/modifier settings
 │       ├── cage_rendering.py       # inverse triangle rasterizer and path transport

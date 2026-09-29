@@ -2,7 +2,31 @@
 
 ## Architectural center
 
-Almost all canvas behavior lives in `comic_editor/ui/canvas.py` (about 21,000 lines).
+Canvas interaction and legacy scene/effect kernels live in
+`comic_editor/ui/canvas.py`. Retained document-region rendering has a separate
+service boundary in `comic_editor/render/`.
+
+- `render/service.py::DocumentRenderService` owns region composition, fixed 4×4
+  capture-block scheduling, explicit requests/results, and the retained tile
+  cache. It imports no editor UI modules and can run with a non-widget backend.
+- `render/projection.py::DocumentProjection` owns finished document tiles,
+  configuration retention, resolution addressing, byte budgets, and invalidation.
+  `ui/document_projection.py` preserves its previous import paths.
+- Frozen `RenderDocument` and `RenderRequest` records identify document/view
+  metadata, revisions, regions, scale, quality, and base/top output phases.
+  `RenderResult` distinguishes exact, provisional, pending, failed, and stale
+  work. Metadata snapshots do not copy all source pixels.
+- `ui/scene_render_backend.py::CanvasSceneBackend` adapts requests to the existing
+  scene kernels on the canvas thread, restoring temporary capture state on every
+  exit. It is not a detached worker renderer.
+- `ui/document_projection_features.py` supplies explicit requests and camera
+  priority/deadlines, translates results into UI publication state, and presents
+  finished artwork. GPU presentation and editing overlays remain in the UI.
+- Full/regional document edits invalidate the service cache. Reentrant edits,
+  view changes, and document replacement cannot publish stale captured pixels.
+- Non-projection scene rendering, asset capture, and export remain reference
+  paths using the existing kernels. See
+  [the implementation plan](../renderer-service-plan-2026-09-29.md).
 
 - `_CanvasLogic` is a large mixin containing document binding, selection, camera math, rendering, hit testing, input dispatch, every drawing tool, text editing, tone-mask and modifier integration, and transform workflows.
 - `RasterCanvasWidget` combines that mixin with `QWidget`.
