@@ -11,6 +11,7 @@ from comic_editor.core.models import (ChildRef, ImageObject, LayerNode, ArrayMod
     HalftoneModifier, PixelateModifier)
 from comic_editor.core.effect_geometry import effect_bounds
 from comic_editor.ui.effect_pipeline import aligned, empty_image, render_stages
+from comic_editor.ui.object_blending import suspend_object_blend
 
 
 def subtree(canvas, kind, identifier):
@@ -142,7 +143,7 @@ def rasterize(canvas, kind, identifier):
         target.visible, target.mask_only = True, False
         canvas._interactive_render = False
         canvas._rendering_compound_references = True
-        with canvas.without_solo():
+        with canvas.without_solo(), suspend_object_blend(canvas, identifier if kind == "object" else ""):
             if kind == "layer":
                 canvas._render_layer(painter, target, 1.0, bounds)
             else:
@@ -162,6 +163,7 @@ def rasterize(canvas, kind, identifier):
         object_id=identifier, parent_layer_id=parent_id, name=target.name,
         custom_name=getattr(target, "custom_name", True), visible=target.visible,
         show_on_top=target.show_on_top,
+        blend_mode=getattr(target, "blend_mode", "normal"),
         mask_only=target.mask_only, fill_reference=target.fill_reference,
         ignore_parent_mask=getattr(target, "ignore_parent_mask", False),
         geometry_reference=getattr(target, "geometry_reference", "direct"),

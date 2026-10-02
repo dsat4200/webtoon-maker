@@ -102,7 +102,9 @@ def render_color_source(canvas, modifier, image, bounds, local_to_world):
                 canvas._render_layer(painter, target, 1., visible)
             else:
                 inverse, valid = parent_transform.inverted()
-                canvas._render_object(painter, target, 1., inverse.mapRect(visible) if valid else visible)
+                from comic_editor.ui.object_blending import suspend_object_blend
+                with suspend_object_blend(canvas, target.object_id):
+                    canvas._render_object(painter, target, 1., inverse.mapRect(visible) if valid else visible)
     finally:
         painter.end()
         for name, value in previous.items():

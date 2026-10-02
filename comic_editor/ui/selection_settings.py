@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from PySide6.QtCore import Qt, Signal
+from PySide6.QtGui import QImage
 from PySide6.QtWidgets import (
     QCheckBox, QComboBox, QFormLayout, QGroupBox, QHBoxLayout, QLabel,
     QLineEdit, QMessageBox, QPushButton, QSlider, QStackedWidget, QToolButton,
@@ -11,6 +12,8 @@ from PySide6.QtWidgets import (
 from comic_editor.core.models import (
     ImageObject, RasterObject, TextObject, VectorDrawingObject,
 )
+from comic_editor.core.blend_modes import OBJECT_BLEND_MODES, BLEND_MODE_HELP
+from comic_editor.core.commands import CallbackCommand
 from comic_editor.ui.layer_settings import LayerSettingsPanel
 from comic_editor.ui.tool_ribbon_pages import RasterObjectControls
 from comic_editor.ui.icons import iconoir
@@ -826,6 +829,22 @@ class SelectionSettingsPanel(QWidget):
         self._updating = False
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
+        self.blend_row = QWidget(self)
+        blend_layout = QFormLayout(self.blend_row)
+        blend_layout.setContentsMargins(8, 4, 8, 0)
+        self.blend_mode = QComboBox(self.blend_row)
+        self.blend_mode.setObjectName("objectBlendMode")
+        self.blend_mode.setAccessibleName("Blend mode")
+        self.blend_mode.setSizeAdjustPolicy(QComboBox.AdjustToMinimumContentsLengthWithIcon)
+        self.blend_mode.setMinimumContentsLength(16)
+        self.blend_mode.setPlaceholderText("Mixed blend modes")
+        for mode, label in OBJECT_BLEND_MODES:
+            self.blend_mode.addItem(label, mode)
+            if mode in BLEND_MODE_HELP:
+                self.blend_mode.setItemData(self.blend_mode.count() - 1, BLEND_MODE_HELP[mode], Qt.ToolTipRole)
+        blend_layout.addRow("Blend mode", self.blend_mode)
+        layout.addWidget(self.blend_row)
+        self.blend_mode.currentIndexChanged.connect(self._blend_mode_changed)
         self.object_show_on_top = QCheckBox("Show on top", self)
         self.object_show_on_top.setToolTip(
             "Show this object above the rest of the document, including during solo."
@@ -881,6 +900,42 @@ class SelectionSettingsPanel(QWidget):
         if not self._updating and self.canvas.selected_kind == "object":
             set_show_on_top(self.canvas, "object", self.canvas.selected_id, enabled)
 
+    def _blend_targets(self):
+        if self.canvas.chapter is None or self.canvas.selected_kind != "object":
+            return []
+        entities = self.canvas.selected_entities or [("object", self.canvas.selected_id)]
+        return [self.canvas.chapter.objects[identifier] for kind, identifier in entities
+                if kind == "object" and identifier in self.canvas.chapter.objects]
+
+    def _blend_mode_changed(self, _index: int) -> None:
+        mode = self.blend_mode.currentData()
+        if self._updating or mode is None:
+            return
+        targets = [obj for obj in self._blend_targets() if obj.blend_mode != mode]
+        if not targets:
+            return
+        self.canvas.commit_active_text_edit()
+        before = {obj.object_id: obj.blend_mode for obj in targets}
+        after = {identifier: mode for identifier in before}
+
+        def apply(values):
+            for identifier, value in values.items():
+                obj = self.canvas.chapter.objects.get(identifier)
+                if obj is not None:
+                    obj.blend_mode = value
+            # A detached transform/eraser background assumes source-over.
+            # Resume scene traversal if the mode changes during a preview.
+            self.canvas._transform_static_cache = QImage()
+            self.canvas._vector_eraser_background_cache = QImage()
+            self.canvas.documentChanged.emit(None)
+            self.canvas.hierarchyChanged.emit()
+            self.canvas.update()
+            self.refresh()
+            self.changed.emit()
+
+        self.canvas.command_stack.push(CallbackCommand(
+            "Change blend mode", lambda: apply(after), lambda: apply(before)))
+
     def refresh(self) -> None:
         chapter = self.layer_page.canvas.chapter
         target = (
@@ -890,6 +945,10 @@ class SelectionSettingsPanel(QWidget):
             else None
         )
         self._updating = True
+        self.blend_row.setVisible(target is not None)
+        modes = {obj.blend_mode for obj in self._blend_targets()}
+        self.blend_mode.setCurrentIndex(self.blend_mode.findData(next(iter(modes))) if len(modes) == 1 else -1)
+        self.blend_mode.setToolTip(BLEND_MODE_HELP.get(target.blend_mode, "Blend this object with artwork beneath it.") if target is not None else "")
         self.object_show_on_top.setVisible(target is not None)
         self.object_show_on_top.setEnabled(target is not None)
         self.object_show_on_top.setChecked(target.show_on_top if target is not None else False)

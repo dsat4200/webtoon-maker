@@ -4615,7 +4615,8 @@ class _CanvasLogic(BrushFeatures, DocumentProjectionFeatures, MultiRasterSelecti
                     scale, 0.0, 0.0, scale,
                     -bounds.left() * scale, -bounds.top() * scale,
                 ))
-                with self.without_solo():
+                from comic_editor.ui.object_blending import suspend_object_blend
+                with self.without_solo(), suspend_object_blend(self, entity_id if kind == "object" else ""):
                     if kind == "layer":
                         self._render_layer(
                             painter, document.layers[entity_id], 1.0, bounds
@@ -7722,6 +7723,13 @@ class _CanvasLogic(BrushFeatures, DocumentProjectionFeatures, MultiRasterSelecti
             and not self._rendering_outward_gradient
         ):
             return
+        if (obj.blend_mode != "normal" and not self._render_base_alpha
+                and not self._render_cage_source and not self._rendering_mask_contributor
+                and ("object", obj.object_id) not in self._render_modifier_sources
+                and obj.object_id not in getattr(self, "_blend_capture_objects", ())):
+            from comic_editor.ui.object_blending import render_blended_object
+            render_blended_object(self, painter, obj, parent_opacity, local_visible)
+            return
         if (
             (
                 self._has_active_modifiers(obj.modifier_ids)
@@ -8263,7 +8271,7 @@ class _CanvasLogic(BrushFeatures, DocumentProjectionFeatures, MultiRasterSelecti
     def _modifier_entity_settings(entity) -> dict:
         """Saved editor bookkeeping does not change captured artwork."""
         settings = entity.to_dict()
-        for name in ("name", "custom_name", "fill_reference", "grid_override", "last_raster_id"):
+        for name in ("name", "custom_name", "fill_reference", "grid_override", "last_raster_id", "blend_mode"):
             settings.pop(name, None)
         return settings
 
@@ -8363,9 +8371,10 @@ class _CanvasLogic(BrushFeatures, DocumentProjectionFeatures, MultiRasterSelecti
                     reference.entity_id
                 ))
             else:
-                children.append(self._modifier_object_signature(
-                    self.chapter.objects[reference.entity_id]
-                ))
+                obj = self.chapter.objects[reference.entity_id]
+                # Own blend selection does not change an object's filtered
+                # source, but does change its parent's assembled source.
+                children.append((obj.blend_mode, self._modifier_object_signature(obj)))
         preview = self._modifier_layer_preview_signature(layer_id)
         excluded = self.chapter.objects.get(self._render_excluded_object_id)
         if excluded is not None and any(parent.layer_id == layer_id
@@ -8475,6 +8484,12 @@ class _CanvasLogic(BrushFeatures, DocumentProjectionFeatures, MultiRasterSelecti
         parent_opacity: float, local_visible: QRectF,
     ) -> None:
         if self._render_tiled_target(painter, obj, parent_opacity, self.layer_world_transform(obj.parent_layer_id).mapRect(local_visible)):
+            return
+        if (isinstance(obj, VectorDrawingObject) and obj.blend_mode != "normal"
+                and self._vector_gesture_mode == "pencil" and obj.object_id == self.selected_object_id):
+            # This source path includes live ink in its bounds even before the
+            # drawing has a committed stroke, and filters it before blending.
+            self._render_mirror_target(painter, obj, parent_opacity, local_visible)
             return
         if self._cage_session is not None and ("object", obj.object_id) in self._cage_session["targets"]:
             self._render_mirror_target(painter, obj, parent_opacity, local_visible)
@@ -9455,6 +9470,8 @@ class _CanvasLogic(BrushFeatures, DocumentProjectionFeatures, MultiRasterSelecti
         if (not isinstance(obj, RasterObject)
                 or not self._solo_content_visible("object", obj.object_id)):
             return
+        if obj.blend_mode != "normal":
+            return
         painter.save()
         for layer in self.chapter.ancestor_layers(obj.parent_layer_id):
             transform = self.layer_world_transform(layer.layer_id)
@@ -9518,7 +9535,7 @@ class _CanvasLogic(BrushFeatures, DocumentProjectionFeatures, MultiRasterSelecti
         ):
             return
         drawing = self._active_vector_drawing()
-        if self._has_active_modifiers(drawing.modifier_ids) or any(
+        if drawing.blend_mode != "normal" or self._has_active_modifiers(drawing.modifier_ids) or any(
             self._has_active_modifiers(layer.modifier_ids)
             for layer in self.chapter.ancestor_layers(
                 drawing.parent_layer_id
@@ -9640,6 +9657,10 @@ class _CanvasLogic(BrushFeatures, DocumentProjectionFeatures, MultiRasterSelecti
             or not self._vector_samples
             or not self._solo_content_visible("object", drawing.object_id)
         ):
+            return
+        if (drawing.blend_mode != "normal"
+                and ("object", drawing.object_id) not in self._render_modifier_sources):
+            # The object blend capture already includes its live source ink.
             return
         if coordinate_parent_id != drawing.parent_layer_id:
             ancestors = {
@@ -24621,6 +24642,7 @@ class _CanvasLogic(BrushFeatures, DocumentProjectionFeatures, MultiRasterSelecti
             self.chapter is None or self.chapter.view_overflow > 0 or not object_id
             or self.width() <= 0 or self.height() <= 0
             or self._show_on_top_plan().entries
+            or any(obj.blend_mode != "normal" for obj in self.chapter.objects.values())
         ):
             return QImage()
         ratio = max(1.0, float(self.devicePixelRatioF()))

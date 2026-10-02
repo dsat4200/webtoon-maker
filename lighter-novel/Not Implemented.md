@@ -1,17 +1,16 @@
 SLOW
 - zooming is slow.
+- working on it
 
 BUGS
 - reparenting objects between parents/children causes transform to change the position of the object and its super annoying.
 - mask opacity of a layer to a shape layer's mask isn't working. fix.
 - panning between parts of the comic rapidly causes a super annoying time consuming delay where i have to wait for the image to load. I think dynamic hiding as a way to save performance may have been a mistake - now the unloading/loading is causing more delay. i have lots of ram. can't the program take advantage of that?
 
-## Raster/Vector object / pencil features
-psd brush support?
-- add brushes to tool settings ribbon (raster/vector pencil) (with preview of a small, curved stroke segment in a square live preview icon, from zero pressure to 100, swoop curve )
-- outside of shapes can be treated as a stroke that supports psd brushes?
+- [ ] blending modes
+- [ ] texture modifier
 
-## review the fill tool
+## review the fill tool, brush tools
 
 
 

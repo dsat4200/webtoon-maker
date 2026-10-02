@@ -292,7 +292,8 @@ class DocumentProjectionFeatures:
     def _paint_projection_frame(self, painter, owner, *, live_ink):
         stats = []
         with self._show_on_top_scene() as phases:
-            if not live_ink or self._is_show_on_top(self.selected_kind, self.selected_id):
+            if (not live_ink or self._is_show_on_top(self.selected_kind, self.selected_id)
+                    or any(obj.blend_mode != "normal" for obj in self.chapter.objects.values())):
                 phases = (None,)
             batch = self._projection_phase_batch(phases)
             # A retained combined view cannot place ordinary prediction below

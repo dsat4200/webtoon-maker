@@ -306,7 +306,7 @@ void main() {
 class GpuPatternRenderer:
     """One canvas-owned renderer; caches survive changes to modifier sliders."""
 
-    def __init__(self, *, allow_offscreen=False):
+    def __init__(self, *, allow_offscreen=False, fragment=FRAGMENT):
         self.available = False
         self.reason = ""
         self.context = self.surface = self.functions = None
@@ -342,7 +342,7 @@ class GpuPatternRenderer:
             self.functions = QOpenGLFunctions_3_3_Core()
             if not self.functions.initializeOpenGLFunctions():
                 raise RuntimeError("OpenGL 3.3 unavailable")
-            self.program = self._program(FRAGMENT)
+            self.program = self._program(fragment)
             self.blur_program = self._program(BLUR)
             self.triangle_program = self._program(FRAGMENT, TRIANGLE_VERTEX)
             self.vao = QOpenGLVertexArrayObject()

@@ -7,6 +7,7 @@ import uuid
 from dataclasses import dataclass, field, fields
 from typing import Any, Iterable, Iterator, Literal
 from comic_editor.core.cage import CageGrid
+from comic_editor.core.blend_modes import validate_blend_mode
 
 
 SCHEMA_VERSION = 25
@@ -2224,6 +2225,7 @@ class DocumentObject:
     modifier_ids: list[str] = field(default_factory=list)
     opacity_mask: ParameterMaskBinding | None = None
     show_on_top: bool = False
+    blend_mode: str = "normal"
 
     def common_dict(self) -> dict[str, Any]:
         return {
@@ -2232,6 +2234,7 @@ class DocumentObject:
             "parent_layer_id": self.parent_layer_id, "position": [self.x, self.y],
             "visible": self.visible, "opacity": self.opacity,
             "show_on_top": bool(self.show_on_top),
+            "blend_mode": self.blend_mode,
             "mask_only": self.mask_only,
             "fill_reference": self.fill_reference,
             "opacity_locked": self.opacity_locked,
@@ -3245,6 +3248,7 @@ def object_from_dict(data: dict[str, Any]) -> ObjectEntity:
         parent_layer_id=str(data.get("parent_layer_id", "")), x=float(position[0]),
         y=float(position[1]), visible=bool(data.get("visible", True)),
         show_on_top=bool(data.get("show_on_top", False)),
+        blend_mode=validate_blend_mode(str(data.get("blend_mode", "normal"))),
         opacity=float(data.get("opacity", 1.0)),
         mask_only=bool(data.get("mask_only", False)),
         fill_reference=bool(data.get("fill_reference", False)),
@@ -3829,6 +3833,7 @@ class ChapterDocument:
                     raise ValueError(f"Unknown child kind: {child.kind}")
         for obj in self.objects.values():
             obj.show_on_top = bool(obj.show_on_top)
+            validate_blend_mode(obj.blend_mode)
             obj.mask_only = bool(
                 obj.mask_only and isinstance(
                     obj,

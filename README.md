@@ -21,6 +21,8 @@ workflow.
 - Drawn rectangle, circle, or custom-shape page insertion with editable gaps
 - Nested rectangle, circle, and polygon bounded layers
 - Non-destructive hierarchical masks
+- All 24 object blend modes in the selection's **Settings → Blend mode** menu,
+  including color, texture, coverage, and height-map modulation
 - Chapter-local reusable tone masks for opacity and modifier parameters, with
   live contributor alpha, raster paint, and a translucent blue edit overlay
 - Linked non-destructive HSL, Brightness / Contrast, blur, exact outside-outline, and hue-based Posterize modifier stacks
@@ -53,6 +55,21 @@ workflow.
   diagnostic logs; see [monitor and eyedropper notes](docs/drawing-performance-monitor.md)
 - Blender 5.2 and 4.5 LTS Comic Views as disk-published transparent image sources with
   persistent offline PNG caches
+
+## Object blend modes
+
+Select a drawing, image, gradient, or text object and choose **Settings → Blend
+mode** above the outliner. Multiple selected objects can share a mode; changes
+support undo/redo and are saved with the document. Blending follows the object's
+modifiers and opacity masks.
+
+The modulation modes affect artwork beneath the object using its opacity as
+strength. Luma Modulate darkens by brightness; Texture Multiply and Texture
+Screen use its colors; Texture Contrast uses brightness with middle gray as
+neutral. These modes retain underlying coverage. Alpha / Coverage Modulate uses
+brightness to reduce underlying coverage. Height / Emboss Modulate treats
+brightness as height and adds directional shading, with flat regions neutral.
+Transparent texture pixels leave the underlying artwork unchanged.
 
 ## Painterly modifiers
 

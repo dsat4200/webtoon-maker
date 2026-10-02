@@ -84,7 +84,9 @@ def _capture(canvas, record, bounds=None, max_edge=512):
             else:
                 if isinstance(target, ColorFillGradientObject) and not canvas._rendering_outward_gradient and not target.ignore_parent_mask:
                     painter.setClipPath(canvas.layer_effective_path(target.parent_layer_id), Qt.IntersectClip)
-                canvas._render_object(painter, target, 1., inverse.mapRect(bounds))
+                from comic_editor.ui.object_blending import suspend_object_blend
+                with suspend_object_blend(canvas, target.object_id):
+                    canvas._render_object(painter, target, 1., inverse.mapRect(bounds))
     finally:
         (target.modifier_ids, target.visible, target.mask_only, target.opacity, target.opacity_mask, canvas._interactive_render,
          canvas._rendering_compound_references, canvas._rendering_outward_gradient) = original
