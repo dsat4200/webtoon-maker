@@ -24,6 +24,31 @@ service boundary in `comic_editor/render/`.
   finished artwork. GPU presentation and editing overlays remain in the UI.
 - Full/regional document edits invalidate the service cache. Reentrant edits,
   view changes, and document replacement cannot publish stale captured pixels.
+- `render/tile_graph.py` evaluates compiled effect nodes recursively on stable
+  256px addresses. Nodes declare required input rectangles or disjoint islands;
+  identities contain semantic frames, transforms, source generations and the
+  upstream parameter/mask prefix. `ui/tile_effects.py` supplies scene kernels,
+  bounded cache adapters and lazy object/layer/raster source capture. Exact
+  regional requests above 256² pixels use this path; small frames retain the
+  existing kernels. Provisional captures and special-purpose contexts opt out.
+- Point operations, native single-pass Kuwahara, sharpen and solid outlines
+  have finite footprints. Generic stacks retain float intermediates until their
+  original final RGBA8 conversion; spatial stacks retain per-stage rounding.
+  Dither and Kuwahara sampling retain full-image coordinate origins.
+- `render/blur_regions.py` requests individual pyramid regions using original
+  frame dimensions and Pillow-compatible fixed-point bilinear coefficients.
+  Odd-size levels, legacy alpha behavior and masked-radius interpolation match
+  the reference path. Its immutable, thread-safe level cache has a 32 MiB budget.
+  Deferred jobs resolve source dependencies on the GUI thread, then perform
+  filtering in workers without consulting canvas state.
+- Integer-translated Array copies request inverse-mapped source islands.
+  Qt's rotated/scaled/reflected sampling keeps a shared full frame. Pattern,
+  contour, reduced-scale/repeated Kuwahara and smudge nodes also retain shared
+  complete-frame dependencies; cage/mesh/radial kernels retain full source
+  access while requesting bounded output. All-solid outline stacks retain their
+  specialized reference path. Sharpen radius/strength masks and generic float
+  stacks with strength-masked blur retain whole-field extrema decisions. See
+  [the tile evaluator plan and results](../tile-evaluator-plan-2026-10-01.md).
 - Non-projection scene rendering, asset capture, and export remain reference
   paths using the existing kernels. See
   [the implementation plan](../renderer-service-plan-2026-09-29.md).

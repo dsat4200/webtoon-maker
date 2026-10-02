@@ -156,7 +156,7 @@ def _orientation(rgba, smoothing):
     return np.cos(angle), np.sin(angle), np.clip(coherence, 0., 1.)
 
 
-def _sectors(rgba, size, modifier, cancelled=None):
+def _sectors(rgba, size, modifier, cancelled=None, origin=(0, 0)):
     height, width = rgba.shape[:2]
     sx, sy, weights = _sector_kernel(modifier.variant, modifier.quality, modifier.overlap)
     radius = np.broadcast_to(np.asarray(size, dtype=np.float32), (height, width))
@@ -177,13 +177,15 @@ def _sectors(rgba, size, modifier, cancelled=None):
             if not np.any(radii > 0) or not np.any(rgba[top:bottom, left:right, 3] > 0):
                 continue
             yy, xx = np.mgrid[top:bottom, left:right].astype(np.float32)
+            yy += origin[1]
+            xx += origin[0]
             u, v = sx[:, None, None]*radii, sy[:, None, None]*radii
             if cosine is not None:
                 cs, sn = cosine[top:bottom, left:right], sine[top:bottom, left:right]
                 stretch = 1 + coherence[top:bottom, left:right]*modifier.anisotropy/100.
                 u, v = u*stretch, v/stretch
                 u, v = u*cs-v*sn, u*sn+v*cs
-            coordinates = np.stack((yy+v, xx+u))
+            coordinates = np.stack((yy+v-origin[1], xx+u-origin[0]))
             samples = np.empty((*u.shape, 7), dtype=np.float32)
             for channel in range(3):
                 samples[..., channel] = map_coordinates(rgba[..., channel], coordinates,
@@ -219,7 +221,7 @@ def _resize(array, shape):
     return zoom(array, factors, order=1, mode="nearest", prefilter=False)
 
 
-def _filtered(rgba, size, modifier, cancelled=None):
+def _filtered(rgba, size, modifier, cancelled=None, origin=(0, 0)):
     scale = modifier.processing_scale / 100.
     original_shape = rgba.shape[:2]
     shape = tuple(max(1, round(value*scale)) for value in original_shape)
@@ -232,7 +234,7 @@ def _filtered(rgba, size, modifier, cancelled=None):
     settings.tensor_radius *= size_scale
     for _ in range(modifier.iterations):
         rgb = (_original(current, radius, cancelled) if modifier.variant == "original"
-               else _sectors(current, radius, settings, cancelled))
+               else _sectors(current, radius, settings, cancelled, origin))
         if rgb is None:
             return None
         result = current.copy()
@@ -255,13 +257,13 @@ class KuwaharaCache:
         self._values = OrderedDict()
         self._lock = RLock()
 
-    def filtered(self, rgba, size, modifier, cancelled=None):
+    def filtered(self, rgba, size, modifier, cancelled=None, origin=(0, 0)):
         if cancelled is not None and cancelled():
             return None
         pixels = np.ascontiguousarray(rgba, dtype=np.float32)
         radius = np.ascontiguousarray(size, dtype=np.float32) if np.ndim(size) else float(size)
         radius_key = (radius.shape, hashlib.blake2b(radius.data, digest_size=16).digest()) if np.ndim(radius) else radius
-        key = (pixels.shape, hashlib.blake2b(pixels.data, digest_size=16).digest(), radius_key,
+        key = (pixels.shape, hashlib.blake2b(pixels.data, digest_size=16).digest(), radius_key, tuple(origin),
                *(getattr(modifier, name) for name in ("variant", "quality", "processing_scale",
                    "sharpness", "hardness", "overlap", "anisotropy", "tensor_radius", "iterations")))
         with self._lock:
@@ -269,7 +271,7 @@ class KuwaharaCache:
             if cached is not None:
                 self._values[key] = cached
                 return cached
-        result = _filtered(pixels, radius, modifier, cancelled)
+        result = _filtered(pixels, radius, modifier, cancelled, origin)
         if result is None or cancelled is not None and cancelled():
             return None
         result.setflags(write=False)
@@ -286,13 +288,13 @@ class KuwaharaCache:
 _cache = KuwaharaCache()
 
 
-def apply_kuwahara(rgba, modifier, *, size=None, strength=None, cancelled=None):
+def apply_kuwahara(rgba, modifier, *, size=None, strength=None, cancelled=None, origin=(0, 0)):
     """Return premultiplied float RGBA, keeping incoming alpha exactly."""
     size = modifier.size if size is None else size
     strength = modifier.strength if strength is None else strength
     if not rgba.size or np.max(size) <= 0 or np.max(strength) <= 0:
         return rgba
-    filtered = _cache.filtered(rgba, size, modifier, cancelled)
+    filtered = _cache.filtered(rgba, size, modifier, cancelled, origin)
     if filtered is None:
         return None
     blend = np.clip(np.asarray(strength, dtype=np.float32)/100., 0., 1.)

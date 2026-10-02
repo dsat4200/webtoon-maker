@@ -5001,6 +5001,18 @@ class _CanvasLogic(BrushFeatures, DocumentProjectionFeatures, MultiRasterSelecti
         )
         if not bounds.intersects(parent_inverse.mapRect(visible_world)):
             return
+        from comic_editor.ui.tile_effects import generic_target_output
+        tiled = generic_target_output(self, layer, bounds, modifiers, parent_transform, visible_world)
+        if tiled:
+            processed, output_bounds = tiled
+            painter.save()
+            painter.setOpacity(parent_opacity * layer.opacity)
+            if not any(isinstance(modifier, OutlineModifier) for modifier in modifiers):
+                painter.setClipPath(self._layer_parent_transform(layer).map(self.layer_effective_path(layer.layer_id)),
+                                    Qt.ClipOperation.IntersectClip)
+            painter.drawImage(output_bounds.topLeft(), processed)
+            painter.restore()
+            return
         from comic_editor.ui.interactive_effects import outline_capture_bounds
         bounds = outline_capture_bounds(
             self, painter, bounds,
@@ -8529,6 +8541,18 @@ class _CanvasLogic(BrushFeatures, DocumentProjectionFeatures, MultiRasterSelecti
         )
         if not bounds.intersects(local_visible):
             return
+        from comic_editor.ui.tile_effects import generic_target_output
+        tiled = generic_target_output(self, obj, bounds, modifiers, layer_transform, local_visible)
+        if tiled:
+            processed, output_bounds = tiled
+            opacity = parent_opacity if obj.opacity_locked else parent_opacity * obj.opacity
+            if obj.object_id == self._live_underlay_object_id:
+                opacity *= 1.0 - self._live_underlay_amount
+            painter.save()
+            painter.setOpacity(opacity)
+            painter.drawImage(output_bounds.topLeft(), processed)
+            painter.restore()
+            return
         from comic_editor.ui.interactive_effects import outline_capture_bounds
         if isinstance(obj, RasterObject):
             viewport_world = self._modifier_viewport_region(QRectF())
@@ -8726,23 +8750,23 @@ class _CanvasLogic(BrushFeatures, DocumentProjectionFeatures, MultiRasterSelecti
             request_scope=request_scope, source_key=key)
             if not has_stroke and not direct_mirror else None)
         source_provisional = False
-        image = completed[0] if completed is not None else self._modifier_source_cache_get(key)
-        if image is None:
+        def capture_region(region):
             revision = getattr(self, "_effect_provisional_revision", 0)
-            image = empty_image(bounds)
+            image = empty_image(region)
             source = QPainter(image)
             source.setRenderHint(QPainter.Antialiasing, True)
             source.setTransform(QTransform.fromScale(thumbnail_scale, thumbnail_scale)
-                                * QTransform.fromTranslate(-bounds.left(), -bounds.top()))
+                                * QTransform.fromTranslate(-region.left(), -region.top()))
+            capture = QTransform.fromScale(1/thumbnail_scale, 1/thumbnail_scale).mapRect(region)
             self._render_modifier_sources.add((kind, identifier))
             try:
                 if layer:
                     if self.chapter.contributing_compound_ancestor(identifier) is not None:
-                        self._render_compound_contributor(source, target, 1.0, mapping.mapRect(capture_bounds))
+                        self._render_compound_contributor(source, target, 1.0, mapping.mapRect(capture))
                     else:
-                        self._render_layer(source, target, 1.0, mapping.mapRect(capture_bounds))
+                        self._render_layer(source, target, 1.0, mapping.mapRect(capture))
                 else:
-                    self._render_object_content(source, target, capture_bounds)
+                    self._render_object_content(source, target, capture)
                 if includes_preview and not layer:
                     self._render_modified_vector_pencil_preview(source, parent_id)
                 elif includes_preview and not self._has_active_modifiers(drawing.modifier_ids):
@@ -8752,7 +8776,21 @@ class _CanvasLogic(BrushFeatures, DocumentProjectionFeatures, MultiRasterSelecti
             finally:
                 self._render_modifier_sources.discard((kind, identifier))
                 source.end()
-            source_provisional = revision != getattr(self, "_effect_provisional_revision", 0)
+            return image, revision != getattr(self, "_effect_provisional_revision", 0)
+        if completed is None and not has_stroke and not direct_mirror and thumbnail_scale == 1. and not navigator:
+            from comic_editor.ui.tile_effects import tile_output
+            from comic_editor.render.tile_graph import TileCacheMiss
+            def exact_capture(region):
+                image, provisional = capture_region(region)
+                if provisional:
+                    raise TileCacheMiss()
+                return image
+            completed = tile_output(self, None, bounds, modifiers, stage_mapping,
+                nearest=isinstance(target, RasterObject), required=required,
+                request_scope=request_scope, source_identity=key, capture=exact_capture)
+        image = completed[0] if completed is not None else self._modifier_source_cache_get(key)
+        if image is None:
+            image, source_provisional = capture_region(bounds)
             if not source_provisional:
                 self._modifier_source_cache_put(key, image)
         source_provisional |= navigator

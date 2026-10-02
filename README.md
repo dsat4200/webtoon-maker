@@ -803,6 +803,14 @@ intensity, and mask edits reuse that pyramid; canvas preview, save, and export
 all use the same result. Run `python tests/benchmark_masked_blur.py` for the
 opt-in 1080p warmed benchmark.
 
+Exact document views also use a demand-driven 256px effect graph. Point
+adjustments, native-scale neighborhood filters, and globally aligned blur
+pyramids evaluate only requested tiles and their source neighborhoods. Unchanged
+prefixes survive later slider edits. Scene sources are captured lazily, and
+deferred blur/filter jobs use detached inputs. Effects with complete-frame
+dependencies retain their existing sampling behavior. See
+[the implementation and measurements](docs/tile-evaluator-plan-2026-10-01.md).
+
 Drag the divider beside the left sidebar to change its width, the divider
 between Tools and Colors to change their heights, or the divider below the
 ribbon to change the canvas/ribbon balance. These sizes are remembered across

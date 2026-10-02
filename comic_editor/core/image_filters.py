@@ -21,13 +21,15 @@ def bayer_matrix(size):
     return matrix
 
 
-def dither(source, modifier, *, strength=None, levels=None, pixel_size=None):
+def dither(source, modifier, *, strength=None, levels=None, pixel_size=None, origin=(0, 0)):
     """Quantize channels with a stable pattern; no global random generator state."""
     strength = modifier.strength if strength is None else strength
     levels = modifier.levels if levels is None else levels
     pixel_size = modifier.pixel_size if pixel_size is None else pixel_size
     height, width = source.shape[:2]
     yy, xx = np.ogrid[:height, :width]
+    xx = xx + origin[0]
+    yy = yy + origin[1]
     spacing = np.clip(np.asarray(pixel_size, np.float32), 1., 32.)
     x = np.floor(xx / spacing).astype(np.int64)
     y = np.floor(yy / spacing).astype(np.int64)

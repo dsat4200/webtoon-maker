@@ -199,6 +199,11 @@ def cached_stage_output(canvas, bounds, modifiers, local_to_world, *, nearest=Fa
     """
     if source_key is None or not _checkpoint_enabled(canvas, request_scope):
         return None
+    from comic_editor.ui.tile_effects import tile_output
+    tiled = tile_output(canvas, None, bounds, modifiers, local_to_world,
+        required=required, request_scope=request_scope, source_identity=source_key, nearest=nearest)
+    if tiled is not None:
+        return tiled
     plan = _stage_plan(canvas, bounds, modifiers, local_to_world, source_key, nearest, required)
     regional = pointwise_output(canvas, None, bounds, modifiers, local_to_world,
         required=required, signatures=plan.signatures, placement=plan.placement,
@@ -216,12 +221,19 @@ def cached_stage_output(canvas, bounds, modifiers, local_to_world, *, nearest=Fa
 
 
 def render_stages(canvas, image, bounds, modifiers, local_to_world, *, nearest=False,
-                  required=None, request_scope=None, provisional=False, source_key=None):
+                  required=None, request_scope=None, provisional=False, source_key=None,
+                  tile_evaluation=True):
     bounds = QRectF(bounds)
     exact = projection_requires_exact(canvas)
     reference = exact_reference_sampling(canvas)
     deferred = projection_deferred(canvas)
     source_identity = source_key if source_key is not None else int(image.cacheKey())
+    if tile_evaluation and not provisional:
+        from comic_editor.ui.tile_effects import tile_output
+        tiled = tile_output(canvas, image, bounds, modifiers, local_to_world,
+            required=required, request_scope=request_scope, source_identity=source_identity, nearest=nearest)
+        if tiled is not None:
+            return tiled
     plan = _stage_plan(canvas, bounds, modifiers, local_to_world, source_identity, nearest, required)
     if not provisional:
         regional = pointwise_output(canvas, image, bounds, modifiers, local_to_world,

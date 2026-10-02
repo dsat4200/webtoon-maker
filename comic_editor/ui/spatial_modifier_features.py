@@ -46,19 +46,19 @@ class SpatialModifierFeatures:
         key = ("radial-raster-source", obj.object_id, signature[0], signature[3], signature[4], self._rect_signature(bounds))
         if navigator:
             key = ("navigator-source", thumbnail_scale, key)
-        image = self._modifier_source_cache_get(key)
-        if image is None:
-            image = empty_image(bounds)
+        def capture_region(region):
+            image = empty_image(region)
             source = QPainter(image)
             source.setTransform(QTransform.fromScale(thumbnail_scale, thumbnail_scale)
-                                * QTransform.fromTranslate(-bounds.left(), -bounds.top()))
+                                * QTransform.fromTranslate(-region.left(), -region.top()))
+            capture = QTransform.fromScale(1/thumbnail_scale, 1/thumbnail_scale).mapRect(region)
             try:
-                if not self._render_raster_selection_preview(source, obj, capture_bounds):
-                    for (x, y), tile in self.tiles.iter_tiles(obj.object_id, capture_bounds):
+                if not self._render_raster_selection_preview(source, obj, capture):
+                    for (x, y), tile in self.tiles.iter_tiles(obj.object_id, capture):
                         source.drawImage(x*obj.tile_size, y*obj.tile_size, tile)
             finally:
                 source.end()
-            self._modifier_source_cache_put(key, image)
+            return image
         required = inverse.mapRect(visible)
         viewport_world = self._modifier_viewport_region(QRectF())
         if not viewport_world.isEmpty():
@@ -73,9 +73,20 @@ class SpatialModifierFeatures:
             required = None
         elif thumbnail_scale < 1.:
             required = QTransform.fromScale(thumbnail_scale, thumbnail_scale).mapRect(required)
-        image, bounds = render_stages(self, image, bounds, modifiers, stage_mapping, nearest=True,
-            required=required, source_key=key, provisional=navigator,
-            request_scope=("object", obj.object_id, getattr(self, "_effect_preview_channel", "canvas")))
+        request_scope = ("object", obj.object_id, getattr(self, "_effect_preview_channel", "canvas"))
+        from comic_editor.ui.tile_effects import tile_output
+        tiled = (tile_output(self, None, bounds, modifiers, stage_mapping, nearest=True,
+            required=required, source_identity=key, request_scope=request_scope, capture=capture_region)
+            if thumbnail_scale == 1. and not navigator else None)
+        if tiled is not None:
+            image, bounds = tiled
+        else:
+            image = self._modifier_source_cache_get(key)
+            if image is None:
+                image = capture_region(bounds)
+                self._modifier_source_cache_put(key, image)
+            image, bounds = render_stages(self, image, bounds, modifiers, stage_mapping, nearest=True,
+                required=required, source_key=key, provisional=navigator, request_scope=request_scope)
         if thumbnail_scale < 1.:
             bounds = QTransform.fromScale(1/thumbnail_scale, 1/thumbnail_scale).mapRect(bounds)
         if obj.opacity_mask is not None:

@@ -755,6 +755,9 @@ def apply_modifier_stack(
     world_to_image: QTransform | None = None,
     nearest: bool = False,
     cancelled=None,
+    original_pixels=None,
+    return_pixels=False,
+    pixel_origin=(0, 0),
 ) -> QImage:
     active_modifiers = [modifier for modifier in modifiers if not modifier.muted]
     for modifier in active_modifiers:
@@ -768,14 +771,14 @@ def apply_modifier_stack(
         isinstance(modifier, CurvesModifier) and (curves_is_neutral(modifier)
         or modifier.intensity <= 0 and "intensity" not in modifier.parameter_masks))]
     if image.isNull() or not active_modifiers:
-        return image
+        return (_qimage_premultiplied(image) if original_pixels is None else original_pixels) if return_pixels else image
     if (len(active_modifiers) == 1 and isinstance(active_modifiers[0], OutlineModifier)
-            and active_modifiers[0].style == "solid"):
+            and active_modifiers[0].style == "solid" and not return_pixels):
         return _outline_qimage(image, active_modifiers[0], mask_fields or {}, outline_distance_cache)
-    if all(isinstance(modifier, OutlineModifier) and modifier.style == "solid"
+    if not return_pixels and all(isinstance(modifier, OutlineModifier) and modifier.style == "solid"
            for modifier in active_modifiers):
         return _outline_stack_qimage(image, active_modifiers, mask_fields or {}, outline_distance_cache)
-    current = _qimage_premultiplied(image)
+    current = _qimage_premultiplied(image) if original_pixels is None else original_pixels.copy()
     height, width = current.shape[:2]
     mask_fields = mask_fields or {}
     for modifier in active_modifiers:
@@ -799,7 +802,7 @@ def apply_modifier_stack(
             effect = apply_kuwahara(current, modifier,
                 size=_parameter_field(modifier, "size", modifier.size, (height, width), mask_fields),
                 strength=_parameter_field(modifier, "strength", modifier.strength, (height, width), mask_fields),
-                cancelled=cancelled)
+                cancelled=cancelled, origin=pixel_origin)
             if effect is None:
                 return None
             if amount.ndim == 2:
@@ -817,7 +820,7 @@ def apply_modifier_stack(
             names = ("strength", "levels", "pixel_size") if isinstance(modifier, DitheringModifier) else ("strength", "radius", "threshold")
             parameters = {name: _parameter_field(modifier, name, getattr(modifier, name),
                                                (height, width), mask_fields) for name in names}
-            effect = (dither(current, modifier, **parameters) if isinstance(modifier, DitheringModifier)
+            effect = (dither(current, modifier, origin=pixel_origin, **parameters) if isinstance(modifier, DitheringModifier)
                       else sharpen(current, **parameters))
             if amount.ndim == 2:
                 amount = amount[..., None]
@@ -966,7 +969,7 @@ def apply_modifier_stack(
             current = effect
         else:
             current = current * (1.0 - mask) + effect * mask
-    return _premultiplied_qimage(np.clip(current, 0.0, 1.0))
+    return current if return_pixels else _premultiplied_qimage(np.clip(current, 0.0, 1.0))
 
 
 def apply_opacity_mask(
