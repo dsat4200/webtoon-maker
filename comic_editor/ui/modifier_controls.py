@@ -1,7 +1,7 @@
 """Contextual nondestructive modifier stack controls."""
 from __future__ import annotations
 
-from PySide6.QtCore import QPoint, Qt, Signal
+from PySide6.QtCore import QPoint, Qt, Signal, QSignalBlocker
 from PySide6.QtGui import QColor, QMouseEvent
 from PySide6.QtWidgets import (
     QCheckBox, QComboBox, QFrame, QHBoxLayout, QLabel, QMenu, QPushButton,
@@ -91,6 +91,7 @@ class ModifierCard(QFrame):
         super().__init__(parent)
         self.modifier = modifier
         self.owner = owner
+        self._parameter_controls = {}
         self.setObjectName("modifierCard")
         selected = owner.canvas.modifier_mode and owner.canvas.active_modifier_id == modifier.modifier_id
         self.setStyleSheet("#modifierCard { border: 2px solid " + ("#65bcff; background-color: #203f59" if selected else "transparent") + "; border-radius: 4px; }")
@@ -372,6 +373,15 @@ class ModifierCard(QFrame):
             self.apply_button.setToolTip("Bake this modifier and all earlier unmuted modifiers into the selected Raster pixels")
             self.apply_button.clicked.connect(lambda: owner.apply_modifier(modifier.modifier_id))
             outer.addWidget(self.apply_button)
+        if isinstance(modifier, RadialBlurModifier):
+            owner.canvas.interactionFinished.connect(self._sync_radial_values)
+
+    def _sync_radial_values(self):
+        for attribute, controls in self._parameter_controls.items():
+            value = round(getattr(self.modifier, attribute))
+            for control in controls:
+                with QSignalBlocker(control):
+                    control.setValue(value)
 
     def mouseReleaseEvent(self, event):
         if event.button() == Qt.LeftButton:
@@ -463,6 +473,7 @@ class ModifierCard(QFrame):
         value_box.setRange(minimum, maximum)
         value_box.setSuffix(suffix)
         value_box.setValue(value)
+        self._parameter_controls[attribute] = (slider, value_box)
         value_box.setKeyboardTracking(False)
         if isinstance(self.modifier, PosterizeModifier):
             layout.setSpacing(3)

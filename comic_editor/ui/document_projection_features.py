@@ -272,18 +272,21 @@ class DocumentProjectionFeatures:
             QTimer.singleShot(0, self.update)
 
     def _projection_can_defer_effects(self):
-        # Queuing pen events is insufficient if whole-view publication hides
-        # their ink. Active edits always get a finished synchronous frame.
-        # Initial chapter loading can publish finished tiles progressively;
-        # later navigation may also keep a matching completed view visible.
+        # Paint contact and live source previews need immediate ink. Radial
+        # settings/gradient edits can keep the previous complete frame while
+        # exact samples finish, including their final release repaint.
+        # Initial loading/navigation can also publish completed tiles.
         previous = getattr(self, "_projection_completed_view", None)
+        radial = self._radial_preview_current()
+        radial_drag = bool(self._modifier_handle_drag and "radial" in self._modifier_handle_drag)
+        radial_mask = radial and self._radial_mask_gradient_active()
         compatible = (previous is None or
                       previous[0] == self._projection_configuration()
-                      and previous[2] == self._document_projection.revision
+                      and (previous[2] == self._document_projection.revision or radial)
                       and any(tiles for _, tiles in previous[1]))
         return bool(self._projection_async_enabled and compatible
                     and not self._drawing
-                    and not getattr(self, "_pen_contact_active", False)
+                    and (not getattr(self, "_pen_contact_active", False) or radial_drag or radial_mask)
                     and not self._projection_has_live_preview())
 
     def _paint_projection_frame(self, painter, owner, *, live_ink):

@@ -1192,9 +1192,15 @@ class _CanvasLogic(BrushFeatures, DocumentProjectionFeatures, MultiRasterSelecti
             or world_rect.isEmpty()
         ):
             self._invalidate_scene_cache()
+            if self._has_live_radial_effect():
+                self._radial_effect_revision = (id(self.chapter), self._document_projection.revision)
+                self._projection_work_waiting = False
             self.update()
             return
         widget = self._mark_scene_dirty_world(QRectF(world_rect))
+        if self._has_live_radial_effect():
+            self._radial_effect_revision = (id(self.chapter), self._document_projection.revision)
+            self._projection_work_waiting = False
         if not widget.isEmpty():
             self.update(widget)
 
@@ -1589,6 +1595,7 @@ class _CanvasLogic(BrushFeatures, DocumentProjectionFeatures, MultiRasterSelecti
         self._cancel_text_features()
         self._radial_handle_timer.stop()
         self._radial_handle_pending = None
+        self._radial_effect_revision = None
         self._modifier_handle_drag = None
         self._outline_edit_timer.stop()
         self._outline_pending_point = None
@@ -1954,6 +1961,7 @@ class _CanvasLogic(BrushFeatures, DocumentProjectionFeatures, MultiRasterSelecti
         self._effect_jobs.cancel()
         self._radial_handle_timer.stop()
         self._radial_handle_pending = None
+        self._radial_effect_revision = None
         self._modifier_handle_drag = None
         self._cancel_text_features()
         self._outline_edit_timer.stop()
@@ -3325,6 +3333,16 @@ class _CanvasLogic(BrushFeatures, DocumentProjectionFeatures, MultiRasterSelecti
         frame_started = time.perf_counter_ns() if self._performance.enabled else None
         self._update_text_gizmo_overlay()
         painter = QPainter(self)
+        try:
+            self._paint_canvas_frame(painter, frame_started)
+        finally:
+            # Deferred effect exceptions can keep Python frames (and this
+            # painter) alive until a later collection. End the native engine
+            # before Qt reuses it for another frame; a delayed destructor must
+            # never end the engine underneath the next canvas painter.
+            painter.end()
+
+    def _paint_canvas_frame(self, painter, frame_started) -> None:
         painter.fillRect(self.rect(), QColor("#242428"))
         painter.setRenderHint(QPainter.Antialiasing, True)
         if self.chapter is None:
@@ -13706,6 +13724,15 @@ class _CanvasLogic(BrushFeatures, DocumentProjectionFeatures, MultiRasterSelecti
         if self.chapter is None:
             self.unsetCursor()
             return
+        radial_hit = self._radial_handle_hit(widget_point)
+        radial_drag = self._modifier_handle_drag
+        if radial_drag and "radial" in radial_drag:
+            radial_hit = radial_drag["handle"]
+        if radial_hit is not None:
+            self.setCursor(Qt.CrossCursor)
+            self.setToolTip("Radial blur center: drag to move" if radial_hit == 0 else
+                            "Radial blur angle: drag around the center")
+            return
         point = QPointF(widget_point)
         world = self.widget_to_document(point)
         if self.active_tone_mask_id and self.tool in {ToolKind.MASK_SELECT, ToolKind.MASK_WAND}:
@@ -14039,7 +14066,7 @@ class _CanvasLogic(BrushFeatures, DocumentProjectionFeatures, MultiRasterSelecti
                 event.accept()
                 return
         if event.key() == Qt.Key_Escape and self._modifier_handle_drag and any(
-            key in self._modifier_handle_drag for key in ("tiling", "array", "distort")
+            key in self._modifier_handle_drag for key in ("tiling", "array", "distort", "radial")
         ):
             before = self._modifier_handle_drag["before"]
             self._modifier_handle_drag = None

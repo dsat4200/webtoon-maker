@@ -97,6 +97,7 @@ class SpatialModifierFeatures:
         from comic_editor.ui.effect_jobs import EffectJobs
         self._effect_jobs = EffectJobs(self)
         self._radial_handle_pending = None
+        self._radial_effect_revision = None
         self._radial_handle_timer = QTimer(self)
         self._radial_handle_timer.setSingleShot(True)
         self._radial_handle_timer.timeout.connect(self._flush_radial_handle)
@@ -116,6 +117,31 @@ class SpatialModifierFeatures:
         center = self.document_to_widget(QPointF(*modifier.center))
         half = math.radians(modifier.angle)/2
         return center, center+QPointF(math.cos(half), math.sin(half))*72
+
+    def _radial_handle_hit(self, point):
+        modifier = self._active_radial_modifier()
+        if modifier is None:
+            return None
+        distance, hit = min((math.dist(p.toTuple(), point.toTuple()), i)
+                            for i, p in enumerate(self._radial_handle_points(modifier)))
+        return hit if distance <= 12 else None
+
+    def _radial_preview_current(self):
+        return self.chapter is not None and self._radial_effect_revision == (
+            id(self.chapter), self._document_projection.revision)
+
+    def _has_live_radial_effect(self):
+        return bool(self.chapter and any(isinstance(modifier, RadialBlurModifier) and not modifier.muted
+            and (modifier.intensity > 0 or "intensity" in modifier.parameter_masks)
+            and (modifier.angle > 0 or "angle" in modifier.parameter_masks)
+            for modifier in self.chapter.modifiers.values()))
+
+    def _radial_mask_gradient_active(self):
+        if not self.chapter or not self._mask_gradient_drag:
+            return False
+        return any(isinstance(modifier, RadialBlurModifier) and not modifier.muted
+            and any(binding.mask_id == self.active_tone_mask_id for binding in modifier.parameter_masks.values())
+            for modifier in self.chapter.modifiers.values())
 
     def _draw_radial_modifier_handles(self, painter):
         modifier = self._active_radial_modifier()
@@ -143,8 +169,7 @@ class SpatialModifierFeatures:
         modifier = self._active_radial_modifier()
         if modifier is None:
             return False
-        hit = next((i for i, p in enumerate(self._radial_handle_points(modifier))
-                    if math.dist(p.toTuple(), point.toTuple()) <= 12), None)
+        hit = self._radial_handle_hit(point)
         if hit is None:
             return False
         self._commit_text_edit()
@@ -170,6 +195,7 @@ class SpatialModifierFeatures:
         modifier = self.chapter.modifiers.get(state["radial"])
         if not isinstance(modifier, RadialBlurModifier):
             return
+        before = modifier.center, modifier.angle
         if state["handle"] == 0:
             center = QPointF(*state["center"])+self.widget_to_document(point)-state["press"]
             modifier.center = self._snap(center, self.active_layer_id).toTuple()
@@ -177,6 +203,15 @@ class SpatialModifierFeatures:
             delta = point-self.document_to_widget(QPointF(*modifier.center))
             modifier.angle = min(360., max(0., abs(math.degrees(math.atan2(delta.y(), delta.x())))*2))
         modifier.validate()
-        self._invalidate_scene_cache()
+        if before[0] == modifier.center and math.isclose(before[1], modifier.angle, abs_tol=1e-9):
+            modifier.angle = before[1]
+            return
+        # A pending whole-view capture must not wait on the previous handle
+        # position. Keep finished images while canceling obsolete snapshots.
+        self._effect_jobs.cancel(clear_retained=False)
+        self._projection_work_waiting = False
         self.documentChanged.emit(None)
+        # Only this revision may keep the previous view while exact radial
+        # work finishes, including the final repaint after mouse/pen release.
+        self._radial_effect_revision = (id(self.chapter), self._document_projection.revision)
         self.update()

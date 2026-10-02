@@ -592,27 +592,14 @@ def render_stages(canvas, image, bounds, modifiers, local_to_world, *, nearest=F
                 painter.drawImage(bounds.topLeft() - target.topLeft(), image)
                 painter.end()
             elif isinstance(modifier, RadialBlurModifier):
-                from comic_editor.ui.radial_blur import radial_blur
+                from comic_editor.ui.radial_pipeline import render_radial_stage
                 painter = QPainter(source)
                 painter.drawImage(bounds.topLeft()-target.topLeft(), image)
                 painter.end()
-                shape = (source.height(), source.width())
-                angle = np.array(_parameter_field(modifier, "angle", modifier.angle, shape, fields), copy=True)
-                amount = np.asarray(_parameter_field(modifier, "intensity", modifier.intensity, shape, fields))/100
-                if amount.ndim == 2:
-                    amount = amount[..., None]
                 # Keep the complete incoming image: rotations can pull content
                 # from outside the requested output tile/viewport.
-                incoming, base = QImage(image), QImage(source)
-                center = tuple(modifier.center)
                 image_mapping = canvas._world_to_image_transform(local_to_world, bounds, image.width(), image.height())
                 origin = (target.x()-bounds.x(), target.y()-bounds.y())
-                def compute(cancelled=None, incoming=incoming, base=base, center=center,
-                            angle=angle, amount=amount, image_mapping=image_mapping,
-                            shape=shape, origin=origin):
-                    effect = radial_blur(_qimage_premultiplied(incoming), center, angle,
-                        image_mapping, output_shape=shape, output_origin=origin, cancelled=cancelled)
-                    return _premultiplied_qimage(_qimage_premultiplied(base)*(1-amount)+effect*amount)
                 asynchronous = (
                     request_scope is not None and canvas._interactive_render and (not exact or deferred)
                     and not canvas._render_base_alpha
@@ -620,18 +607,10 @@ def render_stages(canvas, image, bounds, modifiers, local_to_world, *, nearest=F
                     and not provisional
                     and not navigator
                 )
-                if asynchronous and canvas._effect_jobs.request(
-                    stage_scope, key, compute,
-                    5*int(incoming.sizeInBytes())+10*int(source.sizeInBytes()),
-                    allow_oversized=True, require_exact=deferred,
-                ):
-                    if deferred:
-                        raise ProjectionPending(stage_scope, key)
-                    cached, provisional = source, True
-                elif (provisional or navigator) and canvas._interactive_render and not exact:
-                    cached, provisional = source, True
-                else:
-                    cached = compute()
+                cached, provisional = render_radial_stage(canvas, image, source, modifier, fields,
+                    image_mapping, origin, source_key=upstream_key, scope=stage_scope,
+                    asynchronous=asynchronous, deferred=deferred, provisional=provisional,
+                    navigator=navigator, exact=exact)
             else:
                 if not outline:
                     painter = QPainter(source)

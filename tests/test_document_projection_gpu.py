@@ -12,7 +12,9 @@ from PySide6.QtGui import QColor, QGuiApplication, QImage, QPainter, QSurfaceFor
 from shiboken6 import delete, isValid
 
 from comic_editor.core.images import ImageStore
-from comic_editor.core.models import BoundGeometry, ChapterDocument, ImageObject, RasterObject
+from comic_editor.core.models import (
+    BoundGeometry, ChapterDocument, ImageObject, ParameterMaskBinding, RasterObject, RadialBlurModifier, ToneMask,
+)
 from comic_editor.core.settings import EditorSettings
 from comic_editor.core.tiles import TileStore
 from comic_editor.ui.canvas import GpuCanvasWidget
@@ -143,6 +145,147 @@ def test_small_native_update_preserves_overlay_outside_dirty_region(native_scene
     assert_pixel(canvas, 12, 12, [0, 255, 0, 255])
     np.testing.assert_array_equal(canvas.frame_pixels, initial)
     assert canvas._document_presentation_stats.uploads == 0
+
+
+@pytest.mark.parametrize("smudge_preview", [False, True], ids=["retained-tiles", "smudge-preview"])
+def test_collected_previous_frame_cannot_end_current_native_painter(native_scene, qapp, monkeypatch,
+                                                                  smudge_preview):
+    """Caught effect tracebacks may outlive their frame and be collected mid-paint."""
+    import gc
+
+    canvas = native_scene
+    if smudge_preview:
+        from comic_editor.core.models import DistortModifier
+        artwork = next(iter(canvas.chapter.objects.values()))
+        modifier = DistortModifier(modifier_type="distort_smudge", frame=(0, 0, 1024, 1024))
+        canvas.chapter.add_modifier(modifier, [("object", artwork.object_id)])
+        canvas._smudge_parameter_drag_id = modifier.modifier_id
+    frame = canvas._paint_canvas_frame
+    retained = []
+    old_painters = []
+
+    def capture_traceback(painter, started):
+        # Retain the actual native painter through the frame's traceback, as
+        # happens during deferred captures. Its Python destructor is delayed.
+        old_painters.append(painter)
+        frame(painter, started)
+        try:
+            raise RuntimeError("Simulated deferred capture")
+        except RuntimeError as error:
+            retained.append(error)
+
+    monkeypatch.setattr(canvas, "_paint_canvas_frame", capture_traceback)
+    canvas.update()
+    qapp.processEvents()
+    assert old_painters and all(not painter.isActive() for painter in old_painters)
+
+    def collect_during_paint(painter, started):
+        assert painter.isActive()
+        old_painters.clear()
+        retained.clear()
+        gc.collect()
+        # This enters Qt native painting and then draws ordinary UI overlays.
+        # Ending an old, still-active painter here used to crash Qt's engine.
+        frame(painter, started)
+        assert painter.isActive()
+
+    monkeypatch.setattr(canvas, "_paint_canvas_frame", collect_during_paint)
+    before = canvas.frames
+    canvas.update()
+    qapp.processEvents()
+    assert canvas.frames > before
+    assert_pixel(canvas, 225, 225, [0, 0, 255, 255])
+    assert_pixel(canvas, 12, 12, [0, 255, 0, 255])
+
+
+def test_native_radial_handle_stays_responsive_until_final_exact_frame(native_scene, qapp, monkeypatch):
+    from threading import Event, get_ident
+    from comic_editor.ui import radial_blur
+
+    canvas = native_scene
+    artwork = next(iter(canvas.chapter.objects.values()))
+    modifier = RadialBlurModifier(center=(512, 512), angle=0)
+    canvas.chapter.add_modifier(modifier, [("object", artwork.object_id)])
+    canvas.set_selection("object", artwork.object_id)
+    canvas.modifier_mode, canvas.active_modifier_id = True, modifier.modifier_id
+    canvas.documentChanged.emit(None)
+    canvas.update()
+    qapp.processEvents()
+    before = canvas.frame_pixels.copy()
+    center, end = canvas._radial_handle_points(modifier)
+    assert canvas._begin_modifier_handle(end)
+    entered, release = Event(), Event()
+    gui, original = get_ident(), radial_blur.radial_blur
+
+    def blocked(*args, **kwargs):
+        assert get_ident() != gui, "Native handle drag ran radial integration on the GUI thread"
+        entered.set()
+        assert release.wait(5)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(radial_blur, "radial_blur", blocked)
+    try:
+        canvas._move_modifier_handle(center + QPointF(72, 1))
+        canvas._flush_radial_handle()
+        frames = canvas.frames
+        canvas.update()
+        qapp.processEvents()
+        assert entered.wait(2)
+        assert canvas.frames > frames and canvas._projection_frame_pending
+        assert canvas._effect_jobs.running is not None
+        canvas._finish_modifier_handle()
+        canvas.update()
+        qapp.processEvents()
+        assert canvas._projection_can_defer_effects()
+        assert canvas._projection_frame_pending
+    finally:
+        release.set()
+    canvas._effect_jobs.running[3].result(timeout=30)
+    canvas._effect_jobs.poll()
+    canvas.update()
+    qapp.processEvents()
+    assert not canvas._projection_frame_pending
+    assert canvas._projection_presented_revision == canvas._document_projection.revision
+    assert np.any(canvas.frame_pixels != before)
+
+
+def test_native_intensity_gradient_pen_edit_reuses_full_quality_blur(native_scene, qapp, monkeypatch):
+    from comic_editor.ui import radial_blur
+    canvas = native_scene
+    artwork = next(iter(canvas.chapter.objects.values()))
+    modifier = RadialBlurModifier(center=(512, 512), angle=1)
+    mask = ToneMask(saved=True)
+    canvas.chapter.masks[mask.mask_id] = mask
+    modifier.parameter_masks["intensity"] = ParameterMaskBinding(mask.mask_id, 0, 100)
+    canvas.chapter.add_modifier(modifier, [("object", artwork.object_id)])
+    canvas.set_tone_mask_mode(mask.mask_id)
+    canvas._mask_gradient_press(QPointF(100, 512))
+    canvas._mask_gradient_move(QPointF(900, 512))
+    canvas._finish_mask_gradient()
+    # Warm exact artwork before testing the actual interactive paintEvent.
+    canvas._projection_async_enabled = False
+    canvas.update()
+    qapp.processEvents()
+    before = canvas.frame_pixels.copy()
+    canvas._projection_async_enabled = True
+    def forbidden(*_args, **_kwargs):
+        raise AssertionError("Intensity-gradient edit repeated angular integration")
+    monkeypatch.setattr(radial_blur, "radial_blur", forbidden)
+    canvas._mask_gradient_press(QPointF(900, 512))
+    canvas._pen_contact_active = True
+    canvas._mask_gradient_move(QPointF(600, 512))
+    assert canvas._projection_can_defer_effects()
+    canvas.update()
+    qapp.processEvents()
+    assert not canvas._projection_frame_pending
+    assert np.any(canvas.frame_pixels != before)
+    canvas._finish_mask_gradient()
+    canvas._pen_contact_active = False
+    canvas.update()
+    qapp.processEvents()
+    assert not canvas._projection_frame_pending
+    assert canvas._projection_presented_revision == canvas._document_projection.revision
+    assert canvas._effect_jobs.running is None and not canvas._effect_jobs.pending
 
 
 def test_widget_destruction_releases_presenter_without_explicit_close(native_scene):

@@ -730,6 +730,11 @@ spin around a draggable, grid-snapped center, with a 0–360° angle control and
 selected-only gizmos. Angle/intensity masks, shared links, mute, undo, export,
 Rasterize, and Raster Apply are supported. Radial previews run asynchronously;
 large angles can take appreciably longer than a frame to finish.
+Intensity and its gradient mask reuse the completed angular blur instead of
+recalculating it on every edit. Changes that require a new blur run in the
+background in the GPU canvas, keeping the last completed view visible until the
+full-quality result is ready. Mouse and pen gradient edits stay responsive through
+release. Escape cancels handle drags.
 
 **Export As…** chooses a PNG filename; **Export Again** overwrites the last
 successful destination for that chapter, remembered across restarts. Without
