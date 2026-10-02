@@ -15,7 +15,7 @@ from PySide6.QtGui import QImage, QPolygonF, QTransform
 from .models import (
     BoundGeometry, ChapterDocument, ChildRef, ColorFillGradientObject,
     DocumentObject, EmbeddedImageSourceDescriptor, GradientObject, ImageObject,
-    LayerNode, RasterObject, ShapeStyle, DistortModifier, ArrayModifier, MirrorModifier, RadialBlurModifier, CageTransformModifier, TilingModifier, HalftoneModifier,
+    LayerNode, RasterObject, ShapeStyle, DistortModifier, ArrayModifier, MirrorModifier, RadialBlurModifier, CageTransformModifier, TilingModifier, HalftoneModifier, TextureModifier,
     SpeedLineCenterObject, SpeedLinesGradientObject, TextObject,
     ToneMask, VectorDrawingObject, modifier_from_dict, new_id,
     object_from_dict,
@@ -719,6 +719,8 @@ def extract_asset(
     bounds = entity_visual_bounds(asset, asset_tiles, kind, entity_id, include_effects=True)
     dx, dy = ASSET_PADDING - bounds.left(), ASSET_PADDING - bounds.top()
     for modifier in asset.modifiers.values():
+        if isinstance(modifier, TextureModifier) and modifier.texture_quad is not None:
+            modifier.texture_quad = [(x + dx, y + dy) for x, y in modifier.texture_quad]
         if isinstance(modifier, CageTransformModifier):
             _translate_cage(modifier, dx, dy)
         if isinstance(modifier, DistortModifier):
@@ -880,6 +882,8 @@ def instantiate_asset(
     dy = world_y - (by + bh / 2)
     for modifier_id in cloned_modifier_ids.values():
         modifier = target.modifiers[modifier_id]
+        if isinstance(modifier, TextureModifier) and modifier.texture_quad is not None:
+            modifier.texture_quad = [(x + dx, y + dy) for x, y in modifier.texture_quad]
         if isinstance(modifier, CageTransformModifier):
             _translate_cage(modifier, dx, dy)
         if isinstance(modifier, DistortModifier):

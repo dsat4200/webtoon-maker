@@ -9,16 +9,20 @@ from PySide6.QtGui import QPolygonF, QTransform
 from comic_editor.core.models import (
     ArrayModifier, BlurModifier, CageTransformModifier, DistortModifier,
     MirrorModifier, RadialBlurModifier, TilingModifier,
+    TextureModifier,
 )
 
 
 _RIG_TYPES = (ArrayModifier, BlurModifier, CageTransformModifier, DistortModifier,
-              MirrorModifier, RadialBlurModifier, TilingModifier)
+              MirrorModifier, RadialBlurModifier, TilingModifier, TextureModifier)
 
 
 def transform_modifier_rig(canvas, modifier, transform):
     """Apply the established commit transformation to one mutable rig."""
-    if isinstance(modifier, DistortModifier):
+    if isinstance(modifier, TextureModifier):
+        if modifier.texture_quad is not None:
+            modifier.texture_quad = [transform.map(QPointF(*p)).toTuple() for p in modifier.texture_quad]
+    elif isinstance(modifier, DistortModifier):
         if modifier.modifier_type == "distort_smudge":
             from comic_editor.core.smudge import transform_strokes
             modifier.parameters["strokes"] = transform_strokes(
@@ -108,7 +112,12 @@ def effective_preview_modifier(canvas, modifier):
         return modifier
     # Dataclass values include the rig, masks and parameters without calling
     # validating serializers on the saved model during a transient preview.
-    signature = repr(modifier)
+    if isinstance(modifier, TextureModifier):
+        from comic_editor.core.texture_library import texture_digest
+        signature = repr((texture_digest(modifier.texture_data),
+                          {key: value for key, value in vars(modifier).items() if key != "texture_data"}))
+    else:
+        signature = repr(modifier)
     previous = values.get(modifier.modifier_id)
     if previous is not None and previous[0] == signature:
         values.move_to_end(modifier.modifier_id)

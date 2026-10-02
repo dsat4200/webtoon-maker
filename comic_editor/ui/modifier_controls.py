@@ -18,6 +18,7 @@ from comic_editor.core.models import (
     ColorFillGradientObject, TextObject,
     StrokeModifier, ScreamModifier, WobbleModifier, DotDashModifier, STROKE_MODIFIER_TYPES,
     DistortModifier, ImageObject, CurvesModifier,
+    TextureModifier, SolidColorOverlayModifier,
 )
 from comic_editor.core.distort import DISTORT_TYPES
 from comic_editor.core.models import KuwaharaModifier
@@ -210,6 +211,9 @@ class ModifierCard(QFrame):
                     randomize.setToolTip(f"Seed: {seed}")
                 randomize.clicked.connect(randomize_seed)
                 form.addWidget(randomize)
+        elif isinstance(modifier, SolidColorOverlayModifier):
+            from comic_editor.ui.overlay_controls import OverlayControls
+            form.addWidget(OverlayControls(modifier, owner, body))
         elif isinstance(modifier, DistortModifier):
             if modifier.modifier_type == "distort_smudge":
                 from comic_editor.ui.smudge_controls import SmudgeControls
@@ -551,6 +555,10 @@ class ModifierControls(QWidget):
         layout.addWidget(self.summary)
         self.add_button = QPushButton("Add Modifier", self)
         menu = QMenu(self.add_button)
+        self.overlay_menu = menu.addMenu("Overlay")
+        self.overlay_menu.setObjectName("overlayModifierMenu")
+        self.overlay_menu.addAction("Texture").triggered.connect(lambda: self.add_modifier("texture"))
+        self.overlay_menu.addAction("Solid color overlay").triggered.connect(lambda: self.add_modifier("solid_color_overlay"))
         self.stroke_menu = menu.addMenu("Stroke modifiers")
         for modifier_type, factory in STROKE_MODIFIER_TYPES.items():
             self.stroke_menu.addAction(factory().name).triggered.connect(
@@ -699,6 +707,8 @@ class ModifierControls(QWidget):
             chapter.stroke_modifier_target(*ref) for ref in targets)))
         self.distort_menu.menuAction().setVisible(bool(eligible and all(
             isinstance(chapter.modifier_target(*ref), (RasterObject, ImageObject)) for ref in targets)))
+        self.overlay_menu.menuAction().setVisible(bool(eligible and not
+            chapter.incompatible_modifier_targets(TextureModifier(), targets)))
         if not eligible:
             self.summary.setText("Select a drawing, image, gradient, text, layer, or page.")
             return
@@ -793,6 +803,8 @@ class ModifierControls(QWidget):
             from comic_editor.core.kuwahara import KUWAHARA_VARIANTS
             variant = modifier_type.removeprefix("kuwahara_") if modifier_type != "kuwahara" else "anisotropic"
             modifier = KuwaharaModifier(variant=variant, name=KUWAHARA_VARIANTS[variant])
+        elif modifier_type in {"texture", "solid_color_overlay"}:
+            modifier = TextureModifier() if modifier_type == "texture" else SolidColorOverlayModifier()
         elif modifier_type == "brightness_contrast":
             modifier = BrightnessContrastModifier()
         elif modifier_type == "curves":
@@ -835,6 +847,8 @@ class ModifierControls(QWidget):
             self.canvas.report_incompatible("Add modifier", chapter.modifier_compatibility_message(modifier, incompatible), incompatible)
             return
         chapter.add_modifier(modifier, targets)
+        if isinstance(modifier, TextureModifier):
+            modifier.texture_quad = self.canvas._texture_default_quad(modifier)
         self.canvas.incompatibleSelection.emit([])
         self.canvas._remember_modifier(modifier.modifier_id)
         self.active_modifier_id = modifier.modifier_id

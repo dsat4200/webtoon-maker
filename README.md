@@ -56,6 +56,37 @@ workflow.
 - Blender 5.2 and 4.5 LTS Comic Views as disk-published transparent image sources with
   persistent offline PNG caches
 
+## Brush picker and thumbnails
+
+The Brush **Preset** dropdown opens a large searchable grid. Each tile displays
+a stroke thumbnail above the brush name; click a tile or select it with the
+keyboard to choose that preset. The overlay adapts its columns to the available
+screen space and scrolls smoothly through larger collections.
+
+Imports and saved brush edits prepare thumbnails in advance. Existing libraries
+are filled in automatically, and all 14 built-in brushes ship with pre-rendered
+previews. Thumbnails persist in a sibling `brush-thumbnails` folder beside the
+application preferences, so reopening or scrolling the picker does not render
+them again. Preset thumbnails use consistent ink; the larger live preview still
+responds to your current palette. See [preview scheduling](docs/brush-preview-scheduling.md).
+
+## Importing Clip Studio Paint brushes
+
+In the Brush controls, **CSP library…** beside **Import .sut…** opens a searchable
+list of local downloaded brush materials and installed CSP sub tools. Select a
+brush and choose **Import brush** to copy its settings and required tips/textures
+into your presets. Downloaded material packs are listed by their individual brush
+names; a standalone `.sut` export is not required.
+
+The picker detects the current Windows user-data location and the older
+Documents location. Use **Choose folder…** for a moved library, selecting its
+CELSYS, CLIPStudioCommon, or Material folder. CSP databases are read only, and
+imported images are embedded so your presets can work without the source library.
+Millimeter sizes use the same resolution prompt as SUT imports. Compatibility
+notes identify approximations, including unavailable global pressure calibration
+in older downloaded material formats. Unsupported or incomplete brushes report
+an error; they can also be exported from CSP and imported with **Import .sut…**.
+
 ## Object blend modes
 
 Select a drawing, image, gradient, or text object and choose **Settings → Blend
@@ -707,6 +738,28 @@ in Tool Settings (0–255); higher values include more color variation. Each
 gesture adds to the mask. Hold **Ctrl** while drawing a lasso or clicking the
 wand to remove that region, including coverage from linked contributors.
 These edits support Undo and Redo and are saved with the mask.
+
+**Modifiers → Add Modifier → Overlay** offers **Texture** and **Solid color overlay**
+for raster drawings, images, Blender layers, and shapes containing layers. Both
+have a blend-mode dropdown and 0–100% intensity. **Replace** uses the raw texture
+or color inside the artwork’s silhouette. Shape outlines are preserved by default;
+enable **Apply to outline** to include them.
+
+The texture selector shows folder categories beside a thumbnail grid. Hover a
+category to browse it, and hover near the grid’s top or bottom to scroll. Choose
+the library in **Settings → Paths → Texture library folder**, or use **Library
+folder…** on the modifier. The default is
+`C:\Users\hopper\Documents\Assets\Texturelabs_AllTextures`. Selected textures are
+embedded in the document; changing or moving the library does not affect existing
+overlays. The purchased library itself is read from that folder and is not bundled
+with the application.
+
+Select the texture modifier to show its eight transform handles. **Uniform**
+keeps proportions; **Free** lets corners and edges warp the texture. Drag inside
+to move it, or just outside a corner to rotate it. Hold **Shift** to keep proportions
+while dragging in Free mode. The controls also offer **Fit to layer**. These gizmos
+appear only for the selected, enabled modifier and support Undo, Redo, and Escape
+to cancel a drag.
 
 HSL, Brightness / Contrast, Blur, Radial Blur, Outline, and Mirror modifiers remain attached to their objects rather than
 appearing in the outliner. Their processed results are cached separately from

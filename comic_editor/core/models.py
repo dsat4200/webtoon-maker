@@ -7,7 +7,7 @@ import uuid
 from dataclasses import dataclass, field, fields
 from typing import Any, Iterable, Iterator, Literal
 from comic_editor.core.cage import CageGrid
-from comic_editor.core.blend_modes import validate_blend_mode
+from comic_editor.core.blend_modes import validate_blend_mode, OBJECT_BLEND_MODES
 
 
 SCHEMA_VERSION = 25
@@ -1914,7 +1914,87 @@ class DistortModifier:
                     parameter_masks=_parameter_masks_to_dict(self.parameter_masks))
 
 
-ModifierInstance = HueSaturationLightnessModifier | BrightnessContrastModifier | CurvesModifier | BlurModifier | OutlineModifier | MirrorModifier | ArrayModifier | RadialBlurModifier | CageTransformModifier | PosterizeModifier | PosterizeValueModifier | TilingModifier | ScreamModifier | WobbleModifier | DotDashModifier | HalftoneModifier | PixelateModifier | DistortModifier | KuwaharaModifier | DitheringModifier | SharpnessModifier
+OVERLAY_BLEND_MODES = (("replace", "Replace"),) + tuple(
+    (mode, label) for mode, label in OBJECT_BLEND_MODES
+    if "modulate" not in mode and "texture" not in mode)
+
+
+@dataclass
+class SolidColorOverlayModifier:
+    modifier_id: str = field(default_factory=new_id)
+    modifier_type: str = "solid_color_overlay"
+    name: str = "Solid color overlay"
+    intensity: float = 100.0
+    expanded: bool = True
+    muted: bool = False
+    blend_mode: str = "normal"
+    color: str = "#FF808080"
+    apply_to_outline: bool = False
+    parameter_masks: dict[str, ParameterMaskBinding] = field(default_factory=dict)
+
+    def validate(self):
+        self.name = str(self.name or ("Texture" if self.modifier_type == "texture" else "Solid color overlay"))
+        self.intensity = float(self.intensity)
+        if not math.isfinite(self.intensity):
+            raise ValueError("Overlay intensity must be finite")
+        self.intensity = max(0., min(100., self.intensity))
+        self.expanded, self.muted = bool(self.expanded), bool(self.muted)
+        self.apply_to_outline = bool(self.apply_to_outline)
+        if self.blend_mode not in {mode for mode, _ in OVERLAY_BLEND_MODES}:
+            raise ValueError("Unknown overlay blend mode")
+        self.color = canonical_argb(self.color)
+        _validate_parameter_masks(self.parameter_masks, {"intensity": (0., 100.)})
+
+    def to_dict(self):
+        self.validate()
+        return dict(id=self.modifier_id, type=self.modifier_type, name=self.name,
+                    intensity=self.intensity, expanded=self.expanded, muted=self.muted,
+                    blend_mode=self.blend_mode, color=self.color,
+                    apply_to_outline=self.apply_to_outline,
+                    parameter_masks=_parameter_masks_to_dict(self.parameter_masks))
+
+
+@dataclass
+class TextureModifier(SolidColorOverlayModifier):
+    modifier_type: str = "texture"
+    name: str = "Texture"
+    blend_mode: str = "multiply"
+    texture_name: str = ""
+    texture_category: str = ""
+    texture_data: str = ""
+    texture_quad: list[tuple[float, float]] | None = None
+    transform_mode: str = "uniform"
+
+    def validate(self):
+        super().validate()
+        self.texture_name = str(self.texture_name)
+        self.texture_category = str(self.texture_category)
+        if not isinstance(self.texture_data, str):
+            raise ValueError("Texture image must be encoded image data")
+        if self.transform_mode not in {"uniform", "free"}:
+            raise ValueError("Unknown texture transform mode")
+        if self.texture_quad is not None:
+            if len(self.texture_quad) != 4:
+                raise ValueError("Texture transform requires four corners")
+            self.texture_quad = [_point(point) for point in self.texture_quad]
+            if not all(math.isfinite(v) for point in self.texture_quad for v in point):
+                raise ValueError("Texture transform must be finite")
+            crosses = []
+            for i, point in enumerate(self.texture_quad):
+                next_point, last = self.texture_quad[(i + 1) % 4], self.texture_quad[(i + 2) % 4]
+                crosses.append((next_point[0] - point[0]) * (last[1] - next_point[1])
+                               - (next_point[1] - point[1]) * (last[0] - next_point[0]))
+            if not (all(v > 1e-8 for v in crosses) or all(v < -1e-8 for v in crosses)):
+                raise ValueError("Texture transform must be a convex quadrilateral")
+
+    def to_dict(self):
+        return dict(super().to_dict(), texture_name=self.texture_name,
+                    texture_category=self.texture_category, texture_data=self.texture_data,
+                    texture_quad=[list(point) for point in self.texture_quad] if self.texture_quad is not None else None,
+                    transform_mode=self.transform_mode)
+
+
+ModifierInstance = HueSaturationLightnessModifier | BrightnessContrastModifier | CurvesModifier | BlurModifier | OutlineModifier | MirrorModifier | ArrayModifier | RadialBlurModifier | CageTransformModifier | PosterizeModifier | PosterizeValueModifier | TilingModifier | ScreamModifier | WobbleModifier | DotDashModifier | HalftoneModifier | PixelateModifier | DistortModifier | KuwaharaModifier | DitheringModifier | SharpnessModifier | TextureModifier | SolidColorOverlayModifier
 
 
 def modifier_from_dict(data: dict[str, Any]) -> ModifierInstance:
@@ -1930,7 +2010,18 @@ def modifier_from_dict(data: dict[str, Any]) -> ModifierInstance:
             data.get("parameter_masks")
         ),
     }
-    if modifier_type in DISTORT_TYPES:
+    if modifier_type in {"texture", "solid_color_overlay"}:
+        values = dict(blend_mode=str(data.get("blend_mode", "multiply" if modifier_type == "texture" else "normal")),
+                      color=str(data.get("color", "#FF808080")),
+                      apply_to_outline=bool(data.get("apply_to_outline", False)))
+        if modifier_type == "texture":
+            result = TextureModifier(**common, **values,
+                texture_name=str(data.get("texture_name", "")), texture_category=str(data.get("texture_category", "")),
+                texture_data=data.get("texture_data", ""), texture_quad=data.get("texture_quad"),
+                transform_mode=str(data.get("transform_mode", "uniform")))
+        else:
+            result = SolidColorOverlayModifier(**common, **values)
+    elif modifier_type in DISTORT_TYPES:
         result = DistortModifier(**common, modifier_type=modifier_type,
             parameters=copy.deepcopy(data.get("parameters", {})),
             frame=data.get("frame", (0., 0., 100., 100.)),
@@ -4224,6 +4315,10 @@ class ChapterDocument:
         for ref in targets:
             target = self.modifier_target(*ref)
             compatible = target is not None
+            if isinstance(modifier, SolidColorOverlayModifier):
+                compatible = isinstance(target, (RasterObject, ImageObject)) or (
+                    isinstance(target, LayerNode) and not target.is_page
+                    and target.layer_kind != "text_container" and target.bound is not None)
             if isinstance(modifier, DistortModifier):
                 compatible = isinstance(target, (RasterObject, ImageObject))
             if isinstance(modifier, StrokeModifier):

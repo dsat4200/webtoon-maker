@@ -8,7 +8,7 @@ from PySide6.QtGui import QTransform
 
 from comic_editor.core.models import (
     ArrayModifier, BlurModifier, CageTransformModifier, DistortModifier,
-    MirrorModifier, RadialBlurModifier, TilingModifier,
+    MirrorModifier, RadialBlurModifier, TilingModifier, TextureModifier,
 )
 from comic_editor.ui.transform_modifier_preview import effective_preview_modifier
 from test_page_warp_transform import page_scene, start_move
@@ -18,6 +18,8 @@ def add_rig(canvas, kind):
     modifier = kind()
     if isinstance(modifier, DistortModifier):
         modifier.modifier_type = "distort_mesh_warp"
+    if isinstance(modifier, TextureModifier):
+        modifier.texture_quad = [(20., 20.), (160., 20.), (160., 160.), (20., 160.)]
     modifier.validate()
     target = next(iter(canvas.chapter.objects.values()))
     canvas.chapter.add_modifier(modifier, [("object", target.object_id)])
@@ -25,7 +27,7 @@ def add_rig(canvas, kind):
 
 
 @pytest.mark.parametrize("kind", [ArrayModifier, BlurModifier, CageTransformModifier,
-    DistortModifier, MirrorModifier, RadialBlurModifier, TilingModifier])
+    DistortModifier, MirrorModifier, RadialBlurModifier, TilingModifier, TextureModifier])
 @pytest.mark.parametrize("rotate_scale", [False, True])
 def test_all_rig_preview_values_match_commit_without_model_mutation(page_scene, kind, rotate_scale):
     canvas, _page, _warp = page_scene

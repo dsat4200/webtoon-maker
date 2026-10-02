@@ -47,7 +47,7 @@ def live_brush_stroke(widget):
         canvas=getattr(widget,'canvas',None)
         if getattr(canvas,'_paint_brush_stroke',None) is not None:
             return True
-        widget=widget.parentWidget()
+        widget=widget.parentWidget() if hasattr(widget,'parentWidget') else widget.parent()
     return False
 
 

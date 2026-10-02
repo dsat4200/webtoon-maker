@@ -1,3 +1,15 @@
+![[Pasted image 20261002171844.png]]
+import csp brushes directly
+new modifier - texture modifier
+- can be put on a raster layer, image layer, blender layer, or a shape with layers
+- if placed on a shape layer, setting allows it to be turned on and off for the outline (off by default)
+- settings lets the user set the directory where textures come from
+- subfolders of that folder are treated as "categories" in a dropdown
+	- hovering over a category shows the textures in that category in a thumbnail grid that scrolls down/up as you hover near the top/bottom (similar rendering of this menu to the brushes selector)
+- texture modifier lets you change the blend mode with a dropdown. one of the blend modes is "replace" which just replaces the pixels with the raw texture itself
+- also has an intensity slider 0 to 100. acts as the opacity, as if the texture was overlaid on top.
+
+
 add a kuwahara filter category of modifier
 
 https://youtu.be/LDhN-JK3U9g

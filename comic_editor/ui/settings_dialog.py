@@ -6,7 +6,7 @@ from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (
     QCheckBox, QDialog, QDialogButtonBox, QFormLayout,
     QGroupBox, QHBoxLayout, QPushButton, QSlider, QSpinBox, QTabWidget,
-    QVBoxLayout, QWidget,
+    QVBoxLayout, QWidget, QLineEdit, QLabel, QFileDialog,
 )
 
 from comic_editor.core.models import ChapterDocument, GridSettings
@@ -102,6 +102,23 @@ class SettingsDialog(QDialog):
         grid_layout.addWidget(document_group)
         grid_layout.addStretch(1)
 
+        self.paths_tab = QWidget(self.tabs)
+        self.tabs.addTab(self.paths_tab, "Paths")
+        paths = QVBoxLayout(self.paths_tab)
+        paths.addWidget(QLabel("Texture library folder", self.paths_tab))
+        row = QHBoxLayout()
+        self.texture_directory = QLineEdit(settings.texture_directory, self.paths_tab)
+        self.texture_directory.setObjectName("textureDirectory")
+        row.addWidget(self.texture_directory, 1)
+        self.texture_browse = QPushButton("Browse…", self.paths_tab)
+        self.texture_browse.clicked.connect(self._browse_textures)
+        row.addWidget(self.texture_browse)
+        paths.addLayout(row)
+        help_text = QLabel("Subfolders appear as texture categories. Selected textures are saved with your document.", self.paths_tab)
+        help_text.setWordWrap(True)
+        paths.addWidget(help_text)
+        paths.addStretch(1)
+
         buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok
             | QDialogButtonBox.StandardButton.Cancel,
@@ -118,6 +135,11 @@ class SettingsDialog(QDialog):
         control.setSuffix(" px")
         control.setValue(int(value))
         return control
+
+    def _browse_textures(self):
+        directory = QFileDialog.getExistingDirectory(self, "Texture library folder", self.texture_directory.text())
+        if directory:
+            self.texture_directory.setText(directory)
 
     @staticmethod
     def _division_spin(value: int, parent: QWidget) -> QSpinBox:
@@ -175,6 +197,7 @@ class SettingsDialog(QDialog):
             control.setEnabled(enabled)
 
     def apply_user_settings(self, settings: EditorSettings) -> None:
+        settings.texture_directory = self.texture_directory.text().strip()
         settings.grid_overlay_visible = self.grid_visible.isChecked()
         settings.grid_size_px = self.grid_size.value()
         settings.grid_divisions = self.grid_divisions.value()

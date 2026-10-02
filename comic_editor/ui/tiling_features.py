@@ -5,7 +5,7 @@ import numpy as np
 from PySide6.QtCore import QPointF, QRectF, Qt, QTimer
 from PySide6.QtGui import QColor, QPainter, QPen, QTransform
 
-from comic_editor.core.models import TilingModifier, LayerNode, RasterObject, VectorDrawingObject, new_id, StrokeModifier
+from comic_editor.core.models import TilingModifier, LayerNode, RasterObject, VectorDrawingObject, new_id, StrokeModifier, SolidColorOverlayModifier
 from comic_editor.core.tiling import TilingGeometry, polygon_path
 from comic_editor.ui.effect_pipeline import aligned, empty_image, render_stages
 from comic_editor.ui.modifier_rendering import (
@@ -439,7 +439,12 @@ class TilingFeatures:
             scope = self._effect_request_scope(kind, identifier)
             source_key = ("tiled-stages", self._tiling_target_signature(target),
                           self._rect_signature(bounds))
-            if any(isinstance(effect, StrokeModifier) for effect in rest):
+            if isinstance(target, LayerNode) and any(isinstance(effect, SolidColorOverlayModifier)
+                                                    and not effect.apply_to_outline for effect in rest):
+                from comic_editor.ui.overlay_rendering import shape_overlay_stack
+                image, bounds = shape_overlay_stack(self, target, image, bounds, rest, QTransform(),
+                    source_key, scope, provisional=provisional, tiled=True)
+            elif any(isinstance(effect, StrokeModifier) for effect in rest):
                 from comic_editor.ui.stroke_rendering import render_stroke_stack
                 image, bounds = render_stroke_stack(self, target, image, bounds, rest,
                     QTransform(), source_key, scope, tiled=True,

@@ -51,7 +51,8 @@ def test_real_sidebar_keeps_numeric_fields_and_preview_inside_viewport(qapp, tmp
                 qapp.processEvents()
             assert viewport.width() < 210
             for widget in (controls.presets, controls.size, controls.size_slider,
-                           controls.opacity, controls.opacity_slider, controls.preview):
+                           controls.opacity, controls.opacity_slider, controls.preview,
+                           controls.import_button, controls.library_import_button):
                 left = widget.mapTo(viewport, QPoint()).x()
                 assert 0 <= left
                 assert left + widget.width() <= viewport.width()

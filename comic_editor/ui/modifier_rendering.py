@@ -16,6 +16,7 @@ from comic_editor.core.models import (
     BlurModifier, HueSaturationLightnessModifier, BrightnessContrastModifier, CurvesModifier, ModifierInstance,
     OutlineModifier, MirrorModifier, RadialBlurModifier, PosterizeModifier, PosterizeValueModifier,
     HalftoneModifier, PixelateModifier, DistortModifier,
+    TextureModifier, SolidColorOverlayModifier,
 )
 from comic_editor.core.effect_geometry import reflection_transform
 from comic_editor.core.curves import apply_curves, curves_is_neutral
@@ -28,6 +29,12 @@ def modifier_render_settings(modifier):
     settings = modifier.to_dict()
     settings.pop("name", None)
     settings.pop("expanded", None)
+    if isinstance(modifier, TextureModifier):
+        from comic_editor.core.texture_library import texture_digest
+        settings["texture_data"] = texture_digest(modifier.texture_data)
+        settings.pop("texture_name", None)
+        settings.pop("texture_category", None)
+        settings.pop("transform_mode", None)
     if isinstance(modifier, CurvesModifier):
         # Selecting a graph channel does not enable or disable its curve.
         settings.pop("channel", None)
@@ -792,7 +799,46 @@ def apply_modifier_stack(
         amount = np.asarray(amount, dtype=np.float32) / 100.0
         if np.max(amount) <= 0.0:
             continue
-        if isinstance(modifier, (HalftoneModifier, PixelateModifier)):
+        if isinstance(modifier, SolidColorOverlayModifier):
+            from comic_editor.core.blend_modes import blend_rgb
+            if isinstance(modifier, TextureModifier):
+                from comic_editor.core.texture_library import texture_image
+                if modifier.texture_quad is not None:
+                    from comic_editor.ui.texture_rendering import transformed_texture
+                    texture_pixels, footprint = transformed_texture(
+                        modifier, width, height, world_origin, world_to_image)
+                    if texture_pixels is None:
+                        continue
+                    front = _straight(texture_pixels)
+                else:
+                    texture = texture_image(modifier.texture_data, width, height)
+                    if texture.isNull():
+                        continue
+                    front = _straight(_qimage_premultiplied(texture))
+            else:
+                from PySide6.QtGui import QColor
+                color = QColor(modifier.color)
+                front = np.asarray([color.redF(), color.greenF(), color.blueF(), color.alphaF()], dtype=np.float32)
+            back = _straight(current)
+            if amount.ndim == 2:
+                amount = amount[..., None]
+            if modifier.blend_mode == "replace":
+                # Replace retains the target's silhouette, but uses the raw
+                # texture alpha/color, including transparent texture pixels.
+                effect = np.concatenate((front[..., :3] * front[..., 3:4] * current[..., 3:4],
+                                         front[..., 3:4] * current[..., 3:4]), axis=-1)
+                if isinstance(modifier, TextureModifier) and modifier.texture_quad is not None:
+                    # Moving/scaling the overlay exposes the original artwork
+                    # outside its quad, while transparent pixels inside Replace
+                    # still replace incoming coverage.
+                    amount = amount * footprint
+                current = current * (1 - amount) + effect * amount
+            else:
+                blended = blend_rgb(back[..., :3], front[..., :3], modifier.blend_mode)
+                weight = amount * front[..., 3:4]
+                current[..., :3] = current[..., :3] * (1 - weight) + blended * current[..., 3:4] * weight
+            continue
+        elif isinstance(modifier, (HalftoneModifier, PixelateModifier)):
             from comic_editor.ui.pattern_rendering import apply_pattern_effect
             effect = _qimage_premultiplied(apply_pattern_effect(
                 _premultiplied_qimage(current), modifier))

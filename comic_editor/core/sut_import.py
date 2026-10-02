@@ -127,12 +127,8 @@ def _sqlite_record(payload: bytes) -> list:
     return values
 
 
-def _c2f_rows(data: bytes) -> list[tuple[int, int, list]]:
-    """Recover intact table-leaf records from the supported C2F layout.
-
-    This does not decrypt the opaque prefix. Its exact supported size is checked
-    so unrecognized layouts fail explicitly instead of inventing page offsets.
-    """
+def _c2f_payload(data: bytes) -> tuple[int, list[tuple[int, bytes]]]:
+    """Validate a material container and return its readable logical spans."""
     if not data.startswith(_C2F) or len(data) > MAX_FILE_BYTES:
         raise SutImportError("Unsupported CSP material container.")
     cursor = 8
@@ -162,6 +158,16 @@ def _c2f_rows(data: bytes) -> list[tuple[int, int, list]]:
         cursor = end
     if cursor != len(data) or not spans or logical_size % 512:
         raise SutImportError("Unsupported CSP material page layout.")
+    return logical_size, spans
+
+
+def _c2f_rows(data: bytes) -> list[tuple[int, int, list]]:
+    """Recover intact table-leaf records from the supported C2F layout.
+
+    This does not decrypt the opaque prefix. Its exact supported size is checked
+    so unrecognized layouts fail explicitly instead of inventing page offsets.
+    """
+    logical_size, spans = _c2f_payload(data)
 
     def page(number: int, page_size: int) -> bytes:
         position = (number - 1) * page_size

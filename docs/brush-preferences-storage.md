@@ -4,6 +4,12 @@ Application preferences store large brush PNGs in a sibling `brush-assets` folde
 
 Copy **the preferences JSON and its sibling `brush-assets` folder together** when moving or backing up preferences. The folder name stays the same even if the JSON file is renamed. `BrushDefinition.to_dict()` and the in-memory preset library remain self-contained with embedded PNG strings; the storage representation does not change portable brush definitions or source provenance.
 
+The sibling `brush-thumbnails` folder stores derived preset-grid previews. It is
+optional for backups: missing previews are rebuilt from the original definitions
+and images. Keeping it avoids repeating that preparation after moving preferences.
+Unlike source brush assets, a missing or corrupt thumbnail does not prevent
+loading the brush library. Built-in previews are also bundled with the application.
+
 Older preferences containing embedded PNGs remain readable. On the first save that externalizes their images, the writer preserves an exact `<preferences-filename>.inline-backup` before replacing the original JSON. It publishes and flushes every required image first, then flushes a unique sibling temporary preferences file and atomically replaces the destination. A failed image or preferences write leaves the previous preferences intact. Existing backups are not overwritten, and old image files are never automatically deleted.
 
 Referenced images are checked against their digest on load. Missing, corrupt or invalid references raise an explicit error rather than loading default brushes and risking an overwrite. Restore the matching image folder or use the retained inline backup to recover. During an open session, changed image-file size/timestamps trigger validation; if the full original image is still in memory, saving repairs a missing or damaged managed image.

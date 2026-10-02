@@ -184,6 +184,7 @@ def default_fill_profiles() -> dict[str, dict[str, object]]:
 
 @dataclass
 class EditorSettings:
+    texture_directory: str = r"C:\Users\hopper\Documents\Assets\Texturelabs_AllTextures"
     export_destinations: dict[str, str] = field(default_factory=dict)
     settings_version: int = 23
     tablet_mode: bool = False
@@ -272,6 +273,9 @@ class EditorSettings:
 
     def clamp(self) -> None:
         self.settings_version = 23
+        from .texture_library import DEFAULT_TEXTURE_DIRECTORY
+        self.texture_directory = (str(self.texture_directory).strip()
+                                  if self.texture_directory is not None else DEFAULT_TEXTURE_DIRECTORY)
         normalized_brushes: list[dict] = []
         brush_ids: set[str] = set()
         for item in self.brush_presets if isinstance(self.brush_presets, list) else []:

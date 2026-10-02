@@ -53,7 +53,7 @@ from comic_editor.core.models import (
     ColorGradientRamp, ColorGradientStop, DocumentObject, GradientObject,
     GridSettings, LineGradientField, LayerNode, RadialGradientField,
     ImageObject, PathContour, PathNode, RasterObject, ShapeStyle, TextObject,
-    BlurModifier, OutlineModifier, MirrorModifier, ArrayModifier, RadialBlurModifier, ToneMask, StrokeModifier, CurvesModifier,
+    BlurModifier, OutlineModifier, MirrorModifier, ArrayModifier, RadialBlurModifier, ToneMask, StrokeModifier, CurvesModifier, SolidColorOverlayModifier,
     HalftoneModifier, PixelateModifier, DistortModifier, KuwaharaModifier, DitheringModifier, SharpnessModifier,
     SpeedLineCenterObject, SpeedLinesGradientObject, VectorDrawingObject,
     VectorStroke, VectorStrokePoint, new_id,
@@ -97,6 +97,7 @@ from comic_editor.ui.shape_outline_compound import OutlineSource, compound_outli
 from comic_editor.ui.distort_features import DistortFeatures
 from comic_editor.ui.curves_features import CurvesFeatures
 from comic_editor.ui.spatial_modifier_features import SpatialModifierFeatures
+from comic_editor.ui.texture_overlay_features import TextureOverlayFeatures
 from comic_editor.ui.array_features import ArrayFeatures
 from comic_editor.ui.text_features import TextFeatures
 from comic_editor.ui.view_features import ViewFeatures
@@ -602,7 +603,7 @@ class CanvasPerformanceMonitor:
         }
 
 
-class _CanvasLogic(BrushFeatures, DocumentProjectionFeatures, MultiRasterSelectionFeatures, ShowOnTopFeatures, SoloFeatures, ViewFeatures, MaskSelectionFeatures, MaskGradientFeatures, TilingFeatures, CageFeatures, ArrayFeatures, SpatialModifierFeatures, DistortFeatures, CurvesFeatures, TextFeatures):
+class _CanvasLogic(BrushFeatures, DocumentProjectionFeatures, MultiRasterSelectionFeatures, ShowOnTopFeatures, SoloFeatures, ViewFeatures, MaskSelectionFeatures, MaskGradientFeatures, TilingFeatures, CageFeatures, ArrayFeatures, SpatialModifierFeatures, TextureOverlayFeatures, DistortFeatures, CurvesFeatures, TextFeatures):
     documentChanged = Signal(object)
     viewSettingsChanged = Signal()
     visualChanged = Signal(object)
@@ -4820,7 +4821,8 @@ class _CanvasLogic(BrushFeatures, DocumentProjectionFeatures, MultiRasterSelecti
                         opacity, local_visible,
                     )
             painter.restore()
-            if style.outline_thickness > 0 and self._solo_content_visible("layer", layer.layer_id):
+            if (style.outline_thickness > 0 and self._solo_content_visible("layer", layer.layer_id)
+                    and getattr(self, "_stroke_hide_border_id", None) != layer.layer_id):
                 ring = outline_mesh(
                     layer.bound, style.outline_thickness, clip_path,
                     core=core, base_width=style.base_thickness,
@@ -4943,6 +4945,9 @@ class _CanvasLogic(BrushFeatures, DocumentProjectionFeatures, MultiRasterSelecti
                 self._render_modifier_sources.discard(("layer", layer.layer_id))
             return
         if self._render_tiled_target(painter, layer, parent_opacity, visible_world):
+            return
+        if any(isinstance(m, SolidColorOverlayModifier) for m in self._active_modifier_instances(layer.modifier_ids)):
+            self._render_mirror_target(painter, layer, parent_opacity, visible_world)
             return
         # Curves affects the complete subtree, including children outside a
         # page/shape mask. The staged capture includes their visual bounds.
@@ -5254,7 +5259,8 @@ class _CanvasLogic(BrushFeatures, DocumentProjectionFeatures, MultiRasterSelecti
             painter, layer.layer_id, opacity, visible_world
         )
         painter.restore()
-        if layer.border_width > 0 and self._solo_content_visible("layer", layer.layer_id):
+        if (layer.border_width > 0 and self._solo_content_visible("layer", layer.layer_id)
+                and getattr(self, "_stroke_hide_border_id", None) != layer.layer_id):
             painter.save()
             painter.setOpacity(opacity)
             pen = QPen(
@@ -5297,7 +5303,7 @@ class _CanvasLogic(BrushFeatures, DocumentProjectionFeatures, MultiRasterSelecti
                 isinstance(modifier, (MirrorModifier, ArrayModifier, RadialBlurModifier,
                     CageTransformModifier, HalftoneModifier, PixelateModifier, DistortModifier))
                 or isinstance(modifier, (CurvesModifier, KuwaharaModifier, DitheringModifier,
-                                         SharpnessModifier)) and not self._render_base_alpha
+                                         SharpnessModifier, SolidColorOverlayModifier)) and not self._render_base_alpha
                 for modifier in self._active_modifier_instances(layer.modifier_ids)):
             self._render_mirror_target(painter, layer, parent_opacity, visible_world)
             return
@@ -8494,10 +8500,10 @@ class _CanvasLogic(BrushFeatures, DocumentProjectionFeatures, MultiRasterSelecti
         if self._cage_session is not None and ("object", obj.object_id) in self._cage_session["targets"]:
             self._render_mirror_target(painter, obj, parent_opacity, local_visible)
             return
-        if isinstance(obj, RasterObject) and (obj.modifier_source_frame is not None or any(isinstance(m, (RadialBlurModifier, ArrayModifier, HalftoneModifier, PixelateModifier, DistortModifier, CurvesModifier, KuwaharaModifier, DitheringModifier, SharpnessModifier)) for m in self._active_modifier_instances(obj.modifier_ids))):
+        if isinstance(obj, RasterObject) and (obj.modifier_source_frame is not None or any(isinstance(m, (RadialBlurModifier, ArrayModifier, HalftoneModifier, PixelateModifier, DistortModifier, CurvesModifier, KuwaharaModifier, DitheringModifier, SharpnessModifier, SolidColorOverlayModifier)) for m in self._active_modifier_instances(obj.modifier_ids))):
             self._render_radial_raster(painter, obj, parent_opacity, local_visible)
             return
-        if any(isinstance(m, (MirrorModifier, ArrayModifier, RadialBlurModifier, CageTransformModifier, StrokeModifier, HalftoneModifier, PixelateModifier, DistortModifier, KuwaharaModifier, DitheringModifier, SharpnessModifier)) for m in self._active_modifier_instances(obj.modifier_ids)):
+        if any(isinstance(m, (MirrorModifier, ArrayModifier, RadialBlurModifier, CageTransformModifier, StrokeModifier, HalftoneModifier, PixelateModifier, DistortModifier, KuwaharaModifier, DitheringModifier, SharpnessModifier, SolidColorOverlayModifier)) for m in self._active_modifier_instances(obj.modifier_ids)):
             self._render_mirror_target(painter, obj, parent_opacity, local_visible)
             return
         if (isinstance(obj, RasterObject) and self._interactive_render
@@ -8733,6 +8739,8 @@ class _CanvasLogic(BrushFeatures, DocumentProjectionFeatures, MultiRasterSelecti
             key = (*key, self._modifier_parameter_signature([mid for mid in target.modifier_ids
                 if isinstance(self.chapter.modifiers.get(mid), StrokeModifier)]))
         has_stroke = any(isinstance(modifier, StrokeModifier) for modifier in modifiers)
+        shape_overlay = layer and any(isinstance(modifier, SolidColorOverlayModifier)
+                                      and not modifier.apply_to_outline for modifier in modifiers)
         opacity = target.opacity if layer or not target.opacity_locked else 1.0
         direct_mirror = (not has_stroke and modifiers and isinstance(modifiers[-1], MirrorModifier)
                          and not modifiers[-1].parameter_masks and target.opacity_mask is None
@@ -8763,7 +8771,7 @@ class _CanvasLogic(BrushFeatures, DocumentProjectionFeatures, MultiRasterSelecti
         completed = (cached_stage_output(self, bounds, modifiers, stage_mapping,
             nearest=isinstance(target, RasterObject), required=required,
             request_scope=request_scope, source_key=key)
-            if not has_stroke and not direct_mirror else None)
+            if not has_stroke and not direct_mirror and not shape_overlay else None)
         source_provisional = False
         def capture_region(region):
             revision = getattr(self, "_effect_provisional_revision", 0)
@@ -8792,7 +8800,7 @@ class _CanvasLogic(BrushFeatures, DocumentProjectionFeatures, MultiRasterSelecti
                 self._render_modifier_sources.discard((kind, identifier))
                 source.end()
             return image, revision != getattr(self, "_effect_provisional_revision", 0)
-        if completed is None and not has_stroke and not direct_mirror and thumbnail_scale == 1. and not navigator:
+        if completed is None and not has_stroke and not direct_mirror and not shape_overlay and thumbnail_scale == 1. and not navigator:
             from comic_editor.ui.tile_effects import tile_output
             from comic_editor.render.tile_graph import TileCacheMiss
             def exact_capture(region):
@@ -8809,7 +8817,7 @@ class _CanvasLogic(BrushFeatures, DocumentProjectionFeatures, MultiRasterSelecti
             if not source_provisional:
                 self._modifier_source_cache_put(key, image)
         source_provisional |= navigator
-        if direct_mirror:
+        if direct_mirror and not shape_overlay:
             # Axis dragging reuses the source stages without allocating the gap.
             image, bounds = render_stages(self, image, bounds, modifiers[:-1], stage_mapping, nearest=isinstance(target, RasterObject), request_scope=request_scope, provisional=source_provisional, source_key=key)
             if thumbnail_scale < 1.:
@@ -8829,7 +8837,11 @@ class _CanvasLogic(BrushFeatures, DocumentProjectionFeatures, MultiRasterSelecti
             painter.drawImage(bounds, image)
             painter.restore()
             return
-        if has_stroke:
+        if shape_overlay:
+            from comic_editor.ui.overlay_rendering import shape_overlay_stack
+            image, bounds = shape_overlay_stack(self, target, image, bounds, modifiers, mapping,
+                                                key, request_scope, provisional=source_provisional)
+        elif has_stroke:
             from comic_editor.ui.stroke_rendering import render_stroke_stack
             image, bounds = render_stroke_stack(self, target, image, bounds, modifiers, mapping, key, request_scope,
                                                 provisional=source_provisional)
@@ -9749,7 +9761,7 @@ class _CanvasLogic(BrushFeatures, DocumentProjectionFeatures, MultiRasterSelecti
         painter.restore()
 
     def _draw_selection(self, painter: QPainter) -> None:
-        if self._active_cage() is not None:
+        if self._active_cage() is not None or self._active_texture_modifier() is not None:
             return
         if self.selected_id and not self._solo_content_visible(self.selected_kind, self.selected_id) \
                 and not (len(self.selected_entities) > 1 and self._drawing_selection_raster_targets()):
@@ -11286,6 +11298,8 @@ class _CanvasLogic(BrushFeatures, DocumentProjectionFeatures, MultiRasterSelecti
                 transform_modifier_rig(self, modifier, transform)
 
     def _draw_focal_modifier_handles(self, painter: QPainter) -> None:
+        if self._draw_texture_handles(painter):
+            return
         if self._draw_distort_handles(painter):
             return
         self._draw_tiling_handles(painter)
@@ -13756,6 +13770,8 @@ class _CanvasLogic(BrushFeatures, DocumentProjectionFeatures, MultiRasterSelecti
         if modifiers == Qt.AltModifier:
             return "pan"
         if modifiers == Qt.ShiftModifier:
+            if self._active_texture_modifier() is not None and not self.active_tone_mask_id:
+                return None
             if (
                 self.tool in {
                     ToolKind.MASK_SELECT,
@@ -13784,6 +13800,16 @@ class _CanvasLogic(BrushFeatures, DocumentProjectionFeatures, MultiRasterSelecti
             self.unsetCursor()
             return
         radial_hit = self._radial_handle_hit(widget_point)
+        texture_hit = self._texture_handle_hit(widget_point)
+        if texture_hit is not None:
+            self.setCursor(Qt.SizeAllCursor if texture_hit == "translate" else Qt.PointingHandCursor
+                           if texture_hit == "mode" else Qt.CrossCursor)
+            self.setToolTip("Texture: drag inside to move; outside a corner to rotate. Shift keeps proportions.")
+            return
+        if self._active_texture_modifier() is not None:
+            self.unsetCursor()
+            self.setToolTip("")
+            return
         radial_drag = self._modifier_handle_drag
         if radial_drag and "radial" in radial_drag:
             radial_hit = radial_drag["handle"]
@@ -14125,7 +14151,7 @@ class _CanvasLogic(BrushFeatures, DocumentProjectionFeatures, MultiRasterSelecti
                 event.accept()
                 return
         if event.key() == Qt.Key_Escape and self._modifier_handle_drag and any(
-            key in self._modifier_handle_drag for key in ("tiling", "array", "distort", "radial")
+            key in self._modifier_handle_drag for key in ("tiling", "array", "distort", "radial", "texture")
         ):
             before = self._modifier_handle_drag["before"]
             self._modifier_handle_drag = None
@@ -20308,6 +20334,8 @@ class _CanvasLogic(BrushFeatures, DocumentProjectionFeatures, MultiRasterSelecti
 
     # ---- tool actions --------------------------------------------------
     def _begin_modifier_handle(self, widget_point: QPointF, pressure: float = 1.) -> bool:
+        if self._begin_texture_handle(widget_point):
+            return True
         if self._begin_distort_handle(widget_point, pressure):
             return True
         if self._begin_array_handle(widget_point):
@@ -20352,6 +20380,8 @@ class _CanvasLogic(BrushFeatures, DocumentProjectionFeatures, MultiRasterSelecti
         return True
 
     def _move_modifier_handle(self, widget_point: QPointF, pressure=None) -> bool:
+        if self._move_texture_handle(widget_point):
+            return True
         if self._move_distort_handle(widget_point, pressure):
             return True
         if self._move_array_handle(widget_point):
@@ -20425,7 +20455,7 @@ class _CanvasLogic(BrushFeatures, DocumentProjectionFeatures, MultiRasterSelecti
         after = self.chapter.to_dict()
         if state["before"] != after:
             self.push_model_change(
-                state["before"], after, "Edit distortion" if "distort" in state else "Edit array" if "array" in state else "Edit tiling" if "tiling" in state else "Edit radial blur" if "radial" in state else "Edit mirror" if "mirror" in state else "Edit focal blur"
+                state["before"], after, "Transform texture" if "texture" in state else "Edit distortion" if "distort" in state else "Edit array" if "array" in state else "Edit tiling" if "tiling" in state else "Edit radial blur" if "radial" in state else "Edit mirror" if "mirror" in state else "Edit focal blur"
             )
         self.interactionFinished.emit()
         if "distort" in state and getattr(self, "_mesh_warp_preview_session_id", None) is not None:
@@ -20454,6 +20484,10 @@ class _CanvasLogic(BrushFeatures, DocumentProjectionFeatures, MultiRasterSelecti
         point = self.widget_to_document(widget_point)
         self._press_widget_point = QPointF(widget_point)
         self._press_document_point = QPointF(point)
+        if self._active_texture_modifier() is not None:
+            if not self._begin_texture_handle(widget_point):
+                self._request_object_selection(point, widget_point)
+            return
         if self.tool == ToolKind.BRUSH:
             self._begin_paint_brush(point, pressure)
             return

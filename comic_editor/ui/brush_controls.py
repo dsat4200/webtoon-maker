@@ -100,25 +100,33 @@ class BrushPresetCombo(QComboBox):
     def __init__(self, settings, parent=None):
         super().__init__(parent)
         self.settings = settings
-        self._color = None
-        self._sub_color = None
-        self.setIconSize(QSize(132, 42))
-        self.view().setMinimumWidth(340)
-        self._preview_indices = []
+        from .brush_thumbnail_store import BrushThumbnailStore
+        self.thumbnails = BrushThumbnailStore(self)
+        self.thumbnails.changed.connect(self._thumbnail_changed)
+        # Grid tiles draw full thumbnails themselves; keep the closed field
+        # at the normal text-control height inside the narrow sidebar.
+        self.setIconSize(QSize(16, 16))
+        self._grid = None
         self._popup_open = False
-        self._preview_timer = QTimer(self)
-        self._preview_timer.setSingleShot(True)
-        self._preview_timer.timeout.connect(self._prepare_next_preview)
+        self.thumbnails.sync(self.settings.brush_presets)
 
     def set_colors(self, color, sub_color):
-        preview_queue().cancel(self)
-        self._color = QColor(color)
-        self._sub_color = QColor(sub_color)
+        # Preset thumbnails use fixed ink. The live preview follows the palette.
+        pass
+
+    def refresh_thumbnails(self):
+        self.thumbnails.sync(self.settings.brush_presets)
         for index in range(self.count()):
-            self.setItemIcon(index, QIcon())
-        if self._popup_open:
-            self._preview_indices=list(range(self.count()))
-            self._preview_timer.start(0)
+            self.setItemIcon(index, self.thumbnails.icon(self.itemData(index)))
+        if self._grid is not None:
+            self._grid.refresh()
+
+    def _thumbnail_changed(self, key):
+        for index in range(self.count()):
+            if self.thumbnails.keys.get(self.itemData(index)) == key:
+                self.setItemIcon(index, self.thumbnails.icon(self.itemData(index)))
+        if self._grid is not None:
+            self._grid.thumbnail_changed(key)
 
     def paintEvent(self, event):
         # Only the popup contains stroke thumbnails. Keep the selected name
@@ -131,52 +139,25 @@ class BrushPresetCombo(QComboBox):
         painter.drawControl(QStyle.CE_ComboBoxLabel, option)
 
     def showPopup(self):
-        # Generate only when requested; opening the application never renders
-        # every brush in a potentially large imported collection.
-        self._preview_indices = list(range(self.count()))
+        from .brush_preset_grid import BrushPresetGrid
+        if self._grid is None:
+            self._grid = BrushPresetGrid(self)
+            self._grid.chosen.connect(self.setCurrentIndex)
+            self._grid.closed.connect(self._popup_closed)
         self._popup_open = True
-        super().showPopup()
-        self._preview_timer.start(0)
+        self._grid.open()
 
     def hidePopup(self):
+        if self._grid is not None:
+            self._grid.hide()
+        self._popup_closed()
+
+    def _popup_closed(self):
         self._popup_open = False
-        preview_queue().cancel(self)
-        self._preview_timer.stop()
-        self._preview_indices = []
         super().hidePopup()
 
-    def _prepare_next_preview(self):
-        if not self._popup_open or not self._preview_indices:
-            return
-        index = self._preview_indices.pop(0)
-        definition = next((data for data in self.settings.brush_presets
-                           if data["id"] == self.itemData(index)), None)
-        if definition is not None:
-            try:
-                preview_queue().submit(self,BrushDefinition.from_dict(definition),132,42,
-                    self._color,self._sub_color,context=(index,self.itemData(index)),priority=1)
-                return
-            except Exception:
-                self.setItemIcon(index, QIcon())
-        if self._preview_indices:
-            self._preview_timer.start(0)
-
-    def _preview_is_visible(self):
-        return self._popup_open and self.isVisible()
-
-    def _preview_ready(self,pixmap,error,context):
-        if self._popup_open and context:
-            index,identifier=context
-            if index<self.count() and self.itemData(index)==identifier:
-                self.setItemIcon(index,QIcon(pixmap) if pixmap is not None else QIcon())
-            if self._preview_indices:
-                self._preview_timer.start(0)
-
     def hideEvent(self,event):
-        self._popup_open=False
-        self._preview_timer.stop()
-        self._preview_indices=[]
-        preview_queue().cancel(self)
+        self.hidePopup()
         super().hideEvent(event)
 
 
@@ -991,8 +972,17 @@ class BrushControls(QWidget):
         layout.addWidget(self.preview)
         self.edit_button = QPushButton("Brush settings…", self)
         self.import_button = QPushButton("Import .sut…", self)
+        self.library_import_button = QPushButton("CSP library…", self)
+        self.library_import_button.setObjectName("importCspLibraryBrush")
+        self.library_import_button.setToolTip("Import a brush from your local Clip Studio Paint library.")
         layout.addWidget(self.edit_button)
-        layout.addWidget(self.import_button)
+        import_row = QHBoxLayout()
+        import_row.setSpacing(4)
+        for button in (self.import_button, self.library_import_button):
+            button.setMinimumWidth(0)
+            button.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
+            import_row.addWidget(button, 1)
+        layout.addLayout(import_row)
         self.duplicate_button = QPushButton("Duplicate preset…", self)
         layout.addWidget(self.duplicate_button)
         self.compatibility = QLabel(self)
@@ -1007,6 +997,7 @@ class BrushControls(QWidget):
         self.opacity_slider.sliderReleased.connect(self._commit_slider_change)
         self.edit_button.clicked.connect(self._edit)
         self.import_button.clicked.connect(self._import)
+        self.library_import_button.clicked.connect(self._import_library)
         self.duplicate_button.clicked.connect(self._duplicate)
         self.refresh()
         self.set_preview_colors(QColor(getattr(settings, "primary_color", settings.brush_color)),
@@ -1022,6 +1013,7 @@ class BrushControls(QWidget):
             self.presets.clear()
             for data in self.settings.brush_presets:
                 self.presets.addItem(data["name"], data["id"])
+            self.presets.refresh_thumbnails()
             self.presets.setCurrentIndex(max(0, self.presets.findData(self.settings.active_brush_id)))
             self.size.setValue(self.settings.brush_size_px)
             self.opacity.setValue(self.settings.brush_opacity * 100)
@@ -1139,21 +1131,33 @@ class BrushControls(QWidget):
             return
         try:
             from comic_editor.core.sut_import import import_sut
-            from comic_editor.core.brush_units import has_physical_lengths, with_import_dpi
-            definition = import_sut(path)
-            if has_physical_lengths(definition):
-                dpi, accepted = QInputDialog.getDouble(
-                    self, "Brush size resolution",
-                    "This brush uses millimeters. Enter your canvas resolution to convert its size to pixels.\nResolution (DPI):",
-                    300., 1., 9600., 2)
-                if not accepted:
-                    return
-                if dpi != 300.:
-                    definition = with_import_dpi(definition,dpi)
-            definition = self._accept_import(definition)
+            self._finish_import(import_sut(path))
         except (OSError, ValueError, TypeError) as error:
             QMessageBox.warning(self, "Brush import failed", str(error))
-            return
+
+    def _import_library(self):
+        from .csp_library_dialog import CspLibraryDialog
+        dialog = CspLibraryDialog(self)
+        try:
+            if dialog.exec() == QDialog.Accepted and dialog.definition is not None:
+                self._finish_import(dialog.definition)
+        except (OSError, ValueError, TypeError) as error:
+            QMessageBox.warning(self, "Brush import failed", str(error))
+        finally:
+            dialog.deleteLater()
+
+    def _finish_import(self, definition):
+        from comic_editor.core.brush_units import has_physical_lengths, with_import_dpi
+        if has_physical_lengths(definition):
+            dpi, accepted = QInputDialog.getDouble(
+                self, "Brush size resolution",
+                "This brush uses millimeters. Enter your canvas resolution to convert its size to pixels.\nResolution (DPI):",
+                300., 1., 9600., 2)
+            if not accepted:
+                return
+            if dpi != 300.:
+                definition = with_import_dpi(definition,dpi)
+        definition = self._accept_import(definition)
         if definition.warnings:
             message = QMessageBox(self)
             message.setWindowTitle("Brush imported")

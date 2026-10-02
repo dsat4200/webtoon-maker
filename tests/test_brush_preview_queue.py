@@ -80,7 +80,7 @@ def cooperative(qapp,monkeypatch):
                 state['time']+=.006
                 state['steps'].append((brush.name,i))
                 yield None
-            image=QImage(3,3,QImage.Format_ARGB32);image.fill(QColor('red' if brush.name=='new' else 'blue'))
+            image=QImage(args[0],args[1],QImage.Format_ARGB32);image.fill(QColor('red' if brush.name=='new' else 'blue'))
             yield image
         finally:state['closed'].append(brush.name)
     monkeypatch.setattr(queue_module,'iter_brush_preview',slow)
@@ -141,18 +141,24 @@ def test_only_one_iterator_retains_raster_work_and_hiding_discards_it(cooperativ
     a.deleteLater();b.deleteLater()
 
 
-def test_popup_hide_cancels_in_progress_thumbnail(qapp,cooperative,monkeypatch):
+def test_popup_hide_keeps_prerendering_for_the_next_open(qapp,cooperative,monkeypatch,tmp_path):
     queue,state=cooperative
-    from comic_editor.ui import brush_controls
-    monkeypatch.setattr(brush_controls,'preview_queue',lambda:queue)
+    from comic_editor.ui import brush_thumbnail_store
+    from comic_editor.core import settings as settings_module
+    monkeypatch.setattr(brush_thumbnail_store,'preview_queue',lambda:queue)
+    monkeypatch.setattr(settings_module,'settings_path',lambda:tmp_path/'settings.json')
     settings=EditorSettings(brush_presets=[BrushDefinition(name='old').to_dict()])
     combo=BrushPresetCombo(settings);combo.addItem('old',settings.brush_presets[0]['id'])
-    combo.show();combo.showPopup();combo._prepare_next_preview()
+    combo.show();combo.thumbnails._prepare_next();combo.showPopup()
     queue._tick();queue.timer.stop()
-    assert state['started']==['old']
+    assert len(state['started'])==1
     combo.hidePopup()
-    assert state['closed']==['old'] and queue.active is None and not queue.pending
-    assert not combo._preview_indices
+    assert not state['closed'] and queue.active is not None
+    drain(queue)
+    assert len(state['closed'])==1 and combo.thumbnails.pixmaps
+    started=list(state['started'])
+    combo.showPopup();combo.hidePopup()
+    assert state['started']==started
     combo.close();combo.deleteLater()
 
 

@@ -7,7 +7,7 @@ from PySide6.QtCore import QRectF, Qt
 from PySide6.QtGui import QImage, QPainter, QTransform
 from comic_editor.core.models import (ArrayModifier, MirrorModifier, RadialBlurModifier,
     CageTransformModifier, PosterizeModifier, HalftoneModifier, PixelateModifier,
-    OutlineModifier, DistortModifier, BlurModifier)
+    OutlineModifier, DistortModifier, BlurModifier, TextureModifier)
 from comic_editor.core.color_smoothing import simplify_padding
 from comic_editor.core.models import KuwaharaModifier, DitheringModifier, SharpnessModifier
 from comic_editor.core.effect_geometry import effect_bounds, reflection_transform, array_indices, array_transform, array_input_bounds, outline_blur_padding
@@ -129,7 +129,8 @@ def _stage_plan(canvas, bounds, modifiers, local_to_world, source_identity, near
                 if padding is not None:
                     needed = needed.adjusted(-padding, -padding, padding, padding)
                     continue
-            if (isinstance(modifiers[index], BlurModifier) and region_requests_enabled(canvas)
+            if (isinstance(modifiers[index], TextureModifier)
+                    or isinstance(modifiers[index], BlurModifier) and region_requests_enabled(canvas)
                     or isinstance(modifiers[index], (KuwaharaModifier, SharpnessModifier, DitheringModifier))
                     or isinstance(modifiers[index], OutlineModifier) and modifiers[index].style == "brush"):
                 # The existing blur pyramid is phased by the full image
