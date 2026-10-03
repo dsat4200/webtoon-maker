@@ -7,9 +7,9 @@ from PySide6.QtCore import QPointF, QRectF, Qt
 from PySide6.QtGui import QColor, QImage, QPainter, QTransform
 
 from comic_editor.core.models import (
-    BlurModifier, BoundGeometry, ChapterDocument, DistortModifier, HalftoneModifier,
+    BlurModifier, BoundGeometry, CageTransformModifier, ChapterDocument, DistortModifier, HalftoneModifier,
     ImageObject, MirrorModifier, OutlineModifier, ParameterMaskBinding,
-    PixelateModifier, RasterObject, ToneMask, WobbleModifier,
+    PixelateModifier, RadialBlurModifier, RasterObject, ToneMask, WobbleModifier,
 )
 from comic_editor.core.settings import EditorSettings
 from comic_editor.core.tiles import TileStore
@@ -17,6 +17,16 @@ from comic_editor.ui.canvas import CanvasWidget
 from comic_editor.ui.effect_pipeline import render_stages
 from comic_editor.ui.preview import ChapterPreview
 from comic_editor.ui.thumbnail_effects import capture_scale, scaled_modifiers
+from comic_editor.render.pixels import (
+    FLOAT_PIXELS, LEGACY_PIXELS, current_contract, pixel_scope,
+    premultiplied_pixels, working_image,
+)
+
+
+@pytest.fixture(params=[LEGACY_PIXELS, FLOAT_PIXELS], ids=["rgba8", "float"])
+def spatial_precision(request):
+    with pixel_scope(request.param):
+        yield request.param
 
 
 @pytest.fixture
@@ -203,10 +213,94 @@ def test_thumbnail_scaling_copies_bindings_and_preserves_world_axes(canvas):
     assert outline.to_dict() == original
     bounds = QRectF(1000, 2000, 3000, 4000)
     assert capture_scale(canvas, bounds, [outline, mirror]) < 1
-    for unsupported in (WobbleModifier(), DistortModifier(modifier_type="distort_twirl"), BlurModifier(mode="focal")):
+    assert capture_scale(canvas, bounds, [DistortModifier(modifier_type="distort_twirl")]) < 1
+    for unsupported in (WobbleModifier(), BlurModifier(mode="focal")):
         assert capture_scale(canvas, bounds, [unsupported]) == 1
     canvas._effect_preview_channel = "canvas"
     assert capture_scale(canvas, bounds, [outline, mirror]) == 1
+
+
+@pytest.mark.parametrize("kind,effect", [
+    (kind, effect) for kind in ("image", "raster")
+    for effect in ("twirl", "mesh", "smudge", "radial", "generic")
+] + [("image", "cage")])
+def test_spatial_thumbnail_bounds_mask_work_and_preserves_native_output(canvas, monkeypatch, kind, effect, spatial_precision):
+    chapter = canvas.chapter
+    parent = chapter.add_layer(chapter.root_page_ids[0], "Parent", BoundGeometry.rectangle(0, 0, 1200, 900))
+    parent.fill_color, parent.border_width = None, 0
+    parent.translate_x, parent.translate_y = 25, 40
+    image = source_image()
+    if spatial_precision.floating:
+        pixels = premultiplied_pixels(image)
+        pixels[..., :3] *= 1.7  # Native HDR values cannot pass through RGBA8.
+        image = working_image(pixels)
+    if kind == "image":
+        obj = chapter.add_object(parent.layer_id, ImageObject(x=100, y=200, pixel_width=640, pixel_height=240))
+        canvas.images.put_decoded(obj.object_id, "colors.png", b"", image)
+    else:
+        obj = chapter.add_object(parent.layer_id, RasterObject(x=100, y=200, interaction_rect=(0, 0, 640, 240)))
+        canvas.tiles.replace_object_tiles(obj.object_id, {
+            (x, 0): image.copy(x*256, 0, 256, 256) for x in range(3)
+        })
+    world_frame = (125, 240, 640, 240)
+    if effect == "cage":
+        modifier = CageTransformModifier(frame=world_frame, columns=2, rows=2,
+            points=[(125, 240), (765, 255), (125, 480), (765, 465)], smoothness=0)
+    elif effect == "radial":
+        modifier = RadialBlurModifier(center=(445, 360), angle=15)
+    elif effect == "generic":
+        modifier = OutlineModifier(thickness=8)
+    else:
+        parameters = {"interpolation": "bilinear", "edges": "transparent"}
+        if effect == "twirl":
+            parameters["angle"] = 30
+        elif effect == "mesh":
+            parameters.update(rows=2, columns=2, smoothness=0)
+        if effect == "smudge":
+            from comic_editor.core.smudge import default_tool_settings, validate_strokes
+            parameters["strokes"] = validate_strokes([{"id": "stroke", "points": [
+                {"position": point, "handle": point, "point_type": "vector",
+                 "radius": 25, "flow": 100, "strength": 100}
+                for point in [(250, 350), (650, 350)]
+            ], "pressure_settings": default_tool_settings()}])
+        modifier = DistortModifier(modifier_type="distort_" + ("mesh_warp" if effect == "mesh" else effect),
+            frame=world_frame, center=(445, 360), radius=200, parameters=parameters)
+    mask = ToneMask()
+    chapter.masks[mask.mask_id] = mask
+    for x in range(4):
+        for y in range(3):
+            tile = QImage(256, 256, QImage.Format_ARGB32_Premultiplied)
+            tile.fill(QColor("white"))
+            canvas.tiles.set_tile(mask.mask_id, (x, y), tile)
+    modifier.parameter_masks["intensity"] = ParameterMaskBinding(mask.mask_id, 0, 100)
+    obj.opacity_mask = ParameterMaskBinding(mask.mask_id, 0, 1)
+    chapter.add_modifier(modifier, [("object", obj.object_id)])
+    def exact():
+        canvas._interactive_render = False
+        canvas._effect_preview_channel = "canvas"
+        image = QImage(chapter.width, chapter.height, current_contract().image_format)
+        canvas.render_preview(image)
+        return image
+    expected = exact()
+    model = chapter.to_dict()
+    canvas._modifier_source_cache.clear()
+    canvas._modifier_source_cache_bytes = 0
+    canvas._modifier_render_cache.clear()
+    canvas._modifier_render_cache_bytes = 0
+    fields = []
+    original = canvas.render_tone_mask_field
+    def field(mask_id, width, height, *args, **kwargs):
+        fields.append(width*height)
+        return original(mask_id, width, height, *args, **kwargs)
+    monkeypatch.setattr(canvas, "render_tone_mask_field", field)
+    result = preview(canvas)
+    assert not result.isNull()
+    assert fields and max(fields) < 100_000
+    compact = [image for key, image in canvas._modifier_source_cache.items() if key[0] == "navigator-source"]
+    assert compact and all(max(image.width(), image.height()) <= 258 for image in compact)
+    assert chapter.to_dict() == model, "Thumbnail scaling changed source rigs or mask bindings"
+    assert canvas._effect_jobs.submitted == 0
+    assert exact() == expected, "Navigator drafts contaminated native output"
 
 
 @pytest.mark.parametrize("kind", ["image", "raster"])

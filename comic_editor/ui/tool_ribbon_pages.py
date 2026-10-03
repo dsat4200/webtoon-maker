@@ -1247,7 +1247,7 @@ class TextObjectControls(QObject):
         after = self.canvas.chapter.to_dict()
         if before != after:
             self.canvas.push_model_change(before, after, label)
-            self.canvas.documentChanged.emit(None)
+            self.canvas.documentChanged.emit(self.canvas._text_visual_dirty(self._selected(), before))
             self.canvas.update()
             self.objectChanged.emit()
 

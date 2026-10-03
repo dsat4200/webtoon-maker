@@ -6,6 +6,62 @@ from comic_editor.core.models import TextObject, object_from_dict
 
 
 class TextFeatures:
+    @staticmethod
+    def _text_dirty_union(first: QRectF, second: QRectF) -> QRectF:
+        # Empty denotes a full invalidation and must survive a frame resize.
+        return QRectF() if first.isEmpty() or second.isEmpty() else first.united(second)
+
+    def _text_frame_dirty(self, kind, identifier):
+        if kind == "object":
+            return self._text_visual_dirty(self.chapter.objects.get(identifier))
+        layer = self.chapter.layers.get(identifier)
+        if layer is None:
+            return QRectF()
+        dirty = QRectF()
+        for ref in layer.children:
+            child_dirty = self._text_visual_dirty(self.chapter.objects.get(ref.entity_id))
+            if child_dirty.isEmpty():
+                return QRectF()
+            dirty = dirty.united(child_dirty)
+        return dirty
+
+    def _text_visual_dirty(self, obj: TextObject | None, before: dict | None = None) -> QRectF:
+        """Invalidate the clipped text frame and its existing effect dependants."""
+        if not isinstance(obj, TextObject) or self.chapter is None:
+            return QRectF()
+        world = self.object_world_rect(obj.object_id)
+        if world is None:
+            return QRectF()
+        if before is not None:
+            record = next((item for item in before["objects"]
+                           if item["id"] == obj.object_id), None)
+            if record is not None:
+                original = object_from_dict(record)
+                quad = (self._rect_quad(self._strict_text_rect(original))
+                        if original.layout_mode == "strict" else self._text_quad(original))
+                mapping = self.layer_world_transform(original.parent_layer_id)
+                world = world.united(mapping.map(QPolygonF([QPointF(*p) for p in quad])).boundingRect())
+        # Text is clipped to this frame even when its glyph layout changes.
+        # Existing nonlocal/mask/linked-color rules conservatively fall back
+        # to the whole document; finite effect support is expanded in place.
+        from comic_editor.core.models import (
+            BlurModifier, BrightnessContrastModifier, CurvesModifier,
+            HueSaturationLightnessModifier, OutlineModifier, SolidColorOverlayModifier,
+        )
+        owners = [obj, *self.chapter.ancestor_layers(obj.parent_layer_id)]
+        finite = (BlurModifier, BrightnessContrastModifier, CurvesModifier,
+                  HueSaturationLightnessModifier, OutlineModifier, SolidColorOverlayModifier)
+        if any(not isinstance(modifier, finite)
+                or isinstance(modifier, OutlineModifier) and modifier.style != "solid"
+                for owner in owners for modifier in self._active_modifier_instances(owner.modifier_ids)):
+            return QRectF()
+        dirty = self.modifier_expanded_dirty(obj.object_id, world)
+        if dirty.contains(QRectF(0, 0, self.chapter.width, self.chapter.height)):
+            # Empty signal rectangles invalidate every retained region,
+            # including overflow and remote mask/color dependants.
+            return QRectF()
+        return dirty.adjusted(-2, -2, 2, 2)
+
     def _init_text_features(self):
         self._text_placement = None
         self._free_text_drag = None
@@ -372,6 +428,7 @@ class TextFeatures:
                 for index in (edge, (edge+1)%4): quad[index] = (QPointF(*quad[index])+delta).toTuple()
         if not self._quad_is_valid(quad):
             return
+        dirty = self._text_frame_dirty(state["kind"], state["id"])
         if mode == "translate":
             previous = state.get("result_quad", state["quad"])
             change = self._quad_to_quad_transform(previous, quad)
@@ -401,7 +458,7 @@ class TextFeatures:
             entity.transform_quad = [parent_inverse.map(QPointF(*p)).toTuple() for p in quad]
             entity.translate_x = entity.translate_y = 0.
         state["result_quad"] = quad
-        self.documentChanged.emit(None)
+        self.documentChanged.emit(self._text_dirty_union(dirty, self._text_frame_dirty(state["kind"], state["id"])))
         self.update()
 
     def _finish_free_text_drag(self):
@@ -411,8 +468,10 @@ class TextFeatures:
             return False
         if state["mode"] != "pivot":
             if state["mode"] != "translate" and "result_quad" in state and not (state["behavior"] == "bounds" and state["mode"] == "handle"):
+                dirty = self._text_frame_dirty(state["kind"], state["id"])
                 change = self._quad_to_quad_transform(state["quad"], state["result_quad"])
                 self._transform_single_target_focal_modifiers(state["kind"], state["id"], change)
+                self.documentChanged.emit(self._text_dirty_union(dirty, self._text_frame_dirty(state["kind"], state["id"])))
             after = self.chapter.to_dict()
             if state["before"] != after:
                 self.push_model_change(state["before"], after, "Transform text bounds" if state["behavior"] == "bounds" else "Stretch text")

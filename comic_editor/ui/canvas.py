@@ -4971,6 +4971,10 @@ class _CanvasLogic(LassoBrushFeatures, BrushFeatures, DocumentProjectionFeatures
             return
         if self._render_tiled_target(painter, layer, parent_opacity, visible_world):
             return
+        if (self._interactive_render
+                and getattr(self, "_effect_preview_channel", "canvas") == "navigator"):
+            self._render_mirror_target(painter, layer, parent_opacity, visible_world)
+            return
         if any(isinstance(m, SolidColorOverlayModifier) for m in self._active_modifier_instances(layer.modifier_ids)):
             self._render_mirror_target(painter, layer, parent_opacity, visible_world)
             return
@@ -8544,7 +8548,7 @@ class _CanvasLogic(LassoBrushFeatures, BrushFeatures, DocumentProjectionFeatures
         if any(isinstance(m, (MirrorModifier, ArrayModifier, RadialBlurModifier, CageTransformModifier, StrokeModifier, HalftoneModifier, PixelateModifier, DistortModifier, KuwaharaModifier, DitheringModifier, SharpnessModifier, SolidColorOverlayModifier)) for m in self._active_modifier_instances(obj.modifier_ids)):
             self._render_mirror_target(painter, obj, parent_opacity, local_visible)
             return
-        if (isinstance(obj, RasterObject) and self._interactive_render
+        if (self._interactive_render
                 and getattr(self, "_effect_preview_channel", "canvas") == "navigator"):
             self._render_mirror_target(painter, obj, parent_opacity, local_visible)
             return
@@ -25047,7 +25051,7 @@ class _CanvasLogic(LassoBrushFeatures, BrushFeatures, DocumentProjectionFeatures
         after = self.chapter.to_dict()
         if before != after:
             self.push_model_change(before, after, label)
-            self.documentChanged.emit(QRectF())
+            self.documentChanged.emit(self._text_visual_dirty(self._selected_text_for_gizmos(), before))
         self.update()
         self.interactionFinished.emit()
 
@@ -25190,7 +25194,7 @@ class _CanvasLogic(LassoBrushFeatures, BrushFeatures, DocumentProjectionFeatures
                 min(10.0, round((state["start_value"] + steps * 0.1) * 10) / 10),
             )
         setattr(obj, state["key"], value)
-        self.documentChanged.emit(QRectF())
+        self.documentChanged.emit(self._text_visual_dirty(obj))
         self.update()
 
     def _finish_text_property_drag(self) -> bool:
@@ -25210,10 +25214,11 @@ class _CanvasLogic(LassoBrushFeatures, BrushFeatures, DocumentProjectionFeatures
         if state is None or self.chapter is None:
             return False
         obj = self.chapter.objects.get(state["object_id"])
+        dirty = self._text_visual_dirty(obj)
         if isinstance(obj, TextObject):
             setattr(obj, state["key"], state["start_value"])
         self.unsetCursor()
-        self.documentChanged.emit(QRectF())
+        self.documentChanged.emit(self._text_dirty_union(dirty, self._text_visual_dirty(obj)))
         self.update()
         self.interactionFinished.emit()
         return True
@@ -25353,6 +25358,7 @@ class _CanvasLogic(LassoBrushFeatures, BrushFeatures, DocumentProjectionFeatures
         if obj is None:
             return
         if self._strict_margin_edge is not None:
+            dirty = self._text_visual_dirty(obj)
             parent = self.chapter.layers[obj.parent_layer_id]
             local = self._layer_world_to_local(obj.parent_layer_id, point)
             left, top, width, height = parent.bound.bbox()
@@ -25364,7 +25370,7 @@ class _CanvasLogic(LassoBrushFeatures, BrushFeatures, DocumentProjectionFeatures
             obj.margin = max(
                 0.0, min(candidates[self._strict_margin_edge], min(width, height) / 2 - 1)
             )
-            self.documentChanged.emit(QRectF())
+            self.documentChanged.emit(self._text_dirty_union(dirty, self._text_visual_dirty(obj)))
             self.update()
             return
         hit = self._text_position_at(obj, point, require_inside=False)
@@ -25385,7 +25391,7 @@ class _CanvasLogic(LassoBrushFeatures, BrushFeatures, DocumentProjectionFeatures
         self._text_local_history = []
         self._text_caret_visible = True
         self._text_caret_timer.start()
-        self._invalidate_scene_cache()
+        self._invalidate_scene_cache(projection=False)
         self.update()
 
     def _commit_text_edit(self) -> None:
@@ -25402,11 +25408,10 @@ class _CanvasLogic(LassoBrushFeatures, BrushFeatures, DocumentProjectionFeatures
         self._strict_margin_edge = None
         self._strict_margin_start = None
         self._text_local_history = []
-        self._invalidate_scene_cache()
+        self._invalidate_scene_cache(projection=False)
         if before is not None and before != after:
             self.push_model_change(before, after, "Edit text")
-            self.hierarchyChanged.emit()
-            self.documentChanged.emit(QRectF())
+            self.documentChanged.emit(self._text_visual_dirty(self._editing_text_object(), before))
             self.interactionFinished.emit()
         self.update()
 
@@ -25431,7 +25436,7 @@ class _CanvasLogic(LassoBrushFeatures, BrushFeatures, DocumentProjectionFeatures
         replace_text_range(obj, start, end, value)
         self._text_cursor_position = start + len(value)
         self._text_selection_anchor = self._text_cursor_position
-        self.documentChanged.emit(QRectF())
+        self.documentChanged.emit(self._text_visual_dirty(obj))
         self.update()
 
     def _handle_text_key(self, event) -> bool:
@@ -25462,7 +25467,7 @@ class _CanvasLogic(LassoBrushFeatures, BrushFeatures, DocumentProjectionFeatures
                 obj.text, obj.color_runs, self._text_cursor_position, self._text_selection_anchor = (
                     self._text_local_history.pop()
                 )
-                self.documentChanged.emit(QRectF())
+                self.documentChanged.emit(self._text_visual_dirty(obj))
                 self.update()
             else:
                 position, anchor = self._text_cursor_position, self._text_selection_anchor

@@ -13,6 +13,7 @@ BUGS
 - [x] texture modifier
 - [x] opening a project should return to where you were before (not force you to scroll down)
 - when a blender image is added, it should be added to the center of the existing viewport view, and be a child of the current active shape
+- make it so that when switching between blender image objects, it doesn't switch, nor does it ask to switch, the currently active blender comic view
 
 ## review the fill tool, brush tools
 

@@ -95,6 +95,7 @@ class ChapterPreview(QWidget):
             "_selection_transform_mode", "_fill_gesture_active", "_cage_drag",
             "_modifier_handle_drag", "_mask_gradient_drag", "_text_property_drag",
             "_shape_property_drag", "_active_gradient_control",
+            "_text_editing", "_text_dragging", "_free_text_drag", "_text_placement",
         )):
             return True
         wheel = getattr(self.canvas, "_wheel_zoom_timer", None)

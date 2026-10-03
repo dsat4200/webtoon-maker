@@ -91,6 +91,8 @@ def test_paint_does_not_render_dirty_chapter_and_idle_timer_catches_up(navigator
     ("_text_property_drag", {"property": "size"}),
     ("_shape_property_drag", {"property": "width"}),
     ("_active_gradient_control", ("point", "end")),
+    ("_text_editing", True), ("_text_dragging", True),
+    ("_free_text_drag", {"mode": "handle"}), ("_text_placement", {"new": True}),
 ])
 def test_held_gesture_defers_even_without_further_packets(navigator, field, value):
     canvas, preview = navigator

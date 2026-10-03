@@ -8,6 +8,55 @@ rendering.
 
 ## Measurements
 
+### Text editing capture, 3 October 2026
+
+`text slowness.json` records 70.23 seconds in a 1080 × 54896 chapter with 97
+layers, 153 objects, 87 effects and 23 masks. Its 131 navigator renders consumed
+42.41 seconds of inclusive wall time. Thirteen of the seventeen stalls recorded
+in Text Edit had navigator stacks; the longest gap was 5.73 seconds in smudge
+processing. Glyph drawing/layout accounted for only four leaf stack samples.
+These sampled stacks identify callers, not native internals, and overlapping
+phase totals must not be added.
+
+Typing previously emitted an empty dirty rectangle on every change, discarded
+all document tiles on session entry/commit, and emitted a hierarchy change when
+committing. The navigator rebuilt the entire chapter. Spatial thumbnail stacks
+also retained full-size input captures and mask fields before reducing their
+output. Text now invalidates its affected frames and finite effect support;
+nonlocal/mask/color dependencies retain conservative full invalidation. Text
+sessions defer navigator work until commit. Compact navigator captures use the
+existing staged renderer, keeping spatial rigs in document coordinates and
+excluding drafts from exact disk caching.
+
+A read-only replay of the saved chapter, with monitoring disabled and Windows
+Qt's offscreen raster canvas, measured:
+
+| Work | Before | After |
+| --- | ---: | ---: |
+| Text commit plus navigator refresh | 8782 ms | 74 ms |
+| Navigator refresh attempted during typing | 101 ms | 0.020 ms (deferred) |
+| Initial complete navigator build | 10253 ms | 4869 ms |
+| Largest sampled mask field | 29,149,201 pixels | 753,424 pixels |
+| Total sampled mask pixels across replay | 467,723,034 | 5,383,414 |
+
+The replay performed one cold build, one refresh attempt while editing, then a
+commit. It rendered 59 bands before and 30 afterward and submitted no exact
+effect jobs. The original chapter SHA-256 remained unchanged. Runs were separate
+processes; file-system caches and other machine work affect timings. These are
+the navigator workload, not end-to-end GPU key-to-display latency. Initial source
+decoding, unsupported/linked-mask captures and cold scene work remain measurable:
+the updated first build still took about five seconds, with a 557 ms maximum band.
+
+Regression checks compare native RGBA8 and float/HDR pixels before/after thumbnail rendering for
+masked image/raster twirl, mesh, smudge, radial, cage and generic effects. Text
+checks compare retained and fresh exact frames for transformed strict/free text,
+ancestor blur/outlines, local/command undo, layout properties and Bounds resizing;
+they also verify distant tile retention and full invalidation for nonlocal
+dependencies. Reproduction and raw measurements are under
+`.artifacts/text-performance-20261003/`.
+The affected text, navigator, projection, masking, translation and disk-cache
+suites passed 352 focused tests. Whitespace validation passed.
+
 Representative Windows measurements from this workspace, in milliseconds.
 These measure editor interaction latency; a background operation may take
 longer to finish. Performance varies with artwork, hardware, and other work.
