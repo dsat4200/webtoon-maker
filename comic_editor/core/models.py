@@ -1932,6 +1932,9 @@ class SolidColorOverlayModifier:
     apply_to_outline: bool = False
     parameter_masks: dict[str, ParameterMaskBinding] = field(default_factory=dict)
 
+    def parameter_ranges(self):
+        return {"intensity": (0., 100.)}
+
     def validate(self):
         self.name = str(self.name or ("Texture" if self.modifier_type == "texture" else "Solid color overlay"))
         self.intensity = float(self.intensity)
@@ -1943,7 +1946,7 @@ class SolidColorOverlayModifier:
         if self.blend_mode not in {mode for mode, _ in OVERLAY_BLEND_MODES}:
             raise ValueError("Unknown overlay blend mode")
         self.color = canonical_argb(self.color)
-        _validate_parameter_masks(self.parameter_masks, {"intensity": (0., 100.)})
+        _validate_parameter_masks(self.parameter_masks, self.parameter_ranges())
 
     def to_dict(self):
         self.validate()
@@ -1964,9 +1967,22 @@ class TextureModifier(SolidColorOverlayModifier):
     texture_data: str = ""
     texture_quad: list[tuple[float, float]] | None = None
     transform_mode: str = "uniform"
+    hue: float = 0.0
+    saturation: float = 0.0
+    lightness: float = 0.0
+
+    def parameter_ranges(self):
+        return {**super().parameter_ranges(), "hue": (-180., 180.),
+                "saturation": (-100., 100.), "lightness": (-100., 100.)}
 
     def validate(self):
         super().validate()
+        for attribute in ("hue", "saturation", "lightness"):
+            value = float(getattr(self, attribute))
+            if not math.isfinite(value):
+                raise ValueError("Texture color adjustments must be finite")
+            low, high = self.parameter_ranges()[attribute]
+            setattr(self, attribute, max(low, min(high, value)))
         self.texture_name = str(self.texture_name)
         self.texture_category = str(self.texture_category)
         if not isinstance(self.texture_data, str):
@@ -1991,7 +2007,8 @@ class TextureModifier(SolidColorOverlayModifier):
         return dict(super().to_dict(), texture_name=self.texture_name,
                     texture_category=self.texture_category, texture_data=self.texture_data,
                     texture_quad=[list(point) for point in self.texture_quad] if self.texture_quad is not None else None,
-                    transform_mode=self.transform_mode)
+                    transform_mode=self.transform_mode, hue=self.hue,
+                    saturation=self.saturation, lightness=self.lightness)
 
 
 ModifierInstance = HueSaturationLightnessModifier | BrightnessContrastModifier | CurvesModifier | BlurModifier | OutlineModifier | MirrorModifier | ArrayModifier | RadialBlurModifier | CageTransformModifier | PosterizeModifier | PosterizeValueModifier | TilingModifier | ScreamModifier | WobbleModifier | DotDashModifier | HalftoneModifier | PixelateModifier | DistortModifier | KuwaharaModifier | DitheringModifier | SharpnessModifier | TextureModifier | SolidColorOverlayModifier
@@ -2018,7 +2035,9 @@ def modifier_from_dict(data: dict[str, Any]) -> ModifierInstance:
             result = TextureModifier(**common, **values,
                 texture_name=str(data.get("texture_name", "")), texture_category=str(data.get("texture_category", "")),
                 texture_data=data.get("texture_data", ""), texture_quad=data.get("texture_quad"),
-                transform_mode=str(data.get("transform_mode", "uniform")))
+                transform_mode=str(data.get("transform_mode", "uniform")),
+                hue=float(data.get("hue", 0.)), saturation=float(data.get("saturation", 0.)),
+                lightness=float(data.get("lightness", 0.)))
         else:
             result = SolidColorOverlayModifier(**common, **values)
     elif modifier_type in DISTORT_TYPES:

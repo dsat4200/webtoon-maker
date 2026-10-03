@@ -49,6 +49,7 @@ workflow.
   solo previews on hover, and pen selection support
 - User grid defaults with optional document and per-layer overrides
 - Pixel-snapped pan, zoom, rotation, and aspect-preserving chapter preview navigation
+- Per-document viewport position, zoom, and rotation restored when reopening images or projects
 - Touch navigation controlled only by Tablet Navigation mode
 - Command-based undo/redo and atomic autosave recovery
 - Opt-in drawing performance monitor beside File, with automatic per-run
@@ -56,12 +57,26 @@ workflow.
 - Blender 5.2 and 4.5 LTS Comic Views as disk-published transparent image sources with
   persistent offline PNG caches
 
+## Lasso Brush
+
+Select a Raster object and choose **Lasso Brush** beside Brush. Drag a freehand
+shape to see a solid fill in the active color, with a straight closing edge to
+the starting point. Release the mouse or lift the pen to finish one undoable
+fill; **Escape** cancels it. Transparent color erases the enclosed area.
+Existing drawing selections and layer masks still apply. The tool appears only
+for a single Raster object, and its optional shortcut can be assigned in Hotkeys.
+
 ## Brush picker and thumbnails
 
 The Brush **Preset** dropdown opens a large searchable grid. Each tile displays
 a stroke thumbnail above the brush name; click a tile or select it with the
 keyboard to choose that preset. The overlay adapts its columns to the available
 screen space and scrolls smoothly through larger collections.
+
+The **Outline → Brush outline → Brush** selector uses this same thumbnail grid.
+Its **Saved** tile previews the brush embedded in that modifier, including brushes
+that are no longer in the local library. Selecting a preset copies it into the
+modifier and supports Undo without changing the active painting brush.
 
 Imports and saved brush edits prepare thumbnails in advance. Existing libraries
 are filled in automatically, and all 14 built-in brushes ship with pre-rendered
@@ -741,9 +756,14 @@ These edits support Undo and Redo and are saved with the mask.
 
 **Modifiers → Add Modifier → Overlay** offers **Texture** and **Solid color overlay**
 for raster drawings, images, Blender layers, and shapes containing layers. Both
-have a blend-mode dropdown and 0–100% intensity. **Replace** uses the raw texture
+have a blend-mode dropdown and 0–100% intensity. **Replace** uses the texture
 or color inside the artwork’s silhouette. Shape outlines are preserved by default;
 enable **Apply to outline** to include them.
+
+**Texture color** provides **Hue** (−180° to 180°), **Saturation**, and **Lightness**
+(−100% to 100%). These adjust the texture before its blend mode and intensity are
+applied. All three default to zero, preserve texture transparency, and support
+Undo, parameter masks, saved documents, and modifier presets.
 
 The texture selector shows folder categories beside a thumbnail grid. Hover a
 category to browse it, and hover near the grid’s top or bottom to scroll. Choose

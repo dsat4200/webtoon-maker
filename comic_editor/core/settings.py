@@ -21,6 +21,7 @@ def default_hotkeys() -> dict[str, str]:
     return {
         "raster_pencil": "P",
         "brush": "Shift+B",
+        "lasso_brush": "",
         "raster_eraser": "E",
         "fill": "F",
         "gradient": "G",
@@ -58,6 +59,7 @@ def default_hotkey_hold() -> dict[str, bool]:
     return {
         "raster_pencil": False,
         "brush": False,
+        "lasso_brush": False,
         "raster_eraser": False,
         "fill": False,
         "gradient": False,
@@ -261,6 +263,7 @@ class EditorSettings:
     navigator_expanded: bool = False
     recent_series: list[str] = field(default_factory=list)
     last_chapter_by_series: dict[str, str] = field(default_factory=dict)
+    document_viewports: dict[str, dict[str, float]] = field(default_factory=dict)
     blender_bridge_host: str = "127.0.0.1"
     blender_bridge_port: int = 47837
     blender_bridge_token: str = ""
@@ -600,6 +603,14 @@ class EditorSettings:
                 if isinstance(k, str) and isinstance(v, str) and k and v:
                     cleaned[str(k)] = str(v)
             self.last_chapter_by_series = cleaned
+        from .viewport_state import MAX_SAVED_VIEWPORTS, normalize_viewport
+        viewports = {}
+        if isinstance(self.document_viewports, dict):
+            for key, value in self.document_viewports.items():
+                camera = normalize_viewport(value)
+                if isinstance(key, str) and key and camera is not None:
+                    viewports[key] = camera
+        self.document_viewports = dict(list(viewports.items())[-MAX_SAVED_VIEWPORTS:])
 
     def pencil_size(self) -> int:
         return self.pencil_size_px[self.active_pencil_size]

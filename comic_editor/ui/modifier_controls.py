@@ -213,7 +213,7 @@ class ModifierCard(QFrame):
                 form.addWidget(randomize)
         elif isinstance(modifier, SolidColorOverlayModifier):
             from comic_editor.ui.overlay_controls import OverlayControls
-            form.addWidget(OverlayControls(modifier, owner, body))
+            form.addWidget(OverlayControls(modifier, owner, body, slider_row=self._slider_row))
         elif isinstance(modifier, DistortModifier):
             if modifier.modifier_type == "distort_smudge":
                 from comic_editor.ui.smudge_controls import SmudgeControls
@@ -411,7 +411,7 @@ class ModifierCard(QFrame):
         attribute: str, suffix: str,
     ) -> QWidget:
         row = QWidget(self)
-        stroke_column = QVBoxLayout(row) if isinstance(self.modifier, StrokeModifier) else None
+        stroke_column = QVBoxLayout(row) if isinstance(self.modifier, (StrokeModifier, TextureModifier)) else None
         if stroke_column is not None:
             stroke_column.setContentsMargins(0, 0, 0, 0)
             stroke_column.setSpacing(2)

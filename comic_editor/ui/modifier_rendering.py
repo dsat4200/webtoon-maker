@@ -809,12 +809,17 @@ def apply_modifier_stack(
                         modifier, width, height, world_origin, world_to_image)
                     if texture_pixels is None:
                         continue
-                    front = _straight(texture_pixels)
                 else:
                     texture = texture_image(modifier.texture_data, width, height)
                     if texture.isNull():
                         continue
-                    front = _straight(_qimage_premultiplied(texture))
+                    texture_pixels = _qimage_premultiplied(texture)
+                adjustments = tuple(_parameter_field(modifier, attribute,
+                    getattr(modifier, attribute), (height, width), mask_fields)
+                    for attribute in ("hue", "saturation", "lightness"))
+                if any(np.any(value != 0) for value in adjustments):
+                    texture_pixels = _hsl_effect(texture_pixels, *adjustments)
+                front = _straight(texture_pixels)
             else:
                 from PySide6.QtGui import QColor
                 color = QColor(modifier.color)

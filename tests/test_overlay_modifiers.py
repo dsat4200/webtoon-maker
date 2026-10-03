@@ -70,6 +70,7 @@ def test_overlay_roundtrip_presets_and_eligibility(scene, factory):
     modifier = factory(intensity=47, blend_mode="replace", apply_to_outline=True)
     if isinstance(modifier, TextureModifier):
         modifier.texture_data, modifier.texture_name, modifier.texture_category = encoded(), "sample.png", "Paper"
+        modifier.hue, modifier.saturation, modifier.lightness = 73, -28, 19
     image = chapter.add_object(shape.layer_id, ImageObject())
     blender = chapter.add_object(shape.layer_id, ImageObject(source=BlenderComicViewSourceDescriptor(
         project_uuid="a" * 32, view_uuid="b" * 32)))
@@ -83,6 +84,8 @@ def test_overlay_roundtrip_presets_and_eligibility(scene, factory):
     applied = apply_modifier_preset(fresh, preset)
     assert applied.modifier_id == fresh.modifier_id
     assert applied.intensity == 47 and applied.apply_to_outline
+    if isinstance(applied, TextureModifier):
+        assert (applied.hue, applied.saturation, applied.lightness) == (73, -28, 19)
     for obj in (TextObject(), VectorDrawingObject()):
         chapter.add_object(shape.layer_id, obj)
         assert chapter.incompatible_modifier_targets(modifier, [("object", obj.object_id)])
@@ -118,6 +121,71 @@ def test_texture_replace_raw_pixels_alpha_and_mask():
                     {(modifier.modifier_id, "intensity"): np.array([[0., 1.]])}))
     assert np.array_equal(masked[0, 0], [0, 0, 255, 255])
     assert np.array_equal(masked[0, 1], [255, 0, 0, 128])
+
+
+@pytest.mark.parametrize("quad", [False, True])
+@pytest.mark.parametrize("mode", ["normal", "replace"])
+@pytest.mark.parametrize("adjustments, expected", [
+    ({"hue": 120}, [0, 127, 127]),
+    ({"saturation": -100}, [63, 63, 191]),
+    ({"lightness": 50}, [127, 63, 191]),
+])
+def test_texture_hsl_adjusts_overlay_before_blending(quad, mode, adjustments, expected):
+    image = QImage(4, 2, QImage.Format_ARGB32_Premultiplied)
+    image.fill(QColor("blue"))
+    modifier = TextureModifier(texture_data=encoded((255, 0, 0, 255)),
+        blend_mode=mode, intensity=50, **adjustments)
+    if quad:
+        modifier.texture_quad = [(1, 0), (3, 0), (3, 2), (1, 2)]
+    result = pixels(apply_modifier_stack(image, [modifier], (0, 0)))
+    np.testing.assert_allclose(result[:, 1:3, :3], np.broadcast_to(expected, (2, 2, 3)), atol=1)
+    assert np.all(result[..., 3] == 255)
+    if quad:
+        np.testing.assert_array_equal(result[:, [0, 3]], pixels(image)[:, [0, 3]])
+
+
+def test_texture_hsl_preserves_alpha_and_supports_parameter_masks():
+    image = QImage(2, 1, QImage.Format_ARGB32_Premultiplied)
+    image.fill(QColor("blue"))
+    modifier = TextureModifier(texture_data=encoded((255, 0, 0, 128), (2, 1)),
+        blend_mode="replace", hue=120, saturation=-100, lightness=50)
+    result = pixels(apply_modifier_stack(image, [modifier], (0, 0)))
+    np.testing.assert_allclose(result[0, 0], [191, 191, 191, 128], atol=2)
+    modifier.saturation = modifier.lightness = 0
+    modifier.parameter_masks["hue"] = ParameterMaskBinding("hue-mask", 0, 120)
+    modifier.validate()
+    masked = pixels(apply_modifier_stack(image, [modifier], (0, 0),
+        {(modifier.modifier_id, "hue"): np.array([[0., 1.]], np.float32)}))
+    np.testing.assert_array_equal(masked[0, 0], [255, 0, 0, 128])
+    np.testing.assert_array_equal(masked[0, 1], [0, 255, 0, 128])
+    restored = modifier_from_dict(modifier.to_dict())
+    assert restored.parameter_masks["hue"].white_value == 120
+
+
+def test_texture_hsl_legacy_defaults_and_validation():
+    legacy = modifier_from_dict({"type": "texture", "texture_data": encoded()})
+    assert (legacy.hue, legacy.saturation, legacy.lightness) == (0, 0, 0)
+    modifier = TextureModifier(hue=400, saturation=-200, lightness=200)
+    modifier.validate()
+    assert (modifier.hue, modifier.saturation, modifier.lightness) == (180, -100, 100)
+    for attribute in ("hue", "saturation", "lightness"):
+        invalid = TextureModifier(**{attribute: float("nan")})
+        with pytest.raises(ValueError, match="finite"):
+            invalid.validate()
+
+
+def test_texture_hsl_updates_cached_shape_preview_without_recoloring_outline(scene):
+    canvas, chapter, shape, _ = scene
+    baseline = render(canvas)
+    modifier = TextureModifier(texture_data=encoded((255, 0, 0, 255)), blend_mode="replace")
+    chapter.add_modifier(modifier, [("layer", shape.layer_id)])
+    assert np.array_equal(render(canvas)[60, 90], [255, 0, 0, 255])
+    modifier.hue = 120
+    changed = render(canvas)
+    assert np.array_equal(changed[60, 90], [0, 255, 0, 255])
+    assert np.array_equal(changed[32, 90], baseline[32, 90])
+    modifier.apply_to_outline = True
+    assert np.array_equal(render(canvas)[32, 90], [0, 255, 0, 255])
 
 
 @pytest.mark.parametrize("texture", [False, True])
@@ -388,6 +456,9 @@ def test_texture_mouse_gizmo_takes_priority_over_brush_and_shift_preserves_propo
     assert canvas._modifier_handle_drag["uniform"]
     QTest.mouseMove(canvas, point + QPointF(30, 5).toPoint())
     QTest.mouseRelease(canvas, Qt.LeftButton, Qt.ShiftModifier, point + QPointF(30, 5).toPoint())
+    # Release the simulated key too, so later tree-selection tests don't
+    # inherit Shift from this uniform-transform gesture.
+    QTest.keyRelease(canvas, Qt.Key_Shift)
     assert canvas._modifier_handle_drag is None
     assert effect.texture_quad != [(30, 30), (190, 30), (190, 150), (30, 150)]
     width = np.linalg.norm(np.subtract(effect.texture_quad[1], effect.texture_quad[0]))
@@ -521,4 +592,27 @@ def test_modifier_picker_controls_and_async_selection_undo(scene, qapp, tmp_path
     assert not controls.outline.isHidden() and not controls.outline.isChecked()
     controls.outline.setChecked(True)
     assert solid.apply_to_outline
+    owner.deleteLater()
+
+
+@pytest.mark.parametrize("attribute, value", [("hue", 120), ("saturation", -45), ("lightness", 30)])
+def test_texture_color_controls_commit_one_undoable_change(scene, attribute, value):
+    canvas, chapter, _, raster = scene
+    canvas.set_selection("object", raster.object_id)
+    modifier = TextureModifier(texture_data=encoded())
+    chapter.add_modifier(modifier, [("object", raster.object_id)])
+    owner = ModifierControls(canvas)
+    owner.refresh()
+    card = owner._cards[modifier.modifier_id]
+    slider, number = card._parameter_controls[attribute]
+    slider.sliderPressed.emit()
+    slider.setValue(value)
+    slider.sliderReleased.emit()
+    assert getattr(modifier, attribute) == value
+    assert number.value() == value
+    assert modifier.texture_data == encoded()
+    canvas.command_stack.undo()
+    assert getattr(canvas.chapter.modifiers[modifier.modifier_id], attribute) == 0
+    canvas.command_stack.redo()
+    assert getattr(canvas.chapter.modifiers[modifier.modifier_id], attribute) == value
     owner.deleteLater()

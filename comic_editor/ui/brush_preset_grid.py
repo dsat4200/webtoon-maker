@@ -55,6 +55,7 @@ class BrushPresetGrid(QFrame):
     def __init__(self, combo):
         super().__init__(combo.window(), Qt.Popup)
         self.combo = combo
+        combo.destroyed.connect(self.deleteLater)
         self.setObjectName('brushPresetGrid')
         self.setFrameShape(QFrame.StyledPanel)
         layout = QVBoxLayout(self)

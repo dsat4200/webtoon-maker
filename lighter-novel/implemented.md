@@ -1,3 +1,7 @@
+- make it so reopening and image puts the viewport where you left off instead of at the top of the screen.
+
+- outline modifier brush outline should have its brush picker dropdown replaced with the current brush picker UI.
+
 ![[Pasted image 20261002171844.png]]
 import csp brushes directly
 new modifier - texture modifier

@@ -225,6 +225,15 @@ class ToolSettingsControls(QWidget):
         self.brush_page = BrushControls(settings, self)
         self.brush_page.settingsChanged.connect(self.settingsChanged.emit)
         self.stack.addWidget(self.brush_page)
+        self.lasso_brush_page = QLabel(
+            "Drag a shape to fill it with the active color.\n\n"
+            "Lift the pen or release the mouse to finish.\n"
+            "Escape: Cancel\nTransparent color: Erase",
+            self,
+        )
+        self.lasso_brush_page.setWordWrap(True)
+        self.lasso_brush_page.setAlignment(Qt.AlignTop | Qt.AlignLeft)
+        self.stack.addWidget(self.lasso_brush_page)
         self.mask_pencil_page = self._build_mask_pencil_page()
         self.stack.addWidget(self.mask_pencil_page)
         self.mask_select_page = QLabel(
@@ -667,6 +676,9 @@ class ToolSettingsControls(QWidget):
         elif value == "brush":
             self.context_label.setText("Brush")
             self.stack.setCurrentWidget(self.brush_page)
+        elif value == "lasso_brush":
+            self.context_label.setText("Lasso Brush")
+            self.stack.setCurrentWidget(self.lasso_brush_page)
         elif value == "raster_pencil":
             if mask_active:
                 self.context_label.setText("Mask Pencil")

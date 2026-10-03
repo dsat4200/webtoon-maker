@@ -425,6 +425,7 @@ class MainWindow(QMainWindow):
             (ToolKind.OBJECT_SELECT, "Object Select", "cursor-pointer"),
             (ToolKind.RASTER_PENCIL, "Pencil", "design-pencil"),
             (ToolKind.BRUSH, "Brush", "design-pencil"),
+            (ToolKind.LASSO_BRUSH, "Lasso Brush", "agile"),
             (ToolKind.RASTER_ERASER, "Eraser", "erase"),
         ]
         fill_tool = getattr(ToolKind, "FILL", None)
@@ -1017,6 +1018,42 @@ class MainWindow(QMainWindow):
         self._capture_workspace_layout()
         save_settings(self.settings)
 
+    def _document_view_key(self) -> str | None:
+        if self.repository is None or self.chapter is None:
+            return None
+        return f"{self._series_session_key(self.repository.root)}:{self.chapter.chapter_id}"
+
+    def _remember_document_view(self) -> bool:
+        from comic_editor.core.viewport_state import MAX_SAVED_VIEWPORTS, VIEWPORT_FIELDS, normalize_viewport
+        key = self._document_view_key()
+        if key is None or self.canvas.chapter is not self.chapter:
+            return False
+        camera = normalize_viewport({field: getattr(self.canvas, field) for field in VIEWPORT_FIELDS})
+        if camera is None:
+            return False
+        views = self.settings.document_viewports
+        views.pop(key, None)
+        views[key] = camera
+        while len(views) > MAX_SAVED_VIEWPORTS:
+            views.pop(next(iter(views)))
+        return True
+
+    def _schedule_document_view_save(self) -> None:
+        if not self._switching_session and self._remember_document_view():
+            self.layout_settings_timer.start(500)
+
+    def _restore_document_view(self) -> bool:
+        from comic_editor.core.viewport_state import normalize_viewport
+        camera = normalize_viewport(self.settings.document_viewports.get(self._document_view_key()))
+        if camera is None:
+            return False
+        for field, value in camera.items():
+            setattr(self.canvas, field, value)
+        self.canvas._invalidate_scene_cache(projection=False)
+        self.canvas.update()
+        self.canvas.cameraChanged.emit()
+        return True
+
     def _connect(self) -> None:
         self.project_tabs.currentChanged.connect(self._project_tab_selected)
         self.project_tabs.tabCloseRequested.connect(self._close_project_tab)
@@ -1036,6 +1073,7 @@ class MainWindow(QMainWindow):
         self.redo_action.triggered.connect(self._redo)
         self.chapter_combo.currentIndexChanged.connect(self._chapter_selected)
         self.reset_view_button.clicked.connect(self.canvas.reset_view)
+        self.canvas.cameraChanged.connect(self._schedule_document_view_save)
         self.preview.scrollRequested.connect(self.canvas.scroll_to_fraction)
         self.tablet_mode.toggled.connect(self._settings_changed)
         self.snap_grid.toggled.connect(self._settings_changed)
@@ -1332,6 +1370,7 @@ class MainWindow(QMainWindow):
         self._tool_hotkey_actions = {
             "raster_pencil": ToolKind.RASTER_PENCIL,
             "brush": ToolKind.BRUSH,
+            "lasso_brush": ToolKind.LASSO_BRUSH,
             "raster_eraser": ToolKind.RASTER_ERASER,
             "object_select": ToolKind.OBJECT_SELECT,
             "transform": ToolKind.TRANSFORM,
@@ -2065,6 +2104,7 @@ class MainWindow(QMainWindow):
         if event.type() == QEvent.ApplicationDeactivate or (
             event.type() == QEvent.WindowDeactivate and watched is self
         ):
+            self.canvas._cancel_lasso_brush()
             self.canvas._interrupt_paint_brush()
         if (event.type() == QEvent.ApplicationDeactivate
                 or (event.type() == QEvent.KeyPress and event.key() == Qt.Key_Escape)):
@@ -2245,6 +2285,7 @@ class MainWindow(QMainWindow):
             session.chapter, session.tiles, session.images = (
                 state.chapter, state.tiles, state.images
             )
+            self._remember_document_view()
         session.dirty = self._dirty
         session.last_autosave = self._last_autosave
         session.expanded_entities = self._expanded_layer_ids()
@@ -2280,8 +2321,10 @@ class MainWindow(QMainWindow):
         self.blender_views_widget.set_relink_mode(False)
         self.blender_sources.stop_for_context_change()
         self._switching_session = True
+        was_loading = self._loading_chapter
         try:
             self._capture_active_session()
+            self._loading_chapter = True
             self._adopt_series(session.context.repository, session.context.series)
             self.active_session = session
             self.repository = session.context.repository
@@ -2303,6 +2346,7 @@ class MainWindow(QMainWindow):
                 )
                 if initial_id:
                     self.canvas.set_selection(initial_kind, initial_id)
+                self._restore_document_view()
             else:
                 self.canvas.restore_session_state(session.canvas_state)
             self.canvas.command_stack.changed_callback = self._command_stack_changed
@@ -2336,6 +2380,7 @@ class MainWindow(QMainWindow):
                 f"{session.name} — {self.chapter.width} × {self.chapter.height}px"
             )
         finally:
+            self._loading_chapter = was_loading
             self._switching_session = False
             self.blender_sources.resume_for_context()
 
@@ -2457,6 +2502,8 @@ class MainWindow(QMainWindow):
                 return
         self._autosave_jobs.drain(self._autosave_scope(session))
         was_active = session is self.active_session
+        self.layout_settings_timer.stop()
+        self._save_workspace_layout()
         self.sessions.pop(session.key, None)
         if was_active:
             self.active_session = None
@@ -2702,11 +2749,19 @@ class MainWindow(QMainWindow):
     def _set_chapter(
         self, chapter, tiles, images: ImageStore | None = None,
     ) -> None:
+        self._remember_document_view()
         self._edit_revision += 1
         self._recovery_revision = -1
         self.chapter = chapter
         images = images or ImageStore()
-        self.canvas.set_document(chapter, tiles, images)
+        was_loading = self._loading_chapter
+        self._loading_chapter = True
+        try:
+            self.canvas.set_document(chapter, tiles, images, reset_view=False)
+            if not self._restore_document_view():
+                self.canvas.reset_view()
+        finally:
+            self._loading_chapter = was_loading
         if self.active_session is not None:
             self.active_session.chapter = chapter
             self.active_session.tiles = tiles
@@ -3568,6 +3623,8 @@ class MainWindow(QMainWindow):
         )
         self.tool_buttons[ToolKind.BRUSH].setEnabled(raster_selected)
         self.tool_buttons[ToolKind.BRUSH].setVisible(raster_selected)
+        self.tool_buttons[ToolKind.LASSO_BRUSH].setEnabled(raster_selected)
+        self.tool_buttons[ToolKind.LASSO_BRUSH].setVisible(raster_selected)
         self.tool_buttons[ToolKind.RASTER_ERASER].setEnabled(
             raster_selected or vector_selected
         )
@@ -5420,6 +5477,7 @@ class MainWindow(QMainWindow):
         if (
             self.canvas.tool in {
                 ToolKind.RASTER_PENCIL, ToolKind.RASTER_ERASER, ToolKind.BRUSH,
+                ToolKind.LASSO_BRUSH,
             }
             and isinstance(selected_object, (RasterObject, VectorDrawingObject))
         ):
@@ -5440,6 +5498,7 @@ class MainWindow(QMainWindow):
         if tool in {
             ToolKind.RASTER_PENCIL, ToolKind.RASTER_ERASER, ToolKind.TEXT_EDIT,
             ToolKind.FILL, ToolKind.GRADIENT, ToolKind.BRUSH,
+            ToolKind.LASSO_BRUSH,
         }:
             # _sync_tool_buttons() refreshes contextual pages first.  Select
             # Tool Settings afterward so entering a raster/vector context
@@ -6035,7 +6094,8 @@ class MainWindow(QMainWindow):
 
     # ---- saving, autosave, settings -----------------------------------
     def _mark_dirty(self, dirty_rect) -> None:
-        if self.chapter is None:
+        # Installing a document clears tool gestures and emits cleanup notices.
+        if self.chapter is None or self._loading_chapter:
             return
         self._dirty = True
         self._edit_revision += 1
@@ -6476,6 +6536,7 @@ class MainWindow(QMainWindow):
 
     def _undo(self) -> None:
         """Undo on the command stack owned by the currently active canvas."""
+        self.canvas._finish_lasso_brush()
         self.canvas._finish_paint_brush()
         if self.canvas._cage_session is not None or self.canvas._cage_edit_before is not None:
             self.canvas.finish_cage(False)
@@ -6484,6 +6545,7 @@ class MainWindow(QMainWindow):
 
     def _redo(self) -> None:
         """Redo on the command stack owned by the currently active canvas."""
+        self.canvas._finish_lasso_brush()
         self.canvas._finish_paint_brush()
         if self.canvas._cage_session is not None or self.canvas._cage_edit_before is not None:
             self.canvas.finish_cage(False)

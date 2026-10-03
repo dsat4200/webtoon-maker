@@ -115,12 +115,14 @@ from comic_editor.ui.scene_culling import SceneRenderBounds
 from comic_editor.ui.network import create_network_manager
 from comic_editor.ui.multi_raster_selection import MultiRasterSelectionFeatures
 from comic_editor.ui.brush_features import BrushFeatures
+from comic_editor.ui.lasso_brush_features import LassoBrushFeatures
 
 
 class ToolKind(Enum):
     OBJECT_SELECT = "object_select"
     RASTER_PENCIL = "raster_pencil"
     BRUSH = "brush"
+    LASSO_BRUSH = "lasso_brush"
     RASTER_ERASER = "raster_eraser"
     EYEDROPPER = "eyedropper"
     FILL = "fill"
@@ -603,7 +605,7 @@ class CanvasPerformanceMonitor:
         }
 
 
-class _CanvasLogic(BrushFeatures, DocumentProjectionFeatures, MultiRasterSelectionFeatures, ShowOnTopFeatures, SoloFeatures, ViewFeatures, MaskSelectionFeatures, MaskGradientFeatures, TilingFeatures, CageFeatures, ArrayFeatures, SpatialModifierFeatures, TextureOverlayFeatures, DistortFeatures, CurvesFeatures, TextFeatures):
+class _CanvasLogic(LassoBrushFeatures, BrushFeatures, DocumentProjectionFeatures, MultiRasterSelectionFeatures, ShowOnTopFeatures, SoloFeatures, ViewFeatures, MaskSelectionFeatures, MaskGradientFeatures, TilingFeatures, CageFeatures, ArrayFeatures, SpatialModifierFeatures, TextureOverlayFeatures, DistortFeatures, CurvesFeatures, TextFeatures):
     documentChanged = Signal(object)
     viewSettingsChanged = Signal()
     visualChanged = Signal(object)
@@ -720,6 +722,7 @@ class _CanvasLogic(BrushFeatures, DocumentProjectionFeatures, MultiRasterSelecti
         self._stroke_dirty_world = QRectF()
         self._gc_was_enabled = False
         self._init_brush_features()
+        self._init_lasso_brush_features()
         self._pending_raster_transform_press: tuple[
             QPointF, QPointF
         ] | None = None
@@ -1567,6 +1570,7 @@ class _CanvasLogic(BrushFeatures, DocumentProjectionFeatures, MultiRasterSelecti
 
     def _clear_detached_input_state(self) -> None:
         """Reset transient pointer state that cannot survive without a document."""
+        self._cancel_lasso_brush()
         self._cancel_paint_brush()
         self._projection_completed_view = None
         self._projection_progress_view = None
@@ -1728,6 +1732,7 @@ class _CanvasLogic(BrushFeatures, DocumentProjectionFeatures, MultiRasterSelecti
         """Detach the committed document state without discarding warm caches."""
         if self.chapter is None:
             return None
+        self._cancel_lasso_brush()
         self._finish_paint_brush()
         self.set_export_rect_editing(False)
         if self._cage_session is not None:
@@ -1949,6 +1954,7 @@ class _CanvasLogic(BrushFeatures, DocumentProjectionFeatures, MultiRasterSelecti
 
     def _restore_history_state(self, state: dict, *, objects_only: bool = False) -> None:
         """Restore history, optionally retaining an unchanged document graph."""
+        self._cancel_lasso_brush()
         self._cancel_paint_brush()
         self._reset_export_rect_editor()
         self._cancel_mask_selection()
@@ -2492,6 +2498,7 @@ class _CanvasLogic(BrushFeatures, DocumentProjectionFeatures, MultiRasterSelecti
         if self.chapter is None:
             return
         if (kind, entity_id) != (self.selected_kind, self.selected_id):
+            self._cancel_lasso_brush()
             self._finish_paint_brush()
         if (kind, entity_id) != (self.selected_kind, self.selected_id):
             if self._cage_session is not None:
@@ -2545,7 +2552,7 @@ class _CanvasLogic(BrushFeatures, DocumentProjectionFeatures, MultiRasterSelecti
             self.active_page_id = self.chapter.page_for_layer(obj.parent_layer_id).layer_id
             if activate_default_tool and isinstance(obj, RasterObject):
                 self.tool = (
-                    ToolKind.BRUSH if previous_tool == ToolKind.BRUSH
+                    previous_tool if previous_tool in {ToolKind.BRUSH, ToolKind.LASSO_BRUSH}
                     else ToolKind.RASTER_PENCIL
                 )
                 self.chapter.layers[obj.parent_layer_id].last_raster_id = obj.object_id
@@ -2617,6 +2624,7 @@ class _CanvasLogic(BrushFeatures, DocumentProjectionFeatures, MultiRasterSelecti
             else:
                 return False
         ordered = filtered
+        self._cancel_lasso_brush()
         self._finish_paint_brush()
         if set(ordered) != set(self.selected_entities):
             self.active_modifier_id = ""
@@ -2680,6 +2688,7 @@ class _CanvasLogic(BrushFeatures, DocumentProjectionFeatures, MultiRasterSelecti
         """Clear the current entity and notify every selection consumer."""
         if self.chapter is None:
             return
+        self._cancel_lasso_brush()
         self._finish_paint_brush()
         if self._cage_session is not None:
             self.finish_cage(False)
@@ -2774,13 +2783,14 @@ class _CanvasLogic(BrushFeatures, DocumentProjectionFeatures, MultiRasterSelecti
         ), already_done=True)
 
     def set_tool(self, tool: ToolKind) -> bool:
-        if tool == ToolKind.BRUSH and (
+        if tool in {ToolKind.BRUSH, ToolKind.LASSO_BRUSH} and (
             self.chapter is None or self.active_tone_mask_id
             or len(self.selected_entities) > 1
             or not isinstance(self.chapter.objects.get(self.selected_object_id), RasterObject)
         ):
             return False
         if tool != self.tool:
+            self._cancel_lasso_brush()
             self._finish_paint_brush()
         if tool in {ToolKind.MASK_SELECT, ToolKind.MASK_WAND} and not self.active_tone_mask_id:
             return False
@@ -13799,6 +13809,10 @@ class _CanvasLogic(BrushFeatures, DocumentProjectionFeatures, MultiRasterSelecti
         if self.chapter is None:
             self.unsetCursor()
             return
+        if self.tool == ToolKind.LASSO_BRUSH:
+            self.setCursor(Qt.CrossCursor)
+            self.setToolTip("Drag to fill a shape; release to finish; Escape cancels")
+            return
         radial_hit = self._radial_handle_hit(widget_point)
         texture_hit = self._texture_handle_hit(widget_point)
         if texture_hit is not None:
@@ -14021,6 +14035,8 @@ class _CanvasLogic(BrushFeatures, DocumentProjectionFeatures, MultiRasterSelecti
             world = self.widget_to_document(event.position())
             if self._paint_brush_stroke is not None:
                 self._continue_paint_brush(world, 1.0)
+            if self._lasso_brush is not None:
+                self._continue_lasso_brush(world)
             self._move_mask_selection(world)
             self._queue_free_text_drag(world)
             self._text_placement_move(world)
@@ -14124,6 +14140,10 @@ class _CanvasLogic(BrushFeatures, DocumentProjectionFeatures, MultiRasterSelecti
         super().mouseDoubleClickEvent(event)
 
     def keyPressEvent(self, event) -> None:  # noqa: N802
+        if event.key() == Qt.Key_Escape and self._cancel_lasso_brush():
+            self.interactionFinished.emit()
+            event.accept()
+            return
         if event.key() == Qt.Key_Escape and self._cancel_mask_selection():
             event.accept()
             return
@@ -14489,6 +14509,8 @@ class _CanvasLogic(BrushFeatures, DocumentProjectionFeatures, MultiRasterSelecti
                 self._move_mask_selection(world)
                 if self._paint_brush_stroke is not None:
                     self._continue_paint_brush(world, self._paint_brush_sample.pressure)
+                if self._lasso_brush is not None:
+                    self._continue_lasso_brush(world)
                 self._queue_free_text_drag(world)
                 self._text_placement_move(world)
                 self._finish_shape_pointer(world)
@@ -14504,6 +14526,7 @@ class _CanvasLogic(BrushFeatures, DocumentProjectionFeatures, MultiRasterSelecti
 
     def event(self, event) -> bool:
         if event.type() in {QEvent.UngrabMouse, QEvent.WindowDeactivate}:
+            self._cancel_lasso_brush()
             self._interrupt_paint_brush()
         if event.type() == QEvent.Type.Leave:
             self._tablet_hover_widget = None
@@ -20491,6 +20514,9 @@ class _CanvasLogic(BrushFeatures, DocumentProjectionFeatures, MultiRasterSelecti
         if self.tool == ToolKind.BRUSH:
             self._begin_paint_brush(point, pressure)
             return
+        if self.tool == ToolKind.LASSO_BRUSH:
+            self._begin_lasso_brush(point)
+            return
         if self.active_tone_mask_id and self.tool == ToolKind.MASK_WAND:
             self._mask_wand_press(point, modifiers)
             return
@@ -20970,6 +20996,9 @@ class _CanvasLogic(BrushFeatures, DocumentProjectionFeatures, MultiRasterSelecti
             self._clear_detached_input_state()
             return
         point = self.widget_to_document(widget_point)
+        if self._lasso_brush is not None:
+            self._continue_lasso_brush(point)
+            return
         if self._paint_brush_stroke is not None:
             self._continue_paint_brush(point, pressure)
             return
@@ -21266,6 +21295,9 @@ class _CanvasLogic(BrushFeatures, DocumentProjectionFeatures, MultiRasterSelecti
             self._update_shape_hover(point)
 
     def _tool_release(self) -> None:
+        if self._lasso_brush is not None:
+            self._finish_lasso_brush()
+            return
         if self._paint_brush_stroke is not None:
             self._finish_paint_brush()
             return
@@ -24217,7 +24249,7 @@ class _CanvasLogic(BrushFeatures, DocumentProjectionFeatures, MultiRasterSelecti
     ) -> bool:
         if not self._is_transformable_object(obj):
             return False
-        if self.tool == ToolKind.BRUSH:
+        if self.tool in {ToolKind.BRUSH, ToolKind.LASSO_BRUSH}:
             return False
         if isinstance(obj, ImageObject) and obj.placement_mode == "fit_parent":
             return False

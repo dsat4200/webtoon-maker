@@ -15,6 +15,7 @@ The application separates several kinds of state:
 | Asset document and metadata | `AssetManifest` | Yes | Portable `assets/<id>/asset.json` and `assets/library.json` |
 | Asset raster/thumbnail | `TileStore`, rendered `QImage` | Yes | Portable `assets/<id>/raster/` and `thumbnail.png` |
 | Editor settings/workspace | `EditorSettings` | Yes, per user | Qt application config `settings.json` |
+| Document viewport | `EditorSettings.document_viewports` | Yes, per user | Camera center, zoom, and rotation keyed by resolved project path and chapter ID in `settings.json` |
 | Live editing session | `MainWindow`, `_CanvasLogic`, `CommandStack` | Mostly no | Process memory; recovery autosave contains only chapter/tile/mask/image data |
 
 There is no separate `SessionDocument` or session database. "Session data" in this codebase means the live application state described below.

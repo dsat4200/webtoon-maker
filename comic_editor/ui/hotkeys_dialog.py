@@ -13,6 +13,7 @@ from comic_editor.ui.hotkeys import ChordCaptureEdit, normalize_chord
 LABELS = {
     "raster_pencil": "Pencil",
     "brush": "Brush",
+    "lasso_brush": "Lasso Brush",
     "raster_eraser": "Eraser",
     "fill": "Fill",
     "gradient": "Gradient",

@@ -7,7 +7,7 @@ from types import SimpleNamespace
 
 import numpy as np
 from PIL import Image
-from PySide6.QtWidgets import QComboBox, QPushButton
+from PySide6.QtWidgets import QComboBox, QPushButton, QListView
 
 from comic_editor.core.brushes import BrushDefinition, BrushTip
 from comic_editor.core.brush_outline import alpha_contours
@@ -17,7 +17,7 @@ from comic_editor.core.settings import EditorSettings
 from comic_editor.ui.modifier_rendering import (
     _premultiplied_qimage, _qimage_premultiplied, apply_modifier_stack, modifier_render_settings,
 )
-from comic_editor.ui.outline_brush_controls import OutlineBrushControls
+from comic_editor.ui.outline_brush_controls import OutlineBrushControls, OutlineBrushCombo
 
 
 def source():
@@ -129,6 +129,107 @@ def test_outline_brush_controls_snapshot_library_without_mutating_it(qapp):
     assert modifier.brush == settings.active_paint_brush().to_dict()
     assert calls == ["style", "brush", "brush"]
     controls.deleteLater()
+
+
+def test_outline_uses_current_thumbnail_grid_with_portable_saved_brush_and_live_library(qapp, text_outline_font_family):
+    from copy import deepcopy
+    from PySide6.QtGui import QFont
+    from PySide6.QtTest import QTest
+    from comic_editor.ui.brush_controls import BrushPresetCombo
+    from comic_editor.ui.brush_preset_grid import BrushPresetGrid
+    settings = EditorSettings(brush_presets=[
+        BrushDefinition(id="first", name="Library first").to_dict(),
+        replace(stamp_brush(), id="second", name="Library second").to_dict(),
+    ], active_brush_id="first")
+    original = deepcopy(settings.brush_presets)
+    modifier = OutlineModifier(style="brush", brush=stamp_brush().to_dict())
+    calls = []
+    def set_parameter(_identifier, name, value, _commit):
+        setattr(modifier, name, value)
+        calls.append(name)
+    owner = SimpleNamespace(canvas=SimpleNamespace(settings=settings), set_parameter=set_parameter)
+    controls = OutlineBrushControls(modifier, owner)
+    # Offscreen Qt cannot discover Windows fonts and otherwise measures every
+    # glyph as a wide missing-character box, including the existing buttons.
+    controls.setFont(QFont(text_outline_font_family, 9))
+    controls.resize(220, 460)
+    controls.show()
+    combo = controls.findChild(OutlineBrushCombo, "outlineBrush")
+    assert isinstance(combo, BrushPresetCombo)
+    modifier.brush["name"] = "A very long embedded brush name that should fit in the narrow modifier panel"
+    combo.refresh_choices()
+    qapp.processEvents()
+    assert controls.width() == 220 and combo.width() < controls.width()
+    modifier.brush["name"] = "Pink material"
+    combo.refresh_choices()
+    combo.showPopup()
+    qapp.processEvents()
+    popup = combo._grid
+    assert isinstance(popup, BrushPresetGrid)
+    assert popup.grid.viewMode() == QListView.IconMode
+    assert popup.width() > combo.width() * 2
+    assert popup.grid.item(0).text() == "Saved: Pink material"
+    popup.search.setText("Library second")
+    popup._activate_current()
+    assert not popup.isVisible()
+    assert modifier.brush == original[1] and modifier.brush is not settings.brush_presets[1]
+    assert combo.currentText() == "Saved: Library second"
+    assert combo.thumbnails.keys[combo.saved_id] == combo.thumbnails.keys["second"]
+    assert settings.brush_presets == original and settings.active_brush_id == "first"
+    assert calls == ["brush"]
+    for _ in range(100):
+        if not combo.thumbnails.icon(combo.saved_id).isNull():
+            break
+        QTest.qWait(20)
+    assert not combo.thumbnails.icon(combo.saved_id).isNull()
+    settings.brush_presets.pop()
+    settings.brush_presets.append(BrushDefinition(id="new", name="New import").to_dict())
+    combo.showPopup()
+    qapp.processEvents()
+    assert combo.findData("second") == -1 and combo.findData("new") > 0
+    assert popup.grid.item(0).text() == "Saved: Library second"
+    popup.search.setText("New import")
+    popup._activate_current()
+    assert modifier.brush["id"] == "new"
+    controls.findChild(QPushButton, "outlineUseCurrentBrush").click()
+    assert modifier.brush == settings.active_paint_brush().to_dict()
+    assert combo.currentText() == "Saved: Library first"
+    combo.thumbnails.stop()
+    controls.close()
+    controls.deleteLater()
+
+
+def test_outline_thumbnail_choice_supports_modifier_undo(qapp, monkeypatch):
+    from PySide6.QtNetwork import QNetworkAccessManager
+    from comic_editor.core.models import BoundGeometry, ChapterDocument, RasterObject
+    from comic_editor.core.tiles import TileStore
+    from comic_editor.ui.canvas import CanvasWidget
+    from comic_editor.ui.modifier_controls import ModifierControls
+    monkeypatch.setattr("comic_editor.ui.canvas.create_network_manager", QNetworkAccessManager)
+    settings = EditorSettings()
+    chapter = ChapterDocument(width=128, height=128, document_kind="image")
+    page = chapter.add_page("Canvas", BoundGeometry.rectangle(0, 0, 128, 128))
+    obj = chapter.add_object(page.layer_id, RasterObject())
+    modifier = OutlineModifier(style="brush")
+    chapter.add_modifier(modifier, [("object", obj.object_id)])
+    canvas = CanvasWidget(settings)
+    canvas.set_document(chapter, TileStore())
+    canvas.set_selection("object", obj.object_id)
+    owner = ModifierControls(canvas)
+    owner.refresh()
+    combo = owner._cards[modifier.modifier_id].findChild(OutlineBrushCombo)
+    combo.showPopup()
+    qapp.processEvents()
+    combo._grid._activate(combo._grid.grid.item(2))
+    expected = settings.brush_presets[1]
+    assert modifier.brush == expected
+    canvas.command_stack.undo()
+    assert canvas.chapter.modifiers[modifier.modifier_id].brush is None
+    canvas.command_stack.redo()
+    assert canvas.chapter.modifiers[modifier.modifier_id].brush == expected
+    canvas._effect_jobs.cancel()
+    owner.deleteLater()
+    canvas.deleteLater()
 
 
 def test_limited_gradient_drives_outline_thickness_and_bakes(qapp):

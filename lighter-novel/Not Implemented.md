@@ -9,12 +9,10 @@ BUGS
 - mask opacity of a layer to a shape layer's mask isn't working. fix.
 
 - [x] blending modes
-- [ ] texture modifier
-- [ ] opening a project should return to where you were before (not force you to scroll down)
+- [x] texture modifier
+- [x] opening a project should return to where you were before (not force you to scroll down)
 
-make it so reopening and image puts the viewport where you left off instead of at the top of the screen.
 
-- outline modifier brush outline should have its brush picker dropdown replaced with the current brush picker UI.
 ## review the fill tool, brush tools
 
 ## investigate procreate and steal some ideas

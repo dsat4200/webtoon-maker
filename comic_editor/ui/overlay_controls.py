@@ -11,7 +11,7 @@ from comic_editor.ui.texture_picker import TextureCombo
 
 
 class OverlayControls(QWidget):
-    def __init__(self, modifier, owner, parent=None):
+    def __init__(self, modifier, owner, parent=None, *, slider_row):
         super().__init__(parent)
         self.modifier, self.owner = modifier, owner
         layout = QVBoxLayout(self)
@@ -31,6 +31,14 @@ class OverlayControls(QWidget):
                                         modifier.texture_name, modifier.texture_category, self)
             self.texture.textureSelected.connect(self._import)
             layout.addWidget(self.texture)
+            layout.addWidget(QLabel("Texture color", self))
+            for label, attribute, suffix in (("Hue", "hue", "°"),
+                    ("Saturation", "saturation", "%"), ("Lightness", "lightness", "%")):
+                low, high = modifier.parameter_ranges()[attribute]
+                row = slider_row(label, int(low), int(high), round(getattr(modifier, attribute)),
+                                 attribute, suffix)
+                row.setObjectName(f"texture{attribute.title()}")
+                layout.addWidget(row)
             layout.addWidget(QLabel("Texture transform", self))
             self.transform_mode = QComboBox(self)
             self.transform_mode.setObjectName("textureTransformMode")
