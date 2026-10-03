@@ -249,19 +249,40 @@ class NavigatorPanel(QWidget):
         self.toggle.setFixedSize(24, 32)
         rail_layout.addWidget(self.toggle)
         rail_layout.addStretch(1)
-        self.preview = ChapterPreview(canvas, self)
+        self.contents = QWidget(self)
+        column = QVBoxLayout(self.contents)
+        column.setContentsMargins(0, 0, 0, 0)
+        column.setSpacing(2)
+        self.preview = ChapterPreview(canvas, self.contents)
+        column.addWidget(self.preview, 1)
+        self.cache_button = QPushButton("Cache to disk", self.contents)
+        self.cache_button.setObjectName("cacheToDisk")
+        column.addWidget(self.cache_button)
+        self.cache_progress = QLabel("", self.contents)
+        self.cache_progress.setAlignment(Qt.AlignCenter)
+        column.addWidget(self.cache_progress)
+        self.cache_status = QToolButton(self.contents)
+        self.cache_status.setText("0.0 MB")
+        self.cache_status.setPopupMode(QToolButton.InstantPopup)
+        self.cache_status.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        column.addWidget(self.cache_status)
+        menu = QMenu(self.cache_status)
+        self.clear_selected_action = menu.addAction("Clear selected cache")
+        self.clear_all_action = menu.addAction("Clear all disk cache")
+        self.cache_status.setMenu(menu)
         layout.addWidget(rail)
-        layout.addWidget(self.preview)
+        layout.addWidget(self.contents)
         self.toggle.clicked.connect(
             lambda checked=False: self.setExpanded(not self.isExpanded())
         )
         self.setExpanded(expanded, emit=False)
 
     def isExpanded(self) -> bool:
-        return not self.preview.isHidden()
+        return not self.contents.isHidden()
 
     def setExpanded(self, expanded: bool, *, emit: bool = True) -> None:
         expanded = bool(expanded)
+        self.contents.setVisible(expanded)
         self.preview.setVisible(expanded)
         self.toggle.setText("›" if expanded else "‹")
         self.toggle.setToolTip(
@@ -319,6 +340,8 @@ class MainWindow(QMainWindow):
         self.blender_sources = BlenderImageSourceController(self.canvas, self)
         self._connect()
         self._install_shortcuts()
+        from comic_editor.ui.disk_cache import DiskCacheController
+        self.disk_cache = DiskCacheController(self)
         self._refresh_actions()
         self.statusBar().showMessage("Create or open a series")
 
@@ -400,6 +423,8 @@ class MainWindow(QMainWindow):
         self.file_toolbar.addSeparator()
         self.hotkeys_action = self.file_toolbar.addAction("Hotkeys…")
         self.settings_action = self.file_toolbar.addAction("Settings…")
+        self.fullscreen_action = self.file_toolbar.addAction("Fullscreen")
+        self.fullscreen_action.setToolTip("Toggle fullscreen (Alt+Enter)")
         self.tablet_mode = QCheckBox("Tablet Navigation", self.file_toolbar)
         self.tablet_mode.setChecked(self.settings.tablet_mode)
         self.reset_view_button = QToolButton(self.file_toolbar)
@@ -425,8 +450,6 @@ class MainWindow(QMainWindow):
         export_button = self.file_toolbar.widgetForAction(self.export_png_toolbar_action)
         export_button.setMenu(export_menu)
         export_button.setPopupMode(QToolButton.MenuButtonPopup)
-        self.fullscreen_action = QAction("Fullscreen", self)
-
         self.tool_toolbar = ScrollableToolPanel(self)
         self.tool_buttons: dict[ToolKind, QToolButton] = {}
         labels = [
@@ -1532,6 +1555,8 @@ class MainWindow(QMainWindow):
         self, action_id: str, chord: frozenset[int],
         started: float, tap: bool = False,
     ) -> None:
+        if getattr(self.canvas, "document_read_only", False):
+            return
         if self._hotkey_is_suppressed(action_id, chord):
             return
         if action_id in self._tool_hotkey_actions:
@@ -2109,6 +2134,10 @@ class MainWindow(QMainWindow):
         return True
 
     def eventFilter(self, watched, event) -> bool:  # noqa: N802
+        cache = getattr(self, "disk_cache", None)
+        if cache is not None and cache.blocks_event(watched, event):
+            event.accept()
+            return True
         event_type = event.type()
         if event_type not in _MAIN_FILTER_EVENTS:
             return super().eventFilter(watched, event)
@@ -2328,6 +2357,7 @@ class MainWindow(QMainWindow):
     def _activate_editor_session(self, session: EditorSession) -> None:
         if session is self.active_session:
             return
+        self.disk_cache.detach()
         self._blender_relink_object_id = ""
         self.blender_views_widget.set_relink_mode(False)
         self.blender_sources.stop_for_context_change()
@@ -2365,6 +2395,7 @@ class MainWindow(QMainWindow):
             session.chapter, session.tiles, session.images = (
                 self.chapter, self.canvas.tiles, self.canvas.images
             )
+            self.disk_cache.bind()
             self.hierarchy_model.set_chapter(self.chapter)
             for entity_id in session.expanded_entities:
                 kind = "layer" if entity_id in self.chapter.layers else "object"
@@ -2398,6 +2429,7 @@ class MainWindow(QMainWindow):
     def _clear_active_session(self) -> None:
         if self.project_tabs.count() > 0:
             return
+        self.disk_cache.detach()
         self.active_session = None
         self.repository = None
         self.series = None
@@ -2760,6 +2792,7 @@ class MainWindow(QMainWindow):
     def _set_chapter(
         self, chapter, tiles, images: ImageStore | None = None,
     ) -> None:
+        self.disk_cache.detach()
         self._remember_document_view()
         self._edit_revision += 1
         self._recovery_revision = -1
@@ -2782,6 +2815,7 @@ class MainWindow(QMainWindow):
             self.active_session.recovery_revision = -1
             self.active_session.last_autosave = 0.0
         self.hierarchy_model.set_chapter(chapter)
+        self.disk_cache.bind()
         if self.repository is not None:
             try:
                 key = str(self.repository.root.resolve())
@@ -4720,6 +4754,9 @@ class MainWindow(QMainWindow):
         self.clipboard_image_history.add_images(self._clipboard_sources_cache)
 
     def _clipboard_images_resolved(self, sources) -> None:
+        if getattr(self.canvas, "document_read_only", False):
+            self._deferred_clipboard_sources = sources
+            return
         self._clipboard_sources_cache = sources
         self.clipboard_image_history.add_images(sources)
         pending = self._pending_clipboard_paste
@@ -6262,6 +6299,7 @@ class MainWindow(QMainWindow):
         self.preview.invalidate_all()
         self._refresh_project_tabs()
         self._refresh_actions()
+        self.disk_cache.bind()
 
     def _save_as(self) -> bool:
         if self.canvas.page_gap_mode_active():
@@ -6843,6 +6881,7 @@ class MainWindow(QMainWindow):
         self.showNormal() if self.isFullScreen() else self.showFullScreen()
 
     def closeEvent(self, event: QCloseEvent) -> None:  # noqa: N802
+        self.disk_cache.cancel()
         if self.canvas.page_gap_mode_active():
             self.canvas.cancel_page_gap_transaction()
         if self.sessions:
@@ -6869,6 +6908,7 @@ class MainWindow(QMainWindow):
         if monitor is not None:
             monitor.stop()
         self.autosave_timer.stop()
+        self.disk_cache.detach()
         self._autosave_jobs.shutdown()
         self.blender_sources.shutdown()
         self._flush_series_preferences()

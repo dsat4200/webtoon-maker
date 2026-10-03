@@ -108,6 +108,7 @@ class CommandStack:
         self._undo: list[Command] = []
         self._redo: list[Command] = []
         self._revision = 0
+        self.read_only = False
         self.changed_callback: Callable[[], None] | None = None
 
     @property
@@ -128,6 +129,8 @@ class CommandStack:
         return self._revision
 
     def push(self, command: Command, already_done: bool = False) -> None:
+        if self.read_only:
+            return
         if not already_done:
             command.redo()
         self._undo.append(command)
@@ -138,7 +141,7 @@ class CommandStack:
         self._notify()
 
     def undo(self) -> None:
-        if not self._undo:
+        if self.read_only or not self._undo:
             return
         command = self._undo.pop()
         command.undo()
@@ -147,7 +150,7 @@ class CommandStack:
         self._notify()
 
     def redo(self) -> None:
-        if not self._redo:
+        if self.read_only or not self._redo:
             return
         command = self._redo.pop()
         command.redo()

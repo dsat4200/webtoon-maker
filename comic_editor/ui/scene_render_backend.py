@@ -72,7 +72,8 @@ class CanvasSceneBackend:
         if page_contents_only:
             self.canvas._render_scene_layers(painter, visible, page_contents_only=True)
         else:
-            self.canvas._render_scene_layers(painter, visible, underlay=True, only_phase=phase)
+            values = {"live_ink": True} if getattr(self.canvas, "_capture_live_ink", False) else {}
+            self.canvas._render_scene_layers(painter, visible, underlay=True, only_phase=phase, **values)
 
     def page_area(self):
         canvas = self.canvas

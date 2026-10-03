@@ -173,6 +173,7 @@ class DocumentRenderService:
     def __init__(self, backend: SceneBackend, *, projection=None):
         self.backend = backend
         self.projection = projection if projection is not None else DocumentProjection()
+        self.last_error = ""
 
     def configure(self, configuration, *, document):
         self.projection.configure(configuration, document=document)
@@ -315,6 +316,7 @@ class DocumentRenderService:
             batch.error = result.error
             if result.status in (RenderStatus.PENDING, RenderStatus.FAILED, RenderStatus.STALE):
                 break
+        self.last_error = batch.error
         return batch
 
     def collect(self, requests, render, *, render_many=None):

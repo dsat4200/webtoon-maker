@@ -2,6 +2,50 @@
 
 ## Architectural center
 
+### Native artwork and manual disk backing
+
+Camera zoom and display density do not add artwork samples. Exact projection
+tiles use the native document grid (256px plus 2px gutters), vectors and text
+source captures cap their derived density at one, and transient scene/ink
+captures render into bounded native or smaller devices before presentation.
+Original image/raster grids, modifier source frames, float precision, and
+native sampling behavior remain intact. Grids, borders, and editing controls
+remain screen-resolution overlays. See the root `AGENTS.md` constraint.
+
+`render/cache.py::PersistentRenderCache` is an optional backing for the ordinary
+projection, source, effect, tile-graph, and retained-stage cache access points.
+It never traverses the document or implements a second renderer. Only an
+explicit recording scope writes immutable results. QImage formats/raw bytes
+and numeric array bits are compressed losslessly, including float working
+pixels and retained checkpoint placement. Draft/live caches are excluded.
+
+`ui/cache_dependencies.py` supplies stable source content fingerprints and
+regional scene identities. Encoded source files are hashed asynchronously and
+their stat stamps/content hashes are remembered in the cache index. Known dirty
+pixel identities survive adopting an encoded backing on save; sealed file
+records validate these identities across reopen and project-folder copying. Temporary
+Qt image IDs and runtime document identities are absent from durable keys.
+Simple raster dependencies select contributing source tiles; gutters can
+conservatively invalidate an adjacent section. Modified/masked subtrees retain
+their full upstream dependencies. Names/editor metadata are omitted; source
+pixels, geometry, order, masks, modifiers, resolved fonts, pixel contracts,
+external color configurations, renderer and library versions are dependencies.
+
+`ui/disk_cache.py::DiskCacheController` uses the normal owning-thread render
+service in short batches; image compression, source hashing and disk reads
+run in the bounded IO pool. A row becomes green only after all its final tiles
+and the index are committed. Reads restore values into existing memory LRUs.
+Failure/cancellation retains committed rows. Disk writes occur only after the
+user clicks Cache to disk; normal viewing never automatically records results.
+
+While a cache job runs the active document is read-only. Command history,
+outliner edits, keyboard/mouse/tablet drawing, drop input and property controls
+are locked, while camera/navigation, Cancel and chapter switching remain
+available. Blender publication imports, pending clipboard paste results and
+completed external image drops are deferred until unlocking. Active fill jobs
+and unfinished editing previews must finish before caching starts. Chapter switches/shutdown drain already submitted
+immutable disk writes and start no further rendering.
+
 Canvas interaction and legacy scene/effect kernels live in
 `comic_editor/ui/canvas.py`. Retained document-region rendering has a separate
 service boundary in `comic_editor/render/`.
@@ -301,7 +345,7 @@ The result is a `VectorStroke` of `VectorStrokePoint` anchors with optional inco
 
 Each vector stroke is rasterized independently by `_vector_stroke_image()`:
 
-1. Choose a render scale from canvas zoom and device-pixel ratio, clamped to 0.1–8 and limited to an 8192-pixel maximum dimension.
+1. Use native density, or an explicit preview density clamped to 0.1–1, with an 8192-pixel maximum dimension. Camera zoom and device ratio do not add samples.
 2. Flatten cubic spans while interpolating width and opacity.
 3. Resample enough points for the current render scale.
 4. Draw variable-width line segments and round joins into an 8-bit alpha mask using Lighten composition.
@@ -309,7 +353,7 @@ Each vector stroke is rasterized independently by `_vector_stroke_image()`:
 6. Fill an ARGB image with the stroke color and apply the mask through `DestinationIn`.
 7. Draw the colored image into the stroke's document-space target rectangle.
 
-The cache key includes drawing ID, stroke ID, the stroke render revision or a live-preview cache token, color, closure/caps, rounded render scale, and device ratio. Live eraser and selection previews use transient per-stroke tokens (`eraser-preview`, `selection-preview`). Cache hits are reinserted for LRU recency. Each canvas session has a 64 MiB byte budget; selective invalidation updates byte accounting, and a single image larger than the budget is rendered but not retained.
+The cache key includes drawing ID, stroke ID, the stroke render revision or a live-preview cache token, color, closure/caps, and rounded render scale. Live eraser and selection previews use transient per-stroke tokens (`eraser-preview`, `selection-preview`). Cache hits are reinserted for LRU recency. Each canvas session has a 64 MiB byte budget; selective invalidation updates byte accounting, and a single image larger than the budget is rendered but not retained.
 
 Each drawing also builds a lazy spatial index over 256-document-unit cells keyed by its drawing revision. Visible queries union only intersecting cells, sort their stroke indexes to retain paint order, and fall back to live geometry during edits that have not yet committed a new revision. Very large queries filter occupied cells instead of enumerating an unbounded grid.
 
@@ -374,7 +418,7 @@ Text is laid out by `QTextDocument` with a pixel-size `QFont`, absolute letter s
 - Text-only canvas controls are derived from the current selection and exist only in Text Edit. A floating overlay edits integer size and bold/italic; two screen-space right-edge handles scrub snapped size and kerning from their drag-start values and coalesce each drag into one chapter command.
 - Before any ribbon, gizmo, or transform edit, an active typing transaction is committed so document undo order matches user action order.
 - `text_features.py` owns free-box placement, strict/free conversion, container frames, and Bounds resizing. Bounds previews update logical dimensions and placement together, preserving the glyph mapping and using the same `QTextDocument` as caret/selection/hit testing. Container bounds derive from child quads, and container rendering adds no path/clip. Text layout clips intersect (never replace) ancestor clips.
-- Stretch, translation, and rotation may cache an unmodified box's device/zoom-aware image (8192-pixel side cap). Boxes below active ancestor effects/masks use live scene rendering instead. Bounds never uses stretched image previews. A 16 ms timer coalesces layout gestures and release flushes the last pointer position into one undo command.
+- Stretch, translation, and rotation may cache an unmodified box's native-density image (8192-pixel side cap). Boxes below active ancestor effects/masks use live scene rendering instead. Bounds never uses stretched image previews. A 16 ms timer coalesces layout gestures and release flushes the last pointer position into one undo command.
 - In Text Edit, only a screen-space band around the dotted free-transform boundary begins translation. Transform handles keep priority and the quad interior remains an I-beam text target.
 
 ## Hit testing and tool input
@@ -393,7 +437,7 @@ All mouse, tablet, wheel, touch, key, double-click, and IME events enter the can
 
 Touch hardware and high-frequency desktop pen input may report more events than a full recursive render can sustain. Touch navigation and modifier-drag mouse/pen navigation therefore keep only their newest pending packet and apply it with a zero-delay single-shot timer. Release synchronously applies the final pointer position. Each packet updates camera layout, clipping, transforms, overlays, and newly revealed content live; no viewport screenshot is stretched.
 
-Vector stroke bitmaps are reused at unchanged scale for pan and rotation. Alt+Shift drag zoom, touch pinch, and Ctrl+wheel bursts temporarily reuse vector bitmaps from the gesture's starting scale while the rest of the scene stays live. Release/touch completion, or 120 ms without another Ctrl+wheel event, clears that override and performs one crisp final-scale redraw. Wheel zoom applies `1.0015^delta` per event. Alt+Shift drag zoom also preserves the initial click's document point at its original widget-space position while scale changes.
+Vector stroke bitmaps remain at native density across camera pan, rotation and zoom. Navigation gestures may temporarily retain an explicit preview density capped at one; release/touch completion, or 120 ms without another Ctrl+wheel event, clears that override and redraws at native density. Wheel zoom applies `1.0015^delta` per event. Alt+Shift drag zoom also preserves the initial click's document point at its original widget-space position while scale changes.
 
 ## Underlay rendering
 

@@ -245,6 +245,8 @@ class HierarchyModel(QAbstractItemModel):
         return None
 
     def setData(self, index: QModelIndex, value, role=Qt.EditRole) -> bool:
+        if getattr(self, "read_only", False):
+            return False
         if not index.isValid() or self.chapter is None:
             return False
         item = self.item_for_index(index)
@@ -284,6 +286,8 @@ class HierarchyModel(QAbstractItemModel):
         return True
 
     def flags(self, index: QModelIndex):
+        if getattr(self, "read_only", False):
+            return Qt.ItemIsEnabled | Qt.ItemIsSelectable if index.isValid() else Qt.NoItemFlags
         if not index.isValid():
             return Qt.ItemIsDropEnabled
         item = self.item_for_index(index)
@@ -410,6 +414,8 @@ class HierarchyModel(QAbstractItemModel):
         return True
 
     def dropMimeData(self, data, action, row, column, parent) -> bool:
+        if getattr(self, "read_only", False):
+            return False
         if action == Qt.IgnoreAction:
             return True
         if not self.canDropMimeData(data, action, row, column, parent):

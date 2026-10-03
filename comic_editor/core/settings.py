@@ -264,6 +264,7 @@ class EditorSettings:
     recent_series: list[str] = field(default_factory=list)
     last_chapter_by_series: dict[str, str] = field(default_factory=dict)
     document_viewports: dict[str, dict[str, float]] = field(default_factory=dict)
+    document_cache_ranges: dict[str, list[float]] = field(default_factory=dict)
     blender_bridge_host: str = "127.0.0.1"
     blender_bridge_port: int = 47837
     blender_bridge_token: str = ""
@@ -611,6 +612,14 @@ class EditorSettings:
                 if isinstance(key, str) and key and camera is not None:
                     viewports[key] = camera
         self.document_viewports = dict(list(viewports.items())[-MAX_SAVED_VIEWPORTS:])
+        ranges = {}
+        if isinstance(self.document_cache_ranges, dict):
+            for key, value in self.document_cache_ranges.items():
+                if (isinstance(key, str) and isinstance(value, (list, tuple)) and len(value) == 2
+                        and all(isinstance(v, (int, float)) and math.isfinite(v) for v in value)
+                        and 0 <= value[0] < value[1]):
+                    ranges[key] = list(value)
+        self.document_cache_ranges = dict(list(ranges.items())[-MAX_SAVED_VIEWPORTS:])
 
     def pencil_size(self) -> int:
         return self.pencil_size_px[self.active_pencil_size]

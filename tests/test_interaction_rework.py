@@ -106,6 +106,13 @@ def test_raster_selection_transform_renders_live_without_mutating_tiles(qapp):
     canvas.show()
     qapp.processEvents()
 
+    # Opening native projection may finish outlined source work asynchronously.
+    for _ in range(200):
+        if canvas._projection_completed_view is not None:
+            break
+        QTest.qWait(10)
+    assert canvas._projection_completed_view is not None
+
     source = QPointF(180, 180)
     destination = source + QPointF(120, 0)
     quad = list(canvas._selection_transform_quad)

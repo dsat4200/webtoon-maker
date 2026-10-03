@@ -73,12 +73,22 @@ class EffectJobs(QObject):
 
     def retained_get(self, scope, key):
         from PySide6.QtGui import QImage
+        from comic_editor.ui.cache_dependencies import cache_get, cache_put, backing_for
         entry = self.retained.get(scope)
         if entry is None or entry[0] != key:
-            return None
+            image = cache_get(self.canvas, "retained", ("retained", scope, key))
+            if image is None:
+                return None
+            backing = backing_for(self.canvas)
+            descriptor = backing.descriptor("retained", ("retained", scope, key))
+            from comic_editor.render.cache import restore_state
+            state = restore_state(backing.entries.get(descriptor.identity, {}).get("state"))
+            self.retained_put(scope, key, image, state)
+            return QImage(image), state
         self.retained.move_to_end(scope)
         if scope in self._retained_shared:
             self._retained_shared.move_to_end(scope)
+        cache_put(self.canvas, "retained", ("retained", scope, key), entry[1], state=entry[2])
         return QImage(entry[1]), entry[2]
 
     def _retained_unprotect(self, scope):
@@ -90,6 +100,8 @@ class EffectJobs(QObject):
 
     def retained_put(self, scope, key, image, state=None, *, shared=False, force=False):
         from PySide6.QtGui import QImage
+        from comic_editor.ui.cache_dependencies import cache_put
+        cache_put(self.canvas, "retained", ("retained", scope, key), image, state=state)
         self.retained_remove(scope)
         size = int(image.sizeInBytes())
         storage = int(image.cacheKey())

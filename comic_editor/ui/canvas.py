@@ -1050,6 +1050,7 @@ class _CanvasLogic(LassoBrushFeatures, BrushFeatures, DocumentProjectionFeatures
         self._projection_tile_key = None
         self._projection_defer_effects = False
         self._render_service = DocumentRenderService(CanvasSceneBackend(self))
+        self._effect_preview_channel = "canvas"
         self._document_projection = self._render_service.projection
         self._render_bounds = SceneRenderBounds(self)
         self._scene_cache_key: tuple | None = None
@@ -1525,49 +1526,28 @@ class _CanvasLogic(LassoBrushFeatures, BrushFeatures, DocumentProjectionFeatures
             finally:
                 painter.end()
             return
-        self._render_bounds.prepare()
+        from comic_editor.ui.native_artwork import paint_scene
         painter = QPainter(self._scene_cache if target is None else target)
-        painter.setClipRect(dirty)
-        painter.fillRect(dirty, QColor("#242428"))
-        painter.setRenderHint(QPainter.Antialiasing, True)
-        painter.setTransform(self.camera_transform())
-        painter.fillRect(
-            QRectF(0, 0, self.chapter.width, self.chapter.height),
-            QColor(self.chapter.background),
-        )
-        inverse, valid = self.camera_transform().inverted()
-        visible = (
-            inverse.map(QPolygonF(QRectF(dirty))).boundingRect()
-            if valid else self.visible_document_rect()
-        )
-        self._render_canvas_overflow(painter, dirty, visible)
-        painter.save()
-        painter.setClipRect(
-            QRectF(0, 0, self.chapter.width, self.chapter.height),
-            Qt.IntersectClip,
-        )
-        self._set_live_underlay_context()
-        previous_interactive = self._interactive_render
-        previous_effect_viewport = getattr(self, "_effect_viewport_world", None)
-        self._interactive_render = True
-        self._effect_viewport_world = self.visible_document_rect()
-        # Editing changes the text's content, not its place in the scene.
-        # Keep glyphs in the ordinary hierarchy on every typing/deletion frame;
-        # only caret/selection are painted later as an editing overlay.
         try:
-            self._render_scene_layers(painter, visible, underlay=True, live_ink=live_ink)
+            painter.setRenderHint(QPainter.Antialiasing, True)
+            painter.setClipRect(dirty)
+            painter.fillRect(dirty, QColor("#242428"))
+            inverse, valid = self.camera_transform().inverted()
+            visible = inverse.mapRect(QRectF(dirty)) if valid else self.visible_document_rect()
+            previous = getattr(self, "_capture_live_ink", False)
+            self._capture_live_ink = live_ink
+            try:
+                paint_scene(self, painter, visible)
+            finally:
+                self._capture_live_ink = previous
+            painter.setTransform(self.camera_transform())
+            self._draw_grid(painter, visible)
+            painter.resetTransform()
+            painter.setPen(QPen(QColor("#44444d"), 1))
+            painter.drawPolygon(self.camera_transform().map(QPolygonF(QRectF(0, 0, self.chapter.width, self.chapter.height))))
         finally:
-            self._interactive_render = previous_interactive
-            self._effect_viewport_world = previous_effect_viewport
-        self._clear_live_underlay_context()
-        self._draw_grid(painter, visible)
-        painter.restore()
-        painter.setTransform(QTransform())
-        painter.setPen(QPen(QColor("#44444d"), 1))
-        painter.drawPolygon(self.camera_transform().map(QPolygonF(QRectF(
-            0, 0, self.chapter.width, self.chapter.height
-        ))))
-        painter.end()
+            painter.end()
+        return
 
     def _clear_detached_input_state(self) -> None:
         """Reset transient pointer state that cannot survive without a document."""
@@ -3464,7 +3444,7 @@ class _CanvasLogic(LassoBrushFeatures, BrushFeatures, DocumentProjectionFeatures
                 self._finish_mesh_warp_preview()
             if mesh_preview is not None:
                 self._paint_mesh_warp_preview(painter, mesh_preview)
-            elif self._uses_document_projection():
+            elif self._uses_document_projection() and (isinstance(self, QOpenGLWidget) or promoted_ink):
                 self._paint_document_projection(painter, live_ink=promoted_ink)
             elif promoted_ink:
                 self._ensure_scene_cache()
@@ -4269,6 +4249,8 @@ class _CanvasLogic(LassoBrushFeatures, BrushFeatures, DocumentProjectionFeatures
         }
 
     def _finish_pending_external_drop_if_ready(self) -> None:
+        if getattr(self, "document_read_only", False):
+            return
         pending = self._pending_external_drop
         if pending is None or any(
             entry["pending"] for entry in pending["entries"]
@@ -4386,6 +4368,9 @@ class _CanvasLogic(LassoBrushFeatures, BrushFeatures, DocumentProjectionFeatures
         event.accept()
 
     def dropEvent(self, event) -> None:  # noqa: N802
+        if getattr(self, "document_read_only", False):
+            event.ignore()
+            return
         if (
             not self._asset_drag_valid
             or self._asset_drag_manifest is None
@@ -4532,6 +4517,9 @@ class _CanvasLogic(LassoBrushFeatures, BrushFeatures, DocumentProjectionFeatures
             return
         ancestors = self.chapter.ancestor_layers(obj.parent_layer_id)
         if any(not layer.visible or layer.opacity <= 0 for layer in ancestors):
+            return
+        from comic_editor.ui.native_artwork import paint_overlay
+        if paint_overlay(self, painter, visible, self._render_selected_drawing_underlay):
             return
         painter.save()
         painter.setOpacity(
@@ -5610,12 +5598,10 @@ class _CanvasLogic(LassoBrushFeatures, BrushFeatures, DocumentProjectionFeatures
         )
 
     def _requested_vector_render_scale(self) -> float:
+        from comic_editor.render.sampling import artwork_density
         if self._vector_render_scale_override is not None:
-            return self._vector_render_scale_override
-        return max(
-            0.1,
-            min(8.0, self.scale * max(1.0, self.devicePixelRatioF())),
-        )
+            return artwork_density(self._vector_render_scale_override)
+        return 1.0
 
     def _vector_stroke_indexes(
         self, drawing: VectorDrawingObject, visible: QRectF | None,
@@ -5697,7 +5683,6 @@ class _CanvasLogic(LassoBrushFeatures, BrushFeatures, DocumentProjectionFeatures
         """Rasterize one stroke opacity mask, then colorize it exactly once."""
         if not stroke.points:
             return None
-        device_ratio = max(1.0, float(self.devicePixelRatioF()))
         requested_scale = self._requested_vector_render_scale()
         key = (
             drawing.object_id,
@@ -5709,7 +5694,6 @@ class _CanvasLogic(LassoBrushFeatures, BrushFeatures, DocumentProjectionFeatures
             stroke.end_cap,
             tuple(stroke.clip_polygon or ()), stroke.tiling_group,
             round(requested_scale, 3),
-            device_ratio,
         )
         cached = self._vector_render_cache.get(key)
         if cached is not None:
@@ -8293,6 +8277,8 @@ class _CanvasLogic(LassoBrushFeatures, BrushFeatures, DocumentProjectionFeatures
         )
 
     def _mask_only_render_visible(self, kind: str, identifier: str) -> bool:
+        if getattr(self, "_disk_cache_capture", False) and self._rendering_mask_contributor <= 0:
+            return False
         return self._rendering_mask_contributor > 0 or bool(
             self._interactive_render
             and not getattr(self, "_rendering_halftone_source", False)
@@ -8351,10 +8337,10 @@ class _CanvasLogic(LassoBrushFeatures, BrushFeatures, DocumentProjectionFeatures
             live = (*live, repr(self._cage_session["grid"].grid_dict()))
         return live
 
-    def _modifier_object_signature(self, obj: DocumentObject) -> tuple:
+    def _modifier_object_signature(self, obj: DocumentObject, *, pixel_signature=None) -> tuple:
         pixels: tuple = ()
         if isinstance(obj, RasterObject):
-            pixels = self.tiles.object_signature(obj.object_id)
+            pixels = self.tiles.object_signature(obj.object_id) if pixel_signature is None else pixel_signature
         elif isinstance(obj, ImageObject):
             pixels = self.images.pixel_signature(obj.object_id)
         elif isinstance(obj, ColorFillGradientObject):
@@ -8367,6 +8353,8 @@ class _CanvasLogic(LassoBrushFeatures, BrushFeatures, DocumentProjectionFeatures
             # stored frame and typography have not changed.
             pixels = ("text-layout", self._rect_signature(self._strict_text_rect(obj)))
         live = self._modifier_object_preview_signature(obj)
+        if isinstance(obj, TextObject) and getattr(self, "_render_dependencies", None) is not None:
+            pixels = (pixels, self._render_dependencies.font(obj))
         if getattr(self, "_tiling_capture_geometry", None) is not None:
             live = (*live, repr(self._tiling_capture_geometry))
         if obj.mask_only:
@@ -8453,13 +8441,21 @@ class _CanvasLogic(LassoBrushFeatures, BrushFeatures, DocumentProjectionFeatures
             self._effect_jobs.retained_put(("output", scope), key, image)
 
     def _modifier_cache_get(self, key: tuple) -> QImage | None:
+        from comic_editor.ui.cache_dependencies import cache_get, cache_put
         image = self._modifier_render_cache.pop(key, None)
         if image is None:
-            return None
+            image = cache_get(self, "effect", key)
+            if image is None:
+                return None
+            self._modifier_cache_put(key, image)
+            return QImage(image)
         self._modifier_render_cache[key] = image
+        cache_put(self, "effect", key, image)
         return QImage(image)
 
     def _modifier_cache_put(self, key: tuple, image: QImage) -> None:
+        from comic_editor.ui.cache_dependencies import cache_put
+        cache_put(self, "effect", key, image)
         size = int(image.sizeInBytes())
         if size <= 0:
             return
@@ -8481,13 +8477,21 @@ class _CanvasLogic(LassoBrushFeatures, BrushFeatures, DocumentProjectionFeatures
             self._modifier_render_cache_bytes -= int(old_image.sizeInBytes())
 
     def _modifier_source_cache_get(self, key: tuple) -> QImage | None:
+        from comic_editor.ui.cache_dependencies import cache_get, cache_put
         image = self._modifier_source_cache.pop(key, None)
         if image is None:
-            return None
+            image = cache_get(self, "source", key)
+            if image is None:
+                return None
+            self._modifier_source_cache_put(key, image)
+            return QImage(image)
         self._modifier_source_cache[key] = image
+        cache_put(self, "source", key, image)
         return QImage(image)
 
     def _modifier_source_cache_put(self, key: tuple, image: QImage) -> None:
+        from comic_editor.ui.cache_dependencies import cache_put
+        cache_put(self, "source", key, image)
         size = int(image.sizeInBytes())
         if size <= 0:
             return
@@ -9496,6 +9500,11 @@ class _CanvasLogic(LassoBrushFeatures, BrushFeatures, DocumentProjectionFeatures
     def _draw_predictive_ink(self, painter: QPainter) -> None:
         if not self.settings.predictive_ink or self._predictive is None:
             return
+        from comic_editor.ui.native_artwork import paint_overlay
+        if paint_overlay(self, painter, self.visible_document_rect(), lambda target, area: self._draw_predictive_ink(target)):
+            return
+        if not self.settings.predictive_ink or self._predictive is None:
+            return
         if self.chapter is None or self.selected_kind != "object":
             return
         obj = self.chapter.objects.get(self.selected_id)
@@ -9521,6 +9530,12 @@ class _CanvasLogic(LassoBrushFeatures, BrushFeatures, DocumentProjectionFeatures
         painter.restore()
 
     def _draw_live_vector_gesture(self, painter: QPainter) -> None:
+        if self._vector_gesture_mode not in {"pencil", "simplify"}:
+            return
+        from comic_editor.ui.native_artwork import paint_overlay
+        if (self._vector_gesture_mode == "pencil" and self._vector_samples
+                and paint_overlay(self, painter, self.visible_document_rect(), lambda target, area: self._draw_live_vector_gesture(target))):
+            return
         drawing = self._active_vector_drawing()
         if drawing is not None and not self._solo_content_visible("object", drawing.object_id):
             return
@@ -13980,6 +13995,9 @@ class _CanvasLogic(LassoBrushFeatures, BrushFeatures, DocumentProjectionFeatures
         if nav:
             self._begin_navigation(nav, event.position())
             return
+        if getattr(self, "document_read_only", False):
+            event.accept()
+            return
         if self.export_rect_editing:
             self._export_rect_pointer_press(event.position())
             event.accept()
@@ -14074,6 +14092,9 @@ class _CanvasLogic(LassoBrushFeatures, BrushFeatures, DocumentProjectionFeatures
         return False
 
     def mouseDoubleClickEvent(self, event: QMouseEvent) -> None:  # noqa: N802
+        if getattr(self, "document_read_only", False):
+            event.accept()
+            return
         if self.export_rect_editing:
             event.accept()
             return
@@ -14150,6 +14171,9 @@ class _CanvasLogic(LassoBrushFeatures, BrushFeatures, DocumentProjectionFeatures
         super().mouseDoubleClickEvent(event)
 
     def keyPressEvent(self, event) -> None:  # noqa: N802
+        if getattr(self, "document_read_only", False):
+            event.accept()
+            return
         if event.key() == Qt.Key_Escape and self._cancel_lasso_brush():
             self.interactionFinished.emit()
             event.accept()
@@ -14349,6 +14373,9 @@ class _CanvasLogic(LassoBrushFeatures, BrushFeatures, DocumentProjectionFeatures
             last.outgoing = None
 
     def inputMethodEvent(self, event: QInputMethodEvent) -> None:  # noqa: N802
+        if getattr(self, "document_read_only", False):
+            event.accept()
+            return
         if self._editing_text_object() is not None and event.commitString():
             self._replace_text_selection(event.commitString())
             event.accept()
@@ -14357,7 +14384,8 @@ class _CanvasLogic(LassoBrushFeatures, BrushFeatures, DocumentProjectionFeatures
 
     def inputMethodQuery(self, query):  # noqa: N802
         if query == Qt.ImEnabled:
-            return self.tool == ToolKind.TEXT_EDIT and bool(self.selected_object_id)
+            return (not getattr(self, "document_read_only", False)
+                    and self.tool == ToolKind.TEXT_EDIT and bool(self.selected_object_id))
         if query == Qt.ImCursorRectangle:
             obj = self._editing_text_object()
             if obj is not None:
@@ -14384,6 +14412,9 @@ class _CanvasLogic(LassoBrushFeatures, BrushFeatures, DocumentProjectionFeatures
         event.accept()
 
     def tabletEvent(self, event) -> None:  # noqa: N802
+        if getattr(self, "document_read_only", False) and not (self._nav_mode or self._navigation_mode()):
+            event.accept()
+            return
         self._capture_paint_brush_packet(event, tablet=True)
         device = event.pointingDevice()
         if device is not None:
@@ -14626,10 +14657,7 @@ class _CanvasLogic(LassoBrushFeatures, BrushFeatures, DocumentProjectionFeatures
             return
         if self._vector_render_scale_owner is not None:
             self._vector_render_scale_override = None
-        self._vector_render_scale_override = max(
-            0.1,
-            min(8.0, self.scale * max(1.0, self.devicePixelRatioF())),
-        )
+        self._vector_render_scale_override = self._requested_vector_render_scale()
         self._vector_render_scale_owner = owner
 
     def _finish_vector_scale_reuse(
@@ -20502,6 +20530,8 @@ class _CanvasLogic(LassoBrushFeatures, BrushFeatures, DocumentProjectionFeatures
             self._input_press_modifiers = None
 
     def _tool_press(self, widget_point: QPointF, pressure: float) -> None:
+        if getattr(self, "document_read_only", False):
+            return
         if self.chapter is None:
             self._clear_detached_input_state()
             return
@@ -20996,6 +21026,8 @@ class _CanvasLogic(LassoBrushFeatures, BrushFeatures, DocumentProjectionFeatures
             self.update()
 
     def _tool_move(self, widget_point: QPointF, pressure: float) -> None:
+        if getattr(self, "document_read_only", False):
+            return
         if self.chapter is None:
             self._clear_detached_input_state()
             return
@@ -21299,6 +21331,8 @@ class _CanvasLogic(LassoBrushFeatures, BrushFeatures, DocumentProjectionFeatures
             self._update_shape_hover(point)
 
     def _tool_release(self) -> None:
+        if getattr(self, "document_read_only", False):
+            return
         if self._lasso_brush is not None:
             self._finish_lasso_brush()
             return
@@ -24723,33 +24757,13 @@ class _CanvasLogic(LassoBrushFeatures, BrushFeatures, DocumentProjectionFeatures
         )
         image.setDevicePixelRatio(ratio)
         image.fill(QColor("#242428"))
-        painter = QPainter(image)
-        succeeded = False
         previous_excluded = self._render_excluded_object_id
         try:
-            painter.setRenderHint(QPainter.Antialiasing, True)
-            painter.setTransform(self.camera_transform())
-            painter.fillRect(
-                QRectF(0, 0, self.chapter.width, self.chapter.height),
-                QColor(self.chapter.background),
-            )
-            painter.save()
-            try:
-                painter.setClipRect(
-                    QRectF(0, 0, self.chapter.width, self.chapter.height)
-                )
-                self._render_excluded_object_id = object_id
-                visible = self.visible_document_rect()
-                self._render_scene_layers(painter, visible)
-                self._draw_grid(painter, visible)
-            finally:
-                painter.restore()
-            succeeded = True
+            self._render_excluded_object_id = object_id
+            self._render_scene_cache_rect(self.rect(), target=image, projection=False)
         finally:
             self._render_excluded_object_id = previous_excluded
-            if painter.isActive():
-                painter.end()
-        return image if succeeded else QImage()
+        return image
 
     def _build_vector_eraser_background_cache(self) -> None:
         self._vector_eraser_background_cache = (
@@ -24761,6 +24775,9 @@ class _CanvasLogic(LassoBrushFeatures, BrushFeatures, DocumentProjectionFeatures
     def _render_selected_raster_preview(
         self, painter: QPainter, visible: QRectF,
     ) -> None:
+        from comic_editor.ui.native_artwork import paint_overlay
+        if paint_overlay(self, painter, visible, self._render_selected_raster_preview):
+            return
         obj = self.chapter.objects.get(self.selected_object_id)
         if not (
             self._is_transformable_object(obj) or isinstance(obj, TextObject)
@@ -24796,7 +24813,7 @@ class _CanvasLogic(LassoBrushFeatures, BrushFeatures, DocumentProjectionFeatures
 
     def _build_text_transform_cache(self, obj: TextObject) -> None:
         source = QRectF(0, 0, max(1.0, obj.width), max(1.0, obj.height))
-        ratio = max(1.0, float(self.devicePixelRatioF()) * self.scale)
+        ratio = 1.0
         largest = max(source.width(), source.height())
         if largest * ratio > 8192:
             ratio = max(0.1, 8192 / largest)
@@ -24818,6 +24835,9 @@ class _CanvasLogic(LassoBrushFeatures, BrushFeatures, DocumentProjectionFeatures
         self._text_transform_cache = image
 
     def _render_selected_text_preview(self, painter: QPainter) -> None:
+        from comic_editor.ui.native_artwork import paint_overlay
+        if paint_overlay(self, painter, self.visible_document_rect(), lambda target, area: self._render_selected_text_preview(target)):
+            return
         obj = self.chapter.objects.get(self.selected_object_id)
         if (
             not isinstance(obj, TextObject)
@@ -25536,6 +25556,8 @@ class _CanvasLogic(LassoBrushFeatures, BrushFeatures, DocumentProjectionFeatures
 
 class RasterCanvasWidget(_CanvasLogic, QWidget):
     """Universal software fallback."""
+
+    _document_projection_enabled = True
 
 
 class GpuCanvasWidget(_CanvasLogic, QOpenGLWidget):

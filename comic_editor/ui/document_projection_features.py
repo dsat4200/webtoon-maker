@@ -12,6 +12,7 @@ from comic_editor.render.service import (
     RenderDocument, RenderRequest, RenderResult, RenderQuality, RenderStatus, TileBatchPolicy,
 )
 from comic_editor.core.models import RasterObject
+from comic_editor.render.sampling import artwork_density
 
 
 class DocumentProjectionFeatures:
@@ -29,6 +30,15 @@ class DocumentProjectionFeatures:
         self._projection_work_waiting = False
 
     def _projection_configuration(self):
+        mask_entities = tuple(sorted(
+            [("layer", identifier) for identifier, entity in self.chapter.layers.items()
+             if entity.mask_only] +
+            [("object", identifier) for identifier, entity in self.chapter.objects.items()
+             if entity.mask_only]))
+        if getattr(self, "_disk_cache_capture", False):
+            return (id(self.chapter), id(self.tiles), id(self.images),
+                    self.chapter.width, self.chapter.height, self.chapter.background,
+                    self.chapter.view_overflow, ("", 0.), (), None, mask_entities)
         previous = self._live_underlay_object_id, self._live_underlay_amount
         try:
             self._set_live_underlay_context()
@@ -41,7 +51,8 @@ class DocumentProjectionFeatures:
                      if selected is not None and selected.mask_only else None)
         return (id(self.chapter), id(self.tiles), id(self.images),
                 self.chapter.width, self.chapter.height, self.chapter.background,
-                self.chapter.view_overflow, underlay, tuple(sorted(self._solo_entities)), mask_only)
+                self.chapter.view_overflow, underlay, tuple(sorted(self._solo_entities)), mask_only,
+                mask_entities)
 
     def _invalidate_selection_scene_cache(self):
         # Selection/tool UI is drawn after document presentation. Underlay and
@@ -76,7 +87,7 @@ class DocumentProjectionFeatures:
         # A guard band warms the corners exposed by canvas rotation and the
         # next small pan. Its size is tied to the stable tile grid, not an
         # ever-changing capture rectangle.
-        density = self.scale * max(1., self.devicePixelRatioF())
+        density = 1.0
         level = projection.resolution_level(density)
         margin = projection.tile_size if level == 0 else 0.
         windows = self._projection_windows
@@ -127,7 +138,7 @@ class DocumentProjectionFeatures:
         return RenderDocument(configuration[:3], configuration,
             self._document_projection.revision, self.chapter.width, self.chapter.height,
             self.chapter.background, self.chapter.view_overflow, configuration[7],
-            self._projection_has_live_preview())
+            self._projection_has_live_preview(), self.chapter.pixel_contract)
 
     def _render_document_tiles(self, requests):
         document = self._render_document_state()
@@ -243,6 +254,20 @@ class DocumentProjectionFeatures:
         return previous[1] if previous is not None else []
 
     def _paint_document_projection(self, painter, *, live_ink=False):
+        if self._projection_has_live_preview() and not self._text_editing:
+            # Editing snapshots may be provisional. Present them immediately
+            # through the same kernels without admitting them to exact tiles.
+            from comic_editor.ui.native_artwork import paint_scene
+            previous = getattr(self, "_capture_live_ink", False)
+            self._capture_live_ink = live_ink
+            try:
+                paint_scene(self, painter, self.visible_document_rect())
+            finally:
+                self._capture_live_ink = previous
+            self._paint_projection_grid(painter, None)
+            draw_document_border(painter, QRectF(0, 0, self.chapter.width, self.chapter.height),
+                                 self.camera_transform(), self.size(), owner=None)
+            return
         # Detached captures and exports stay synchronous. Only interactive
         # widget presentation may defer exact effect work to the job queue.
         owner = self if painter.device() is self else None
@@ -278,7 +303,12 @@ class DocumentProjectionFeatures:
         if (deferred and self._projection_frame_pending and self._projection_yielded
                 and not getattr(self, "_projection_work_waiting", False)
                 and not getattr(self, "_projection_render_error", None)):
-            QTimer.singleShot(0, self.update)
+            timer = getattr(self, "_projection_redraw_timer", None)
+            if timer is None:
+                timer = self._projection_redraw_timer = QTimer(self)
+                timer.setSingleShot(True)
+                timer.timeout.connect(self.update)
+            timer.start(0)
 
     def _projection_can_defer_effects(self):
         # Paint contact and live source previews need immediate ink. Radial
@@ -315,9 +345,10 @@ class DocumentProjectionFeatures:
             self._projection_stroke_preview = None
             return False
         visible = self.visible_document_rect()
-        density = self.scale * max(1., self.devicePixelRatioF())
+        density = artwork_density(self.scale)
         size = (max(1, round(visible.width()*density)), max(1, round(visible.height()*density)))
-        if size[0]*size[1]*4 > self._document_projection.budget:
+        pixel_bytes = QImage.toPixelFormat(self.chapter.pixel_contract.image_format).bitsPerPixel() // 8
+        if size[0]*size[1]*pixel_bytes > self._document_projection.budget:
             self._projection_stroke_preview = None
             return False
         jobs = self._effect_jobs
@@ -332,6 +363,12 @@ class DocumentProjectionFeatures:
         same_view = (previous is not None and previous[0] == document.configuration
                      and previous[2] == visible and previous[1].image.size() == QSize(*size))
         dirty = QRectF(getattr(self, '_stroke_dirty_world', QRectF()))
+        predictive = self._predictive if self._show_on_top_live_ink() else None
+        if predictive is not None:
+            start, end, width, _color = predictive
+            margin = width / 2 + 2
+            dirty = dirty.united(QRectF(start, end).normalized().adjusted(
+                -margin, -margin, margin, margin))
         if same_view and len(previous) > 4:
             dirty = dirty.united(previous[4])
         coverage_needed = visible if document.overflow > 0. else visible.intersected(document.bounds)
@@ -354,13 +391,18 @@ class DocumentProjectionFeatures:
                           patch.width()/density, patch.height()/density)
         request = RenderRequest(tuple(area.getRect()), density, capture_size, ('stroke-preview',),
                                 document.revision, quality=RenderQuality.INTERACTIVE)
-        result = self._render_service.render_region(document, request)
+        previous_ink = getattr(self, '_capture_live_ink', False)
+        self._capture_live_ink = self._show_on_top_live_ink()
+        try:
+            result = self._render_service.render_region(document, request)
+        finally:
+            self._capture_live_ink = previous_ink
         if result.image.isNull():
             self._projection_stroke_preview = None
             return False
         image = result.image
         if capture_size != size or offset != (0, 0):
-            image = QImage(previous[1].image) if same_view else QImage(*size, QImage.Format_ARGB32_Premultiplied)
+            image = QImage(previous[1].image) if same_view else QImage(*size, document.pixel_contract.image_format)
             if not same_view:
                 image.fill(Qt.transparent)
             painter = QPainter(image)
@@ -406,16 +448,18 @@ class DocumentProjectionFeatures:
             else:
                 batch = self._projection_phase_batch(phases)
             stroke = getattr(self, '_projection_stroke_preview', None)
-            if (self._projection_frame_pending and stroke is not None
+            showing_stroke = (self._projection_frame_pending and stroke is not None
                     and stroke[0] == self._projection_configuration()
                     and stroke[3] == self._document_projection.revision
-                    and stroke[2].contains(self.visible_document_rect())):
+                    and stroke[2].contains(self.visible_document_rect()))
+            if showing_stroke:
                 batch = [(None, [stroke[1]])]
             elif not self._projection_frame_pending:
                 self._projection_stroke_preview = None
             # A retained combined view cannot place ordinary prediction below
             # promoted artwork. Wait for the matching finished phase set.
-            draw_live = live_ink and tuple(phase for phase, _ in batch) == tuple(phases)
+            draw_live = (live_ink and not showing_stroke
+                         and tuple(phase for phase, _ in batch) == tuple(phases))
             for phase, tiles in batch:
                 stats.append(draw_document_tiles(
                     painter, tiles, self.camera_transform(), self.size(),

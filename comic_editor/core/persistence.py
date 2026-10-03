@@ -213,7 +213,7 @@ class SeriesRepository:
         ignored: set[str] = set()
         for name in names:
             folded = name.casefold()
-            if folded in {"autosave", LAST_GOOD_DIR, PENDING_FILE}:
+            if folded in {"autosave", LAST_GOOD_DIR, PENDING_FILE, ".render-cache"}:
                 ignored.add(name)
             elif folded.endswith(".tmp") or folded.endswith("~"):
                 ignored.add(name)

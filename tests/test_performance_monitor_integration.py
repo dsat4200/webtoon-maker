@@ -152,7 +152,7 @@ def test_native_qt_paints_are_timed_and_stop_restores_every_probe(editor, contro
     QTest.qWait(window.preview.REFRESH_DELAY_MS + 30)
     phases = _phases(controller)
     assert phases["canvas.paintEvent"]["count"] >= 1
-    assert phases["canvas.ensure_scene_cache"]["count"] >= 1
+    assert phases["canvas.paint_document_projection"]["count"] >= 1
     assert phases["navigator.render"]["count"] >= 1
     assert phases["canvas.render_preview"]["count"] >= 1
     assert controller._counts["paint.request"] >= 1

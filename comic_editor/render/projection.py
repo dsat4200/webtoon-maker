@@ -7,7 +7,6 @@ An unfinished render never replaces an existing exact tile with a draft.
 from __future__ import annotations
 
 from collections import OrderedDict
-from bisect import bisect_left
 from dataclasses import dataclass
 from functools import cached_property
 import math
@@ -17,9 +16,8 @@ from PySide6.QtCore import QRectF
 from PySide6.QtGui import QImage
 
 
-# Include physical-pixel density above the editor's 8x logical zoom for HiDPI
-# displays. Tile dimensions and memory accounting remain independent of level.
-RESOLUTION_SCALES = (1., 1.25, 1.5, 2., 3., 4., 6., 8., 12., 16., 24., 32., 48., 64.)
+# One document grid is shared by all zoom levels and display densities.
+RESOLUTION_SCALES = (1.,)
 
 
 @dataclass(frozen=True)
@@ -88,13 +86,11 @@ class DocumentProjection:
         self.revision = 0
         self.configuration = None
         self.hits = self.renders = self.incomplete = self.evictions = 0
+        self.backing_lookup = self.backing_retain = None
 
     @staticmethod
     def resolution_level(pixels_per_unit: float) -> int:
-        # Never enlarge a low-resolution preview to manufacture vector detail.
-        # Level zero also preserves native raster/effect pixels when zoomed out.
-        value = max(1., min(RESOLUTION_SCALES[-1], float(pixels_per_unit)))
-        return bisect_left(RESOLUTION_SCALES, value)
+        return 0
 
     @classmethod
     def resolution_scale(cls, pixels_per_unit: float) -> float:
@@ -153,6 +149,25 @@ class DocumentProjection:
         protected = {request.address for request in requests}
         missing = [request for request in requests
                    if request.address not in self.tiles or not self.tiles[request.address].valid]
+        pending = set()
+        if self.backing_lookup is not None:
+            from .service import RenderPending
+            for request in missing:
+                try:
+                    image = self.backing_lookup(request, configuration)
+                except RenderPending:
+                    pending.add(request.address)
+                    continue
+                if image is not None and not image.isNull():
+                    if image.width() != request.pixel_size or image.height() != request.pixel_size:
+                        continue
+                    previous = self.tiles.get(request.address)
+                    if previous is not None:
+                        self.bytes -= previous.image.sizeInBytes()
+                    self.tiles[request.address] = ProjectionTile(request, image, revision)
+                    self.bytes += image.sizeInBytes()
+            missing = [request for request in missing if request.address not in pending
+                       and (request.address not in self.tiles or not self.tiles[request.address].valid)]
         rendered = render_many(missing) if missing and render_many is not None else {}
         if not current():
             return []
@@ -177,6 +192,9 @@ class DocumentProjection:
                 self.hits += 1
                 self.tiles.move_to_end(request.address)
             else:
+                if request.address in pending:
+                    self.incomplete += 1
+                    continue
                 self.renders += 1
                 image, exact = (rendered[request.address] if request.address in rendered
                                 else render(request))
@@ -195,6 +213,8 @@ class DocumentProjection:
                     self.incomplete += 1
             if tile is not None:
                 result.append(tile)
+                if tile.valid and self.backing_retain is not None:
+                    self.backing_retain(request, configuration, tile.image)
         self._trim(protected)
         return result
 

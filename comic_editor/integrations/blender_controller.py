@@ -221,6 +221,8 @@ class BlenderImageSourceController(QObject):
         ]
 
     def _reconcile_views(self, values: list[ComicViewInfo]) -> None:
+        if getattr(self.canvas, "document_read_only", False):
+            return
         for view in values:
             if not view.frame_path:
                 continue
@@ -252,6 +254,8 @@ class BlenderImageSourceController(QObject):
     def _apply_frame(
         self, view: ComicViewInfo, objects: list[ImageObject], raw: bytes, image,
     ) -> None:
+        if getattr(self.canvas, "document_read_only", False):
+            return
         dirty = QRectF()
         changed = False
         for obj in objects:

@@ -59,14 +59,14 @@ def test_cold_draft_is_not_cached_or_presented(qapp):
     assert not projection.tiles
 
 
-def test_zoom_uses_sufficient_detail_and_reuses_existing_levels(qapp):
+def test_zoom_reuses_native_pixels_without_extra_resolution(qapp):
     projection, calls = DocumentProjection(), []
     view = QRectF(0, 0, 256, 256)
-    for scale, count in ((1., 1), (1.2, 5), (1.24, 5), (1., 5), (.3, 5)):
+    for scale in (1., 1.2, 1.24, 8., 32., 1., .3):
         requests = projection.requests(view, scale)
         projection.collect(requests, renderer(calls))
-        assert len(calls) == count
-        assert all(request.scale >= scale for request in requests)
+        assert len(calls) == 1
+        assert all(request.scale == 1. for request in requests)
 
 
 def test_negative_tile_coordinates_and_capture_gutters(qapp):
@@ -77,10 +77,10 @@ def test_negative_tile_coordinates_and_capture_gutters(qapp):
     assert requests[0].source_rect == QRectF(2, 2, 256, 256)
 
 
-def test_maximum_zoom_on_hidpi_keeps_physical_pixel_detail():
+def test_maximum_zoom_on_hidpi_keeps_native_artwork_resolution():
     for ratio in (1., 1.25, 1.5, 2., 3., 4.):
         density = 8. * ratio
-        assert DocumentProjection.resolution_scale(density) >= density
+        assert DocumentProjection.resolution_scale(density) == 1.
 
 
 def test_cache_budget_is_enforced_without_dropping_frame_results(qapp):

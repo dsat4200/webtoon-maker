@@ -73,7 +73,9 @@ def test_small_pan_reuses_source_window_and_export_remains_complete(scene, monke
     original_keys = set(canvas._modifier_source_cache)
     sources = [image for key, image in canvas._modifier_source_cache.items()
                if key[:2] == ("object-source", obj.object_id)]
-    assert sources and max(image.height() for image in sources) <= 768
+    # Native projection captures one stable 1024-pixel block, plus snapped
+    # outline support on either side, rather than a camera-sized bitmap.
+    assert sources and max(image.height() for image in sources) <= 1536
     canvas.center_y += 4
     render(canvas)
     assert original_keys == set(canvas._modifier_source_cache)

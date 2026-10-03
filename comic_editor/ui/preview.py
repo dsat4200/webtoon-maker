@@ -1,8 +1,8 @@
 """Low-resolution live chapter navigator with a viewport handle."""
 from __future__ import annotations
 
-from PySide6.QtCore import QRect, QRectF, Qt, QTimer, Signal
-from PySide6.QtGui import QColor, QImage, QMouseEvent, QPainter, QPen
+from PySide6.QtCore import QPointF, QRect, QRectF, Qt, QTimer, Signal
+from PySide6.QtGui import QColor, QImage, QMouseEvent, QPainter, QPen, QPolygonF
 from PySide6.QtWidgets import QApplication, QWidget
 
 
@@ -14,6 +14,8 @@ class ChapterPreview(QWidget):
     def __init__(self, canvas, parent=None):
         super().__init__(parent)
         self.canvas = canvas
+        self.disk_cache = None
+        self._cache_drag = None
         self._cache = QImage()
         self._cache_chapter = None
         self._dirty_full = True
@@ -101,6 +103,9 @@ class ChapterPreview(QWidget):
     def _refresh_cache(self) -> None:
         self._refresh_timer.stop()
         if not self.isVisible() or self.canvas.chapter is None:
+            return
+        if self.disk_cache is not None and self.disk_cache.building:
+            self._refresh_timer.start(self.REFRESH_DELAY_MS)
             return
         if self._interaction_active():
             self._schedule_refresh()
@@ -213,6 +218,25 @@ class ChapterPreview(QWidget):
         painter.setPen(QPen(QColor("#80c8ff"), 2))
         painter.setBrush(QColor(128, 200, 255, 35))
         painter.drawRect(handle)
+        cache = self.disk_cache
+        if cache is not None and cache.backing is not None:
+            x = self.width() - 7
+            height = self.canvas.chapter.height
+            side = self.canvas._document_projection.tile_size
+            for row in range((height + side - 1) // side):
+                top = preview_rect.top() + row * side / height * preview_rect.height()
+                bottom = preview_rect.top() + min(height, (row + 1) * side) / height * preview_rect.height()
+                color = "#45da63" if cache.status.get(row, False) else "#ed4343"
+                if cache.building and row in cache.selected_rows and not cache.status.get(row, False):
+                    color = "#eab345"
+                painter.fillRect(QRectF(x, top, 3, max(1., bottom - top)), QColor(color))
+            painter.setPen(QPen(QColor("#eeeeee"), 1))
+            painter.setBrush(QColor("#eeeeee"))
+            start = preview_rect.top() + cache.start_y / height * preview_rect.height()
+            end = preview_rect.top() + cache.end_y / height * preview_rect.height()
+            painter.drawLine(QPointF(x + 5, start), QPointF(x + 5, end))
+            for y in (start, end):
+                painter.drawPolygon(QPolygonF([QPointF(x - 9, y), QPointF(x - 2, y - 5), QPointF(x - 2, y + 5)]))
 
     def _render_live_preview(self, image, clip=None):
         previous = self.canvas._interactive_render
@@ -227,11 +251,38 @@ class ChapterPreview(QWidget):
 
     def mousePressEvent(self, event: QMouseEvent) -> None:  # noqa: N802
         if event.button() == Qt.LeftButton:
+            cache = self.disk_cache
+            if cache is not None and cache.backing is not None and event.position().x() >= self.width() - 20:
+                if not cache.building:
+                    rect = self.content_rect()
+                    y = (event.position().y() - rect.top()) / max(1, rect.height()) * self.canvas.chapter.height
+                    self._cache_drag = "start" if abs(y - cache.start_y) < abs(y - cache.end_y) else "end"
+                    self._drag_cache(event.position().y())
+                event.accept()
+                return
             self._scroll(event.position().y())
 
     def mouseMoveEvent(self, event: QMouseEvent) -> None:  # noqa: N802
         if event.buttons() & Qt.LeftButton:
+            if self._cache_drag:
+                self._drag_cache(event.position().y())
+                return
             self._scroll(event.position().y())
+
+    def mouseReleaseEvent(self, event):  # noqa: N802
+        if self._cache_drag:
+            self._drag_cache(event.position().y(), save=True)
+            self._cache_drag = None
+
+    def _drag_cache(self, y, *, save=False):
+        cache = self.disk_cache
+        rect = self.content_rect()
+        value = max(0., min(self.canvas.chapter.height,
+            (y - rect.top()) / max(1, rect.height()) * self.canvas.chapter.height))
+        if self._cache_drag == "start":
+            cache.set_range(min(value, cache.end_y - 1), cache.end_y, save=save)
+        else:
+            cache.set_range(cache.start_y, max(value, cache.start_y + 1), save=save)
 
     def _scroll(self, y: float) -> None:
         usable = self.content_rect()

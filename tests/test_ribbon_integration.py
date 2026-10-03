@@ -158,7 +158,7 @@ def test_project_view_controls_and_icon_tool_strip(qapp):
         assert hotkeys.x() < window.snap_grid.x()
         assert window.view_settings.isAncestorOf(window.tablet_mode)
         assert window.view_settings.isAncestorOf(window.reset_view_button)
-        assert window.fullscreen_action not in window.file_toolbar.actions()
+        assert window.fullscreen_action in window.file_toolbar.actions()
         assert window.view_settings.fullscreen.defaultAction() is window.fullscreen_action
         assert window.settings_tabs.tab_bar.tabText(2) == "View Settings"
         assert window.tablet_mode.text() == "Tablet Navigation"

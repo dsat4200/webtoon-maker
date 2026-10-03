@@ -1240,6 +1240,9 @@ class TileStore:
         same immutable backing must not invalidate an effect merely because
         Qt assigned its new display buffer a different cache key.
         """
+        fingerprint = getattr(self, "render_fingerprint", None)
+        if fingerprint is not None:
+            return fingerprint(self, object_id)
         owner = self._tiles.get(object_id)
         if isinstance(owner, DiskTileMap):
             return tuple((key, owner.version(key)) for key in sorted(owner))

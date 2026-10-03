@@ -358,7 +358,8 @@ def test_vector_pencil_uses_tiled_preview_and_promotes_current_scale(
         painter, drawing, QRectF(0, 0, 800, 600)
     )
     painter.end()
-    assert rasterized == [drawing.strokes[-1].stroke_id]
+    # Camera zoom enlarges the same native preview; it adds no cache level.
+    assert rasterized == []
 
 
 @pytest.mark.parametrize(

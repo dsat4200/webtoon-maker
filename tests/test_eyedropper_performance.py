@@ -195,7 +195,7 @@ def test_gesture_reads_finished_tile_while_other_tiles_are_pending(scene, monkey
     assert EyedropperSampler(canvas).sample(QPointF(100, 100)) == "#FF224466"
 
 
-def test_presented_composite_is_skipped_when_view_is_not_native_resolution(scene, monkeypatch):
+def test_zoomed_view_reuses_native_presented_composite(scene, monkeypatch):
     canvas, chapter, page = scene
     layer = chapter.add_layer(page.layer_id, "Color", BoundGeometry.rectangle(0, 0, 500, 400))
     layer.fill_color, layer.border_width = "#FF123456", 0
@@ -209,7 +209,7 @@ def test_presented_composite_is_skipped_when_view_is_not_native_resolution(scene
     monkeypatch.setattr(sampling, "render_sample_region", lambda *a, **k:
                         (calls.append(True), original(*a, **k))[1])
     assert EyedropperSampler(canvas).sample(QPointF(250, 250)) == "#FF123456"
-    assert calls
+    assert not calls
 
 
 def test_selected_mask_only_projection_is_not_used_for_chapter_sampling(scene):

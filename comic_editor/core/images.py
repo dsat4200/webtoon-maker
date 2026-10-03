@@ -193,6 +193,9 @@ class ImageStore:
 
     def pixel_signature(self, object_id: str) -> tuple:
         """Identify immutable source bytes without decoding their display image."""
+        fingerprint = getattr(self, "render_fingerprint", None)
+        if fingerprint is not None:
+            return fingerprint(self, object_id)
         source = self.source(object_id)
         return (str(source._encoded.pin.path),) if source is not None else ()
 
