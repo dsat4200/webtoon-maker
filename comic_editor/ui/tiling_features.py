@@ -497,6 +497,9 @@ class TilingFeatures:
         modifier, handles = self._selected_tiling()
         if modifier is None:
             return
+        if handles:
+            from comic_editor.ui.transform_modifier_preview import effective_preview_modifier
+            modifier = effective_preview_modifier(self, modifier)
         geometry = TilingGeometry.from_modifier(modifier)
         painter.save()
         painter.setTransform(QTransform())

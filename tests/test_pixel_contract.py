@@ -194,7 +194,7 @@ def test_legacy_document_policy_is_explicit_and_float_policy_survives_json():
     old.pop('pixel_contract')
     migrated = ChapterDocument.from_dict(old)
     assert migrated.pixel_contract is LEGACY_PIXELS
-    assert migrated.schema_version == SCHEMA_VERSION == 26
+    assert migrated.schema_version == SCHEMA_VERSION == 27
     assert migrated.to_dict()['pixel_contract'] == LEGACY_PIXELS.to_dict()
     migrated.pixel_contract = replace(FLOAT_PIXELS, precision='float16',
         working_space='linear_srgb', export_space='linear_srgb')

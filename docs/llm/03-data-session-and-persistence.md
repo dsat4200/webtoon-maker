@@ -37,6 +37,15 @@ incompatible entries without discarding source data.
 
 ## Saved document graph
 
+Chapter schema **27** adds `ToneMask.paint_offset`, a finite document-space
+translation of the original sparse painted-mask grid. Older documents default
+to `(0, 0)` without changing their appearance. Translation changes this origin
+and the mask's owned gradient geometry, while preserving paint pixels and tile
+addresses. It survives ordinary saves, recovery, undo/redo, asset extraction and
+placement. Shared masks/rigs move only when every consuming target moves in the
+same operation; linked contributor entities keep their normal scene placement.
+Transient rig/mask preview copies and translation-cache state are not persisted.
+
 Chapter schema **24** adds `CageTransformModifier` geometry (frame, lattice,
 deformed points, optional source quad, pivot, smoothness, interpolation, and
 uniform mode). Legacy repeating-texture settings are ignored when loading;
@@ -497,8 +506,8 @@ Undo history itself is never saved. Recovery autosave represents only the latest
 
 ## Migration behavior
 
-- Chapter schema 24 and series schema 17 are current; anything newer is rejected without rewrite.
-- Chapter load accepts older schemas, rebuilds typed objects, preserves legacy blur/free-transform behavior, migrates legacy text alignment into free quads and pre-22 white chapter backgrounds to transparency, normalizes invariants, validates, and sets the in-memory schema to 24.
+- Chapter schema 27 and series schema 18 are current; anything newer is rejected without rewrite.
+- Chapter load accepts older schemas, rebuilds typed objects, preserves legacy blur/free-transform behavior, migrates legacy text alignment into free quads and pre-22 white chapter backgrounds to transparency, normalizes invariants, validates, and sets the in-memory schema to 27.
 - Legacy fill layers and owned vector fills are converted into pending tile materialization plans and rasterized after tile loading.
 - Legacy speed-line records and centers are dropped with warnings; references are repaired.
 - `LayerNode.from_dict()` accepts legacy fill/border/radius fields and converts them into `ShapeStyle`/node roundness.

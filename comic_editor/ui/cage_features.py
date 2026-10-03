@@ -299,6 +299,8 @@ class CageFeatures:
         cage = self._active_cage()
         if cage is None:
             return False
+        from comic_editor.ui.transform_modifier_preview import effective_preview_modifier
+        cage = effective_preview_modifier(self, cage)
         owner = getattr(cage, "modifier_id", id(cage))
         if owner != self._cage_selection_owner:
             self._cage_selected_points.clear()

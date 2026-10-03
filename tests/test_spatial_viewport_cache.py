@@ -35,6 +35,9 @@ def scene(qapp, monkeypatch):
         return image, bounds
 
     monkeypatch.setattr("comic_editor.ui.effect_pipeline.render_stages", stages)
+    # Observe planning on every repaint; the real renderer may now recover a
+    # completed translation-invariant output before entering the stage engine.
+    monkeypatch.setattr("comic_editor.ui.translation_cache.get", lambda *_: None)
     yield canvas, obj, requirements
     canvas._effect_jobs.cancel()
     canvas.deleteLater()

@@ -11,7 +11,7 @@ from comic_editor.core.blend_modes import validate_blend_mode, OBJECT_BLEND_MODE
 from comic_editor.core.pixel_contract import PixelContract, LEGACY_PIXELS
 
 
-SCHEMA_VERSION = 26
+SCHEMA_VERSION = 27
 SERIES_SCHEMA_VERSION = 18
 CHAPTER_WIDTH = 1080
 DEFAULT_CHAPTER_HEIGHT = 3240
@@ -738,6 +738,8 @@ class ToneMask:
     limited_gradients: list[LimitedMaskGradient] = field(default_factory=list)
     # Signed paint keeps cutouts editable without baking linked mask sources.
     paint_has_subtractions: bool = False
+    # Place the original sparse paint grid without resampling its pixels.
+    paint_offset: tuple[float, float] = (0.0, 0.0)
 
     def validate(self) -> None:
         self.mask_id = str(self.mask_id)
@@ -746,6 +748,9 @@ class ToneMask:
         self.name = str(self.name).strip()
         self.saved = bool(self.saved)
         self.paint_has_subtractions = bool(self.paint_has_subtractions)
+        self.paint_offset = _point(self.paint_offset)
+        if not all(math.isfinite(value) for value in self.paint_offset):
+            raise ValueError("Tone mask paint offset must be finite")
         if self.saved and not self.name:
             self.name = "Mask"
         if not self.saved:
@@ -801,6 +806,7 @@ class ToneMask:
             "gradient": self.gradient.to_dict() if self.gradient else None,
             "limited_gradients": [item.to_dict() for item in self.limited_gradients],
             "paint_has_subtractions": self.paint_has_subtractions,
+            "paint_offset": list(self.paint_offset),
         }
 
     @classmethod
@@ -818,6 +824,7 @@ class ToneMask:
             ],
             revision=int(data.get("revision", 0)),
             paint_has_subtractions=bool(data.get("paint_has_subtractions", False)),
+            paint_offset=_point(data.get("paint_offset", [0, 0])),
             limited_gradients=[
                 LimitedMaskGradient.from_dict(item)
                 for item in data.get("limited_gradients", [])

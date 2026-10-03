@@ -22,6 +22,8 @@ class ArrayFeatures:
         modifier = self._active_array_modifier()
         if modifier is None:
             return False
+        from comic_editor.ui.transform_modifier_preview import effective_preview_modifier
+        modifier = effective_preview_modifier(self, modifier)
         start, end, center = self._array_handle_points(modifier)
         delta = end - start
         length = math.hypot(delta.x(), delta.y())

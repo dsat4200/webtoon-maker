@@ -203,6 +203,17 @@ compound contributor geometry. See [limits and measured timings](../cage-transfo
 
 ## Tone masks
 
+Object/group translations carry wholly owned modifier rigs and private mask
+geometry through `ui/attached_translation.py`. Ownership is resolved across
+opacity and parameter bindings; a shared rig/mask moves once only when all its
+consumers move together. Contributor references remain live scene links, so
+moving an attached mask never mutates unrelated contributor artwork.
+
+Mask paint uses a persistent document-space `paint_offset` over its original
+sparse grid. Rendering, the blue overlay, painting, erasing, lasso and wand
+editing use that origin. Moving paint does not retile or resample source pixels.
+Object/group previews transform value copies and cancel without model writes.
+
 A tone mask is a chapter-level grayscale field. `render_tone_mask_field()` sums per-contributor coverage (each contributor's base render, respecting ancestor visibility, clipping, and opacity) plus optional sparse mask paint tiles, clamped to 0–1 in a float32 field. Contributor images are cached in an LRU with a 64 MiB byte budget keyed by entity state, and the whole field is cached keyed by `(mask_id, size, transform, contributor signature, mask revision)`.
 
 - Mask paint tiles are drawn as translucent `#64B5F6` coverage multiplied by `0.35 × mask` alpha in the editing overlay, with a small LRU for painted tile images composited with `CompositionMode_Plus`.
@@ -226,6 +237,33 @@ A tone mask is a chapter-level grayscale field. `render_tone_mask_field()` sums 
 - `apply_opacity_mask()` applies a bound opacity mask to an isolated render.
 
 Canvas-side caches (`_modifier_render_cache`, `_modifier_source_cache`, 64 MiB each) key by layer/object signatures that include pixel cache keys, selection transform preview quads, and eraser previews. Parameter, focal-rig, intensity, and mask edits reuse the isolated source render.
+
+`ui/translation_cache.py` supplies relative-placement aliases through the same
+effect-cache accessors and optional disk backing. Aliases include source pixels,
+the subtree's geometry/effects/masks, native capture phase, linear mapping,
+concrete stage extents, and the pixel contract. Completed opacity-mask crops
+retain the canonical upstream stage identity. Coordinate subtraction roundoff
+is canonicalized at 10 decimal places, finer than existing semantic frame keys;
+parameter values and pixel bits are unchanged. There is no alternate renderer.
+Linked scene masks, external effect sources, projective mappings, strict text
+layout and live source edits conservatively use the existing dependency path.
+Fractional placement changes recapture parent-space artwork; raster-local
+effects retain their original grid and are placed after processing. Drafts and
+live previews still cannot enter the durable exact cache.
+
+`tests/test_attached_translation.py` compares moved previews/commits against
+cold native renders for focal blur, Array, Mirror, Radial Blur, deformed cages,
+twirl, mesh warp and smudge, plus nested effects and painted/limited-gradient
+masks. Reuse assertions count source captures, effect-parameter evaluation and
+mask sampling; qualifying moves perform none. It also covers fractional raster
+placement, undo/redo, mask editing, shared ownership and disk-backed exact reuse.
+
+The offscreen CPU probe `python tests/benchmark_attached_translation.py` measures
+twelve translations of a 256×192 deformed cage with parameter and opacity masks.
+On 2026-10-03, enabling relative-placement reuse reduced the median full-preview
+capture from 44.711 ms to 3.557 ms. Source captures/effect-field evaluations/mask
+fields fell from 12/12/24 to 0/0/0. These are local CPU timings, not display
+latency guarantees, and artwork density, filters and precision are unchanged.
 
 Blur measurements on this machine (September 5, 2026; `python tests/benchmark_free_text_blurs.py`): warmed 128×128 normal Blur edits had a 0.43 ms median, one pyramid build, and 0.08 MiB cached. A 50×40 target's radial angle edits had a 25.28 ms median with one reused source stage (0.01 MiB source / 0.08 MiB results). The 128×128 radial integration measured 69.34 / 774.25 / 1596.72 ms for 15° / 180° / 360°, respectively, with a 1.45 MiB traced peak. These are full-quality computation times, not UI frame times: larger/full-circle radial jobs are asynchronous and are not claimed to fit a 16.7 ms frame budget.
 

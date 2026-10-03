@@ -54,6 +54,8 @@ class TextureOverlayFeatures:
         modifier = self._active_texture_modifier()
         if modifier is None:
             return False
+        from comic_editor.ui.transform_modifier_preview import effective_preview_modifier
+        modifier = effective_preview_modifier(self, modifier)
         quad = self._texture_quad(modifier)
         painter.save()
         painter.setTransform(QTransform())

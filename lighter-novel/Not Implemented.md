@@ -4,6 +4,7 @@ SLOW
 - brushes at high resolutions are super slow.
 	- brush size slider range too high.
 
+
 BUGS
 - reparenting objects between parents/children causes transform to change the position of the object and its super annoying.
 - mask opacity of a layer to a shape layer's mask isn't working. fix.
@@ -11,7 +12,7 @@ BUGS
 - [x] blending modes
 - [x] texture modifier
 - [x] opening a project should return to where you were before (not force you to scroll down)
-
+- when a blender image is added, it should be added to the center of the existing viewport view, and be a child of the current active shape
 
 ## review the fill tool, brush tools
 

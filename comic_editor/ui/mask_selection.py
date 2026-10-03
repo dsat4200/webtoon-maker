@@ -6,7 +6,7 @@ from contextlib import contextmanager
 
 import numpy as np
 from PySide6.QtCore import QPointF, QRectF, Qt
-from PySide6.QtGui import QColor, QImage, QPainter, QPainterPath, QPen
+from PySide6.QtGui import QColor, QImage, QPainter, QPainterPath, QPen, QTransform
 
 from comic_editor.core.commands import TilePatchCommand
 from comic_editor.core.tiles import TileStore
@@ -73,6 +73,7 @@ class MaskSelectionFeatures:
         remove = bool(modifiers & Qt.ControlModifier)
         size = self.tiles.tile_size
         selected = TileStore(tile_size=size)
+        offset = QPointF(*mask.paint_offset)
 
         def reference_tile(key):
             image = QImage(size, size, QImage.Format_ARGB32_Premultiplied)
@@ -81,12 +82,12 @@ class MaskSelectionFeatures:
             # before any mask paint changes, including across tile boundaries.
             self.render_preview(image, source_rect=QRectF(
                 key[0] * size, key[1] * size, size, size,
-            ))
+            ).translated(offset))
             return image
 
         with self._mask_wand_reference_render(entities):
             selected.advanced_fill(
-                mask.mask_id, point, frame, QColor("white"),
+                mask.mask_id, point - offset, frame.translated(-offset), QColor("white"),
                 {
                     "tolerance": self.settings.mask_wand_tolerance,
                     "connected_pixels_only": self.settings.mask_wand_connected,
@@ -203,6 +204,7 @@ class MaskSelectionFeatures:
     def _apply_mask_selection(self, mask, path: QPainterPath, remove: bool) -> None:
         if path.isEmpty():
             return
+        path = QTransform.fromTranslate(-mask.paint_offset[0], -mask.paint_offset[1]).map(path)
         before, after = {}, {}
         size = self.tiles.tile_size
         color = QColor("black" if remove else "white")

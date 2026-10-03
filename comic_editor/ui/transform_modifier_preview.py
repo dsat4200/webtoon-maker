@@ -1,10 +1,9 @@
-"""Carry sole-target document-space rigs through an ancestor preview."""
+"""Carry attached document-space rigs through object and group previews."""
 from copy import deepcopy
 from collections import OrderedDict
 import math
 
 from PySide6.QtCore import QPointF
-from PySide6.QtGui import QPolygonF, QTransform
 
 from comic_editor.core.models import (
     ArrayModifier, BlurModifier, CageTransformModifier, DistortModifier,
@@ -19,18 +18,38 @@ _RIG_TYPES = (ArrayModifier, BlurModifier, CageTransformModifier, DistortModifie
 
 def transform_modifier_rig(canvas, modifier, transform):
     """Apply the established commit transformation to one mutable rig."""
+    from comic_editor.ui.attached_translation import translation
+    delta = translation(transform)
     if isinstance(modifier, TextureModifier):
         if modifier.texture_quad is not None:
             modifier.texture_quad = [transform.map(QPointF(*p)).toTuple() for p in modifier.texture_quad]
     elif isinstance(modifier, DistortModifier):
         if modifier.modifier_type == "distort_smudge":
-            from comic_editor.core.smudge import transform_strokes
-            modifier.parameters["strokes"] = transform_strokes(
-                modifier.parameters.get("strokes", []),
-                lambda point: transform.map(QPointF(*point)).toTuple(),
-            )
-        canvas._transform_distort_modifier(modifier, transform)
+            if delta is not None:
+                strokes = deepcopy(modifier.parameters.get("strokes", []))
+                for stroke in strokes:
+                    for point in stroke["points"]:
+                        for name in ("position", "handle"):
+                            x, y = point[name]
+                            point[name] = [x + delta[0], y + delta[1]]
+                modifier.parameters["strokes"] = strokes
+            else:
+                from comic_editor.core.smudge import transform_strokes
+                modifier.parameters["strokes"] = transform_strokes(
+                    modifier.parameters.get("strokes", []),
+                    lambda point: transform.map(QPointF(*point)).toTuple(),
+                )
+        if delta is not None:
+            dx, dy = delta
+            x, y, w, h = modifier.frame
+            modifier.frame = (x + dx, y + dy, w, h)
+            modifier.center = (modifier.center[0] + dx, modifier.center[1] + dy)
+        else:
+            canvas._transform_distort_modifier(modifier, transform)
     elif isinstance(modifier, TilingModifier):
+        if delta is not None:
+            modifier.center = transform.map(QPointF(*modifier.center)).toTuple()
+            return
         a = transform.map(QPointF(1, 0)) - transform.map(QPointF())
         b = transform.map(QPointF(0, 1)) - transform.map(QPointF())
         length_a, length_b = math.hypot(a.x(), a.y()), math.hypot(b.x(), b.y())
@@ -41,6 +60,10 @@ def transform_modifier_rig(canvas, modifier, transform):
             modifier.side = max(1., modifier.side * length_a)
             modifier.rotation = (modifier.rotation + math.degrees(math.atan2(a.y(), a.x()))) % 360
     elif isinstance(modifier, CageTransformModifier):
+        if delta is not None:
+            from comic_editor.core.assets import _translate_cage
+            _translate_cage(modifier, *delta)
+            return
         rest = modifier.rest_points().reshape(modifier.rows, modifier.columns, 2)
         corners = [rest[0, 0], rest[0, -1], rest[-1, -1], rest[-1, 0]]
         modifier.source_quad = [transform.map(QPointF(*p)).toTuple() for p in corners]
@@ -56,6 +79,9 @@ def transform_modifier_rig(canvas, modifier, transform):
         modifier.axis_start = transform.map(QPointF(*modifier.axis_start)).toTuple()
         modifier.axis_end = transform.map(QPointF(*modifier.axis_end)).toTuple()
     elif isinstance(modifier, BlurModifier):
+        if delta is not None:
+            modifier.focal_center = transform.map(QPointF(*modifier.focal_center)).toTuple()
+            return
         center, _ramp, end = canvas._focal_points(modifier)
         mapped_center, mapped_end = transform.map(center), transform.map(end)
         delta = mapped_end - mapped_center
@@ -65,53 +91,25 @@ def transform_modifier_rig(canvas, modifier, transform):
 
 
 def effective_preview_modifier(canvas, modifier):
-    """Return a transformed value copy; shared and unrelated rigs stay fixed."""
+    """Return a transformed value copy for a wholly moving set of owners."""
+    from comic_editor.ui.attached_translation import preview_attachment_context, translation
     if not isinstance(modifier, _RIG_TYPES):
         return modifier
-    target = canvas._geometry_transform_target
-    source, destination = canvas._transform_start_quad, canvas._transform_preview_quad
-    if (target is None or target[0] != "layer_group" or source is None
-            or destination is None or source == destination or canvas.chapter is None):
+    context = preview_attachment_context(canvas)
+    if context is None:
         canvas._transform_modifier_preview_cache = None
         return modifier
-    chapter = canvas.chapter
-    moving = chapter.layers.get(target[1])
-    if moving is None:
+    transform, moving, owners, _masks = context
+    references = owners.get(modifier.modifier_id, set())
+    if not references or not references <= moving or (translation(transform) is None and len(references) != 1):
         return modifier
-    parent = (canvas.layer_world_transform(moving.parent_id)
-              if moving.parent_id else QTransform())
-    projection = getattr(canvas, "_document_projection", None)
-    key = (id(chapter), target, tuple(source), tuple(destination),
-           tuple(getattr(parent, f"m{i}{j}")() for i in range(1, 4) for j in range(1, 4)),
-           getattr(projection, "revision", None), id(getattr(canvas, "_model_before", None)),
-           len(chapter.layers), len(chapter.objects), len(chapter.modifiers))
+    key = (id(canvas.chapter), frozenset(moving),
+           tuple(getattr(transform, f"m{i}{j}")() for i in range(1, 4) for j in range(1, 4)),
+           id(canvas._model_before), getattr(canvas._document_projection, "revision", None))
     cache = getattr(canvas, "_transform_modifier_preview_cache", None)
     if cache is None or cache[0] != key:
-        # Index ownership once per current preview, rather than scanning the
-        # entire chapter for every modifier used by every source capture.
-        owners = {}
-        for kind, records in (("layer", chapter.layers), ("object", chapter.objects)):
-            for identifier, owner in records.items():
-                for modifier_id in owner.modifier_ids:
-                    owners[modifier_id] = (kind, identifier) if modifier_id not in owners else None
-        transform = QTransform.quadToQuad(
-            parent.map(QPolygonF([QPointF(*point) for point in source])),
-            parent.map(QPolygonF([QPointF(*point) for point in destination])),
-        )
         cache = canvas._transform_modifier_preview_cache = (key, owners, transform, OrderedDict())
-    _, owners, transform, values = cache
-    owner_ref = owners.get(modifier.modifier_id)
-    if owner_ref is None:
-        return modifier
-    kind, identifier = owner_ref
-    owner = chapter.modifier_target(kind, identifier)
-    if owner is None:
-        return modifier
-    parent_id = identifier if kind == "layer" else owner.parent_layer_id
-    if not any(layer.layer_id == moving.layer_id for layer in chapter.ancestor_layers(parent_id)):
-        return modifier
-    # Dataclass values include the rig, masks and parameters without calling
-    # validating serializers on the saved model during a transient preview.
+    values = cache[3]
     if isinstance(modifier, TextureModifier):
         from comic_editor.core.texture_library import texture_digest
         signature = repr((texture_digest(modifier.texture_data),

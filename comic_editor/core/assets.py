@@ -70,6 +70,15 @@ def _translate_cage(modifier, dx, dy):
         modifier.source_quad = [(x+dx, y+dy) for x, y in modifier.source_quad]
 
 
+def _translate_mask(mask, dx, dy):
+    """Carry private mask geometry and the unchanged painted sampling grid."""
+    gradients = ([mask.gradient] if mask.gradient is not None else [])
+    gradients += [item.gradient for item in mask.limited_gradients]
+    for gradient in gradients:
+        _translate_object(gradient, dx, dy, None)
+    mask.paint_offset = (mask.paint_offset[0] + dx, mask.paint_offset[1] + dy)
+
+
 def _rect_quad(rect: QRectF) -> list[tuple[float, float]]:
     return [
         rect.topLeft().toTuple(), rect.topRight().toTuple(),
@@ -653,7 +662,7 @@ def extract_asset(
         {item: item for item in layer_ids},
         {item: item for item in object_ids},
     )
-    _clone_referenced_masks(
+    cloned_mask_ids = _clone_referenced_masks(
         document, asset,
         [asset.layers[item] for item in layer_ids],
         [asset.objects[item] for item in object_ids],
@@ -718,6 +727,8 @@ def extract_asset(
 
     bounds = entity_visual_bounds(asset, asset_tiles, kind, entity_id, include_effects=True)
     dx, dy = ASSET_PADDING - bounds.left(), ASSET_PADDING - bounds.top()
+    for mask_id in cloned_mask_ids.values():
+        _translate_mask(asset.masks[mask_id], dx, dy)
     for modifier in asset.modifiers.values():
         if isinstance(modifier, TextureModifier) and modifier.texture_quad is not None:
             modifier.texture_quad = [(x + dx, y + dy) for x, y in modifier.texture_quad]
@@ -880,6 +891,8 @@ def instantiate_asset(
     bx, by, bw, bh = manifest.visual_bounds
     dx = world_x - (bx + bw / 2)
     dy = world_y - (by + bh / 2)
+    for mask_id in cloned_mask_ids.values():
+        _translate_mask(target.masks[mask_id], dx, dy)
     for modifier_id in cloned_modifier_ids.values():
         modifier = target.modifiers[modifier_id]
         if isinstance(modifier, TextureModifier) and modifier.texture_quad is not None:

@@ -372,6 +372,10 @@ class TextFeatures:
                 for index in (edge, (edge+1)%4): quad[index] = (QPointF(*quad[index])+delta).toTuple()
         if not self._quad_is_valid(quad):
             return
+        if mode == "translate":
+            previous = state.get("result_quad", state["quad"])
+            change = self._quad_to_quad_transform(previous, quad)
+            self._transform_single_target_focal_modifiers(state["kind"], state["id"], change)
         if isinstance(entity, TextObject):
             if resized is not None:
                 entity.width, entity.height = resized.width(), resized.height()
@@ -406,9 +410,9 @@ class TextFeatures:
         if state is None:
             return False
         if state["mode"] != "pivot":
-            if state["kind"] == "layer" and "result_quad" in state and not (state["behavior"] == "bounds" and state["mode"] == "handle"):
+            if state["mode"] != "translate" and "result_quad" in state and not (state["behavior"] == "bounds" and state["mode"] == "handle"):
                 change = self._quad_to_quad_transform(state["quad"], state["result_quad"])
-                self._transform_single_target_focal_modifiers("layer", state["id"], change)
+                self._transform_single_target_focal_modifiers(state["kind"], state["id"], change)
             after = self.chapter.to_dict()
             if state["before"] != after:
                 self.push_model_change(state["before"], after, "Transform text bounds" if state["behavior"] == "bounds" else "Stretch text")

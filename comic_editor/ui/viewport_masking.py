@@ -5,7 +5,7 @@ from PySide6.QtGui import QTransform
 from comic_editor.ui.modifier_rendering import apply_opacity_mask
 
 
-def mask_output(canvas, image, bounds, mapping, binding, visible, painter):
+def mask_output(canvas, image, bounds, mapping, binding, visible, painter, *, target=None, source_key=None):
     bounds = QRectF(bounds)
     original_key = int(image.cacheKey())
     crop = image.rect()
@@ -42,6 +42,15 @@ def mask_output(canvas, image, bounds, mapping, binding, visible, painter):
                for i in range(1, 4) for j in range(1, 4)),
            binding.black_value, binding.white_value,
            canvas._tone_mask_signature(binding.mask_id))
+    from comic_editor.ui import translation_cache
+    move_key = None
+    if target is not None and source_key is not None:
+        mask_key = translation_cache.output_key(canvas, target, bounds, mapping, [])
+        if mask_key is not None:
+            move_key = ("translated-opacity-output", source_key, mask_key)
+    reused = translation_cache.get(canvas, move_key)
+    if reused is not None:
+        return reused, bounds
     cached = canvas._modifier_cache_get(key)
     if cached is not None:
         return cached, bounds
@@ -56,4 +65,5 @@ def mask_output(canvas, image, bounds, mapping, binding, visible, painter):
     result = apply_opacity_mask(image, field, binding.black_value, binding.white_value)
     if revision == getattr(canvas, "_effect_provisional_revision", 0):
         canvas._modifier_cache_put(key, result)
+        translation_cache.put(canvas, move_key, result, revision)
     return result, bounds

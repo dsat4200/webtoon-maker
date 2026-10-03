@@ -146,6 +146,8 @@ class DistortFeatures(SmudgeFeatures):
         modifier = self._active_distort_modifier()
         if modifier is None:
             return False
+        from comic_editor.ui.transform_modifier_preview import effective_preview_modifier
+        modifier = effective_preview_modifier(self, modifier)
         if modifier.modifier_type == "distort_smudge":
             return self._draw_smudge_handles(painter, modifier)
         kind = gizmo_kind(modifier.modifier_type, modifier.parameters)

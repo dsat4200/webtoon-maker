@@ -3605,6 +3605,8 @@ class _CanvasLogic(LassoBrushFeatures, BrushFeatures, DocumentProjectionFeatures
         mask = self.chapter.masks.get(mask_id)
         if mask is None:
             return
+        from comic_editor.ui.attached_translation import effective_preview_mask
+        mask = effective_preview_mask(self, mask)
         if mask.paint_has_subtractions:
             field = self.render_tone_mask_field(
                 mask_id, width, height, self.camera_transform(),
@@ -3623,7 +3625,7 @@ class _CanvasLogic(LassoBrushFeatures, BrushFeatures, DocumentProjectionFeatures
         ))
         cache_key = (
             mask_id, width, height, transform_key,
-            tuple(mask.contributors), int(mask.revision),
+            self._tone_mask_signature(mask_id, include_paint=False),
         )
         if self._tone_mask_overlay_key != cache_key:
             field = self.render_tone_mask_field(
@@ -3639,7 +3641,8 @@ class _CanvasLogic(LassoBrushFeatures, BrushFeatures, DocumentProjectionFeatures
         painter.setTransform(transform)
         painter.setClipRect(QRectF(0, 0, self.chapter.width, self.chapter.height))
         visible = self.visible_document_rect()
-        for key, tile in self.tiles.iter_tiles(mask_id, visible):
+        painter.translate(*mask.paint_offset)
+        for key, tile in self.tiles.iter_tiles(mask_id, visible.translated(-mask.paint_offset[0], -mask.paint_offset[1])):
             painter.drawImage(
                 key[0] * self.tiles.tile_size,
                 key[1] * self.tiles.tile_size,
@@ -5050,6 +5053,9 @@ class _CanvasLogic(LassoBrushFeatures, BrushFeatures, DocumentProjectionFeatures
         from comic_editor.ui.effect_regions import region_scope
         request_scope = region_scope(self, self._effect_request_scope("layer", layer.layer_id), bounds)
         layer_signature = self._modifier_layer_signature(layer.layer_id)
+        from comic_editor.ui import translation_cache
+        move_key = translation_cache.output_key(self, layer, bounds, parent_transform, modifiers)
+        move_revision = getattr(self, "_effect_provisional_revision", 0)
         cache_key = (
             "layer", layer.layer_id,
             layer_signature,
@@ -5058,7 +5064,9 @@ class _CanvasLogic(LassoBrushFeatures, BrushFeatures, DocumentProjectionFeatures
             self._modifier_mapping_signature(parent_transform),
         )
         from comic_editor.ui.interactive_effects import render_interactive_stack
-        processed = self._modifier_cache_get(cache_key)
+        processed = translation_cache.get(self, move_key)
+        if processed is None:
+            processed = self._modifier_cache_get(cache_key)
         provisional = False
         if processed is None:
             processed = self._cached_modifier_output(
@@ -5148,6 +5156,7 @@ class _CanvasLogic(LassoBrushFeatures, BrushFeatures, DocumentProjectionFeatures
                 self._modifier_cache_put(cache_key, processed)
         if not provisional:
             self._retain_modifier_output(cache_key, request_scope, processed)
+            translation_cache.put(self, move_key, processed, move_revision)
         painter.save()
         painter.setOpacity(parent_opacity * layer.opacity)
         outline_overflows = any(
@@ -7863,6 +7872,8 @@ class _CanvasLogic(LassoBrushFeatures, BrushFeatures, DocumentProjectionFeatures
         mask = self.chapter.masks.get(mask_id)
         if mask is None:
             return (mask_id, "missing")
+        from comic_editor.ui.attached_translation import effective_preview_mask
+        mask = effective_preview_mask(self, mask)
         if mask_id in _stack:
             return (mask_id, "cycle")
         stack = _stack | {mask_id}
@@ -8125,6 +8136,8 @@ class _CanvasLogic(LassoBrushFeatures, BrushFeatures, DocumentProjectionFeatures
         width, height = max(1, int(width)), max(1, int(height))
         if mask is None:
             return np.zeros((height, width), dtype=np.float32)
+        from comic_editor.ui.attached_translation import effective_preview_mask
+        mask = effective_preview_mask(self, mask)
         transform_signature = tuple(round(value, 6) for value in (
             world_to_image.m11(), world_to_image.m12(), world_to_image.m13(),
             world_to_image.m21(), world_to_image.m22(), world_to_image.m23(),
@@ -8200,8 +8213,9 @@ class _CanvasLogic(LassoBrushFeatures, BrushFeatures, DocumentProjectionFeatures
             painter = QPainter(paint)
             painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
             painter.setTransform(world_to_image)
+            painter.translate(*mask.paint_offset)
             for (tile_x, tile_y), tile in self.tiles.iter_tiles(
-                mask_id, visible_world
+                mask_id, visible_world.translated(-mask.paint_offset[0], -mask.paint_offset[1])
             ):
                 painter.drawImage(
                     tile_x * self.tiles.tile_size,
@@ -8541,6 +8555,8 @@ class _CanvasLogic(LassoBrushFeatures, BrushFeatures, DocumentProjectionFeatures
             ),
         )
         world_bounds = self.object_world_rect(obj.object_id)
+        from comic_editor.ui.attached_translation import preview_object_bounds
+        world_bounds = preview_object_bounds(self, obj, world_bounds)
         if isinstance(obj, ColorFillGradientObject):
             world_bounds = self.layer_world_transform(obj.parent_layer_id).mapRect(
                 self._color_gradient_local_bounds(obj))
@@ -8608,6 +8624,9 @@ class _CanvasLogic(LassoBrushFeatures, BrushFeatures, DocumentProjectionFeatures
         from comic_editor.ui.effect_regions import region_scope
         request_scope = region_scope(self, self._effect_request_scope("object", obj.object_id), bounds)
         object_signature = self._modifier_object_signature(obj)
+        from comic_editor.ui import translation_cache
+        move_key = translation_cache.output_key(self, obj, bounds, layer_transform, modifiers)
+        move_revision = getattr(self, "_effect_provisional_revision", 0)
         cache_key = (
             "object", obj.object_id,
             object_signature,
@@ -8615,7 +8634,9 @@ class _CanvasLogic(LassoBrushFeatures, BrushFeatures, DocumentProjectionFeatures
             self._modifier_mapping_signature(layer_transform),
         )
         from comic_editor.ui.interactive_effects import render_interactive_stack
-        processed = self._modifier_cache_get(cache_key)
+        processed = translation_cache.get(self, move_key)
+        if processed is None:
+            processed = self._modifier_cache_get(cache_key)
         provisional = False
         if processed is None:
             processed = self._cached_modifier_output(
@@ -8683,6 +8704,7 @@ class _CanvasLogic(LassoBrushFeatures, BrushFeatures, DocumentProjectionFeatures
                 self._modifier_cache_put(cache_key, processed)
         if not provisional:
             self._retain_modifier_output(cache_key, request_scope, processed)
+            translation_cache.put(self, move_key, processed, move_revision)
         opacity = parent_opacity if self._render_base_alpha else (
             parent_opacity
             if obj.opacity_locked else parent_opacity * obj.opacity
@@ -8705,6 +8727,9 @@ class _CanvasLogic(LassoBrushFeatures, BrushFeatures, DocumentProjectionFeatures
             return
         world = entity_visual_bounds(self.chapter, self.tiles, kind, identifier,
                                      layer_mapping=self.layer_world_transform)
+        if not layer:
+            from comic_editor.ui.attached_translation import preview_object_bounds
+            world = preview_object_bounds(self, target, world)
         world = world.united(self._raster_selection_capture_bounds(kind, identifier))
         if layer:
             from comic_editor.ui.baking import visual_bounds
@@ -8792,7 +8817,17 @@ class _CanvasLogic(LassoBrushFeatures, BrushFeatures, DocumentProjectionFeatures
         if thumbnail_scale < 1. and required is not None:
             required = QTransform.fromScale(thumbnail_scale, thumbnail_scale).mapRect(required)
         from comic_editor.ui.effect_pipeline import cached_stage_output
-        completed = (cached_stage_output(self, bounds, modifiers, stage_mapping,
+        from comic_editor.ui import translation_cache
+        move_key = None
+        move_revision = getattr(self, "_effect_provisional_revision", 0)
+        if not has_stroke and not direct_mirror and not shape_overlay and thumbnail_scale == 1. and not navigator:
+            from comic_editor.ui.effect_pipeline import _stage_plan
+            move_plan = _stage_plan(self, bounds, modifiers, stage_mapping, key, isinstance(target, RasterObject), required)
+            move_key = translation_cache.output_key(self, target, bounds, stage_mapping, modifiers,
+                geometry=move_plan.geometry, opacity=False)
+        reused = translation_cache.get(self, move_key)
+        completed = ((reused, QRectF(move_plan.targets[-1] if move_plan.targets else bounds))
+            if reused is not None else cached_stage_output(self, bounds, modifiers, stage_mapping,
             nearest=isinstance(target, RasterObject), required=required,
             request_scope=request_scope, source_key=key)
             if not has_stroke and not direct_mirror and not shape_overlay else None)
@@ -8875,11 +8910,14 @@ class _CanvasLogic(LassoBrushFeatures, BrushFeatures, DocumentProjectionFeatures
             image, bounds = render_stages(self, image, bounds, modifiers, stage_mapping, nearest=isinstance(target, RasterObject), required=required, request_scope=request_scope, provisional=source_provisional, source_key=key)
         if thumbnail_scale < 1.:
             bounds = QTransform.fromScale(1/thumbnail_scale, 1/thumbnail_scale).mapRect(bounds)
+        if not source_provisional:
+            translation_cache.put(self, move_key, image, move_revision)
         if target.opacity_mask is not None:
             from comic_editor.ui.viewport_masking import mask_output
             image, bounds = mask_output(
                 self, image, bounds, mapping, target.opacity_mask,
-                inverse.mapRect(visible) if layer else visible, painter)
+                inverse.mapRect(visible) if layer else visible, painter,
+                target=target, source_key=move_key)
             if image is None:
                 return
         opacity = target.opacity if layer or not target.opacity_locked else 1.0
@@ -9268,6 +9306,10 @@ class _CanvasLogic(LassoBrushFeatures, BrushFeatures, DocumentProjectionFeatures
         source: list[tuple[float, float]],
         destination: list[tuple[float, float]],
     ) -> QTransform:
+        changes = [(b[0] - a[0], b[1] - a[1]) for a, b in zip(source, destination)]
+        if len(changes) == 4 and all(abs(dx - changes[0][0]) < 1e-9
+                and abs(dy - changes[0][1]) < 1e-9 for dx, dy in changes):
+            return QTransform.fromTranslate(*changes[0])
         source_polygon = QPolygonF([QPointF(*point) for point in source])
         destination_polygon = QPolygonF([
             QPointF(*point) for point in destination
@@ -11320,17 +11362,8 @@ class _CanvasLogic(LassoBrushFeatures, BrushFeatures, DocumentProjectionFeatures
         self, kind: str, entity_id: str, transform: QTransform,
     ) -> None:
         """Keep a sole target's document-space focal rig attached to it."""
-        from comic_editor.ui.transform_modifier_preview import transform_modifier_rig
-        if kind == "layer" and entity_id in self.chapter.layers:
-            for child in self.chapter.layers[entity_id].children:
-                self._transform_single_target_focal_modifiers(child.kind, child.entity_id, transform)
-        target = self.chapter.modifier_target(kind, entity_id)
-        if target is None:
-            return
-        for modifier_id in target.modifier_ids:
-            modifier = self.chapter.modifiers.get(modifier_id)
-            if len(self.chapter.modifier_target_ids(modifier_id)) == 1:
-                transform_modifier_rig(self, modifier, transform)
+        from comic_editor.ui.attached_translation import transform_attached
+        transform_attached(self, [(kind, entity_id)], transform)
 
     def _draw_focal_modifier_handles(self, painter: QPainter) -> None:
         if self._draw_texture_handles(painter):
@@ -11348,6 +11381,8 @@ class _CanvasLogic(LassoBrushFeatures, BrushFeatures, DocumentProjectionFeatures
             return
         mirror = self._active_mirror_modifier()
         if mirror is not None:
+            from comic_editor.ui.transform_modifier_preview import effective_preview_modifier
+            mirror = effective_preview_modifier(self, mirror)
             start, end = QPointF(*mirror.axis_start), QPointF(*mirror.axis_end)
             midpoint = (start + end) / 2
             direction = end - start
@@ -11366,6 +11401,8 @@ class _CanvasLogic(LassoBrushFeatures, BrushFeatures, DocumentProjectionFeatures
         modifier = self._active_focal_modifier()
         if modifier is None:
             return
+        from comic_editor.ui.transform_modifier_preview import effective_preview_modifier
+        modifier = effective_preview_modifier(self, modifier)
         center, ramp, end = self._focal_points(modifier)
         scale = max(0.05, self.scale)
         painter.save()
@@ -22724,6 +22761,9 @@ class _CanvasLogic(LassoBrushFeatures, BrushFeatures, DocumentProjectionFeatures
                     world_destination = parent_transform.map(destination)
                     snapped = self._snap(world_destination, layer.layer_id)
                     destination = parent_inverse.map(snapped)
+                delta = parent_transform.map(destination) - parent_transform.map(QPointF(layer.translate_x, layer.translate_y))
+                self._transform_single_target_focal_modifiers("layer", layer.layer_id,
+                    QTransform.fromTranslate(delta.x(), delta.y()))
                 layer.translate_x = destination.x()
                 layer.translate_y = destination.y()
             else:
@@ -23384,6 +23424,7 @@ class _CanvasLogic(LassoBrushFeatures, BrushFeatures, DocumentProjectionFeatures
         erasing = self.tool == ToolKind.RASTER_ERASER
         while self._mask_sample_queue:
             point, raw_pressure, _timestamp = self._mask_sample_queue.popleft()
+            point = point - QPointF(*mask.paint_offset)
             pressure = self._effective_pressure(raw_pressure)
             if not self._mask_has_painted_sample:
                 self._last_draw_point = QPointF(point)
@@ -23420,6 +23461,7 @@ class _CanvasLogic(LassoBrushFeatures, BrushFeatures, DocumentProjectionFeatures
                 dirty = changed if dirty.isEmpty() else dirty.united(changed)
         if dirty.isEmpty():
             return
+        dirty.translate(*mask.paint_offset)
         self._mask_runtime_revision += 1
         self._mask_stroke_dirty = (
             dirty if self._mask_stroke_dirty.isEmpty()
@@ -24136,10 +24178,7 @@ class _CanvasLogic(LassoBrushFeatures, BrushFeatures, DocumentProjectionFeatures
         ):
             self.update()
             return
-        transform = QTransform.quadToQuad(
-            QPolygonF([QPointF(*value) for value in source]),
-            QPolygonF([QPointF(*value) for value in destination]),
-        )
+        transform = self._quad_to_quad_transform(source, destination)
 
         def map_point(value: tuple[float, float]) -> tuple[float, float]:
             mapped = transform.map(QPointF(*value))
@@ -24154,6 +24193,8 @@ class _CanvasLogic(LassoBrushFeatures, BrushFeatures, DocumentProjectionFeatures
             dirty_regions = (self._multi_translation_dirty(0, 0)
                              + self._multi_translation_dirty(dx, dy))
         if kind == "multi":
+            from comic_editor.ui.attached_translation import transform_attached
+            transform_attached(self, [("object", oid) for oid in self._multi_transform_preview_quads], transform)
             for object_id, destination_quad in (
                 self._multi_transform_preview_quads.items()
             ):
@@ -24164,9 +24205,6 @@ class _CanvasLogic(LassoBrushFeatures, BrushFeatures, DocumentProjectionFeatures
                 if obj.transform_frame is None:
                     obj.transform_frame = self._object_transform_frame(obj)
                 obj.transform_quad = list(destination_quad)
-                self._transform_single_target_focal_modifiers(
-                    "object", object_id, transform
-                )
             self._multi_transform_start_world_quads.clear()
             self._multi_transform_preview_quads.clear()
             self._multi_transform_start_render_bounds = None
@@ -24177,14 +24215,9 @@ class _CanvasLogic(LassoBrushFeatures, BrushFeatures, DocumentProjectionFeatures
                 self.layer_world_transform(layer.parent_id)
                 if layer.parent_id else QTransform()
             )
-            world_transform = QTransform.quadToQuad(
-                parent_transform.map(QPolygonF([
-                    QPointF(*value) for value in source
-                ])),
-                parent_transform.map(QPolygonF([
-                    QPointF(*value) for value in destination
-                ])),
-            )
+            world_transform = self._quad_to_quad_transform(
+                [parent_transform.map(QPointF(*value)).toTuple() for value in source],
+                [parent_transform.map(QPointF(*value)).toTuple() for value in destination])
             self._transform_single_target_focal_modifiers(
                 "layer", entity_id, world_transform
             )
@@ -24654,6 +24687,11 @@ class _CanvasLogic(LassoBrushFeatures, BrushFeatures, DocumentProjectionFeatures
             self.update()
             return
         if isinstance(obj, TextObject):
+            parent_transform = self.layer_world_transform(obj.parent_layer_id)
+            world_transform = self._quad_to_quad_transform(
+                [parent_transform.map(QPointF(*p)).toTuple() for p in source],
+                [parent_transform.map(QPointF(*p)).toTuple() for p in destination])
+            self._transform_single_target_focal_modifiers("object", object_id, world_transform)
             obj.transform_quad = destination
             obj.x = obj.y = 0
             after = self.chapter.to_dict()
@@ -24668,14 +24706,9 @@ class _CanvasLogic(LassoBrushFeatures, BrushFeatures, DocumentProjectionFeatures
         ):
             return
         parent_transform = self.layer_world_transform(obj.parent_layer_id)
-        world_transform = QTransform.quadToQuad(
-            parent_transform.map(QPolygonF([
-                QPointF(*value) for value in source
-            ])),
-            parent_transform.map(QPolygonF([
-                QPointF(*value) for value in destination
-            ])),
-        )
+        world_transform = self._quad_to_quad_transform(
+            [parent_transform.map(QPointF(*value)).toTuple() for value in source],
+            [parent_transform.map(QPointF(*value)).toTuple() for value in destination])
         if drag_mode == "translate" and obj.transform_quad is None:
             obj.x += destination[0][0] - source[0][0]
             obj.y += destination[0][1] - source[0][1]
@@ -24708,6 +24741,7 @@ class _CanvasLogic(LassoBrushFeatures, BrushFeatures, DocumentProjectionFeatures
         self.update()
 
     def _clear_transform_preview(self) -> None:
+        self._attached_preview_context = None
         self._model_before = None
         self._transform_start_quad = None
         self._transform_preview_quad = None

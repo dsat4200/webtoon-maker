@@ -335,12 +335,15 @@ def test_pasted_object_translates_mask_paint_and_gradient_with_content(qapp):
         pasted_id = paste_object(window.canvas, payload, page.layer_id, payload.original_center + offset)
         pasted = chapter.objects[pasted_id]
         pasted_mask_id = pasted.opacity_mask.mask_id
-        assert window.canvas.tiles.content_bounds(pasted_mask_id).center() == window.canvas.tiles.content_bounds(mask.mask_id).center() + offset
+        source_center = window.canvas.tiles.content_bounds(mask.mask_id).center()
+        destination_center = window.canvas._raster_world_point(pasted, source_center)
+        attached_offset = destination_center - window.canvas._raster_world_point(raster, source_center)
+        assert window.canvas.tiles.content_bounds(pasted_mask_id).center() + QPointF(*chapter.masks[pasted_mask_id].paint_offset) == source_center + attached_offset
         gradient = chapter.masks[pasted_mask_id].gradient
-        assert gradient.radial_field.origin_x == 290
-        assert gradient.radial_field.origin_y == 330
+        assert gradient.radial_field.origin_x == 90 + attached_offset.x()
+        assert gradient.radial_field.origin_y == 110 + attached_offset.y()
         field = window.canvas.render_tone_mask_field(pasted_mask_id, 600, 600, QTransform(), QRectF(0, 0, 600, 600))
-        assert field[320, 300] > .99
+        assert field[int(destination_center.y()), int(destination_center.x())] > .99
         assert mask.gradient.radial_field.origin_x == 90
     finally:
         window.deleteLater()

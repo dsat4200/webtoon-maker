@@ -384,31 +384,6 @@ def _instantiated_identity_map(source, target, kind, source_id, target_id):
     return result
 
 
-def _translate_mask(canvas, mask_id, offset):
-    if offset.isNull():
-        return
-    mask = canvas.chapter.masks[mask_id]
-    if mask.gradient is not None:
-        _translate_object(mask.gradient, offset.x(), offset.y(), canvas.chapter)
-    for limited in mask.limited_gradients:
-        _translate_object(limited.gradient, offset.x(), offset.y(), canvas.chapter)
-    source = canvas.tiles.object_tiles(mask_id)
-    size = canvas.tiles.tile_size
-    translated = {}
-    for (tile_x, tile_y), image in source.items():
-        position = QPointF(tile_x * size, tile_y * size) + offset
-        for key in canvas.tiles.keys_for_rect(QRectF(position.x(), position.y(), size, size)):
-            tile = translated.get(key)
-            if tile is None:
-                tile = translated[key] = canvas.tiles._empty(size)
-            painter = QPainter(tile)
-            painter.setRenderHint(QPainter.SmoothPixmapTransform, True)
-            painter.drawImage(position - QPointF(key[0] * size, key[1] * size), image)
-            painter.end()
-    canvas.tiles.replace_object_tiles(mask_id, translated)
-    mask.revision += 1
-
-
 def paste_object(canvas, payload: ObjectClipboard, parent_id: str, world: QPointF,
                  insertion_index: int | None = None, label="Paste object") -> str:
     """Use independent model/resource identities and one reversible command."""
@@ -452,8 +427,6 @@ def paste_object(canvas, payload: ObjectClipboard, parent_id: str, world: QPoint
                 target_mask = canvas.chapter.masks[masks[mask_id]]
                 target_mask.contributors.extend((ref_kind, identities[(ref_kind, identifier)])
                                                 for ref_kind, identifier in references)
-        for mask_id in {identifier for _component, masks in mask_maps for identifier in masks.values()}:
-            _translate_mask(canvas, mask_id, offset)
         canvas.chapter.validate()
         if payload.is_page:
             if canvas.chapter.document_kind in {"image", "asset"}:

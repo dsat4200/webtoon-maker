@@ -74,8 +74,18 @@ class SpatialModifierFeatures:
         elif thumbnail_scale < 1.:
             required = QTransform.fromScale(thumbnail_scale, thumbnail_scale).mapRect(required)
         request_scope = ("object", obj.object_id, getattr(self, "_effect_preview_channel", "canvas"))
+        from comic_editor.ui import translation_cache
+        from comic_editor.ui.effect_pipeline import _stage_plan
+        move_key = None
+        move_revision = getattr(self, "_effect_provisional_revision", 0)
+        if thumbnail_scale == 1. and not navigator:
+            move_plan = _stage_plan(self, bounds, modifiers, stage_mapping, key, True, required)
+            move_key = translation_cache.output_key(self, obj, bounds, stage_mapping, modifiers,
+                tile_space=True, geometry=move_plan.geometry)
+        reused = translation_cache.get(self, move_key)
         from comic_editor.ui.tile_effects import tile_output
-        tiled = (tile_output(self, None, bounds, modifiers, stage_mapping, nearest=True,
+        tiled = ((reused, QRectF(move_plan.targets[-1] if move_plan.targets else bounds))
+            if reused is not None else tile_output(self, None, bounds, modifiers, stage_mapping, nearest=True,
             required=required, source_identity=key, request_scope=request_scope, capture=capture_region)
             if thumbnail_scale == 1. and not navigator else None)
         if tiled is not None:
@@ -89,11 +99,13 @@ class SpatialModifierFeatures:
                 required=required, source_key=key, provisional=navigator, request_scope=request_scope)
         if thumbnail_scale < 1.:
             bounds = QTransform.fromScale(1/thumbnail_scale, 1/thumbnail_scale).mapRect(bounds)
-        if obj.opacity_mask is not None:
+        if obj.opacity_mask is not None and reused is None:
             binding = obj.opacity_mask
             field = self.render_tone_mask_field(binding.mask_id, image.width(), image.height(),
                 self._world_to_image_transform(mapping, bounds, image.width(), image.height()), mapping.mapRect(bounds))
             image = apply_opacity_mask(image, field, binding.black_value, binding.white_value)
+        if not navigator:
+            translation_cache.put(self, move_key, image, move_revision)
         opacity = parent_opacity if self._render_base_alpha or obj.opacity_locked else parent_opacity*obj.opacity
         if obj.object_id == self._live_underlay_object_id:
             opacity *= 1-self._live_underlay_amount
@@ -159,6 +171,8 @@ class SpatialModifierFeatures:
         modifier = self._active_radial_modifier()
         if modifier is None:
             return False
+        from comic_editor.ui.transform_modifier_preview import effective_preview_modifier
+        modifier = effective_preview_modifier(self, modifier)
         center, end = self._radial_handle_points(modifier)
         painter.save()
         painter.setTransform(QTransform())
