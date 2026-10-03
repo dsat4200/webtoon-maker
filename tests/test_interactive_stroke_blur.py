@@ -88,6 +88,7 @@ def test_paired_blur_matches_existing_stage_and_runs_exact_work_off_thread(
 
 def test_queued_paired_blur_snapshots_models_masks_and_both_images(scene, monkeypatch):
     canvas, sources, bounds, mapping = scene
+    canvas._effect_jobs.worker_limit = 1  # Deliberately keep this request queued.
     modifier = BlurModifier(strength=3)
     modifier.parameter_masks["intensity"] = ParameterMaskBinding("mask", 0, 100)
     target = aligned(effect_bounds(bounds, [modifier], mapping))

@@ -11,6 +11,7 @@ import base64
 from collections import OrderedDict
 from dataclasses import dataclass
 import math
+from threading import RLock
 
 import numpy as np
 from PySide6.QtCore import QRectF, Qt
@@ -20,6 +21,8 @@ from scipy.ndimage import map_coordinates, sobel, spline_filter
 
 from comic_editor.core.cage import CageGrid, homography, map_points, project, tessellate
 from comic_editor.ui.distort_equations import evaluate_equation
+from comic_editor.core.pixel_arrays import normalized_bytes
+from comic_editor.render.pixels import current_contract, premultiplied_pixels, working_image
 
 
 _MAX_PIXELS = 64 * 1024 * 1024
@@ -27,22 +30,41 @@ _QUAD = np.asarray(((0., 0.), (1., 0.), (1., 1.), (0., 1.)))
 
 
 def _rgba(image):
+    if current_contract().floating:
+        return premultiplied_pixels(image)
     image = image.convertToFormat(QImage.Format.Format_RGBA8888_Premultiplied)
     data = np.frombuffer(image.constBits(), np.uint8, count=image.sizeInBytes()).reshape(image.height(), image.bytesPerLine())
-    return data[:, :image.width() * 4].reshape(image.height(), image.width(), 4).astype(np.float32) / 255.
+    return normalized_bytes(data[:, :image.width() * 4].reshape(image.height(), image.width(), 4))
 
 
 def _byte_pixels(array):
     array = np.nan_to_num(array, nan=0., posinf=1., neginf=0.)
-    array[..., 3] = np.clip(array[..., 3], 0., 1.)
-    array[..., :3] = np.clip(array[..., :3], 0., array[..., 3:4])
-    return np.ascontiguousarray(np.rint(array * 255.).astype(np.uint8))
+    np.clip(array[..., 3], 0., 1., out=array[..., 3])
+    np.clip(array[..., :3], 0., array[..., 3:4], out=array[..., :3])
+    if not np.issubdtype(array.dtype, np.floating):
+        return np.ascontiguousarray(np.rint(array * 255.).astype(np.uint8))
+    np.multiply(array, 255., out=array)
+    np.rint(array, out=array)
+    return np.ascontiguousarray(array.astype(np.uint8))
 
 
 def _image(array):
+    if current_contract().floating:
+        if array.dtype == np.uint8:
+            array = normalized_bytes(array)
+        return working_image(_float_pixels(array))
     data = np.ascontiguousarray(array) if array.dtype == np.uint8 else _byte_pixels(array)
     height, width = data.shape[:2]
     return QImage(data.data, width, height, width * 4, QImage.Format.Format_RGBA8888_Premultiplied).copy().convertToFormat(QImage.Format.Format_ARGB32_Premultiplied)
+
+
+def _float_pixels(array):
+    """Keep finite HDR color and sub-byte coverage after spatial sampling."""
+    result = np.array(array, dtype=np.float32, copy=True, order="C")
+    np.nan_to_num(result, copy=False, nan=0., posinf=0., neginf=0.)
+    np.clip(result[..., 3], 0., 1., out=result[..., 3])
+    result[..., :3] *= (result[..., 3:4] > 0.)
+    return result
 
 
 def _transform(transform, points):
@@ -462,8 +484,8 @@ class PreparedDistort:
 class PreparedDistortCache:
     """Bounded immutable source/mesh setup reused by exact region requests.
 
-    The GUI and each background worker own separate instances. Entries contain
-    detached NumPy allocations, not Qt images or canvas state. Output
+    The GUI and the worker pool own separate instances. Entries contain
+    immutable detached NumPy allocations, not Qt images or canvas state. Output
     coordinates and effect parameters remain per request, so region reuse
     cannot reuse another region's pixels.
     """
@@ -475,15 +497,17 @@ class PreparedDistortCache:
         self.entry_limit = max(1, int(entry_limit))
         self.bytes = self.hits = self.misses = self.evictions = 0
         self._entries = OrderedDict()
+        self._lock = RLock()
 
     def _get(self, key):
-        entry = self._entries.pop(key, None)
-        if entry is None:
-            self.misses += 1
-            return None
-        self.hits += 1
-        self._entries[key] = entry
-        return entry[0]
+        with self._lock:
+            entry = self._entries.pop(key, None)
+            if entry is None:
+                self.misses += 1
+                return None
+            self.hits += 1
+            self._entries[key] = entry
+            return entry[0]
 
     def _put(self, key, value, arrays):
         size = _array_storage_bytes(arrays)
@@ -491,21 +515,22 @@ class PreparedDistortCache:
             return value
         for array in arrays:
             array.setflags(write=False)
-        previous = self._entries.pop(key, None)
-        if previous is not None:
-            self.bytes -= previous[1]
-        while self._entries and (self.bytes + size > self.budget
-                                 or len(self._entries) >= self.entry_limit):
-            _, (_, removed) = self._entries.popitem(last=False)
-            self.bytes -= removed
-            self.evictions += 1
-        self._entries[key] = value, size
-        self.bytes += size
+        with self._lock:
+            previous = self._entries.pop(key, None)
+            if previous is not None:
+                self.bytes -= previous[1]
+            while self._entries and (self.bytes + size > self.budget
+                                     or len(self._entries) >= self.entry_limit):
+                _, (_, removed) = self._entries.popitem(last=False)
+                self.bytes -= removed
+                self.evictions += 1
+            self._entries[key] = value, size
+            self.bytes += size
         return value
 
     def source(self, image, interpolation="bilinear", edges="transparent"):
         key = ("source", int(image.cacheKey()), image.width(), image.height(),
-               image.format().value, interpolation, edges)
+               image.format().value, interpolation, edges, current_contract().signature)
         prepared = self._get(key)
         if prepared is not None:
             return prepared
@@ -527,8 +552,9 @@ class PreparedDistortCache:
         return self._put(key, prepared, prepared)
 
     def clear(self):
-        self._entries.clear()
-        self.bytes = 0
+        with self._lock:
+            self._entries.clear()
+            self.bytes = 0
 
 
 def _triangle_map(query, source, destination, faces):
@@ -792,7 +818,9 @@ def render_distort(image: QImage, bounds: QRectF, modifier, local_to_world: QTra
     else:
         prepared = preparation_cache.source(image, interpolation, edges)
         pixels, sampler = prepared.pixels, prepared.sampler
-    output = np.zeros((height, width, 4), np.uint8)
+    floating = current_contract().floating
+    encode = _float_pixels if floating else _byte_pixels
+    output = np.zeros((height, width, 4), np.float32 if floating else np.uint8)
     image_scale = np.asarray((image.width() / bounds.width(), image.height() / bounds.height()))
 
     def sample_world(world):
@@ -1017,10 +1045,10 @@ def render_distort(image: QImage, bounds: QRectF, modifier, local_to_world: QTra
                     result[..., :3] += noise[..., None] * result[..., 3:4]
                 if strength < 0 and mode == "data_blocks":
                     result[..., :3] = result[..., 3:4] - result[..., :3]
-            output[top:bottom] = _byte_pixels(result)
+            output[top:bottom] = encode(result)
             continue
         elif effect == "pixelate":
-            output[top:bottom] = _byte_pixels(context["blocks"](world))
+            output[top:bottom] = encode(context["blocks"](world))
             continue
         else:
             if effect not in {"lens_correction"}:
@@ -1031,5 +1059,5 @@ def render_distort(image: QImage, bounds: QRectF, modifier, local_to_world: QTra
             straight = np.divide(result[..., :3], result[..., 3:4], out=np.zeros_like(result[..., :3]), where=result[..., 3:4] > 1e-8)
             result[..., :3] = straight * original_alpha
             result[..., 3:4] = original_alpha
-        output[top:bottom] = _byte_pixels(result)
+        output[top:bottom] = encode(result)
     return _image(output)

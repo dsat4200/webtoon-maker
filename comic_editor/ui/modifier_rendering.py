@@ -5,6 +5,7 @@ from collections import OrderedDict
 import hashlib
 import math
 import sys
+from threading import RLock
 
 import numpy as np
 from PIL import Image
@@ -22,6 +23,8 @@ from comic_editor.core.effect_geometry import reflection_transform
 from comic_editor.core.curves import apply_curves, curves_is_neutral
 from comic_editor.core.models import KuwaharaModifier
 from comic_editor.core.models import DitheringModifier, SharpnessModifier
+from comic_editor.render.pixels import current_contract, premultiplied_pixels, working_image
+from comic_editor.core.pixel_arrays import normalized_bytes, truncated_bytes
 
 
 def modifier_render_settings(modifier):
@@ -42,6 +45,8 @@ def modifier_render_settings(modifier):
 
 
 def _qimage_premultiplied(image: QImage) -> np.ndarray:
+    if current_contract().floating:
+        return premultiplied_pixels(image)
     converted = image.convertToFormat(
         QImage.Format.Format_RGBA8888_Premultiplied
     )
@@ -49,16 +54,13 @@ def _qimage_premultiplied(image: QImage) -> np.ndarray:
     view = np.frombuffer(
         converted.constBits(), dtype=np.uint8, count=converted.sizeInBytes()
     ).reshape(height, converted.bytesPerLine())
-    return (
-        view[:, :width * 4].reshape(height, width, 4).astype(np.float32)
-        / 255.0
-    )
+    return normalized_bytes(view[:, :width * 4].reshape(height, width, 4))
 
 
 def _premultiplied_qimage(array: np.ndarray) -> QImage:
-    array = np.ascontiguousarray(
-        np.clip(array * 255.0, 0, 255).astype(np.uint8)
-    )
+    if current_contract().floating:
+        return working_image(array)
+    array = truncated_bytes(array)
     height, width = array.shape[:2]
     return QImage(
         array.data, width, height, width * 4,
@@ -68,11 +70,15 @@ def _premultiplied_qimage(array: np.ndarray) -> QImage:
 
 def _straight(premultiplied: np.ndarray) -> np.ndarray:
     alpha = premultiplied[..., 3:4]
-    rgb = np.divide(
-        premultiplied[..., :3], alpha,
-        out=np.zeros_like(premultiplied[..., :3]), where=alpha > 1e-6,
+    # Divide contiguous RGBA together for the vectorized path, then restore
+    # coverage. A strided RGB output is substantially slower on large layers.
+    result = np.zeros_like(premultiplied)
+    np.divide(
+        premultiplied, alpha,
+        out=result, where=alpha > 1e-6,
     )
-    return np.concatenate((rgb, alpha), axis=2)
+    result[..., 3:4] = alpha
+    return result
 
 
 def _brightness_contrast_effect(original, brightness, contrast):
@@ -120,8 +126,10 @@ def _hsl_effect_dense(
 ) -> np.ndarray:
     straight = _straight(original)
     rgb = straight[..., :3]
-    maximum = np.max(rgb, axis=2)
-    minimum = np.min(rgb, axis=2)
+    maximum = np.maximum(rgb[..., 0], rgb[..., 1])
+    np.maximum(maximum, rgb[..., 2], out=maximum)
+    minimum = np.minimum(rgb[..., 0], rgb[..., 1])
+    np.minimum(minimum, rgb[..., 2], out=minimum)
     delta = maximum - minimum
     hue = np.zeros_like(maximum)
     nonzero = delta > 1e-7
@@ -168,7 +176,8 @@ def _hsl_effect_dense(
         chroma = (1.0 - np.abs(2.0 * light - 1.0)) * saturation
         base = light - chroma * 0.5
     sector = hue * 6.0
-    output = np.empty_like(rgb)
+    output = np.empty_like(original)
+    output[..., 3:4] = original[..., 3:4]
     # Each channel is a shifted, clipped triangle wave around the hue wheel.
     # This is the same six-sector HSL interpolation without allocating six
     # complete RGB candidate images and copying their boolean selections.
@@ -182,7 +191,7 @@ def _hsl_effect_dense(
         value += base
         value *= straight[..., 3]
         output[..., channel] = value
-    return np.concatenate((output, original[..., 3:4]), axis=2)
+    return output
 
 
 BLUR_PYRAMID_RADII = np.asarray(
@@ -192,7 +201,7 @@ BLUR_PYRAMID_RADII = np.asarray(
 
 
 class BlurPyramidCache:
-    """Byte-budgeted LRU of reduced premultiplied RGBA8 blur levels."""
+    """Byte-budgeted LRU of reduced, policy-typed premultiplied blur levels."""
 
     def __init__(self, budget: int = 64 * 1024 * 1024):
         self.budget = max(0, int(budget))
@@ -201,12 +210,14 @@ class BlurPyramidCache:
             OrderedDict()
         )
         self.builds = 0
+        self.extensions = 0
+        self._lock = RLock()
 
     @staticmethod
     def _pixels(original: np.ndarray) -> np.ndarray:
-        return np.ascontiguousarray(
-            np.clip(original * 255.0, 0.0, 255.0).astype(np.uint8)
-        )
+        if current_contract().floating:
+            return np.array(original, dtype=np.float32, order='C', copy=True)
+        return truncated_bytes(original)
 
     @staticmethod
     def _key(pixels: np.ndarray) -> tuple:
@@ -217,9 +228,19 @@ class BlurPyramidCache:
 
     @staticmethod
     def _build(pixels: np.ndarray, algorithm="normal") -> tuple[np.ndarray, ...]:
-        levels = [pixels]
-        current = Image.fromarray(pixels, "RGBA" if algorithm == "legacy" else "RGBa")
-        for _radius in BLUR_PYRAMID_RADII[1:]:
+        return BlurPyramidCache._extend(pixels, algorithm, (), len(BLUR_PYRAMID_RADII)-1)
+
+    @staticmethod
+    def _extend(pixels, algorithm, previous, maximum):
+        levels = list(previous) if previous else [pixels]
+        if np.issubdtype(pixels.dtype, np.floating):
+            from comic_editor.render.float_resize import resize_rgba
+            for _index in range(len(levels), maximum + 1):
+                height, width = levels[-1].shape[:2]
+                levels.append(resize_rgba(levels[-1], (max(1, (width+1)//2), max(1, (height+1)//2))))
+            return tuple(levels)
+        current = Image.fromarray(levels[-1], "RGBA" if algorithm == "legacy" else "RGBa")
+        for _index in range(len(levels), maximum + 1):
             width = max(1, (current.width + 1) // 2)
             height = max(1, (current.height + 1) // 2)
             current = current.resize(
@@ -228,27 +249,46 @@ class BlurPyramidCache:
             levels.append(np.asarray(current, dtype=np.uint8).copy())
         return tuple(levels)
 
-    def pyramid(self, original: np.ndarray, algorithm="normal") -> tuple[np.ndarray, ...]:
+    def pyramid(self, original: np.ndarray, algorithm="normal", *, max_level=None) -> tuple[np.ndarray, ...]:
+        maximum = (len(BLUR_PYRAMID_RADII)-1 if max_level is None
+                   else max(0, min(len(BLUR_PYRAMID_RADII)-1, int(max_level))))
         pixels = self._pixels(original)
-        key = (algorithm, *self._key(pixels))
-        cached = self._values.pop(key, None)
-        if cached is not None:
-            self._values[key] = cached
-            return cached
-        result = self._build(pixels, algorithm)
-        self.builds += 1
+        key = (algorithm, pixels.dtype.str, *self._key(pixels))
+        with self._lock:
+            cached = self._values.pop(key, None)
+            if cached is not None:
+                self._values[key] = cached
+                if len(cached) > maximum:
+                    return cached
+        extending = cached is not None
+        result = (self._build(pixels, algorithm) if max_level is None and cached is None
+                  else self._extend(pixels, algorithm, cached or (), maximum))
+        for level in result:
+            level.setflags(write=False)
         size = sum(int(level.nbytes) for level in result)
-        if 0 < size <= self.budget:
-            self._values[key] = result
-            self.bytes += size
-            while self._values and self.bytes > self.budget:
-                _old_key, old = self._values.popitem(last=False)
-                self.bytes -= sum(int(level.nbytes) for level in old)
+        with self._lock:
+            if extending:
+                self.extensions += 1
+            else:
+                self.builds += 1
+            cached = self._values.pop(key, None)
+            if cached is not None:
+                if len(cached) >= len(result) or size > self.budget:
+                    self._values[key] = cached
+                    return cached if len(cached) >= len(result) else result
+                self.bytes -= sum(int(level.nbytes) for level in cached)
+            if 0 < size <= self.budget:
+                self._values[key] = result
+                self.bytes += size
+                while self._values and self.bytes > self.budget:
+                    _old_key, old = self._values.popitem(last=False)
+                    self.bytes -= sum(int(level.nbytes) for level in old)
         return result
 
     def clear(self) -> None:
-        self._values.clear()
-        self.bytes = 0
+        with self._lock:
+            self._values.clear()
+            self.bytes = 0
 
 
 def _upscaled_blur_image(
@@ -287,39 +327,40 @@ def _variable_blur(
     cache: BlurPyramidCache | None = None,
     algorithm="normal",
 ) -> np.ndarray:
-    radii = np.clip(
-        np.broadcast_to(
-            np.asarray(strength, dtype=np.float32), original.shape[:2]
-        ),
-        0.0, 100.0,
-    )
+    scalar = np.ndim(strength) == 0
+    values = np.asarray(strength, dtype=np.float32)
+    radii = np.clip(values if scalar else np.broadcast_to(values, original.shape[:2]), 0.0, 100.0)
     if float(np.max(radii)) <= 1e-6:
         return original.copy()
+    if current_contract().floating:
+        return _variable_float_blur(original, radii, cache, algorithm)
+    if scalar:
+        from comic_editor.ui.gpu_effects import scalar_blur
+        accelerated = scalar_blur(original, strength, algorithm)
+        if accelerated is not None:
+            return accelerated
     cache = cache or BlurPyramidCache(0)
-    levels = cache.pyramid(original, algorithm)
     lower = np.searchsorted(
         BLUR_PYRAMID_RADII, radii, side="right"
     ) - 1
     lower = np.clip(lower, 0, len(BLUR_PYRAMID_RADII) - 2)
-    scalar = np.ndim(strength) == 0
+    levels = cache.pyramid(original, algorithm, max_level=int(np.max(lower)) + 1)
     if scalar:
-        index = int(lower.flat[0])
+        index = int(lower)
         low_radius = float(BLUR_PYRAMID_RADII[index])
         high_radius = float(BLUR_PYRAMID_RADII[index + 1])
-        blend = (float(radii.flat[0]) - low_radius) / max(
+        blend = (float(radii) - low_radius) / max(
             1e-6, high_radius - low_radius
         )
         low_image = _upscaled_blur_image(
             levels, index, original.shape[:2], algorithm
         )
         if blend <= 1e-6:
-            return np.asarray(low_image, dtype=np.float32) / 255.0
+            return normalized_bytes(low_image)
         high_image = _upscaled_blur_image(
             levels, index + 1, original.shape[:2], algorithm
         )
-        return np.asarray(
-            Image.blend(low_image, high_image, blend), dtype=np.float32
-        ) / 255.0
+        return normalized_bytes(Image.blend(low_image, high_image, blend))
 
     low_radius = BLUR_PYRAMID_RADII[lower]
     high_radius = BLUR_PYRAMID_RADII[lower + 1]
@@ -352,7 +393,41 @@ def _variable_blur(
         selection[selected] = 255
         result.paste(mixed, (0, 0), Image.fromarray(selection, "L"))
         prior_index, prior_high = index, high_image
-    return np.asarray(result, dtype=np.float32) / 255.0
+    return normalized_bytes(result)
+
+
+def _variable_float_blur(original, radii, cache, algorithm):
+    """Version-two pyramid interpolation keeps premultiplied float samples.
+
+    The legacy straight/premultiplied resize distinction only exists because
+    of intermediate byte rounding. Both float modes resample premultiplied
+    channels and coverage together, preserving HDR and negative RGB values.
+    """
+    from comic_editor.render.float_resize import resize_rgba
+    lower = np.clip(np.searchsorted(BLUR_PYRAMID_RADII, radii, side='right') - 1,
+                    0, len(BLUR_PYRAMID_RADII)-2)
+    levels = (cache or BlurPyramidCache(0)).pyramid(original, algorithm,
+                                                   max_level=int(np.max(lower))+1)
+    low_radius, high_radius = BLUR_PYRAMID_RADII[lower], BLUR_PYRAMID_RADII[lower+1]
+    blend = np.clip((radii-low_radius)/(high_radius-low_radius), 0., 1.)
+    size = original.shape[1], original.shape[0]
+    if np.ndim(radii) == 0:
+        low = resize_rgba(levels[int(lower)], size)
+        if float(blend) <= 1e-6:
+            return low
+        high = resize_rgba(levels[int(lower)+1], size)
+        return low + (high-low)*blend
+    result = np.empty_like(original)
+    previous_index, previous_high = -1, None
+    for raw_index in np.unique(lower):
+        index = int(raw_index)
+        low = previous_high if previous_index+1 == index and previous_high is not None else resize_rgba(levels[index], size)
+        high = resize_rgba(levels[index+1], size)
+        selected = lower == index
+        values = low[selected]
+        result[selected] = values + (high[selected]-values)*blend[selected, None]
+        previous_index, previous_high = index, high
+    return result
 
 
 class OutlineDistanceCache:
@@ -370,10 +445,11 @@ class OutlineDistanceCache:
             tuple, tuple[np.ndarray, tuple[int, int, int, int], tuple[int, int, int, int]]
         ] = OrderedDict()
         self.computations = 0
+        self._lock = RLock()
 
     @staticmethod
-    def _key(alpha: np.ndarray) -> tuple:
-        packed = np.packbits(alpha > 1e-6)
+    def _key(alpha: np.ndarray, occupied=None) -> tuple:
+        packed = np.packbits(alpha > 1e-6 if occupied is None else occupied)
         return (
             alpha.shape,
             hashlib.blake2b(memoryview(packed), digest_size=16).digest(),
@@ -391,12 +467,13 @@ class OutlineDistanceCache:
         Distances that can contribute to an outline within that margin are
         identical to a full-image transform; large fields omit farther values.
         """
-        key = (margin, *self._key(alpha))
-        cached = self._values.pop(key, None)
-        if cached is not None:
-            self._values[key] = cached
-            return cached
         occupied = alpha > 1e-6
+        key = (margin, *self._key(alpha, occupied))
+        with self._lock:
+            cached = self._values.pop(key, None)
+            if cached is not None:
+                self._values[key] = cached
+                return cached
         rows = np.flatnonzero(np.any(occupied, axis=1))
         columns = np.flatnonzero(np.any(occupied, axis=0))
         bounds = (
@@ -417,19 +494,26 @@ class OutlineDistanceCache:
                     if margin is not None and region.size > 1_000_000 and margin <= 256
                     else _outside_distance(region))
         result = (distance, bounds, extent)
-        self.computations += 1
+        distance.setflags(write=False)
         size = int(result[0].nbytes)
-        if 0 < size <= self.budget:
-            self._values[key] = result
-            self.bytes += size
-            while self._values and self.bytes > self.budget:
-                _old_key, old = self._values.popitem(last=False)
-                self.bytes -= int(old[0].nbytes)
+        with self._lock:
+            self.computations += 1
+            cached = self._values.pop(key, None)
+            if cached is not None:
+                self._values[key] = cached
+                return cached
+            if 0 < size <= self.budget:
+                self._values[key] = result
+                self.bytes += size
+                while self._values and self.bytes > self.budget:
+                    _old_key, old = self._values.popitem(last=False)
+                    self.bytes -= int(old[0].nbytes)
         return result
 
     def clear(self) -> None:
-        self._values.clear()
-        self.bytes = 0
+        with self._lock:
+            self._values.clear()
+            self.bytes = 0
 
 
 def _outside_distance(alpha: np.ndarray) -> np.ndarray:
@@ -438,9 +522,7 @@ def _outside_distance(alpha: np.ndarray) -> np.ndarray:
     # distance_transform_edt measures nonzero pixels to the nearest zero.
     # Transparent pixels are therefore the foreground and opaque pixels the
     # zero-valued targets.
-    return distance_transform_edt(
-        np.asarray(alpha <= 1e-6, dtype=np.uint8)
-    ).astype(np.float32, copy=False)
+    return distance_transform_edt(alpha <= 1e-6).astype(np.float32, copy=False)
 
 
 def _outside_distance_bounded(alpha: np.ndarray, margin: int) -> np.ndarray:
@@ -765,6 +847,7 @@ def apply_modifier_stack(
     original_pixels=None,
     return_pixels=False,
     pixel_origin=(0, 0),
+    _point_lut=True,
 ) -> QImage:
     active_modifiers = [modifier for modifier in modifiers if not modifier.muted]
     for modifier in active_modifiers:
@@ -779,13 +862,22 @@ def apply_modifier_stack(
         or modifier.intensity <= 0 and "intensity" not in modifier.parameter_masks))]
     if image.isNull() or not active_modifiers:
         return (_qimage_premultiplied(image) if original_pixels is None else original_pixels) if return_pixels else image
-    if (len(active_modifiers) == 1 and isinstance(active_modifiers[0], OutlineModifier)
+    if (not current_contract().floating and len(active_modifiers) == 1 and isinstance(active_modifiers[0], OutlineModifier)
             and active_modifiers[0].style == "solid" and not return_pixels):
         return _outline_qimage(image, active_modifiers[0], mask_fields or {}, outline_distance_cache)
-    if not return_pixels and all(isinstance(modifier, OutlineModifier) and modifier.style == "solid"
+    if not current_contract().floating and not return_pixels and all(isinstance(modifier, OutlineModifier) and modifier.style == "solid"
            for modifier in active_modifiers):
         return _outline_stack_qimage(image, active_modifiers, mask_fields or {}, outline_distance_cache)
     current = _qimage_premultiplied(image) if original_pixels is None else original_pixels.copy()
+    if cancelled is not None and cancelled():
+        return None
+    if _point_lut and original_pixels is None:
+        from comic_editor.ui.point_lut import point_chain
+        accelerated = point_chain(image, current, active_modifiers)
+        if accelerated is not None:
+            if cancelled is not None and cancelled():
+                return None
+            return accelerated if return_pixels else _premultiplied_qimage(np.clip(accelerated, 0., 1.))
     height, width = current.shape[:2]
     mask_fields = mask_fields or {}
     for modifier in active_modifiers:
@@ -1020,7 +1112,7 @@ def apply_modifier_stack(
             current = effect
         else:
             current = current * (1.0 - mask) + effect * mask
-    return current if return_pixels else _premultiplied_qimage(np.clip(current, 0.0, 1.0))
+    return current if return_pixels else _premultiplied_qimage(current if current_contract().floating else np.clip(current, 0.0, 1.0))
 
 
 def apply_opacity_mask(
@@ -1040,6 +1132,13 @@ def apply_opacity_mask(
     if normalized.shape != (height, width):
         return image
     black, white = float(black_value), float(white_value)
+    from comic_editor.render.pixels import current_contract, premultiplied_pixels, working_image
+    if current_contract().floating:
+        opacity = np.clip(normalized, 0., 1.) * (white - black) + black
+        np.clip(opacity, 0., 1., out=opacity)
+        pixels = premultiplied_pixels(image)
+        pixels *= opacity[..., None]
+        return working_image(pixels)
     converted = image.convertToFormat(QImage.Format.Format_ARGB32_Premultiplied)
     result = QImage(width, height, QImage.Format.Format_ARGB32_Premultiplied)
     # Copy bytes into an ordinary document-pixel image, like the legacy helper.

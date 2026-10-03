@@ -122,9 +122,11 @@ def test_compact_output_opacity_mask_uses_original_world_coordinates(canvas, ang
     assert actual.pixelColor(int(blue.x()/4), int(blue.y()/4)) == actual.pixelColor(0, 0)
 
 
-def test_navigator_pattern_samples_masks_at_compact_resolution_in_world_frame(canvas, monkeypatch):
+@pytest.mark.parametrize("channel", ["navigator", "contact"])
+def test_interactive_pattern_samples_masks_at_compact_resolution_in_world_frame(canvas, monkeypatch, channel):
     canvas._interactive_render = True
-    canvas._effect_preview_channel = "navigator"
+    canvas._effect_preview_channel = "navigator" if channel == "navigator" else "canvas"
+    canvas._stroke_projection_active = channel == "contact"
     source = source_image()
     bounds = QRectF(1000, 2000, 640, 240)
     mapping = QTransform().translate(53, 71).rotate(31)
@@ -142,7 +144,7 @@ def test_navigator_pattern_samples_masks_at_compact_resolution_in_world_frame(ca
         return {(modifier.modifier_id, "intensity"): field}
     monkeypatch.setattr(canvas, "_modifier_mask_fields", fields)
     monkeypatch.setattr("comic_editor.ui.gpu_pattern_effects.renderer_for",
-                        lambda _: pytest.fail("Navigator must not start full-size GPU work"))
+                        lambda _: pytest.fail("Interactive draft must not start full-size GPU work"))
     result, actual_bounds = render_stages(canvas, source, bounds, [modifier], mapping,
         required=QRectF(1100, 2020, 440, 180), source_key=("frame",))
     assert actual_bounds == QRectF(1100, 2020, 440, 180)

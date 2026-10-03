@@ -263,9 +263,8 @@ def test_region_workers_do_not_cancel_siblings_and_completion_uses_projection_ho
         assert jobs.request(second_scope, ("second",), lambda _: source, 4096)
         assert not jobs.running[2].is_set()
         gate.set()
-        jobs.running[3].result(timeout=3)
-        jobs.poll()
-        jobs.running[3].result(timeout=3)
+        for job in jobs.running_jobs:
+            job[3].result(timeout=3)
         jobs.poll()
         assert jobs.result(first_scope, ("first",)) == source
         assert jobs.result(second_scope, ("second",)) == source

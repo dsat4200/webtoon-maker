@@ -101,7 +101,7 @@ def blend_rgb(back, front, mode):
     raise ValueError(f"Unknown color blend mode: {mode}")
 
 
-def composite_blend(back, front, mode, *, height_shade=None):
+def composite_blend(back, front, mode, *, height_shade=None, clamp_color=True):
     """Composite float32 premultiplied RGBA; modulation retains backdrop alpha.
 
     Source alpha controls modulation strength. Transparent source pixels never
@@ -128,4 +128,6 @@ def composite_blend(back, front, mode, *, height_shade=None):
     else:
         rgb = front[..., :3] * (1 - da) + back[..., :3] * (1 - sa) + blend_rgb(cb, cs, mode) * sa * da
         alpha = sa + da * (1 - sa)
-    return np.concatenate((np.minimum(np.maximum(rgb, 0), alpha), alpha), axis=-1)
+    if clamp_color:
+        rgb = np.minimum(np.maximum(rgb, 0), alpha)
+    return np.concatenate((rgb, alpha), axis=-1)

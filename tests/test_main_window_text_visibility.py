@@ -15,6 +15,9 @@ def text_window(qapp, monkeypatch, text_outline_font_family):
     monkeypatch.setattr("comic_editor.ui.main_window.save_settings", lambda _: None)
     window = MainWindow()
     window.resize(1280, 900)
+    # Typography cards can change the ribbon's minimum width. Keep the paint
+    # device fixed so visibility comparisons cover the same document pixels.
+    window.canvas.setFixedSize(640, 480)
     window.settings.grid_overlay_visible = False
     chapter = ChapterDocument(height=480)
     page = chapter.add_page("Page", BoundGeometry.rectangle(0, 0, 1080, 480))

@@ -4,7 +4,7 @@ from __future__ import annotations
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 from copy import deepcopy
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from PySide6.QtCore import QObject, QTimer, Signal
@@ -24,6 +24,10 @@ class RecoverySnapshot:
     tile_size: int
     images: dict[str, ImageSource]
     asset: dict | None = None
+    tile_store: TileStore | None = None
+    saved_tiles: dict = field(default_factory=dict)
+    saved_images: dict = field(default_factory=dict)
+    derived_bounds: dict = field(default_factory=dict)
 
     @classmethod
     def capture(cls, root, chapter, tiles, images, asset=None):
@@ -43,25 +47,41 @@ class RecoverySnapshot:
                 "root": {"kind": asset.root_kind, "id": asset.root_id},
                 "visual_bounds": list(asset.visual_bounds), "document": payload,
             }
-        return cls(Path(root), payload,
-                   {identifier: tiles.object_tiles(identifier) for identifier in raster_ids},
-                   tiles.tile_size, images.snapshot(image_ids), asset_payload)
+        detached = tiles.detached_snapshot(raster_ids)
+        return cls(Path(root), payload, detached._tiles,
+                   tiles.tile_size, images.snapshot(image_ids), asset_payload,
+                   tile_store=detached)
 
     def write(self):
         """Worker-only stores preserve the live document's dirty flags."""
         chapter = ChapterDocument.from_dict(self.chapter)
-        tiles = TileStore(self.tile_size)
-        # Saving does not need alpha bounds; avoid scanning every snapshot
-        # tile just to construct a store that will only encode PNG files.
-        tiles._tiles = self.tiles
+        if self.tile_store is not None:
+            # Publication may adopt destination paths. Keep the captured input
+            # pinned separately so later writes cannot mutate this snapshot.
+            tiles = self.tile_store.detached_snapshot(set(self.tiles))
+        else:
+            # Support explicitly constructed snapshots and older callers.
+            tiles = TileStore(self.tile_size)
+            for identifier, values in self.tiles.items():
+                tiles._object_tiles(identifier).update(values)
+        tiles._saved_versions = {key: dict(value) for key, value in self.saved_tiles.items()}
         images = ImageStore()
         images.restore(self.images)
+        images._saved_sources = {key: dict(value) for key, value in self.saved_images.items()}
         if self.asset is None:
             SeriesRepository(self.root).save_chapter(chapter, tiles, images, autosave=True)
         else:
             manifest = AssetManifest.from_dict(self.asset)
             manifest.document = chapter
             AssetRepository(self.root).save(manifest, tiles, images=images, autosave=True)
+        self.saved_tiles = {key: dict(value) for key, value in tiles._saved_versions.items()}
+        self.saved_images = {key: dict(value) for key, value in images._saved_sources.items()}
+        self.derived_bounds = {
+            (identifier, *key): (owner.version(key), bounds)
+            for identifier, owner in tiles._tiles.items()
+            for key, bounds in tiles._alpha_bounds.get(identifier, {}).items()
+            if key in owner and (identifier, *key) not in tiles._alpha_bounds_dirty
+        }
 
 
 @dataclass
@@ -83,6 +103,7 @@ class AutosaveJobs(QObject):
         self.running = None
         self.closed = False
         self.submitted = 0
+        self.saved_resources = {}
         self.timer = QTimer(self)
         self.timer.setInterval(20)
         self.timer.timeout.connect(self.poll)
@@ -108,6 +129,9 @@ class AutosaveJobs(QObject):
         if self.closed or self.running is not None or not self.pending:
             return
         _, request = self.pending.popitem(last=False)
+        saved = self.saved_resources.get(request.scope)
+        if saved is not None:
+            request.snapshot.saved_tiles, request.snapshot.saved_images = saved
         self.running = request, self.executor.submit(request.snapshot.write)
         self.submitted += 1
 
@@ -120,6 +144,12 @@ class AutosaveJobs(QObject):
                 future.result()
             except Exception as caught:
                 error = caught
+            if error is None:
+                self.saved_resources[request.scope] = (
+                    request.snapshot.saved_tiles, request.snapshot.saved_images)
+                live_tiles = getattr(request.owner, 'tiles', None)
+                if live_tiles is not None:
+                    live_tiles.adopt_snapshot_bounds(request.snapshot.derived_bounds)
             self.completed.emit(request, error)
         self._start()
         if self.running is None and not self.pending:
@@ -139,6 +169,10 @@ class AutosaveJobs(QObject):
             except Exception:
                 pass  # The normal save/open path handles any recovery marker.
             self.running = None
+        if scope is None:
+            self.saved_resources.clear()
+        else:
+            self.saved_resources.pop(scope, None)
         self._start()
         if self.running is None and not self.pending:
             self.timer.stop()
@@ -151,3 +185,4 @@ class AutosaveJobs(QObject):
         self.timer.stop()
         self.executor.shutdown(wait=True, cancel_futures=True)
         self.running = None
+        self.saved_resources.clear()

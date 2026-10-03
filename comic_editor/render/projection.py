@@ -9,6 +9,7 @@ from __future__ import annotations
 from collections import OrderedDict
 from bisect import bisect_left
 from dataclasses import dataclass
+from functools import cached_property
 import math
 from typing import Callable
 
@@ -45,8 +46,14 @@ class ProjectionRequest:
 
     @property
     def capture_rect(self) -> QRectF:
+        return QRectF(*self._capture_coordinates)
+
+    @cached_property
+    def _capture_coordinates(self) -> tuple:
+        # Only immutable numbers are retained. Each caller gets an independent
+        # Qt value; mutating a returned rectangle cannot alter another request.
         margin = self.gutter / self.scale
-        return self.world_rect.adjusted(-margin, -margin, margin, margin)
+        return self.world_rect.adjusted(-margin, -margin, margin, margin).getRect()
 
     @property
     def source_rect(self) -> QRectF:
@@ -121,7 +128,7 @@ class DocumentProjection:
         self.revision += 1
         for tiles in self._configurations.values():
             for tile in tiles.values():
-                if world is None or tile.request.capture_rect.intersects(world):
+                if tile.valid and (world is None or tile.request.capture_rect.intersects(world)):
                     tile.valid = False
 
     def requests(self, world: QRectF, pixels_per_unit: float) -> list[ProjectionRequest]:

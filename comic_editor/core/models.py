@@ -8,9 +8,10 @@ from dataclasses import dataclass, field, fields
 from typing import Any, Iterable, Iterator, Literal
 from comic_editor.core.cage import CageGrid
 from comic_editor.core.blend_modes import validate_blend_mode, OBJECT_BLEND_MODES
+from comic_editor.core.pixel_contract import PixelContract, LEGACY_PIXELS
 
 
-SCHEMA_VERSION = 25
+SCHEMA_VERSION = 26
 SERIES_SCHEMA_VERSION = 18
 CHAPTER_WIDTH = 1080
 DEFAULT_CHAPTER_HEIGHT = 3240
@@ -3784,6 +3785,7 @@ class ChapterDocument:
     view_overflow: float = 0.0
     export_rect_enabled: bool = False
     export_rect: tuple[float, float, float, float] | None = None
+    pixel_contract: PixelContract = LEGACY_PIXELS
     schema_version: int = SCHEMA_VERSION
     legacy_fill_migrations: list[dict[str, Any]] = field(
         default_factory=list, repr=False, compare=False
@@ -3796,6 +3798,8 @@ class ChapterDocument:
             )
         if self.document_kind not in {"chapter", "asset", "image"}:
             raise ValueError(f"Unknown document kind: {self.document_kind}")
+        if not isinstance(self.pixel_contract, PixelContract):
+            raise ValueError("Chapter pixel contract must be validated")
         if self.document_kind == "chapter" and self.width != CHAPTER_WIDTH:
             raise ValueError(f"Chapter width must be {CHAPTER_WIDTH}")
         self.width = max(1, int(self.width))
@@ -5067,6 +5071,7 @@ class ChapterDocument:
             "view_overflow": self.view_overflow,
             "export_rect_enabled": self.export_rect_enabled,
             "export_rect": list(self.export_rect) if self.export_rect is not None else None,
+            "pixel_contract": self.pixel_contract.to_dict(),
             "background": self.background, "grid": self.grid.to_dict(),
             "grid_override_enabled": self.grid_override_enabled,
             "root_page_ids": list(self.root_page_ids),
@@ -5149,6 +5154,7 @@ class ChapterDocument:
             view_overflow=float(data.get("view_overflow", 0.0)),
             export_rect_enabled=bool(data.get("export_rect_enabled", False)),
             export_rect=data.get("export_rect"),
+            pixel_contract=PixelContract.from_dict(data.get("pixel_contract")),
             background=(
                 "#00000000" if legacy_background
                 and data.get("document_kind", "chapter") == "chapter"

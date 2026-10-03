@@ -94,6 +94,14 @@ from comic_editor.integrations.blender_controller import (
 )
 
 
+_MAIN_FILTER_EVENTS = frozenset((
+    QEvent.ApplicationDeactivate, QEvent.WindowDeactivate,
+    QEvent.KeyPress, QEvent.KeyRelease,
+    QEvent.MouseButtonPress, QEvent.MouseMove, QEvent.MouseButtonRelease,
+    QEvent.TabletPress, QEvent.TabletMove, QEvent.TabletRelease,
+))
+
+
 class ResponsiveToolButton(QToolButton):
     """Fixed-height command button that reveals its label when it fits."""
 
@@ -2101,25 +2109,28 @@ class MainWindow(QMainWindow):
         return True
 
     def eventFilter(self, watched, event) -> bool:  # noqa: N802
-        if event.type() == QEvent.ApplicationDeactivate or (
-            event.type() == QEvent.WindowDeactivate and watched is self
+        event_type = event.type()
+        if event_type not in _MAIN_FILTER_EVENTS:
+            return super().eventFilter(watched, event)
+        if event_type == QEvent.ApplicationDeactivate or (
+            event_type == QEvent.WindowDeactivate and watched is self
         ):
             self.canvas._cancel_lasso_brush()
             self.canvas._interrupt_paint_brush()
-        if (event.type() == QEvent.ApplicationDeactivate
-                or (event.type() == QEvent.KeyPress and event.key() == Qt.Key_Escape)):
+        if (event_type == QEvent.ApplicationDeactivate
+                or (event_type == QEvent.KeyPress and event.key() == Qt.Key_Escape)):
             self._solo_star_press = None
         if self._suppress_outliner_compat_mouse(watched, event):
             event.accept()
             return True
         if self._handle_solo_star_event(watched, event):
             return True
-        if (event.type() == QEvent.MouseButtonRelease and event.button() == Qt.LeftButton
+        if (event_type == QEvent.MouseButtonRelease and event.button() == Qt.LeftButton
                 and getattr(self, "_target_layer_pick_mouse_press", False)):
             self._target_layer_pick_mouse_press = False
             event.accept()
             return True
-        if (watched is self.tree.viewport() and event.type() == QEvent.MouseButtonPress
+        if (watched is self.tree.viewport() and event_type == QEvent.MouseButtonPress
                 and event.button() == Qt.LeftButton and self.modifier_controls.target_layer_pick_id):
             self._target_layer_pick_mouse_press = True
             index = self.tree.indexAt(event.position().toPoint()).siblingAtColumn(0)
@@ -2128,13 +2139,13 @@ class MainWindow(QMainWindow):
                 self.modifier_controls.choose_target_layer(item.kind, item.entity_id)
             event.accept()
             return True
-        if (event.type() == QEvent.KeyPress and event.key() == Qt.Key_Escape
+        if (event_type == QEvent.KeyPress and event.key() == Qt.Key_Escape
                 and self.modifier_controls.cancel_target_layer_pick()):
             event.accept()
             return True
         if (
             watched is self.tree.viewport()
-            and event.type() == QEvent.MouseButtonPress
+            and event_type == QEvent.MouseButtonPress
             and event.button() == Qt.MouseButton.LeftButton
             and self.canvas.active_tone_mask_id
         ):
@@ -2145,7 +2156,7 @@ class MainWindow(QMainWindow):
             return True
         if (
             watched is self.tree.viewport()
-            and event.type() == QEvent.MouseButtonRelease
+            and event_type == QEvent.MouseButtonRelease
             and event.button() == Qt.MouseButton.LeftButton
             and self.canvas.active_tone_mask_id
         ):
@@ -2161,7 +2172,7 @@ class MainWindow(QMainWindow):
             return True
         if (
             watched is self.tree.viewport()
-            and event.type() == QEvent.MouseButtonPress
+            and event_type == QEvent.MouseButtonPress
             and event.button() == Qt.MouseButton.LeftButton
             and self.modifier_controls.link_modifier_id
         ):
@@ -2177,7 +2188,7 @@ class MainWindow(QMainWindow):
             return True
         if self._forward_popup_tablet_event(watched, event):
             return True
-        if event.type() == QEvent.KeyPress and event.key() == Qt.Key_Escape and getattr(self, "_color_dialog_sample", None) is not None:
+        if event_type == QEvent.KeyPress and event.key() == Qt.Key_Escape and getattr(self, "_color_dialog_sample", None) is not None:
             self._color_dialog_sample.finish_sample()
             event.accept()
             return True
@@ -2185,7 +2196,7 @@ class MainWindow(QMainWindow):
             return True
         if watched is self.tree.viewport() and self._forward_outliner_mouse_event(event):
             return True
-        if event.type() == QEvent.ApplicationDeactivate:
+        if event_type == QEvent.ApplicationDeactivate:
             self._cancel_outliner_tablet_press()
             self._mouse_outliner_press = None
             self._hotkey_prefix_timer.stop()
@@ -2194,28 +2205,28 @@ class MainWindow(QMainWindow):
             self._restore_active_hotkey_tool()
             return super().eventFilter(watched, event)
         if (
-            event.type() == QEvent.KeyPress
+            event_type == QEvent.KeyPress
             and event.key() == Qt.Key_Escape
             and self.canvas._cancel_mask_selection()
         ):
             event.accept()
             return True
         if (
-            event.type() == QEvent.KeyPress
+            event_type == QEvent.KeyPress
             and event.key() == Qt.Key_Escape
             and self.canvas._finish_mask_gradient(False)
         ):
             event.accept()
             return True
         if (
-            event.type() == QEvent.KeyPress
+            event_type == QEvent.KeyPress
             and event.key() == Qt.Key_Escape
             and self._finish_mask_mode(False)
         ):
             event.accept()
             return True
         if (
-            event.type() == QEvent.KeyPress
+            event_type == QEvent.KeyPress
             and event.key() == Qt.Key_Escape
             and self.modifier_controls.cancel_link_mode()
         ):
@@ -2223,7 +2234,7 @@ class MainWindow(QMainWindow):
             return True
         if (
             not getattr(self, "_hotkey_runtime_enabled", False)
-            or event.type() not in {QEvent.KeyPress, QEvent.KeyRelease}
+            or event_type not in {QEvent.KeyPress, QEvent.KeyRelease}
         ):
             return super().eventFilter(watched, event)
         if int(event.key()) in {int(Qt.Key_Shift), int(Qt.Key_Control)}:
@@ -2235,7 +2246,7 @@ class MainWindow(QMainWindow):
             return False
         handled = (
             self._hotkey_press(int(event.key()))
-            if event.type() == QEvent.KeyPress
+            if event_type == QEvent.KeyPress
             else self._hotkey_release(int(event.key()))
         )
         return handled or super().eventFilter(watched, event)

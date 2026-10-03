@@ -113,15 +113,17 @@ def test_changed_angle_cancels_old_integration_even_when_output_region_changes(s
         with pytest.raises(ProjectionPending):
             render_stages(scene, source, bounds, [modifier], QTransform(), **args)
         assert job[2].is_set(), "Obsolete angular samples kept a newer regional request waiting"
-        assert scene._effect_jobs.pending
-        pending = next(iter(scene._effect_jobs.pending.values()))
+        admitted = (*scene._effect_jobs.running_jobs, *scene._effect_jobs.pending.values())
+        assert any(not active[2].is_set() and active[1] != job[1] for active in admitted)
+        pending = next(active for active in admitted if not active[2].is_set() and active[1] != job[1])
         assert pending[0] != job[0]
     finally:
         release.set()
     with pytest.raises(radial_blur.RadialRenderCancelled):
         job[3].result(timeout=10)
     scene._effect_jobs.poll()
-    scene._effect_jobs.running[3].result(timeout=10)
+    for active in scene._effect_jobs.running_jobs:
+        active[3].result(timeout=10)
     scene._effect_jobs.poll()
     assert render_stages(scene, source, bounds, [modifier], QTransform(), **args)[0] is not None
 

@@ -6,6 +6,7 @@ from PySide6.QtCore import QRectF
 from PySide6.QtGui import QTransform
 from comic_editor.core.cage import map_points
 from comic_editor.ui.modifier_rendering import _qimage_premultiplied, _premultiplied_qimage
+from comic_editor.render.pixels import current_contract
 
 
 def warp_path(path, grid, tolerance=.2):
@@ -108,7 +109,8 @@ def warp_image(image, bounds, grid, local_to_world=None, output_bounds=None, can
         from PySide6.QtCore import Qt
         image = image.scaled(max(1, math.ceil(image.width()*pixel_scale)), max(1, math.ceil(image.height()*pixel_scale)), Qt.IgnoreAspectRatio, Qt.SmoothTransformation)
     pixels = _qimage_premultiplied(image)
-    output = np.zeros((height, width, 4), np.uint8)
+    floating = current_contract().floating
+    output = np.zeros((height, width, 4), np.float32 if floating else np.uint8)
     src = (source-np.array((bounds.x(), bounds.y()))) * (image.width()/bounds.width(), image.height()/bounds.height()) - .5
     dst = (destination - (output_bounds.x(), output_bounds.y())) * (width/max(1, output_bounds.width()), height/max(1, output_bounds.height()))
     triangles = dst[faces]
@@ -147,9 +149,15 @@ def warp_image(image, bounds, grid, local_to_world=None, output_bounds=None, can
         values = (cubic_sample(pixels, mx, my) if order == 3 else nearest_sample(pixels, mx, my) if order == 0 else np.stack([
             map_coordinates(channel, coordinates, order=order, mode="grid-constant", cval=0, prefilter=False)
             for channel in filtered], axis=-1))
-        values = np.clip(values, 0, 1)
-        values[..., :3] = np.minimum(values[..., :3], values[..., 3:4])
-        output[top:bottom] = np.rint(values*255).astype(np.uint8)
+        if floating:
+            from comic_editor.ui.distort_rendering import _float_pixels
+            output[top:bottom] = _float_pixels(values)
+        else:
+            values = np.clip(values, 0, 1)
+            values[..., :3] = np.minimum(values[..., :3], values[..., 3:4])
+            output[top:bottom] = np.rint(values*255).astype(np.uint8)
+    if floating:
+        return _premultiplied_qimage(output), output_bounds
     from PySide6.QtGui import QImage
     result = QImage(output.data, width, height, width*4, QImage.Format_RGBA8888_Premultiplied).copy()
     return result, output_bounds

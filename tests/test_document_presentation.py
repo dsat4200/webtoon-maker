@@ -51,6 +51,32 @@ def test_camera_maps_before_float_conversion_at_large_document_offsets():
     np.testing.assert_array_equal(vertices[-1, :2], [1, -1])
 
 
+def test_geometry_reuses_positions_across_pixel_edits_and_retires_camera_changes():
+    presenter = GpuTilePresenter()
+    presenter.geometry_limit = 3
+    camera, viewport = QTransform(), QSizeF(64, 64)
+    tile = PresentedTile('a', solid('red'), QRectF(10, 20, 16, 16))
+    first = presenter._prepare_geometry([tile], camera, viewport, None)[0][1]
+    changed = PresentedTile('a', solid('blue'), tile.world_rect)
+    assert presenter._prepare_geometry([changed], camera, viewport, None)[0][1] is first
+    assert presenter.geometry_builds == presenter.geometry_hits == 1
+    camera.translate(3, 8)
+    actual = presenter._prepare_geometry([changed], camera, viewport, None)[0][1]
+    np.testing.assert_array_equal(actual, tile_vertices(changed, camera, viewport))
+    assert not np.array_equal(actual, first)
+    tile.world_rect.translate(7, 0)
+    clipped = QRectF(20, 20, 10, 16)
+    actual = presenter._prepare_geometry([tile], camera, viewport, clipped)[0][1]
+    np.testing.assert_array_equal(actual, tile_vertices(tile, camera, viewport, clipped))
+    resized = PresentedTile('a', solid(size=32), tile.world_rect, QRectF(2, 2, 16, 16))
+    actual = presenter._prepare_geometry([resized], camera, QSizeF(128, 64), None)[0][1]
+    np.testing.assert_array_equal(actual, tile_vertices(resized, camera, QSizeF(128, 64)))
+    for index in range(8):
+        moved = PresentedTile(index, tile.image, QRectF(index*16, 0, 16, 16))
+        presenter._prepare_geometry([moved], camera, viewport, None)
+    assert len(presenter._geometry) == presenter.geometry_limit
+
+
 def test_raster_fallback_uses_gutters_and_restores_painter():
     tile_image = solid("green", 20)
     painter = QPainter(tile_image)
@@ -138,16 +164,47 @@ def test_gpu_camera_changes_reuse_uploads_and_preserve_premultiplied_alpha(gl_co
     np.testing.assert_allclose(first[12, 12], [100, 20, 40, 128], atol=1)
     assert not first[0, 0].any()
     assert presenter.uploads == 1
+    assert presenter.geometry_uploads == 1
     camera = QTransform.fromTranslate(16, 4)
     camera.rotate(5)
     camera.scale(1.3, 1.3)
     assert presenter.draw([tile], camera, QSizeF(64, 64))
     assert presenter.uploads == 1
+    assert presenter.geometry_uploads == 2
     changed = image.copy()
     changed.fill(QColor("blue"))
     assert presenter.draw([PresentedTile(tile.key, changed, tile.world_rect)],
                           camera, QSizeF(64, 64))
     assert presenter.uploads == 2
+    assert presenter.geometry_uploads == 2
+    target.release()
+
+
+def test_gpu_repeated_frame_keeps_vertices_filters_and_context_limits(gl_context, monkeypatch):
+    presenter = gl_context
+    tile = PresentedTile('a', solid(), QRectF(0, 0, 16, 16))
+    target = framebuffer(presenter)
+    assert presenter.draw([tile], QTransform(), QSizeF(64,64), smooth=False)
+    expected = pixels(target.toImage())
+    entry = next(iter(presenter._textures.values()))
+    filters = []
+    set_filters = entry.texture.setMinMagFilters
+    monkeypatch.setattr(entry.texture, 'setMinMagFilters', lambda *values: (filters.append(values), set_filters(*values))[1])
+    get_integer = presenter.functions.glGetIntegerv
+    queries = []
+    def query(name):
+        queries.append(name)
+        return get_integer(name)
+    monkeypatch.setattr(presenter.functions, 'glGetIntegerv', query)
+    for _ in range(3):
+        assert presenter.draw([tile], QTransform(), QSizeF(64,64), smooth=False)
+        np.testing.assert_array_equal(pixels(target.toImage()), expected)
+    assert presenter.geometry_uploads == 1 and not filters
+    assert 0x0D33 not in queries
+    assert presenter.draw([tile], QTransform(), QSizeF(64,64), smooth=True)
+    assert len(filters) == 1 and presenter.geometry_uploads == 1
+    assert presenter.draw([tile], QTransform(), QSizeF(64,64), smooth=False)
+    assert len(filters) == 2
     target.release()
 
 

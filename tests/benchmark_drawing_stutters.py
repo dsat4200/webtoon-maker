@@ -9,6 +9,7 @@ controller is replaced before MainWindow construction; no broker is started.
 from __future__ import annotations
 
 import argparse
+import cProfile
 from collections import Counter, defaultdict
 from functools import wraps
 import hashlib
@@ -20,6 +21,7 @@ import shutil
 import sys
 import threading
 import time
+import weakref
 from types import SimpleNamespace
 
 
@@ -35,8 +37,15 @@ CAMERAS = {
 parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument("--label", required=True)
 parser.add_argument("--baseline", action="store_true")
+parser.add_argument("--source-code", type=Path,
+                    help="Import an explicitly preserved source checkout for before/after comparisons.")
 parser.add_argument("--project-copy", type=Path, default=ARTIFACTS / "project-copy")
-parser.add_argument("--scenario", choices=CAMERAS, default="rotated")
+parser.add_argument("--scenario", choices=(*CAMERAS, 'occupied'), default="rotated")
+parser.add_argument('--raster-id', default=RASTER_ID, help='Choose an existing raster in the isolated chapter.')
+parser.add_argument('--exercise-point-chain', action='store_true',
+                    help='Prepend a compatible three-effect color chain in the benchmark copy only.')
+parser.add_argument('--profile', action='store_true', help='Capture GUI call costs; affects latency measurements.')
+parser.add_argument('--profile-startup', action='store_true', help='Include initial rendering in the GUI profile; implies --profile.')
 parser.add_argument("--hz", type=float, default=120.)
 parser.add_argument("--stroke-seconds", type=float, default=2.)
 parser.add_argument("--strokes", type=int, default=4)
@@ -49,6 +58,8 @@ parser.add_argument("--navigate-between-strokes", action="store_true")
 parser.add_argument("--cold-only", action="store_true")
 parser.add_argument("--async-exact", action="store_true",
                     help="Start input before first exposure, await exact readiness, and validate final native pixels.")
+parser.add_argument("--effect-workers", type=int, choices=range(1, 5),
+                    help="Limit detached effect concurrency for matched diagnostic runs.")
 parser.add_argument("--async-warm-start", action="store_true",
                     help="With async-exact, wait for the initial exact view before sustained input/navigation.")
 parser.add_argument("--warm-from", choices=CAMERAS,
@@ -56,6 +67,8 @@ parser.add_argument("--warm-from", choices=CAMERAS,
 parser.add_argument("--no-stroke-warmup", action="store_true",
                     help="Skip explicit initial repaint; Qt may already have painted its exposure.")
 args = parser.parse_args()
+RASTER_ID = args.raster_id
+assert not (args.baseline and args.source_code)
 assert 1 <= args.hz <= 1000 and 0 < args.stroke_seconds <= 30 and 1 <= args.strokes <= 20
 assert not args.async_warm_start or args.async_exact
 assert not args.warm_from or (args.async_exact and args.cold_only)
@@ -68,7 +81,7 @@ assert COPY.is_relative_to((ROOT / ".artifacts").resolve()) and (COPY / "series.
 assert not OUT.exists(), "Use a new label to preserve previous measurements"
 OUT.mkdir(parents=True)
 shutil.copyfile(ARTIFACTS / "user-settings-snapshot.json", OUT / "settings.json")
-sys.path.insert(0, str(ARTIFACTS / "baseline-source" if args.baseline else ROOT))
+sys.path.insert(0, str(args.source_code.resolve() if args.source_code else ARTIFACTS / "baseline-source" if args.baseline else ROOT))
 os.environ["QT_QPA_PLATFORM"] = "windows"
 os.environ["QT_TLS_BACKEND"] = "schannel"
 
@@ -184,7 +197,7 @@ class Probe:
                         for candidate in candidates:
                             if hasattr(candidate, "modifier_type"):
                                 modifiers.append({"id": candidate.modifier_id, "type": candidate.modifier_type})
-                    if modifiers:
+                    if modifiers and (label != 'effects.fused_points' or result is not None):
                         row["modifiers"] = modifiers
                     source = next((v for v in values if isinstance(v, QImage)), None)
                     if source is not None:
@@ -271,6 +284,15 @@ probe.patch(ChapterPreview, "_render_live_preview", "navigator.render")
 probe.patch(distort_rendering, "render_distort", "effects.distort")
 probe.patch(effect_pipeline, "apply_modifier_stack", "effects.exact_stack")
 probe.patch(interactive_effects, "apply_modifier_stack", "effects.interactive_stack")
+import importlib
+import importlib.util
+for module_name, function_name, label in (
+    ('tile_effects', 'apply_modifier_stack', 'effects.tile_stack'),
+    ('point_lut', 'point_chain', 'effects.fused_points'),
+):
+    full_name = f'comic_editor.ui.{module_name}'
+    if importlib.util.find_spec(full_name) is not None:
+        probe.patch(importlib.import_module(full_name), function_name, label)
 probe.patch(GpuPatternRenderer, "render", "effects.pattern")
 probe.patch(modifier_rendering, "_outside_distance", "effects.outline_distance")
 probe.patch(modifier_rendering, "_outline_qimage", "effects.outline")
@@ -281,10 +303,34 @@ write_json("project-files-before.json", before_hashes)
 repository = SeriesRepository(COPY)
 chapter, tiles, images = repository.load_chapter(CHAPTER_ID, include_images=True)
 assert RASTER_ID in chapter.objects
+forced_visible_layers = []
+if args.scenario == 'occupied':
+    # Saved drafting pages may be hidden. A stroke on one would otherwise
+    # measure pointer dispatch without ever evaluating its drawing effects.
+    chapter.objects[RASTER_ID].visible = True
+    ancestor = chapter.objects[RASTER_ID].parent_layer_id
+    while ancestor is not None:
+        layer = chapter.layers[ancestor]
+        if not layer.visible:
+            forced_visible_layers.append(ancestor)
+            layer.visible = True
+        ancestor = layer.parent_id
+if args.exercise_point_chain:
+    from comic_editor.core.models import BrightnessContrastModifier, CurvesModifier
+    point_effects = [BrightnessContrastModifier(brightness=13.25, contrast=23.5, intensity=57.75),
+                    CurvesModifier(intensity=83.25, curves={'rgb:master': [[0,0],[.35,.65],[1,1]]}),
+                    BrightnessContrastModifier(brightness=-21.25, contrast=-30.5, intensity=66.75)]
+    chapter.modifiers.update({modifier.modifier_id: modifier for modifier in point_effects})
+    chapter.objects[RASTER_ID].modifier_ids[:0] = [modifier.modifier_id for modifier in point_effects]
 window = window_module.MainWindow()
 window.setAttribute(Qt.WA_DontShowOnScreen, True)
 window.setAttribute(Qt.WA_ShowWithoutActivating, True)
 canvas = window.canvas
+if args.effect_workers is not None:
+    available_workers = getattr(canvas._effect_jobs, 'worker_limit', 1)
+    assert args.effect_workers <= available_workers, 'Requested concurrency exceeds the configured pool'
+    if hasattr(canvas._effect_jobs, 'worker_limit'):
+        canvas._effect_jobs.worker_limit = args.effect_workers
 canvas._projection_async_enabled = bool(args.async_exact and not args.baseline)
 canvas.setFixedSize(955, 927)
 window.series = SeriesDocument.from_dict(json.loads((COPY / "series.json").read_text()))
@@ -294,6 +340,12 @@ if not args.no_autosave:
 window._set_chapter(chapter, tiles, images)
 canvas.set_selection("object", RASTER_ID)
 window._activate_tool(ToolKind.RASTER_PENCIL)
+if args.scenario == 'occupied':
+    occupied = canvas.object_world_rect(RASTER_ID)
+    assert occupied is not None and not occupied.isEmpty()
+    center = occupied.center()
+    density = min(.7, 955 / max(1, occupied.width()*1.1), 927 / max(1, occupied.height()*1.1))
+    CAMERAS['occupied'] = (center.x(), center.y(), max(.05, density), 0.)
 canvas.center_x, canvas.center_y, canvas.scale, canvas.rotation = CAMERAS[args.warm_from or args.scenario]
 if args.navigator != "saved":
     window.navigator_panel.setExpanded(args.navigator == "shown", emit=False)
@@ -377,6 +429,10 @@ for stroke in range(0 if args.cold_only else args.strokes):
                      "activity": f"stroke-{stroke}", "expected_camera": list(planned_camera)})
     anchor = QPointF(max(rect.left()+30, min(rect.right()-30, planned_camera[0])),
                      max(rect.top()+30, min(rect.bottom()-30, planned_camera[1])))
+    if args.scenario == 'occupied':
+        # The center pivot handle owns a press within a fixed screen radius.
+        # Use an interior ink position away from it and the corner handles.
+        anchor = QPointF(rect.left() + rect.width()*.37, rect.top() + rect.height()*.43)
     transform = QTransform()
     transform.translate(canvas.width()/2, canvas.height()/2)
     transform.rotate(planned_camera[3])
@@ -481,6 +537,22 @@ def produce():
         producer_done.set()
 
 
+def graphics_state():
+    point_module = sys.modules.get('comic_editor.ui.point_lut')
+    worker = getattr(point_module, '_worker', None)
+    if worker is not None:
+        return {'available': worker.available, 'reason': worker.reason,
+                'ready': worker.ready.is_set(), 'closed': worker.closed,
+                'queued_bytes': worker.queued_bytes, **worker.stats}
+
+
+graphics_before_shutdown = None
+def finish_run():
+    global graphics_before_shutdown
+    graphics_before_shutdown = graphics_state()
+    app.quit()
+
+
 def heartbeat():
     global last_heartbeat, input_end, timed_out
     now = time.perf_counter()
@@ -502,10 +574,10 @@ def heartbeat():
                 failed=state["failed"])):
         start_producer()
     if state and state["failed"]:
-        app.quit()
+        finish_run()
     elif now-probe.started > args.deadline_seconds:
         timed_out = True
-        app.quit()
+        finish_run()
     elif input_end is not None and now-input_end >= args.drain_seconds:
         last_activity = max(
             [r["dispatched_at"] for r in probe.input_rows if "dispatched_at" in r]
@@ -514,12 +586,14 @@ def heartbeat():
         if not args.async_exact or probe.exact_progress.terminal(
                 now, last_activity_at=last_activity, signature=canvas_signature(canvas),
                 jobs_busy=state["jobs_busy"], failed=state["failed"]):
-            app.quit()
+            finish_run()
 
 
 thread = None
 def start_producer():
     global thread, input_started, last_heartbeat
+    if args.profile and args.async_warm_start and gui_profile is not None:
+        gui_profile.enable()
     if args.warm_from:
         write_json("warmup.json", {
             "camera": CAMERAS[args.warm_from], "elapsed_ms": (time.perf_counter()-probe.started)*1000,
@@ -567,7 +641,7 @@ def start():
 def deadline():
     global timed_out
     timed_out = True
-    app.quit()
+    finish_run()
 
 
 timer = QTimer()
@@ -578,10 +652,12 @@ write_json("setup.json", {
     "source": str(Path(canvas_module.__file__).resolve()), "project": str(COPY),
     "gui_thread": probe.gui_thread,
     "scenario": args.scenario, "camera": CAMERAS[args.scenario], "selected": RASTER_ID,
+    "forced_visible_layers_in_memory": forced_visible_layers,
     "chapter": {"objects": len(chapter.objects), "modifiers": len(chapter.modifiers),
                 "layers": len(chapter.layers), "masks": len(chapter.masks)},
     "viewport": [955, 927], "settings": json.loads((OUT / "settings.json").read_text()),
     "device_pixel_ratio": canvas.devicePixelRatioF(),
+    "effect_workers": getattr(canvas._effect_jobs, 'worker_limit', 1),
     "args": {key: str(value) if isinstance(value, Path) else value for key, value in vars(args).items()},
     "limitations": ["Synthetic pen trajectory and constant pressure; no original raw pen samples exist.",
                     "Input deadlines include producer GIL delay; posted queue delay is reported separately.",
@@ -600,14 +676,31 @@ write_json("source-files.json", {
 try:
     QTimer.singleShot(round(args.deadline_seconds * 1000), deadline)
     QTimer.singleShot(0, start)
+    gui_profile = cProfile.Profile() if args.profile or args.profile_startup else None
+    if gui_profile is not None and (args.profile_startup or not args.async_warm_start):
+        gui_profile.enable()
     app.exec()
 finally:
+    if 'gui_profile' in globals() and gui_profile is not None:
+        gui_profile.disable()
+        gui_profile.dump_stats(str(OUT/'gui.prof'))
     stop_producer.set()
     if thread is not None:
         thread.join(2.)
     timer.stop()
     probe.phase = "shutdown"
     measured_projection = canvas._document_projection.snapshot()
+    preparation_before_shutdown = None
+    pipeline_module = sys.modules.get('comic_editor.ui.distort_pipeline')
+    registry = getattr(pipeline_module, '_worker_preparation', None)
+    shared_preparation = registry() if isinstance(registry, weakref.ReferenceType) else None
+    if shared_preparation is not None:
+        preparation_before_shutdown = {
+            'pool_budget': shared_preparation.budget,
+            'pool_bytes': shared_preparation.bytes,
+            'entries': len(shared_preparation._entries),
+        }
+    shared_preparation = None
     exact_status = None
     if args.async_exact:
         state = canvas_pending(canvas)
@@ -711,7 +804,23 @@ finally:
         "projection": measured_projection,
         "async_exact": exact_status,
     }
+    if args.scenario == 'occupied':
+        selected_effects = {identifier for identifier in chapter.objects[RASTER_ID].modifier_ids
+                            if not chapter.modifiers[identifier].muted
+                            and (chapter.modifiers[identifier].intensity > 0
+                                 or chapter.modifiers[identifier].parameter_masks)}
+        evaluated = {effect['id'] for row in probe.rows
+                     if row['phase'] in ({'cold'} if args.cold_only else {'input'})
+                     for effect in row.get('modifiers', [])}
+        summary['selected_effects_evaluated'] = sorted(selected_effects & evaluated)
+        summary['selected_effects_expected'] = sorted(selected_effects)
+        if selected_effects:
+            assert selected_effects <= evaluated, 'Occupied drawing did not evaluate every active selected effect'
     window._dirty = False
+    if graphics_before_shutdown is not None:
+        summary['graphics_worker'] = graphics_before_shutdown
+    if preparation_before_shutdown is not None:
+        summary['worker_preparation'] = preparation_before_shutdown
     canvas._effect_jobs.cancel()
     canvas._effect_jobs.executor.shutdown(wait=True, cancel_futures=True)
     gpu = getattr(canvas, "_gpu_pattern_renderer", None)

@@ -8,6 +8,7 @@ from typing import Any, Callable, Protocol
 from PySide6.QtGui import QImage
 
 from .models import object_from_dict
+from .tile_history import HistoryTileMap, TileHistoryCache
 
 
 class Command(Protocol):
@@ -41,11 +42,18 @@ class TilePatchCommand:
     after_state: object | None = None
     state_callback: Callable[[object], None] | None = None
 
+    def __post_init__(self):
+        cache = getattr(self.tile_store, '_history_cache', None)
+        if cache is None:
+            cache = self.tile_store._history_cache = TileHistoryCache()
+        self.before = HistoryTileMap(cache, self.before)
+        self.after = HistoryTileMap(cache, self.after)
+
     def _apply(
         self, values: dict[tuple[int, int], QImage | None], state: object,
     ) -> None:
-        for key, image in values.items():
-            self.tile_store.set_tile(self.object_id, key, image)
+        for key, image, bounds in values.items_with_bounds(self.tile_store._alpha_bbox):
+            self.tile_store.set_tile(self.object_id, key, image, _known_alpha_bounds=bounds)
         if self.state_callback is not None:
             self.state_callback(state)
         if self.changed_callback:

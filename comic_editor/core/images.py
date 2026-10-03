@@ -5,27 +5,77 @@ import mimetypes
 import os
 import re
 import shutil
+from collections import OrderedDict
 from dataclasses import dataclass
 from pathlib import Path
 
 from PySide6.QtCore import QBuffer, QByteArray, QIODevice
 from PySide6.QtGui import QImage, QImageReader
+from .encoded_images import EncodedImage, EncodedImageCache, DEFAULT_ENCODED_CACHE
+from .pixel_arrays import image_has_high_precision
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, init=False, eq=False)
 class ImageSource:
     filename: str
     mime_type: str
-    data: bytes
+    _encoded: EncodedImage
+
+    def __init__(self, filename, mime_type, data):
+        object.__setattr__(self, 'filename', filename)
+        object.__setattr__(self, 'mime_type', mime_type)
+        object.__setattr__(self, '_encoded', data if isinstance(data, EncodedImage)
+                           else EncodedImage.from_bytes(bytes(data), DEFAULT_ENCODED_CACHE))
+
+    @property
+    def data(self):
+        return self._encoded.data
+
+    def __deepcopy__(self, memo):
+        return self
+
+    def __eq__(self, other):
+        if not isinstance(other, ImageSource):
+            return NotImplemented
+        return (self.filename == other.filename and self.mime_type == other.mime_type
+                and (self._encoded is other._encoded or self.data == other.data))
+
+    def __hash__(self):
+        return hash((self.filename, self.mime_type, self.data))
 
 
 class ImageStore:
     """Own immutable imported files while caching decoded display frames."""
 
-    def __init__(self) -> None:
+    def __init__(self, *, decoded_budget: int = 256 * 1024 * 1024,
+                 encoded_budget: int = 64 * 1024 * 1024) -> None:
         self._sources: dict[str, ImageSource] = {}
-        self._decoded: dict[str, QImage] = {}
+        self._decoded: OrderedDict[object, QImage] = OrderedDict()
+        self.decoded_budget = max(0, int(decoded_budget))
+        self.decoded_bytes = 0
+        self._encoded_cache = EncodedImageCache(encoded_budget)
+        self._saved_sources = {}
+        self._pending_saves = {}
         self.dirty: set[str] = set()
+
+    def _forget_decoded(self, object_id):
+        previous = self._decoded.pop(object_id, None)
+        if previous is not None:
+            self.decoded_bytes -= int(previous.sizeInBytes())
+
+    def _cache_decoded(self, object_id, image):
+        self._forget_decoded(object_id)
+        size = int(image.sizeInBytes())
+        if size > self.decoded_budget:
+            return
+        while self._decoded and self.decoded_bytes + size > self.decoded_budget:
+            self._forget_decoded(next(iter(self._decoded)))
+        self._decoded[object_id] = image
+        self.decoded_bytes += size
+
+    def _forget_object_decoded(self, object_id):
+        self._forget_decoded(object_id)
+        self._forget_decoded(('native', object_id))
 
     @staticmethod
     def safe_filename(filename: str) -> str:
@@ -34,14 +84,19 @@ class ImageStore:
         return name or "image"
 
     @staticmethod
-    def _decode(data: bytes) -> tuple[QImage, bytes]:
-        payload = QByteArray(data)
-        buffer = QBuffer(payload)
+    def _decode_native(data: bytes) -> tuple[QImage, bytes]:
+        # Own the QByteArray inside Qt instead of borrowing a Python-managed
+        # QByteArray pointer. The reader and its plugin must also die before
+        # their non-owned device, including on an unsuccessful decode.
+        buffer = QBuffer()
+        buffer.setData(QByteArray(data))
         buffer.open(QIODevice.OpenModeFlag.ReadOnly)
         reader = QImageReader(buffer)
         reader.setAutoTransform(True)
         image = reader.read()
         detected = bytes(reader.format())
+        error_message = reader.errorString()
+        del reader
         buffer.close()
         if image.isNull():
             # TGA has no reliable magic header for Qt's byte-buffer reader.
@@ -57,7 +112,12 @@ class ImageStore:
                         rgba.width * 4, QImage.Format_RGBA8888,
                     ).copy()
             except (OSError, ValueError) as error:
-                raise ValueError(reader.errorString() or "Unsupported or invalid image") from error
+                raise ValueError(error_message or "Unsupported or invalid image") from error
+        return image, detected
+
+    @staticmethod
+    def _decode(data: bytes) -> tuple[QImage, bytes]:
+        image, detected = ImageStore._decode_native(data)
         return image.convertToFormat(QImage.Format_ARGB32_Premultiplied), detected
 
     @staticmethod
@@ -79,17 +139,27 @@ class ImageStore:
         mime_type: str = "",
     ) -> ImageSource:
         raw = bytes(data)
-        image, detected = self._decode(raw)
         safe = self.safe_filename(filename)
         guessed = mimetypes.guess_type(safe)[0] or ""
+        previous = self._sources.get(str(object_id))
+        known_mime = str(mime_type or guessed)
+        if (previous is not None and known_mime
+                and previous.filename == safe and previous.mime_type == known_mime
+                and previous.data == raw):
+            # The immutable payload has already passed validation. Preserve the
+            # caller's dirty notification without decoding or pinning it again.
+            self.dirty.add(str(object_id))
+            return previous
+        image, detected = self._decode(raw)
         if not mime_type:
             mime_type = guessed or (
                 f"image/{detected.decode('ascii', 'ignore').lower()}"
                 if detected else "application/octet-stream"
             )
-        source = ImageSource(safe, str(mime_type), raw)
+        source = ImageSource(safe, str(mime_type), EncodedImage.from_bytes(raw, self._encoded_cache))
         self._sources[str(object_id)] = source
-        self._decoded[str(object_id)] = image
+        self._forget_object_decoded(str(object_id))
+        self._cache_decoded(str(object_id), image)
         self.dirty.add(str(object_id))
         return source
 
@@ -102,28 +172,60 @@ class ImageStore:
             raise ValueError("Cannot store a null decoded image")
         object_id = str(object_id)
         source = ImageSource(
-            self.safe_filename(filename), str(mime_type), bytes(data)
+            self.safe_filename(filename), str(mime_type),
+            EncodedImage.from_bytes(bytes(data), self._encoded_cache)
         )
         self._sources[object_id] = source
-        self._decoded[object_id] = image.convertToFormat(
-            QImage.Format_ARGB32_Premultiplied
-        )
+        self._forget_object_decoded(object_id)
+        frames = [(('native', object_id), QImage(image)),
+                  (object_id, image.convertToFormat(QImage.Format_ARGB32_Premultiplied))]
+        if image_has_high_precision(image):
+            frames.reverse()
+        # A one-frame budget retains the immediately useful representation:
+        # display pixels for byte sources, original precision for wide sources.
+        for key, frame in frames:
+            self._cache_decoded(key, frame)
         self.dirty.add(object_id)
         return source
 
     def source(self, object_id: str) -> ImageSource | None:
         return self._sources.get(str(object_id))
 
+    def pixel_signature(self, object_id: str) -> tuple:
+        """Identify immutable source bytes without decoding their display image."""
+        source = self.source(object_id)
+        return (str(source._encoded.pin.path),) if source is not None else ()
+
     def image(self, object_id: str) -> QImage:
         object_id = str(object_id)
         cached = self._decoded.get(object_id)
         if cached is not None:
+            self._decoded.move_to_end(object_id)
             return QImage(cached)
         source = self._sources.get(object_id)
         if source is None:
             return QImage()
         image, _detected = self._decode(source.data)
-        self._decoded[object_id] = image
+        self._cache_decoded(object_id, image)
+        return QImage(image)
+
+    def native_image(self, object_id: str) -> QImage:
+        """Decode the immutable original without reducing precision or its ICC profile.
+
+        Native and legacy display frames share the same residency budget. Color
+        conversion belongs to the renderer's source edge, before composition.
+        """
+        object_id = str(object_id)
+        key = ('native', object_id)
+        cached = self._decoded.get(key)
+        if cached is not None:
+            self._decoded.move_to_end(key)
+            return QImage(cached)
+        source = self.source(object_id)
+        if source is None:
+            return QImage()
+        image, _detected = self._decode_native(source.data)
+        self._cache_decoded(key, image)
         return QImage(image)
 
     def relabel(
@@ -138,7 +240,7 @@ class ImageStore:
         self._sources[object_id] = ImageSource(
             self.safe_filename(filename),
             str(mime_type or source.mime_type or "application/octet-stream"),
-            source.data,
+            source._encoded,
         )
         self.dirty.add(object_id)
         return True
@@ -147,40 +249,51 @@ class ImageStore:
         object_id = str(object_id)
         if object_id in self._sources:
             self._sources.pop(object_id, None)
-            self._decoded.pop(object_id, None)
+            self._forget_object_decoded(object_id)
             self.dirty.add(object_id)
 
     def copy_source_to(self, object_id: str, target: "ImageStore", new_id: str) -> None:
         source = self.source(object_id)
         if source is not None:
-            target.put(new_id, source.filename, source.data, source.mime_type)
+            identifier = str(new_id)
+            cached = self._decoded.get(str(object_id))
+            target._sources[identifier] = source
+            target._forget_object_decoded(identifier)
+            native = self._decoded.get(('native', str(object_id)))
+            frames = [(('native', identifier), native), (identifier, cached)]
+            if native is not None and image_has_high_precision(native):
+                frames.reverse()
+            for key, frame in frames:
+                if frame is not None:
+                    target._cache_decoded(key, QImage(frame))
+            target.dirty.add(identifier)
 
     def clone(self, object_ids: set[str] | None = None) -> "ImageStore":
         result = ImageStore()
+        result._encoded_cache = self._encoded_cache
         identifiers = set(self._sources) if object_ids is None else set(object_ids)
         for object_id in identifiers:
             source = self._sources.get(object_id)
             if source is not None:
-                result._sources[object_id] = ImageSource(
-                    source.filename, source.mime_type, bytes(source.data)
-                )
+                result._sources[object_id] = source
         result.dirty.clear()
         return result
 
     def snapshot(self, object_ids: set[str] | None = None) -> dict[str, ImageSource]:
         identifiers = set(self._sources) if object_ids is None else set(object_ids)
         return {
-            object_id: ImageSource(item.filename, item.mime_type, bytes(item.data))
+            object_id: item
             for object_id in identifiers
             if (item := self._sources.get(object_id)) is not None
         }
 
     def restore(self, values: dict[str, ImageSource]) -> None:
         self._sources = {
-            object_id: ImageSource(item.filename, item.mime_type, bytes(item.data))
+            object_id: item
             for object_id, item in values.items()
         }
         self._decoded.clear()
+        self.decoded_bytes = 0
         self.dirty.update(values)
 
     @staticmethod
@@ -195,8 +308,12 @@ class ImageStore:
 
     def save_directory(
         self, root: Path, object_ids: set[str], *, complete: bool = False,
+        incremental: bool = False, transactional: bool = False,
     ) -> None:
         root.mkdir(parents=True, exist_ok=True)
+        destination = str(root.resolve())
+        known = self._saved_sources.get(destination, {})
+        saved = {}
         for object_id in object_ids:
             source = self._sources.get(object_id)
             if source is None:
@@ -204,8 +321,17 @@ class ImageStore:
             directory = root / object_id
             directory.mkdir(parents=True, exist_ok=True)
             target = directory / self.safe_filename(source.filename)
-            if complete or object_id in self.dirty or not target.is_file():
+            try:
+                stat = target.stat()
+                stamp = (stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns)
+            except OSError:
+                stamp = None
+            if ((complete and not incremental) or known.get(object_id) != (source, stamp)
+                    or stamp is None):
                 self._atomic_bytes(target, source.data)
+                stat = target.stat()
+                stamp = (stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns)
+            saved[object_id] = (source, stamp)
             for stale in directory.iterdir():
                 if stale != target:
                     if stale.is_dir():
@@ -216,14 +342,27 @@ class ImageStore:
             if directory.is_dir() and directory.name not in object_ids:
                 shutil.rmtree(directory)
         self.dirty.difference_update(object_ids)
+        self._pending_saves[destination] = saved
+        if not transactional:
+            self.commit_directory(root)
+
+    def commit_directory(self, root: Path) -> None:
+        destination = str(root.resolve())
+        saved = self._pending_saves.pop(destination, None)
+        if saved is not None:
+            self._saved_sources[destination] = saved
 
     def load_directory(
         self, root: Path, metadata: dict[str, tuple[str, str]],
     ) -> None:
         self._sources.clear()
         self._decoded.clear()
+        self.decoded_bytes = 0
+        self._saved_sources.clear()
+        self._pending_saves.clear()
         if not root.is_dir():
             return
+        saved = {}
         for object_id, (filename, mime_type) in metadata.items():
             directory = root / object_id
             requested = directory / self.safe_filename(filename)
@@ -233,12 +372,16 @@ class ImageStore:
             )
             if not candidates:
                 continue
-            data = candidates[0].read_bytes()
-            self._verify(data)
+            encoded = EncodedImage.from_file(candidates[0], self._encoded_cache)
+            self._verify(encoded.data)
             self._sources[object_id] = ImageSource(
                 self.safe_filename(filename or candidates[0].name),
                 mime_type or mimetypes.guess_type(candidates[0].name)[0]
                 or "application/octet-stream",
-                data,
+                encoded,
             )
+            stat = candidates[0].stat()
+            saved[object_id] = (self._sources[object_id],
+                (stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns))
         self.dirty.clear()
+        self._saved_sources[str(root.resolve())] = saved

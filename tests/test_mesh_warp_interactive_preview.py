@@ -21,6 +21,43 @@ def context():
     return canvas, results, jobs
 
 
+def test_pen_contact_bounds_warp_work_and_waits_until_release_to_queue_exact(monkeypatch):
+    canvas, results, jobs = context()
+    canvas._stroke_projection_active = True
+    effect = modifier('mesh_warp')
+    effect.points[5] = (.61, .41)
+    image = source_image().scaled(640, 480)
+    bounds = QRectF(0, 0, 640, 480)
+    calls = []
+    original = distort_rendering.render_distort
+
+    def track(*args, **kwargs):
+        result = original(*args, **kwargs)
+        calls.append((kwargs['pixel_scale'], result.size().toTuple()))
+        return result
+
+    monkeypatch.setattr(distort_rendering, 'render_distort', track)
+
+    def render():
+        return distort_pipeline.render_distort_stage(canvas, image, image, bounds, bounds,
+            effect, QTransform(), {}, 'pixels', 'scope', False, False)
+
+    draft, provisional = render()
+    assert provisional and not jobs
+    assert len(calls) == 1 and max(calls[0][1]) <= 96
+    assert calls[0][1][0] * calls[0][1][1] <= 4096 + 192
+    assert render() == (draft, True) and len(calls) == 1
+    assert set(results) == {('contact-distort-draft', 'pixels')}
+    canvas._stroke_projection_active = False
+    render()
+    assert len(jobs) == 1
+    expected = original(image, bounds, effect, QTransform(), bounds)
+    assert jobs[0][2]() == expected
+    canvas._projection_exact = True
+    exact, provisional = render()
+    assert exact == expected and not provisional
+
+
 @pytest.mark.parametrize("masked", [False, True])
 def test_mesh_preview_matches_existing_draft_blending_without_native_jobs(monkeypatch, masked):
     canvas, results, jobs = context()

@@ -57,8 +57,16 @@ def footprint(modifier):
 
 
 def eligible(canvas, required, request_scope, bounds, modifiers):
+    stroke_regions = (getattr(canvas, '_stroke_projection_active', False)
+                      and any(isinstance(m, (BrightnessContrastModifier, CurvesModifier,
+                                            HueSaturationLightnessModifier)) for m in modifiers)
+                      and all(isinstance(m, (BrightnessContrastModifier, CurvesModifier,
+                                            HueSaturationLightnessModifier))
+                              or isinstance(m, OutlineModifier) and m.style == 'solid'
+                              for m in modifiers if not m.muted))
     return (required is not None and request_scope is not None
-            and region_requests_enabled(canvas) and projection_requires_exact(canvas)
+            and region_requests_enabled(canvas)
+            and (projection_requires_exact(canvas) or stroke_regions)
             and bounds == QRectF(bounds.toAlignedRect()) and not bounds.isEmpty()
             and bounds.width() * bounds.height() > 256 * 256
             and any(footprint(m) is not None for m in modifiers if not m.muted))
@@ -79,11 +87,14 @@ def tile_output(canvas, image, bounds, modifiers, mapping, *, required, request_
                            or all(isinstance(m, OutlineModifier) for m in active)):
         return None
     transform = canvas._modifier_mapping_signature(mapping)
-    placement = (tuple(bounds.getRect()), transform, nearest, float_pipeline)
+    tile_size = 64 if getattr(canvas, '_stroke_projection_active', False) and not projection_requires_exact(canvas) else 256
+    placement = (tuple(bounds.getRect()), transform, nearest, float_pipeline, tile_size)
     signatures = tuple((repr(modifier_render_settings(m)),
         canvas._modifier_parameter_signature([m.modifier_id]), _color_signature(canvas, m)) for m in active)
     storage = QImage.Format_RGBA32FPx4_Premultiplied if float_pipeline else QImage.Format_ARGB32_Premultiplied
     nodes = [TileNode(QRectF(bounds), (source_identity, placement), None, None, format=storage)]
+    from comic_editor.ui.point_lut import _supported, point_chain
+    point_start = 0
     for index, modifier in enumerate(active):
         incoming = nodes[-1].frame
         frame = QRectF(bounds) if float_pipeline else aligned(effect_bounds(incoming, [modifier], mapping))
@@ -119,10 +130,12 @@ def tile_output(canvas, image, bounds, modifiers, mapping, *, required, request_
                                   for transform in copies))
             if pad is None:
                 return source_frame
-            # Gaussian/Kuwahara replicate the true edge of their source frame.
-            # Outline operates on transparent padding outside that frame.
+            # Generic float stacks have a fixed semantic frame, including for
+            # outline blur: outside coverage must not enter its convolution.
+            # Compatibility stages instead expand the outline's actual frame.
             needed = output.adjusted(-pad, -pad, pad, pad)
-            return needed if isinstance(effect, (OutlineModifier, BlurModifier)) else needed.intersected(source_frame)
+            return (needed if isinstance(effect, (OutlineModifier, BlurModifier)) and not float_pipeline
+                    else needed.intersected(source_frame))
         def evaluate(output, source, source_bounds, effect=modifier, stage=index,
                      source_frame=incoming, output_frame=frame, prefix=identity, halo=padding, copies=transforms):
             if copies is not None:
@@ -246,8 +259,36 @@ def tile_output(canvas, image, bounds, modifiers, mapping, *, required, request_
             regional_spatial = False
         if isinstance(modifier, DistortModifier) and modifier.modifier_type == "distort_smudge":
             regional_spatial = False
+        input_index = None
+        if _supported(modifier):
+            # Float intermediates after another effect need their exact input
+            # values; a byte-indexed table is eligible only at the source.
+            if index - point_start >= 1 and (not float_pipeline or point_start == 0):
+                effects = tuple(copy.deepcopy(m) for m in active[point_start:index + 1])
+                input_index = point_start
+                def evaluate_points(output, source, source_bounds, fused=effects,
+                                    prefix=identity, source_stage=point_start):
+                    pixels = _float_pixels(source) if float_pipeline else _qimage_premultiplied(source)
+                    result = point_chain(source, pixels, fused, quantize_stages=not float_pipeline,
+                        canonical_input=float_pipeline,
+                        source_key=('tile-point-input', source_identity, placement,
+                                    signatures[:source_stage], tuple(source_bounds.getRect())))
+                    if result is None:
+                        for operation in fused:
+                            if float_pipeline:
+                                pixels = apply_modifier_stack(source, [operation], (0, 0),
+                                    original_pixels=pixels, return_pixels=True, _point_lut=False)
+                            else:
+                                source = apply_modifier_stack(source, [operation], (0, 0), _point_lut=False)
+                        return _float_image(pixels) if float_pipeline else source
+                    return _float_image(result) if float_pipeline else _premultiplied_qimage(result)
+                evaluate = evaluate_points
+                required_input = lambda output: output
+        else:
+            point_start = index + 1
         nodes.append(TileNode(frame, identity, required_input, evaluate,
-                              shared_frame=padding is None and not regional_spatial, format=storage))
+                              shared_frame=padding is None and not regional_spatial, format=storage,
+                              input_index=input_index))
     def get(owner, key):
         scope = ("tile-graph", request_scope, owner)
         retained = canvas._effect_jobs.retained_get(scope, key)
@@ -266,7 +307,17 @@ def tile_output(canvas, image, bounds, modifiers, mapping, *, required, request_
             crop.translate(-bounds.topLeft())
             result = image.copy(crop.toAlignedRect())
         return _float_image(_qimage_premultiplied(result)) if float_pipeline else result
-    graph = TileGraph(nodes, source, get, put, cache_only=image is None and capture is None)
+    def continue_pending():
+        jobs = canvas._effect_jobs
+        # Queue only enough independent neighbors to occupy existing workers.
+        # Snapshot admission still owns the combined byte limit, including an
+        # exclusive oversized job. Contact previews never enter this path.
+        count = len(jobs.running_jobs) + len(jobs.pending)
+        return (count < jobs.worker_limit and jobs.bytes_in_flight < jobs.budget
+                and not any(job[4] > jobs.budget for job in jobs.running_jobs))
+    graph = TileGraph(nodes, source, get, put, cache_only=image is None and capture is None,
+                      tile_size=tile_size,
+                      continue_pending=continue_pending if projection_deferred(canvas) else None)
     try:
         output_bounds = QRectF(nodes[-1].frame.intersected(required).toAlignedRect())
         output_owner = ("output", tuple(output_bounds.getRect()))

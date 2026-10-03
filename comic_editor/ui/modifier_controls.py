@@ -21,6 +21,7 @@ from comic_editor.core.models import (
     TextureModifier, SolidColorOverlayModifier,
 )
 from comic_editor.core.distort import DISTORT_TYPES
+from comic_editor.core.document_patch import RecordSnapshot
 from comic_editor.core.models import KuwaharaModifier
 from comic_editor.core.models import DitheringModifier, SharpnessModifier
 from comic_editor.ui.icons import iconoir
@@ -483,10 +484,10 @@ class ModifierCard(QFrame):
             layout.setSpacing(3)
             value_box.setFixedWidth(58)
             mask_button.setFixedSize(22, 22)
-        value_box.valueChanged.connect(lambda _value: self.owner.begin_parameter_drag())
+        value_box.valueChanged.connect(lambda _value: self.owner.begin_parameter_drag(self.modifier.modifier_id))
         slider.valueChanged.connect(value_box.setValue)
         value_box.valueChanged.connect(slider.setValue)
-        slider.sliderPressed.connect(self.owner.begin_parameter_drag)
+        slider.sliderPressed.connect(lambda: self.owner.begin_parameter_drag(self.modifier.modifier_id))
         slider.valueChanged.connect(
             lambda current: self.owner.set_parameter(
                 self.modifier.modifier_id, attribute, float(current), False
@@ -738,7 +739,9 @@ class ModifierControls(QWidget):
         self.canvas.documentChanged.emit(None)
 
     def _push(self, before, label: str) -> None:
-        after = self.canvas.chapter.to_dict()
+        if isinstance(before, RecordSnapshot) and before.document_identity != id(self.canvas.chapter):
+            return
+        after = before.after(self.canvas.chapter) if isinstance(before, RecordSnapshot) else self.canvas.chapter.to_dict()
         if before != after:
             self.canvas.push_model_change(before, after, label)
             self.canvas.documentChanged.emit(None)
@@ -758,7 +761,7 @@ class ModifierControls(QWidget):
         targets = list(self.canvas.selected_entities)
         if chapter is None or not targets:
             return
-        before = chapter.to_dict()
+        before = self._graph_snapshot(targets, modifiers=None)
         if modifier_type in DISTORT_TYPES:
             bounds = self._default_bounds()
             frame = (self.canvas._rect_signature(bounds) if bounds is not None and not bounds.isEmpty()
@@ -863,7 +866,7 @@ class ModifierControls(QWidget):
         chapter = self.canvas.chapter
         if chapter is None or modifier_id not in chapter.modifiers:
             return
-        before = chapter.to_dict()
+        before = self._graph_snapshot(chapter.modifier_target_ids(modifier_id), modifiers=[modifier_id])
         chapter.remove_modifier(modifier_id)
         if self.active_modifier_id == modifier_id:
             self.activate_modifier("")
@@ -885,11 +888,14 @@ class ModifierControls(QWidget):
         self.activate_modifier("" if self.active_modifier_id == modifier_id else modifier_id)
         self.refresh()
 
-    def begin_parameter_drag(self) -> None:
+    def begin_parameter_drag(self, modifier_id=None) -> None:
         if self.canvas._cage_edit_before is not None:
             self.canvas.finish_cage(True)
         if self._parameter_before is None and self.canvas.chapter is not None:
-            self._parameter_before = self.canvas.chapter.to_dict()
+            self._parameter_before = RecordSnapshot.capture(self.canvas.chapter,
+                modifiers=[modifier_id] if modifier_id is not None else None,
+                scalars=('modifier_preset_ids',))
+            self._parameter_history_generation = getattr(self.canvas, '_history_generation', 0)
 
     def set_parameter(
         self, modifier_id: str, attribute: str, value, commit: bool,
@@ -900,7 +906,8 @@ class ModifierControls(QWidget):
         modifier = chapter.modifiers.get(modifier_id) if chapter else None
         if modifier is None or not hasattr(modifier, attribute):
             return
-        before = chapter.to_dict() if commit and self._parameter_before is None else None
+        before = (RecordSnapshot.capture(chapter, modifiers=[modifier_id], scalars=('modifier_preset_ids',))
+                  if commit and self._parameter_before is None else None)
         if (self._parameter_before is not None
                 and modifier.modifier_type == "distort_mesh_warp"):
             self.canvas._mesh_warp_parameter_drag_id = modifier_id
@@ -932,7 +939,8 @@ class ModifierControls(QWidget):
         self.canvas._smudge_parameter_drag_id = None
         # Undo/document replacement may already have restored another model.
         # Never append the abandoned gesture to that model's history.
-        if before is not None and (chapter is None or chapter is self.canvas.chapter):
+        if (before is not None and (chapter is None or chapter is self.canvas.chapter)
+                and getattr(self, '_parameter_history_generation', 0) == getattr(self.canvas, '_history_generation', 0)):
             self._push(before, "Edit modifier")
         if mesh_preview is not None or smudge_preview is not None:
             self.canvas._invalidate_scene_cache()
@@ -967,7 +975,8 @@ class ModifierControls(QWidget):
         if binding is None:
             return
         if self._parameter_before is None:
-            self._parameter_before = chapter.to_dict()
+            self._parameter_before = RecordSnapshot.capture(chapter, modifiers=[modifier_id], scalars=('modifier_preset_ids',))
+            self._parameter_history_generation = getattr(self.canvas, '_history_generation', 0)
         binding.black_value = float(black)
         binding.white_value = float(white)
         modifier.validate()
@@ -978,7 +987,19 @@ class ModifierControls(QWidget):
 
     def begin_reorder(self, _modifier_id: str) -> None:
         if self._reorder_before is None and self.canvas.chapter is not None:
-            self._reorder_before = self.canvas.chapter.to_dict()
+            targets = self.targets()
+            self._reorder_before = RecordSnapshot.capture(self.canvas.chapter,
+                layers=[identifier for kind, identifier in targets if kind == 'layer'],
+                objects=[identifier for kind, identifier in targets if kind == 'object'],
+                attributes={'layers': ('modifier_ids',), 'objects': ('modifier_ids',)})
+
+    def _graph_snapshot(self, targets, *, modifiers):
+        targets = tuple(targets)
+        return RecordSnapshot.capture(self.canvas.chapter, modifiers=modifiers,
+            layers=[identifier for kind, identifier in targets if kind == 'layer'],
+            objects=[identifier for kind, identifier in targets if kind == 'object'],
+            attributes={'layers': ('modifier_ids',), 'objects': ('modifier_ids',)},
+            scalars=('modifier_preset_ids',))
 
     def move_reorder(self, modifier_id: str, global_y: int) -> None:
         ids = self.common_ids()
@@ -1057,7 +1078,7 @@ class ModifierControls(QWidget):
         chapter = self.canvas.chapter
         if not self.link_modifier_id or chapter is None:
             return
-        before = chapter.to_dict()
+        before = self._graph_snapshot(self.link_original | self.link_working, modifiers=[self.link_modifier_id])
         modifier = chapter.modifiers[self.link_modifier_id]
         incompatible = chapter.incompatible_modifier_targets(modifier, self.link_working)
         if incompatible:
@@ -1083,6 +1104,8 @@ class ModifierControls(QWidget):
         return True
 
     def _chapter_replaced(self, *_):
+        self._parameter_before = self._reorder_before = None
+        self._mesh_warp_parameter_chapter = self._smudge_parameter_chapter = None
         self.cancel_target_layer_pick()
         self.refresh()
 

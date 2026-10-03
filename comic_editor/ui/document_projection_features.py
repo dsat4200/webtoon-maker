@@ -1,4 +1,5 @@
 """Bridge the editor's faithful document renderer to retained presentation."""
+import math
 import time
 
 from PySide6.QtCore import QRect, QRectF, QSize, Qt, QTimer
@@ -10,6 +11,7 @@ from comic_editor.ui.document_presentation import (
 from comic_editor.render.service import (
     RenderDocument, RenderRequest, RenderResult, RenderQuality, RenderStatus, TileBatchPolicy,
 )
+from comic_editor.core.models import RasterObject
 
 
 class DocumentProjectionFeatures:
@@ -182,9 +184,8 @@ class DocumentProjectionFeatures:
             progress = self._projection_progress_view = None
         deferred = getattr(self, "_projection_defer_effects", False)
         jobs = self._effect_jobs
-        running = jobs.running
         waiting = (deferred and getattr(self, "_projection_work_waiting", False)
-                   and ((running is not None and not running[2].is_set()) or bool(jobs.pending)))
+                   and (jobs.has_running() or bool(jobs.pending)))
         failed = (deferred and getattr(self, "_projection_render_error", None)
                   and getattr(self, "_projection_error_revision", None) == revision)
         batch, complete = [], not (waiting or failed)
@@ -245,14 +246,22 @@ class DocumentProjectionFeatures:
         # Detached captures and exports stay synchronous. Only interactive
         # widget presentation may defer exact effect work to the job queue.
         owner = self if painter.device() is self else None
+        stroke = getattr(self, '_projection_stroke_preview', None)
+        if owner is not None and (self._drawing or stroke is not None):
+            refresh = self._drawing or stroke[3] != self._document_projection.revision
+            if refresh and self._capture_stroke_projection_preview():
+                stroke = self._projection_stroke_preview
+            if self._drawing and stroke is not None:
+                self._paint_projection_frame(painter, owner, live_ink=live_ink, stroke_only=True)
+                return
         previous = (getattr(self, "_projection_defer_effects", False),
                     getattr(self, "_projection_render_deadline", None))
         deferred = bool(owner is not None and self._projection_can_defer_effects())
         if owner is not None and not deferred:
             jobs = self._effect_jobs
-            if jobs.running is not None and jobs.running[3].done():
+            if jobs.has_finished:
                 jobs.poll()
-            if ((jobs.running is not None and jobs.running[5])
+            if (any(job[5] for job in jobs.running_jobs)
                     or any(job[5] for job in jobs.pending.values())):
                 # Drawing takes priority over queued background work. Retain
                 # finished checkpoints and never wait for a canceled worker.
@@ -280,22 +289,130 @@ class DocumentProjectionFeatures:
         radial = self._radial_preview_current()
         radial_drag = bool(self._modifier_handle_drag and "radial" in self._modifier_handle_drag)
         radial_mask = radial and self._radial_mask_gradient_active()
+        stroke = getattr(self, '_projection_stroke_preview', None)
+        late_stroke = (stroke is not None and stroke[0] == self._projection_configuration()
+                       and stroke[3] == self._document_projection.revision)
         compatible = (previous is None or
                       previous[0] == self._projection_configuration()
-                      and (previous[2] == self._document_projection.revision or radial)
+                      and (previous[2] == self._document_projection.revision or radial or late_stroke)
                       and any(tiles for _, tiles in previous[1]))
         return bool(self._projection_async_enabled and compatible
                     and not self._drawing
                     and (not getattr(self, "_pen_contact_active", False) or radial_drag or radial_mask)
                     and not self._projection_has_live_preview())
 
-    def _paint_projection_frame(self, painter, owner, *, live_ink):
+    def _capture_stroke_projection_preview(self):
+        """Composite fresh ink in scene order while expensive filters finish.
+
+        The existing bounded effect previews handle masks and nested modifiers.
+        This viewport image lives outside exact document/graph tile caches; it
+        is replaced only by a complete exact projection after contact ends.
+        """
+        if (not self._projection_async_enabled or self.active_tone_mask_id
+                or self.preview_tone_mask_id or self._projection_has_live_preview()
+                or self.selected_kind != 'object'
+                or not isinstance(self.chapter.objects.get(self.selected_id), RasterObject)):
+            self._projection_stroke_preview = None
+            return False
+        visible = self.visible_document_rect()
+        density = self.scale * max(1., self.devicePixelRatioF())
+        size = (max(1, round(visible.width()*density)), max(1, round(visible.height()*density)))
+        if size[0]*size[1]*4 > self._document_projection.budget:
+            self._projection_stroke_preview = None
+            return False
+        jobs = self._effect_jobs
+        if jobs.has_finished:
+            jobs.poll()
+        if any(job[5] for job in jobs.running_jobs) or any(job[5] for job in jobs.pending.values()):
+            jobs.cancel(clear_retained=False)
+        self._projection_work_waiting = False
+        document = self._render_document_state()
+        previous = getattr(self, '_projection_stroke_preview', None)
+        completed = getattr(self, '_projection_completed_view', None)
+        same_view = (previous is not None and previous[0] == document.configuration
+                     and previous[2] == visible and previous[1].image.size() == QSize(*size))
+        dirty = QRectF(getattr(self, '_stroke_dirty_world', QRectF()))
+        if same_view and len(previous) > 4:
+            dirty = dirty.united(previous[4])
+        coverage_needed = visible if document.overflow > 0. else visible.intersected(document.bounds)
+        completed_covers = (completed is not None and completed[0] == document.configuration
+                            and self._completed_projection_covers(completed, coverage_needed))
+        seed = same_view or completed_covers
+        area, offset, capture_size = visible, (0, 0), size
+        if seed and not dirty.isEmpty():
+            # Replace the affected composite, including erased pixels and all
+            # covering layers. Repainting unrelated artwork causes a large
+            # first-contact stall even when the active effect has a cheap draft.
+            patch = QRect(math.floor((dirty.left()-visible.left())*density)-2,
+                          math.floor((dirty.top()-visible.top())*density)-2,
+                          math.ceil(dirty.width()*density)+5,
+                          math.ceil(dirty.height()*density)+5).intersected(QRect(0, 0, *size))
+            if patch.isEmpty():
+                return False
+            offset, capture_size = (patch.x(), patch.y()), (patch.width(), patch.height())
+            area = QRectF(visible.x()+patch.x()/density, visible.y()+patch.y()/density,
+                          patch.width()/density, patch.height()/density)
+        request = RenderRequest(tuple(area.getRect()), density, capture_size, ('stroke-preview',),
+                                document.revision, quality=RenderQuality.INTERACTIVE)
+        result = self._render_service.render_region(document, request)
+        if result.image.isNull():
+            self._projection_stroke_preview = None
+            return False
+        image = result.image
+        if capture_size != size or offset != (0, 0):
+            image = QImage(previous[1].image) if same_view else QImage(*size, QImage.Format_ARGB32_Premultiplied)
+            if not same_view:
+                image.fill(Qt.transparent)
+            painter = QPainter(image)
+            try:
+                if not same_view:
+                    camera = QTransform.fromTranslate(-visible.x(), -visible.y()) * QTransform.fromScale(density, density)
+                    for _, tiles in completed[1]:
+                        draw_document_tiles(painter, tiles, camera, QSize(*size), owner=None, smooth=True)
+                painter.setCompositionMode(QPainter.CompositionMode_Source)
+                painter.drawImage(*offset, result.image)
+            finally:
+                painter.end()
+        tile = PresentedTile(('stroke-preview', document.identity, document.revision), image,
+                             visible, QRectF(0, 0, *size))
+        self._projection_stroke_preview = document.configuration, tile, visible, document.revision, dirty
+        return True
+
+    @staticmethod
+    def _completed_projection_covers(completed, visible):
+        """Every retained pass must cover the camera before a dirty-only patch."""
+        if not completed[1]:
+            return False
+        needed = QPainterPath()
+        needed.addRect(visible)
+        for _, tiles in completed[1]:
+            coverage = QPainterPath()
+            coverage.setFillRule(Qt.WindingFill)
+            for tile in tiles:
+                coverage.addRect(tile.world_rect)
+            if not needed.subtracted(coverage).isEmpty():
+                return False
+        return True
+
+    def _paint_projection_frame(self, painter, owner, *, live_ink, stroke_only=False):
         stats = []
         with self._show_on_top_scene() as phases:
             if (not live_ink or self._is_show_on_top(self.selected_kind, self.selected_id)
                     or any(obj.blend_mode != "normal" for obj in self.chapter.objects.values())):
                 phases = (None,)
-            batch = self._projection_phase_batch(phases)
+            if stroke_only:
+                self._projection_frame_pending = True
+                batch = []
+            else:
+                batch = self._projection_phase_batch(phases)
+            stroke = getattr(self, '_projection_stroke_preview', None)
+            if (self._projection_frame_pending and stroke is not None
+                    and stroke[0] == self._projection_configuration()
+                    and stroke[3] == self._document_projection.revision
+                    and stroke[2].contains(self.visible_document_rect())):
+                batch = [(None, [stroke[1]])]
+            elif not self._projection_frame_pending:
+                self._projection_stroke_preview = None
             # A retained combined view cannot place ordinary prediction below
             # promoted artwork. Wait for the matching finished phase set.
             draw_live = live_ink and tuple(phase for phase, _ in batch) == tuple(phases)
@@ -322,7 +439,7 @@ class DocumentProjectionFeatures:
         self._paint_projection_grid(painter, owner)
         draw_document_border(painter, QRectF(0, 0, self.chapter.width, self.chapter.height),
                              self.camera_transform(), self.size(), owner=owner)
-        if owner is not None and self._projection_frame_pending:
+        if owner is not None and self._projection_frame_pending and not stroke_only:
             painter.save()
             painter.resetTransform()
             label = ("Artwork rendering failed" if getattr(self, "_projection_render_error", None)

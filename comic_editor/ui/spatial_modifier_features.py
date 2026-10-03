@@ -105,8 +105,9 @@ class SpatialModifierFeatures:
         painter.restore()
 
     def _init_spatial_features(self):
+        import os
         from comic_editor.ui.effect_jobs import EffectJobs
-        self._effect_jobs = EffectJobs(self)
+        self._effect_jobs = EffectJobs(self, workers=min(4, max(1, (os.cpu_count() or 2) - 1)))
         self._radial_handle_pending = None
         self._radial_effect_revision = None
         self._radial_handle_timer = QTimer(self)

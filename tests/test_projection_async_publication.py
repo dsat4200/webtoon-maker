@@ -3,7 +3,7 @@ import time
 from threading import Event
 import pytest
 
-from PySide6.QtCore import QRectF
+from PySide6.QtCore import QPointF, QRectF
 from PySide6.QtGui import QColor, QImage, QPainter
 
 from comic_editor.ui.async_projection import ProjectionPending, ProjectionFailed
@@ -22,6 +22,40 @@ def frame(canvas):
     finally:
         painter.end()
     return image
+
+
+def test_dirty_stroke_seed_requires_complete_camera_coverage_in_every_pass():
+    from comic_editor.ui.document_projection_features import DocumentProjectionFeatures
+    covers = DocumentProjectionFeatures._completed_projection_covers
+    image = QImage(1, 1, QImage.Format_ARGB32_Premultiplied)
+    def tile(x, width):
+        return PresentedTile(x, image, QRectF(x, 0, width, 20))
+    complete = ('config', [(None, [tile(0, 10), tile(10, 10)])], 7)
+    assert covers(complete, QRectF(0, 0, 20, 20))
+    assert covers(complete, QRectF(3, 2, 15, 10))
+    assert not covers(complete, QRectF(5, 0, 20, 20))
+    gap = ('config', [(None, [tile(0, 9), tile(10, 10)])], 7)
+    assert not covers(gap, QRectF(0, 0, 20, 20))
+    passes = ('config', [('base', complete[1][0][1]), ('top', [tile(0, 10)])], 7)
+    assert not covers(passes, QRectF(0, 0, 20, 20))
+
+
+def test_first_stroke_after_camera_pan_captures_new_view_instead_of_blank_seed(scene, monkeypatch):
+    canvas, obj, _ = scene
+    frame(canvas)
+    completed = canvas._projection_completed_view
+    canvas.set_selection('object', obj.object_id)
+    canvas.center_x += 300
+    canvas._stroke_dirty_world = QRectF(obj.x, obj.y, 5, 5)
+    seen = []
+    original = canvas._render_service.render_region
+    def capture(document, request):
+        seen.append(request.region)
+        return original(document, request)
+    monkeypatch.setattr(canvas._render_service, 'render_region', capture)
+    assert canvas._capture_stroke_projection_preview()
+    assert seen == [canvas.visible_document_rect().getRect()]
+    assert canvas._projection_completed_view is completed
 
 
 def test_cross_block_edit_publishes_only_when_all_regions_finish(scene, monkeypatch):
@@ -175,6 +209,58 @@ def test_document_reset_drops_previous_presentation_and_errors(scene):
     assert canvas._projection_completed_view is None
     assert canvas._projection_render_error is None
     assert not canvas._projection_frame_pending
+    assert canvas._projection_stroke_preview is None
+
+
+def test_stroke_preview_shows_fresh_ink_without_waiting_or_publishing_draft(scene, qapp, monkeypatch):
+    from threading import get_ident
+    from comic_editor.core.models import OutlineModifier
+    from comic_editor.ui import interactive_effects
+    canvas, obj, _ = scene
+    effect = OutlineModifier(thickness=3, blur_radius=4, blur_strength=50)
+    canvas.chapter.add_modifier(effect, [('object', obj.object_id)])
+    before = frame(canvas)
+    completed = canvas._projection_completed_view
+    gui, started, release = get_ident(), Event(), Event()
+    original = interactive_effects.apply_modifier_stack
+    def gated(*args, **kwargs):
+        if get_ident() != gui:
+            started.set()
+            assert release.wait(5)
+        return original(*args, **kwargs)
+    monkeypatch.setattr(interactive_effects, 'apply_modifier_stack', gated)
+    try:
+        canvas._begin_stroke(QPointF(900, 220), 1.)
+        assert canvas._capture_stroke_projection_preview()
+        assert started.wait(2)
+        assert canvas._projection_completed_view is completed
+        assert canvas._projection_presented_revision != canvas._document_projection.revision
+        preview = canvas._projection_stroke_preview
+        canvas._projection_frame_pending = True
+        image = QImage(canvas.size(), QImage.Format_ARGB32_Premultiplied)
+        image.fill(QColor('#242428'))
+        painter = QPainter(image)
+        try:
+            canvas._paint_projection_frame(painter, None, live_ink=False, stroke_only=True)
+        finally:
+            painter.end()
+        assert image != before
+        assert canvas._projection_stroke_preview is preview
+        # Export/synchronous requests retain the full-quality reference.
+        exact = frame(canvas)
+        assert not canvas._projection_frame_pending
+        assert canvas._projection_stroke_preview is None
+        assert exact != before
+    finally:
+        release.set()
+        canvas._end_stroke()
+    # The final tail dab needs a fresh preview, then may finish asynchronously.
+    assert canvas._capture_stroke_projection_preview()
+    assert canvas._projection_can_defer_effects()
+    canvas._projection_defer_effects = False
+    final = frame(canvas)
+    canvas._document_projection.clear()
+    assert frame(canvas) == final
 
 
 def test_canceled_running_job_does_not_block_current_capture(scene, monkeypatch):
@@ -187,7 +273,7 @@ def test_canceled_running_job_does_not_block_current_capture(scene, monkeypatch)
     token = Event()
     token.set()
     with monkeypatch.context() as patch:
-        patch.setattr(canvas._effect_jobs, "running", ("old", "old", token, None, 0, True))
+        patch.setattr(canvas._effect_jobs, "_running", {0: ("old", "old", token, None, 0, True)})
         assert frame(canvas) != before
         assert not canvas._projection_frame_pending
 

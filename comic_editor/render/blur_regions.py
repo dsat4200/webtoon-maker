@@ -169,7 +169,9 @@ class RegionalBlur:
         return result
 
     def apply(self, region, strength):
-        radii = np.clip(np.broadcast_to(np.asarray(strength, np.float32), (region[3], region[2])), 0., 100.)
+        scalar = np.ndim(strength) == 0
+        values = np.asarray(strength, np.float32)
+        radii = np.clip(values if scalar else np.broadcast_to(values, (region[3], region[2])), 0., 100.)
         if float(np.max(radii)) <= 1e-6:
             return self.fetch(region).astype(np.float32) / 255.
         lower = np.clip(np.searchsorted(RADII, radii, side="right") - 1, 0, len(RADII) - 2)
@@ -177,9 +179,9 @@ class RegionalBlur:
         def upscaled(index):
             data = resize_region(lambda r: self.level(index, r), self.sizes[index], self.sizes[0], region, self.algorithm)
             return Image.fromarray(data, mode)
-        if np.ndim(strength) == 0:
-            index = int(lower.flat[0])
-            blend = (float(radii.flat[0]) - float(RADII[index])) / float(RADII[index+1] - RADII[index])
+        if scalar:
+            index = int(lower)
+            blend = (float(radii) - float(RADII[index])) / float(RADII[index+1] - RADII[index])
             low = upscaled(index)
             mixed = low if blend <= 1e-6 else Image.blend(low, upscaled(index + 1), blend)
             return np.asarray(mixed, np.float32) / 255.

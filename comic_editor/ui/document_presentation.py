@@ -56,6 +56,7 @@ class PresentationStats:
 class _TextureEntry:
     texture: QOpenGLTexture
     byte_count: int
+    sampling: object = None
 
 
 VERTEX = """#version 330 core
@@ -127,7 +128,43 @@ class GpuTilePresenter:
         self._ready = False
         self.context = self.functions = self.program = self.buffer = self.vao = None
         self._textures: OrderedDict[tuple, _TextureEntry] = OrderedDict()
+        self._geometry = OrderedDict()
+        self._geometry_configuration = None
+        self.geometry_limit = 4096
+        self.geometry_builds = self.geometry_hits = 0
+        self.geometry_uploads = 0
+        self._uploaded_geometry = ()
+        self._max_texture_size = None
         self._owner = weakref.ref(owner) if owner is not None else None
+
+    def _prepare_geometry(self, tiles, camera, viewport, clip_world):
+        # Ink changes pixel revisions frequently while these screen positions
+        # remain fixed. Keep geometry independent of texture content/revisions.
+        configuration = (tuple(getattr(camera, f'm{row}{column}')()
+            for row in range(1, 4) for column in range(1, 4)),
+            viewport.width(), viewport.height(),
+            None if clip_world is None else tuple(clip_world.getRect()))
+        if configuration != self._geometry_configuration:
+            self._geometry.clear()
+            self._geometry_configuration = configuration
+        prepared = []
+        for tile in tiles:
+            key = (tuple(tile.world_rect.getRect()),
+                   None if tile.source_rect is None else tuple(tile.source_rect.getRect()),
+                   tile.image.width(), tile.image.height())
+            vertices = self._geometry.pop(key, None)
+            if vertices is None:
+                vertices = tile_vertices(tile, camera, viewport, clip_world)
+                vertices.setflags(write=False)
+                self.geometry_builds += 1
+            else:
+                self.geometry_hits += 1
+            self._geometry[key] = vertices
+            while len(self._geometry) > self.geometry_limit:
+                self._geometry.popitem(last=False)
+            if len(vertices):
+                prepared.append((tile, vertices))
+        return prepared
 
     def _initialize(self):
         context = QOpenGLContext.currentContext()
@@ -141,6 +178,7 @@ class GpuTilePresenter:
         self.functions = QOpenGLFunctions_3_3_Core()
         if not self.functions.initializeOpenGLFunctions():
             raise RuntimeError("OpenGL 3.3 unavailable")
+        self._max_texture_size = int(self.functions.glGetIntegerv(0x0D33))
         self.program = QOpenGLShaderProgram()
         if (not self.program.addShaderFromSourceCode(QOpenGLShader.Vertex, VERTEX)
                 or not self.program.addShaderFromSourceCode(QOpenGLShader.Fragment, FRAGMENT)
@@ -235,8 +273,7 @@ class GpuTilePresenter:
         """
         if viewport.width() <= 0 or viewport.height() <= 0:
             return True
-        prepared = [(tile, tile_vertices(tile, camera, viewport, clip_world)) for tile in tiles]
-        prepared = [(tile, vertices) for tile, vertices in prepared if len(vertices)]
+        prepared = self._prepare_geometry(tiles, camera, viewport, clip_world)
         if not prepared:
             return True
         needed = {self._key(tile): tile for tile, _ in prepared}
@@ -248,8 +285,7 @@ class GpuTilePresenter:
         try:
             self._initialize()
             state = self._save_state()
-            max_texture_size = self.functions.glGetIntegerv(0x0D33)
-            if any(max(tile.image.width(), tile.image.height()) > max_texture_size
+            if any(max(tile.image.width(), tile.image.height()) > self._max_texture_size
                    for tile in needed.values()):
                 self.reason = "A document tile exceeds the driver's texture limit"
                 return False
@@ -271,8 +307,13 @@ class GpuTilePresenter:
             gl = self.functions
             self.vao.bind()
             self.buffer.bind()
-            vertices = np.concatenate([vertices for _, vertices in prepared]).tobytes()
-            self.buffer.allocate(vertices, len(vertices))
+            geometry = tuple(vertices for _, vertices in prepared)
+            if (len(geometry) != len(self._uploaded_geometry)
+                    or any(current is not previous for current, previous in zip(geometry, self._uploaded_geometry))):
+                vertices = np.concatenate(geometry).tobytes()
+                self.buffer.allocate(vertices, len(vertices))
+                self._uploaded_geometry = geometry
+                self.geometry_uploads += 1
             if not self.program.bind():
                 raise RuntimeError("Could not bind tile presentation program")
             self.program.enableAttributeArray(0)
@@ -293,8 +334,11 @@ class GpuTilePresenter:
             gl.glUniform1f(self.program.uniformLocation("opacity"), float(opacity))
             sampling = QOpenGLTexture.Linear if smooth else QOpenGLTexture.Nearest
             for index, (tile, _) in enumerate(prepared):
-                texture = self._textures[self._key(tile)].texture
-                texture.setMinMagFilters(sampling, sampling)
+                entry = self._textures[self._key(tile)]
+                texture = entry.texture
+                if entry.sampling != sampling:
+                    texture.setMinMagFilters(sampling, sampling)
+                    entry.sampling = sampling
                 texture.bind(0)
                 gl.glDrawArrays(0x0004, index * 6, 6)  # GL_TRIANGLES
             self.draws += 1
@@ -358,6 +402,8 @@ class GpuTilePresenter:
             self.program = self.buffer = self.vao = self.functions = None
             self.context = None
             self._ready = False
+            self._uploaded_geometry = ()
+            self._max_texture_size = None
             if switched and activated and isValid(context):
                 context.doneCurrent()
                 if (previous is not None and isValid(previous)

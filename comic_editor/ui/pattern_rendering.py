@@ -9,7 +9,9 @@ from functools import lru_cache
 import math
 
 import numpy as np
-from PySide6.QtCore import QRect
+from comic_editor.core.pixel_arrays import normalized_bytes
+from comic_editor.render.pixels import current_contract, premultiplied_pixels, working_image
+from PySide6.QtCore import QRect, Qt
 from PySide6.QtGui import QColor, QImage, QPainter
 from scipy.ndimage import gaussian_filter, map_coordinates
 from scipy.spatial import Delaunay, QhullError
@@ -24,13 +26,17 @@ def _check_cancelled(cancelled):
 
 
 def _rgba(image: QImage) -> np.ndarray:
+    if current_contract().floating:
+        return premultiplied_pixels(image)
     image = image.convertToFormat(QImage.Format.Format_RGBA8888_Premultiplied)
     data = np.frombuffer(image.constBits(), dtype=np.uint8,
                          count=image.sizeInBytes()).reshape(image.height(), image.bytesPerLine())
-    return data[:, :image.width() * 4].reshape(image.height(), image.width(), 4).astype(np.float32) / 255.
+    return normalized_bytes(data[:, :image.width() * 4].reshape(image.height(), image.width(), 4))
 
 
 def _image(array: np.ndarray) -> QImage:
+    if current_contract().floating:
+        return working_image(array)
     data = np.ascontiguousarray(np.rint(np.clip(array, 0., 1.) * 255.).astype(np.uint8))
     height, width = data.shape[:2]
     return QImage(data.data, width, height, width * 4,
@@ -655,10 +661,10 @@ def _halftone_strips(image, modifier, color_source, cancelled, *,
     if padding >= 1024 or (height <= strip_height + 2 * padding
                            and width <= tile_width + 2 * padding):
         return None
-    result = QImage(width, height, QImage.Format_ARGB32_Premultiplied)
+    result = QImage(width, height, current_contract().image_format)
     if result.isNull():
         raise MemoryError("Could not allocate halftone result")
-    result.fill(0)
+    result.fill(Qt.transparent)
     painter = QPainter(result)
     try:
         for top in range(0, height, strip_height):
@@ -707,10 +713,10 @@ def halftone_region(image: QImage, modifier: HalftoneModifier, region: QRect,
     half_span = 2 if modifier.size > 1.5 else 1
     padding = math.ceil((half_span + 4) * spacing * math.sqrt(2)
                         + 3 * modifier.blur * unit + 8)
-    result = QImage(requested.size(), QImage.Format_ARGB32_Premultiplied)
+    result = QImage(requested.size(), current_contract().image_format)
     if result.isNull():
         raise MemoryError("Could not allocate regional halftone result")
-    result.fill(0)
+    result.fill(Qt.transparent)
     painter = QPainter(result)
     try:
         for top in range(requested.top(), requested.bottom() + 1, tile_size):

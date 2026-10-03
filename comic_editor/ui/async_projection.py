@@ -47,8 +47,7 @@ def projection_result_or_pending(canvas, scope, key):
     result = jobs.result(scope, key)
     if result is not None:
         return result
-    running = jobs.running
-    if running is not None and running[:2] == (scope, key) and not running[2].is_set():
+    if jobs.has_running(scope, key):
         raise ProjectionPending(scope, key)
     pending = jobs.pending.get(scope)
     if pending is not None and pending[1] == key:

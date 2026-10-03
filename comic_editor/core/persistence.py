@@ -6,6 +6,9 @@ import os
 import shutil
 import time
 import uuid
+from contextlib import contextmanager
+from threading import RLock
+from weakref import WeakValueDictionary
 from pathlib import Path
 from typing import Callable
 
@@ -21,6 +24,35 @@ SERIES_FILE = "series.json"
 CHAPTER_FILE = "chapter.json"
 PENDING_FILE = ".save_pending"
 LAST_GOOD_DIR = "last_good"
+_revision_locks = WeakValueDictionary()
+_revision_locks_guard = RLock()
+
+
+@contextmanager
+def resource_revision(root: Path):
+    """Serialize readers/publication for one chapter or asset, not the project."""
+    from .tile_backing import finish_revision_readers
+    address = os.path.normcase(str(root.resolve()))
+    with _revision_locks_guard:
+        lock = _revision_locks.get(address)
+        if lock is None:
+            lock = _revision_locks[address] = RLock()
+    with lock:
+        finish_revision_readers(Path(address))
+        yield
+
+
+def link_or_copy(source: str, destination: str) -> str:
+    """Snapshot immutable resource files cheaply on the same filesystem.
+
+    Resource publishers replace files atomically; they never modify a linked
+    inode. Filesystems without hard links retain the portable copy fallback.
+    """
+    try:
+        os.link(source, destination)
+    except OSError:
+        shutil.copy2(source, destination)
+    return destination
 
 
 def atomic_json(path: Path, payload: dict) -> None:
@@ -86,20 +118,57 @@ def prepare_revision_save(
         allow_first_save_retry=True,
     )
     backup = root / LAST_GOOD_DIR
-    if backup.exists():
-        shutil.rmtree(backup)
     manifest = root / manifest_name
     if manifest.is_file():
-        backup.mkdir()
+        backup.mkdir(exist_ok=True)
         for name in ("raster", "masks", "images"):
             if (root / name).is_dir():
-                shutil.copytree(root / name, backup / name)
+                sync_immutable_tree(root / name, backup / name)
+            elif (backup / name).exists():
+                shutil.rmtree(backup / name)
         for name in extra_files:
             if (root / name).is_file():
                 shutil.copy2(root / name, backup / name)
+            else:
+                (backup / name).unlink(missing_ok=True)
         # The backup manifest is published last so it denotes a complete copy.
         shutil.copy2(manifest, backup / manifest_name)
+    elif backup.exists():
+        shutil.rmtree(backup)
     atomic_json(root / PENDING_FILE, {"started_at": time.time()})
+
+
+def sync_immutable_tree(source: Path, destination: Path) -> None:
+    """Reuse already-linked backup resources; mirror changed/deleted files.
+
+    This runs before the pending marker and any live resource writes. A failed
+    backup preparation therefore leaves the current published revision intact.
+    The backup manifest is published only after the entire mirror succeeds.
+    """
+    destination.mkdir(parents=True, exist_ok=True)
+    names = set()
+    for entry in os.scandir(source):
+        names.add(entry.name)
+        target = destination / entry.name
+        if entry.is_dir():
+            sync_immutable_tree(Path(entry.path), target)
+        else:
+            try:
+                if os.path.samefile(entry.path, target):
+                    continue
+            except OSError:
+                pass
+            temporary = target.with_name(f'.{target.name}.backup.tmp')
+            temporary.unlink(missing_ok=True)
+            link_or_copy(entry.path, str(temporary))
+            temporary.replace(target)
+    for entry in os.scandir(destination):
+        if entry.name not in names:
+            target = Path(entry.path)
+            if entry.is_dir():
+                shutil.rmtree(target)
+            else:
+                target.unlink()
 
 
 class SeriesRepository:
@@ -240,8 +309,16 @@ class SeriesRepository:
         self, chapter: ChapterDocument, tiles: TileStore,
         images: ImageStore | None = None, autosave: bool = False,
     ) -> None:
+        root = self.chapter_root(chapter.chapter_id)
+        # Manual saves also prune recovery files, so both destinations share
+        # their document lock. Different chapters still proceed independently.
+        with resource_revision(root):
+            self._save_chapter(chapter, tiles, images, autosave)
+
+    def _save_chapter(self, chapter, tiles, images, autosave):
         images = images or ImageStore()
         chapter.validate()
+        tiles.finish_snapshot_prefetch()
         raster_object_ids = {
             object_id for object_id, obj in chapter.objects.items()
             if isinstance(obj, RasterObject)
@@ -268,11 +345,14 @@ class SeriesRepository:
             # to be restored on the next open.
             tiles.save_directory(tile_root, raster_object_ids, complete=True)
             tiles.save_directory(mask_root, mask_ids, complete=True)
-            images.save_directory(image_root, image_object_ids, complete=True)
+            images.save_directory(image_root, image_object_ids, complete=True, incremental=True, transactional=True)
             if autosave:
                 atomic_json(destination / "recovery.json", {"saved_at": time.time()})
             atomic_json(manifest, chapter.to_dict())
             pending.unlink(missing_ok=True)
+            tiles.commit_directory(tile_root)
+            tiles.commit_directory(mask_root)
+            images.commit_directory(image_root)
         except Exception:
             # Leave the pending marker and last-good data intact for recovery.
             images.dirty.update(image_dirty)
@@ -284,6 +364,7 @@ class SeriesRepository:
         images.dirty.clear()
         autosave_root = destination / "autosave"
         if autosave_root.exists():
+            tiles.preserve_backing(autosave_root)
             shutil.rmtree(autosave_root)
 
     def load_chapter(
@@ -292,6 +373,10 @@ class SeriesRepository:
     ) -> tuple[ChapterDocument, TileStore] | tuple[
         ChapterDocument, TileStore, ImageStore
     ]:
+        with resource_revision(self.chapter_root(chapter_id)):
+            return self._load_chapter(chapter_id, recover, include_images=include_images)
+
+    def _load_chapter(self, chapter_id, recover, *, include_images):
         root = self.chapter_root(chapter_id)
         source = root / "autosave" if recover else root
         self._recover_interrupted_save(source)
@@ -314,6 +399,7 @@ class SeriesRepository:
             for object_id, obj in chapter.objects.items()
             if isinstance(obj, ImageObject)
         })
+        tiles.prefetch_snapshot_backing()
         return (chapter, tiles, images) if include_images else (chapter, tiles)
 
     def has_recovery(self, chapter_id: str) -> bool:

@@ -135,6 +135,7 @@ class PerformanceMonitorController(QObject):
                       "vector_index_entries": len(canvas._vector_spatial_indexes),
                       "compound_entries": len(canvas._compound_path_cache)},
             "effect_jobs": {"pending": len(jobs.pending), "running": jobs.running is not None,
+                            "running_count": len(jobs.running_jobs), "worker_limit": jobs.worker_limit,
                             "bytes_in_flight": jobs.bytes_in_flight,
                             "retained_bytes": jobs.retained_bytes, "budget_bytes": jobs.budget,
                             "retained_budget_bytes": jobs.retained_budget,

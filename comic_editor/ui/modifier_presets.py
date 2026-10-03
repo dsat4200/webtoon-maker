@@ -136,7 +136,8 @@ class ModifierPresetController(QObject):
                 preset.preset_id = loaded.preset_id
             presets = [item for item in series.modifier_presets if item.preset_id != preset.preset_id]
             presets.append(preset)
-            before = chapter.to_dict()
+            from comic_editor.core.document_patch import RecordSnapshot
+            before = RecordSnapshot.capture(chapter, modifiers=[modifier_id], scalars=('modifier_preset_ids',))
         except ValueError as error:
             QMessageBox.warning(self.owner, "Modifier presets", str(error))
             return False
@@ -166,7 +167,8 @@ class ModifierPresetController(QObject):
             incompatible = chapter.incompatible_modifier_targets(replacement, targets)
             if incompatible:
                 raise ValueError(chapter.modifier_compatibility_message(replacement, incompatible))
-            before = chapter.to_dict()
+            from comic_editor.core.document_patch import RecordSnapshot
+            before = RecordSnapshot.capture(chapter, modifiers=[modifier_id], scalars=('modifier_preset_ids',))
         except ValueError as error:
             QMessageBox.warning(self.owner, "Load modifier preset", str(error))
             return False

@@ -229,7 +229,7 @@ def test_overflow_keeps_page_opacity_nested_effects_masks_and_compound_shapes(qa
         canvas.deleteLater()
 
 
-def test_undo_model_replacement_closes_export_editor_safely(qapp):
+def test_undo_model_patch_cancels_export_editor_safely(qapp):
     canvas, chapter, _obj = scene(qapp)
     try:
         before = chapter.to_dict()
@@ -237,10 +237,13 @@ def test_undo_model_replacement_closes_export_editor_safely(qapp):
         canvas.push_model_change(before, chapter.to_dict(), "Add raster")
         canvas.set_export_rect_editing(True)
         canvas.command_stack.undo()
+        assert canvas.chapter is chapter
         assert not canvas.export_rect_editing
         assert canvas.chapter.export_rect is None
         canvas._export_rect_pointer_move(QPointF(50, 50))
         assert canvas._export_rect_handles() == {}
+        canvas.command_stack.redo()
+        assert canvas.chapter is chapter and canvas.chapter.export_rect is None
     finally:
         canvas.deleteLater()
 

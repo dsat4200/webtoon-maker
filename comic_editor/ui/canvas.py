@@ -45,6 +45,7 @@ from PySide6.QtWidgets import (
 from comic_editor.core.commands import (
     CallbackCommand, CommandStack, ObjectPatchCommand, TilePatchCommand,
 )
+from comic_editor.core.document_patch import DocumentPatch, RecordSnapshot
 from comic_editor.core.assets import (
     AssetManifest, AssetRepository, entity_visual_bounds, instantiate_asset,
 )
@@ -1574,6 +1575,7 @@ class _CanvasLogic(LassoBrushFeatures, BrushFeatures, DocumentProjectionFeatures
         self._cancel_paint_brush()
         self._projection_completed_view = None
         self._projection_progress_view = None
+        self._projection_stroke_preview = None
         self._mesh_warp_parameter_drag_id = None
         self._smudge_parameter_drag_id = None
         self.smudge_selected_stroke_id = ""
@@ -1662,6 +1664,8 @@ class _CanvasLogic(LassoBrushFeatures, BrushFeatures, DocumentProjectionFeatures
         self, chapter: ChapterDocument, tiles: TileStore,
         images: ImageStore | None = None, reset_view: bool = True,
     ) -> None:
+        from comic_editor.ui.point_lut import prepare_point_worker
+        QTimer.singleShot(0, prepare_point_worker)
         self._solo_entities = set()
         self._cancel_mask_selection()
         self._mask_gradient_drag = None
@@ -1952,10 +1956,15 @@ class _CanvasLogic(LassoBrushFeatures, BrushFeatures, DocumentProjectionFeatures
     def replace_chapter(self, state: dict) -> None:
         self._restore_history_state(state)
 
-    def _restore_history_state(self, state: dict, *, objects_only: bool = False) -> None:
+    def _restore_history_state(self, state: dict, *, objects_only: bool = False, document_patch: bool = False) -> None:
         """Restore history, optionally retaining an unchanged document graph."""
+        self._history_generation = getattr(self, '_history_generation', 0) + 1
         self._cancel_lasso_brush()
         self._cancel_paint_brush()
+        if self.export_rect_editing and self.chapter is not None:
+            # Opening the editor can create a transient default rectangle.
+            # Cancel it before a focused patch keeps the chapter in place.
+            self.chapter.export_rect = self._export_rect_before
         self._reset_export_rect_editor()
         self._cancel_mask_selection()
         self._mask_gradient_drag = None
@@ -1970,6 +1979,8 @@ class _CanvasLogic(LassoBrushFeatures, BrushFeatures, DocumentProjectionFeatures
         self._radial_handle_pending = None
         self._radial_effect_revision = None
         self._modifier_handle_drag = None
+        self._mesh_warp_parameter_drag_id = None
+        self._smudge_parameter_drag_id = None
         self._cancel_text_features()
         self._outline_edit_timer.stop()
         self._outline_pending_point = None
@@ -1982,6 +1993,8 @@ class _CanvasLogic(LassoBrushFeatures, BrushFeatures, DocumentProjectionFeatures
         self.pageGapModeChanged.emit(False)
         if objects_only:
             self._restore_vector_payloads(state)
+        elif document_patch:
+            state.apply(self.chapter)
         else:
             self.chapter = ChapterDocument.from_dict(state)
         self.viewSettingsChanged.emit()
@@ -2035,10 +2048,10 @@ class _CanvasLogic(LassoBrushFeatures, BrushFeatures, DocumentProjectionFeatures
         # Most transforms and object-property edits leave the hierarchy and
         # every other chapter record unchanged. Retain only those object
         # records for history, avoiding whole-chapter parsing on every undo.
-        # Structural edits and vector hierarchy edits use the full fallback.
+        # Other metadata edits retain only changed graph records below.
         # Image source changes also retain the full restore notifications so
         # linked Blender views reconnect and reconcile their cached frame.
-        if (
+        if (not isinstance(before, RecordSnapshot) and
             before.keys() == after.keys()
             and all(before[key] == after[key] for key in before if key != "objects")
         ):
@@ -2071,6 +2084,17 @@ class _CanvasLogic(LassoBrushFeatures, BrushFeatures, DocumentProjectionFeatures
                     lambda: self._restore_history_state(old_records, objects_only=True),
                 ), already_done=True)
                 return
+        patches = DocumentPatch.pair(before, after)
+        if patches is not None:
+            old_patch, new_patch = patches
+            if new_patch.empty:
+                return
+            self.command_stack.push(CallbackCommand(
+                label,
+                lambda: self._restore_history_state(new_patch, document_patch=True),
+                lambda: self._restore_history_state(old_patch, document_patch=True),
+            ), already_done=True)
+            return
         self.command_stack.push(
             CallbackCommand(
                 label,
@@ -7876,12 +7900,7 @@ class _CanvasLogic(LassoBrushFeatures, BrushFeatures, DocumentProjectionFeatures
                 return kind, entity_id, "missing"
             pixels: tuple = ()
             if isinstance(entity, RasterObject):
-                pixels = tuple(sorted(
-                    (key, int(image.cacheKey()))
-                    for key, image in self.tiles.object_tiles(
-                        entity.object_id
-                    ).items()
-                ))
+                pixels = self.tiles.object_signature(entity.object_id)
                 preview = self._raster_selection_preview_state(entity)
                 if preview is not None:
                     before_tiles, moving_tiles, source_path, _transform, copying = preview
@@ -7899,7 +7918,7 @@ class _CanvasLogic(LassoBrushFeatures, BrushFeatures, DocumentProjectionFeatures
                                      for key, image in moving_tiles.items())),
                     ))
             elif isinstance(entity, ImageObject):
-                pixels = (int(self.images.image(entity.object_id).cacheKey()),)
+                pixels = self.images.pixel_signature(entity.object_id)
             if isinstance(entity, DocumentObject):
                 pixels = (pixels, self._modifier_object_preview_signature(entity))
             children: tuple = ()
@@ -7955,10 +7974,7 @@ class _CanvasLogic(LassoBrushFeatures, BrushFeatures, DocumentProjectionFeatures
             )
 
         paint = (
-            tuple(sorted(
-                (key, int(image.cacheKey()))
-                for key, image in self.tiles.object_tiles(mask_id).items()
-            ))
+            self.tiles.object_signature(mask_id)
             if include_paint else ()
         )
         return (
@@ -8324,8 +8340,7 @@ class _CanvasLogic(LassoBrushFeatures, BrushFeatures, DocumentProjectionFeatures
                 if self._vector_gesture_mode == "eraser" and self._vector_eraser_preview:
                     live = (*live, ("vector-eraser", self._vector_eraser_preview_revision))
                 if self._vector_gesture_mode == "pencil" and self._vector_samples:
-                    preview = tuple(sorted((key, int(image.cacheKey())) for key, image
-                        in self._vector_preview_tiles.object_tiles(self._vector_preview_id).items()))
+                    preview = self._vector_preview_tiles.object_signature(self._vector_preview_id)
                     if preview:
                         live = (*live, ("vector-pencil", preview))
             if self._transform_preview_quad:
@@ -8339,14 +8354,9 @@ class _CanvasLogic(LassoBrushFeatures, BrushFeatures, DocumentProjectionFeatures
     def _modifier_object_signature(self, obj: DocumentObject) -> tuple:
         pixels: tuple = ()
         if isinstance(obj, RasterObject):
-            pixels = tuple(sorted(
-                (key, int(image.cacheKey()))
-                for key, image in self.tiles.object_tiles(
-                    obj.object_id
-                ).items()
-            ))
+            pixels = self.tiles.object_signature(obj.object_id)
         elif isinstance(obj, ImageObject):
-            pixels = (int(self.images.image(obj.object_id).cacheKey()),)
+            pixels = self.images.pixel_signature(obj.object_id)
         elif isinstance(obj, ColorFillGradientObject):
             # Shape gradients and line-field coverage also depend on the
             # effective parent shape, including edits with unchanged bounds.
@@ -19226,10 +19236,7 @@ class _CanvasLogic(LassoBrushFeatures, BrushFeatures, DocumentProjectionFeatures
         return detached
 
     def _fill_object_signature(self, object_id: str) -> tuple:
-        return tuple(sorted(
-            (key, int(image.cacheKey()))
-            for key, image in self.tiles.object_tiles(object_id).items()
-        ))
+        return self.tiles.object_signature(object_id)
 
     def _fill_tile_count(self, frame: QRectF) -> int:
         """Count a region without allocating millions of tile coordinates."""
@@ -19673,12 +19680,9 @@ class _CanvasLogic(LassoBrushFeatures, BrushFeatures, DocumentProjectionFeatures
                 isinstance(entity, RasterObject)
                 and entity_id != skip_pixels_for
             ):
-                pixels = tuple(sorted(
-                    (key, int(image.cacheKey()))
-                    for key, image in self.tiles.object_tiles(entity_id).items()
-                ))
+                pixels = self.tiles.object_signature(entity_id)
             elif isinstance(entity, ImageObject):
-                pixels = (int(self.images.image(entity_id).cacheKey()),)
+                pixels = self.images.pixel_signature(entity_id)
             children = tuple(signature(child.kind, child.entity_id)
                              for child in entity.children) if isinstance(entity, LayerNode) else ()
             return (

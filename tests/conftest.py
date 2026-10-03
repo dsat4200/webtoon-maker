@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import gc
 from pathlib import Path
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
@@ -49,10 +50,16 @@ def text_outline_font_family(qapp):
 
 @pytest.fixture(autouse=True)
 def flush_deferred_qt_deletes(qapp):
-    """Keep full-suite UI tests from retaining every deleteLater() window."""
+    """Retire Qt and Python object cycles between unrelated UI operations."""
     yield
     QCoreApplication.sendPostedEvents(
         None, QEvent.Type.DeferredDelete
     )
+    qapp.processEvents()
+    # Signal cycles can retain Python-owned Qt trees beyond deleteLater().
+    # Collect them at a boundary with no active painter, decoder, or dialog;
+    # then flush any native deferred deletions their cleanup scheduled.
+    gc.collect()
+    QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
     qapp.processEvents()
 

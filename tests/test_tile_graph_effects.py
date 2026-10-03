@@ -22,6 +22,130 @@ def enable(scene):
     scene._projection_exact = True
 
 
+def test_independent_pending_tiles_fill_workers_without_publishing_an_incomplete_region(scene, monkeypatch):
+    from threading import Lock
+    from comic_editor.render.blur_regions import RegionalBlur
+    from comic_editor.ui.async_projection import ProjectionPending
+    modifiers = [BrightnessContrastModifier(brightness=12), BlurModifier(strength=7),
+                 HueSaturationLightnessModifier(hue=30)]
+    register(scene, modifiers)
+    source, bounds = image(), QRectF(-37, -61, 530, 403)
+    full, frame = render_stages(scene, source, bounds, modifiers, QTransform())
+    enable(scene)
+    scene._projection_defer_effects = True
+    args = dict(required=QRectF(0, 0, 480, 280), source_key=('parallel-tile-pixels',),
+                request_scope=('object', 'parallel-tile', 'canvas'))
+    original = RegionalBlur.apply
+    gui, count, lock = get_ident(), [], Lock()
+    both_started, release = Event(), Event()
+    def blocked(self, *a, **kw):
+        assert get_ident() != gui
+        with lock:
+            count.append(get_ident())
+            if len(count) == scene._effect_jobs.worker_limit:
+                both_started.set()
+        assert release.wait(5)
+        return original(self, *a, **kw)
+    monkeypatch.setattr(RegionalBlur, 'apply', blocked)
+    try:
+        with pytest.raises(ProjectionPending):
+            render_stages(scene, source, bounds, modifiers, QTransform(), **args)
+        assert both_started.wait(1)
+        assert len(set(count)) == scene._effect_jobs.worker_limit
+        assert scene._effect_jobs.worker_limit >= 2
+        assert scene._effect_jobs.bytes_in_flight <= scene._effect_jobs.budget
+        assert not scene._effect_jobs.pending
+        assert not any(key[0] == 'tile-output' for key in scene._modifier_render_cache)
+    finally:
+        release.set()
+    for _ in range(12):
+        for job in scene._effect_jobs.running_jobs:
+            job[3].result(timeout=5)
+        scene._effect_jobs.poll()
+        try:
+            result = render_stages(scene, source, bounds, modifiers, QTransform(), **args)
+            break
+        except ProjectionPending:
+            pass
+    else:
+        pytest.fail('Parallel tile dependencies did not finish')
+    assert result == crop(full, frame, args['required'])
+
+
+@pytest.mark.parametrize('region', [(200, 130, 71, 65), (0, 0, 31, 25), (739, 445, 61, 55)])
+def test_stroke_color_regions_keep_exact_stack_pixels_in_a_small_capture(scene, region):
+    modifiers = [BrightnessContrastModifier(brightness=13.25, contrast=23.5, intensity=57.75),
+                 HueSaturationLightnessModifier(hue=33.25, intensity=71.5),
+                 OutlineModifier(thickness=6, blur_radius=3, blur_strength=70)]
+    register(scene, modifiers)
+    source, bounds = image(801, 503), QRectF(0, 0, 801, 503)
+    full = apply_modifier_stack(source, modifiers, (0, 0), _point_lut=False)
+    enable(scene)
+    scene._projection_exact = False
+    scene._stroke_projection_active = True
+    required, captures = QRectF(*region), []
+    def capture(rect):
+        captures.append(QRectF(rect))
+        return crop(source, bounds, rect)[0]
+    result = tile_output(scene, None, bounds, modifiers, QTransform(), required=required,
+        source_identity=('stroke-colors',), request_scope=('object', 'stroke', 'canvas'),
+        capture=capture, float_pipeline=True)
+    assert result == crop(full, bounds, required)
+    assert captures and max(max(r.width(), r.height()) for r in captures) <= 64
+    scene._projection_exact = True
+    scene._stroke_projection_active = False
+    released = tile_output(scene, None, bounds, modifiers, QTransform(), required=required,
+        source_identity=('stroke-colors',), request_scope=('object', 'stroke', 'canvas'),
+        capture=capture, float_pipeline=True)
+    assert released == result
+
+
+@pytest.mark.parametrize('float_pipeline', [False, True])
+@pytest.mark.parametrize('prefix', [None, 'blur', 'hsl', 'masked'])
+def test_fused_point_nodes_keep_stage_rounding_and_noncanonical_inputs(scene, monkeypatch, float_pipeline, prefix):
+    from comic_editor.ui import point_lut
+    modifiers = [BrightnessContrastModifier(brightness=13.25, contrast=23.5, intensity=57.75),
+                 CurvesModifier(intensity=83.25, curves={
+                     'rgb:master': [[0,0],[.35,.65],[1,1]],
+                     'rgb:alpha': [[0,0],[.5,.7],[1,1]]}),
+                 BrightnessContrastModifier(brightness=-21.25, contrast=-30.5, intensity=66.75)]
+    if prefix == 'blur':
+        modifiers.insert(0, BlurModifier(strength=3.75, intensity=41.5))
+    elif prefix == 'hsl':
+        modifiers.insert(0, HueSaturationLightnessModifier(hue=33.25, intensity=71.5))
+    elif prefix == 'masked':
+        mask = ToneMask()
+        scene.chapter.masks[mask.mask_id] = mask
+        modifiers[1].parameter_masks['intensity'] = ParameterMaskBinding(mask.mask_id, 20, 90)
+        monkeypatch.setattr(scene, '_modifier_mask_fields', lambda mods, width, height, *_:
+            {(m.modifier_id, 'intensity'): np.full((height, width), .33, np.float32)
+             for m in mods if m.parameter_masks})
+    register(scene, modifiers)
+    source, bounds = image(), QRectF(-37, -61, 530, 403)
+    if float_pipeline:
+        fields = scene._modifier_mask_fields(modifiers, source.width(), source.height(), QTransform(), bounds)
+        full, frame = apply_modifier_stack(source, modifiers, (bounds.x(), bounds.y()), fields, _point_lut=False), bounds
+    else:
+        full, frame = render_stages(scene, source, bounds, modifiers, QTransform(), tile_evaluation=False)
+    enable(scene)
+    calls = []
+    original = point_lut.point_chain
+    def counted(*args, **kwargs):
+        if 'quantize_stages' in kwargs:
+            calls.append(kwargs['quantize_stages'])
+        return original(*args, **kwargs)
+    monkeypatch.setattr(point_lut, 'point_chain', counted)
+    required = QRectF(0, 0, 300, 280)
+    result = tile_output(scene, source, bounds, modifiers, QTransform(), required=required,
+        source_identity=('fused-source', prefix, float_pipeline), request_scope=('object', 'fused', 'canvas'),
+        float_pipeline=float_pipeline)
+    assert result == crop(full, frame, required)
+    if prefix != 'masked' and (not float_pipeline or prefix is None):
+        assert calls and all(value == (not float_pipeline) for value in calls)
+    else:
+        assert not calls
+
+
 @pytest.mark.parametrize("modifier", [
     BlurModifier(strength=11.25), BlurModifier(strength=6, algorithm="legacy"),
     BlurModifier(strength=4, mode="focal", focal_center=(50, 80), focal_radius=180),

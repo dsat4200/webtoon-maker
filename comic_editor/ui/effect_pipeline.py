@@ -19,6 +19,7 @@ from comic_editor.ui.effect_regions import (
 from comic_editor.ui.async_projection import (
     ProjectionPending, projection_deferred, projection_result_or_pending,
 )
+from comic_editor.render.pixels import current_contract
 
 
 REGIONAL_HALFTONE_MIN_PIXELS = 2_000_000
@@ -50,7 +51,7 @@ def empty_image(bounds):
     width, height = max(1, math.ceil(bounds.width())), max(1, math.ceil(bounds.height()))
     if width * height > 64 * 1024 * 1024:
         raise ValueError("Effect bounds are too large to render. Reduce the effect or move its axis/center closer to the artwork.")
-    image = QImage(width, height, QImage.Format_ARGB32_Premultiplied)
+    image = QImage(width, height, current_contract().image_format)
     if image.isNull():
         raise MemoryError("Could not allocate effect image")
     image.fill(Qt.transparent)
@@ -247,6 +248,7 @@ def render_stages(canvas, image, bounds, modifiers, local_to_world, *, nearest=F
     pipeline_key = plan.key
     navigator = (canvas._interactive_render
                  and getattr(canvas, "_effect_preview_channel", "canvas") == "navigator")
+    contact = bool(getattr(canvas, "_stroke_projection_active", False))
     base_request_scope = request_scope
     request_scope = region_scope(canvas, request_scope, plan.targets[-1] if plan.targets else bounds)
     checkpoint_scope = ("pipeline", request_scope)
@@ -322,12 +324,12 @@ def render_stages(canvas, image, bounds, modifiers, local_to_world, *, nearest=F
                 crop = QRectF(target)
                 crop.translate(-bounds.topLeft())
                 cached = frame.copy(crop.toAlignedRect()) if bounds != target else frame
-        if cached is None and navigator and not exact and isinstance(modifier, (HalftoneModifier, PixelateModifier)):
-            # The navigator is a thumbnail. A full-size GPU render and readback
-            # can stall input for a second, even when its destination is only
-            # a few pixels wide. Bound masks and target-layer captures before
-            # either is allocated; this draft never enters the exact cache.
-            draft_key = ("navigator-pattern-draft", key)
+        if cached is None and (navigator or contact) and not exact and isinstance(modifier, (HalftoneModifier, PixelateModifier)):
+            # Keep cold pattern work bounded while the pen is down or the
+            # destination is a thumbnail. Full-size GPU work also blocks the
+            # GUI during readback. Reuse completed exact pixels above, and
+            # keep this draft separate until an exact request follows.
+            draft_key = ("navigator-pattern-draft" if navigator else "contact-pattern-draft", key)
             draft = canvas._modifier_cache_get(draft_key)
             if draft is None:
                 from comic_editor.ui.modifier_rendering import apply_pattern_modifier

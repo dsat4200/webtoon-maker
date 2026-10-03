@@ -98,6 +98,44 @@ def test_gpu_failure_falls_back_in_worker_but_export_stays_exact(scene, monkeypa
     assert len(queued) == 1
 
 
+def test_pen_contact_defers_available_full_size_gpu_then_reuses_exact_result(scene, monkeypatch):
+    modifier = PixelateModifier(pixel_size=13, brightness=40)
+    source, frame = image(), QRectF(0, 0, 320, 240)
+    expected = apply_pattern_modifier(source, modifier)
+    calls, dimensions = [], []
+
+    class GPU:
+        def render(self, *_args, **_kwargs):
+            calls.append("gpu")
+            return expected
+
+    def fields(_modifiers, width, height, *_args):
+        dimensions.append((width, height))
+        return {}
+
+    monkeypatch.setattr("comic_editor.ui.gpu_pattern_effects.renderer_for", lambda _: GPU())
+    monkeypatch.setattr(scene, "_modifier_mask_fields", fields)
+    scene._interactive_render = scene._stroke_projection_active = True
+    arguments = dict(source_key=("unchanged pixels",), request_scope=("object", "contact", "canvas"))
+    draft, _ = render_stages(scene, source, frame, [modifier], QTransform(), **arguments)
+    assert not draft.isNull() and not calls and not scene._effect_jobs.submitted
+    assert dimensions and all(max(size) <= 128 and size[0] * size[1] <= 8192 for size in dimensions)
+    assert scene._effect_provisional_revision > 0
+    assert not any(key[0] == "stage" for key in scene._modifier_render_cache)
+
+    scene._stroke_projection_active = False
+    scene._projection_exact = True
+    exact, _ = render_stages(scene, source, frame, [modifier], QTransform(), **arguments)
+    assert exact == expected and calls == ["gpu"]
+    dimensions.clear()
+    revision = scene._effect_provisional_revision
+    scene._projection_exact = False
+    scene._stroke_projection_active = True
+    reused, _ = render_stages(scene, source, frame, [modifier], QTransform(), **arguments)
+    assert reused == expected and calls == ["gpu"] and not dimensions
+    assert scene._effect_provisional_revision == revision
+
+
 def test_async_outline_stage_crops_only_after_exact_work_is_cached(scene, monkeypatch):
     source = QImage(2050, 1100, QImage.Format.Format_ARGB32_Premultiplied)
     source.fill(QColor(40, 100, 180, 210))

@@ -190,6 +190,9 @@ class GpuTextureRenderer:
 
 
 def renderer_for(canvas):
+    from comic_editor.render.pixels import current_contract
+    if current_contract().floating:
+        return None
     if getattr(canvas.settings, "canvas_renderer", "auto") == "raster":
         return None
     renderer = getattr(canvas, "_gpu_texture_renderer", None)

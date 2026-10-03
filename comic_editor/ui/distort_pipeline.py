@@ -1,7 +1,8 @@
 """Cached, cancellable distortion stages with a bounded interactive preview."""
 import copy
 import math
-from threading import local
+from threading import Lock, local
+import weakref
 
 import numpy as np
 from PySide6.QtCore import QRectF, Qt
@@ -16,19 +17,29 @@ from comic_editor.ui.async_projection import (
 )
 
 
-_worker_preparation = local()
+_worker_preparation = None
+_worker_preparation_lock = Lock()
+_worker_local = local()
 
 
 def _worker_preparation_cache():
-    """One bounded cache per executor thread, released when that thread exits.
+    """One bounded immutable cache shared by live executor threads.
 
     The cache only owns immutable numerical snapshots keyed by source-image
     revision. It never retains a canvas, model, or GUI-owned cache.
     """
-    cache = getattr(_worker_preparation, "cache", None)
+    global _worker_preparation
+    cache = getattr(_worker_local, "cache", None)
     if cache is None:
-        from comic_editor.ui.distort_rendering import PreparedDistortCache
-        cache = _worker_preparation.cache = PreparedDistortCache()
+        with _worker_preparation_lock:
+            cache = _worker_preparation() if _worker_preparation is not None else None
+            if cache is None:
+                from comic_editor.ui.distort_rendering import PreparedDistortCache
+                cache = PreparedDistortCache()
+                _worker_preparation = weakref.ref(cache)
+            # The registry is weak; the last executor thread releases its
+            # cache on exit, including when a canvas closes without app exit.
+            _worker_local.cache = cache
     return cache
 
 
@@ -40,6 +51,8 @@ def render_distort_stage(canvas, image, base, bounds, target, modifier,
     large = max(image.width() * image.height(), base.width() * base.height()) > 128 * 128
     interactive = (canvas._interactive_render and not canvas._render_base_alpha
                    and canvas._rendering_mask_contributor <= 0)
+    contact = (not exact and interactive
+               and bool(getattr(canvas, "_stroke_projection_active", False)))
     mesh_preview = (not exact and interactive and not navigator
                     and ((modifier.modifier_type == "distort_mesh_warp"
                           and getattr(canvas, "_mesh_warp_preview_id", None) == modifier.modifier_id)
@@ -106,18 +119,20 @@ def render_distort_stage(canvas, image, base, bounds, target, modifier,
             12 * int(incoming.sizeInBytes()) + 8 * int(original.sizeInBytes()) + amount.nbytes,
             allow_oversized=True, require_exact=True)
         raise ProjectionPending(scope, key)
-    asynchronous = interactive and not exact and large and scope is not None and not provisional and not navigator
+    asynchronous = (interactive and not exact and not contact and large
+                    and scope is not None and not provisional and not navigator)
     if asynchronous:
         asynchronous = canvas._effect_jobs.request(
             scope, key, compute,
             12 * int(incoming.sizeInBytes()) + 8 * int(original.sizeInBytes()) + amount.nbytes,
             allow_oversized=True)
-    if not exact and (asynchronous or (interactive and (navigator or provisional) and large)):
-        draft_key = ("distort-draft", key)
+    if not exact and (asynchronous or (interactive and (navigator or provisional or contact) and large)):
+        draft_key = ("contact-distort-draft" if contact else "distort-draft", key)
         result = canvas._modifier_cache_get(draft_key)
         if result is None:
-            scale = min(1.0, 224 / max(base.width(), base.height()),
-                        math.sqrt(32768 / (base.width() * base.height())))
+            edge, pixels = (96, 4096) if contact else (224, 32768)
+            scale = min(1.0, edge / max(base.width(), base.height()),
+                        math.sqrt(pixels / (base.width() * base.height())))
             result = compute(pixel_scale=scale)
             canvas._modifier_cache_put(draft_key, result)
         return result.scaled(base.size(), Qt.IgnoreAspectRatio, Qt.SmoothTransformation), True

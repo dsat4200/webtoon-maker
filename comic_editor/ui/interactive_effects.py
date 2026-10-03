@@ -123,6 +123,11 @@ def render_interactive_stack(canvas, image, modifiers, world_origin, mask_fields
     inexpensive = not active or pixels <= 16384 or (all(isinstance(m, OutlineModifier) and m.style == "solid"
                                       and outline_blur_padding(m) == 0 for m in active)
                                       and pixels <= 2 * 1024 * 1024)
+    if (getattr(canvas, '_stroke_projection_active', False) and pixels > 16384
+            and any(isinstance(m, OutlineModifier) for m in active)):
+        # A single outline is cheap in isolation, but a stroke patch can cross
+        # many outlined layers. Their cumulative distance work blocks contact.
+        inexpensive = False
     asynchronous = (deferred and pixels > 16384 or
                     interactive and not exact and not inexpensive and not upstream_provisional and not preview_only)
     if asynchronous:

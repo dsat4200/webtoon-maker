@@ -4,7 +4,7 @@ import uuid
 
 import pytest
 from PySide6.QtCore import QByteArray, QPoint, Qt
-from PySide6.QtGui import QColor, QImage
+from PySide6.QtGui import QColor, QFont, QImage
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QComboBox, QDoubleSpinBox, QFileDialog, QLabel, QLineEdit, QPushButton, QSlider
 
@@ -85,13 +85,14 @@ def test_invalid_distortion_data_is_rejected(values):
 
 
 @pytest.fixture
-def editor(qapp, monkeypatch):
+def editor(qapp, monkeypatch, text_outline_font_family):
     monkeypatch.setattr("comic_editor.ui.canvas.create_network_manager", lambda *_: None)
     chapter, layer, objects = document()
     canvas = CanvasWidget(EditorSettings(canvas_renderer="raster"))
     canvas.set_document(chapter, TileStore())
     canvas.set_selection("object", objects[0].object_id)
     controls = ModifierControls(canvas)
+    controls.setFont(QFont(text_outline_font_family, 9))
     yield canvas, controls, layer, objects
     canvas._effect_jobs.cancel()
     controls.deleteLater()
@@ -134,13 +135,22 @@ def test_number_control_changes_parameters_in_one_undoable_action(editor, monkey
     controls.add_modifier("distort_twirl")
     modifier = canvas.chapter.modifiers[canvas.active_modifier_id]
     changes = []
-    monkeypatch.setattr(canvas, "push_model_change", lambda before, after, label: changes.append((before, after, label)))
+    push = canvas.push_model_change
+    def observed(before, after, label):
+        changes.append((before, after, label))
+        push(before, after, label)
+    monkeypatch.setattr(canvas, "push_model_change", observed)
     value = controls.findChild(QDoubleSpinBox, "distortValue_angle")
     value.setValue(45)
     assert modifier.parameters["angle"] == 45
     assert len(changes) == 1
-    restored = ChapterDocument.from_dict(changes[0][0])
-    assert restored.modifiers[modifier.modifier_id].parameters["angle"] == 0
+    chapter = canvas.chapter
+    canvas.command_stack.undo()
+    assert canvas.chapter is chapter
+    assert canvas.chapter.modifiers[modifier.modifier_id].parameters['angle'] == 0
+    canvas.command_stack.redo()
+    assert canvas.chapter.modifiers[modifier.modifier_id].parameters['angle'] == 45
+    assert len(changes) == 1
 
 
 def test_mesh_dimensions_reset_grid_atomically_and_sync_preserves_sources(editor, monkeypatch):

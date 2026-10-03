@@ -156,7 +156,8 @@ def _base_image(image, bounds, work, scale):
     size = max(1, math.ceil(work.width()*scale)), max(1, math.ceil(work.height()*scale))
     if work == bounds and size == (image.width(), image.height()):
         return _rgba(image)
-    result = QImage(*size, QImage.Format_ARGB32_Premultiplied)
+    from comic_editor.render.pixels import current_contract
+    result = QImage(*size, current_contract().image_format)
     result.fill(Qt.transparent)
     painter = QPainter(result)
     try:
@@ -193,6 +194,7 @@ def render_smudge(image, bounds, modifier, transform, target, cancelled=None, *,
                   pixel_scale=1., preparation_cache=None):
     """Return a faithful crop of the complete ordered smear, or cancellation."""
     from comic_editor.ui.distort_rendering import _byte_pixels, _image
+    from comic_editor.render.pixels import current_contract
 
     work = QRectF(smudge_bounds(bounds, modifier, transform).toAlignedRect())
     scale = pixel_scale
@@ -202,7 +204,8 @@ def render_smudge(image, bounds, modifier, transform, target, cancelled=None, *,
     if work.width()*work.height()*scale*scale > 64*1024*1024:
         raise ValueError("Smudge result is too large; reduce the layer or stroke extent")
     placement = tuple(getattr(transform, f"m{i}{j}")() for i in range(1, 4) for j in range(1, 4))
-    prefix_source_key = ("smudge-prefix", int(image.cacheKey()), bounds.getRect(), scale, placement)
+    prefix_source_key = ("smudge-prefix", int(image.cacheKey()), bounds.getRect(), scale, placement,
+                         current_contract().signature)
     source_key = (*prefix_source_key, work.getRect())
     cache = preparation_cache
     prefix = hashlib.sha256()
@@ -259,6 +262,11 @@ def render_smudge(image, bounds, modifier, transform, target, cancelled=None, *,
             and left >= 0 and top >= 0 and round(left)+width <= result.shape[1]
             and round(top)+height <= result.shape[0]):
         region = np.s_[round(top):round(top)+height, round(left):round(left)+width]
+        if current_contract().floating:
+            final = result[region]
+            if opacity < 1.:
+                final = original[region] + (final-original[region])*opacity
+            return _image(final)
         byte_key = source_key, "pixels", prefix.digest(), opacity
         encoded = cache._get(byte_key) if cache is not None else None
         if encoded is not None:

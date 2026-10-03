@@ -45,6 +45,8 @@ class CanvasSceneBackend:
             "_effect_preview_channel": "canvas",
             "_projection_exact": request.quality is RenderQuality.EXACT,
             "_projection_defer_effects": request.defer_effects,
+            "_stroke_projection_active": (request.quality is RenderQuality.INTERACTIVE
+                                           and request.key == ('stroke-preview',)),
             "_live_underlay_object_id": document.underlay[0],
             "_live_underlay_amount": document.underlay[1],
         }

@@ -15,6 +15,7 @@ from PySide6.QtGui import QImage, QPainter, QTransform
 
 from comic_editor.core.blend_modes import composite_blend, luminance
 from comic_editor.core.models import VectorDrawingObject
+from comic_editor.render.pixels import current_contract, premultiplied_pixels, working_image
 
 
 CAPTURE_SIDE = 512
@@ -39,6 +40,8 @@ def suspend_object_blend(canvas, identifier):
 
 
 def _pixels(image):
+    if current_contract().floating:
+        return image, premultiplied_pixels(image)
     rgba = image.convertToFormat(QImage.Format_RGBA8888_Premultiplied)
     pixels = np.ndarray((rgba.height(), rgba.width(), 4), dtype=np.uint8,
                         buffer=rgba.constBits(), strides=(rgba.bytesPerLine(), 4, 1))
@@ -50,23 +53,28 @@ def _custom_composite(destination, source, mode, core, density):
     back_image, back = _pixels(destination)
     source_image, front = _pixels(source)
     output = np.empty_like(back)
+    floating = current_contract().floating
+    divisor = 1. if floating else 255
     x, y, width, height = core.getRect()
     for start in range(0, height, 256):
         stop = min(height, start + 256)
         # Contiguous channel planes make repeated color/luminance operations
         # substantially faster than strided RGBA channel slices.
-        b = np.moveaxis(np.ascontiguousarray(np.moveaxis(back[start:stop], -1, 0), dtype=np.float32) / 255, 0, -1)
-        f = np.moveaxis(np.ascontiguousarray(np.moveaxis(front[y + start:y + stop, x:x + width], -1, 0), dtype=np.float32) / 255, 0, -1)
+        b = np.moveaxis(np.ascontiguousarray(np.moveaxis(back[start:stop], -1, 0), dtype=np.float32) / divisor, 0, -1)
+        f = np.moveaxis(np.ascontiguousarray(np.moveaxis(front[y + start:y + stop, x:x + width], -1, 0), dtype=np.float32) / divisor, 0, -1)
         shade = None
         if mode == "height_modulate":
             # One-pixel halo prevents seams between capture blocks. Work on
             # premultiplied height to avoid fringes around transparent texels.
-            neighborhood = front[y + start - 1:y + stop + 1].astype(np.float32) / 255
+            neighborhood = front[y + start - 1:y + stop + 1].astype(np.float32) / divisor
             heights = luminance(neighborhood[..., :3])
             dx = heights[1:-1, x + 1:x + width + 1] - heights[1:-1, x - 1:x + width - 1]
             dy = heights[2:, x:x + width] - heights[:-2, x:x + width]
             shade = np.clip((dx + dy) * density, -.5, .5)
-        output[start:stop] = np.rint(composite_blend(b, f, mode, height_shade=shade) * 255).astype(np.uint8)
+        blended = composite_blend(b, f, mode, height_shade=shade, clamp_color=not floating)
+        output[start:stop] = blended if floating else np.rint(blended * 255).astype(np.uint8)
+    if floating:
+        return working_image(output)
     return QImage(output.data, width, height, output.strides[0], QImage.Format_RGBA8888_Premultiplied).copy()
 
 
@@ -116,7 +124,7 @@ def render_blended_object(canvas, painter, obj, parent_opacity, local_visible):
                               min(capture_side, rectangle.bottom() - top + 1))
                 halo = 1 if mode == "height_modulate" else 0
                 capture = block.adjusted(-halo, -halo, halo, halo)
-                source = QImage(capture.size(), QImage.Format_ARGB32_Premultiplied)
+                source = QImage(capture.size(), current_contract().image_format)
                 if source.isNull():
                     raise MemoryError("Could not allocate object blend block")
                 source.fill(Qt.transparent)
@@ -139,10 +147,14 @@ def render_blended_object(canvas, painter, obj, parent_opacity, local_visible):
                     source_painter.end()
                 # Sparse objects commonly leave whole blocks empty. Inspect
                 # source coverage before copying/converting the backdrop.
-                words = np.ndarray((source.height(), source.width()), np.uint32,
-                                   buffer=source.constBits(), strides=(source.bytesPerLine(), 4))
-                if not np.any(words & np.uint32(0xff000000)):
-                    continue
+                if current_contract().floating:
+                    if not np.any(premultiplied_pixels(source)[..., 3] > 0.):
+                        continue
+                else:
+                    words = np.ndarray((source.height(), source.width()), np.uint32,
+                                       buffer=source.constBits(), strides=(source.bytesPerLine(), 4))
+                    if not np.any(words & np.uint32(0xff000000)):
+                        continue
                 painter.save()
                 try:
                     # combinedTransform includes the device pixel ratio. Draw

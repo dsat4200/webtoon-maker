@@ -2,13 +2,18 @@
 from __future__ import annotations
 
 import math
+import json
+import os
+import shutil
+import tempfile
 from pathlib import Path
 from typing import Callable, Iterator
 
 import numpy as np
 from PIL import Image as PILImage
 from PySide6.QtCore import QPointF, QRect, QRectF, Qt
-from PySide6.QtGui import QColor, QImage, QPainter, QPainterPath, QPolygonF, QTransform
+from PySide6.QtGui import QColor, QImage, QImageReader, QPainter, QPainterPath, QPolygonF, QTransform
+from .tile_backing import DiskTileMap, SnapshotBacking, TileResidency, EditableTile, prefetch_pins
 from scipy.ndimage import (
     binary_closing, binary_dilation, binary_erosion, binary_opening,
     gaussian_filter, label as connected_components,
@@ -16,17 +21,144 @@ from scipy.ndimage import (
 
 
 TILE_SIZE = 256
+_UNKNOWN_ALPHA_BOUNDS = object()
 
 
 class TileStore:
-    def __init__(self, tile_size: int = TILE_SIZE) -> None:
+    def __init__(self, tile_size: int = TILE_SIZE, *, cache_budget: int = 256 * 1024 * 1024) -> None:
         self.tile_size = tile_size
-        self._tiles: dict[str, dict[tuple[int, int], QImage]] = {}
+        self._tiles: dict[str, DiskTileMap] = {}
+        self.residency = TileResidency(cache_budget)
+        self._saved_versions = {}
+        self._pending_saves = {}
+        self._backing_workspace = None
+        self._snapshot_backing = None
+        self._snapshot_future = None
+        self.residency.prepare = self.prepare_tile_backing
         self._alpha_bounds: dict[
             str, dict[tuple[int, int], tuple[int, int, int, int] | None]
         ] = {}
         self._alpha_bounds_dirty: set[tuple[str, int, int]] = set()
         self.dirty: set[tuple[str, int, int]] = set()
+
+    def _object_tiles(self, object_id):
+        result = self._tiles.get(object_id)
+        if result is None:
+            result = self._tiles[object_id] = DiskTileMap(object_id, self.residency, self._tile_changed)
+        return result
+
+    @staticmethod
+    def _file_stamp(stat):
+        return stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns
+
+    def _tile_changed(self, marker):
+        self.dirty.add(marker)
+        self._alpha_bounds_dirty.add(marker)
+
+    def preserve_backing(self, directory: Path) -> None:
+        """Keep orphaned pixels available to undo when saved files are pruned."""
+        directory = directory.resolve()
+        for object_tiles in self._tiles.values():
+            for key in object_tiles:
+                path = object_tiles.backing(key)
+                if path is None or not path.resolve().is_relative_to(directory):
+                    continue
+                object_tiles.version(key)
+                # A borrowed frame may have become an uncommitted edit.
+                if object_tiles.backing(key) is None:
+                    continue
+                if self._backing_workspace is None:
+                    self._backing_workspace = tempfile.TemporaryDirectory(prefix='comic-tile-backing-')
+                target = Path(self._backing_workspace.name) / object_tiles.object_id / f'{key[0]}_{key[1]}.png'
+                target.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copyfile(path, target)
+                object_tiles.entries[key] = target
+
+    def detached_snapshot(self, object_ids: set[str]) -> "TileStore":
+        """Freeze a worker's pixels without decoding unchanged disk tiles.
+
+        Resource writers always replace files. Hard links therefore pin the
+        captured revision, even if its original filename is replaced or removed.
+        QImage copies pin edited buffers through Qt's copy-on-write ownership.
+        """
+        self.finish_snapshot_prefetch()
+        snapshot = TileStore(self.tile_size, cache_budget=self.residency.budget)
+        for object_id in object_ids:
+            source = self._tiles.get(object_id)
+            if source is None:
+                continue
+            detached = snapshot._object_tiles(object_id)
+            for key in source:
+                # Detect edits made through a borrowed clean QImage first.
+                source.version(key)
+                value = source.entries[key]
+                if isinstance(value, Path):
+                    pin = source.snapshot_pins.get(key)
+                    if pin is None:
+                        if self._snapshot_backing is None:
+                            self._snapshot_backing = SnapshotBacking()
+                        pin = source.snapshot_pins[key] = self._snapshot_backing.pin(value)
+                    detached.entries[key] = pin.path
+                    detached.snapshot_pins[key] = pin
+                elif value.frozen is not None:
+                    detached.entries[key] = EditableTile(value.frozen)
+                else:
+                    detached[key] = QImage(source[key])
+                detached.versions[key] = source.versions.get(key, 0)
+                if key in source.content_keys:
+                    detached.content_keys[key] = source.content_keys[key]
+            snapshot._alpha_bounds[object_id] = dict(self._alpha_bounds.get(object_id, {}))
+        snapshot._alpha_bounds_dirty = {
+            marker for marker in self._alpha_bounds_dirty if marker[0] in object_ids
+        }
+        snapshot.dirty = {marker for marker in self.dirty if marker[0] in object_ids}
+        return snapshot
+
+    def prefetch_snapshot_backing(self) -> None:
+        """Pin clean revision files in the background before recovery is due."""
+        self.finish_snapshot_prefetch()
+        records = []
+        for object_id, owner in self._tiles.items():
+            for key in owner:
+                version = owner.version(key)
+                path = owner.backing(key)
+                if path is not None and key not in owner.snapshot_pins:
+                    records.append((object_id, key, version, path))
+        if records:
+            if self._snapshot_backing is None:
+                self._snapshot_backing = SnapshotBacking()
+            self._snapshot_future = prefetch_pins(self._snapshot_backing, tuple(records))
+
+    def finish_snapshot_prefetch(self) -> None:
+        future, self._snapshot_future = self._snapshot_future, None
+        if future is None:
+            return
+        for object_id, key, version, path, pin in future.result():
+            owner = self._tiles.get(object_id)
+            if (owner is not None and key in owner and owner.version(key) == version
+                    and owner.entries.get(key) == path):
+                owner.snapshot_pins[key] = pin
+
+    def prepare_tile_backing(self, owner, key) -> None:
+        """A visible tile takes priority without waiting for the whole chapter."""
+        job = self._snapshot_future
+        if job is None or key in owner.snapshot_pins:
+            return
+        if job.done():
+            self.finish_snapshot_prefetch()
+            return
+        record = job.records.get((owner.object_id, key))
+        if record is not None and (owner.version(key), owner.entries.get(key)) == record:
+            owner.snapshot_pins[key] = job.pin(owner.object_id, key)
+
+    def adopt_snapshot_bounds(self, values) -> None:
+        """Receive worker-derived metadata only for still-matching pixels."""
+        for (object_id, x, y), (version, bounds) in values.items():
+            owner = self._tiles.get(object_id)
+            key = x, y
+            if owner is not None and key in owner and owner.version(key) == version:
+                self._alpha_bounds.setdefault(object_id, {})[key] = bounds
+                self._alpha_bounds_dirty.discard((object_id, x, y))
 
     @staticmethod
     def _empty(size: int) -> QImage:
@@ -35,7 +167,7 @@ class TileStore:
         return image
 
     def tile(self, object_id: str, key: tuple[int, int], create: bool = False) -> QImage | None:
-        object_tiles = self._tiles.setdefault(object_id, {})
+        object_tiles = self._object_tiles(object_id)
         image = object_tiles.get(key)
         if image is None and create:
             image = self._empty(self.tile_size)
@@ -43,9 +175,10 @@ class TileStore:
             self._alpha_bounds.setdefault(object_id, {})[key] = None
         return image
 
-    def set_tile(self, object_id: str, key: tuple[int, int], image: QImage | None) -> None:
-        object_tiles = self._tiles.setdefault(object_id, {})
-        bounds = (
+    def set_tile(self, object_id: str, key: tuple[int, int], image: QImage | None,
+                 *, _known_alpha_bounds=_UNKNOWN_ALPHA_BOUNDS) -> None:
+        object_tiles = self._object_tiles(object_id)
+        bounds = _known_alpha_bounds if _known_alpha_bounds is not _UNKNOWN_ALPHA_BOUNDS else (
             None if image is None or image.isNull()
             else self._alpha_bbox(image)
         )
@@ -165,7 +298,7 @@ class TileStore:
             return QRectF()
         tolerance = max(0, min(255, int(tolerance)))
         tile_size = self.tile_size
-        object_tiles = self._tiles.setdefault(object_id, {})
+        object_tiles = self._object_tiles(object_id)
         rgba_cache: dict[tuple[int, int], np.ndarray] = {}
         label_cache: dict[tuple[int, int], np.ndarray] = {}
 
@@ -574,7 +707,7 @@ class TileStore:
         if right < left or bottom < top:
             return QRectF()
         tile_size = self.tile_size
-        object_tiles = self._tiles.setdefault(object_id, {})
+        object_tiles = self._object_tiles(object_id)
         rgba_cache: dict[tuple[int, int], np.ndarray] = {}
         reference_cache: dict[tuple[int, int], np.ndarray] = {}
         target_masks: dict[tuple[int, int], np.ndarray] = {}
@@ -954,7 +1087,7 @@ class TileStore:
             from comic_editor.core.tiling_paint import paint_samples
             return paint_samples(self, object_id, samples, color, tiling,
                                  erase=erase, square=square, antialias=antialias, before=before)
-        object_tiles = self._tiles.setdefault(object_id, {})
+        object_tiles = self._object_tiles(object_id)
         grouped: dict[
             tuple[int, int], list[tuple[QPointF, float, float]]
         ] = {}
@@ -1084,18 +1217,34 @@ class TileStore:
                 yield (tile_x, tile_y), image
 
     def remove_object(self, object_id: str) -> None:
-        self._tiles.pop(object_id, None)
+        previous = self._tiles.pop(object_id, None)
+        if previous is not None:
+            for key in previous:
+                self.residency.remove(previous, key)
         self._alpha_bounds.pop(object_id, None)
         self._alpha_bounds_dirty = {
             item for item in self._alpha_bounds_dirty if item[0] != object_id
         }
-        self.dirty = {item for item in self.dirty if item[0] != object_id}
+        self.dirty.difference_update(item for item in tuple(self.dirty) if item[0] == object_id)
 
     def object_tiles(self, object_id: str) -> dict[tuple[int, int], QImage]:
         return {
             key: QImage(image)
             for key, image in self._tiles.get(object_id, {}).items()
         }
+
+    def object_signature(self, object_id: str) -> tuple:
+        """Stable pixel revisions without reading or decoding cold tiles.
+
+        Resident borrowed edits are adopted by ``version``. Re-decoding the
+        same immutable backing must not invalidate an effect merely because
+        Qt assigned its new display buffer a different cache key.
+        """
+        owner = self._tiles.get(object_id)
+        if isinstance(owner, DiskTileMap):
+            return tuple((key, owner.version(key)) for key in sorted(owner))
+        return tuple(sorted((key, int(image.cacheKey()))
+                            for key, image in (owner or {}).items()))
 
     def replace_object_tiles(
         self, object_id: str, values: dict[tuple[int, int], QImage | None],
@@ -1106,7 +1255,9 @@ class TileStore:
             for key, image in values.items()
             if image is not None and not image.isNull() and not self.is_empty(image)
         }
-        self._tiles[object_id] = replacement
+        object_tiles = self._object_tiles(object_id)
+        object_tiles.clear()
+        object_tiles.update(replacement)
         bounds_cache = self._alpha_bounds.setdefault(object_id, {})
         bounds_cache.clear()
         for key, image in replacement.items():
@@ -1120,8 +1271,8 @@ class TileStore:
     def content_bounds(self, object_id: str) -> QRectF | None:
         result = QRectF()
         found = False
-        for (tile_x, tile_y), image in self._tiles.get(object_id, {}).items():
-            bbox = self._cached_alpha_bbox(object_id, (tile_x, tile_y), image)
+        for tile_x, tile_y in self._tiles.get(object_id, {}):
+            bbox = self._cached_alpha_bbox(object_id, (tile_x, tile_y))
             if bbox is None:
                 continue
             left, top, right, bottom = bbox
@@ -1213,11 +1364,13 @@ class TileStore:
         return TileStore._alpha_bbox(image) is None
 
     def _cached_alpha_bbox(
-        self, object_id: str, key: tuple[int, int], image: QImage,
+        self, object_id: str, key: tuple[int, int], image: QImage | None = None,
     ) -> tuple[int, int, int, int] | None:
         marker = (object_id, key[0], key[1])
         cache = self._alpha_bounds.setdefault(object_id, {})
         if key not in cache or marker in self._alpha_bounds_dirty:
+            if image is None:
+                image = self._tiles[object_id][key]
             cache[key] = self._alpha_bbox(image)
             self._alpha_bounds_dirty.discard(marker)
         return cache[key]
@@ -1225,6 +1378,12 @@ class TileStore:
     @staticmethod
     def _alpha_bbox(image: QImage) -> tuple[int, int, int, int] | None:
         try:
+            if image.format() in (QImage.Format_ARGB32, QImage.Format_ARGB32_Premultiplied):
+                import sys
+                rows = np.frombuffer(image.constBits(), np.uint8).reshape(image.height(), image.bytesPerLine())
+                start = 3 if sys.byteorder == 'little' else 0
+                alpha = np.ascontiguousarray(rows[:, start:image.width()*4:4])
+                return PILImage.fromarray(alpha, 'L').getbbox()
             rgba = image.convertToFormat(QImage.Format_RGBA8888)
             pil = PILImage.frombuffer(
                 "RGBA", (rgba.width(), rgba.height()), bytes(rgba.constBits()),
@@ -1248,9 +1407,18 @@ class TileStore:
         self, root: Path, object_ids: set[str], *, clear: bool = True,
     ) -> None:
         if clear:
+            self.finish_snapshot_prefetch()
             self._tiles.clear()
+            self.residency.clear(discard=True)
+            self._saved_versions.clear()
+            self._pending_saves.clear()
             self._alpha_bounds.clear()
             self._alpha_bounds_dirty.clear()
+        try:
+            index = json.loads((root / '.tile-index.json').read_text(encoding='utf-8'))
+        except (OSError, ValueError):
+            index = {}
+        saved = {}
         for object_id in object_ids:
             directory = root / object_id
             if not directory.is_dir():
@@ -1261,20 +1429,36 @@ class TileStore:
                     key = int(x_text), int(y_text)
                 except ValueError:
                     continue
-                image = QImage(str(path))
-                if not image.isNull():
-                    self._tiles.setdefault(object_id, {})[key] = image.convertToFormat(
-                        QImage.Format_ARGB32_Premultiplied
-                    )
-                    self._alpha_bounds_dirty.add((object_id, key[0], key[1]))
+                stat = path.stat()
+                record = index.get(f'{object_id}/{path.name}')
+                if not (isinstance(record, list) and len(record) == 3
+                        and record[:2] == [stat.st_size, stat.st_mtime_ns]):
+                    reader = QImageReader(str(path))
+                    if not reader.canRead():
+                        continue
+                    record = None
+                object_tiles = self._object_tiles(object_id)
+                object_tiles.register(key, path)
+                saved[(object_id, *key)] = (object_tiles.version(key), self._file_stamp(stat))
+                if record is not None:
+                    bbox = record[2]
+                    if bbox is None or (isinstance(bbox, list) and len(bbox) == 4
+                                        and all(isinstance(v, int) for v in bbox)):
+                        self._alpha_bounds.setdefault(object_id, {})[key] = tuple(bbox) if bbox else None
+                        continue
+                self._alpha_bounds_dirty.add((object_id, key[0], key[1]))
+        self._saved_versions[str(root.resolve())] = saved
         self.dirty.clear()
 
     def save_directory(self, root: Path, object_ids: set[str], complete: bool = False) -> None:
+        self.finish_snapshot_prefetch()
         root.mkdir(parents=True, exist_ok=True)
         for directory in root.iterdir():
             if directory.is_dir() and directory.name not in object_ids:
-                import shutil
+                self.preserve_backing(directory)
                 shutil.rmtree(directory)
+        destination = str(root.resolve())
+        known = self._saved_versions.get(destination, {})
         targets = set(self.dirty)
         if complete:
             targets = {
@@ -1294,21 +1478,80 @@ class TileStore:
                 }
                 for saved in directory.glob("*.png"):
                     if saved.name not in names:
+                        self.preserve_backing(saved)
                         saved.unlink()
-        for object_id, x, y in targets:
+        versions = dict(known) if not complete else {}
+        index = {}
+        for object_id, x, y in sorted(targets):
             if object_id not in object_ids:
                 continue
             directory = root / object_id
             directory.mkdir(parents=True, exist_ok=True)
             target = directory / f"{x}_{y}.png"
-            image = self._tiles.get(object_id, {}).get((x, y))
-            if image is None:
+            object_tiles = self._tiles.get(object_id)
+            key = x, y
+            marker = object_id, x, y
+            if object_tiles is None or key not in object_tiles:
                 if target.exists():
                     target.unlink()
+                versions.pop(marker, None)
                 continue
-            temporary = target.with_suffix(".png.tmp")
-            if not image.save(str(temporary), "PNG"):
-                raise OSError(f"Unable to save raster tile {target}")
-            temporary.replace(target)
+            version = object_tiles.version(key)
+            try:
+                stamp = self._file_stamp(target.stat())
+            except OSError:
+                stamp = None
+            # Another repository instance may have published a different
+            # inode since this store loaded. Its version counter is private;
+            # validate the actual destination before skipping a resource.
+            if known.get(marker) != (version, stamp) or stamp is None:
+                temporary = target.with_suffix(".png.tmp")
+                temporary.unlink(missing_ok=True)
+                backing = object_tiles.backing(key)
+                linked = False
+                if backing is not None:
+                    try:
+                        # Published backing is immutable and already durable.
+                        # Link the inode instead of copying and reflushing it.
+                        os.link(backing, temporary)
+                        linked = True
+                    except OSError:
+                        shutil.copyfile(backing, temporary)
+                elif not object_tiles[key].save(str(temporary), 'PNG'):
+                    raise OSError(f"Unable to save raster tile {target}")
+                if not linked:
+                    with temporary.open('r+b') as handle:
+                        os.fsync(handle.fileno())
+                temporary.replace(target)
+                stamp = self._file_stamp(target.stat())
+            versions[marker] = (version, stamp)
+            # Record exact alpha bounds once; subsequent opens need neither
+            # pixel decode nor an all-tile scan to find each object's frame.
+            bounds_cache = self._alpha_bounds.setdefault(object_id, {})
+            if key not in bounds_cache or marker in self._alpha_bounds_dirty:
+                self._cached_alpha_bbox(object_id, key, object_tiles[key])
+            stat = target.stat()
+            index[f'{object_id}/{target.name}'] = [stat.st_size, stat.st_mtime_ns, bounds_cache[key]]
+        if complete:
+            from .persistence import atomic_json
+            atomic_json(root / '.tile-index.json', index)
+        self._pending_saves[destination] = versions
         if not complete:
+            self.commit_directory(root)
             self.dirty.difference_update(targets)
+
+    def commit_directory(self, root: Path) -> None:
+        """Adopt backing files only after the owning revision is published."""
+        destination = str(root.resolve())
+        versions = self._pending_saves.pop(destination, None)
+        if versions is None:
+            return
+        self._saved_versions[destination] = versions
+        for (object_id, x, y), (version, _stamp) in versions.items():
+            object_tiles = self._tiles.get(object_id)
+            if object_tiles is not None and (x, y) in object_tiles and object_tiles.version((x, y)) == version:
+                if (x, y) not in object_tiles.snapshot_pins:
+                    if self._snapshot_backing is None:
+                        self._snapshot_backing = SnapshotBacking()
+                    object_tiles.snapshot_pins[x, y] = self._snapshot_backing.pin(root / object_id / f'{x}_{y}.png')
+                object_tiles.commit((x, y), root / object_id / f'{x}_{y}.png')

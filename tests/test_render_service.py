@@ -117,7 +117,10 @@ def test_provisional_pixels_cannot_become_exact_tiles():
     service, backend, document = setup_service()
     backend.provisional = True
     result = service.render_region(document, request(document, quality=RenderQuality.INTERACTIVE))
-    assert result.status is RenderStatus.PROVISIONAL and result.image.isNull()
+    assert result.status is RenderStatus.PROVISIONAL and not result.image.isNull() and not result.exact
+    # A preview can be presented separately, never promoted into an exact tile.
+    exact = service.render_region(document, request(document, quality=RenderQuality.EXACT))
+    assert exact.status is RenderStatus.PROVISIONAL and exact.image.isNull()
 
 
 @pytest.mark.parametrize("change", ["revision", "document", "view"])

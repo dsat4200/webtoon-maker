@@ -65,7 +65,7 @@ def test_object_undo_keeps_unrelated_models_tree_rows_and_selection(qapp, monkey
         window.deleteLater()
 
 
-def test_object_patch_history_tracks_current_chapter_after_structural_restore(qapp):
+def test_object_patch_history_retains_current_chapter_after_structural_restore(qapp):
     chapter, page = _chapter()
     raster = next(iter(chapter.objects.values()))
     canvas = CanvasWidget(EditorSettings(snap_to_grid=False))
@@ -81,7 +81,7 @@ def test_object_patch_history_tracks_current_chapter_after_structural_restore(qa
     canvas.push_model_change(moved, expanded, "Add layer")
 
     canvas.command_stack.undo()
-    assert canvas.chapter is not chapter
+    assert canvas.chapter is chapter
     assert canvas.chapter.to_dict() == moved
     restored_chapter = canvas.chapter
     canvas.command_stack.undo()

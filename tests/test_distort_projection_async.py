@@ -171,7 +171,7 @@ def test_export_and_recursive_source_capture_remain_synchronous(canvas, monkeypa
 
 
 def test_memory_waiting_exact_request_does_not_recopy_snapshot():
-    jobs = SimpleNamespace(result=lambda *_: None, running=None, pending={},
+    jobs = SimpleNamespace(result=lambda *_: None, has_running=lambda *_: False, pending={},
                            waiting={"object": "revision"})
     canvas = SimpleNamespace(_effect_jobs=jobs)
     with pytest.raises(ProjectionPending):

@@ -116,13 +116,15 @@ def test_promoted_parent_passes_converge_without_canceling_each_other(
         draft = render(canvas, True)
         assert entered.wait(1)
         jobs = canvas._effect_jobs
-        assert jobs.running is not None and len(jobs.pending) == 1
-        assert not jobs.running[2].is_set(), "Top pass canceled the ordinary pass"
-        assert jobs.running[0] != next(iter(jobs.pending.values()))[0]
+        admitted = (*jobs.running_jobs, *jobs.pending.values())
+        assert len(admitted) == 2
+        assert all(not job[2].is_set() for job in admitted), "Top pass canceled the ordinary pass"
+        assert len({job[0] for job in admitted}) == 2
         for _ in range(2):
             render(canvas, True)
-            assert not jobs.running[2].is_set(), "Repaint canceled an unchanged effect pass"
-            assert len(jobs.pending) == 1
+            admitted = (*jobs.running_jobs, *jobs.pending.values())
+            assert all(not job[2].is_set() for job in admitted), "Repaint canceled an unchanged effect pass"
+            assert len(admitted) == 2
         assert not np.array_equal(pixels(draft), pixels(expected))
     finally:
         release.set()

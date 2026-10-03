@@ -16,6 +16,9 @@ def disconnected_canvas(monkeypatch):
 
 def mesh(canvas):
     canvas._document_projection_enabled = True
+    # These checks compare finished captures immediately on release. Deferred
+    # publication is covered separately by test_distort_projection_async.
+    canvas._projection_async_enabled = False
     canvas.tiles.paint_dab(canvas.selected_object_id, QPointF(160, 150), 140, QColor("red"))
     modifier = DistortModifier(modifier_type="distort_mesh_warp", frame=(60, 70, 200, 160),
                               parameters={"rows": 6, "columns": 4, "smoothness": 50})

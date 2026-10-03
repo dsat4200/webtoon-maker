@@ -233,6 +233,7 @@ def test_resume_stroke_stack_preserves_mixed_stages_masks_and_parent_transform(
 
 def test_queued_stroke_worker_keeps_full_resolution_fill(scene, qapp):
     canvas, _, _ = scene
+    canvas._effect_jobs.worker_limit = 1  # The blocker must occupy every slot.
     expected = pixels(render(canvas, False))
     clear(canvas)
     started, release = threading.Event(), threading.Event()

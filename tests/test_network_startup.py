@@ -23,7 +23,9 @@ def test_startup_with_https_clipboard_uses_native_tls(tmp_path):
         from PySide6.QtWidgets import QApplication
 
         app = QApplication([])
-        if 'schannel' not in QSslSocket.availableBackends():
+        from comic_editor.ui.network import create_network_manager
+        probe_manager = create_network_manager()
+        if QSslSocket.activeBackend() != 'schannel':
             sys.exit(77)
         from comic_editor.core import settings
         settings.settings_path = lambda: Path(sys.argv[1])
@@ -69,3 +71,4 @@ def test_startup_with_https_clipboard_uses_native_tls(tmp_path):
     assert result.returncode == 0, result.stdout + result.stderr
     assert "Startup and HTTPS failure handling survived" in result.stdout
     assert "Cannot set backend" not in result.stderr
+    assert "Windows fatal exception" not in result.stderr

@@ -1,6 +1,7 @@
 """Latest-request-wins effect work; workers never read mutable canvas state."""
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
+from contextvars import copy_context
 from threading import Event
 
 from PySide6.QtCore import QObject, QTimer
@@ -13,13 +14,15 @@ _MISSING = object()
 
 class EffectJobs(QObject):
     def __init__(self, canvas, budget=256 * 1024 * 1024, retained_budget=256 * 1024 * 1024,
-                 retained_limit=512):
+                 retained_limit=512, *, workers=1):
         super().__init__(canvas)
         self.canvas = canvas
         self.budget = budget
         self.pending = OrderedDict()
         self.waiting = OrderedDict()
-        self.running = None
+        self.worker_limit = max(1, int(workers))
+        self._running = OrderedDict()
+        self._job_serial = 0
         self.retry_on_release = False
         self.exact_failures = OrderedDict()
         # The ordinary scene LRU also contains previews and source images.
@@ -36,7 +39,7 @@ class EffectJobs(QObject):
         self._retained_shared = OrderedDict()
         self._retained_shared_images = {}
         self.retained_shared_bytes = 0
-        self.executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="effect-preview")
+        self.executor = ThreadPoolExecutor(max_workers=self.worker_limit, thread_name_prefix="effect-preview")
         self.stopped = Event()
         self.timer = QTimer(self)
         self.timer.setInterval(16)
@@ -49,7 +52,24 @@ class EffectJobs(QObject):
 
     @property
     def bytes_in_flight(self):
-        return sum(job[4] for job in self.pending.values()) + (self.running[4] if self.running else 0)
+        return sum(job[4] for job in self.pending.values()) + sum(job[4] for job in self._running.values())
+
+    @property
+    def running(self):
+        """Compatibility observation of the oldest job; use running_jobs to inspect all."""
+        return next(iter(self._running.values()), None)
+
+    @property
+    def running_jobs(self):
+        return tuple(self._running.values())
+
+    @property
+    def has_finished(self):
+        return any(job[3].done() for job in self._running.values())
+
+    def has_running(self, scope=_MISSING, key=_MISSING):
+        return any(not job[2].is_set() and (scope is _MISSING or job[0] == scope)
+                   and (key is _MISSING or job[1] == key) for job in self._running.values())
 
     def retained_get(self, scope, key):
         from PySide6.QtGui import QImage
@@ -131,8 +151,7 @@ class EffectJobs(QObject):
                 self.retained_bytes -= self._retained_images.pop(storage)[0]
 
     def result(self, scope, key):
-        job = self.running
-        if job is not None and job[:2] == (scope, key) and job[3].done():
+        if any(job[:2] == (scope, key) and job[3].done() for job in self._running.values()):
             # A paint may arrive between worker completion and the 16 ms timer.
             # Adopt its exact pixels now instead of flashing another draft.
             self.poll()
@@ -144,6 +163,9 @@ class EffectJobs(QObject):
         return entry[0] if entry is not None else None
 
     def request(self, scope, key, compute, size, *, allow_oversized=False, require_exact=False):
+        size = int(size)
+        if size < 0:
+            raise ValueError("Effect snapshot size cannot be negative")
         self.waiting.pop(scope, None)
         failure = self.exact_failures.get(scope)
         if failure is not None:
@@ -154,19 +176,21 @@ class EffectJobs(QObject):
         oversized = size > self.budget
         if oversized and not allow_oversized:
             return False
-        if self.running and self.running[:2] == (scope, key) and not self.running[2].is_set():
-            if require_exact:
-                self.running = (*self.running[:5], True)
-            return True
+        for identifier, job in self._running.items():
+            if job[:2] == (scope, key) and not job[2].is_set():
+                if require_exact:
+                    self._running[identifier] = (*job[:5], True)
+                return True
         existing = self.pending.get(scope)
         if existing and existing[1] == key:
             if require_exact:
                 self.pending[scope] = (*existing[:5], True)
             return True
-        if self.running and self.running[0] == scope:
-            self.running[2].set()
+        for job in self._running.values():
+            if job[0] == scope:
+                job[2].set()
         self.pending.pop(scope, None)
-        if self.running and self.running[4] + size > self.budget:
+        if self._running and sum(job[4] for job in self._running.values()) + size > self.budget:
             # This request cannot start until the running snapshot releases.
             # Keep unrelated queued work instead of evicting it for a snapshot
             # we cannot retain yet. A repaint asks for the latest state later.
@@ -187,25 +211,37 @@ class EffectJobs(QObject):
         while self.pending and self.bytes_in_flight + size > self.budget:
             self.pending.popitem(last=False)
         # A canceled running job releases its arrays before the next starts.
-        self.pending[scope] = (scope, key, Event(), compute, size, require_exact)
+        # Contexts carry immutable render policy, never the live canvas. Each
+        # admitted request owns a separate context, including when it queues.
+        context = copy_context()
+        detached_compute = lambda cancelled: context.run(compute, cancelled)
+        self.pending[scope] = (scope, key, Event(), detached_compute, size, require_exact)
         self._start()
         self.timer.start()
         return True
 
     def _start(self):
-        if self.running is not None or not self.pending:
-            return
-        _, job = self.pending.popitem(last=False)
-        scope, key, token, compute, size, require_exact = job
-        stopped = self.stopped
-        cancelled = lambda: token.is_set() or stopped.is_set()
-        self.running = (scope, key, token, self.executor.submit(compute, cancelled), size, require_exact)
-        self.submitted += 1
+        while len(self._running) < self.worker_limit and self.pending:
+            job = next(iter(self.pending.values()))
+            scope, key, token, compute, size, require_exact = job
+            # An oversized fallback owns the worker pool exclusively, rather
+            # than adding another large snapshot to already active work.
+            if self._running and (size > self.budget
+                    or any(active[4] > self.budget for active in self._running.values())):
+                break
+            self.pending.pop(scope)
+            stopped = self.stopped
+            cancelled = lambda token=token: token.is_set() or stopped.is_set()
+            self._job_serial += 1
+            self._running[self._job_serial] = (scope, key, token,
+                self.executor.submit(compute, cancelled), size, require_exact)
+            self.submitted += 1
 
     def poll(self):
-        job = self.running
-        if job is not None and job[3].done():
-            self.running = None
+        for identifier, job in tuple(self._running.items()):
+            if not job[3].done():
+                continue
+            self._running.pop(identifier)
             self.waiting.clear()
             failure = "The exact effect returned no image"
             try:
@@ -266,7 +302,7 @@ class EffectJobs(QObject):
                 self.canvas.visualChanged.emit(None)
                 self.canvas.update()
         self._start()
-        if self.running is None and not self.pending:
+        if not self._running and not self.pending:
             self.timer.stop()
 
     def cancel(self, *, clear_retained=True):
@@ -281,7 +317,7 @@ class EffectJobs(QObject):
             self._retained_shared.clear()
             self._retained_shared_images.clear()
             self.retained_shared_bytes = 0
-        if self.running:
-            self.running[2].set()
-        else:
+        for job in self._running.values():
+            job[2].set()
+        if not self._running:
             self.timer.stop()

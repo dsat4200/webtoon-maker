@@ -1243,6 +1243,11 @@ class AssetRepository:
     ) -> tuple[AssetManifest, TileStore] | tuple[
         AssetManifest, TileStore, ImageStore
     ]:
+        from .persistence import resource_revision
+        with resource_revision(self.asset_root(asset_id)):
+            return self._load(asset_id, recover, include_images=include_images)
+
+    def _load(self, asset_id, recover, *, include_images):
         root = self.asset_root(asset_id)
         source = root / "autosave" if recover else root
         self._recover_interrupted_save(source)
@@ -1266,6 +1271,7 @@ class AssetRepository:
             for object_id, obj in manifest.document.objects.items()
             if isinstance(obj, ImageObject)
         })
+        tiles.prefetch_snapshot_backing()
         return (manifest, tiles, images) if include_images else (manifest, tiles)
 
     def save(
@@ -1273,9 +1279,15 @@ class AssetRepository:
         thumbnail: QImage | None = None, images: ImageStore | None = None,
         autosave: bool = False,
     ) -> None:
+        from .persistence import resource_revision
+        with resource_revision(self.asset_root(manifest.asset_id)):
+            self._save(manifest, tiles, thumbnail, images, autosave)
+
+    def _save(self, manifest, tiles, thumbnail, images, autosave):
         images = images or ImageStore()
         manifest.name = self._ensure_unique_name(manifest.name, manifest.asset_id)
         manifest.validate()
+        tiles.finish_snapshot_prefetch()
         raster_ids = {
             object_id for object_id, obj in manifest.document.objects.items()
             if isinstance(obj, RasterObject)
@@ -1295,7 +1307,7 @@ class AssetRepository:
         try:
             tiles.save_directory(root / "raster", raster_ids, complete=True)
             tiles.save_directory(root / "masks", mask_ids, complete=True)
-            images.save_directory(root / "images", image_ids, complete=True)
+            images.save_directory(root / "images", image_ids, complete=True, incremental=True, transactional=True)
             if thumbnail is not None and not autosave:
                 temporary = root / f".{THUMBNAIL_FILE}.tmp"
                 if not thumbnail.save(str(temporary), "PNG"):
@@ -1305,6 +1317,9 @@ class AssetRepository:
                 atomic_json(root / "recovery.json", {"saved_at": time.time()})
             atomic_json(manifest_path, manifest.to_dict())
             (root / PENDING_FILE).unlink(missing_ok=True)
+            tiles.commit_directory(root / 'raster')
+            tiles.commit_directory(root / 'masks')
+            images.commit_directory(root / 'images')
         except Exception:
             images.dirty.update(image_dirty)
             raise
@@ -1315,6 +1330,7 @@ class AssetRepository:
         images.dirty.clear()
         autosave_root = root / "autosave"
         if autosave_root.exists():
+            tiles.preserve_backing(autosave_root)
             shutil.rmtree(autosave_root)
 
     def rename(self, asset_id: str, name: str) -> AssetManifest:

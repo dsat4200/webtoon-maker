@@ -18,6 +18,7 @@ from PySide6.QtCore import QRect, QRectF, QSize, Qt
 from PySide6.QtGui import QColor, QImage, QPainter, QPainterPath, QTransform
 
 from .projection import DocumentProjection, ProjectionAddress, ProjectionRequest
+from .pixels import LEGACY_PIXELS, PixelContract, pixel_scope
 
 
 class RenderQuality(Enum):
@@ -59,8 +60,11 @@ class RenderDocument:
     overflow: float = 0.
     underlay: tuple[str, float] = ("", 0.)
     live_preview: bool = False
+    pixel_contract: PixelContract = LEGACY_PIXELS
 
     def __post_init__(self):
+        if not isinstance(self.pixel_contract, PixelContract):
+            raise ValueError("Render documents require a validated pixel contract")
         for name in ("identity", "configuration", "underlay"):
             object.__setattr__(self, name, _immutable_sequence(getattr(self, name)))
 
@@ -184,9 +188,13 @@ class DocumentRenderService:
         return request.revision == document.revision and self.current_document(document)
 
     def render_region(self, document: RenderDocument, request: RenderRequest) -> RenderResult:
+        with pixel_scope(document.pixel_contract):
+            return self._render_region(document, request)
+
+    def _render_region(self, document: RenderDocument, request: RenderRequest) -> RenderResult:
         if not self.current(document, request):
             return RenderResult(request, document, QImage(), RenderStatus.STALE)
-        image = QImage(QSize(*request.pixel_size), QImage.Format_ARGB32_Premultiplied)
+        image = QImage(QSize(*request.pixel_size), document.pixel_contract.image_format)
         if image.isNull():
             raise MemoryError("Could not allocate document render image")
         image.fill(Qt.transparent)
@@ -221,8 +229,9 @@ class DocumentRenderService:
         # Such pixels must not acquire the latest revision merely by finishing.
         if not self.current(document, request):
             status, error = RenderStatus.STALE, ""
-        return RenderResult(request, document,
-                            image if status is RenderStatus.EXACT else QImage(), status, error)
+        presentable = (status is RenderStatus.EXACT or status is RenderStatus.PROVISIONAL
+                       and request.quality is RenderQuality.INTERACTIVE)
+        return RenderResult(request, document, image if presentable else QImage(), status, error)
 
     def _paint_overflow(self, painter, document, request):
         chapter_area = QPainterPath()
@@ -232,7 +241,7 @@ class DocumentRenderService:
         outside = area.subtracted(self.backend.page_area().intersected(chapter_area))
         if outside.isEmpty():
             return
-        image = QImage(QSize(*request.pixel_size), QImage.Format_ARGB32_Premultiplied)
+        image = QImage(QSize(*request.pixel_size), document.pixel_contract.image_format)
         image.fill(Qt.transparent)
         overflow = QPainter(image)
         try:

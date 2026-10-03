@@ -128,9 +128,9 @@ def test_multi_lasso_undo_only_rewrites_changed_tiles(qapp, monkeypatch):
     canvas._tool_release()
     writes = []
     original = canvas.tiles.set_tile
-    def write(identifier, key, image):
+    def write(identifier, key, image, **kwargs):
         writes.append((identifier, key))
-        original(identifier, key, image)
+        original(identifier, key, image, **kwargs)
     monkeypatch.setattr(canvas.tiles, "set_tile", write)
     canvas.command_stack.undo()
     assert 2 <= len(writes) <= 8

@@ -441,8 +441,6 @@ def test_brush_preview_uses_palette_colors_for_main_and_subcolor(qapp):
     controls.set_preview_colors(QColor("blue"), QColor("red"))
     render_preview(qapp, controls.preview)
     assert bytes(first.constBits()) != bytes(controls.preview.pixmap().toImage().constBits())
-    assert controls.presets._color == QColor("blue")
-    assert controls.presets._sub_color == QColor("red")
     controls.close()
 
 

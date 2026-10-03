@@ -5,6 +5,7 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 from PySide6.QtCore import QObject, QPoint, Qt, Signal
+from PySide6.QtGui import QFont
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QVBoxLayout, QWidget
 
@@ -61,9 +62,10 @@ class OwnerStub(QWidget):
 
 
 @pytest.fixture
-def editor(qapp):
+def editor(qapp, text_outline_font_family):
     modifier = CurvesModifier()
     owner = OwnerStub(modifier)
+    owner.setFont(QFont(text_outline_font_family, 9))
     controls = CurvesControls(owner, modifier)
     QVBoxLayout(owner).addWidget(controls)
     owner.resize(320, 460)

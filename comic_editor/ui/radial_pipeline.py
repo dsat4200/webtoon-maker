@@ -39,8 +39,9 @@ def _cancel_obsolete_sampling(jobs, scope, key):
         return (owner(job[0]) == owner(scope) and job[0] != scope
                 and job[1][0] == "radial-integration" and job[1][2:4] != key[2:4])
 
-    if jobs.running is not None and obsolete(jobs.running):
-        jobs.running[2].set()
+    for job in jobs.running_jobs:
+        if obsolete(job):
+            job[2].set()
     for pending_scope, job in tuple(jobs.pending.items()):
         if obsolete(job):
             jobs.pending.pop(pending_scope)
