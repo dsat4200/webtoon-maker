@@ -35,6 +35,12 @@ external color configurations, renderer and library versions are dependencies.
 service in short batches; image compression, source hashing and disk reads
 run in the bounded IO pool. A row becomes green only after all its final tiles
 and the index are committed. Reads restore values into existing memory LRUs.
+Completed reads displaced by IO admission enter a separate 64 MiB handoff LRU
+(one oversized completion may occupy it exclusively). This lets a restarted
+capture consume its finished effect after reloading an evicted source, rather
+than discarding that effect and repeating the same reads indefinitely. The
+handoff retains the ordinary validated values and checkpoint metadata; clearing
+or closing the backing releases it.
 Failure/cancellation retains committed rows. Disk writes occur only after the
 user clicks Cache to disk; normal viewing never automatically records results.
 

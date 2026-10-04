@@ -33,6 +33,7 @@ RENDERER_VERSION = "native-artwork-1"
 MAX_PAYLOAD = 512 * 1024 * 1024
 WRITE_BUDGET = 64 * 1024 * 1024
 READ_BUDGET = 64 * 1024 * 1024
+READY_BUDGET = 64 * 1024 * 1024
 MAGIC = b"WTRCACHE1"
 
 
@@ -298,34 +299,42 @@ class PersistentRenderCache:
         result = self.ready.pop(identity, None)
         if result is not None:
             self.ready_bytes -= int(result.sizeInBytes() if isinstance(result, QImage) else result.nbytes)
-            self.hits += 1
-            self.retain(kind, key, result)
-            return result
+            if entry is not None:
+                self.hits += 1
+                self.retain(kind, key, result)
+                return result
         if entry is None:
             self.misses += 1
             return None
         future = self.reads.get(identity)
         if future is None:
-            # Retire abandoned completed reads when the camera moves. Never
-            # accumulate one decoded image per chapter tile in this adapter.
+            # A restarted capture can need an earlier source before reaching
+            # its completed effect read. Hand finished reads off to a bounded
+            # LRU instead of discarding them to make room for that source:
+            # source-LRU eviction would otherwise restart the same IO forever.
             reserved = sum(self.entries.get(item, {}).get("raw_size", MAX_PAYLOAD)
                            for item in self.reads)
             for old, previous in list(self.reads.items()):
                 if len(self.reads) < 8 and reserved + entry.get("raw_size", MAX_PAYLOAD) <= READ_BUDGET:
                     break
                 if previous.done() or wait:
-                    if wait:
-                        try:
-                            previous.result()
-                        except Exception:
-                            pass
                     self.reads.pop(old)
                     reserved -= self.entries.get(old, {}).get("raw_size", MAX_PAYLOAD)
+                    value = self._finish_read(old, previous)
+                    if value is not None:
+                        self._ready_put(old, value)
             if self.reads and (len(self.reads) >= 8 or reserved + entry.get("raw_size", MAX_PAYLOAD) > READ_BUDGET):
                 raise RenderPending("Saved artwork is loading")
             future = self.reads[identity] = self.executor.submit(self._read, dict(entry))
         if not wait and not future.done():
             raise RenderPending("Saved artwork is loading")
+        self.reads.pop(identity, None)
+        result = self._finish_read(identity, future)
+        if result is not None:
+            self.retain(kind, key, result)
+        return result
+
+    def _finish_read(self, identity, future):
         try:
             result = future.result()
         except Exception:
@@ -334,12 +343,22 @@ class PersistentRenderCache:
             self.invalidated = True
             self.misses += 1
             return None
-        finally:
-            self.reads.pop(identity, None)
         self.verified.add(identity)
         self.loads += 1
-        self.retain(kind, key, result)
         return result
+
+    def _ready_put(self, identity, value):
+        size = int(value.sizeInBytes() if isinstance(value, QImage) else value.nbytes)
+        previous = self.ready.pop(identity, None)
+        if previous is not None:
+            self.ready_bytes -= int(previous.sizeInBytes() if isinstance(previous, QImage) else previous.nbytes)
+        self.ready[identity] = value
+        self.ready_bytes += size
+        # Keep one oversized completion consumable, as the owning caches do.
+        # Other completed reads remain bounded independently of in-flight IO.
+        while self.ready_bytes > max(READY_BUDGET, size):
+            _, old = self.ready.popitem(last=False)
+            self.ready_bytes -= int(old.sizeInBytes() if isinstance(old, QImage) else old.nbytes)
 
     def retain(self, kind, key, value, *, state=None):
         if not self.recording or self.closed:
@@ -478,3 +497,5 @@ class PersistentRenderCache:
         self.closed = True
         self.reads.clear()
         self.verifications.clear()
+        self.ready.clear()
+        self.ready_bytes = 0

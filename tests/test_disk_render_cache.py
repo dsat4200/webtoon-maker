@@ -1,5 +1,6 @@
 """Durable pixels, reopen reuse, cancellation, and cache mutation boundaries."""
 import json
+from concurrent.futures import Future
 import shutil
 import time
 
@@ -12,6 +13,7 @@ from PySide6.QtTest import QTest
 from comic_editor.core.models import RasterObject, CurvesModifier
 from comic_editor.core.persistence import SeriesRepository
 from comic_editor.render.cache import PersistentRenderCache, encode_value, decode_value
+from comic_editor.render.service import RenderPending
 from comic_editor.ui.main_window import MainWindow
 
 
@@ -81,6 +83,145 @@ def test_malformed_manifest_and_changed_environment_are_cache_misses(tmp_path):
     assert reopened.disk_bytes == 0
     assert not reopened.entries
     reopened.close()
+
+
+@pytest.mark.parametrize("wait", [False, True])
+def test_completed_effect_read_survives_source_read_pressure(tmp_path, monkeypatch, wait):
+    import comic_editor.render.cache as storage
+    effect = QImage(8, 8, QImage.Format_ARGB32_Premultiplied)
+    effect.fill(QColor("red"))
+    source = QImage(16, 16, QImage.Format_ARGB32_Premultiplied)
+    source.fill(QColor("blue"))
+    cache = PersistentRenderCache(tmp_path)
+    try:
+        with cache.record():
+            cache.retain("effect", ("finished-stage",), effect, state=(1, QRectF(0, 0, 8, 8)))
+            cache.retain("source", ("large-source",), source)
+        cache.drain()
+        monkeypatch.setattr(storage, "READ_BUDGET", effect.sizeInBytes())
+        calls = []
+        read = cache._read
+        def counted(entry, **kwargs):
+            calls.append(entry["kind"])
+            return read(entry, **kwargs)
+        monkeypatch.setattr(cache, "_read", counted)
+        # A previous capture yielded after requesting its final effect. The
+        # restarted capture must first reload a source evicted by another target.
+        identity = cache.descriptor("effect", ("finished-stage",)).identity
+        future = cache.executor.submit(cache._read, dict(cache.entries[identity]))
+        cache.reads[identity] = future
+        future.result()
+        try:
+            cache.lookup("source", ("large-source",), wait=wait)
+        except RenderPending:
+            pass
+        restored = cache.lookup("effect", ("finished-stage",))
+        assert bytes(restored.constBits()) == bytes(effect.constBits())
+        assert calls.count("effect") == 1
+        assert cache.entries[identity]["state"] == [1, {"rect": [0., 0., 8., 8.]}]
+        assert cache.ready_bytes == 0
+    finally:
+        cache.close()
+
+
+@pytest.mark.parametrize("budget", [128, 512])
+def test_completed_read_handoff_is_bounded_and_clearable(tmp_path, monkeypatch, budget):
+    import comic_editor.render.cache as storage
+    image = QImage(8, 8, QImage.Format_ARGB32_Premultiplied)
+    image.fill(QColor("red"))
+    cache = PersistentRenderCache(tmp_path)
+    try:
+        with cache.record():
+            for number in range(5):
+                cache.retain("effect", ("stage", number), image)
+        cache.drain()
+        monkeypatch.setattr(storage, "READ_BUDGET", image.sizeInBytes())
+        monkeypatch.setattr(storage, "READY_BUDGET", budget)
+        for number in range(4):
+            identity = cache.descriptor("effect", ("stage", number)).identity
+            future = cache.executor.submit(cache._read, dict(cache.entries[identity]))
+            cache.reads[identity] = future
+            future.result()
+            cache.lookup("effect", ("stage", number + 1), wait=True)
+            assert cache.ready_bytes <= max(budget, image.sizeInBytes())
+        assert cache.ready
+        cache.clear()
+        assert not cache.ready and cache.ready_bytes == 0
+    finally:
+        cache.close()
+    assert not cache.ready and cache.ready_bytes == 0
+
+
+def test_failed_retired_read_is_invalidated_and_not_handed_off(tmp_path, monkeypatch):
+    import comic_editor.render.cache as storage
+    image = QImage(8, 8, QImage.Format_ARGB32_Premultiplied)
+    image.fill(QColor("red"))
+    cache = PersistentRenderCache(tmp_path)
+    try:
+        with cache.record():
+            for number in range(2):
+                cache.retain("effect", ("stage", number), image)
+        cache.drain()
+        identity = cache.descriptor("effect", ("stage", 0)).identity
+        failed = Future()
+        failed.set_exception(ValueError("Corrupt saved pixels"))
+        cache.reads[identity] = failed
+        monkeypatch.setattr(storage, "READ_BUDGET", image.sizeInBytes())
+        cache.lookup("effect", ("stage", 1), wait=True)
+        assert identity not in cache.entries and identity not in cache.verified
+        assert cache.lookup("effect", ("stage", 0)) is None
+        assert not cache.ready and cache.invalidated
+    finally:
+        cache.close()
+
+
+def test_pending_read_pressure_yields_without_waiting(tmp_path, monkeypatch):
+    import comic_editor.render.cache as storage
+    image = QImage(8, 8, QImage.Format_ARGB32_Premultiplied)
+    image.fill(QColor("red"))
+    cache = PersistentRenderCache(tmp_path)
+    try:
+        with cache.record():
+            for number in range(2):
+                cache.retain("effect", ("stage", number), image)
+        cache.drain()
+        identity = cache.descriptor("effect", ("stage", 0)).identity
+        pending = Future()
+        cache.reads[identity] = pending
+        monkeypatch.setattr(storage, "READ_BUDGET", image.sizeInBytes())
+        with pytest.raises(RenderPending):
+            cache.lookup("effect", ("stage", 1))
+        assert cache.reads == {identity: pending}
+        assert not cache.ready
+        pending.set_result(image)
+        cache.lookup("effect", ("stage", 1), wait=True)
+        assert cache.lookup("effect", ("stage", 0)) is not None
+    finally:
+        cache.close()
+
+
+def test_handed_off_value_still_validates_its_entry(tmp_path, monkeypatch):
+    import comic_editor.render.cache as storage
+    pixels = np.array([-.01, 1.7, np.inf, np.nan], np.float32).reshape(1, 1, 4)
+    cache = PersistentRenderCache(tmp_path)
+    try:
+        with cache.record():
+            for number in range(3):
+                cache.retain("effect", ("stage", number), pixels)
+        cache.drain()
+        monkeypatch.setattr(storage, "READ_BUDGET", pixels.nbytes)
+        for number in (0, 1):
+            identity = cache.descriptor("effect", ("stage", number)).identity
+            future = cache.executor.submit(cache._read, dict(cache.entries[identity]))
+            cache.reads[identity] = future
+            future.result()
+            cache.lookup("effect", ("stage", 2), wait=True)
+        assert cache.lookup("effect", ("stage", 0)).tobytes() == pixels.tobytes()
+        cache.entries[identity]["seal"] = "invalid"
+        assert cache.lookup("effect", ("stage", 1)) is None
+        assert not cache.ready and cache.ready_bytes == 0
+    finally:
+        cache.close()
 
 
 @pytest.fixture
