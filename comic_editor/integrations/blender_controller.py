@@ -193,11 +193,8 @@ class BlenderImageSourceController(QObject):
         if view.frame_path and key in self._failed_imports:
             self.statusChanged.emit("error")
             return
-        sent = self.client.activate_view(view.view_uuid)
-        if sent:
-            self.statusChanged.emit("activating")
-        else:
-            self._emit_selected_status("ready")
+        # Editor selection observes publications without changing Blender's scene.
+        self._emit_selected_status("ready")
 
     def stop_for_context_change(self) -> None:
         self._imported.clear()

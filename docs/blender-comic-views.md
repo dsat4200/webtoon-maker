@@ -125,6 +125,14 @@ on the next connection.
 
 ## Editor lifecycle
 
+New linked images are placed at the current canvas viewport center, beneath the
+selected shape (or the selected object's parent shape), with the active page as
+the fallback when there is no active shape. Placement preserves the camera and
+the image's native dimensions.
+Selecting linked images, reconnecting, and undoing or redoing source edits only
+reconcile published PNGs and status; they never activate a Comic View in Blender
+or request a decision about unsaved Blender scene changes.
+
 The editor validates that a publication path is absolute and ends in `.png`,
 limits compressed input to 128 MiB, verifies the PNG format and advertised
 dimensions, and reads each publication once per session key. Accepted original

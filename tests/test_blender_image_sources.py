@@ -254,6 +254,111 @@ def test_controller_reports_unsaved_and_needs_render_without_streaming(qapp):
     controller.deleteLater()
 
 
+@pytest.mark.parametrize("selected_kind", ["layer", "object", "active_layer", "page"])
+def test_add_blender_image_uses_viewport_center_and_active_shape(qapp, selected_kind):
+    chapter, page, _objects, images = _chapter_with_linked_images()
+    shape = chapter.add_layer(
+        page.layer_id, "Shape", BoundGeometry.rectangle(50, 70, 400, 300),
+    )
+    nested = chapter.add_layer(
+        shape.layer_id, "Nested shape", BoundGeometry.rectangle(20, 30, 200, 150),
+    )
+    page.translate_x, page.translate_y = 40, 55
+    shape.translate_x, shape.translate_y = 90, -15
+    nested.translate_x, nested.translate_y = -25, 45
+    child = chapter.add_object(nested.layer_id, ImageObject(pixel_width=80, pixel_height=40))
+    images.put(child.object_id, "child.png", _png(), "image/png")
+    window = MainWindow()
+    try:
+        window._set_chapter(chapter, TileStore(), images)
+        if selected_kind == "object":
+            window.canvas.set_selection("object", child.object_id)
+        elif selected_kind in {"layer", "active_layer"}:
+            window.canvas.set_selection("layer", nested.layer_id)
+            if selected_kind == "active_layer":
+                window.canvas.selected_kind = window.canvas.selected_id = ""
+        else:
+            window.canvas.clear_selection()
+            window.canvas.active_page_id = page.layer_id
+        window.canvas.resize(901, 701)
+        window.canvas.center_x, window.canvas.center_y = 725.25, 510.75
+        window.canvas.scale, window.canvas.rotation = 2.5, 33.0
+        camera = window.canvas.camera_transform()
+        before_ids = set(chapter.objects)
+
+        window._add_blender_comic_view(_view())
+
+        created_id, = set(chapter.objects) - before_ids
+        created = chapter.objects[created_id]
+        assert created.parent_layer_id == (
+            page.layer_id if selected_kind == "page" else nested.layer_id
+        )
+        assert created.is_blender_linked
+        assert (created.pixel_width, created.pixel_height) == (300, 200)
+        assert created.placement_mode == "free"
+        quad = window.canvas.object_world_quad(created_id)
+        center = QPointF(*(sum(point[i] for point in quad) / 4 for i in (0, 1)))
+        assert center == QPointF(725.25, 510.75)
+        assert window.canvas.document_to_widget(center) == QPointF(450.5, 350.5)
+        assert window.canvas.camera_transform() == camera
+        if selected_kind == "object":
+            siblings = chapter.layers[nested.layer_id].children
+            assert [ref.entity_id for ref in siblings] == [created_id, child.object_id]
+
+        window.canvas.command_stack.undo()
+        assert created_id not in window.canvas.chapter.objects
+        window.canvas.command_stack.redo()
+        restored = window.canvas.chapter.objects[created_id]
+        assert restored.parent_layer_id == created.parent_layer_id
+        assert restored.transform_quad == created.transform_quad
+        assert window.canvas.camera_transform() == camera
+    finally:
+        window._dirty = False
+        window.close()
+
+
+def test_switching_linked_images_preserves_blender_view_and_imports_frames(qapp, tmp_path, monkeypatch):
+    chapter, _page, objects, images = _chapter_with_linked_images(2)
+    objects[1].source.view_uuid = OTHER_VIEW_UUID
+    first_path = tmp_path / "first.png"
+    second_path = tmp_path / "second.png"
+    first_path.write_bytes(_png(300, 200, "#1976d2"))
+    second_path.write_bytes(_png(160, 90, "#d32f2f"))
+    first = _view(first_path)
+    second = ComicViewInfo(
+        PROJECT_UUID, OTHER_VIEW_UUID, "Other", 3, 160, 90,
+        True, QImage(), str(second_path),
+    )
+    window = MainWindow()
+    sent, decisions, statuses = [], [], []
+    try:
+        window._set_chapter(chapter, TileStore(), images)
+        client = window.blender_sources.client
+        client._active_project_uuid = PROJECT_UUID
+        client._active_view_uuid = VIEW_UUID
+        monkeypatch.setattr(client, "_send", lambda message: (sent.append(message), True)[1])
+        window.blender_sources.switchDecisionRequired.connect(decisions.append)
+        window.blender_sources.statusChanged.connect(statuses.append)
+        with patch.object(BlenderSourceClient, "connected", new_callable=PropertyMock,
+                          return_value=True):
+            window.blender_sources._set_views([first, second])
+            for obj in (objects[0], objects[1], objects[0], objects[1]):
+                window.canvas.set_selection("object", obj.object_id)
+            assert statuses[-1] == "unsaved"
+            window.blender_sources.resume_for_context()
+            window.blender_sources.reconnect_selected()
+        assert not [message for message in sent if message["type"] in {"ACTIVATE_VIEW", "RESOLVE_DIRTY"}]
+        assert not decisions
+        assert client._active_view_uuid == VIEW_UUID
+        assert "activating" not in statuses
+        assert objects[0].source.last_revision == objects[1].source.last_revision == 3
+        assert images.source(objects[0].object_id).data == first_path.read_bytes()
+        assert images.source(objects[1].object_id).data == second_path.read_bytes()
+    finally:
+        window._dirty = False
+        window.close()
+
+
 def test_linked_image_transform_keeps_front_image_at_its_stack_position(qapp):
     chapter, page, objects, images = _chapter_with_linked_images()
     linked = objects[0]
@@ -293,7 +398,7 @@ def test_copy_as_asset_freezes_linked_source_and_preserves_transform(qapp):
     assert asset_images.source(obj.object_id).filename == "Panel 12.png"
 
 
-def test_source_undo_redo_reactivates_connected_view_and_preserves_cached_frame(qapp, monkeypatch):
+def test_source_undo_redo_preserves_blender_view_and_cached_frame(qapp, monkeypatch):
     chapter, _page, objects, images = _chapter_with_linked_images()
     obj = objects[0]
     original_cache = images.source(obj.object_id).data
@@ -315,20 +420,18 @@ def test_source_undo_redo_reactivates_connected_view_and_preserves_cached_frame(
                           return_value=True):
             window._begin_relink_selected_blender_source()
             window._add_blender_comic_view(second)
-            activated.clear()
+            assert not activated
             window.canvas.command_stack.undo()
-            assert activated == [VIEW_UUID]
+            assert not activated
             assert window.canvas.chapter.objects[obj.object_id].source.view_uuid == VIEW_UUID
-            activated.clear()
             window.canvas.command_stack.redo()
-            assert activated == [OTHER_VIEW_UUID]
+            assert not activated
 
             window._detach_selected_blender_source()
-            activated.clear()
+            assert not activated
             window.canvas.command_stack.undo()
-            assert activated == [OTHER_VIEW_UUID]
+            assert not activated
             assert window.canvas.chapter.objects[obj.object_id].is_blender_linked
-            activated.clear()
             window.canvas.command_stack.redo()
             assert not activated
             assert not window.canvas.chapter.objects[obj.object_id].is_blender_linked

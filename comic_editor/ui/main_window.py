@@ -4538,6 +4538,8 @@ class MainWindow(QMainWindow):
             )
             return
         parent = self._selected_parent_layer(allow_page=True)
+        if parent is None and self.canvas.active_layer_id in self.chapter.layers:
+            parent = self.chapter.layers[self.canvas.active_layer_id]
         if parent is None and self.canvas.active_page_id in self.chapter.layers:
             parent = self.chapter.layers[self.canvas.active_page_id]
         if parent is None:
@@ -4566,7 +4568,7 @@ class MainWindow(QMainWindow):
         created = self.canvas.place_image_sources(
             [(f"{view.name}.png", "image/png", bytes(payload))],
             parent.layer_id,
-            self._selected_parent_center(parent.layer_id),
+            QPointF(self.canvas.center_x, self.canvas.center_y),
             insertion_index=self._new_object_insertion_index(parent.layer_id),
             fit_parent=False,
             label="Add Blender Comic View",
