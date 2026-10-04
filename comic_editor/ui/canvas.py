@@ -1558,6 +1558,7 @@ class _CanvasLogic(LassoBrushFeatures, BrushFeatures, DocumentProjectionFeatures
         self._projection_stroke_preview = None
         self._mesh_warp_parameter_drag_id = None
         self._smudge_parameter_drag_id = None
+        self._overlay_color_preview = None
         self.smudge_selected_stroke_id = ""
         self.smudge_selected_point_index = 0
         self._mesh_warp_preview_session_id = None
@@ -1961,6 +1962,7 @@ class _CanvasLogic(LassoBrushFeatures, BrushFeatures, DocumentProjectionFeatures
         self._modifier_handle_drag = None
         self._mesh_warp_parameter_drag_id = None
         self._smudge_parameter_drag_id = None
+        self._overlay_color_preview = None
         self._cancel_text_features()
         self._outline_edit_timer.stop()
         self._outline_pending_point = None
@@ -8964,10 +8966,9 @@ class _CanvasLogic(LassoBrushFeatures, BrushFeatures, DocumentProjectionFeatures
             ):
                 painter.restore()
                 return
-            if object_visible is not None:
-                object_visible = object_visible.intersected(
-                    QRectF(*obj.interaction_rect)
-                )
+            # The editing frame can be in destination space after a transform.
+            # It is not a source-pixel boundary: only inverse-mapped visibility
+            # may restrict the sparse tile query.
             for (tile_x, tile_y), image in self.tiles.iter_tiles(
                 obj.object_id, object_visible
             ):

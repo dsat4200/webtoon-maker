@@ -506,6 +506,176 @@ def test_render_key_uses_content_not_label():
     assert key != modifier_render_settings(modifier)
 
 
+@pytest.mark.parametrize("target_kind, attribute, value", [
+    (kind, attribute, value) for kind in ("layer", "object")
+    for attribute, value in (("color", "#FF00FF00"), ("intensity", 35),
+                             ("blend_mode", "multiply"), ("apply_to_outline", True))
+    if kind == "layer" or attribute != "apply_to_outline"
+])
+def test_solid_overlay_edits_refresh_warm_canvas(scene, target_kind, attribute, value):
+    canvas, chapter, shape, raster = scene
+    identifier = shape.layer_id if target_kind == "layer" else raster.object_id
+    canvas.set_selection(target_kind, identifier)
+    modifier = SolidColorOverlayModifier(color="#FFFF8040")
+    chapter.add_modifier(modifier, [(target_kind, identifier)])
+    owner = ModifierControls(canvas)
+    canvas.center_x, canvas.center_y, canvas.scale = 150, 100, 1
+    canvas._ensure_scene_cache()
+    before = pixels(canvas._scene_cache)
+    source_keys = set(canvas._modifier_source_cache)
+    owner.set_parameter(modifier.modifier_id, attribute, value, False)
+    canvas._ensure_scene_cache()
+    after = pixels(canvas._scene_cache)
+    assert not np.array_equal(before, after)
+    assert source_keys == set(canvas._modifier_source_cache)
+    # A fully cold render must agree without moving any artwork or the camera.
+    canvas._modifier_render_cache.clear()
+    canvas._modifier_render_cache_bytes = 0
+    canvas._effect_jobs.cancel(clear_retained=True)
+    canvas._document_projection.clear()
+    canvas._invalidate_scene_cache()
+    canvas._ensure_scene_cache()
+    np.testing.assert_array_equal(after, pixels(canvas._scene_cache))
+    owner.deleteLater()
+
+
+@pytest.mark.parametrize("accept", [False, True])
+@pytest.mark.parametrize("target_kind", ["layer", "object"])
+def test_solid_overlay_picker_previews_before_apply_and_cancels(scene, qapp, accept, target_kind):
+    canvas, chapter, shape, raster = scene
+    identifier = shape.layer_id if target_kind == "layer" else raster.object_id
+    canvas.set_selection(target_kind, identifier)
+    modifier = SolidColorOverlayModifier(color="#FFFF0000")
+    chapter.add_modifier(modifier, [(target_kind, identifier)])
+    owner = ModifierControls(canvas)
+    owner.refresh()
+    controls = owner._cards[modifier.modifier_id].findChild(OverlayControls)
+    canvas.center_x, canvas.center_y, canvas.scale = 150, 100, 1
+    canvas._ensure_scene_cache()
+    before = pixels(canvas._scene_cache)
+    revision = canvas.command_stack.revision
+    controls.color.click()
+    popup = controls._popup
+    qapp.processEvents()
+    popup.workspace.panel.apply_color("#FF00FF00")
+    wait(qapp, lambda: canvas._overlay_color_preview is not None
+         and canvas._overlay_color_preview[2].color == "#FF00FF00")
+    canvas._ensure_scene_cache()
+    during = pixels(canvas._scene_cache)
+    assert modifier.color == "#FFFF0000"  # Draft is absent from saved artwork.
+    assert not np.array_equal(before, during)
+    assert canvas.command_stack.revision == revision
+    if accept:
+        popup.accept()
+    else:
+        popup.reject()
+    canvas._ensure_scene_cache()
+    assert canvas._overlay_color_preview is None
+    assert modifier.color == ("#FF00FF00" if accept else "#FFFF0000")
+    np.testing.assert_array_equal(during if accept else before, pixels(canvas._scene_cache))
+    assert canvas.command_stack.revision == revision + int(accept)
+    if accept:
+        canvas.command_stack.undo()
+        canvas._ensure_scene_cache()
+        np.testing.assert_array_equal(before, pixels(canvas._scene_cache))
+        canvas.command_stack.redo()
+        canvas._ensure_scene_cache()
+        np.testing.assert_array_equal(during, pixels(canvas._scene_cache))
+    owner.deleteLater()
+
+
+@pytest.mark.parametrize("accept", [False, True])
+def test_solid_overlay_picker_coalesces_and_flushes_last_color(scene, qapp, accept):
+    from comic_editor.ui.cache_dependencies import exact_cache_allowed
+    canvas, chapter, shape, _ = scene
+    canvas.set_selection("layer", shape.layer_id)
+    modifier = SolidColorOverlayModifier(color="#FFFF0000")
+    chapter.add_modifier(modifier, [("layer", shape.layer_id)])
+    owner = ModifierControls(canvas)
+    owner.refresh()
+    controls = owner._cards[modifier.modifier_id].findChild(OverlayControls)
+    controls.color.click()
+    popup = controls._popup
+    qapp.processEvents()
+    changes = []
+    canvas.visualChanged.connect(lambda _region: changes.append(1))
+    for color in ("#FF00FF00", "#FF112233", "#FF556677"):
+        popup.workspace.panel.apply_color(color)
+    assert not changes
+    assert chapter.modifiers[modifier.modifier_id].color == "#FFFF0000"
+    wait(qapp, lambda: bool(changes))
+    assert len(changes) == 1
+    assert canvas._overlay_color_preview[2].color == "#FF556677"
+    # Preview captures use the normal kernels and cannot enter disk backing.
+    canvas._projection_exact = True
+    assert not exact_cache_allowed(canvas, ("stage-stack", "source"))
+    canvas._projection_exact = False
+    canvas._ensure_scene_cache()
+    source_keys = set(canvas._modifier_source_cache)
+    popup.workspace.panel.apply_color("#FF8899AA")
+    wait(qapp, lambda: canvas._overlay_color_preview[2].color == "#FF8899AA")
+    canvas._ensure_scene_cache()
+    assert source_keys == set(canvas._modifier_source_cache)
+    # Apply/Cancel while the final update is still queued must retire the timer.
+    popup.workspace.panel.apply_color("#FFABCDEF")
+    revision = canvas.command_stack.revision
+    if accept:
+        popup.accept()
+    else:
+        popup.reject()
+    QTest.qWait(20)
+    assert canvas._overlay_color_preview is None
+    assert not controls._color_timer.isActive()
+    assert modifier.color == ("#FFABCDEF" if accept else "#FFFF0000")
+    assert canvas.command_stack.revision == revision + int(accept)
+    owner.deleteLater()
+
+
+def test_solid_overlay_picker_drag_repaints_visible_canvas(scene, qapp):
+    canvas, chapter, shape, _ = scene
+    canvas.set_selection("layer", shape.layer_id)
+    modifier = SolidColorOverlayModifier(color="#FFFF0000")
+    chapter.add_modifier(modifier, [("layer", shape.layer_id)])
+    owner = ModifierControls(canvas, canvas)
+    owner.refresh()
+    controls = owner._cards[modifier.modifier_id].findChild(OverlayControls)
+    canvas.center_x, canvas.center_y, canvas.scale = 150, 100, 1
+    canvas.show()
+    qapp.processEvents()
+    before = pixels(canvas.grab().toImage())
+    controls.color.click()
+    popup = controls._popup
+    qapp.processEvents()
+    QTest.mousePress(popup.picker, Qt.LeftButton, pos=popup.picker.sv_rect().center().toPoint())
+    wait(qapp, lambda: canvas._overlay_color_preview is not None)
+    assert not np.array_equal(before, pixels(canvas.grab().toImage()))
+    assert modifier.color == "#FFFF0000"
+    QTest.mouseRelease(popup.picker, Qt.LeftButton)
+    popup.reject()
+    np.testing.assert_array_equal(before, pixels(canvas.grab().toImage()))
+
+
+def test_solid_overlay_inspector_deletion_retires_preview(scene, qapp):
+    canvas, chapter, shape, _ = scene
+    canvas.set_selection("layer", shape.layer_id)
+    modifier = SolidColorOverlayModifier(color="#FFFF0000")
+    chapter.add_modifier(modifier, [("layer", shape.layer_id)])
+    owner = ModifierControls(canvas, canvas)
+    owner.refresh()
+    controls = owner._cards[modifier.modifier_id].findChild(OverlayControls)
+    controls.color.click()
+    popup = controls._popup
+    qapp.processEvents()
+    popup.workspace.panel.apply_color("#FF00FF00")
+    wait(qapp, lambda: canvas._overlay_color_preview is not None)
+    owner.deleteLater()
+    from PySide6.QtCore import QCoreApplication, QEvent
+    QCoreApplication.sendPostedEvents(None, QEvent.DeferredDelete)
+    assert canvas._overlay_color_preview is None
+    assert modifier.color == "#FFFF0000"
+    assert not canvas.command_stack.can_undo
+
+
 def test_texture_directory_settings_dialog_persistence(qapp, tmp_path, monkeypatch):
     from comic_editor.core import settings as settings_module
     monkeypatch.setattr(settings_module, "settings_path", lambda: tmp_path / "settings.json")

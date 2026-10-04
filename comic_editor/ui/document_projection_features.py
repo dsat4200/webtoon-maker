@@ -70,7 +70,7 @@ class DocumentProjectionFeatures:
             "_vector_gesture_mode", "_cage_session", "_text_editing", "_text_placement",
             "_gradient_preview_active", "_render_excluded_object_id", "_page_gap_draft",
             "_fill_gesture_active", "_text_property_drag", "_shape_property_drag",
-            "_raster_paste_overlay",
+            "_raster_paste_overlay", "_overlay_color_preview",
         )) or getattr(self, "_selection_before_tiles", None) is not None
 
     def _collect_document_projection(self, phase=None):

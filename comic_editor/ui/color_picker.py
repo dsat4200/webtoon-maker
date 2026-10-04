@@ -808,6 +808,7 @@ class ColorPickerPopup(QDialog):
     """Transactional Picker/Palette/History dialog with canvas sampling."""
 
     colorApplied = Signal(str)
+    colorPreviewed = Signal(str)
 
     def __init__(
         self,
@@ -873,6 +874,10 @@ class ColorPickerPopup(QDialog):
             self.picker = self.workspace.panel.picker
             self.workspace.panel.eyedropperRequested.connect(self._sample)
             self.workspace.enable_draft_palette_edits()
+            panel = self.workspace.panel
+            panel.colorChanged.connect(lambda _slot, color: self.colorPreviewed.emit(color))
+            panel.activeSlotChanged.connect(lambda _slot: self.colorPreviewed.emit(panel.active_color()))
+            panel.colorsSwapped.connect(lambda _primary, _secondary: self.colorPreviewed.emit(panel.active_color()))
             self._initial_color = initial
         if not self._sampling:
             host = self._host()
@@ -1035,10 +1040,12 @@ class ColorWorkspace(QTabWidget):
         self.palettes.set_palettes(palettes, active)
 
 
-def choose_color(parent, color, callback, title="Choose color"):
+def choose_color(parent, color, callback, title="Choose color", *, preview=None):
     popup = ColorPickerPopup(color, parent)
     popup.setWindowTitle(title)
     popup.colorApplied.connect(callback)
+    if preview is not None:
+        popup.colorPreviewed.connect(preview)
     popup.setAttribute(Qt.WA_DeleteOnClose)
     popup.open()
     return popup

@@ -85,6 +85,24 @@ def test_malformed_manifest_and_changed_environment_are_cache_misses(tmp_path):
     reopened.close()
 
 
+def test_obsolete_raster_frame_renderer_cache_is_not_reused(tmp_path, monkeypatch):
+    from comic_editor.render import cache as storage
+    image = QImage(8, 8, QImage.Format_ARGB32_Premultiplied)
+    image.fill(QColor("white"))  # Missing raster pixels captured by the old renderer.
+    with monkeypatch.context() as patch:
+        patch.setattr(storage, "RENDERER_VERSION", "native-artwork-1")
+        cache = PersistentRenderCache(tmp_path)
+        with cache.record():
+            cache.retain("projection", ("tile", 0), image)
+        cache.close()
+    reopened = PersistentRenderCache(tmp_path)
+    try:
+        assert not reopened.entries
+        assert reopened.lookup("projection", ("tile", 0), wait=True) is None
+    finally:
+        reopened.close()
+
+
 @pytest.mark.parametrize("wait", [False, True])
 def test_completed_effect_read_survives_source_read_pressure(tmp_path, monkeypatch, wait):
     import comic_editor.render.cache as storage

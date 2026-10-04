@@ -244,6 +244,22 @@ A tone mask is a chapter-level grayscale field. `render_tone_mask_field()` sums 
 
 Canvas-side caches (`_modifier_render_cache`, `_modifier_source_cache`, 64 MiB each) key by layer/object signatures that include pixel cache keys, selection transform preview quads, and eraser previews. Parameter, focal-rig, intensity, and mask edits reuse the isolated source render.
 
+Solid color overlay picker edits use a transient modifier value copy through
+`effective_preview_modifier()`. The picker forwards color, alpha, hex, palette,
+history and active-well changes; a 16 ms single-shot timer coalesces pending
+colors without restarting on each input. Preview publication invalidates the
+canvas and signals `visualChanged`, retaining unchanged source captures without
+changing saved artwork or undo history. Apply retires the pending timer and
+commits the latest picker color as one command; Cancel or inspector destruction
+retires the preview. Document/history replacement guards reject stale edits.
+The ordinary native preview path and live-preview disk-cache exclusion apply.
+`tests/test_overlay_modifiers.py` checks warm cache edits, visible picker input,
+preview/commit pixel equality, source reuse, cancellation, undo/redo, queued
+final input and inspector deletion. On 2026-10-04, 24 warm color edits of a
+1000×700 shape on a 1200×900 raster canvas at zoom 1 rendered in a median
+32.83 ms (p95 37.63 ms), excluding the timer delay, with two retained source
+entries. Sampling and color/precision contracts are unchanged.
+
 `ui/translation_cache.py` supplies relative-placement aliases through the same
 effect-cache accessors and optional disk backing. Aliases include source pixels,
 the subtree's geometry/effects/masks, native capture phase, linear mapping,
@@ -364,6 +380,16 @@ For a selected Raster, Fill inverse-maps the pointer through its persistent quad
 ### Raster rendering and transforms
 
 Normal raster rendering translates by object `(x, y)`, queries only tiles intersecting the local visible rectangle, and draws each image at `tile_index × 256`.
+
+Transformed raster queries inverse-map visibility to the original sparse tile
+grid without intersecting `interaction_rect`. That editing frame can contain
+destination-space bounds after the first transform; filtering source tiles by
+it hides valid artwork and makes stroke-driven frame expansion reveal stale
+projection tiles in square chunks. `tests/test_raster_transform_visibility.py`
+covers Free/Uniform handle commits, drawing across tile boundaries afterward,
+undo/redo, save/reopen and bounded source queries. The shared disk renderer
+identity is `native-artwork-2`, so incomplete captures from the older renderer
+are ordinary cache misses. Original pixels and nearest sampling are preserved.
 
 - Translation preview simply offsets drawing. Commit changes object position and preserves tile images.
 - Projective/scale/rotation preview maps the original interaction rectangle to a destination quad with `QTransform.quadToQuad`; the stored `transform_frame`/`transform_quad` pair renders through the same projective transform.

@@ -29,7 +29,8 @@ from .service import RenderPending
 
 
 CACHE_VERSION = 1
-RENDERER_VERSION = "native-artwork-1"
+# Earlier captures could omit transformed raster tiles outside the edit frame.
+RENDERER_VERSION = "native-artwork-2"
 MAX_PAYLOAD = 512 * 1024 * 1024
 WRITE_BUDGET = 64 * 1024 * 1024
 READ_BUDGET = 64 * 1024 * 1024

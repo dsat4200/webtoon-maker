@@ -1,5 +1,7 @@
 """Texture and solid-color overlay controls."""
+from copy import copy
 from concurrent.futures import ThreadPoolExecutor
+from shiboken6 import isValid
 
 from PySide6.QtCore import QTimer, QSignalBlocker
 from PySide6.QtGui import QColor
@@ -76,6 +78,12 @@ class OverlayControls(QWidget):
             self.color.setObjectName("overlayColor")
             self._set_color(modifier.color)
             self.color.clicked.connect(self._choose_color)
+            self._color_timer = QTimer(self)
+            self._color_timer.setSingleShot(True)
+            self._color_timer.setInterval(16)
+            self._color_timer.timeout.connect(self._flush_color_preview)
+            self._color_edit = None
+            self._pending_color = None
             layout.addWidget(QLabel("Color", self))
             layout.addWidget(self.color)
         self.outline = QCheckBox("Apply to outline", self)
@@ -143,7 +151,74 @@ class OverlayControls(QWidget):
 
     def _choose_color(self):
         from comic_editor.ui.color_picker import choose_color
+        canvas = self.owner.canvas
+        modifier = canvas.chapter.modifiers.get(self.modifier.modifier_id) if canvas.chapter else None
+        if modifier is not self.modifier or canvas.command_stack.read_only:
+            return
+        self._color_edit = (canvas.chapter, modifier, copy(modifier),
+                            getattr(canvas, "_history_generation", 0))
         def apply(value):
+            valid = self._color_edit_valid()
+            self._finish_color_preview()
+            if not valid:
+                return
             self._set_color(value)
             self.owner.set_parameter(self.modifier.modifier_id, "color", value, True)
-        self._popup = choose_color(self, self.modifier.color, apply, "Overlay color")
+        self._popup = choose_color(self, modifier.color, apply, "Overlay color",
+                                   preview=self._preview_color)
+        self._popup.finished.connect(self._finish_color_preview)
+        # Inspector rebuilds can delete a popup without a finished signal.
+        edit = self._color_edit
+        def cleanup():
+            if isValid(canvas) and getattr(canvas, "_overlay_color_preview", None) is edit:
+                canvas._overlay_color_preview = None
+                canvas._invalidate_scene_cache()
+                canvas.update()
+                canvas.visualChanged.emit(None)
+        self._popup.destroyed.connect(cleanup)
+
+    def _color_edit_valid(self):
+        edit, canvas = self._color_edit, self.owner.canvas
+        return bool(isValid(canvas) and edit is not None and canvas.chapter is edit[0]
+                    and canvas.chapter.modifiers.get(edit[1].modifier_id) is edit[1]
+                    and getattr(canvas, "_history_generation", 0) == edit[3]
+                    and not canvas.command_stack.read_only)
+
+    def _preview_color(self, value):
+        if self._color_edit_valid():
+            self._pending_color = value
+            self._set_color(value)
+            if not self._color_timer.isActive():
+                self._color_timer.start()
+
+    def _flush_color_preview(self):
+        value, self._pending_color = self._pending_color, None
+        if value is None or not self._color_edit_valid():
+            return
+        preview = self._color_edit[2]
+        if preview.color == value:
+            return
+        preview.color = value
+        preview.validate()
+        canvas = self.owner.canvas
+        canvas._overlay_color_preview = self._color_edit
+        canvas._invalidate_scene_cache()
+        canvas.update()
+        canvas.visualChanged.emit(None)
+
+    def _finish_color_preview(self, *_):
+        self._color_timer.stop()
+        self._pending_color = None
+        edit, self._color_edit = self._color_edit, None
+        canvas = self.owner.canvas
+        if not isValid(canvas):
+            return
+        if getattr(canvas, "_overlay_color_preview", None) is edit and edit is not None:
+            canvas._overlay_color_preview = None
+            canvas._invalidate_scene_cache()
+            canvas.update()
+            canvas.visualChanged.emit(None)
+        if canvas.chapter is not None:
+            modifier = canvas.chapter.modifiers.get(self.modifier.modifier_id)
+            if modifier is not None:
+                self._set_color(modifier.color)

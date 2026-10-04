@@ -92,6 +92,11 @@ def transform_modifier_rig(canvas, modifier, transform):
 
 def effective_preview_modifier(canvas, modifier):
     """Return a transformed value copy for a wholly moving set of owners."""
+    color_edit = getattr(canvas, "_overlay_color_preview", None)
+    if (color_edit is not None and canvas.chapter is color_edit[0]
+            and modifier is color_edit[1]
+            and getattr(canvas, "_history_generation", 0) == color_edit[3]):
+        return color_edit[2]
     from comic_editor.ui.attached_translation import preview_attachment_context, translation
     if not isinstance(modifier, _RIG_TYPES):
         return modifier
