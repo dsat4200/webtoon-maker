@@ -8917,7 +8917,14 @@ class _CanvasLogic(LassoBrushFeatures, BrushFeatures, DocumentProjectionFeatures
         if thumbnail_scale < 1.:
             bounds = QTransform.fromScale(1/thumbnail_scale, 1/thumbnail_scale).mapRect(bounds)
         if not source_provisional:
-            translation_cache.put(self, move_key, image, move_revision)
+            # A tile-graph crop can be smaller than the reference plan's full
+            # spatial stage (e.g. Smudge). The alias restores that planned
+            # placement, so admitting a crop would stretch it over the frame.
+            # Ordinary tile caches already retain crops with their own bounds.
+            if move_key is not None:
+                move_bounds = move_plan.targets[-1] if move_plan.targets else capture_bounds
+                if bounds == move_bounds:
+                    translation_cache.put(self, move_key, image, move_revision)
         if target.opacity_mask is not None:
             from comic_editor.ui.viewport_masking import mask_output
             image, bounds = mask_output(

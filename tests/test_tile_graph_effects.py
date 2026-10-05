@@ -22,6 +22,44 @@ def enable(scene):
     scene._projection_exact = True
 
 
+@pytest.mark.parametrize('reverse', [False, True])
+def test_regional_smudged_image_reuse_keeps_pixel_placement(scene, monkeypatch, reverse):
+    from PySide6.QtGui import QPainter
+    from comic_editor.core.models import ImageObject
+    from comic_editor.ui.effect_pipeline import empty_image
+    from test_smudge_rendering import modifier, stroke
+    quad = [(25, 45), (590, 90), (555, 650), (40, 600)]
+    obj = scene.chapter.add_object(scene.chapter.root_page_ids[0], ImageObject(
+        pixel_width=530, pixel_height=403, placement_mode='free', transform_quad=quad))
+    scene.images.put_decoded(obj.object_id, 'sample.png', b'', image())
+    modifiers = [OutlineModifier(thickness=7), modifier(stroke(start=(100, 150), end=(300, 280)))]
+    for effect in reversed(modifiers) if reverse else modifiers:
+        scene.chapter.add_modifier(effect, [('object', obj.object_id)])
+    enable(scene)
+    def render(region):
+        scene._effect_viewport_world = region
+        result = empty_image(region)
+        painter = QPainter(result)
+        painter.setRenderHint(QPainter.Antialiasing, True)
+        painter.translate(-region.x(), -region.y())
+        try:
+            scene._render_modified_object(painter, obj, 1., region)
+        finally:
+            painter.end()
+        return result
+    regions = [QRectF(0, 0, 300, 256), QRectF(0, 256, 300, 256),
+               QRectF(256, 0, 300, 512), QRectF(0, 0, 700, 750)]
+    with monkeypatch.context() as patch:
+        patch.setattr('comic_editor.ui.translation_cache.get', lambda *_: None)
+        patch.setattr('comic_editor.ui.translation_cache.put', lambda *_: None)
+        expected = [render(region) for region in regions]
+    monkeypatch.setattr(scene, '_render_object_content',
+        lambda *_: pytest.fail('Completed regional pixels were recaptured'))
+    for region, reference in zip(regions, expected):
+        assert render(region) == reference
+        assert render(region) == reference
+
+
 def test_independent_pending_tiles_fill_workers_without_publishing_an_incomplete_region(scene, monkeypatch):
     from threading import Lock
     from comic_editor.render.blur_regions import RegionalBlur

@@ -273,6 +273,13 @@ Fractional placement changes recapture parent-space artwork; raster-local
 effects retain their original grid and are placed after processing. Drafts and
 live previews still cannot enter the durable exact cache.
 
+Translation aliases admit stage outputs only when their actual bounds match
+the reference plan's final placement. A tile-graph crop of a retained spatial
+stage (such as Outline followed by Smudge) keeps its ordinary regional cache
+identity; it must never be restored across the complete stage frame. The
+`native-artwork-3` renderer identity excludes older durable aliases/projection
+tiles that could contain this placement error. Sampling density is unchanged.
+
 `tests/test_attached_translation.py` compares moved previews/commits against
 cold native renders for focal blur, Array, Mirror, Radial Blur, deformed cages,
 twirl, mesh warp and smudge, plus nested effects and painted/limited-gradient
@@ -388,7 +395,7 @@ it hides valid artwork and makes stroke-driven frame expansion reveal stale
 projection tiles in square chunks. `tests/test_raster_transform_visibility.py`
 covers Free/Uniform handle commits, drawing across tile boundaries afterward,
 undo/redo, save/reopen and bounded source queries. The shared disk renderer
-identity is `native-artwork-2`, so incomplete captures from the older renderer
+identity is `native-artwork-3`, so incomplete or misplaced captures from older renderers
 are ordinary cache misses. Original pixels and nearest sampling are preserved.
 
 - Translation preview simply offsets drawing. Commit changes object position and preserves tile images.
