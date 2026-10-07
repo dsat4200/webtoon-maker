@@ -367,7 +367,7 @@ def test_series_colors_and_palette_mutations_autosave(qapp, tmp_path):
         assert window.canvas.secondary_color == "#40AABBCC"
 
         window.color_panel.apply_color("#C0102030")
-        window._flush_series_preferences()
+        window._flush_series_preferences(wait=True)
         restored = repository.load_series()
         assert restored.primary_color == "#C0102030"
 
@@ -376,6 +376,7 @@ def test_series_colors_and_palette_mutations_autosave(qapp, tmp_path):
         assert len(series.palettes) == old_count + 1
         palette = series.palettes[-1]
         window._add_palette_swatch(palette.palette_id, "#4000FF00")
+        window._flush_series_preferences(wait=True)
         restored = repository.load_series()
         assert restored.palettes[-1].swatches[-1].color == "#4000FF00"
     finally:

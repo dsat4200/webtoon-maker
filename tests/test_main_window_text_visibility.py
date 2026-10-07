@@ -11,7 +11,7 @@ from comic_editor.ui.main_window import MainWindow
 
 
 @pytest.fixture
-def text_window(qapp, monkeypatch, text_outline_font_family):
+def text_window(qapp, monkeypatch, text_outline_font_family, wait_scene):
     monkeypatch.setattr("comic_editor.ui.main_window.save_settings", lambda _: None)
     window = MainWindow()
     window.resize(1280, 900)
@@ -24,6 +24,7 @@ def text_window(qapp, monkeypatch, text_outline_font_family):
     page.fill_color, page.border_width = None, 0
     window._set_chapter(chapter, TileStore())
     window._test_font_family = text_outline_font_family
+    window.canvas._test_wait_scene = wait_scene
     window.show()
     qapp.processEvents()
     yield window
@@ -67,6 +68,7 @@ def capture(canvas, qapp):
     canvas._text_caret_timer.stop()
     canvas._text_caret_visible = False
     qapp.processEvents()
+    canvas._test_wait_scene(canvas)
     return canvas.grab().toImage()
 
 

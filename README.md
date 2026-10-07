@@ -508,7 +508,7 @@ To install and connect it:
 
 1. Install Blender 5.2 LTS on Windows (4.5 LTS is also supported).
 2. Run `blender_extension/webtoon_comic_views/build.ps1`, or use the already
-   built `blender_extension/webtoon_comic_views-0.8.0.zip`.
+   built `blender_extension/webtoon_comic_views-0.8.1.zip`.
 3. In Blender, choose **Edit → Preferences → Get Extensions → Install from
    Disk**, select the ZIP, and enable **Webtoon Comic Views**.
 4. In a 3D View, open the **Comic Views** sidebar. Create, Save, and Render views and

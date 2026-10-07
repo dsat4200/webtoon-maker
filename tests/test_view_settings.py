@@ -128,7 +128,7 @@ def test_export_rect_preserves_geometry_and_supports_move_resize_and_undo(qapp, 
 
 
 @pytest.mark.parametrize("command", ["_export_again", "_export_png"])
-def test_cropped_export_asks_first_and_keeps_original_destination(qapp, tmp_path, monkeypatch, command):
+def test_cropped_export_asks_first_and_keeps_original_destination(qapp, tmp_path, monkeypatch, command, wait_outputs):
     original = tmp_path / "texture.png"
     image = QImage(70, 50, QImage.Format.Format_ARGB32_Premultiplied)
     image.fill(QColor("red"))
@@ -145,6 +145,7 @@ def test_cropped_export_asks_first_and_keeps_original_destination(qapp, tmp_path
         monkeypatch.setattr(QFileDialog, "getSaveFileName", lambda *args: (
             requests.append(args) or (str(destination), "PNG image (*.png)")))
         getattr(window, command)()
+        wait_outputs(window)
         assert len(requests) == 1
         assert original.read_bytes() == normal_bytes
         assert QImage(str(destination)).size().toTuple() == (25, 30)
@@ -153,6 +154,7 @@ def test_cropped_export_asks_first_and_keeps_original_destination(qapp, tmp_path
         assert window.settings.export_destinations[normal_key] == str(original)
         assert window.settings.export_destinations[rect_key] == str(destination)
         window._export_again()
+        wait_outputs(window)
         assert len(requests) == 1
         window.canvas.set_export_rect_enabled(False)
         assert window._export_destination_key() == normal_key
@@ -248,30 +250,38 @@ def test_undo_model_patch_cancels_export_editor_safely(qapp):
         canvas.deleteLater()
 
 
-def test_overflow_remains_visible_and_moves_during_live_raster_transform(qapp):
+def test_overflow_remains_visible_and_moves_during_live_raster_transform(qapp, wait_scene, monkeypatch):
     from comic_editor.ui.canvas import ToolKind
     canvas, chapter, obj = scene(qapp, raster=True)
+    monkeypatch.setattr(canvas, '_draw_selection', lambda *_args: None)
+    def visible_pixel(world):
+        wait_scene(canvas)
+        point = canvas.camera_transform().map(QPointF(*world)).toPoint()
+        return canvas.grab().toImage().pixelColor(point)
     try:
         canvas.set_selection("object", obj.object_id)
         canvas.set_tool(ToolKind.TRANSFORM)
         canvas.set_view_overflow(1)
-        point = canvas.camera_transform().map(QPointF(-10, 70)).toPoint()
-        assert canvas.grab().toImage().pixelColor(point) == QColor("red")
+        assert visible_pixel((-10, 70)) == QColor("red")
         assert canvas._begin_selected_raster_transform(QPointF(30, 70))
-        assert canvas.grab().toImage().pixelColor(point) == QColor("red")
+        assert visible_pixel((-10, 70)) == QColor("red")
         canvas._update_transform_preview(QPointF(30, 90))
         canvas.grab()
-        assert pixel(canvas, (-10, 70)) == QColor("#242428")
-        assert pixel(canvas, (-10, 90)) == QColor("red")
+        assert visible_pixel((-10, 70)) == QColor("#242428")
+        assert visible_pixel((-10, 90)) == QColor("red")
         canvas._clear_transform_preview()
     finally:
         canvas.deleteLater()
 
 
-def test_overflow_keeps_other_vector_ink_visible_during_live_eraser(qapp):
+def test_overflow_keeps_other_vector_ink_visible_during_live_eraser(qapp, wait_scene):
     from comic_editor.core.models import VectorDrawingObject, VectorStroke, VectorStrokePoint
     from comic_editor.ui.canvas import ToolKind
     canvas, chapter, original = scene(qapp)
+    def visible_pixel(world):
+        wait_scene(canvas)
+        point = canvas.camera_transform().map(QPointF(*world)).toPoint()
+        return canvas.grab().toImage().pixelColor(point)
     original.visible = False
     strokes = [VectorStroke(color="#FFFF0000", points=[
         VectorStrokePoint(x=0, y=y, width=10),
@@ -284,12 +294,12 @@ def test_overflow_keeps_other_vector_ink_visible_during_live_eraser(qapp):
         canvas.set_tool(ToolKind.RASTER_ERASER)
         canvas.set_view_overflow(1)
         canvas.grab()
-        assert pixel(canvas, (-10, 70)) == QColor("red")
-        assert pixel(canvas, (-10, 90)) == QColor("red")
+        assert visible_pixel((-10, 70)) == QColor("red")
+        assert visible_pixel((-10, 90)) == QColor("red")
         canvas._begin_vector_gesture(obj, QPointF(50, 70), 1.0)
         canvas.grab()
-        assert pixel(canvas, (-10, 70)) == QColor("#242428")
-        assert pixel(canvas, (-10, 90)) == QColor("red")
+        assert visible_pixel((-10, 70)) == QColor("#242428")
+        assert visible_pixel((-10, 90)) == QColor("red")
         canvas._finish_vector_eraser(obj)
     finally:
         canvas.deleteLater()

@@ -245,13 +245,19 @@ def test_displacement_map_is_embedded_and_presets_remain_portable(editor, tmp_pa
     assert apply_modifier_preset(DistortModifier(modifier_type="distort_displace"), preset).parameters == modifier.parameters
 
 
-def test_load_beneath_commits_captured_map(editor, monkeypatch):
+def test_load_beneath_commits_captured_map(editor, monkeypatch, qapp):
     canvas, controls, _layer, _objects = editor
     controls.add_modifier("distort_displace")
     modifier = canvas.chapter.modifiers[canvas.active_modifier_id]
     calls = []
-    monkeypatch.setattr(canvas, "capture_distort_beneath", lambda mid: (calls.append(mid), "encoded-test-map")[1], raising=False)
+    monkeypatch.setattr('comic_editor.render.source_sampling.distort_beneath',
+                        lambda snapshot, mid: (calls.append(mid), 'encoded-test-map')[1])
     controls.findChild(QPushButton, "distortLoadBeneath").click()
+    import time
+    deadline = time.monotonic()+15
+    while modifier.parameters.get('map_png') != 'encoded-test-map' and time.monotonic() < deadline:
+        qapp.processEvents()
+        time.sleep(.002)
     assert calls == [modifier.modifier_id]
     assert modifier.parameters["map_png"] == "encoded-test-map"
     assert modifier.parameters["map_source"] == "embedded"

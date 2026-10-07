@@ -6,6 +6,7 @@ from PySide6.QtCore import QPointF
 from PySide6.QtGui import QPolygonF, QTransform
 
 from comic_editor.core.texture_library import texture_image
+from comic_editor.render.pixels import current_contract, import_image
 
 
 def transformed_texture(modifier, width, height, origin, world_to_image):
@@ -20,6 +21,8 @@ def transformed_texture(modifier, width, height, origin, world_to_image):
     decoded = texture_image(modifier.texture_data, sample_w, sample_h)
     if decoded.isNull():
         return None, None
+    if current_contract().floating:
+        decoded = import_image(decoded, current_contract())
     source = _qimage_premultiplied(decoded)
     unit = QPolygonF([QPointF(0, 0), QPointF(1, 0), QPointF(1, 1), QPointF(0, 1)])
     inverse, valid = QTransform.quadToQuad(unit, world_quad).inverted()

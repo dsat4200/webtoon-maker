@@ -36,6 +36,14 @@ def pixels(store, object_id):
     return {key: bytes(image.constBits()) for key, image in store.object_tiles(object_id).items()}
 
 
+def wait_brush(canvas, qapp):
+    deadline = time.monotonic() + 10
+    while canvas._paint_brush_tile_input is not None and time.monotonic() < deadline:
+        qapp.processEvents()
+        time.sleep(.002)
+    assert canvas._paint_brush_tile_input is None
+
+
 def render_preview(qapp,preview):
     from comic_editor.ui.brush_preview_queue import preview_queue
     preview.window().show()
@@ -614,6 +622,7 @@ def test_active_secondary_is_drawing_color_and_transparent_subcolor_is_not_erase
     canvas.primary_color, canvas.secondary_color = "#FFFF0000", "#00FFFFFF"
     canvas._begin_paint_brush(QPointF(80, 80), 1)
     canvas._finish_paint_brush()
+    wait_brush(canvas, qapp)
     image = canvas.tiles.tile(raster.object_id, (0, 0))
     assert image.pixelColor(70, 80).name() == "#ff0000"
     assert image.pixelColor(90, 80) == QColor("blue")
@@ -641,6 +650,7 @@ def test_transparent_color_erases_only_black_part_of_two_color_tip(qapp, slot):
     canvas.active_color_slot = slot
     canvas._begin_paint_brush(QPointF(80, 80), 1)
     canvas._finish_paint_brush()
+    wait_brush(canvas, qapp)
     image = canvas.tiles.tile(raster.object_id, (0, 0))
     assert image.pixelColor(70, 80).alpha() == 0
     assert image.pixelColor(90, 80) == QColor("blue")
@@ -666,6 +676,7 @@ def test_secondary_drawing_color_paints_both_parts_of_two_color_tip(qapp):
     canvas.active_color_slot = "secondary"
     canvas._begin_paint_brush(QPointF(80, 80), 1)
     canvas._finish_paint_brush()
+    wait_brush(canvas, qapp)
     image = canvas.tiles.tile(raster.object_id, (0, 0))
     assert image.pixelColor(70, 80) == QColor("#00ff00")
     assert image.pixelColor(90, 80) == QColor("#00ff00")
@@ -780,7 +791,7 @@ def test_brush_save_finishes_contact_and_roundtrips_pixels(qapp, tmp_path):
         canvas.set_tool(ToolKind.BRUSH)
         canvas._begin_paint_brush(QPointF(30, 30), 1)
         canvas._continue_paint_brush(QPointF(200, 70), .5)
-        assert window.save()
+        assert window.save(wait=True)
         assert canvas._paint_brush_stroke is None
         loaded, tiles = repository.load_chapter(canvas.chapter.chapter_id)
         assert pixels(tiles, raster.object_id) == pixels(canvas.tiles, raster.object_id)
@@ -815,6 +826,12 @@ def test_autosave_defers_active_brush_until_committed(qapp, tmp_path, monkeypatc
         assert canvas._paint_brush_stroke is not None
         canvas._finish_paint_brush()
         window._autosave()
+        # Recovery captures are staged on the owner thread before submission.
+        import time
+        deadline = time.monotonic() + 20
+        while not submitted and time.monotonic() < deadline:
+            qapp.processEvents()
+            time.sleep(.002)
         assert len(submitted) == 1
         assert submitted[0].revision == window.active_session.edit_revision
     finally:
@@ -849,6 +866,10 @@ def test_clear_during_brush_contact_cannot_restore_cached_paint(qapp, selected_r
         assert painted != original
         window._clear_canvas()
         assert canvas._paint_brush_stroke is None
+        deadline = time.monotonic() + 10
+        while store.content_bounds(raster.object_id) is not None and time.monotonic() < deadline:
+            qapp.processEvents()
+            time.sleep(.002)
         assert store.content_bounds(raster.object_id) is None
         canvas._continue_paint_brush(QPointF(90, 30), 1)
         canvas._finish_paint_brush()
@@ -990,6 +1011,8 @@ def test_renderer_error_restores_transaction_without_dirty_signal(qapp, monkeypa
     canvas.set_tool(ToolKind.BRUSH)
     commits = []
     canvas.documentChanged.connect(commits.append)
+    errors = []
+    canvas.operationError.connect(lambda title, message: errors.append((title, message)))
     frame = raster.interaction_rect
     enabled = gc.isenabled()
     original = RasterBrushStroke.add
@@ -1000,8 +1023,12 @@ def test_renderer_error_restores_transaction_without_dirty_signal(qapp, monkeypa
 
     monkeypatch.setattr(RasterBrushStroke, "add", failing)
     canvas._begin_paint_brush(QPointF(30, 30), 1)
-    with pytest.raises(ValueError, match="material failure"):
-        canvas._continue_paint_brush(QPointF(400, 300), 1)
+    canvas._continue_paint_brush(QPointF(400, 300), 1)
+    deadline = time.monotonic() + 10
+    while not errors and time.monotonic() < deadline:
+        qapp.processEvents()
+        time.sleep(.002)
+    assert len(errors) == 1 and "material failure" in errors[0][1]
     assert not canvas._drawing and canvas._paint_brush_stroke is None
     assert canvas.tiles.content_bounds(raster.object_id) is None
     assert raster.interaction_rect == frame

@@ -216,14 +216,14 @@ class DistortFeatures(SmudgeFeatures):
         if kind == "pins":
             mode = getattr(self, "distort_pin_mode", "move")
             if hit is not None and mode == "remove":
-                before = self.chapter.to_dict()
+                before = self._modifier_record_snapshot(modifier)
                 del modifier.points[hit]
                 del modifier.source_points[hit]
                 self._distort_changed()
-                self.push_model_change(before, self.chapter.to_dict(), "Remove deform pin")
+                self.push_model_change(before, before.after(self.chapter), "Remove deform pin")
                 return True
             if hit is None and (mode == "add" or not modifier.points) and QRectF(*modifier.frame).contains(world):
-                before = self.chapter.to_dict()
+                before = self._modifier_record_snapshot(modifier)
                 normalized = self._distort_normalized_point(modifier, world)
                 modifier.points.append(normalized)
                 modifier.source_points.append(normalized)
@@ -233,14 +233,14 @@ class DistortFeatures(SmudgeFeatures):
             return False
         self._commit_text_edit()
         self._modifier_handle_drag = {"distort": modifier.modifier_id, "handle": hit,
-            "before": before or self.chapter.to_dict(), "center": modifier.center,
+            "before": before or self._modifier_record_snapshot(modifier), "center": modifier.center,
             "press": world, "source": getattr(self, "distort_edit_source", False)}
         return True
 
     def _distort_changed(self):
-        self._invalidate_scene_cache()
-        self.documentChanged.emit(None)
-        self.update()
+        modifier = self._active_distort_modifier()
+        if modifier is not None:
+            self._modifier_preview_changed(modifier)
 
     def _move_distort_handle(self, point, pressure=None):
         state = self._modifier_handle_drag

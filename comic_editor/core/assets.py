@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import copy
 import math
 import shutil
 import time
@@ -135,11 +136,11 @@ def _translate_layer(layer: LayerNode, dx: float, dy: float) -> None:
 
 
 def _copy_layer(layer: LayerNode) -> LayerNode:
-    return LayerNode.from_dict(layer.to_dict())
+    return LayerNode.from_dict(copy.deepcopy(layer).to_dict())
 
 
 def _copy_object(obj: DocumentObject) -> DocumentObject:
-    return object_from_dict(obj.to_dict())
+    return object_from_dict(copy.deepcopy(obj).to_dict())
 
 
 def _clone_referenced_modifiers(
@@ -156,7 +157,7 @@ def _clone_referenced_modifiers(
     }
     identifier_map: dict[str, str] = {}
     for old_id in referenced:
-        clone = modifier_from_dict(source.modifiers[old_id].to_dict())
+        clone = modifier_from_dict(copy.deepcopy(source.modifiers[old_id]).to_dict())
         clone.modifier_id = new_id()
         if isinstance(clone, HalftoneModifier):
             clone.target_layer_id = layer_map.get(clone.target_layer_id,
@@ -214,7 +215,7 @@ def _clone_referenced_masks(
                 "copied subtree. Detach those contributors or rasterize "
                 "the result before copying it as an asset."
             )
-        clone = ToneMask.from_dict(source_mask.to_dict())
+        clone = ToneMask.from_dict(copy.deepcopy(source_mask).to_dict())
         clone.mask_id = new_id()
         clone.name = ""
         clone.saved = False
@@ -642,6 +643,7 @@ def extract_asset(
     asset = ChapterDocument(
         name=name.strip() or "Asset", width=512, height=512,
         background="#00000000", document_kind="asset",
+        pixel_contract=document.pixel_contract,
     )
     container = LayerNode(
         name="Asset Canvas", is_page=True,

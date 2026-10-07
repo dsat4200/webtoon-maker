@@ -1,6 +1,8 @@
 from __future__ import annotations
 
-from PySide6.QtCore import QBuffer, QByteArray, QIODevice, QMimeData, QPointF, QRectF, Qt
+import time
+
+from PySide6.QtCore import QCoreApplication, QBuffer, QByteArray, QIODevice, QMimeData, QPointF, QRectF, Qt
 from PySide6.QtGui import QColor, QImage, QPainterPath, QTransform
 
 from comic_editor.core.assets import entity_visual_bounds
@@ -16,6 +18,15 @@ from comic_editor.ui.clipboard_history import (
     ClipboardImageHistory, HistoryEntry, capture_object, drawing_at, paste_object,
 )
 from comic_editor.ui.main_window import MainWindow
+
+
+def wait_outliner(window):
+    deadline = time.monotonic()+10
+    while (window.canvas._scene_consumers.contains(('outliner-copy',))
+           or window.canvas._scene_consumers.contains(('outliner-duplicate',))):
+        QCoreApplication.processEvents()
+        time.sleep(.002)
+        assert time.monotonic() < deadline
 
 
 def _png(width=40, height=20, color="red"):
@@ -120,6 +131,7 @@ def test_object_subtree_pastes_across_scenes_with_independent_resources_and_undo
     vector.modifier_ids = [modifier.modifier_id]
     try:
         assert window._copy_outliner_object("layer", layer.layer_id)
+        wait_outliner(window)
         payload = window._object_clipboard
         target = ChapterDocument(height=600)
         target_page = target.add_page()
@@ -157,6 +169,7 @@ def test_duplicate_container_is_sibling_with_same_world_bounds(qapp):
     try:
         before = entity_visual_bounds(chapter, window.canvas.tiles, "layer", layer.layer_id, include_effects=True)
         assert window._duplicate_outliner_object("layer", layer.layer_id), window.statusBar().currentMessage()
+        wait_outliner(window)
         duplicate = chapter.layers[window.canvas.selected_id]
         assert duplicate.parent_id == page.layer_id
         assert [child.entity_id for child in page.children][:2] == [duplicate.layer_id, layer.layer_id]
@@ -190,6 +203,7 @@ def test_duplicate_root_page_preserves_children_and_world_translation(qapp):
     try:
         before = entity_visual_bounds(chapter, window.canvas.tiles, "layer", page.layer_id, include_effects=True)
         assert window._duplicate_outliner_object("layer", page.layer_id), window.statusBar().currentMessage()
+        wait_outliner(window)
         duplicate = chapter.layers[window.canvas.selected_id]
         assert duplicate.is_page and duplicate.parent_id is None
         assert chapter.root_page_ids == [duplicate.layer_id, page.layer_id]
@@ -229,6 +243,7 @@ def test_object_history_releases_large_decoded_image_cache(qapp):
         identifier = window.canvas.place_image_sources(
             [("solid.png", "image/png", data)], layer.layer_id, QPointF(200, 200))[0]
         assert window._copy_outliner_object("object", identifier)
+        wait_outliner(window)
         entry = window.clipboard_image_history.entries[0]
         assert entry.kind == "object"
         assert entry.byte_size < 1024 * 1024
@@ -271,6 +286,7 @@ def test_copy_masked_object_carries_editable_sibling_dependencies(qapp):
     target.opacity_mask = ParameterMaskBinding(mask.mask_id, 0, 1)
     try:
         assert window._copy_outliner_object("object", target.object_id), window.statusBar().currentMessage()
+        wait_outliner(window)
         assert mask.contributors == [("object", contributor.object_id)]
         assert len(window._object_clipboard.dependencies) == 1
         scene = ChapterDocument()

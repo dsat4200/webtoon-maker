@@ -200,7 +200,7 @@ class SpatialModifierFeatures:
             return False
         self._commit_text_edit()
         self._modifier_handle_drag = {"radial": modifier.modifier_id, "handle": hit,
-            "before": self.chapter.to_dict(), "center": modifier.center,
+            "before": self._modifier_record_snapshot(modifier), "center": modifier.center,
             "press": self.widget_to_document(point)}
         return True
 
@@ -236,7 +236,7 @@ class SpatialModifierFeatures:
         # position. Keep finished images while canceling obsolete snapshots.
         self._effect_jobs.cancel(clear_retained=False)
         self._projection_work_waiting = False
-        self.documentChanged.emit(None)
+        self._modifier_preview_changed(modifier)
         # Only this revision may keep the previous view while exact radial
         # work finishes, including the final repaint after mouse/pen release.
         self._radial_effect_revision = (id(self.chapter), self._document_projection.revision)

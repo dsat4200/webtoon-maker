@@ -6,7 +6,6 @@ import copy
 import math
 
 from PySide6.QtCore import QBuffer, QByteArray, QIODevice, QRectF
-from PySide6.QtGui import QImage
 
 from comic_editor.core.models import DistortModifier, GradientObject
 
@@ -85,37 +84,34 @@ def _capture_plan(canvas, target):
 
 
 def _capture_renderer(canvas, chapter, plan):
-    # A private software renderer owns all temporary effect/mask/geometry caches.
-    # Keeping the live canvas untouched also leaves its in-flight jobs intact.
-    from comic_editor.ui.canvas import CanvasWidget
+    from dataclasses import replace
+    from comic_editor.render.outputs import capture_document
+    from comic_editor.render.scene import DetachedSceneBackend, EvaluatedScene
 
-    class BeneathRenderer(CanvasWidget):
+    class BeneathRenderer(EvaluatedScene):
         def _independent_source(self):
             return bool(getattr(self, "_rendering_mask_contributor", 0)
                         or getattr(self, "_rendering_halftone_source", False))
 
         def _solo_content_visible(self, kind, identifier):
-            allowed = getattr(self, "_capture_content", None)
-            if allowed is not None and not self._independent_source() and (kind, identifier) not in allowed:
+            if not self._independent_source() and (kind, identifier) not in self._capture_content:
                 return False
             return super()._solo_content_visible(kind, identifier)
 
         def _solo_branch_visible(self, identifier):
-            branches = getattr(self, "_capture_branches", None)
-            if branches is not None and not self._independent_source() and identifier not in branches:
+            if not self._independent_source() and identifier not in self._capture_branches:
                 return False
             return super()._solo_branch_visible(identifier)
 
-    renderer = BeneathRenderer(copy.copy(canvas.settings))
-    renderer._capture_content, _, renderer._capture_branches = plan
-    try:
-        renderer.set_document(chapter, canvas.tiles, canvas.images, reset_view=False)
-        renderer._interactive_render = False
-        return renderer
-    except BaseException:
-        renderer._effect_jobs.cancel()
-        renderer.deleteLater()
-        raise
+    snapshot = getattr(canvas, 'snapshot', None) or capture_document(chapter, canvas.tiles, canvas.images)
+    document = replace(snapshot.document, overflow=0., underlay=('', 0.), live_preview=False)
+    snapshot = replace(snapshot, document=document, chapter=chapter, graphics_worker=None, cache_spec=None,
+                       state=dict(snapshot.state, _solo_suspended=True, _text_editing=False))
+    backend = DetachedSceneBackend(snapshot)
+    backend.scene = BeneathRenderer(snapshot)
+    backend.scene._capture_content, _, backend.scene._capture_branches = plan
+    backend.scene._interactive_render = False
+    return backend
 
 
 def capture_distort_beneath(canvas, modifier_id: str) -> str:
@@ -145,22 +141,29 @@ def capture_distort_beneath(canvas, modifier_id: str) -> str:
     width, height = max(1, math.ceil(frame.width())), max(1, math.ceil(frame.height()))
     if width * height > 64 * 1024 * 1024:
         raise ValueError("The displacement map frame is too large to capture. Reduce its size.")
-    image = QImage(width, height, QImage.Format_ARGB32_Premultiplied)
-    if image.isNull():
-        raise MemoryError("Could not allocate the displacement map image.")
-
     detached = copy.deepcopy(chapter)
     # Retain all records for geometry/masks/explicit color-source dependencies.
     # A prefix ending inside an ancestor does not include its later border.
     for identifier, layer in detached.layers.items():
         if ("layer", identifier) in plan[0] and ("layer", identifier) not in plan[1]:
             layer.border_color = "#00000000"
-    renderer = _capture_renderer(canvas, detached, plan)
+    from comic_editor.render.service import DocumentRenderService, RenderRequest
+    from comic_editor.render.pixels import pixel_scope, display_image
+    backend = _capture_renderer(canvas, detached, plan)
     try:
-        renderer.render_preview(image, source_rect=frame)
+        request = RenderRequest(tuple(frame.getRect()), 1., (width, height), ('beneath', modifier_id),
+            backend.snapshot.document.revision, clip_document=False,
+            output_transform=(width/frame.width(), 0., 0., height/frame.height(),
+                              -frame.x()*width/frame.width(), -frame.y()*height/frame.height()))
+        result = DocumentRenderService(backend).render_region(backend.snapshot.document, request)
+        if not result.exact:
+            raise RuntimeError(result.error or 'Could not capture displacement source')
+        with pixel_scope(backend.snapshot.document.pixel_contract, environment=backend.pixel_environment):
+            # Embedded maps retain byte data representing the pinned display
+            # appearance; they never depend on a later view/config change.
+            image = display_image(result.image, backend.snapshot.document.pixel_contract)
     finally:
-        renderer._effect_jobs.cancel()
-        renderer.deleteLater()
+        backend.close()
     data = QByteArray()
     buffer = QBuffer(data)
     if not buffer.open(QIODevice.WriteOnly):

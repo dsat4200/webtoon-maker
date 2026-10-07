@@ -10,7 +10,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from PySide6.QtCore import QBuffer, QByteArray, QIODevice
-from PySide6.QtGui import QImage, QImageReader
+from PySide6.QtGui import QImage, QImageReader, QColorSpace
 from .encoded_images import EncodedImage, EncodedImageCache, DEFAULT_ENCODED_CACHE
 from .pixel_arrays import image_has_high_precision
 
@@ -74,8 +74,10 @@ class ImageStore:
         self.decoded_bytes += size
 
     def _forget_object_decoded(self, object_id):
-        self._forget_decoded(object_id)
-        self._forget_decoded(('native', object_id))
+        for key in tuple(self._decoded):
+            if key == object_id or (isinstance(key, tuple) and len(key) > 1
+                                    and key[1] == object_id):
+                self._forget_decoded(key)
 
     @staticmethod
     def safe_filename(filename: str) -> str:
@@ -88,8 +90,9 @@ class ImageStore:
         # Own the QByteArray inside Qt instead of borrowing a Python-managed
         # QByteArray pointer. The reader and its plugin must also die before
         # their non-owned device, including on an unsuccessful decode.
+        encoded = QByteArray(data)
         buffer = QBuffer()
-        buffer.setData(QByteArray(data))
+        buffer.setData(encoded)
         buffer.open(QIODevice.OpenModeFlag.ReadOnly)
         reader = QImageReader(buffer)
         reader.setAutoTransform(True)
@@ -106,11 +109,26 @@ class ImageStore:
             try:
                 with Image.open(BytesIO(data)) as decoded:
                     detected = (decoded.format or "").lower().encode("ascii")
-                    rgba = decoded.convert("RGBA")
-                    image = QImage(
-                        rgba.tobytes(), rgba.width, rgba.height,
-                        rgba.width * 4, QImage.Format_RGBA8888,
-                    ).copy()
+                    profile = decoded.info.get('icc_profile', b'')
+                    if decoded.mode.startswith('I;16'):
+                        import numpy as np
+                        values = np.ascontiguousarray(np.asarray(decoded), dtype=np.uint16)
+                        image = QImage(values.data, decoded.width, decoded.height,
+                                       values.strides[0], QImage.Format_Grayscale16).copy()
+                    elif decoded.mode == 'F':
+                        import numpy as np
+                        values = np.ones((decoded.height, decoded.width, 4), np.float32)
+                        values[..., :3] = np.asarray(decoded, np.float32)[..., None]
+                        image = QImage(values.data, decoded.width, decoded.height,
+                                       values.strides[0], QImage.Format_RGBA32FPx4).copy()
+                    else:
+                        rgba = decoded.convert("RGBA")
+                        image = QImage(
+                            rgba.tobytes(), rgba.width, rgba.height,
+                            rgba.width * 4, QImage.Format_RGBA8888,
+                        ).copy()
+                    if profile:
+                        image.setColorSpace(QColorSpace.fromIccProfile(QByteArray(profile)))
             except (OSError, ValueError) as error:
                 raise ValueError(error_message or "Unsupported or invalid image") from error
         return image, detected
@@ -199,8 +217,25 @@ class ImageStore:
         source = self.source(object_id)
         return (str(source._encoded.pin.path),) if source is not None else ()
 
-    def image(self, object_id: str) -> QImage:
+    def image(self, object_id: str, *, contract=None) -> QImage:
+        """Return the legacy frame or an explicitly converted working source.
+
+        Original bytes and decoded native pixels never adopt the document's
+        color policy. Working frames use the same bounded residency budget and
+        are invalidated when either source bytes or the color environment change.
+        """
         object_id = str(object_id)
+        if contract is not None and contract.floating:
+            from comic_editor.render.pixels import import_image, color_environment
+            key = ('working', object_id, contract.signature, color_environment(contract))
+            cached = self._decoded.get(key)
+            if cached is not None:
+                self._decoded.move_to_end(key)
+                return QImage(cached)
+            image = import_image(self.native_image(object_id), contract)
+            if not image.isNull():
+                self._cache_decoded(key, image)
+            return QImage(image)
         cached = self._decoded.get(object_id)
         if cached is not None:
             self._decoded.move_to_end(object_id)
@@ -298,6 +333,16 @@ class ImageStore:
         self._decoded.clear()
         self.decoded_bytes = 0
         self.dirty.update(values)
+
+    def apply_patch(self, values: dict[str, ImageSource | None]) -> None:
+        """Restore changed immutable originals, retaining unrelated sources."""
+        for identifier, source in values.items():
+            self._forget_object_decoded(identifier)
+            if source is None:
+                self._sources.pop(identifier, None)
+            else:
+                self._sources[identifier] = source
+            self.dirty.add(identifier)
 
     @staticmethod
     def _atomic_bytes(path: Path, data: bytes) -> None:

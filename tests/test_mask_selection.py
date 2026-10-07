@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import numpy as np
 import pytest
+import time
 from PySide6.QtCore import QCoreApplication, QEvent, QPoint, QPointF, QRectF, Qt
 from PySide6.QtGui import QFont, QGuiApplication, QPointingDevice, QTabletEvent, QTransform
 from PySide6.QtTest import QTest
@@ -49,6 +50,20 @@ def _field(canvas):
     return canvas.render_tone_mask_field(
         canvas.active_tone_mask_id, 500, 600, QTransform(), QRectF(0, 0, 500, 600),
     )
+
+
+def _overlay_frame(canvas):
+    deadline = time.monotonic()+10
+    while time.monotonic() < deadline:
+        frame = canvas.grab().toImage()
+        QCoreApplication.processEvents()
+        time.sleep(.002)
+        controller = canvas._mask_overlay_controller
+        context = controller.context()
+        assert controller.error is None
+        if controller.ready_key == controller.key(context):
+            return canvas.grab().toImage()
+    pytest.fail('Mask overlay did not prepare the current scalar field')
 
 
 def test_lasso_adds_and_control_removes_only_enclosed_pixels(canvas):
@@ -244,9 +259,9 @@ def test_pen_lasso_honors_modifiers_and_release_position(canvas, monkeypatch, mo
 
 def test_lasso_preview_and_cutout_overlay_are_mask_scoped(canvas):
     _lasso(canvas, [(50, 50), (400, 50), (400, 400), (50, 400)])
-    before_cutout = canvas.grab().toImage().pixelColor(100, 100)
+    before_cutout = _overlay_frame(canvas).pixelColor(100, 100)
     _lasso(canvas, [(75, 75), (125, 75), (125, 125), (75, 125)], Qt.ControlModifier)
-    assert canvas.grab().toImage().pixelColor(100, 100) != before_cutout
+    assert _overlay_frame(canvas).pixelColor(100, 100) != before_cutout
     canvas._begin_mask_selection(QPointF(250, 250), Qt.ShiftModifier)
     canvas._move_mask_selection(QPointF(350, 250))
     canvas._move_mask_selection(QPointF(350, 350))
@@ -288,6 +303,16 @@ def _wand_click(canvas, point, modifiers=Qt.NoModifier):
         canvas, Qt.LeftButton, modifiers,
         canvas.document_to_widget(QPointF(*point)).toPoint(),
     )
+    _wait_wand(canvas)
+
+
+def _wait_wand(canvas):
+    jobs = getattr(canvas, '_scene_consumers', None)
+    deadline = time.monotonic()+10
+    while jobs is not None and jobs.contains(('mask-wand',)) and time.monotonic() < deadline:
+        QCoreApplication.processEvents()
+        time.sleep(.002)
+    assert jobs is None or not jobs.contains(('mask-wand',))
 
 
 def test_wand_tolerance_connectivity_and_undo_across_tiles(canvas):
@@ -383,6 +408,7 @@ def test_pen_wand_honors_modifiers(canvas, monkeypatch, modifiers, expected):
             Qt.NoButton if release else Qt.LeftButton,
         )
         QCoreApplication.sendEvent(canvas, event)
+    _wait_wand(canvas)
     assert _field(canvas)[100, 250] == expected
     assert canvas._nav_mode is None
     assert not canvas._tablet_tool_active

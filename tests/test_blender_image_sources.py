@@ -359,7 +359,7 @@ def test_switching_linked_images_preserves_blender_view_and_imports_frames(qapp,
         window.close()
 
 
-def test_linked_image_transform_keeps_front_image_at_its_stack_position(qapp):
+def test_linked_image_transform_keeps_front_image_at_its_stack_position(qapp, wait_scene):
     chapter, page, objects, images = _chapter_with_linked_images()
     linked = objects[0]
     images.put(linked.object_id, "last-frame.png", _png(640, 360, "#1565c0"), "image/png")
@@ -379,6 +379,13 @@ def test_linked_image_transform_keeps_front_image_at_its_stack_position(qapp):
 
     rendered = QImage(900, 700, QImage.Format_ARGB32_Premultiplied)
     rendered.fill(Qt.transparent)
+    canvas.render(rendered)
+    # Widget paint consumes a ready preview; the scene is captured/evaluated
+    # separately. Wait for this transform's matching scene before checking
+    # foreground stacking, rather than sampling the initial empty frame.
+    rendered = wait_scene(canvas)
+    preview = canvas._scene_controller.preview
+    assert preview is not None and preview[0] == canvas._render_document_state(), canvas._scene_controller.error
     canvas.render(rendered)
     sample = canvas.camera_transform().map(QPointF(340, 290))
     color = rendered.pixelColor(round(sample.x()), round(sample.y()))

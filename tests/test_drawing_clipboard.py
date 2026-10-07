@@ -1,6 +1,9 @@
 from __future__ import annotations
 
-from PySide6.QtCore import QPointF, QRectF, Qt
+import time
+from threading import Event
+import pytest
+from PySide6.QtCore import QCoreApplication, QPointF, QRectF, Qt
 from PySide6.QtGui import QColor, QPainterPath
 
 from comic_editor.core.models import (
@@ -46,6 +49,14 @@ def _pixel(tiles: TileStore, object_id: str, x: int, y: int) -> QColor:
     )
 
 
+def _wait_clipboard(window):
+    deadline = time.monotonic() + 10
+    while getattr(window, '_pending_drawing_copy', None) is not None and time.monotonic() < deadline:
+        QCoreApplication.processEvents()
+        time.sleep(.002)
+    assert getattr(window, '_pending_drawing_copy', None) is None
+
+
 def test_raster_copy_cut_and_paste_are_undoable(qapp):
     window, chapter, layer, tiles = _window_document()
     source = chapter.add_object(layer.layer_id, RasterObject(name="Source"))
@@ -57,6 +68,7 @@ def test_raster_copy_cut_and_paste_are_undoable(qapp):
     try:
         _select_rect(window, source.object_id, QRectF(10, 10, 80, 80))
         assert window._copy_drawing_selection()
+        _wait_clipboard(window)
         assert isinstance(window._drawing_clipboard, RasterSelectionClipboard)
 
         window.canvas.set_selection("object", target.object_id)
@@ -71,6 +83,7 @@ def test_raster_copy_cut_and_paste_are_undoable(qapp):
 
         _select_rect(window, source.object_id, QRectF(35, 35, 30, 30))
         assert window._cut_drawing_selection()
+        _wait_clipboard(window)
         assert _pixel(tiles, source.object_id, 50, 50).alpha() == 0
         window.canvas.command_stack.undo()
         assert _pixel(tiles, source.object_id, 50, 50).alpha() > 0
@@ -93,6 +106,7 @@ def test_raster_paste_overlay_moves_without_underlying_pixels(qapp):
     try:
         _select_rect(window, source.object_id, QRectF(10, 10, 80, 80))
         assert window._copy_drawing_selection()
+        _wait_clipboard(window)
         window.canvas.set_selection("object", target.object_id)
         assert window._paste()
         window.canvas.scale = 1.0
@@ -132,6 +146,7 @@ def test_later_raster_edit_finalizes_pasted_overlay_through_redo(qapp):
     try:
         _select_rect(window, source.object_id, QRectF(10, 10, 80, 80))
         assert window._copy_drawing_selection()
+        _wait_clipboard(window)
         window.canvas.set_selection("object", target.object_id)
         assert window._paste()
         assert window.canvas._raster_paste_overlay is not None
@@ -166,9 +181,11 @@ def test_cut_of_pasted_raster_removes_only_the_overlay(qapp):
     try:
         _select_rect(window, source.object_id, QRectF(10, 10, 80, 80))
         assert window._copy_drawing_selection()
+        _wait_clipboard(window)
         window.canvas.set_selection("object", target.object_id)
         assert window._paste()
         assert window._cut_drawing_selection()
+        _wait_clipboard(window)
         assert _pixel(tiles, target.object_id, 50, 50) == QColor("#ff2255cc")
 
         window.canvas.command_stack.undo()
@@ -206,6 +223,7 @@ def test_vector_copy_splits_runs_and_paste_uses_fresh_ids(qapp):
             source, {source_stroke.stroke_id}, selected
         )
         assert window._copy_drawing_selection()
+        _wait_clipboard(window)
         payload = window._drawing_clipboard
         assert isinstance(payload, VectorSelectionClipboard)
         assert [len(stroke.points) for stroke in payload.strokes] == [2, 1]
@@ -247,6 +265,7 @@ def test_vector_cut_undo_restores_content_and_point_selection(qapp):
             drawing, {stroke.stroke_id}, selected
         )
         assert window._cut_drawing_selection()
+        _wait_clipboard(window)
         assert selected.isdisjoint({
             point.point_id
             for item in drawing.strokes for point in item.points
@@ -278,6 +297,7 @@ def test_raster_paste_preserves_world_position_across_object_offsets(qapp):
     try:
         _select_rect(window, source.object_id, QRectF(35, 35, 30, 30))
         assert window._copy_drawing_selection()
+        _wait_clipboard(window)
         window.canvas.set_selection("object", target.object_id)
         assert window._paste()
 
@@ -298,6 +318,7 @@ def test_paste_as_new_inserts_above_active_and_selects_content(qapp):
     try:
         _select_rect(window, source.object_id, QRectF(55, 45, 30, 30))
         assert window._copy_drawing_selection()
+        _wait_clipboard(window)
         window.canvas.set_selection("object", anchor.object_id)
         anchor_index = next(
             index for index, ref in enumerate(layer.children)
@@ -330,6 +351,7 @@ def test_internal_buffer_pastes_as_new_after_document_switch(qapp):
     try:
         _select_rect(window, source.object_id, QRectF(55, 45, 30, 30))
         assert window._copy_drawing_selection()
+        _wait_clipboard(window)
 
         other = ChapterDocument()
         page = other.add_page()
@@ -386,6 +408,7 @@ def test_vector_paste_as_new_preserves_closed_style_and_selects_fresh_ids(
             {point.point_id for point in stroke.points},
         )
         assert window._copy_drawing_selection()
+        _wait_clipboard(window)
         payload = window._drawing_clipboard
         assert isinstance(payload, VectorSelectionClipboard)
         assert payload.strokes[0].closed
@@ -396,7 +419,7 @@ def test_vector_paste_as_new_preserves_closed_style_and_selects_fresh_ids(
         assert isinstance(created, VectorDrawingObject)
         pasted = created.strokes[0]
         assert pasted.closed
-        assert pasted.color == stroke.color
+        assert QColor(pasted.color) == QColor(stroke.color)
         assert pasted.start_cap == stroke.start_cap
         assert pasted.end_cap == stroke.end_cap
         assert [point.width for point in pasted.points] == [5, 7, 9]
@@ -465,6 +488,7 @@ def test_empty_selection_does_not_replace_internal_clipboard(qapp):
     try:
         _select_rect(window, source.object_id, QRectF(10, 10, 80, 80))
         assert window._copy_drawing_selection()
+        _wait_clipboard(window)
         payload = window._drawing_clipboard
         serial = window._drawing_clipboard_serial
 
@@ -483,4 +507,89 @@ def test_drawing_clipboard_hotkeys_yield_to_text_input(qapp):
         for action_id in ("cut", "copy", "paste", "paste_as_new"):
             assert window._hotkey_is_suppressed(action_id, frozenset())
     finally:
+        window.deleteLater()
+
+
+@pytest.mark.parametrize('as_new', [False, True])
+def test_copy_then_immediate_paste_retains_destination_and_cursor(qapp, monkeypatch, as_new):
+    from comic_editor.render import input_capture
+    window, chapter, layer, tiles = _window_document()
+    source = chapter.add_object(layer.layer_id, RasterObject(name='Source'))
+    target = chapter.add_object(layer.layer_id, RasterObject(name='Target'))
+    other = chapter.add_object(layer.layer_id, RasterObject(name='Other'))
+    tiles.paint_dab(source.object_id, QPointF(50, 50), 12, QColor('red'), antialias=False)
+    entered, release = Event(), Event()
+    original = input_capture.drawing_selection
+    def held(*args, **kwargs):
+        entered.set()
+        assert release.wait(5)
+        return original(*args, **kwargs)
+    held.accepts_cancelled = True
+    monkeypatch.setattr(input_capture, 'drawing_selection', held)
+    monkeypatch.setattr(chapter, 'to_dict', lambda: pytest.fail('Whole chapter serialization during clipboard action'))
+    monkeypatch.setattr(other, 'to_dict', lambda: pytest.fail('Unrelated object serialization during clipboard action'))
+    position = [QPointF(100, 100)]
+    monkeypatch.setattr('comic_editor.ui.main_window.cursor_world', lambda _: position[0])
+    try:
+        _select_rect(window, source.object_id, QRectF(35, 35, 30, 30))
+        assert window._copy_drawing_selection()
+        deadline = time.monotonic() + 10
+        while not entered.is_set() and time.monotonic() < deadline:
+            QCoreApplication.processEvents()
+            time.sleep(.002)
+        assert entered.is_set()
+        window.canvas.set_selection('object', target.object_id)
+        assert window._paste_drawing_as_new() if as_new else window._paste()
+        window.canvas.set_selection('object', other.object_id)
+        position[0] = QPointF(180, 180)
+        assert len(window.canvas.command_stack._undo) == 0
+        release.set()
+        _wait_clipboard(window)
+        destination = window.canvas.selected_id if as_new else target.object_id
+        assert destination != other.object_id
+        assert _pixel(tiles, destination, 100, 100) == QColor('red')
+        assert _pixel(tiles, destination, 180, 180).alpha() == 0
+        assert _pixel(tiles, other.object_id, 100, 100).alpha() == 0
+        assert len(window.canvas.command_stack._undo) == 1
+        window.canvas.command_stack.undo()
+        assert destination not in chapter.objects if as_new else _pixel(tiles, destination, 100, 100).alpha() == 0
+    finally:
+        release.set()
+        window.deleteLater()
+
+
+def test_document_retirement_discards_pending_copy_and_paste(qapp, monkeypatch):
+    from comic_editor.render import input_capture
+    window, chapter, layer, tiles = _window_document()
+    source = chapter.add_object(layer.layer_id, RasterObject(name='Source'))
+    tiles.paint_dab(source.object_id, QPointF(50, 50), 12, QColor('red'), antialias=False)
+    entered, release = Event(), Event()
+    original = input_capture.drawing_selection
+    def held(*args, **kwargs):
+        entered.set()
+        assert release.wait(5)
+        return original(*args, **kwargs)
+    held.accepts_cancelled = True
+    monkeypatch.setattr(input_capture, 'drawing_selection', held)
+    previous = object()
+    window._drawing_clipboard, window._drawing_clipboard_serial = previous, 4
+    try:
+        _select_rect(window, source.object_id, QRectF(35, 35, 30, 30))
+        assert window._copy_drawing_selection()
+        assert window._paste()
+        deadline = time.monotonic() + 10
+        while not entered.is_set() and time.monotonic() < deadline:
+            QCoreApplication.processEvents()
+            time.sleep(.002)
+        assert entered.is_set()
+        other = ChapterDocument()
+        other.add_page()
+        window._set_chapter(other, TileStore())
+        release.set()
+        _wait_clipboard(window)
+        assert window._drawing_clipboard is previous
+        assert window._drawing_clipboard_serial == 4
+        assert not other.objects and not window.canvas.command_stack.can_undo
+    finally:
+        release.set()
         window.deleteLater()

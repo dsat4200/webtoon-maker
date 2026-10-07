@@ -6,6 +6,7 @@ premultiplication and scalar blend, while a float table preserves NumPy's final
 normalization bits. The graphics owner's LRU accounts for every texture/FBO.
 """
 from functools import lru_cache
+import weakref
 
 import numpy as np
 from PIL import Image
@@ -69,6 +70,16 @@ void main() {
                        texelFetch(normalizationTable,ivec2(low.g,0),0).r,
                        texelFetch(normalizationTable,ivec2(low.b,0),0).r,
                        texelFetch(normalizationTable,ivec2(low.a,0),0).r);
+}
+'''
+
+FLOAT_TO_BYTE = '''#version 430 core
+uniform sampler2D sourceTexture;
+out uvec4 outputColor;
+void main() {
+    precise vec4 source = texelFetch(sourceTexture, ivec2(gl_FragCoord.xy), 0);
+    precise vec4 scaled = source * 255.;
+    outputColor = uvec4(clamp(scaled, 0., 255.));
 }
 '''
 
@@ -138,11 +149,13 @@ class _IntegerFramebuffer:
 class GpuBlur:
     """Kernels owned by an existing private context, sharing its resource budget."""
     def __init__(self, renderer):
-        self.renderer = renderer
+        self.renderer = weakref.proxy(renderer)
         self.resize_program = self.normalize_program = None
+        self.byte_program = None
 
     def close(self):
         self.resize_program = self.normalize_program = None
+        self.byte_program = None
 
     def _programs(self):
         if self.resize_program is not None:
@@ -173,7 +186,8 @@ class GpuBlur:
         texture.allocateStorage(pixel_format, pixel_type)
         texture.setMinMagFilters(QOpenGLTexture.Nearest, QOpenGLTexture.Nearest)
         texture.setData(pixel_format, pixel_type, values)
-        result = _Resource(texture, texture.textureId(), width, height, int(values.nbytes))
+        result = _Resource(texture, texture.textureId(), width, height, int(values.nbytes),
+                           'byte' if values.dtype == np.uint8 else 'float')
         r.resources[key] = result
         r.bytes += result.bytes
         r.uploads += 1
@@ -211,7 +225,8 @@ class GpuBlur:
         r.vao.release()
         program.release()
         framebuffer.release()
-        result = _Resource(framebuffer, framebuffer.texture(), width, height, bytes_needed)
+        result = _Resource(framebuffer, framebuffer.texture(), width, height, bytes_needed,
+                           'float' if floating else 'byte')
         r.resources[key] = result
         r.bytes += bytes_needed
         r.draws += 1
@@ -259,25 +274,43 @@ class GpuBlur:
             protected.append(pass_key)
         return output_key
 
-    def apply(self, pixels, strength, *, source_key, algorithm='normal'):
+    def byte_resource(self, source, source_key):
+        if source.kind == 'byte':
+            return source, source_key
+        if self.byte_program is None:
+            program = QOpenGLShaderProgram()
+            if not (program.addShaderFromSourceCode(QOpenGLShader.Vertex, VERTEX)
+                    and program.addShaderFromSourceCode(QOpenGLShader.Fragment, FLOAT_TO_BYTE)
+                    and program.link()):
+                raise RuntimeError(program.log())
+            self.byte_program = program
+            self.renderer.compiles += 1
+        key = ('truncate-byte', source_key)
+        return self._draw(key, (source.width,source.height), self.byte_program,
+                          [('sourceTexture',source)], {}, [source_key]), key
+
+    def apply(self, pixels, strength, *, source_key, algorithm='normal', resident=False):
         # The fixed-point/pass-order contract is verified against this release.
         # A future or different Pillow resampler keeps the CPU reference path.
         if PILLOW_VERSION != '12.2.0':
             return None
         r = self.renderer
-        pixels = np.asarray(pixels)
-        if pixels.dtype != np.uint8 or pixels.ndim != 3 or pixels.shape[2] != 4:
-            raise ValueError('Legacy GPU blur requires H × W × RGBA byte pixels')
+        source_resource = pixels if isinstance(pixels, _Resource) else None
+        if source_resource is None:
+            pixels = np.asarray(pixels)
+            if pixels.dtype != np.uint8 or pixels.ndim != 3 or pixels.shape[2] != 4:
+                raise ValueError('Legacy GPU blur requires H × W × RGBA byte pixels')
         if algorithm not in ('normal', 'legacy') or np.ndim(strength) != 0:
             return None
-        height, width = pixels.shape[:2]
+        height, width = ((source_resource.height,source_resource.width) if source_resource is not None
+                         else pixels.shape[:2])
         radius = float(np.clip(np.float32(strength), 0., 100.))
         if (not r.available or radius <= 1e-6 or min(width, height) <= 0
                 or max(width, height) > r.max_size or width * height * 36 + 256*256*3 > r.budget):
             return None
         index = max(0, min(int(np.searchsorted(RADII, radius, side='right'))-1, len(RADII)-2))
         amount = (radius - float(RADII[index])) / (float(RADII[index+1]) - float(RADII[index]))
-        incoming_key = ('blur-source', source_key, width, height)
+        incoming_key = (source_key if source_resource is not None else ('blur-source', source_key, width, height))
         output_key = ('blur-float', incoming_key, algorithm, radius)
         with r._current():
             result = r._get(output_key)
@@ -286,8 +319,11 @@ class GpuBlur:
             else:
                 try:
                     self._programs()
-                    self._upload(incoming_key, np.ascontiguousarray(pixels), QOpenGLTexture.RGBA8U,
-                        QOpenGLTexture.RGBA_Integer, QOpenGLTexture.UInt8, [])
+                    if source_resource is not None:
+                        _, incoming_key = self.byte_resource(source_resource,incoming_key)
+                    else:
+                        self._upload(incoming_key, np.ascontiguousarray(pixels), QOpenGLTexture.RGBA8U,
+                            QOpenGLTexture.RGBA_Integer, QOpenGLTexture.UInt8, [])
                     protected = [incoming_key]
                     levels, size = [incoming_key], (width, height)
                     for _ in range(index + (2 if amount > 1e-6 else 1) - 1):
@@ -314,9 +350,4 @@ class GpuBlur:
                         dict(blend=amount > 1e-6), protected, floating=True)
                 except _BudgetExceeded:
                     return None
-            result.owner.bind()
-            output = np.empty((height, width, 4), np.float32)
-            r.functions.glReadPixels(0, 0, width, height, 0x1908, 0x1406, output)
-            result.owner.release()
-            r.readbacks += 1
-            return output
+            return (result, output_key) if resident else r.read_resource(result)

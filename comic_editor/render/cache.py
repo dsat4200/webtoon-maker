@@ -20,6 +20,7 @@ import struct
 import sys
 import uuid
 import zlib
+from weakref import WeakValueDictionary
 
 import numpy as np
 from PySide6.QtGui import QImage, QColorSpace
@@ -29,13 +30,34 @@ from .service import RenderPending
 
 
 CACHE_VERSION = 1
-# Older captures could omit transformed raster tiles or stretch spatial crops.
-RENDERER_VERSION = "native-artwork-3"
+# Version four fixes native straight-source alpha and float source boundaries.
+RENDERER_VERSION = "native-artwork-4"
 MAX_PAYLOAD = 512 * 1024 * 1024
 WRITE_BUDGET = 64 * 1024 * 1024
 READ_BUDGET = 64 * 1024 * 1024
 READY_BUDGET = 64 * 1024 * 1024
 MAGIC = b"WTRCACHE1"
+
+
+class _RootState:
+    def __init__(self):
+        self.lock = RLock()
+        self.epoch = 0
+        self.generation = 0
+
+
+_ROOTS = WeakValueDictionary()
+_ROOTS_LOCK = RLock()
+
+
+def _root_state(root):
+    key = os.path.normcase(str(root.resolve()))
+    with _ROOTS_LOCK:
+        state = _ROOTS.get(key)
+        if state is None:
+            state = _RootState()
+            _ROOTS[key] = state
+        return state
 
 
 def canonical(value):
@@ -179,6 +201,8 @@ class PersistentRenderCache:
 
     def __init__(self, root, *, contract=(), environment=()):
         self.root = Path(root)
+        self._root_state = _root_state(self.root)
+        self._root_epoch = self._root_state.epoch
         self.contract, self.environment = tuple(contract), tuple(environment)
         self.entries = {}
         self.source_digests = {}
@@ -196,10 +220,11 @@ class PersistentRenderCache:
         except (OSError, ValueError, TypeError):
             pass
         self.executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="render-cache-io")
-        self.values_lock = RLock()
+        self.values_lock = self._root_state.lock
         self.reads, self.writes, self.verifications = {}, {}, {}
         self.staged = {}
         self.publication = None
+        self._reload = None
         self.verified = set()
         self.ready = OrderedDict()
         self.ready_bytes = 0
@@ -258,6 +283,7 @@ class PersistentRenderCache:
         return True if verify else result
 
     def _entry(self, kind, key):
+        self._sync_epoch()
         identity = self.descriptor(kind, key).identity
         entry = self.entries.get(identity)
         if entry is not None:
@@ -364,6 +390,7 @@ class PersistentRenderCache:
     def retain(self, kind, key, value, *, state=None):
         if not self.recording or self.closed:
             return
+        self._sync_epoch()
         descriptor = self.descriptor(kind, key)
         identity = descriptor.identity
         if identity in self.entries or identity in self.writes or identity in self.staged:
@@ -376,12 +403,14 @@ class PersistentRenderCache:
             return
         frozen = _freeze(value)
         snapshot, semantic_key = canonical(state), canonical(key)
-        epoch = self.epoch
+        epoch = self.epoch,self._root_state.epoch
         def write():
             payload = encode_value(frozen)
             blob = hashlib.sha256(payload).hexdigest()
             path = self.root / "values" / (blob + ".cache")
             with self.values_lock:
+                if epoch != (self.epoch,self._root_state.epoch):
+                    return None
                 try:
                     existing = path.read_bytes()
                     valid = hashlib.sha256(existing).hexdigest() == blob
@@ -396,19 +425,35 @@ class PersistentRenderCache:
         return True
 
     def poll(self):
+        self._sync_epoch()
         changed, self.invalidated = self.invalidated, False
+        if self._reload is not None and self._reload.done():
+            future,self._reload = self._reload,None
+            try:
+                entries,sources,epoch,generation = future.result()
+                if epoch == self._root_state.epoch and generation == self._root_state.generation:
+                    self.entries,self.source_digests = entries,sources
+                    changed = True
+                else:
+                    self._reload = self.executor.submit(self._reload_index)
+            except Exception as error:
+                self.error = str(error)
         if self.publication is not None and self.publication[0].done():
             future, snapshot, epoch = self.publication
             self.publication = None
             try:
-                future.result()
-                if epoch == self.epoch:
+                manifest = future.result()
+                if epoch == (self.epoch,self._root_state.epoch) and manifest is not None:
+                    self.entries,self.source_digests = manifest
                     for identity, entry in snapshot.items():
                         self.entries[identity] = entry
                         self.staged.pop(identity, None)
                         self.verified.add(identity)
                         self.saved += 1
                     changed = True
+                else:
+                    for identity in snapshot:
+                        self.staged.pop(identity,None)
             except Exception as error:
                 self.error = str(error)
         for identity, (future, size, epoch) in list(self.writes.items()):
@@ -418,7 +463,7 @@ class PersistentRenderCache:
             self.write_bytes -= size
             try:
                 entry = future.result()
-                if epoch == self.epoch:
+                if epoch == (self.epoch,self._root_state.epoch) and entry is not None:
                     self.staged[identity] = entry
             except Exception as error:
                 self.error = str(error)
@@ -434,10 +479,55 @@ class PersistentRenderCache:
             changed = True
         if self.staged and self.publication is None and not self.error:
             snapshot = dict(self.staged)
-            data = self._index_bytes({**self.entries, **snapshot})
-            self.publication = (self.executor.submit(_atomic_bytes, self.root / "index.json", data),
-                                snapshot, self.epoch)
+            epoch = self.epoch,self._root_state.epoch
+            self.publication = (self.executor.submit(self._publish_index,snapshot,dict(self.source_digests),epoch),
+                                snapshot,epoch)
         return changed
+
+    def _sync_epoch(self):
+        if self._root_epoch != self._root_state.epoch:
+            # A sibling owner cleared this root. A GUI cache reader drops
+            # metadata immediately and never waits on the IO owner's lock.
+            self._root_epoch = self._root_state.epoch
+            self.entries.clear()
+            self.verified.clear()
+            self.ready.clear()
+            self.ready_bytes = 0
+            self.reads.clear()
+            self.verifications.clear()
+            self.staged.clear()
+            self.invalidated = True
+            if not self.closed:
+                self._reload = self.executor.submit(self._reload_index)
+
+    def _reload_index(self):
+        with self.values_lock:
+            entries,sources = self._committed_index()
+            return entries,sources,self._root_state.epoch,self._root_state.generation
+
+    def _committed_index(self):
+        try:
+            document = json.loads((self.root/'index.json').read_text(encoding='utf-8'))
+            if document.get('version') == CACHE_VERSION and document.get('renderer') == RENDERER_VERSION:
+                entries,sources = document.get('entries',{}),document.get('sources',{})
+                if isinstance(entries,dict) and isinstance(sources,dict):
+                    return {key:value for key,value in entries.items() if self._valid_entry(key,value)},sources
+        except (OSError,ValueError,TypeError,AttributeError):
+            pass
+        return {},{}
+
+    def _publish_index(self,snapshot,sources,epoch):
+        with self.values_lock:
+            if epoch != (self.epoch,self._root_state.epoch):
+                return None
+            entries,previous_sources = self._committed_index()
+            entries.update(snapshot)
+            previous_sources.update(sources)
+            data = json.dumps(dict(version=CACHE_VERSION,renderer=RENDERER_VERSION,
+                entries=entries,sources=previous_sources),sort_keys=True,separators=(',',':')).encode()
+            _atomic_bytes(self.root/'index.json',data)
+            self._root_state.generation += 1
+            return entries,previous_sources
 
     def _index_bytes(self, entries):
         return json.dumps(dict(version=CACHE_VERSION, renderer=RENDERER_VERSION,
@@ -445,7 +535,9 @@ class PersistentRenderCache:
             separators=(",", ":")).encode()
 
     def flush(self):
-        _atomic_bytes(self.root / "index.json", self._index_bytes(self.entries))
+        with self.values_lock:
+            _atomic_bytes(self.root / "index.json", self._index_bytes(self.entries))
+            self._root_state.generation += 1
 
     def drain(self):
         # Used only during shutdown/explicit clearing, never while painting.
@@ -465,20 +557,22 @@ class PersistentRenderCache:
     def clear(self, predicate=None):
         self.drain()
         self.epoch += 1
-        for identity, entry in list(self.entries.items()):
-            if predicate is None or predicate(entry):
-                self.entries.pop(identity, None)
-                self.verified.discard(identity)
-        self.ready.clear()
-        self.ready_bytes = 0
-        self.reads.clear()
-        self.verifications.clear()
-        self.flush()
-        # Values can be shared by many keys; collect only unreferenced blobs.
-        keep = {entry["blob"] for entry in self.entries.values()}
-        for path in (self.root / "values").glob("*.cache"):
-            if path.stem not in keep:
-                with self.values_lock:
+        with self.values_lock:
+            self._root_state.epoch += 1
+            self._root_epoch = self._root_state.epoch
+            self.entries,self.source_digests = self._committed_index()
+            for identity,entry in list(self.entries.items()):
+                if predicate is None or predicate(entry):
+                    self.entries.pop(identity,None)
+                    self.verified.discard(identity)
+            self.ready.clear()
+            self.ready_bytes = 0
+            self.reads.clear()
+            self.verifications.clear()
+            self.flush()
+            keep = {entry['blob'] for entry in self.entries.values()}
+            for path in (self.root/'values').glob('*.cache'):
+                if path.stem not in keep:
                     path.unlink(missing_ok=True)
 
     @property
@@ -488,7 +582,7 @@ class PersistentRenderCache:
 
     @property
     def pending(self):
-        return bool(self.reads or self.writes or self.verifications or self.staged or self.publication)
+        return bool(self.reads or self.writes or self.verifications or self.staged or self.publication or self._reload)
 
     def close(self):
         if self.closed:

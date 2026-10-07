@@ -163,6 +163,18 @@ class RenderDependencies:
         return self.fonts[properties]
 
     def projection_key(self, request, configuration):
+        from comic_editor.ui.color_resources import metadata_color_environment
+        from comic_editor.render.pixels import pixel_scope
+        contract = self.canvas.chapter.pixel_contract
+        environment = metadata_color_environment(self.canvas, contract)
+        if environment is None:
+            raise RenderPending('Color resources are being prepared')
+        # Object/source signature kernels share the worker's immutable scope.
+        # Inspecting a cached row never hashes/reloads its external resources.
+        with pixel_scope(contract, environment=environment):
+            return self._projection_key(request, configuration)
+
+    def _projection_key(self, request, configuration):
         canvas, chapter = self.canvas, self.canvas.chapter
         canvas._render_bounds.prepare()
         region = request.capture_rect
@@ -199,12 +211,14 @@ class RenderDependencies:
                     children.append((ref.kind, ref.entity_id, value))
             return (canvas._modifier_entity_settings(layer), tuple(children))
         scene = tuple((identifier, branch(identifier)) for identifier in chapter.root_page_ids)
-        context = tuple(configuration[3:])
-        color = ()
-        config = chapter.pixel_contract.ocio_config
-        if config:
-            path = Path(config)
-            color = (self.file_digest("color-config", path),) if path.is_file() else ("missing-color-config", config)
+        from comic_editor.ui.color_resources import semantic_color_identity
+        color = semantic_color_identity(canvas, chapter.pixel_contract)
+        # Presentation tickets express consumer ownership while resources are
+        # pending. Durable content keys use only the captured configuration,
+        # LUT/context signature, never an editor's runtime ticket.
+        context = tuple(('pixel-environment', chapter.pixel_contract.signature, color)
+                        if isinstance(value, tuple) and value and value[0] == 'pixel-environment'
+                        else value for value in configuration[3:])
         return (chapter.chapter_id, request.address.level, request.address.x, request.address.y,
                 request.tile_size, request.gutter, digest((scene, context, chapter.pixel_contract.signature, color)))
 
@@ -223,6 +237,9 @@ def exact_cache_allowed(canvas, key):
     if (not getattr(canvas, "_projection_exact", False)
             or canvas._projection_has_live_preview()
             or getattr(canvas, "_effect_preview_channel", "canvas") == "navigator"):
+        return False
+    from comic_editor.ui.color_resources import semantic_color_identity
+    if semantic_color_identity(canvas, canvas.chapter.pixel_contract) == ('color-resources-pending',):
         return False
     # Identity-only image keys cannot survive reopening. All reusable semantic
     # scene/stage keys start with a named cache kind; drafts are excluded.
@@ -244,12 +261,20 @@ def cache_get(canvas, kind, key):
     backing = backing_for(canvas)
     if backing is None or not exact_cache_allowed(canvas, key):
         return None
+    contract = canvas.chapter.pixel_contract
+    backing.contract = contract.signature
+    from comic_editor.ui.color_resources import semantic_color_identity
+    backing.environment = (*RenderDependencies.environment(), semantic_color_identity(canvas, contract))
     return backing.lookup(kind, key, wait=not getattr(canvas, "_projection_defer_effects", False))
 
 
 def cache_put(canvas, kind, key, value, *, state=None):
     backing = backing_for(canvas)
     if backing is not None and exact_cache_allowed(canvas, key):
+        contract = canvas.chapter.pixel_contract
+        backing.contract = contract.signature
+        from comic_editor.ui.color_resources import semantic_color_identity
+        backing.environment = (*RenderDependencies.environment(), semantic_color_identity(canvas, contract))
         coordinator = getattr(canvas, "_disk_cache_controller", None)
         if coordinator is not None:
             coordinator.observe(kind, key, state)

@@ -306,6 +306,7 @@ def test_spatial_thumbnail_bounds_mask_work_and_preserves_native_output(canvas, 
 @pytest.mark.parametrize("kind", ["image", "raster"])
 @pytest.mark.parametrize("effect", ["none", "outline", "mirror", "halftone"])
 def test_chunked_full_and_dirty_thumbnail_match_direct_render(canvas, kind, effect):
+    from PySide6.QtTest import QTest
     canvas.chapter.height = 9000
     page = canvas.chapter.layers[canvas.chapter.root_page_ids[0]]
     page.bound = BoundGeometry.rectangle(0, 0, 1200, 9000)
@@ -332,16 +333,20 @@ def test_chunked_full_and_dirty_thumbnail_match_direct_render(canvas, kind, effe
         canvas._modifier_source_cache_bytes = 0
         canvas._modifier_render_cache.clear()
         canvas._modifier_render_cache_bytes = 0
-        for _ in range(100):
+        for _ in range(1000):
             navigator._refresh_cache()
+            QTest.qWait(10)
             if not navigator._cache.isNull():
                 break
-        assert navigator._cache == reference
+        assert navigator._cache == reference, (navigator._navigator_jobs.error,
+            navigator._navigator_jobs.document, navigator._navigator_jobs.capture,
+            navigator._navigator_jobs.sent, navigator._navigator_jobs.scheduler.busy)
         obj.x += 41
         canvas.documentChanged.emit(QRectF(50, 2900, 1150, 500))
-        for _ in range(100):
+        for _ in range(1000):
             navigator._refresh_cache()
-            if navigator._pending_image.isNull():
+            QTest.qWait(10)
+            if not navigator._dirty_full and not navigator._dirty_bands:
                 break
         navigator._render_live_preview(reference)
         assert navigator._cache == reference

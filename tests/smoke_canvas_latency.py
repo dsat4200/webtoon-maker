@@ -16,7 +16,7 @@ from pathlib import Path
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from PySide6.QtCore import QPointF  # noqa: E402
+from PySide6.QtCore import QCoreApplication, QEvent, QPointF  # noqa: E402
 from PySide6.QtGui import QColor  # noqa: E402
 from PySide6.QtWidgets import QApplication  # noqa: E402
 
@@ -27,6 +27,7 @@ from comic_editor.core.models import (  # noqa: E402
 from comic_editor.core.settings import EditorSettings  # noqa: E402
 from comic_editor.core.tiles import TileStore  # noqa: E402
 from comic_editor.ui.canvas import CanvasWidget, ToolKind  # noqa: E402
+from drawing_benchmark_support import canvas_pending  # noqa: E402
 
 
 MOVES = 800
@@ -39,6 +40,37 @@ VECTOR_GROWTH_LIMIT = 1.25
 def percentile(values: list[float], amount: float) -> float:
     ordered = sorted(values)
     return ordered[round((len(ordered) - 1) * amount)]
+
+
+def wait_exact(canvas, timeout: float = 20.0) -> float:
+    """Separate cold preparation/exact convergence from the warmed timing gate."""
+    started = time.perf_counter()
+    deadline = started + timeout
+    while time.perf_counter() < deadline:
+        canvas.repaint()
+        QApplication.processEvents()
+        status = canvas_pending(canvas)
+        if status["failed"]:
+            raise AssertionError(status)
+        if not status["frame_pending"] and not status["jobs_busy"]:
+            return (time.perf_counter() - started) * 1000
+        time.sleep(.002)
+    raise AssertionError(f"Exact scene did not converge: {status}")
+
+
+def warm_canvas(canvas) -> None:
+    wait_exact(canvas)
+    canvas._performance.input_ms.clear()
+    canvas._performance.submit_ms.clear()
+    canvas._performance.frame_ms.clear()
+
+
+def retire_canvas(canvas) -> None:
+    """Do not let a previous workload's Qt cycles retain evaluation workers."""
+    canvas.close()
+    canvas.deleteLater()
+    QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+    QApplication.processEvents()
 
 
 def make_canvas(kind: str, *, eraser: bool = False):
@@ -89,6 +121,7 @@ def make_canvas(kind: str, *, eraser: bool = False):
     )
     canvas.show()
     QApplication.processEvents()
+    warm_canvas(canvas)
     return canvas, obj
 
 
@@ -133,8 +166,8 @@ def run_pencil(kind: str) -> dict[str, float]:
             / max(0.001, statistics.mean(moves[:100]))
         ),
     }
-    canvas.close()
-    QApplication.processEvents()
+    result["exact_settle_ms"] = wait_exact(canvas)
+    retire_canvas(canvas)
     return result
 
 
@@ -170,8 +203,8 @@ def run_eraser(kind: str) -> dict[str, float]:
         "commit_ms": commit,
         "growth": 1.0,
     }
-    canvas.close()
-    QApplication.processEvents()
+    result["exact_settle_ms"] = wait_exact(canvas)
+    retire_canvas(canvas)
     return result
 
 
@@ -209,6 +242,7 @@ def run_text_transform() -> dict[str, float]:
     canvas.set_tool(ToolKind.TRANSFORM)
     canvas.show()
     QApplication.processEvents()
+    warm_canvas(canvas)
 
     start = canvas.document_to_widget(QPointF(600, 390))
     canvas._tool_press(start, 1.0)
@@ -236,8 +270,8 @@ def run_text_transform() -> dict[str, float]:
             / max(0.001, statistics.mean(moves[:100]))
         ),
     }
-    canvas.close()
-    QApplication.processEvents()
+    result["exact_settle_ms"] = wait_exact(canvas)
+    retire_canvas(canvas)
     return result
 
 
@@ -281,6 +315,7 @@ def run_dense_vector_navigation() -> dict[str, float]:
     canvas.show()
     QApplication.processEvents()
     QApplication.processEvents()
+    warm_canvas(canvas)
 
     frames: list[float] = []
     start = QPointF(500, 400)
@@ -308,8 +343,8 @@ def run_dense_vector_navigation() -> dict[str, float]:
         "commit_ms": commit,
         "growth": 1.0,
     }
-    canvas.close()
-    QApplication.processEvents()
+    result["exact_settle_ms"] = wait_exact(canvas)
+    retire_canvas(canvas)
     return result
 
 

@@ -519,11 +519,24 @@ class CurvesControls(QWidget):
         if self.graph.dragging or getattr(self.owner, "_parameter_before", None) is not None:
             self._histogram_timer.start()
             return
-        try:
-            bins = self.owner.canvas.curves_histogram(self.modifier_id, self.modifier.color_mode, self.channel)
-        except (ValueError, MemoryError):
-            bins = None
-        self.graph.set_histogram(bins)
+        # Small provider adapters can supply statistics directly. Editor
+        # canvases always expose the compiler and take the detached path.
+        if not hasattr(self.owner.canvas, '_scene_snapshot_compiler'):
+            self.graph.set_histogram(self.owner.canvas.curves_histogram(
+                self.modifier_id, self.modifier.color_mode, self.channel))
+            return
+        from comic_editor.render.source_sampling import curves_histogram
+        from comic_editor.ui.scene_consumers import scene_consumers
+        import weakref
+        reference = weakref.ref(self)
+        def accept(bins, error):
+            from shiboken6 import isValid
+            control = reference()
+            if control is not None and isValid(control):
+                control.graph.set_histogram(None if error is not None else bins)
+        scene_consumers(self.owner.canvas).request(('curves-histogram', self.modifier_id),
+            curves_histogram, (self.modifier_id, self.modifier.color_mode, self.channel,
+                               tuple(self.owner.canvas.selected_entities)), accept)
 
     def showEvent(self, event):
         super().showEvent(event)

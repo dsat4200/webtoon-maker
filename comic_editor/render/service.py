@@ -18,7 +18,7 @@ from PySide6.QtCore import QRect, QRectF, QSize, Qt
 from PySide6.QtGui import QColor, QImage, QPainter, QPainterPath, QTransform
 
 from .projection import DocumentProjection, ProjectionAddress, ProjectionRequest
-from .pixels import LEGACY_PIXELS, PixelContract, pixel_scope
+from .pixels import LEGACY_PIXELS, PixelContract, pixel_scope, working_color
 
 
 class RenderQuality(Enum):
@@ -86,6 +86,10 @@ class RenderRequest:
     phase: str | None = None
     quality: RenderQuality = RenderQuality.EXACT
     defer_effects: bool = False
+    clip_document: bool = True
+    output_transform: tuple | None = None
+    smooth_sources: bool = False
+    target: tuple[str, str] | None = None
 
     def __post_init__(self):
         # Detach sequence inputs so callers cannot mutate a queued request.
@@ -108,8 +112,19 @@ class RenderRequest:
             raise ValueError("Requested region must have finite nonnegative dimensions")
         if self.phase not in (None, "base", "top"):
             raise ValueError("Unknown document output phase")
+        if self.output_transform is not None:
+            object.__setattr__(self, "output_transform", tuple(self.output_transform))
+            if len(self.output_transform) != 6 or not all(math.isfinite(v) for v in self.output_transform):
+                raise ValueError("Output transforms require six finite coefficients")
         if not isinstance(self.quality, RenderQuality):
             raise ValueError("Unknown render quality")
+        if not isinstance(self.clip_document, bool):
+            raise ValueError("Document clipping must be explicit")
+        if self.target is not None:
+            if (len(self.target) != 2 or self.target[0] not in ('layer', 'object')
+                    or not isinstance(self.target[1], str)):
+                raise ValueError("Output targets require a layer or object identity")
+            object.__setattr__(self, 'target', tuple(self.target))
 
     @property
     def bounds(self):
@@ -121,6 +136,8 @@ class RenderRequest:
 
     @property
     def transform(self):
+        if self.output_transform is not None:
+            return QTransform(*self.output_transform)
         x, y, _, _ = self.region
         return QTransform(self.scale, 0, 0, self.scale, -x * self.scale, -y * self.scale)
 
@@ -189,19 +206,33 @@ class DocumentRenderService:
         return request.revision == document.revision and self.current_document(document)
 
     def render_region(self, document: RenderDocument, request: RenderRequest) -> RenderResult:
-        with pixel_scope(document.pixel_contract):
+        with pixel_scope(document.pixel_contract,
+                         environment=getattr(self.backend, 'pixel_environment', None)):
             return self._render_region(document, request)
 
     def _render_region(self, document: RenderDocument, request: RenderRequest) -> RenderResult:
         if not self.current(document, request):
             return RenderResult(request, document, QImage(), RenderStatus.STALE)
+        # A detached backend can complete a native final stack in shared device
+        # storage. Its semantic request/status are identical to the CPU route.
+        # QPainter composition remains the fallback and an explicit CPU edge.
+        device_render = getattr(self.backend, "render_device", None)
+        if device_render is not None and request.target is None:
+            completed = device_render(document, request)
+            if completed is not None and not completed.isNull():
+                if completed.size() != QSize(*request.pixel_size):
+                    raise ValueError("Scene backend returned the wrong capture dimensions")
+                if not self.current(document, request):
+                    completed.release()
+                    return RenderResult(request, document, QImage(), RenderStatus.STALE)
+                return RenderResult(request, document, completed, RenderStatus.EXACT)
         image = QImage(QSize(*request.pixel_size), document.pixel_contract.image_format)
         if image.isNull():
             raise MemoryError("Could not allocate document render image")
         image.fill(Qt.transparent)
         bounds, visible = request.bounds, request.requested
         effect_region = QRectF(bounds)
-        if document.overflow <= 0:
+        if request.clip_document and document.overflow <= 0:
             visible = visible.intersected(document.bounds)
             effect_region = effect_region.intersected(document.bounds)
         status, error = RenderStatus.EXACT, ""
@@ -210,14 +241,19 @@ class DocumentRenderService:
                 painter = QPainter(image)
                 try:
                     painter.setRenderHint(QPainter.Antialiasing, True)
+                    painter.setRenderHint(QPainter.SmoothPixmapTransform, request.smooth_sources)
                     painter.setTransform(request.transform)
-                    if request.phase != "top":
-                        painter.fillRect(document.bounds, QColor(document.background))
+                    if request.phase != "top" and request.target is None:
+                        painter.fillRect(document.bounds if request.clip_document else bounds,
+                                         working_color(document.background))
                         if document.overflow > 0:
                             self._paint_overflow(painter, document, request)
-                    painter.setClipRect(document.bounds)
+                    painter.setClipRect(document.bounds if request.clip_document else bounds)
                     if not visible.isEmpty():
-                        self.backend.paint(painter, visible, phase=request.phase)
+                        if request.target is None:
+                            self.backend.paint(painter, visible, phase=request.phase)
+                        else:
+                            self.backend.paint_entity(painter, visible, request.target)
                 finally:
                     painter.end()
             if capture.provisional:

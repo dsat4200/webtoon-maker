@@ -12,7 +12,7 @@ from pathlib import Path
 import numpy as np
 
 from PySide6.QtCore import (
-    QCoreApplication, QEvent, QItemSelection, QItemSelectionModel, QModelIndex,
+    QCoreApplication, QEvent, QEventLoop, QItemSelection, QItemSelectionModel, QModelIndex,
     QBuffer, QByteArray, QIODevice, QPointF, QRectF, QSignalBlocker, QSize,
     QTimer, Qt,
     Signal,
@@ -84,7 +84,7 @@ from comic_editor.ui.selection_candidates import SelectionCandidateMenu
 from comic_editor.ui.mask_controls import MaskButton, MasksPanel
 from comic_editor.ui.tree_model import HierarchyModel
 from comic_editor.ui.asset_library import AssetLibraryWidget
-from comic_editor.ui.autosave import AutosaveJobs, RecoveryRequest, RecoverySnapshot
+from comic_editor.ui.autosave import AutosaveJobs, RecoveryCapture, RecoveryRequest, RecoverySnapshot, SeriesCapture, write_series_clone
 from comic_editor.ui.blender_views import BlenderViewsWidget
 from comic_editor.ui.sessions import EditorSession, ProjectContext
 from comic_editor.ui.file_notification import CanvasFileNotification
@@ -853,6 +853,7 @@ class MainWindow(QMainWindow):
             QTreeView.EditKeyPressed | QTreeView.DoubleClicked
         )
         self.hierarchy_model = HierarchyModel()
+        self.hierarchy_model.focused_mutations = True
         self.hierarchy_model.prepare_text_move = self.canvas.prepare_text_move
         self.tree.setModel(self.hierarchy_model)
         self.canvas.incompatibleSelection.connect(self.hierarchy_model.set_error_highlights)
@@ -1111,6 +1112,7 @@ class MainWindow(QMainWindow):
         self.canvas.documentChanged.connect(self._mark_dirty)
         self.ribbon.pageChanged.connect(self._ribbon_page_changed)
         self.canvas.hierarchyChanged.connect(self._hierarchy_changed)
+        self.canvas.changesPublished.connect(self._canvas_changes_published)
         self.canvas.selectionChanged.connect(self._canvas_selection_changed)
         self.canvas.chapterReplaced.connect(self._chapter_replaced)
         self.canvas.objectRecordsChanged.connect(self._object_records_changed)
@@ -1173,8 +1175,8 @@ class MainWindow(QMainWindow):
                 lambda _mode: self._ribbon_settings_changed()
             )
         self.canvas.command_stack.changed_callback = self._command_stack_changed
-        self.selection_common.changed.connect(self._hierarchy_changed)
-        self.selection_settings.changed.connect(self._hierarchy_changed)
+        self.selection_common.changed.connect(self._selection_properties_changed)
+        self.selection_settings.changed.connect(self._selection_properties_changed)
         self.selection_common.maskRequested.connect(self._request_parameter_mask)
         self.selection_common.maskPreviewRequested.connect(self._preview_tone_mask)
         self.selection_common.maskContributorsDropped.connect(
@@ -2315,6 +2317,47 @@ class MainWindow(QMainWindow):
         if self.active_session is None:
             self._activate_editor_session(session)
 
+    def _drain_accepted_input_actions(self) -> bool:
+        """Resolve accepted source edits before a close or document retirement.
+
+        Ordinary Save keeps its asynchronous capture policy. Context retirement
+        must first expose completed Cut/duplicate/delete/cage edits to the dirty
+        prompt; otherwise a cold action could disappear while the tab was clean.
+        """
+        self.canvas._finish_paint_brush()
+        jobs = getattr(self.canvas, '_scene_consumers', None)
+        def native_pending():
+            return (bool(getattr(self.canvas, '_native_deferred_activations', None))
+                    or any(gate is not None and gate.released and gate.busy
+                           for gate in self.canvas._native_input_gates()))
+        while native_pending():
+            QCoreApplication.processEvents(QEventLoop.ExcludeUserInputEvents)
+            time.sleep(.002)
+        native_error = getattr(self.canvas, '_native_input_error', None)
+        if native_error is not None:
+            QMessageBox.critical(self, 'Drawing failed', str(native_error))
+            self.canvas._native_input_error = None
+            return False
+        if jobs is not None:
+            def pending():
+                drawing = getattr(self, '_pending_drawing_copy', None)
+                cage = getattr(self.canvas, '_cage_prepare', None)
+                return (drawing is not None and drawing['cut']
+                    or any(job is not None and job.lane == ('drawing-clipboard',)
+                        and job.arguments[6] and not job.cancelled.is_set()
+                        for job in (jobs.active, *jobs.pending.values()))
+                    or cage is not None and cage.get('commit', False)
+                    or any(jobs.contains(lane) for lane in (
+                        ('cage-commit',), ('mask-wand',), ('outliner-duplicate',), ('delete-mask',), ('clear-canvas',))))
+            while pending():
+                QCoreApplication.processEvents(QEventLoop.ExcludeUserInputEvents)
+                time.sleep(.002)
+        error = getattr(self.canvas, '_cage_commit_error', None)
+        if error is not None:
+            QMessageBox.critical(self, 'Cage Transform failed', str(error))
+            return False
+        return True
+
     def _capture_active_session(self) -> None:
         session = self.active_session
         if session is None or self.chapter is None:
@@ -2356,6 +2399,8 @@ class MainWindow(QMainWindow):
 
     def _activate_editor_session(self, session: EditorSession) -> None:
         if session is self.active_session:
+            return
+        if not self._drain_accepted_input_actions():
             return
         self.disk_cache.detach()
         self._blender_relink_object_id = ""
@@ -2448,77 +2493,190 @@ class MainWindow(QMainWindow):
         self.file_notification.hide()
         self._refresh_actions()
 
-    def _save_editor_session(self, session: EditorSession) -> bool:
+    def _save_editor_session(self, session: EditorSession, *, wait=False) -> bool:
+        if session.kind == "asset" and session.asset_manifest is None:
+            QMessageBox.critical(self, "Save failed", "Asset session has no manifest")
+            return False
         if self.canvas.page_gap_mode_active():
-            self.statusBar().showMessage(
-                "Confirm or cancel the page gap before saving", 4000
-            )
+            self.statusBar().showMessage("Confirm or cancel the page gap before saving", 4000)
             return False
         if session is self.active_session:
+            self.canvas._finish_paint_brush()
+            if getattr(self.canvas, "_pointer_tool_session", None) is not None:
+                self.canvas._tool_release()
             if not self.canvas.commit_active_cage():
                 return False
-            self._capture_active_session()
-        self._autosave_jobs.drain(self._autosave_scope(session))
-        try:
-            if session.kind == "series":
-                session.context.repository.save_chapter(
-                    session.chapter, session.tiles, session.images
-                )
-                for reference in session.context.series.chapters:
-                    if reference.chapter_id == session.chapter.chapter_id:
-                        reference.name = session.chapter.name
-                session.context.repository.save_series(session.context.series)
-            else:
-                manifest = session.asset_manifest
-                if manifest is None:
-                    raise ValueError("Asset session has no manifest")
-                manifest.document = session.chapter
-                bounds = entity_visual_bounds(
-                    session.chapter, session.tiles,
-                    manifest.root_kind, manifest.root_id,
-                )
-                manifest.visual_bounds = (
-                    bounds.x(), bounds.y(), bounds.width(), bounds.height()
-                )
-                session.chapter.width = max(
-                    session.chapter.width,
-                    math.ceil(bounds.right() + 64),
-                )
-                session.chapter.height = max(
-                    session.chapter.height,
-                    math.ceil(bounds.bottom() + 64),
-                )
-                container = session.chapter.layers[
-                    session.chapter.root_page_ids[0]
-                ]
-                container.bound = BoundGeometry.rectangle(
-                    0, 0, session.chapter.width, session.chapter.height
-                )
-                thumbnail = self.canvas.render_asset_thumbnail(
-                    manifest, session.tiles, images=session.images
-                )
-                session.context.assets.save(
-                    manifest, session.tiles, thumbnail, images=session.images
-                )
-        except (OSError, ValueError) as error:
-            QMessageBox.critical(self, "Save failed", str(error))
+            if not (getattr(self.canvas, '_cage_prepare', None) or getattr(self.canvas, '_cage_commit_pending', None)):
+                self._capture_active_session()
+        return self._queue_manual_save(session, wait=wait)
+
+    def _queue_manual_save(self, session=None, *, wait=False) -> bool:
+        scope = self._autosave_scope(session)
+        if scope is None or self._autosave_jobs.closed:
             return False
-        session.dirty = False
-        session.recovery_revision = session.edit_revision
-        if session is self.active_session:
-            self._dirty = False
-            self.autosave_timer.stop()
-        self.asset_library.refresh()
-        self._refresh_project_tabs()
-        self.statusBar().showMessage("Saved", 3000)
-        destination = (
-            session.context.assets.asset_root(session.asset_manifest.asset_id) / "asset.json"
-            if session.kind == "asset" and session.asset_manifest is not None
-            else session.context.repository.series_path
-        )
-        self._show_file_notification("saved", destination)
-        self._refresh_actions()
+        revision = session.edit_revision if session is not None else self._edit_revision
+        existing = self._autosave_jobs.manual_request(scope, revision)
+        if existing is not None:
+            return self._autosave_jobs.wait(existing) if wait else True
+        request = RecoveryRequest(scope, revision, session, None,
+            session.name if session is not None else self.chapter.name, manual=True)
+        context = session.context if session is not None else None
+        repository = context.repository if context is not None else self.repository
+        series = context.series if context is not None else self.series
+        source = self._save_capture_source(scope, session, manual=True)
+        if scope[1] == "series":
+            def current_series():
+                return series
+            request.series_supplier = current_series
+            request.series_version_supplier = lambda: self._autosave_jobs.series_version(scope[0], series)
+        if not self._autosave_jobs.capture_manual(request, source):
+            return False
+        self.statusBar().showMessage("Saving…", 3000)
+        if wait:
+            return self._autosave_jobs.wait(request)
         return True
+
+    def _resolve_manual_save_previews(self) -> None:
+        """Commit authoring controls without persisting their intermediate draft."""
+        if (any(gate.busy for gate in self.canvas._native_input_gates()) or self.canvas._drawing
+                or getattr(self.canvas, '_native_deferred_activations', None)):
+            return
+        if getattr(self.gradient_tools_controls, '_edit_before', None) is not None:
+            self.gradient_tools_controls._finish_ramp_edit()
+        if getattr(self.canvas, '_mask_gradient_drag', None) is not None:
+            self.canvas._finish_mask_gradient()
+        before = getattr(self, '_mask_contributors_before', None)
+        if before is None or self.chapter is None or before.document_identity != id(self.chapter):
+            return
+        mask_id = self.canvas.active_tone_mask_id
+        mask = self.chapter.masks.get(mask_id)
+        if mask is None or list(mask.contributors) == self._mask_original_contributors:
+            return
+        from comic_editor.core.document_patch import RecordSnapshot
+        from comic_editor.ui.record_edits import commit_records
+        commit_records(self.canvas, before, 'Edit mask contributors')
+        self._mask_original_contributors = list(mask.contributors)
+        self._mask_contributors_before = RecordSnapshot.capture(self.chapter, masks=(mask_id,),
+            attributes={'masks': ('contributors', 'revision')})
+
+    def _save_capture_source(self, scope, session=None, *, manual=False):
+        def durable_inputs_ready(chapter):
+            if chapter is not self.canvas.chapter:
+                return True
+            if getattr(self.canvas, '_native_input_error', None) is not None:
+                raise ValueError(f'Drawing failed: {self.canvas._native_input_error}')
+            if any(gate.busy for gate in self.canvas._native_input_gates()):
+                return False
+            if getattr(self.canvas, '_native_deferred_activations', None):
+                return False
+            if getattr(self.gradient_tools_controls, '_edit_before', None) is not None:
+                return False
+            before = getattr(self, '_mask_contributors_before', None)
+            if before is not None and before.document_identity == id(chapter):
+                mask = chapter.masks.get(self.canvas.active_tone_mask_id)
+                if mask is not None and list(mask.contributors) != self._mask_original_contributors:
+                    return False
+            if getattr(self.canvas, '_cage_commit_error', None) is not None:
+                raise ValueError(f'Cage Transform failed: {self.canvas._cage_commit_error}')
+            return not any(bool(getattr(self.canvas, attribute, None)) for attribute in (
+                "_drawing", "_paint_brush_stroke", "_lasso_brush_stroke",
+                "_page_creation_anchor_id", "_page_gap_draft", "_gradient_creation_before",
+                "_gradient_preview_active", "_model_before", "_mask_gradient_drag",
+                "_vector_gesture_mode", "_free_text_drag", "_cage_session", "_cage_prepare", "_cage_commit_pending", "_cage_edit_before", "_text_editing",
+                "_fill_async_gesture", "_fill_gesture_active", "_fill_job_cancel", "_fill_replay_cancel")) and not (
+                    getattr(self.canvas, '_scene_consumers', None) is not None
+                    and (self.canvas._scene_consumers.contains(('mask-wand',))
+                         or self.canvas._scene_consumers.contains(('drawing-clipboard',))
+                         or self.canvas._scene_consumers.contains(('outliner-copy',))
+                         or self.canvas._scene_consumers.contains(('outliner-duplicate',))
+                         or self.canvas._scene_consumers.contains(('delete-mask',))
+                         or self.canvas._scene_consumers.contains(('clear-canvas',))))
+        def source():
+            chapter = session.chapter if session is not None else self.chapter
+            if session is not None:
+                if self.sessions.get(session.key) is not session or self._autosave_scope(session) != scope:
+                    return None
+                if manual and chapter is self.canvas.chapter:
+                    self._resolve_manual_save_previews()
+                return scope[0], session.chapter, session.tiles, session.images, session.asset_manifest if session.kind == "asset" else None, session.edit_revision, durable_inputs_ready(session.chapter)
+            if self.active_session is not None or self._autosave_scope() != scope:
+                return None
+            if manual and chapter is self.canvas.chapter:
+                self._resolve_manual_save_previews()
+            return scope[0], self.chapter, self.canvas.tiles, self.canvas.images, None, self._edit_revision, durable_inputs_ready(self.chapter)
+        return source
+
+    def _manual_save_completed(self, request, error) -> None:
+        session = request.owner
+        if session is not None:
+            if self.sessions.get(session.key) is not session or self._autosave_scope(session) != request.scope:
+                return
+            revision = session.edit_revision
+        else:
+            if self.active_session is not None or self._autosave_scope() != request.scope:
+                return
+            revision = self._edit_revision
+        if error is not None:
+            self.statusBar().showMessage(f"Save failed for {request.name}: {error}", 7000)
+            self.autosave_timer.start(5000)
+            QMessageBox.critical(self, "Save failed", str(error))
+            return
+        tiles = session.tiles if session is not None else self.canvas.tiles
+        images = session.images if session is not None else self.canvas.images
+        # Resource stamps only describe the captured revision. Later edits
+        # retain their dirty state and remain eligible for recovery autosave.
+        tiles._saved_versions.update(request.snapshot.saved_tiles)
+        images._saved_sources.update(request.snapshot.saved_images)
+        if request.scope[1] == 'series':
+            series = session.context.series if session is not None else self.series
+            for reference in series.chapters:
+                if reference.chapter_id == request.scope[2]:
+                    reference.name = request.snapshot.chapter['name']
+        unchanged = revision == request.revision
+        if unchanged:
+            tiles.dirty.clear()
+            images.dirty.clear()
+            if session is not None:
+                session.dirty = False
+                session.recovery_revision = revision
+                if session.kind == "asset" and session.asset_manifest is not None:
+                    saved = request.snapshot.model
+                    session.chapter.width, session.chapter.height = saved.width, saved.height
+                    root_id = session.chapter.root_page_ids[0]
+                    session.chapter.layers[root_id].bound = copy.deepcopy(saved.layers[root_id].bound)
+                    session.asset_manifest.visual_bounds = tuple(request.snapshot.asset["visual_bounds"])
+                    session.asset_manifest.name = request.snapshot.asset["name"]
+                    session.asset_manifest.document = session.chapter
+                    if session is self.active_session:
+                        self.canvas._scene_snapshot_compiler.invalidate()
+                        self.canvas._invalidate_scene_cache()
+                if session is self.active_session:
+                    self._dirty = False
+                    self.autosave_timer.stop()
+            else:
+                self._dirty = False
+                self._recovery_revision = revision
+                self.autosave_timer.stop()
+        else:
+            self.autosave_timer.start(2000)
+        if (request.scope[1] == 'asset' and session is not None
+                and self.asset_library.repository is session.context.assets):
+            self.asset_library.refresh()
+        self._refresh_project_tabs()
+        self.statusBar().showMessage("Saved" if unchanged else "Saved; newer changes remain unsaved", 3000)
+        destination = (session.context.assets.asset_root(session.asset_manifest.asset_id) / "asset.json"
+            if session is not None and session.kind == "asset" else
+            (session.context.repository.series_path if session is not None else self.repository.series_path))
+        if session is None or session is self.active_session:
+            self._show_file_notification("saved", destination)
+        self._refresh_actions()
+
+    def _finish_pending_manual_save(self, session=None) -> bool:
+        """Close waits for an already requested Save of this exact edit state."""
+        scope = self._autosave_scope(session)
+        revision = session.edit_revision if session is not None else self._edit_revision
+        request = self._autosave_jobs.manual_request(scope, revision)
+        return request is None or self._autosave_jobs.wait(request)
 
     def _close_project_tab(self, index: int) -> None:
         if self._page_gap_mode_locked:
@@ -2529,6 +2687,10 @@ class MainWindow(QMainWindow):
             return
         session = self.sessions.get(str(self.project_tabs.tabData(index)))
         if session is None:
+            return
+        if session is self.active_session and not self._drain_accepted_input_actions():
+            return
+        if not self._finish_pending_manual_save(session):
             return
         if session is self.active_session:
             self._capture_active_session()
@@ -2541,7 +2703,7 @@ class MainWindow(QMainWindow):
             )
             if answer == QMessageBox.Cancel:
                 return
-            if answer == QMessageBox.Save and not self._save_editor_session(session):
+            if answer == QMessageBox.Save and not self._save_editor_session(session, wait=True):
                 return
         self._autosave_jobs.drain(self._autosave_scope(session))
         was_active = session is self.active_session
@@ -2755,6 +2917,9 @@ class MainWindow(QMainWindow):
             return
         chapter_id = self.chapter_combo.itemData(index)
         if self.chapter and chapter_id == self.chapter.chapter_id:
+            return
+        if not self._drain_accepted_input_actions():
+            self._sync_chapter_combo()
             return
         if not self._save_if_dirty():
             self._sync_chapter_combo()
@@ -3066,7 +3231,13 @@ class MainWindow(QMainWindow):
             return
         self.chapter.height = base_height
         self.canvas._ensure_page_height_safety()
-        after = self.chapter.to_dict()
+        from comic_editor.core.document_patch import RecordSnapshot
+        if isinstance(before, RecordSnapshot):
+            before.records.setdefault('layers', {})[page.layer_id] = None
+            before.selections['layers'] = (*before.selections.get('layers', ()), page.layer_id)
+            after = before.after(self.chapter)
+        else:
+            after = self.chapter.to_dict()
         self.canvas.push_model_change(before, after, "Add page")
         self._after_structure(page.layer_id, "layer")
         # Acknowledge before changing tools: changing away from a creation
@@ -3104,18 +3275,20 @@ class MainWindow(QMainWindow):
                 4000,
             )
             return
-        before = self.chapter.to_dict()
+        from comic_editor.core.document_patch import RecordSnapshot
         count = sum(
             isinstance(item, VectorDrawingObject)
             for item in self.chapter.objects.values()
         ) + 1
         drawing = VectorDrawingObject(name=f"Vector Drawing {count}")
+        before = RecordSnapshot.capture(self.chapter, layers=(parent.layer_id,),
+                                        objects=(drawing.object_id,))
         self.chapter.add_object(
             parent.layer_id,
             drawing,
             index=self._new_object_insertion_index(parent.layer_id),
         )
-        after = self.chapter.to_dict()
+        after = before.after(self.chapter)
         self.canvas.push_model_change(
             before, after, "Add Vector Drawing"
         )
@@ -3262,6 +3435,7 @@ class MainWindow(QMainWindow):
             self.canvas.begin_text_placement(parent.layer_id, new_container=True)
 
     def _add_text(self) -> None:
+        from comic_editor.core.document_patch import RecordSnapshot
         container = self.canvas._selected_text_container()
         if container is not None:
             self.canvas.begin_text_placement(container.layer_id)
@@ -3273,7 +3447,6 @@ class MainWindow(QMainWindow):
                 4000,
             )
             return
-        before = self.chapter.to_dict()
         left, top, width, height = parent.bound.bbox()
         count = sum(isinstance(item, TextObject) for item in self.chapter.objects.values()) + 1
         obj = TextObject(name=f"Text {count}", text="Text", x=0, y=0)
@@ -3297,13 +3470,19 @@ class MainWindow(QMainWindow):
                 (left + (width + obj.width) / 2, top + (height + obj.height) / 2),
                 (left + (width - obj.width) / 2, top + (height + obj.height) / 2),
             ]
+        before = RecordSnapshot.capture(self.chapter, layers=(parent.layer_id,),
+                                        objects=(obj.object_id,), scalars=('size',))
         self.chapter.add_object(
             parent.layer_id, obj,
             index=self._new_object_insertion_index(parent.layer_id),
         )
-        after = self.chapter.to_dict()
+        after = before.after(self.chapter)
         self.canvas.push_model_change(before, after, "Add text object")
-        self._after_structure(obj.object_id, "object")
+        self.canvas.set_selection('object', obj.object_id)
+        self.canvas._emit_typed_hierarchy_changed(self.canvas._last_published_change)
+        self.canvas._emit_typed_document_changed(None, self.canvas._last_published_change)
+        self.canvas.update()
+        self._refresh_actions()
         self.canvas.start_text_edit(select_all=True)
 
     def _next_layer_name(self) -> str:
@@ -3330,21 +3509,73 @@ class MainWindow(QMainWindow):
             "Delete the selected entity and all of its descendants?",
         ) != QMessageBox.Yes:
             return
-        before = self.chapter.to_dict()
+        before = self._entity_deletion_snapshot(self.canvas.selected_kind, self.canvas.selected_id)
         deleted = self.chapter.delete_entity(
             self.canvas.selected_kind, self.canvas.selected_id
         )
         # Keep detached tiles in memory until the undo stack is discarded.
         # Persistence writes only referenced objects and removes stale folders.
-        after = self.chapter.to_dict()
+        after = before.after(self.chapter)
         self.canvas.clear_selection()
         self.canvas.push_model_change(before, after, "Delete entity")
         self._after_structure("", "")
 
+    def _entity_deletion_snapshot(self, kind, identifier):
+        """Capture the removed subtree, changed parent and affected registries."""
+        from comic_editor.core.document_patch import RecordSnapshot
+        refs = set()
+        def visit(current_kind, current_id):
+            ref = current_kind, current_id
+            if ref in refs:
+                return
+            refs.add(ref)
+            if current_kind == 'layer':
+                for child in self.chapter.layers[current_id].children:
+                    visit(child.kind, child.entity_id)
+            else:
+                obj = self.chapter.objects[current_id]
+                if isinstance(obj, SpeedLinesGradientObject) and obj.center_shape_id:
+                    visit('object', obj.center_shape_id)
+        visit(kind, identifier)
+        layers = {entity_id for entity_kind, entity_id in refs if entity_kind == 'layer'}
+        objects = {entity_id for entity_kind, entity_id in refs if entity_kind == 'object'}
+        entity = (self.chapter.layers[identifier] if kind == 'layer' else self.chapter.objects[identifier])
+        parent_id = entity.parent_id if kind == 'layer' else entity.parent_layer_id
+        if parent_id:
+            layers.add(parent_id)
+        if isinstance(entity, SpeedLineCenterObject) and entity.owner_gradient_id:
+            objects.add(entity.owner_gradient_id)
+        candidates = {modifier_id for entity_kind, entity_id in refs
+            for modifier_id in (self.chapter.layers[entity_id] if entity_kind == 'layer'
+                                else self.chapter.objects[entity_id]).modifier_ids}
+        retained_modifiers = {modifier_id
+            for group_kind, group in (('layer', self.chapter.layers), ('object', self.chapter.objects))
+            for entity_id, record in group.items() if (group_kind, entity_id) not in refs
+            for modifier_id in record.modifier_ids}
+        removed_modifiers = candidates - retained_modifiers
+        referenced_masks = {record.opacity_mask.mask_id
+            for group_kind, group in (('layer', self.chapter.layers), ('object', self.chapter.objects))
+            for entity_id, record in group.items() if (group_kind, entity_id) not in refs
+            and record.opacity_mask is not None}
+        referenced_masks.update(binding.mask_id for modifier_id, modifier in self.chapter.modifiers.items()
+            if modifier_id not in removed_modifiers for binding in modifier.parameter_masks.values())
+        masks = {mask_id for mask_id, mask in self.chapter.masks.items()
+            if any(tuple(contributor) in refs for contributor in mask.contributors)
+            or not mask.saved and mask_id not in referenced_masks}
+        return RecordSnapshot.capture(self.chapter, layers=layers, objects=objects,
+            modifiers=removed_modifiers, masks=masks, scalars=('root_page_ids', 'modifier_preset_ids'))
+
     def _clear_canvas(self) -> None:
         if self.chapter is None or self.canvas.chapter is None:
             return
+        self.canvas._finish_lasso_brush()
+        if getattr(self.canvas, '_raster_tile_input', None) is not None:
+            self.canvas._end_stroke()
+        if getattr(self.canvas, '_mask_tile_input', None) is not None:
+            self.canvas._end_mask_stroke()
         self.canvas._finish_paint_brush()
+        if not self._drain_accepted_input_actions():
+            return
         if self.canvas.clear_selected_drawing_content():
             return
         entities = list(self.canvas.selected_entities) if len(self.canvas.selected_entities) > 1 else ([(self.canvas.selected_kind, self.canvas.selected_id)] if self.canvas.selected_id else [])
@@ -3359,48 +3590,31 @@ class MainWindow(QMainWindow):
                 targets.append((kind, eid, obj))
         if not targets:
             return
-        before = self.chapter.to_dict()
-        before_tiles = {}
-        for _, eid, obj in targets:
-            if isinstance(obj, RasterObject):
-                before_tiles[eid] = self.canvas.tiles.object_tiles(eid)
-        after_tiles_state = {}
-        for _, eid, obj in targets:
-            if isinstance(obj, RasterObject):
-                self.canvas.tiles.remove_object(eid)
-            elif isinstance(obj, VectorDrawingObject):
-                if obj.strokes:
+        from comic_editor.render.bake_sources import BakeState, clear_drawings_history
+        from comic_editor.ui.scene_consumers import scene_consumers
+        from comic_editor.ui.baking import commit
+        identifiers = tuple(eid for _, eid, _ in targets)
+        chapter, canvas = self.chapter, self.canvas
+        def accept(before, error):
+            if error is not None:
+                self.statusBar().showMessage(f'Clear failed: {type(error).__name__}: {error}', 7000)
+                return
+            if self.chapter is not chapter or before.model.document_identity != id(chapter):
+                return
+            selection = list(canvas.selected_entities)
+            for identifier in identifiers:
+                obj = chapter.objects.get(identifier)
+                if isinstance(obj, RasterObject):
+                    canvas.tiles.remove_object(identifier)
+                elif isinstance(obj, VectorDrawingObject) and obj.strokes:
                     obj.strokes = []
                     obj.touch_revision()
-        after = self.chapter.to_dict()
-        def _undo():
-            self.chapter.__dict__.update(ChapterDocument.from_dict(before).__dict__)
-            for eid, tiles in before_tiles.items():
-                if tiles:
-                    self.canvas.tiles.replace_object_tiles(eid, tiles)
-                else:
-                    self.canvas.tiles.remove_object(eid)
-            self.hierarchy_model.rebuild()
-            self.canvas._invalidate_scene_cache()
-            self.canvas.documentChanged.emit(None)
-            self.canvas.update()
-        def _redo():
-            self.chapter.__dict__.update(ChapterDocument.from_dict(after).__dict__)
-            for eid in before_tiles:
-                self.canvas.tiles.remove_object(eid)
-            for _, eid, obj in targets:
-                cur = self.chapter.objects.get(eid)
-                if isinstance(cur, VectorDrawingObject):
-                    cur.strokes = []
-            self.hierarchy_model.rebuild()
-            self.canvas._invalidate_scene_cache()
-            self.canvas.documentChanged.emit(None)
-            self.canvas.update()
-        self.canvas.command_stack.push(CallbackCommand("Clear canvas", _redo, _undo), already_done=True)
-        self.hierarchy_model.rebuild()
-        self.canvas._invalidate_scene_cache()
-        self.canvas.documentChanged.emit(None)
-        self.canvas.update()
+            after = BakeState(before.model.after(chapter), {},
+                {identifier: {} for identifier in before.tiles},
+                {identifier: {} for identifier in before.tiles})
+            commit(canvas, before, after, 'Clear canvas', selection, selection)
+        scene_consumers(canvas).request(('clear-canvas',), clear_drawings_history,
+            (identifiers,), accept, ordered=True)
 
     def _after_structure(self, entity_id: str, kind: str) -> None:
         self._refresh_hierarchy()
@@ -3425,16 +3639,15 @@ class MainWindow(QMainWindow):
         )
         if not accepted or value == self.chapter.height:
             return
-        before = self.chapter.to_dict()
+        from comic_editor.core.document_patch import RecordSnapshot
+        before = RecordSnapshot.capture(self.chapter, scalars=('size',))
         try:
             self.chapter.trim_height(value)
         except ValueError as error:
             QMessageBox.warning(self, "Cannot trim", str(error))
             return
-        after = self.chapter.to_dict()
-        self.canvas.push_model_change(before, after, "Trim chapter")
-        self.canvas.hierarchyChanged.emit()
-        self._mark_dirty(None)
+        from comic_editor.ui.record_edits import commit_records
+        commit_records(self.canvas, before, "Trim chapter")
 
     def _activate_tool(self, tool: ToolKind) -> bool:
         if self.canvas.active_tone_mask_id and tool in {
@@ -4059,29 +4272,31 @@ class MainWindow(QMainWindow):
         elif selected is copy_asset:
             self._copy_selected_as_asset(item.kind, item.entity_id)
         elif mask_only is not None and selected is mask_only:
-            before = self.chapter.to_dict()
+            from comic_editor.core.document_patch import RecordSnapshot
+            from comic_editor.ui.record_edits import commit_records
+            group = 'layers' if item.kind == 'layer' else 'objects'
+            before = RecordSnapshot.capture(self.chapter, **{group: (item.entity_id,)},
+                                            attributes={group: ('mask_only',)})
             mask_only_target.mask_only = mask_only.isChecked()
-            self.canvas.push_model_change(
-                before, self.chapter.to_dict(), "Show as mask only"
-            )
-            self.canvas.hierarchyChanged.emit()
-            self.canvas.documentChanged.emit(None)
+            commit_records(self.canvas, before, "Show as mask only", hierarchy=True)
         elif reference is not None and selected is reference:
-            before = self.chapter.to_dict()
+            from comic_editor.core.document_patch import RecordSnapshot
+            from comic_editor.ui.record_edits import commit_records
+            before = RecordSnapshot.capture(self.chapter,
+                layers=tuple(entity.layer_id for entity in reference_targets if isinstance(entity, LayerNode)),
+                objects=tuple(entity.object_id for entity in reference_targets if not isinstance(entity, LayerNode)),
+                attributes={'layers': ('fill_reference',), 'objects': ('fill_reference',)})
             enabled = reference.isChecked()
             for entity in reference_targets:
                 entity.fill_reference = enabled
-            self.canvas.push_model_change(
-                before, self.chapter.to_dict(), "Set reference layer"
-            )
-            self.canvas.hierarchyChanged.emit()
-            self.canvas.documentChanged.emit(None)
+            commit_records(self.canvas, before, "Set reference layer", hierarchy=True)
         elif rasterize is not None and selected is rasterize:
             self._rasterize_image(item.entity_id)
         elif flatten is not None and selected is flatten:
-            from comic_editor.ui.baking import rasterize
+            from comic_editor.ui.baking import request_rasterize
             try:
-                rasterize(self.canvas, item.kind, item.entity_id)
+                request_rasterize(self.canvas, item.kind, item.entity_id,
+                    lambda error: QMessageBox.warning(self, 'Rasterize', str(error)) if error else None)
             except (ValueError, MemoryError, OSError) as error:
                 QMessageBox.warning(self, "Rasterize", str(error))
 
@@ -4134,52 +4349,62 @@ class MainWindow(QMainWindow):
                 if answer != QMessageBox.Yes:
                     return
         try:
-            manifest, tiles, images = extract_asset(
-                self.chapter, self.canvas.tiles, kind, entity_id, name,
-                source_images=self.canvas.images, include_images=True,
-            )
-            thumbnail = self.canvas.render_asset_thumbnail(
-                manifest, tiles, images=images
-            )
-            if existing is None:
-                context.assets.create(
-                    manifest, tiles, thumbnail, images=images,
-                    folder_id=self.asset_library.selected_folder_id(),
-                )
-            else:
-                self._autosave_jobs.drain((str(context.repository.root), "asset", existing.asset_id))
-                manifest = context.assets.replace(
-                    existing.asset_id, manifest, tiles, thumbnail,
-                    images=images,
-                )
+            self.canvas._commit_text_edit()
+            self.canvas.commit_active_cage()
+            from comic_editor.ui.asset_copy_jobs import AssetCopyJobs
+            jobs = getattr(self, '_asset_copy_jobs', None)
+            if jobs is None:
+                jobs = self._asset_copy_jobs = AssetCopyJobs(self)
+            jobs.request(context, kind, entity_id, name, existing, open_session,
+                         self.asset_library.selected_folder_id())
         except (OSError, KeyError, ValueError) as error:
             QMessageBox.warning(self, "Unable to create asset", str(error))
             return
-        if existing is not None and open_session is not None:
-            self._reload_replaced_asset_session(
-                open_session, manifest, tiles, images
-            )
-        self.asset_library.refresh()
-        self.ribbon.select_page("asset_library")
-        action = "Replaced" if existing is not None else "Created"
-        self.statusBar().showMessage(f"{action} asset {manifest.name}", 4000)
+        self.statusBar().showMessage(f'Preparing asset {name.strip()}', 4000)
 
-    def _rasterize_image(self, object_id: str) -> None:
+    def _asset_copy_completed(self, job, result, error) -> None:
+        if error is not None:
+            QMessageBox.warning(self, 'Unable to create asset', str(error))
+            return
+        manifest, tiles, images = result
+        source_visible = job.binding == self._asset_copy_jobs.binding()
+        if job.existing_id:
+            self._autosave_jobs.saved_resources.pop(
+                (str(job.context.repository.root), 'asset', job.existing_id), None)
+        session = job.destination_session
+        if (session is not None and self.sessions.get(session.key) is session
+                and session.edit_revision == job.destination_revision):
+            self._reload_replaced_asset_session(session, manifest, tiles, images)
+        # A user may continue editing the open asset while its captured copy
+        # publishes. Preserve those newer edits and their dirty/history state.
+        if self._current_project_context() is job.context:
+            self.asset_library.refresh()
+            if source_visible:
+                self.ribbon.select_page('asset_library')
+            action = 'Replaced' if job.existing_id else 'Created'
+            self.statusBar().showMessage(f'{action} asset {manifest.name}', 4000)
+
+    def _rasterize_image(self, object_id: str, *, prepared=None) -> None:
         if self.chapter is None:
             return
         obj = self.chapter.objects.get(object_id)
         if not isinstance(obj, ImageObject):
             return
-        image = self.canvas.images.image(object_id)
-        if image.isNull():
-            QMessageBox.warning(
-                self, "Rasterize Image", "The embedded image cannot be decoded."
-            )
+        if prepared is None:
+            from comic_editor.render.bake_sources import image_raster_source
+            from comic_editor.ui.scene_consumers import scene_consumers
+            def accept(source, error):
+                if error is not None:
+                    QMessageBox.warning(self, 'Rasterize Image', str(error))
+                else:
+                    self._rasterize_image(object_id, prepared=source)
+            scene_consumers(self.canvas).request(('image-raster-source', object_id),
+                                                image_raster_source, (object_id,), accept)
             return
-        before_model = self.chapter.to_dict()
-        before_images = self.canvas.images.snapshot()
-        before_tiles = self.canvas.tiles.object_tiles(object_id)
-        quad = self.canvas._image_local_quad(obj)
+        before = prepared.history
+        if before is None or before.model.document_identity != id(self.chapter):
+            return
+        quad = prepared.quad
         raster = RasterObject(
             object_id=obj.object_id, name=obj.name,
             custom_name=obj.custom_name,
@@ -4191,43 +4416,17 @@ class MainWindow(QMainWindow):
             geometry_reference=obj.geometry_reference,
             ignore_parent_mask=obj.ignore_parent_mask,
             underlay_opacity=obj.underlay_opacity,
-            interaction_rect=(0.0, 0.0, image.width(), image.height()),
-            transform_frame=(0.0, 0.0, image.width(), image.height()),
+            interaction_rect=(0.0, 0.0, prepared.width, prepared.height),
+            transform_frame=(0.0, 0.0, prepared.width, prepared.height),
             transform_quad=list(quad),
         )
         self.chapter.objects[object_id] = raster
         self.canvas.images.remove(object_id)
         self.canvas.tiles.remove_object(object_id)
-        size = self.canvas.tiles.tile_size
-        for tile_y in range(math.ceil(image.height() / size)):
-            for tile_x in range(math.ceil(image.width() / size)):
-                tile = image.copy(
-                    tile_x * size, tile_y * size,
-                    min(size, image.width() - tile_x * size),
-                    min(size, image.height() - tile_y * size),
-                )
-                self.canvas.tiles.set_tile(object_id, (tile_x, tile_y), tile)
-        after_model = self.chapter.to_dict()
-        after_images = self.canvas.images.snapshot()
-        after_tiles = self.canvas.tiles.object_tiles(object_id)
-
-        def restore(model: dict, resources: dict, tiles: dict) -> None:
-            self.canvas.replace_chapter(model)
-            self.canvas.images.restore(resources)
-            self.canvas.tiles.replace_object_tiles(object_id, tiles)
-            self.canvas.set_selection("object", object_id)
-            self.canvas.hierarchyChanged.emit()
-            self.canvas.documentChanged.emit(None)
-            self.canvas.update()
-
-        self.canvas.command_stack.push(CallbackCommand(
-            "Rasterize image",
-            lambda: restore(after_model, after_images, after_tiles),
-            lambda: restore(before_model, before_images, before_tiles),
-        ), already_done=True)
-        self.canvas.set_selection("object", object_id)
-        self.canvas.hierarchyChanged.emit()
-        self.canvas.documentChanged.emit(None)
+        self.canvas.tiles.replace_object_tiles(object_id, prepared.tiles, alpha_bounds=prepared.alpha_bounds)
+        from comic_editor.ui.baking import after_state, commit
+        commit(self.canvas, before, after_state(self.canvas, before), 'Rasterize image',
+               list(self.canvas.selected_entities), [('object', object_id)])
         self._sync_contextual_ribbon()
 
     def _reload_replaced_asset_session(
@@ -4510,7 +4709,8 @@ class MainWindow(QMainWindow):
                     "The image selected for relinking is no longer available", 5000
                 )
                 return
-            before = self.chapter.to_dict()
+            from comic_editor.core.document_patch import RecordSnapshot
+            before = RecordSnapshot.capture(self.chapter, objects=(obj.object_id,))
             obj.source = BlenderComicViewSourceDescriptor(
                 project_uuid=view.project_uuid,
                 view_uuid=view.view_uuid,
@@ -4518,11 +4718,8 @@ class MainWindow(QMainWindow):
                 last_revision=view.revision,
             )
             obj.sync_source_metadata()
-            after = self.chapter.to_dict()
-            self.canvas.push_model_change(
-                before, after, "Relink Blender Comic View"
-            )
-            self.canvas.documentChanged.emit(None)
+            from comic_editor.ui.record_edits import commit_records
+            commit_records(self.canvas, before, "Relink Blender Comic View")
             self.selection_settings.refresh()
             self.blender_sources.handle_selection()
             self.statusBar().showMessage(
@@ -4669,7 +4866,8 @@ class MainWindow(QMainWindow):
                 "This Comic View has no cached frame to preserve.",
             )
             return
-        before = self.chapter.to_dict()
+        from comic_editor.core.document_patch import RecordSnapshot
+        before = RecordSnapshot.capture(self.chapter, objects=(obj.object_id,))
         display_name = obj.source.display_name
         obj.source = EmbeddedImageSourceDescriptor(
             filename=f"{display_name}.png", mime_type="image/png"
@@ -4678,11 +4876,8 @@ class MainWindow(QMainWindow):
         self.canvas.images.relabel(
             obj.object_id, obj.source_filename, obj.source_mime_type
         )
-        after = self.chapter.to_dict()
-        self.canvas.push_model_change(
-            before, after, "Detach Blender image source"
-        )
-        self.canvas.documentChanged.emit(None)
+        from comic_editor.ui.record_edits import commit_records
+        commit_records(self.canvas, before, "Detach Blender image source")
         self.selection_settings.refresh()
         self.blender_sources.handle_selection()
         self.statusBar().showMessage(
@@ -4772,21 +4967,44 @@ class MainWindow(QMainWindow):
                 self.statusBar().showMessage("The copied web image could not be downloaded", 4000)
 
     def _capture_drawing_selection(self, *, cut: bool) -> bool:
-        payload = self.canvas.drawing_selection_clipboard()
-        if payload is None:
+        serial = self._next_clipboard_serial()
+        chapter = self.canvas.chapter
+        pending = {'serial': serial, 'chapter': chapter, 'paste': [], 'cut': cut,
+            'object_id': self.canvas.selected_object_id, 'selection': self.canvas._selection_snapshot()}
+        self._pending_drawing_copy = pending
+        def discard():
+            if getattr(self, '_pending_drawing_copy', None) is pending:
+                self._pending_drawing_copy = None
+        def ready(payload, error):
+            discard()
+            if error is not None or payload is None:
+                self.statusBar().showMessage(str(error) if error else 'The selected drawing contains no artwork', 4000)
+                return
+            if cut:
+                self.canvas._commit_drawing_clipboard_cut(payload, object_id=pending['object_id'],
+                    selection_before=pending['selection'])
+                payload = payload.payload
+            self._drawing_clipboard = payload
+            self._drawing_clipboard_serial = serial
+            self.clipboard_image_history.add_drawing(self.canvas, payload)
+            self.statusBar().showMessage('Cut drawing selection' if cut else 'Copied drawing selection', 2500)
+            for intent in pending['paste']:
+                if self.canvas.chapter is chapter:
+                    world, kind, identifier, as_new = intent
+                    collection = chapter.layers if kind == 'layer' else chapter.objects
+                    if identifier in collection:
+                        self.canvas.set_selection(kind, identifier, activate_default_tool=False)
+                    if as_new:
+                        self._paste_drawing_as_new_payload(payload, world)
+                    else:
+                        self._paste_drawing_payload(payload, world)
+        if not self.canvas.request_drawing_selection_clipboard(ready, discard=discard, cut=cut):
+            discard()
             self.statusBar().showMessage(
                 "Select raster pixels or vector points first", 4000
             )
             return False
-        if cut and not self.canvas.clear_selected_drawing_content():
-            return False
-        self._drawing_clipboard = payload
-        self._drawing_clipboard_serial = self._next_clipboard_serial()
-        self.clipboard_image_history.add_drawing(self.canvas, payload)
-        self.statusBar().showMessage(
-            "Cut drawing selection" if cut else "Copied drawing selection",
-            2500,
-        )
+        self.statusBar().showMessage('Copying drawing selection…', 2500)
         return True
 
     def _cut_drawing_selection(self) -> bool:
@@ -4812,6 +5030,16 @@ class MainWindow(QMainWindow):
     def _paste(self) -> bool:
         image_sources = self._clipboard_image_sources()
         image_serial = self._image_clipboard_serial if image_sources or self._external_clipboard_reader.pending else 0
+        pending = getattr(self, '_pending_drawing_copy', None)
+        object_pending = getattr(self, '_pending_object_copy', None)
+        if object_pending is not None and object_pending['serial'] >= max(image_serial,
+                self._drawing_clipboard_serial, pending['serial'] if pending is not None else 0):
+            object_pending['paste'].append(cursor_world(self.canvas))
+            return True
+        if pending is not None and pending['serial'] >= max(image_serial, self._object_clipboard_serial):
+            pending['paste'].append((cursor_world(self.canvas), self.canvas.selected_kind,
+                self.canvas.selected_id, False))
+            return True
         if self._object_clipboard is not None and self._object_clipboard_serial >= max(image_serial, self._drawing_clipboard_serial):
             return self._paste_outliner_object(world=cursor_world(self.canvas))
         use_drawing = bool(
@@ -4841,15 +5069,22 @@ class MainWindow(QMainWindow):
         return False
 
     def _paste_drawing_as_new(self) -> bool:
+        pending = getattr(self, '_pending_drawing_copy', None)
+        if pending is not None:
+            pending['paste'].append((cursor_world(self.canvas), self.canvas.selected_kind,
+                self.canvas.selected_id, True))
+            return True
         payload = self._drawing_clipboard
         if payload is None:
             self.statusBar().showMessage(
                 "Copy or cut a drawing selection first", 3500
             )
             return False
+        return self._paste_drawing_as_new_payload(payload, cursor_world(self.canvas))
+
+    def _paste_drawing_as_new_payload(self, payload, world) -> bool:
         created = self.canvas.paste_drawing_clipboard_as_new(
-            drawing_at(payload, cursor_world(self.canvas)), self.canvas.selected_id
-        )
+            drawing_at(payload, world), self.canvas.selected_id)
         if not created:
             self.statusBar().showMessage(
                 "Unable to paste the drawing selection here", 4000
@@ -4870,15 +5105,49 @@ class MainWindow(QMainWindow):
         return bool(created)
 
     def _copy_outliner_object(self, kind: str, entity_id: str) -> bool:
-        try:
-            payload = capture_object(self.canvas, kind, entity_id)
-        except (KeyError, ValueError, OSError) as error:
-            self.statusBar().showMessage(str(error), 5000)
+        return self._capture_outliner_object(kind, entity_id)
+
+    def _capture_outliner_object(self, kind, entity_id, *, duplicate=False):
+        chapter = self.chapter
+        collection = chapter.layers if chapter is not None and kind == 'layer' else chapter.objects if chapter is not None else {}
+        entity = collection.get(entity_id)
+        if entity is None:
             return False
-        self._object_clipboard = payload
-        self._object_clipboard_serial = self._next_clipboard_serial()
-        self.clipboard_image_history.add_object(self.canvas, payload)
-        self.statusBar().showMessage(f"Copied {payload.manifest.name}", 2500)
+        from comic_editor.render.input_capture import object_clipboard
+        from comic_editor.ui.scene_consumers import scene_consumers
+        serial = self._next_clipboard_serial() if not duplicate else None
+        pending = {'serial': serial, 'chapter': chapter, 'paste': []}
+        if not duplicate:
+            self._pending_object_copy = pending
+        parent_id = entity.parent_id if kind == 'layer' else entity.parent_layer_id
+        parent_id = parent_id or entity_id
+        def discard():
+            if getattr(self, '_pending_object_copy', None) is pending:
+                self._pending_object_copy = None
+        def valid():
+            return (self.chapter is chapter and collection.get(entity_id) is entity
+                    and (not duplicate or parent_id in chapter.layers))
+        def ready(payload, error):
+            discard()
+            if error is not None:
+                self.statusBar().showMessage(str(error), 5000)
+                return
+            if duplicate:
+                index = next((i for i, child in enumerate(chapter.layers[parent_id].children)
+                    if child.entity_id == entity_id), None)
+                self._paste_outliner_object(payload, payload.original_center, parent_id=parent_id,
+                    insertion_index=index, label='Duplicate object')
+                return
+            self._object_clipboard = payload
+            self._object_clipboard_serial = serial
+            self.clipboard_image_history.add_object(self.canvas, payload)
+            self.statusBar().showMessage(f'Copied {payload.manifest.name}', 2500)
+            for world in pending['paste']:
+                if self.chapter is chapter:
+                    self._paste_outliner_object(payload, world)
+        scene_consumers(self.canvas).request(('outliner-duplicate' if duplicate else 'outliner-copy',),
+            object_clipboard, (kind, entity_id), ready, ordered=True, valid=valid, discard=discard)
+        self.statusBar().showMessage('Duplicating object…' if duplicate else 'Copying object…', 2500)
         return True
 
     def _paste_outliner_object(self, payload=None, world=None, *, parent_id=None,
@@ -4914,21 +5183,7 @@ class MainWindow(QMainWindow):
         return bool(created)
 
     def _duplicate_outliner_object(self, kind: str, entity_id: str) -> bool:
-        if self.chapter is None:
-            return False
-        try:
-            payload = capture_object(self.canvas, kind, entity_id)
-        except (KeyError, ValueError, OSError) as error:
-            self.statusBar().showMessage(str(error), 5000)
-            return False
-        entity = self.chapter.layers[entity_id] if kind == "layer" else self.chapter.objects[entity_id]
-        parent_id = entity.parent_id if kind == "layer" else entity.parent_layer_id
-        if not parent_id:
-            parent_id = entity_id
-        index = next((i for i, child in enumerate(self.chapter.layers[parent_id].children)
-                      if child.entity_id == entity_id), None)
-        return self._paste_outliner_object(payload, payload.original_center, parent_id=parent_id,
-                                           insertion_index=index, label="Duplicate object")
+        return self._capture_outliner_object(kind, entity_id, duplicate=True)
 
     def _show_clipboard_image_history(self) -> bool:
         if self.chapter is None:
@@ -4954,6 +5209,33 @@ class MainWindow(QMainWindow):
         return True
 
     # ---- selection and model synchronization --------------------------
+    def _parameter_mask_snapshot(self, context, mask_ids=()):
+        from comic_editor.core.document_patch import RecordSnapshot
+        if context[0] == 'modifier':
+            return RecordSnapshot.capture(self.chapter, modifiers=(context[1],), masks=mask_ids)
+        group = 'layers' if context[1] == 'layer' else 'objects'
+        target = getattr(self.chapter, group).get(context[2])
+        attributes = ('opacity', 'opacity_mask')
+        if hasattr(target, 'opacity_locked'):
+            attributes += ('opacity_locked',)
+        return RecordSnapshot.capture(self.chapter, **{group: (context[2],)}, masks=mask_ids,
+                                      attributes={group: attributes})
+
+    def _unreferenced_masks_after_detach(self, context):
+        """Capture only masks the existing garbage collector can remove."""
+        referenced = set()
+        for kind, targets in (('layer', self.chapter.layers), ('object', self.chapter.objects)):
+            for identifier, target in targets.items():
+                binding = target.opacity_mask
+                if binding is not None and context[:3] != ('opacity', kind, identifier):
+                    referenced.add(binding.mask_id)
+        for identifier, modifier in self.chapter.modifiers.items():
+            for name, binding in modifier.parameter_masks.items():
+                if context[:3] != ('modifier', identifier, name):
+                    referenced.add(binding.mask_id)
+        return tuple(identifier for identifier, mask in self.chapter.masks.items()
+                     if not mask.saved and identifier not in referenced)
+
     def _parameter_binding(self, context: tuple | None):
         if self.chapter is None or context is None:
             return None
@@ -5007,19 +5289,17 @@ class MainWindow(QMainWindow):
             return
         if self.canvas.active_tone_mask_id:
             self._finish_mask_mode(True)
-        before = self.chapter.to_dict()
         binding = self._parameter_binding(context)
         if binding is None:
+            from comic_editor.ui.record_edits import commit_records
             mask = ToneMask(saved=False)
+            before = self._parameter_mask_snapshot(context, (mask.mask_id,))
             self.chapter.masks[mask.mask_id] = mask
             binding = ParameterMaskBinding(
                 mask.mask_id, float(context[5]), float(context[6])
             )
             self._set_parameter_binding(context, binding)
-            self.canvas.push_model_change(
-                before, self.chapter.to_dict(), "Attach parameter mask"
-            )
-            self.canvas.documentChanged.emit(None)
+            commit_records(self.canvas, before, "Attach parameter mask")
         self._enter_mask_mode(binding.mask_id, context)
 
     def _detach_parameter_mask(self, context: tuple | None) -> None:
@@ -5034,7 +5314,8 @@ class MainWindow(QMainWindow):
             binding = self._parameter_binding(context)
             if binding is None:
                 return
-        before = self.chapter.to_dict()
+        from comic_editor.ui.record_edits import commit_records
+        before = self._parameter_mask_snapshot(context, self._unreferenced_masks_after_detach(context))
         if context[0] == "modifier":
             modifier = self.chapter.modifiers.get(context[1])
             if modifier is None:
@@ -5057,11 +5338,7 @@ class MainWindow(QMainWindow):
         # restore an anonymous mask without losing its tile payload. Save only
         # persists IDs that remain in the chapter registry.
         del removed
-        self.canvas.push_model_change(
-            before, self.chapter.to_dict(), "Detach parameter mask"
-        )
-        self.canvas._invalidate_scene_cache()
-        self.canvas.documentChanged.emit(None)
+        commit_records(self.canvas, before, "Detach parameter mask")
         self.selection_common.refresh()
         self.modifier_controls.refresh()
         self._refresh_masks_panel()
@@ -5093,6 +5370,9 @@ class MainWindow(QMainWindow):
         self._mask_context = context
         mask = self.chapter.masks[mask_id]
         self._mask_original_contributors = list(mask.contributors)
+        from comic_editor.core.document_patch import RecordSnapshot
+        self._mask_contributors_before = RecordSnapshot.capture(self.chapter, masks=(mask_id,),
+            attributes={'masks': ('contributors', 'revision')})
         self.canvas.set_tone_mask_mode(mask_id)
         self.canvas.set_tool(
             ToolKind.GRADIENT if mask.gradient is not None or mask.limited_gradients else ToolKind.RASTER_PENCIL
@@ -5123,8 +5403,12 @@ class MainWindow(QMainWindow):
         original = list(self._mask_original_contributors)
         final = list(mask.contributors) if mask is not None else []
         if mask is not None and not commit:
-            mask.contributors = list(original)
-            mask.touch()
+            before = getattr(self, '_mask_contributors_before', None)
+            if before is not None and before.document_identity == id(self.chapter):
+                self.canvas.replace_chapter(before)
+            else:
+                mask.contributors = list(original)
+                mask.touch()
         self.canvas.set_tone_mask_mode("")
         self.exit_mask_mode_button.hide()
         self.remove_mask_button.hide()
@@ -5132,14 +5416,9 @@ class MainWindow(QMainWindow):
         self._mask_context = None
         self._mask_original_contributors = []
         if commit and mask is not None and original != final:
-            self.canvas.command_stack.push(CallbackCommand(
-                "Edit mask contributors",
-                lambda values=final, current_id=mask_id:
-                self._apply_mask_contributors(current_id, values),
-                lambda values=original, current_id=mask_id:
-                self._apply_mask_contributors(current_id, values),
-            ), already_done=True)
-            self.canvas.documentChanged.emit(None)
+            from comic_editor.ui.record_edits import commit_records
+            commit_records(self.canvas, self._mask_contributors_before, 'Edit mask contributors')
+        self._mask_contributors_before = None
         self.canvas._invalidate_scene_cache()
         self.canvas.update()
         self.selection_common.refresh()
@@ -5168,14 +5447,17 @@ class MainWindow(QMainWindow):
         target = (kind, entity_id)
         if mask is None or self.chapter.mask_contributor(*target) is None:
             return False
+        from comic_editor.core.document_patch import RecordSnapshot
+        from comic_editor.ui.record_edits import preview_records
+        before = RecordSnapshot.capture(self.chapter, masks=(mask.mask_id,),
+                                       attributes={'masks': ('contributors', 'revision')})
         if target in mask.contributors:
             mask.contributors.remove(target)
         else:
             mask.contributors.append(target)
         mask.touch()
         self.hierarchy_model.set_mask_highlights(set(mask.contributors))
-        self.canvas._invalidate_scene_cache()
-        self.canvas.update()
+        preview_records(self.canvas, before, 'Edit mask contributors')
         self._refresh_masks_panel()
         return True
 
@@ -5184,10 +5466,12 @@ class MainWindow(QMainWindow):
     ) -> None:
         if self.chapter is None:
             return
+        from comic_editor.ui.record_edits import commit_records
         binding = self._parameter_binding(context)
-        before = self.chapter.to_dict()
+        created = ToneMask(saved=False) if binding is None else None
+        before = self._parameter_mask_snapshot(context, (created.mask_id if created is not None else binding.mask_id,))
         if binding is None:
-            mask = ToneMask(saved=False)
+            mask = created
             self.chapter.masks[mask.mask_id] = mask
             binding = ParameterMaskBinding(
                 mask.mask_id, float(context[5]), float(context[6])
@@ -5203,10 +5487,7 @@ class MainWindow(QMainWindow):
             ):
                 mask.contributors.append(target)
         mask.touch()
-        self.canvas.push_model_change(
-            before, self.chapter.to_dict(), "Assign mask contributors"
-        )
-        self.canvas.documentChanged.emit(None)
+        commit_records(self.canvas, before, "Assign mask contributors")
         self._enter_mask_mode(mask.mask_id, context)
 
     def _preview_tone_mask(self, mask_id: str, hovered: bool) -> None:
@@ -5221,11 +5502,12 @@ class MainWindow(QMainWindow):
             return
         if self.canvas.active_tone_mask_id:
             self._finish_mask_mode(True)
-        before = self.chapter.to_dict()
+        from comic_editor.core.document_patch import RecordSnapshot
+        from comic_editor.ui.record_edits import commit_records
         mask = ToneMask(name=name.strip(), saved=True)
+        before = RecordSnapshot.capture(self.chapter, masks=(mask.mask_id,))
         self.chapter.masks[mask.mask_id] = mask
-        self.canvas.push_model_change(before, self.chapter.to_dict(), "Add mask")
-        self.canvas.documentChanged.emit(None)
+        commit_records(self.canvas, before, "Add mask")
         self._enter_mask_mode(mask.mask_id)
 
     def _save_current_mask(self) -> None:
@@ -5235,12 +5517,13 @@ class MainWindow(QMainWindow):
         name, accepted = QInputDialog.getText(self, "Save Mask", "Mask name")
         if not accepted or not name.strip():
             return
-        before = self.chapter.to_dict()
+        from comic_editor.core.document_patch import RecordSnapshot
+        from comic_editor.ui.record_edits import commit_records
+        before = RecordSnapshot.capture(self.chapter, masks=(mask.mask_id,),
+                                       attributes={'masks': ('saved', 'name')})
         mask.saved = True
         mask.name = name.strip()
-        mask.touch()
-        self.canvas.push_model_change(before, self.chapter.to_dict(), "Save mask")
-        self.canvas.documentChanged.emit(None)
+        commit_records(self.canvas, before, "Save mask")
         self._refresh_masks_panel()
 
     def _rename_current_mask(self) -> None:
@@ -5252,11 +5535,11 @@ class MainWindow(QMainWindow):
         )
         if not accepted or not name.strip() or name.strip() == mask.name:
             return
-        before = self.chapter.to_dict()
+        from comic_editor.core.document_patch import RecordSnapshot
+        from comic_editor.ui.record_edits import commit_records
+        before = RecordSnapshot.capture(self.chapter, masks=(mask.mask_id,), attributes={'masks': ('name',)})
         mask.name = name.strip()
-        mask.touch()
-        self.canvas.push_model_change(before, self.chapter.to_dict(), "Rename mask")
-        self.canvas.documentChanged.emit(None)
+        commit_records(self.canvas, before, "Rename mask")
         self._refresh_masks_panel()
 
     def _delete_current_mask(self) -> None:
@@ -5272,31 +5555,53 @@ class MainWindow(QMainWindow):
             )
             if answer != QMessageBox.Yes:
                 return
-        before = self.chapter.to_dict()
-        paint = self.canvas.tiles.object_tiles(mask_id)
-        self.chapter.detach_mask(mask_id)
-        self.chapter.masks.pop(mask_id, None)
-        self.canvas.tiles.remove_object(mask_id)
-        self._finish_mask_mode(False)
-        after = self.chapter.to_dict()
+        from comic_editor.render.source_sampling import owned_object_tiles
+        from comic_editor.ui.scene_consumers import scene_consumers
+        chapter = self.chapter
 
-        def restore(state: dict, with_paint: bool) -> None:
-            self.canvas.replace_chapter(state)
-            if with_paint:
-                self.canvas.tiles.replace_object_tiles(mask_id, paint)
-            else:
-                self.canvas.tiles.remove_object(mask_id)
-            self.canvas._invalidate_scene_cache()
-            self.canvas.documentChanged.emit(None)
-            self.canvas.update()
+        def accept(result, error):
+            if error is not None:
+                self.statusBar().showMessage(f'Unable to delete mask: {error}', 5000)
+                return
+            if self.chapter is not chapter or mask_id not in chapter.masks:
+                return
+            from dataclasses import replace
+            from comic_editor.core.changes import ResourceChange
+            from comic_editor.core.document_patch import DocumentPatch, RecordSnapshot
+            paint, bounds = result
+            layers = tuple(identifier for identifier, target in chapter.layers.items()
+                if target.opacity_mask is not None and target.opacity_mask.mask_id == mask_id)
+            objects = tuple(identifier for identifier, target in chapter.objects.items()
+                if target.opacity_mask is not None and target.opacity_mask.mask_id == mask_id)
+            modifiers = tuple(identifier for identifier, modifier in chapter.modifiers.items()
+                if any(binding.mask_id == mask_id for binding in modifier.parameter_masks.values()))
+            before = RecordSnapshot.capture(chapter, layers=layers, objects=objects,
+                modifiers=modifiers, masks=(mask_id,),
+                attributes={'layers': ('opacity', 'opacity_mask'), 'objects': ('opacity', 'opacity_mask')})
+            chapter.detach_mask(mask_id)
+            chapter.masks.pop(mask_id)
+            self.canvas.tiles.remove_object(mask_id)
+            self._finish_mask_mode(False)
+            old, new = DocumentPatch.pair(before, before.after(chapter))
+            change = new.change_set(old, label='Delete mask')
+            change = replace(change, resources=(ResourceChange(('mask', mask_id), 'raster'),))
 
-        self.canvas.command_stack.push(CallbackCommand(
-            "Delete mask",
-            lambda: restore(after, False),
-            lambda: restore(before, True),
-        ), already_done=True)
-        self.canvas.documentChanged.emit(None)
-        self._refresh_masks_panel()
+            def restore(state, with_paint):
+                self.canvas._restore_history_state(state, document_patch=True)
+                if with_paint:
+                    self.canvas.tiles.replace_object_tiles(mask_id, paint, alpha_bounds=bounds)
+                else:
+                    self.canvas.tiles.remove_object(mask_id)
+                self.canvas.update()
+
+            self.canvas.command_stack.push(CallbackCommand('Delete mask',
+                lambda: restore(new, False), lambda: restore(old, True), change, change.reversed()),
+                already_done=True)
+            self.canvas._emit_typed_document_changed(None, change)
+            self._refresh_masks_panel()
+
+        scene_consumers(self.canvas).request(('delete-mask',), owned_object_tiles,
+            (mask_id,), accept, ordered=True)
 
     def _select_saved_mask(self, mask_id: str) -> None:
         if self.chapter is None or mask_id not in self.chapter.masks:
@@ -5305,17 +5610,15 @@ class MainWindow(QMainWindow):
             context = self._mask_context
             if self.canvas.active_tone_mask_id:
                 self._finish_mask_mode(True)
-            before = self.chapter.to_dict()
             binding = self._parameter_binding(context)
             if binding is not None and binding.mask_id != mask_id:
+                from comic_editor.ui.record_edits import commit_records
+                before = self._parameter_mask_snapshot(context, self._unreferenced_masks_after_detach(context))
                 old_id = binding.mask_id
                 binding.mask_id = mask_id
                 removed = self.chapter.garbage_collect_masks()
                 del removed
-                self.canvas.push_model_change(
-                    before, self.chapter.to_dict(), "Assign saved mask"
-                )
-                self.canvas.documentChanged.emit(None)
+                commit_records(self.canvas, before, "Assign saved mask")
                 if old_id == self.canvas.active_tone_mask_id:
                     self.canvas.set_tone_mask_mode("")
             self._enter_mask_mode(mask_id, context)
@@ -5325,31 +5628,38 @@ class MainWindow(QMainWindow):
             self._enter_mask_mode(mask_id)
 
     def _refresh_masks_panel(self) -> None:
-        thumbnails: dict[str, QImage] = {}
-        if self.chapter is not None:
-            width, height = 80, 80
-            transform = QTransform()
-            transform.scale(
-                width / max(1.0, self.chapter.width),
-                height / max(1.0, self.chapter.height),
-            )
-            visible = QRectF(
-                0, 0, self.chapter.width, self.chapter.height
-            )
-            for mask in self.chapter.masks.values():
-                if not mask.saved:
-                    continue
-                field = self.canvas.render_tone_mask_field(
-                    mask.mask_id, width, height, transform, visible
-                )
-                values = np.ascontiguousarray(
-                    np.clip(field * 255.0, 0, 255).astype(np.uint8)
-                )
-                thumbnails[mask.mask_id] = QImage(
-                    values.data, width, height, width,
-                    QImage.Format.Format_Grayscale8,
-                ).copy()
+        chapter = self.chapter
+        mask_ids = tuple(identifier for identifier, mask in chapter.masks.items() if mask.saved) if chapter else ()
+        state = getattr(self, '_mask_thumbnail_state', None)
+        thumbnails = ({identifier: image for identifier, image in state[2].items() if identifier in mask_ids}
+                      if state is not None and state[0] == id(chapter) else {})
         self.masks_panel.refresh(self.chapter, thumbnails)
+        if not mask_ids or self.canvas.chapter is not chapter:
+            return
+        from comic_editor.render.source_sampling import tone_mask_thumbnails
+        from comic_editor.ui.scene_consumers import scene_consumers
+        document = self.canvas._render_document_state()
+        signature = id(chapter), document, mask_ids
+        if state is not None and state[:2] == (id(chapter), (document, mask_ids)):
+            return
+        if getattr(self, '_mask_thumbnail_request', None) == signature:
+            return
+        self._mask_thumbnail_request = signature
+
+        def discard():
+            if getattr(self, '_mask_thumbnail_request', None) == signature:
+                self._mask_thumbnail_request = None
+
+        def accept(result, error):
+            discard()
+            if self.chapter is not chapter or self.canvas._render_document_state() != document:
+                return
+            if error is None:
+                self._mask_thumbnail_state = id(chapter), (document, mask_ids), result
+                self.masks_panel.refresh(chapter, result)
+
+        scene_consumers(self.canvas).request(('mask-thumbnails',), tone_mask_thumbnails,
+            (mask_ids,), accept, discard=discard)
 
     def _show_selected_saved_mask(self) -> None:
         if self.chapter is None or not self.canvas.selected_id:
@@ -5558,10 +5868,12 @@ class MainWindow(QMainWindow):
     def _tree_mutated(self, before: dict, after: dict, label: str) -> None:
         self.canvas.push_model_change(before, after, label)
         self.chapter = self.canvas.chapter
-        self._canvas_selection_changed(
-            self.canvas.selected_kind, self.canvas.selected_id
-        )
-        self.canvas.documentChanged.emit(None)
+        from comic_editor.core.document_patch import RecordSnapshot
+        if isinstance(before, RecordSnapshot):
+            self.canvas._emit_typed_document_changed(None, self.canvas._last_published_change)
+        else:
+            self._canvas_selection_changed(self.canvas.selected_kind, self.canvas.selected_id)
+            self.canvas.documentChanged.emit(None)
         self.canvas.update()
         self._mark_dirty(None)
 
@@ -5588,6 +5900,8 @@ class MainWindow(QMainWindow):
 
     def _object_records_changed(self, object_ids) -> None:
         """Refresh restored object rows without resetting or scrolling the tree."""
+        if self._focused_change_notice():
+            return
         for object_id in object_ids:
             index = self.hierarchy_model.index_for_entity("object", object_id)
             if index.isValid():
@@ -5600,7 +5914,46 @@ class MainWindow(QMainWindow):
         self.preview.invalidate_all()
         self._sync_tool_buttons()
 
-    def _hierarchy_changed(self) -> None:
+    def _focused_change_notice(self) -> bool:
+        change = self.canvas.command_stack.applying_change
+        return change is not None and not change.conservative
+
+    def _canvas_changes_published(self, change) -> None:
+        """Update changed rows and selected controls after a typed mutation."""
+        if self.chapter is not self.canvas.chapter:
+            self.chapter = self.canvas.chapter
+        if change.hierarchy_changed or self.hierarchy_model.chapter is not self.chapter:
+            self._hierarchy_changed(force=True)
+            return
+        self.hierarchy_model.apply_change(change)
+        affected = self.canvas._change_index.affected(change)
+        selected = set(self.canvas.selected_entities or
+                       [(self.canvas.selected_kind, self.canvas.selected_id)])
+        selected_changes = selected & (set(change.refs) | affected)
+        fields = set().union(*(item.fields for item in change.entities)) if change.entities else set()
+        if selected_changes:
+            if fields & {'*', 'visible', 'opacity', 'opacity_locked', 'opacity_mask', 'mask_only'}:
+                self.selection_common.refresh()
+            if change.entities:
+                self.selection_settings.refresh()
+            if any(isinstance(self.chapter.objects.get(identifier), TextObject)
+                   for kind, identifier in selected_changes if kind == 'object'):
+                self.text_object_controls.refresh()
+        if any(kind == 'mask' for kind, _identifier in affected | set(change.refs)):
+            self._refresh_masks_panel()
+
+    def _selection_properties_changed(self) -> None:
+        # Property controls publish their record changes independently. Their
+        # compatibility signal does not describe a structural tree mutation.
+        if self._focused_change_notice():
+            return
+        from comic_editor.core.changes import ChangeSet, EntityChange
+        refs = self.canvas.selected_entities or [(self.canvas.selected_kind, self.canvas.selected_id)]
+        self.hierarchy_model.apply_change(ChangeSet(tuple(EntityChange(ref) for ref in refs)))
+
+    def _hierarchy_changed(self, *, force=False) -> None:
+        if not force and self._focused_change_notice():
+            return
         if self.chapter is not self.canvas.chapter:
             self.chapter = self.canvas.chapter
         self._refresh_hierarchy()
@@ -5749,7 +6102,7 @@ class MainWindow(QMainWindow):
                 return
             ramp = preset.ramp.copy()
             gradient_shape = preset.gradient_shape
-        before = self.chapter.to_dict()
+        before = self.gradient_tools_controls._capture_change()
         color_ramp = MainWindow._gradient_color_ramp(obj)
         color_ramp.stops = [
             ColorGradientStop(
@@ -5764,11 +6117,8 @@ class MainWindow(QMainWindow):
         obj.touch_revision()
         self.canvas.set_gradient_shape(gradient_shape)
         self.gradient_tools_controls._touch_mask_gradient(obj)
-        after = self.chapter.to_dict()
-        self.canvas.push_model_change(
-            before, after, "Load gradient preset"
-        )
-        self.canvas.documentChanged.emit(None)
+        from comic_editor.ui.record_edits import commit_records
+        commit_records(self.canvas, before, "Load gradient preset")
         self.gradient_tools_controls.refresh()
 
     @staticmethod
@@ -5796,9 +6146,9 @@ class MainWindow(QMainWindow):
         )
         self.series.gradient_ramp_presets.append(preset)
         if self.chapter is not None:
-            before = self.chapter.to_dict()
+            before = self.gradient_tools_controls._capture_change()
             obj.loaded_preset_id = preset.preset_id
-            after = self.chapter.to_dict()
+            after = before.after(self.chapter)
             self.canvas.push_model_change(
                 before, after, "Associate gradient preset"
             )
@@ -6131,15 +6481,14 @@ class MainWindow(QMainWindow):
         else:
             self.series_preferences_timer.start(250)
 
-    def _flush_series_preferences(self) -> None:
+    def _flush_series_preferences(self, *, wait=False) -> None:
         self.series_preferences_timer.stop()
         if self.repository is None or self.series is None:
             return
-        try:
-            self.repository.save_series(self.series)
-        except (OSError, ValueError) as error:
+        request = self._autosave_jobs.save_preferences(self.repository.root, self.series)
+        if wait and request is not None and not self._autosave_jobs.wait(request):
             self.statusBar().showMessage(
-                f"Unable to save color preferences: {error}", 7000
+                f"Unable to save color preferences: {request.error}", 7000
             )
 
     # ---- saving, autosave, settings -----------------------------------
@@ -6161,106 +6510,34 @@ class MainWindow(QMainWindow):
         self._mark_dirty(None)
         self._refresh_actions()
 
-    def save(self) -> bool:
+    def save(self, *, wait=False) -> bool:
         self.canvas._finish_paint_brush()
         if self.canvas.page_gap_mode_active():
-            self.statusBar().showMessage(
-                "Confirm or cancel the page gap before saving", 4000
-            )
+            self.statusBar().showMessage("Confirm or cancel the page gap before saving", 4000)
             return False
         if self.active_session is not None:
-            return self._save_editor_session(self.active_session)
+            return self._save_editor_session(self.active_session, wait=wait)
         if self.repository is None or self.chapter is None:
             return False
+        if getattr(self.canvas, "_pointer_tool_session", None) is not None:
+            self.canvas._tool_release()
         if not self.canvas.commit_active_cage():
             return False
-        self._autosave_jobs.drain(self._autosave_scope())
-        try:
-            self.repository.save_chapter(
-                self.chapter, self.canvas.tiles, self.canvas.images
-            )
-            for reference in self.series.chapters:
-                if reference.chapter_id == self.chapter.chapter_id:
-                    reference.name = self.chapter.name
-            self.repository.save_series(self.series)
-        except (OSError, ValueError) as error:
-            QMessageBox.critical(self, "Save failed", str(error))
-            return False
-        self._dirty = False
-        self._recovery_revision = self._edit_revision
-        self.autosave_timer.stop()
-        self.statusBar().showMessage("Saved", 3000)
-        self._show_file_notification("saved", self.repository.series_path)
-        self._refresh_actions()
-        return True
-
-    @staticmethod
-    def _copy_session_tiles(
-        chapter: ChapterDocument, source: TileStore,
-    ) -> TileStore:
-        copied = TileStore(source.tile_size)
-        for object_id, obj in chapter.objects.items():
-            if isinstance(obj, RasterObject):
-                copied.replace_object_tiles(
-                    object_id, source.object_tiles(object_id)
-                )
-        for mask_id in chapter.masks:
-            copied.replace_object_tiles(
-                mask_id, source.object_tiles(mask_id)
-            )
-        return copied
-
-    def _write_session_to_clone(
-        self, session: EditorSession, repository: SeriesRepository,
-        series,
-    ) -> None:
-        """Write one session through detached models and tiles."""
-        chapter = copy.deepcopy(session.chapter)
-        tiles = self._copy_session_tiles(chapter, session.tiles)
-        images = session.images.clone({
-            object_id for object_id, obj in chapter.objects.items()
-            if isinstance(obj, ImageObject)
-        })
-        if session.kind == "series":
-            repository.save_chapter(chapter, tiles, images)
-            for reference in series.chapters:
-                if reference.chapter_id == chapter.chapter_id:
-                    reference.name = chapter.name
-            return
-
-        if session.asset_manifest is None:
-            raise ValueError("Asset session has no manifest")
-        manifest = copy.deepcopy(session.asset_manifest)
-        manifest.document = chapter
-        bounds = entity_visual_bounds(
-            chapter, tiles, manifest.root_kind, manifest.root_id,
-        )
-        manifest.visual_bounds = (
-            bounds.x(), bounds.y(), bounds.width(), bounds.height()
-        )
-        chapter.width = max(chapter.width, math.ceil(bounds.right() + 64))
-        chapter.height = max(chapter.height, math.ceil(bounds.bottom() + 64))
-        container = chapter.layers[chapter.root_page_ids[0]]
-        container.bound = BoundGeometry.rectangle(
-            0, 0, chapter.width, chapter.height
-        )
-        thumbnail = self.canvas.render_asset_thumbnail(
-            manifest, tiles, images=images
-        )
-        AssetRepository(repository.root).save(
-            manifest, tiles, thumbnail, images=images
-        )
+        self.canvas.commit_active_text_edit()
+        return self._queue_manual_save(wait=wait)
 
     def _rebind_sessions_to_clone(
         self,
         sessions: list[EditorSession],
         repository: SeriesRepository,
         series,
+        captured_revisions=None,
     ) -> None:
         clone_context = ProjectContext.create(repository, series)
         replacements: dict[str, str] = {}
         session_ids = {id(session) for session in sessions}
         for session in sessions:
+            unchanged = captured_revisions is None or captured_revisions[id(session)] == session.edit_revision
             old_key = session.key
             session.context = clone_context
             session.key = (
@@ -6271,12 +6548,13 @@ class MainWindow(QMainWindow):
                 )
             )
             replacements[old_key] = session.key
-            session.dirty = False
+            session.dirty = not unchanged
             session.last_autosave = 0.0
             session.edit_revision += 1
-            session.recovery_revision = session.edit_revision
-            session.tiles.dirty.clear()
-            session.images.dirty.clear()
+            if unchanged:
+                session.recovery_revision = session.edit_revision
+                session.tiles.dirty.clear()
+                session.images.dirty.clear()
 
         rebound: dict[str, EditorSession] = {}
         for old_key, session in self.sessions.items():
@@ -6291,9 +6569,11 @@ class MainWindow(QMainWindow):
         if self.active_session is not None and id(self.active_session) in session_ids:
             self.repository = repository
             self.series = series
-            self._dirty = False
+            self._dirty = self.active_session.dirty
             self._last_autosave = 0.0
             self.autosave_timer.stop()
+            if self._dirty:
+                self.autosave_timer.start(2000)
             self.canvas.asset_repository = clone_context.assets
             self.asset_library.set_repository(clone_context.assets)
             self._update_project_title(self.active_session.name)
@@ -6302,6 +6582,24 @@ class MainWindow(QMainWindow):
         self._refresh_project_tabs()
         self._refresh_actions()
         self.disk_cache.bind()
+
+    def _adopt_clone_resources(self, sessions, snapshots):
+        """Adopt matching published paths without decoding or dropping newer ink."""
+        deadline = time.perf_counter() + .004
+        for session, snapshot in zip(sessions, snapshots):
+            session.tiles._saved_versions.update(snapshot.saved_tiles)
+            session.images._saved_sources.update(snapshot.saved_images)
+            session.tiles.adopt_snapshot_bounds(snapshot.derived_bounds)
+            for directory, records in snapshot.saved_tiles.items():
+                for (identifier, x, y), (version, _stamp) in records.items():
+                    owner = session.tiles._tiles.get(identifier)
+                    key = x, y
+                    if owner is not None and key in owner and owner.version(key) == version:
+                        owner.commit(key, Path(directory) / identifier / f'{x}_{y}.png')
+                    if time.perf_counter() >= deadline:
+                        QCoreApplication.processEvents(QEventLoop.ExcludeUserInputEvents)
+                        time.sleep(.002)
+                        deadline = time.perf_counter() + .004
 
     def _save_as(self) -> bool:
         if self.canvas.page_gap_mode_active():
@@ -6342,7 +6640,24 @@ class MainWindow(QMainWindow):
             )
             return False
 
-        if not self.canvas.commit_active_cage():
+        self.canvas._finish_paint_brush()
+        if getattr(self.canvas, '_pointer_tool_session', None) is not None:
+            self.canvas._tool_release()
+        self.canvas.commit_active_text_edit()
+        if not self.canvas.commit_active_cage(wait=True):
+            return False
+        try:
+            source = self._save_capture_source(self._autosave_scope(self.active_session), self.active_session, manual=True)
+            while True:
+                inputs = source()
+                if inputs is None:
+                    return False
+                if inputs[-1]:
+                    break
+                QCoreApplication.processEvents(QEventLoop.ExcludeUserInputEvents)
+                time.sleep(.002)
+        except Exception as error:
+            QMessageBox.critical(self, 'Save As failed', str(error))
             return False
         self._capture_active_session()
         source_root = context.repository.root
@@ -6352,26 +6667,47 @@ class MainWindow(QMainWindow):
         ]
         for session in project_sessions:
             self._autosave_jobs.drain(self._autosave_scope(session))
-        cloned_series = copy.deepcopy(context.series)
-        cloned_series.series_id = new_id()
-
-        def overlay(staged_repository: SeriesRepository) -> None:
-            for session in project_sessions:
-                self._write_session_to_clone(
-                    session, staged_repository, cloned_series
-                )
-            staged_repository.save_series(cloned_series)
-
         try:
-            cloned_repository = context.repository.clone_to(
-                destination, cloned_series, overlay,
-            )
+            # Capture only owned originals, in bounded slices, before handing
+            # filesystem copying, serialization and thumbnails to the writer.
+            while True:
+                captures, revisions = [], {}
+                for session in project_sessions:
+                    revision = session.edit_revision
+                    revisions[id(session)] = revision
+                    capture = RecoveryCapture(source_root, session.chapter, session.tiles,
+                        session.images, session.asset_manifest if session.kind == 'asset' else None,
+                        valid=lambda session=session, revision=revision: session.edit_revision == revision)
+                    while not capture.advance(.004):
+                        QCoreApplication.processEvents(QEventLoop.ExcludeUserInputEvents)
+                        time.sleep(.002)
+                    if capture.stale:
+                        break
+                    captures.append(capture.result)
+                if len(captures) == len(project_sessions) and all(
+                        revisions[id(session)] == session.edit_revision for session in project_sessions):
+                    break
+            series_capture = SeriesCapture(context.series)
+            while not series_capture.advance(.004):
+                QCoreApplication.processEvents(QEventLoop.ExcludeUserInputEvents)
+                time.sleep(.002)
+            if series_capture.stale:
+                raise ValueError('The series preferences changed during Save As')
+            cloned_series = series_capture.result
+            cloned_series.series_id = new_id()
+            future = self._autosave_jobs.submit_owned_write(write_series_clone,
+                source_root, destination, cloned_series, tuple(captures))
+            while not future.done():
+                QCoreApplication.processEvents(QEventLoop.ExcludeUserInputEvents)
+                time.sleep(.002)
+            cloned_repository = future.result()
         except Exception as error:
             QMessageBox.critical(self, "Save As failed", str(error))
             return False
 
+        self._adopt_clone_resources(project_sessions, captures)
         self._rebind_sessions_to_clone(
-            project_sessions, cloned_repository, cloned_series,
+            project_sessions, cloned_repository, cloned_series, revisions,
         )
         self._remember_series(cloned_repository.root)
         self.statusBar().showMessage(
@@ -6415,13 +6751,10 @@ class MainWindow(QMainWindow):
             if self.canvas._paint_brush_stroke is not None and chapter is self.canvas.chapter:
                 deferred.append(.25)
                 continue
-            tiles = session.tiles if session is not None else self.canvas.tiles
-            images = session.images if session is not None else self.canvas.images
-            asset = session.asset_manifest if session is not None and session.kind == "asset" else None
             name = session.name if session is not None else chapter.name
             try:
-                snapshot = RecoverySnapshot.capture(scope[0], chapter, tiles, images, asset)
-                self._autosave_jobs.submit(RecoveryRequest(scope, revision, session, snapshot, name))
+                self._autosave_jobs.capture_request(RecoveryRequest(scope, revision, session, None, name),
+                                                   self._save_capture_source(scope, session))
             except (OSError, ValueError) as error:
                 self.statusBar().showMessage(f"Autosave failed for {name}: {error}", 7000)
                 deferred.append(5)
@@ -6429,6 +6762,13 @@ class MainWindow(QMainWindow):
             self.autosave_timer.start(max(1, round(min(deferred)*1000)))
 
     def _autosave_completed(self, request, error) -> None:
+        if request.preferences_only:
+            if error is not None:
+                self.statusBar().showMessage(f"Unable to save color preferences: {error}", 7000)
+            return
+        if request.manual:
+            self._manual_save_completed(request, error)
+            return
         session = request.owner
         if session is not None:
             if self.sessions.get(session.key) is not session or self._autosave_scope(session) != request.scope:
@@ -6592,6 +6932,12 @@ class MainWindow(QMainWindow):
         if self.canvas._cage_session is not None or self.canvas._cage_edit_before is not None:
             self.canvas.finish_cage(False)
             return
+        if getattr(self.canvas, '_mask_tile_input', None) is not None:
+            self.canvas._end_mask_stroke()
+        if getattr(self.canvas, '_raster_tile_input', None) is not None:
+            self.canvas._end_stroke()
+        if not self._drain_accepted_input_actions():
+            return
         self.canvas.command_stack.undo()
 
     def _redo(self) -> None:
@@ -6600,6 +6946,12 @@ class MainWindow(QMainWindow):
         self.canvas._finish_paint_brush()
         if self.canvas._cage_session is not None or self.canvas._cage_edit_before is not None:
             self.canvas.finish_cage(False)
+        if getattr(self.canvas, '_mask_tile_input', None) is not None:
+            self.canvas._end_mask_stroke()
+        if getattr(self.canvas, '_raster_tile_input', None) is not None:
+            self.canvas._end_stroke()
+        if not self._drain_accepted_input_actions():
+            return
         self.canvas.command_stack.redo()
 
     def _toggle_grid(self) -> None:
@@ -6614,7 +6966,9 @@ class MainWindow(QMainWindow):
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
 
-        before = self.chapter.to_dict() if self.chapter is not None else None
+        from comic_editor.core.document_patch import RecordSnapshot
+        before = (RecordSnapshot.capture(self.chapter, scalars=('grid', 'grid_override_enabled'))
+                  if self.chapter is not None else None)
         dialog.apply_user_settings(self.settings)
         save_settings(self.settings)
 
@@ -6626,13 +6980,13 @@ class MainWindow(QMainWindow):
             if self.chapter.grid_override_enabled:
                 self.chapter.grid = dialog.document_grid()
             self.chapter.validate()
-            after = self.chapter.to_dict()
+            after = before.after(self.chapter)
             document_changed = before != after
             if document_changed:
                 self.canvas.push_model_change(
                     before, after, "Edit document grid"
                 )
-                self.canvas.documentChanged.emit(None)
+                self.canvas._emit_typed_document_changed(None, self.canvas._last_published_change)
 
         self.canvas.refresh_grid_settings()
         self.selection_settings.refresh()
@@ -6684,11 +7038,17 @@ class MainWindow(QMainWindow):
             )
 
     def _save_if_dirty(self) -> bool:
+        if not self._drain_accepted_input_actions():
+            return False
         self.canvas._finish_paint_brush()
-        return not self._dirty or self.save()
+        return not self._dirty or self.save(wait=True)
 
     def _confirm_discard_or_save(self) -> bool:
+        if not self._drain_accepted_input_actions():
+            return False
         self.canvas._finish_paint_brush()
+        if not self._finish_pending_manual_save(self.active_session):
+            return False
         if not self._dirty:
             return True
         answer = QMessageBox.question(
@@ -6698,7 +7058,7 @@ class MainWindow(QMainWindow):
         )
         if answer == QMessageBox.Cancel:
             return False
-        return self.save() if answer == QMessageBox.Save else True
+        return self.save(wait=True) if answer == QMessageBox.Save else True
 
     def _export_destination_key(self, *, cropped: bool | None = None) -> str:
         parts = [str(self.repository.root.resolve()).casefold(), self.chapter.chapter_id]
@@ -6745,6 +7105,7 @@ class MainWindow(QMainWindow):
         return self._write_export_image(destination, "PNG")
 
     def _write_export_image(self, destination: Path, image_format: str | None = None) -> bool:
+        """Accept an export; its captured evaluation/encoding completes asynchronously."""
         try:
             self.canvas._finish_paint_brush()
             image_format = image_format or EXPORT_FORMATS.get(destination.suffix.lower())
@@ -6753,34 +7114,23 @@ class MainWindow(QMainWindow):
             if not self.canvas.commit_active_cage():
                 return False
             self.canvas.commit_active_text_edit()
-            image = self.canvas.render_export_image()
-            destination.parent.mkdir(parents=True, exist_ok=True)
-            temporary = destination.with_name(f".{destination.name}.{new_id()}.tmp")
-            try:
-                if image_format == "PNG":
-                    if not image.save(str(temporary), "PNG"):
-                        raise OSError("Qt could not encode the PNG")
-                else:
-                    from PIL import Image
-                    rgba = image.convertToFormat(QImage.Format_RGBA8888)
-                    output = Image.frombytes(
-                        "RGBA", (rgba.width(), rgba.height()), bytes(rgba.constBits()),
-                        "raw", "RGBA", rgba.bytesPerLine(),
-                    )
-                    if image_format == "JPEG":
-                        background = Image.new("RGB", output.size, "white")
-                        background.paste(output, mask=output.getchannel("A"))
-                        output = background
-                    output.save(temporary, format=image_format)
-                temporary.replace(destination)
-            finally:
-                temporary.unlink(missing_ok=True)
-        except (MemoryError, OSError, ValueError) as error:
+            jobs = getattr(self, '_output_jobs', None)
+            if jobs is None:
+                from comic_editor.ui.output_jobs import OutputJobs
+                jobs = self._output_jobs = OutputJobs(self)
+            jobs.request(destination, image_format)
+        except (MemoryError, OSError, ValueError, RuntimeError) as error:
             QMessageBox.critical(self, "Export image", f"Unable to export the image:\n{error}")
             return False
+        self.statusBar().showMessage(f"Exporting {destination.name}…", 7000)
+        return True
+
+    def _export_completed(self, destination: Path, error=None) -> None:
+        if error is not None:
+            QMessageBox.critical(self, "Export image", f"Unable to export {destination.name}:\n{error}")
+            return
         self.statusBar().showMessage(f"Exported {destination}", 7000)
         self._show_file_notification("exported", destination)
-        return True
 
     def _export_png(self) -> None:
         if (
@@ -6799,32 +7149,19 @@ class MainWindow(QMainWindow):
         safe_name = safe_name.strip(" .-") or "Chapter"
         stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
         base = f"{safe_name}-{stamp}"
-        if not self.canvas.commit_active_cage():
-            return
         try:
-            exports.mkdir(parents=True, exist_ok=True)
             destination = exports / f"{base}.png"
             suffix = 2
-            while destination.exists():
+            jobs = getattr(self, '_output_jobs', None)
+            while destination.exists() or jobs is not None and jobs.contains(destination):
                 destination = exports / f"{base}-{suffix}.png"
                 suffix += 1
-            self.canvas.commit_active_text_edit()
-            image = self.canvas.render_export_image()
-            temporary = destination.with_name(f".{destination.name}.tmp.png")
-            try:
-                if not image.save(str(temporary), "PNG"):
-                    raise OSError("Qt could not encode the PNG")
-                temporary.replace(destination)
-            finally:
-                if temporary.exists():
-                    temporary.unlink(missing_ok=True)
+            self._write_export_image(destination, 'PNG')
         except (MemoryError, OSError, ValueError) as error:
             QMessageBox.critical(
                 self, "Export PNG", f"Unable to export the chapter:\n{error}"
             )
             return
-        self.statusBar().showMessage(f"Exported {destination.name}", 7000)
-        self._show_file_notification("exported", destination)
 
     def _refresh_actions(self) -> None:
         active = self.chapter is not None
@@ -6886,7 +7223,16 @@ class MainWindow(QMainWindow):
         self.disk_cache.cancel()
         if self.canvas.page_gap_mode_active():
             self.canvas.cancel_page_gap_transaction()
+        assets = getattr(self, '_asset_copy_jobs', None)
+        if assets is not None:
+            assets.drain()
+        if not self._drain_accepted_input_actions():
+            event.ignore()
+            return
         if self.sessions:
+            if not all(self._finish_pending_manual_save(session) for session in self.sessions.values()):
+                event.ignore()
+                return
             self._capture_active_session()
             for session in list(self.sessions.values()):
                 if not session.dirty:
@@ -6900,7 +7246,7 @@ class MainWindow(QMainWindow):
                 if answer == QMessageBox.Cancel:
                     event.ignore()
                     return
-                if answer == QMessageBox.Save and not self._save_editor_session(session):
+                if answer == QMessageBox.Save and not self._save_editor_session(session, wait=True):
                     event.ignore()
                     return
         elif not self._confirm_discard_or_save():
@@ -6911,9 +7257,17 @@ class MainWindow(QMainWindow):
             monitor.stop()
         self.autosave_timer.stop()
         self.disk_cache.detach()
+        self._flush_series_preferences(wait=True)
         self._autosave_jobs.shutdown()
+        if assets is not None:
+            assets.shutdown()
+        outputs = getattr(self, '_output_jobs', None)
+        if outputs is not None:
+            outputs.shutdown()
+        consumers = getattr(self.canvas, '_scene_consumers', None)
+        if consumers is not None:
+            consumers.shutdown()
         self.blender_sources.shutdown()
-        self._flush_series_preferences()
         self.layout_settings_timer.stop()
         self._save_workspace_layout()
         if getattr(self, "_application_event_filter_installed", False):

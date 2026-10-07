@@ -36,6 +36,46 @@ def palette():
     return values
 
 
+@pytest.mark.parametrize('module,name,fields',[
+    ('comic_editor.ui.gpu_pattern_effects','GpuPatternRenderer',
+     ('source','gradient','color_source_texture','mask','output','blur_x','blur_y',
+      'triangle_output','program','blur_program','triangle_program','buffer','triangle_buffer','vao','functions')),
+    ('comic_editor.ui.gpu_textures','GpuTextureRenderer',
+     ('framebuffer','texture','program','buffer','vao','functions')),
+])
+def test_legacy_helper_context_loss_retires_guards_on_owner(module,name,fields):
+    from concurrent.futures import ThreadPoolExecutor
+    import importlib
+    import weakref
+    renderer_type = getattr(importlib.import_module(module),name)
+    gui = threading.get_ident()
+    retired = []
+    class Guard:
+        def destroy(self):
+            pytest.fail('Lost context cannot explicitly destroy GL storage')
+        def __del__(self):
+            retired.append(threading.get_ident())
+    class LostContext:
+        def makeCurrent(self,_surface): return False
+        def doneCurrent(self): pytest.fail('Context never became current')
+    def retire():
+        renderer = renderer_type.__new__(renderer_type)
+        renderer.context,renderer.surface = LostContext(),object()
+        guards = []
+        for field in fields:
+            value = Guard()
+            setattr(renderer,field,value)
+            guards.append(weakref.ref(value))
+        del value
+        renderer.close()
+        assert renderer.context is None and renderer.surface is None
+        return guards
+    with ThreadPoolExecutor(1) as owner:
+        guards = owner.submit(retire).result(5)
+    assert all(reference() is None for reference in guards)
+    assert len(retired) == len(fields) and all(thread != gui for thread in retired)
+
+
 def test_worker_keeps_mutable_input_detached_and_runs_gl_on_one_owner(worker, monkeypatch, qapp):
     started, release = threading.Event(), threading.Event()
     apply = GpuPointChain.apply_lut

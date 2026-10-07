@@ -831,16 +831,60 @@ class GradientToolsControls(QWidget):
         self._sync_preset_name()
         self._loading = False
 
-    def _commit_change(self, before: dict, label: str) -> None:
-        after = self.canvas.chapter.to_dict()
-        if before != after:
-            self.canvas.push_model_change(before, after, label)
+    def _capture_change(self):
+        from comic_editor.core.document_patch import RecordSnapshot
+        if self.canvas.active_tone_mask_id:
+            return RecordSnapshot.capture(
+                self.canvas.chapter, masks=(self.canvas.active_tone_mask_id,),
+                attributes={'masks': ('gradient', 'limited_gradients', 'revision')},
+            )
+        obj = self.selected_gradient()
+        return RecordSnapshot.capture(
+            self.canvas.chapter, objects=(obj.object_id,) if obj is not None else (),
+        )
+
+    def _commit_change(self, before, label: str) -> None:
+        from comic_editor.ui.record_edits import commit_records
+        if before.document_identity != id(self.canvas.chapter):
+            return
+        after = before.after(self.canvas.chapter)
+        if before == after:
+            return
+        for mask_id, payload in before.records.get('masks', {}).items():
+            mask = self.canvas.chapter.masks.get(mask_id)
+            if mask is not None and payload is not None and mask.revision == payload['revision']:
+                mask.touch()
+                self.canvas._invalidate_tone_mask_overlay()
+        if commit_records(self.canvas, before, label):
             self.objectChanged.emit()
-        self.canvas.documentChanged.emit(QRectF())
-        self.canvas.update()
+
+    def _ramp_edit_object(self):
+        target = getattr(self, '_edit_target', None)
+        if target is None:
+            return self.selected_gradient()
+        chapter, mask_id, obj = target
+        if chapter is not self.canvas.chapter:
+            return None
+        if mask_id:
+            mask = chapter.masks.get(mask_id)
+            if mask is None or not (mask.gradient is obj or any(
+                entry.gradient is obj for entry in mask.limited_gradients
+            )):
+                return None
+        elif chapter.objects.get(obj.object_id) is not obj:
+            return None
+        return obj
+
+    def _preview_change(self, before, obj) -> None:
+        from comic_editor.ui.record_edits import preview_records
+        self._touch_mask_gradient(obj)
+        preview_records(self.canvas, before, 'Edit gradient')
 
     def _touch_mask_gradient(self, obj: ColorFillGradientObject) -> None:
-        mask = self.canvas.chapter.masks.get(self.canvas.active_tone_mask_id)
+        target = getattr(self, '_edit_target', None)
+        mask_id = (target[1] if target is not None and target[0] is self.canvas.chapter
+                   else self.canvas.active_tone_mask_id)
+        mask = self.canvas.chapter.masks.get(mask_id)
         if mask is not None and (mask.gradient is obj or any(entry.gradient is obj for entry in mask.limited_gradients)):
             mask.touch()
             self.canvas._invalidate_tone_mask_overlay()
@@ -874,7 +918,7 @@ class GradientToolsControls(QWidget):
         limited = self.canvas.active_limited_mask_gradient()
         if limited is None:
             return
-        before = self.canvas.chapter.to_dict()
+        before = self._capture_change()
         for key, control in self.limited_bounds_controls.items():
             setattr(limited, key, control.value() / (100 if key.endswith("bound") else 1))
         limited.operation = str(self.limited_operation.currentData() or "add")
@@ -892,7 +936,7 @@ class GradientToolsControls(QWidget):
         obj = self.selected_gradient()
         if not isinstance(obj, ColorFillGradientObject) or obj.gradient_shape == shape:
             return
-        before = self.canvas.chapter.to_dict()
+        before = self._capture_change()
         obj.gradient_shape = shape
         obj.touch_revision()
         self._touch_mask_gradient(obj)
@@ -927,7 +971,7 @@ class GradientToolsControls(QWidget):
                 )
             self.refresh()
             return
-        before = self.canvas.chapter.to_dict()
+        before = self._capture_change()
         obj.field_type = str(field_type)
         obj.touch_revision()
         self._commit_change(before, "Change gradient field")
@@ -939,7 +983,7 @@ class GradientToolsControls(QWidget):
         obj = self.selected_gradient()
         if obj is None:
             return
-        before = self.canvas.chapter.to_dict()
+        before = self._capture_change()
         obj.opacity_locked = bool(checked)
         if obj.opacity_locked:
             obj.opacity = self.canvas.chapter.layers[
@@ -963,10 +1007,10 @@ class GradientToolsControls(QWidget):
         del args
         if self._loading:
             return
-        obj = self.selected_gradient()
+        obj = self._ramp_edit_object() if self._edit_before is not None else self.selected_gradient()
         if obj is None:
             return
-        before = self.canvas.chapter.to_dict()
+        before = self._edit_before if self._edit_before is not None else self._capture_change()
         if isinstance(obj, SpeedLinesGradientObject):
             speed = obj.speed_field
             speed.density = self._speed_sliders["density"][1].value()
@@ -1028,25 +1072,29 @@ class GradientToolsControls(QWidget):
         if self._edit_before is None:
             self._commit_change(before, "Change gradient direction")
         else:
-            self.canvas.documentChanged.emit(QRectF())
-            self.canvas.update()
+            self._preview_change(self._edit_before, obj)
         self.refresh()
 
     def _begin_ramp_edit(self) -> None:
         if self._edit_before is None and self.canvas.chapter is not None:
-            self._edit_before = self.canvas.chapter.to_dict()
+            obj = self.selected_gradient()
+            if obj is None:
+                return
+            self._edit_before = self._capture_change()
+            self._edit_target = (self.canvas.chapter, self.canvas.active_tone_mask_id, obj)
         # Gradient image generation uses a reduced field while a slider or
         # stop is being dragged.  The normal-resolution cache is rebuilt on
         # release by _finish_ramp_edit.
         self.canvas._gradient_preview_active = True
 
     def _preview_ramp(self, ramp: ColorGradientRamp) -> None:
-        obj = self.selected_gradient()
+        obj = self._ramp_edit_object()
         if obj is None:
             return
         color_ramp = self._color_ramp_of(obj)
         if color_ramp is None:
             return
+        before = self._edit_before if self._edit_before is not None else self._capture_change()
         color_ramp.stops = [
             ColorGradientStop(
                 stop_id=stop.stop_id, position=stop.position,
@@ -1056,13 +1104,13 @@ class GradientToolsControls(QWidget):
         ]
         color_ramp.validate()
         obj.touch_revision()
-        self.canvas.documentChanged.emit(QRectF())
-        self.canvas.update()
+        self._preview_change(before, obj)
 
     def _preview_thickness_ramp(self, ramp: ColorGradientRamp) -> None:
-        obj = self.selected_gradient()
+        obj = self._ramp_edit_object()
         if not isinstance(obj, SpeedLinesGradientObject):
             return
+        before = self._edit_before if self._edit_before is not None else self._capture_change()
         obj.thickness_ramp.stops = [
             ColorGradientStop(
                 stop_id=stop.stop_id, position=stop.position,
@@ -1072,11 +1120,11 @@ class GradientToolsControls(QWidget):
         ]
         obj.thickness_ramp.validate()
         obj.touch_revision()
-        self.canvas.documentChanged.emit(QRectF())
-        self.canvas.update()
+        self._preview_change(before, obj)
 
     def _finish_ramp_edit(self) -> None:
         before, self._edit_before = self._edit_before, None
+        self._edit_target = None
         self.canvas._gradient_preview_active = False
         self.canvas._gradient_render_cache.clear()
         if before is not None:
@@ -1127,7 +1175,7 @@ class GradientToolsControls(QWidget):
         color_ramp = self._color_ramp_of(obj)
         if color_ramp is None:
             return
-        before = self.canvas.chapter.to_dict()
+        before = self._capture_change()
         stop = self._interpolated_stop(color_ramp)
         color_ramp.stops.append(stop)
         color_ramp.validate()
@@ -1142,7 +1190,7 @@ class GradientToolsControls(QWidget):
         color_ramp = self._color_ramp_of(obj)
         if obj is None or color_ramp is None or len(color_ramp.stops) <= 2:
             return
-        before = self.canvas.chapter.to_dict()
+        before = self._capture_change()
         color_ramp.stops = [
             stop for stop in color_ramp.stops
             if stop.stop_id != self._selected_stop_id
@@ -1185,7 +1233,7 @@ class GradientToolsControls(QWidget):
         ), None)
         if stop is None:
             return
-        before = self.canvas.chapter.to_dict()
+        before = self._capture_change()
         stop.color = canonical_argb(color)
         obj.touch_revision()
         self._commit_change(before, "Change gradient color")
@@ -1195,7 +1243,7 @@ class GradientToolsControls(QWidget):
         obj = self.selected_gradient()
         if not isinstance(obj, SpeedLinesGradientObject):
             return
-        before = self.canvas.chapter.to_dict()
+        before = self._capture_change()
         stop = self._interpolated_stop(obj.thickness_ramp)
         obj.thickness_ramp.stops.append(stop)
         obj.thickness_ramp.validate()
@@ -1214,7 +1262,7 @@ class GradientToolsControls(QWidget):
             or len(obj.thickness_ramp.stops) <= 2
         ):
             return
-        before = self.canvas.chapter.to_dict()
+        before = self._capture_change()
         obj.thickness_ramp.stops = [
             stop for stop in obj.thickness_ramp.stops
             if stop.stop_id != self._selected_thickness_stop_id
@@ -1252,7 +1300,7 @@ class GradientToolsControls(QWidget):
         ), None)
         if stop is None:
             return
-        before = self.canvas.chapter.to_dict()
+        before = self._capture_change()
         stop.color = canonical_argb(color)
         obj.touch_revision()
         self._commit_change(before, "Change thickness stop")

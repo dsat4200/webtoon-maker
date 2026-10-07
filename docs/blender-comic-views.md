@@ -54,6 +54,19 @@ so current timeline evaluation never replaces their saved pose. Conflicting
 camera/property drivers, active NLA evaluation, and linked read-only Actions
 fail with a channel-specific message. Driver-produced rig deformation channels
 are left to evaluate from their baked pose controls.
+Verification follows the same driver policy: active non-strict rig outputs are
+excluded from value comparisons, while their saved controllers, muted drivers,
+camera channels, and registered properties remain checked. Extension 0.8.1 also
+restores the previous selection after New fails and repairs stale out-of-range
+selections on initialization without loading over working edits.
+
+On Fourth Axis Blender, snapshots additionally capture native camera Spatial
+Optics controls and optical object settings, including UUID-linked portal exits.
+These fields are optional for standard Blender and older snapshots; numeric
+optical channels participate in the existing bake and verification pipeline.
+Render always uses the last successful Save. Newly added optical objects absent
+from that Save are hidden along with other uncaptured objects; save the panel
+again before rendering to include them.
 Channels that Blender explicitly marks non-animatable, including collection
 viewport/render visibility, remain verified snapshot values and are applied
 after the owned frame is selected rather than receiving invalid FCurves.

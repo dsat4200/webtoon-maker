@@ -1,6 +1,7 @@
 """Bridge the editor's faithful document renderer to retained presentation."""
 import math
 import time
+from contextlib import nullcontext
 
 from PySide6.QtCore import QRect, QRectF, QSize, Qt, QTimer
 from PySide6.QtGui import QColor, QImage, QPainter, QPainterPath, QTransform
@@ -13,6 +14,7 @@ from comic_editor.render.service import (
 )
 from comic_editor.core.models import RasterObject
 from comic_editor.render.sampling import artwork_density
+from comic_editor.ui.color_resources import projection_color_identity
 
 
 class DocumentProjectionFeatures:
@@ -30,6 +32,8 @@ class DocumentProjectionFeatures:
         self._projection_work_waiting = False
 
     def _projection_configuration(self):
+        pixels = ("pixel-environment", self.chapter.pixel_contract.signature,
+                  projection_color_identity(self, self.chapter.pixel_contract))
         mask_entities = tuple(sorted(
             [("layer", identifier) for identifier, entity in self.chapter.layers.items()
              if entity.mask_only] +
@@ -38,7 +42,7 @@ class DocumentProjectionFeatures:
         if getattr(self, "_disk_cache_capture", False):
             return (id(self.chapter), id(self.tiles), id(self.images),
                     self.chapter.width, self.chapter.height, self.chapter.background,
-                    self.chapter.view_overflow, ("", 0.), (), None, mask_entities)
+                    self.chapter.view_overflow, ("", 0.), (), None, mask_entities, pixels)
         previous = self._live_underlay_object_id, self._live_underlay_amount
         try:
             self._set_live_underlay_context()
@@ -52,7 +56,7 @@ class DocumentProjectionFeatures:
         return (id(self.chapter), id(self.tiles), id(self.images),
                 self.chapter.width, self.chapter.height, self.chapter.background,
                 self.chapter.view_overflow, underlay, tuple(sorted(self._solo_entities)), mask_only,
-                mask_entities)
+                mask_entities, pixels)
 
     def _invalidate_selection_scene_cache(self):
         # Selection/tool UI is drawn after document presentation. Underlay and
@@ -63,15 +67,117 @@ class DocumentProjectionFeatures:
         self._invalidate_scene_cache(projection=preview)
         self._projection_captured_live_preview = False
 
-    def _projection_has_live_preview(self):
-        return any(bool(getattr(self, name, None)) for name in (
+    def _projection_has_live_preview(self, *, include_ink=True):
+        return (include_ink and bool(getattr(self, "_drawing", False))) or any(bool(getattr(self, name, None)) for name in (
             "_transform_preview_quad", "_multi_transform_preview_quads",
             "_selection_raster_states", "_selection_vector_preview", "_selection_shape_nodes",
             "_vector_gesture_mode", "_cage_session", "_text_editing", "_text_placement",
             "_gradient_preview_active", "_render_excluded_object_id", "_page_gap_draft",
             "_fill_gesture_active", "_text_property_drag", "_shape_property_drag",
             "_raster_paste_overlay", "_overlay_color_preview",
+            "_modifier_handle_drag", "_mesh_warp_parameter_drag_id", "_smudge_parameter_drag_id",
         )) or getattr(self, "_selection_before_tiles", None) is not None
+
+    def _paint_ready_document_projection(self, painter, *, live_ink=False):
+        """Paint is presentation only; capture/evaluation run on separate lanes."""
+        configuration = self._projection_configuration()
+        projection = self._document_projection
+        document = self._render_document_state()
+        visible = self.visible_document_rect()
+        if document.overflow <= 0:
+            visible = visible.intersected(document.bounds)
+        if getattr(self, '_projection_windows_configuration', None) != configuration:
+            self._projection_windows = {}
+            self._projection_windows_configuration = configuration
+        coverage = self._projection_windows.get(0)
+        if coverage is None or not coverage.contains(visible):
+            coverage = visible.adjusted(-projection.tile_size, -projection.tile_size,
+                                        projection.tile_size, projection.tile_size)
+            self._projection_windows[0] = QRectF(coverage)
+        if document.overflow <= 0:
+            coverage = coverage.intersected(document.bounds)
+        requests = projection.requests(coverage, 1.)
+        if self._projection_cull_outside_view:
+            requests = self._projection_visible_requests(requests, projection.tile_size)
+        phases = (None,)
+        if (live_ink and not self._is_show_on_top(self.selected_kind, self.selected_id)
+                and not any(obj.blend_mode != 'normal' for obj in self.chapter.objects.values())
+                and self._show_on_top_plan().entries):
+            phases = ('base', 'top')
+        projection.configure((*configuration, phases[0]), document=configuration[:3])
+        self._scene_controller.request(document, requests, phases, visible)
+        batch, complete = self._scene_controller.ready_batch(document, requests, phases)
+        previous = getattr(self, "_projection_completed_view", None)
+        if previous is not None and previous[0] != configuration:
+            previous = None
+        preview = self._scene_controller.preview
+        self._projection_provisional_visible = False
+        if self._scene_controller.preview_mode:
+            overview = self._scene_controller.overview
+            complete = (overview is not None and overview[0] == document
+                        and overview[1].world_rect == visible)
+            if complete:
+                batch = [(None, [overview[1]])]
+                self._projection_completed_view = configuration, batch, document.revision
+                self._projection_presented_revision = document.revision
+            elif preview is not None and preview[0].configuration == configuration:
+                batch = [(None, [preview[1]])]
+                self._projection_provisional_visible = True
+            else:
+                batch = previous[1] if previous is not None else []
+        elif complete:
+            storage = {tile.image.cacheKey(): tile.image.sizeInBytes() for _, tiles in batch for tile in tiles}
+            if sum(storage.values()) <= projection.budget:
+                self._projection_completed_view = configuration, batch, document.revision
+            self._projection_presented_revision = document.revision
+        elif previous is not None and previous[2] != document.revision:
+            # An edited view stays coherent until every requested replacement is
+            # ready. Unchanged artwork can be progressively exposed on a pan.
+            batch = previous[1]
+        self._projection_frame_pending = not complete
+        # Keep the tool's release/cancel bookkeeping aligned with the actual
+        # ready preview, without invoking its old inline viewport renderer.
+        mesh = self._mesh_warp_preview_modifier()
+        self._mesh_warp_preview_presented = bool(mesh is not None and
+            self._projection_provisional_visible and preview is not None and preview[0] == document)
+        if self._mesh_warp_preview_presented:
+            self._mesh_warp_preview_session_id = mesh.modifier_id
+        stats = []
+        feedback_tiles = 0
+        self._raster_feedback_contact_covered = False
+        draw_live = (live_ink and not self._projection_provisional_visible
+            and tuple(phase for phase, _ in batch) == phases)
+        with self._show_on_top_scene() if draw_live else nullcontext():
+            for phase, tiles in batch:
+                stats.append(draw_document_tiles(painter, tiles, self.camera_transform(), self.size(),
+                    owner=self, smooth=True))
+                if phase is None:
+                    feedback_tiles = self._scene_controller.present_feedback(painter, document)
+                if draw_live:
+                    self._show_on_top_phase = phase
+                    painter.save()
+                    try:
+                        painter.setTransform(self.camera_transform())
+                        painter.setClipRect(document.bounds, Qt.IntersectClip)
+                        self._set_live_underlay_context()
+                        if not feedback_tiles:
+                            self._draw_predictive_ink(painter)
+                        self._draw_live_vector_gesture(painter)
+                    finally:
+                        self._clear_live_underlay_context()
+                        painter.restore()
+        if not feedback_tiles:
+            feedback_tiles = self._scene_controller.present_feedback(painter, document)
+        self._document_presentation_stats = PresentationStats(
+            stats[-1].backend if stats else "pending", sum(item.tiles for item in stats),
+            sum(item.uploads for item in stats), stats[-1].texture_bytes if stats else 0)
+        if feedback_tiles:
+            self._projection_provisional_visible = True
+        projection._trim({request.address for request in requests})
+        self._paint_projection_grid(painter, self)
+        draw_document_border(painter, document.bounds, self.camera_transform(), self.size(), owner=self)
+        from comic_editor.ui.raster_feedback import present_pending_raster_gesture
+        present_pending_raster_gesture(self, painter, document)
 
     def _collect_document_projection(self, phase=None):
         projection = self._document_projection
@@ -254,6 +360,8 @@ class DocumentProjectionFeatures:
         return previous[1] if previous is not None else []
 
     def _paint_document_projection(self, painter, *, live_ink=False):
+        if painter.device() is self and getattr(self, "_scene_controller", None) is not None:
+            return self._paint_ready_document_projection(painter, live_ink=live_ink)
         if self._projection_has_live_preview() and not self._text_editing:
             # Editing snapshots may be provisional. Present them immediately
             # through the same kernels without admitting them to exact tiles.
@@ -329,7 +437,7 @@ class DocumentProjectionFeatures:
         return bool(self._projection_async_enabled and compatible
                     and not self._drawing
                     and (not getattr(self, "_pen_contact_active", False) or radial_drag or radial_mask)
-                    and not self._projection_has_live_preview())
+                    and (not self._projection_has_live_preview() or radial_drag or radial_mask))
 
     def _capture_stroke_projection_preview(self):
         """Composite fresh ink in scene order while expensive filters finish.
@@ -339,7 +447,7 @@ class DocumentProjectionFeatures:
         is replaced only by a complete exact projection after contact ends.
         """
         if (not self._projection_async_enabled or self.active_tone_mask_id
-                or self.preview_tone_mask_id or self._projection_has_live_preview()
+                or self.preview_tone_mask_id or self._projection_has_live_preview(include_ink=False)
                 or self.selected_kind != 'object'
                 or not isinstance(self.chapter.objects.get(self.selected_id), RasterObject)):
             self._projection_stroke_preview = None

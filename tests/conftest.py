@@ -29,6 +29,49 @@ def qapp():
 
 
 @pytest.fixture
+def wait_outputs(qapp):
+    """Pump owner-thread captures while a detached output completes."""
+    import time
+    def wait(window, timeout=20):
+        deadline = time.monotonic() + timeout
+        while window._output_jobs.busy and time.monotonic() < deadline:
+            qapp.processEvents()
+            time.sleep(.002)
+        assert not window._output_jobs.busy, 'Detached output did not finish'
+        assert all(error is None for _job, error in window._output_jobs.completed)
+    return wait
+
+
+@pytest.fixture
+def wait_scene(qapp):
+    """Present the matching detached scene before asserting visible pixels."""
+    import time
+    from PySide6.QtGui import QImage
+    def wait(canvas, timeout=20):
+        image = QImage(canvas.size(), QImage.Format_ARGB32_Premultiplied)
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            canvas.render(image)
+            qapp.processEvents()
+            # Qt's native test wait can retain the Python GIL. Let the detached
+            # evaluator execute while the owner continues staged publication.
+            time.sleep(.002)
+            controller = canvas._scene_controller
+            assert not controller.error, controller.error
+            document = canvas._render_document_state()
+            if (controller.capture is None and not controller.scheduler.busy
+                    and controller.snapshot is not None and controller.snapshot.document == document):
+                canvas.render(image)
+                if document.live_preview:
+                    if controller.preview is not None and controller.preview[0] == document:
+                        return image
+                elif not canvas._projection_frame_pending:
+                    return image
+        pytest.fail("Matching detached scene did not finish")
+    return wait
+
+
+@pytest.fixture
 def text_outline_font_family(qapp):
     """Load real glyphs when Qt offscreen cannot discover Windows system fonts."""
     for candidate in (Path("C:/Windows/Fonts/arial.ttf"), Path("C:/Windows/Fonts/segoeui.ttf")):

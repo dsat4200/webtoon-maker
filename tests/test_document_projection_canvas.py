@@ -3,6 +3,7 @@ import time
 
 import numpy as np
 from PySide6.QtCore import QPointF
+from PySide6.QtGui import QColor, QImage, QPainter
 from PySide6.QtTest import QTest
 
 from test_dirty_modifier_reuse import scene, pixels, exact_scene, watch_effect_work
@@ -10,15 +11,25 @@ from test_dirty_modifier_reuse import scene, pixels, exact_scene, watch_effect_w
 
 def settled_projection(canvas, qapp):
     deadline = time.monotonic() + 8
+    image = QImage(canvas.size(), QImage.Format_ARGB32_Premultiplied)
     while time.monotonic() < deadline:
         qapp.processEvents()
-        canvas._effect_jobs.poll()
-        canvas._ensure_scene_cache()
-        projection = canvas._document_projection
-        if (not canvas._effect_jobs.running and not canvas._effect_jobs.pending
-                and projection.tiles and all(t.valid for t in projection.tiles.values())):
-            return pixels(canvas._scene_cache)
-        QTest.qWait(2)
+        image.fill(QColor("#242428"))
+        painter = QPainter(image)
+        painter.setRenderHint(QPainter.Antialiasing, True)
+        try:
+            canvas._paint_ready_document_projection(painter)
+        finally:
+            painter.end()
+        controller = canvas._scene_controller
+        document = canvas._render_document_state()
+        assert not controller.error, controller.error
+        ready_preview = (document.live_preview and controller.preview is not None
+                         and controller.preview[0] == document)
+        if (controller.capture is None and not controller.scheduler.busy
+                and (ready_preview or not canvas._projection_frame_pending)):
+            return pixels(image)
+        time.sleep(.002)
     raise AssertionError("Document projection did not reach exact pixels")
 
 

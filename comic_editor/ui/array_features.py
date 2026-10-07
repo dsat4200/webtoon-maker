@@ -72,7 +72,7 @@ class ArrayFeatures:
             return False
         self._commit_text_edit()
         self._modifier_handle_drag = {
-            "array": modifier.modifier_id, "handle": hit, "before": self.chapter.to_dict(),
+            "array": modifier.modifier_id, "handle": hit, "before": self._modifier_record_snapshot(modifier),
             "press": self.widget_to_document(point),
             "origin": (modifier.axis_start, modifier.axis_end, modifier.center)[hit],
         }
@@ -89,7 +89,5 @@ class ArrayFeatures:
         position = self._snap(position, self.active_layer_id)
         setattr(modifier, ("axis_start", "axis_end", "center")[state["handle"]], position.toTuple())
         modifier.validate()
-        self._invalidate_scene_cache()
-        self.documentChanged.emit(None)
-        self.update()
+        self._modifier_preview_changed(modifier)
         return True

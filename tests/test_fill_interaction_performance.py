@@ -156,6 +156,8 @@ def test_pending_fill_tolerance_uses_captured_color_and_one_undo(fill_canvas, qa
 
 
 def test_composite_reference_capture_yields_and_includes_morphology_halo(fill_canvas, qapp, monkeypatch):
+    from threading import get_ident
+    from comic_editor.render import fill_references
     canvas, obj = fill_canvas
     reference = canvas.chapter.add_object(obj.parent_layer_id, RasterObject())
     reference.fill_reference = True
@@ -163,15 +165,19 @@ def test_composite_reference_capture_yields_and_includes_morphology_halo(fill_ca
     profile.update({"reference_mode": "reference", "close_gap": True, "gap_threshold": 8,
                     "fill_narrow_areas": False, "area_scaling": True, "area_amount": 3})
     captured = {}
-    original = canvas._fill_reference_tile
+    original = fill_references.reference_tile
+    owner_thread, render_threads = get_ident(), []
 
     def slow_capture(*args, **kwargs):
         image = original(*args, **kwargs)
-        captured[args[1]] = image
+        captured[args[2]] = image
+        render_threads.append(get_ident())
         time.sleep(.003)
         return image
 
-    monkeypatch.setattr(canvas, "_fill_reference_tile", slow_capture)
+    monkeypatch.setattr(fill_references, "reference_tile", slow_capture)
+    monkeypatch.setattr(canvas, "_fill_reference_tile", lambda *args, **kwargs:
+                        pytest.fail("A cold reference must not evaluate artwork on the owner thread"))
     start = time.perf_counter()
     canvas._begin_fill_gesture(obj, QPointF(80, 80))
     canvas._finish_fill_gesture(obj)
@@ -185,6 +191,7 @@ def test_composite_reference_capture_yields_and_includes_morphology_halo(fill_ca
     wait_fill(qapp, canvas)
     timer.stop()
     assert len(set(ticks)) > 2
+    assert render_threads and all(thread != owner_thread for thread in render_threads)
     assert (-1, -1) in captured
     expected = TileStore()
     expected.advanced_fill(obj.object_id, QPointF(80, 80), QRectF(*obj.interaction_rect),
@@ -202,6 +209,55 @@ def test_composite_reference_capture_yields_and_includes_morphology_halo(fill_ca
     canvas.request_fill_tolerance_replay(20, immediate=True)
     wait_fill(qapp, canvas)
     assert replay_references and replay_references[0].keys() == captured.keys()
+
+
+def test_large_fill_materializes_file_backed_source_only_in_worker(fill_canvas, qapp, monkeypatch, tmp_path):
+    from pathlib import Path
+    from comic_editor.core.tile_backing import DiskTileMap
+    canvas, obj = fill_canvas
+    canvas.tiles.paint_dab(obj.object_id, QPointF(20, 20), 8, QColor('red'))
+    canvas.tiles.save_directory(tmp_path, {obj.object_id})
+    canvas.tiles.load_directory(tmp_path, {obj.object_id})
+    owner_thread, reads = threading.get_ident(), []
+    original = DiskTileMap.__getitem__
+    def materialize(source, key):
+        if isinstance(source.entries.get(key), Path):
+            reads.append(threading.get_ident())
+            assert threading.get_ident() != owner_thread, 'Clean source pixels decoded on owner thread'
+        return original(source, key)
+    monkeypatch.setattr(DiskTileMap, '__getitem__', materialize)
+    canvas._begin_fill_gesture(obj, QPointF(80, 80))
+    canvas._finish_fill_gesture(obj)
+    wait_fill(qapp, canvas)
+    assert reads and all(thread != owner_thread for thread in reads)
+    assert canvas.command_stack.can_undo
+    canvas.command_stack.undo()
+    assert canvas.tiles.tile(obj.object_id, (0, 0)).pixelColor(20, 20) == QColor('red')
+
+
+@pytest.mark.parametrize('kind', ['object', 'layer'])
+@pytest.mark.parametrize('transformed_target', [False, True])
+def test_detached_fill_reference_matches_native_hierarchy_kernel(fill_canvas, kind, transformed_target):
+    from comic_editor.render.fill_references import populate_references
+    from comic_editor.render.outputs import capture_document
+    canvas, target = fill_canvas
+    if transformed_target:
+        target.transform_frame = target.interaction_rect
+        target.transform_quad = ((17., 11.), (997., 49.), (911., 999.), (36., 911.))
+    folder = canvas.chapter.add_layer(target.parent_layer_id, 'Reference',
+        BoundGeometry.rectangle(0, 0, 300, 300))
+    folder.fill_color = None
+    folder.border_width = 0
+    folder.opacity, folder.translate_x, folder.translate_y = .7, 13, 18
+    source = canvas.chapter.add_object(folder.layer_id, RasterObject(x=21, y=17))
+    canvas.tiles.paint_dab(source.object_id, QPointF(64, 64), 45, QColor('#AACC2233'))
+    entities = [(kind, source.object_id if kind == 'object' else folder.layer_id)]
+    profile = {'reference_mode': 'reference'}
+    expected = canvas._fill_reference_tile(target, (0, 0), profile, entities=entities)
+    captured = {}
+    populate_references(capture_document(canvas.chapter, canvas.tiles, canvas.images),
+                        target.object_id, entities, {(0, 0)}, profile, captured, threading.Event())
+    assert captured[(0, 0)] == expected
 
 
 def test_reference_descendant_change_invalidates_pending_snapshot(fill_canvas, qapp, monkeypatch):

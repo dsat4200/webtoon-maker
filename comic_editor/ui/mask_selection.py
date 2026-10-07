@@ -70,53 +70,24 @@ class MaskSelectionFeatures:
         entities = self._mask_wand_source_entities()
         if entities is not None and not entities:
             return
+        from comic_editor.render.input_capture import mask_wand_patch
+        from comic_editor.ui.scene_consumers import scene_consumers
         remove = bool(modifiers & Qt.ControlModifier)
-        size = self.tiles.tile_size
-        selected = TileStore(tile_size=size)
-        offset = QPointF(*mask.paint_offset)
-
-        def reference_tile(key):
-            image = QImage(size, size, QImage.Format_ARGB32_Premultiplied)
-            # Render artwork at document resolution, without the blue mask
-            # overlay, grid, or selection handles. All source pixels are read
-            # before any mask paint changes, including across tile boundaries.
-            self.render_preview(image, source_rect=QRectF(
-                key[0] * size, key[1] * size, size, size,
-            ).translated(offset))
-            return image
-
-        with self._mask_wand_reference_render(entities):
-            selected.advanced_fill(
-                mask.mask_id, point - offset, frame.translated(-offset), QColor("white"),
-                {
-                    "tolerance": self.settings.mask_wand_tolerance,
-                    "connected_pixels_only": self.settings.mask_wand_connected,
-                    "antialiasing": False,
-                },
-                reference_tile=reference_tile,
-            )
-        before, after = {}, {}
-        for key, coverage in selected.object_tiles(mask.mask_id).items():
-            if remove:
-                painter = QPainter(coverage)
-                painter.setCompositionMode(QPainter.CompositionMode_SourceIn)
-                painter.fillRect(coverage.rect(), QColor("black"))
-                painter.end()
-            original = self.tiles.tile(mask.mask_id, key)
-            image = (
-                QImage(original) if original is not None
-                else self.tiles._empty(size)
-            )
-            painter = QPainter(image)
-            painter.drawImage(0, 0, coverage)
-            painter.end()
-            if image == original:
-                continue
-            before[key] = QImage(original) if original is not None else None
-            after[key] = image
-        self._commit_mask_selection(mask, before, after, remove)
-        self.interactionFinished.emit()
-        self.update()
+        chapter, identifier, tool = self.chapter, mask.mask_id, self.tool
+        def valid():
+            return (self.chapter is chapter and self.active_tone_mask_id == identifier
+                    and self.tool == tool and self.chapter.masks.get(identifier) is mask)
+        def ready(patch, error):
+            if error is not None:
+                self.operationError.emit('Magic Wand', str(error))
+                return
+            before, after = patch
+            self._commit_mask_selection(mask, before, after, remove)
+            self.interactionFinished.emit()
+            self.update()
+        scene_consumers(self).request(('mask-wand',), mask_wand_patch,
+            (identifier, point.toTuple(), remove, entities, self.settings.mask_wand_tolerance,
+             self.settings.mask_wand_connected), ready, ordered=True, valid=valid)
 
     def _begin_mask_selection(self, point: QPointF, modifiers) -> None:
         if (
@@ -141,7 +112,11 @@ class MaskSelectionFeatures:
             self.update()
 
     def _cancel_mask_selection(self) -> bool:
-        if self._mask_selection_gesture is None:
+        jobs = getattr(self, '_scene_consumers', None)
+        wand = jobs is not None and jobs.contains(('mask-wand',))
+        if wand:
+            jobs.cancel(('mask-wand',))
+        if self._mask_selection_gesture is None and not wand:
             return False
         self._mask_selection_gesture = None
         self.update()

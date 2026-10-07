@@ -64,8 +64,8 @@ void main() {
 
 
 class GpuObjectBlendRenderer(GpuPatternRenderer):
-    def __init__(self, *, allow_offscreen=False):
-        super().__init__(allow_offscreen=allow_offscreen, fragment=FRAGMENT)
+    def __init__(self, *, allow_offscreen=False, surface=None):
+        super().__init__(allow_offscreen=allow_offscreen, fragment=FRAGMENT, surface=surface)
 
     def composite(self, destination, source, mode, core, density):
         if not self.available or mode not in GPU_MODES or max(source.width(), source.height()) > 1026:
@@ -105,6 +105,11 @@ def renderer_for(canvas):
         return None
     if getattr(canvas.settings, "canvas_renderer", "auto") == "raster":
         return None
+    from PySide6.QtCore import QThread
+    from PySide6.QtGui import QGuiApplication
+    if QThread.currentThread() != QGuiApplication.instance().thread():
+        from comic_editor.render.gpu.worker import helper_for
+        return helper_for(canvas, "blend")
     renderer = getattr(canvas, "_gpu_object_blend_renderer", None)
     if renderer is None:
         renderer = GpuObjectBlendRenderer()

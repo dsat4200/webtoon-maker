@@ -832,6 +832,12 @@ def test_transform_cache_cleanup_survives_render_exception(qapp, monkeypatch):
         raise RuntimeError("injected render failure")
 
     monkeypatch.setattr(canvas, "_render_layer", fail_render)
+    # The production transform uses detached geometry and never constructs
+    # this bitmap on input. Keep the exception cleanup gate for the explicit
+    # reference adapter as well.
+    canvas._build_raster_transform_cache()
+    assert canvas._transform_static_cache.isNull()
+    canvas._projection_async_enabled = False
     with pytest.raises(RuntimeError, match="injected render failure"):
         canvas._build_raster_transform_cache()
     assert canvas._render_excluded_object_id == ""
@@ -853,6 +859,12 @@ def test_rasterize_image_preserves_identity_and_is_undoable(qapp):
     try:
         window._set_chapter(chapter, TileStore(), images)
         window._rasterize_image(obj.object_id)
+        from PySide6.QtTest import QTest
+        import time
+        deadline = time.monotonic()+15
+        while isinstance(window.canvas.chapter.objects[obj.object_id], ImageObject) and time.monotonic() < deadline:
+            qapp.processEvents()
+            time.sleep(.002)
         raster = window.canvas.chapter.objects[obj.object_id]
         assert isinstance(raster, RasterObject)
         assert raster.transform_quad == obj.transform_quad

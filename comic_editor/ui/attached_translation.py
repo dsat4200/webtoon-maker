@@ -41,6 +41,21 @@ def ownership(chapter):
     return modifiers, masks
 
 
+def record_snapshot(chapter, roots, *, object_fields=None):
+    """Retain changed placement records and the rigs this gesture can move."""
+    from comic_editor.core.document_patch import RecordSnapshot
+    roots = tuple(roots)
+    moving = moving_entities(chapter, roots)
+    modifiers, masks = ownership(chapter)
+    attributes = {'objects': tuple(object_fields)} if object_fields is not None else None
+    return RecordSnapshot.capture(chapter, scalars=('size',),
+        layers=[identifier for kind, identifier in roots if kind == 'layer'],
+        objects=[identifier for kind, identifier in roots if kind == 'object'],
+        modifiers=[identifier for identifier, owners in modifiers.items() if owners and owners <= moving],
+        masks=[identifier for identifier, owners in masks.items() if owners and owners <= moving],
+        attributes=attributes)
+
+
 def translate_mask(mask, dx, dy):
     """Move owned geometry and place unchanged paint samples at a new origin.
 

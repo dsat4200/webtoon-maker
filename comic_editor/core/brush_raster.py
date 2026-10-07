@@ -17,7 +17,8 @@ import struct
 import tempfile
 import zlib
 from collections import OrderedDict
-from dataclasses import replace
+from dataclasses import dataclass, replace
+from types import MappingProxyType
 
 import numpy as np
 from PySide6.QtCore import QRectF
@@ -27,10 +28,18 @@ from scipy.ndimage import gaussian_filter, maximum_filter, minimum_filter
 from .brushes import BrushDab, BrushDefinition, BrushInput, BrushTip
 from .brush_stroke import BrushStroke
 from .brush_correction import corrected_samples, resolved_taper, stroke_length
+from .pixel_arrays import image_has_high_precision, native_rgba_pixels
 
 
 def image_pixels(image: QImage) -> np.ndarray:
     """Return independent, straight RGBA floats, with no Qt-buffer lifetime."""
+    if image_has_high_precision(image):
+        pixels, associated = native_rgba_pixels(image)
+        if associated:
+            alpha = pixels[..., 3:4]
+            np.divide(pixels[..., :3], alpha, out=pixels[..., :3], where=alpha > 0)
+            pixels[..., :3] = np.where(alpha > 0, pixels[..., :3], 0.)
+        return pixels
     rgba = image.convertToFormat(QImage.Format_RGBA8888)
     pixels = (np.frombuffer(rgba.constBits(), np.uint8)
             .reshape(rgba.height(), rgba.bytesPerLine())[:, :rgba.width()*4]
@@ -39,7 +48,12 @@ def image_pixels(image: QImage) -> np.ndarray:
     return pixels
 
 
-def pixels_image(rgba: np.ndarray) -> QImage:
+def pixels_image(rgba: np.ndarray, *, native_format=None) -> QImage:
+    if native_format is not None:
+        pixels = np.ascontiguousarray(rgba, dtype=np.float32)
+        h, w = pixels.shape[:2]
+        image = QImage(pixels.data, w, h, pixels.strides[0], QImage.Format_RGBA32FPx4).copy()
+        return image.convertToFormat(native_format)
     pixels = np.ascontiguousarray(np.rint(np.clip(rgba, 0, 1)*255), dtype=np.uint8)
     h, w = pixels.shape[:2]
     return QImage(pixels.data, w, h, w*4, QImage.Format_RGBA8888).copy().convertToFormat(
@@ -215,12 +229,7 @@ class _MaterialCache:
                                  Qt.IgnoreAspectRatio, Qt.SmoothTransformation)
             if image.isNull():
                 raise MemoryError("Not enough memory to resize the original brush material")
-        material_class = (_CompressedImageMaterial
-                          if image.width()*image.height()*4 >= 8*1024*1024
-                          and image.width()*4 <= 256*1024
-                          and len(png) < image.width()*image.height()
-                          else _ImageMaterial)
-        result = material_class(image,premultiplied=premultiplied,gray=gray)
+        result = _image_material(image, png, premultiplied=premultiplied, gray=gray)
         cost = result.nbytes
         if cost+len(png) <= self.budget:
             self._reserve(cost, png)
@@ -239,6 +248,97 @@ class _MaterialCache:
 
 
 _material_cache = _MaterialCache()
+
+
+def _image_material(image, png, *, premultiplied=False, gray=False):
+    material_class = (_CompressedImageMaterial
+                      if image.width()*image.height()*4 >= 8*1024*1024
+                      and image.width()*4 <= 256*1024
+                      and len(png) < image.width()*image.height()
+                      else _ImageMaterial)
+    return material_class(image, premultiplied=premultiplied, gray=gray)
+
+
+def _brush_material_requests(definition):
+    requests = {}
+    while definition is not None:
+        for tip in definition.tips:
+            if tip.shape != "image" or not tip.png:
+                continue
+            # _tip_pixels clamps both sampled dimensions to at least one for
+            # mip selection. Pressure, spray and replay cannot request a level
+            # above this limit, regardless of the eventual input sequence.
+            maximum = (max(0, int(math.floor(math.log2(max(1, min(tip.width, tip.height))))))
+                       if definition.antialiasing >= 2 else 0)
+            requests.setdefault(tip.png, set()).update((True, False, mip)
+                                                       for mip in range(maximum+1))
+        texture = definition.texture
+        if texture is not None and texture.png and texture.density > 0:
+            requests.setdefault(texture.png, set()).add((False, True, 0))
+        definition = definition.dual
+    return requests
+
+
+def brush_material_working_bytes(definition):
+    """Estimate original decode plus retained levels without decoding PNGs."""
+    total = 0
+    while definition is not None:
+        sources = [(tip.png, max(0, int(math.log2(max(1, min(tip.width, tip.height)))))
+                    if definition.antialiasing >= 2 else 0)
+                   for tip in definition.tips if tip.shape == "image" and tip.png]
+        texture = definition.texture
+        if texture is not None and texture.png and texture.density > 0:
+            sources.append((texture.png, 0))
+        # Deliberately avoid hashing complete source strings on the GUI. An
+        # upper estimate may charge repeated tips twice; worker preparation
+        # deduplicates them after admission.
+        for png, maximum in sources:
+            header = base64.b64decode(png[:32], validate=True)
+            if len(header) < 24 or header[:8] != b'\x89PNG\r\n\x1a\n':
+                raise ValueError("Brush material is not a readable PNG")
+            width, height = struct.unpack_from('>II', header, 16)
+            total += width*height*8
+            total += sum(max(1, width//(2**mip))*max(1, height//(2**mip))*4
+                         for mip in range(maximum+1))
+        definition = definition.dual
+    return total
+
+
+@dataclass(frozen=True)
+class PreparedBrushMaterials:
+    """Private, pinned material pixels; lookup never decodes or resizes."""
+    _values: MappingProxyType
+
+    def get(self, png, premultiplied=False, *, gray=False, mip=0):
+        try:
+            return self._values[png, premultiplied, gray, mip]
+        except KeyError as error:
+            raise ValueError("Brush material was not prepared for this stroke") from error
+
+
+def prepare_brush_materials(definition):
+    """Prepare an independent stroke owner on an admitted worker.
+
+    Every level comes directly from the original decoded PNG, preserving the
+    authored material equations. This never consults or mutates the shared
+    live cache, and retains compact byte pixels or lossless row blocks.
+    """
+    from PySide6.QtCore import Qt
+    values = {}
+    for png, requests in _brush_material_requests(definition).items():
+        image = QImage.fromData(base64.b64decode(png, validate=True), "PNG")
+        if image.isNull():
+            raise ValueError("Brush material is not a readable PNG")
+        for premultiplied, gray, mip in sorted(requests):
+            level = (image.scaled(max(1, image.width()//(2**mip)),
+                                  max(1, image.height()//(2**mip)),
+                                  Qt.IgnoreAspectRatio, Qt.SmoothTransformation)
+                     if mip else image)
+            if level.isNull():
+                raise MemoryError("Not enough memory to resize the original brush material")
+            values[png, premultiplied, gray, mip] = _image_material(
+                level, png, premultiplied=premultiplied, gray=gray)
+    return PreparedBrushMaterials(MappingProxyType(values))
 
 
 def _material(png):
@@ -473,11 +573,13 @@ class RasterBrushStroke:
     """
     def __init__(self, tiles, object_id: str, definition: BrushDefinition,
                  color: QColor, before: dict, seed=0, *, selection_tile=None,
-                 defer_flush=False, _path_length=None):
+                 defer_flush=False, materials=None, _path_length=None):
         self.tiles, self.object_id = tiles, object_id
         self.definition, self.before = definition, before
         self.seed=seed
         self.defer_flush=bool(defer_flush)
+        self._materials = materials
+        self._material_sampling_started = False
         self._stroke_color=QColor(color)
         self.color = np.asarray(color.getRgbF(), dtype=np.float32)
         self.sub_color = np.asarray(definition.sub_color, dtype=np.float32)/255.
@@ -542,6 +644,19 @@ class RasterBrushStroke:
     @property
     def bounds(self):
         return QRectF(self._bounds)
+
+    def install_materials(self, materials):
+        """Adopt a worker-owned material set before applying input packets."""
+        if self._material_sampling_started:
+            raise RuntimeError("Brush material ownership cannot change after sampling")
+        if not isinstance(materials, PreparedBrushMaterials):
+            raise TypeError("Expected prepared brush materials")
+        self._materials = materials
+
+    def _brush_material(self, png, premultiplied=False, *, gray=False, mip=0):
+        self._material_sampling_started = True
+        owner = self._materials if self._materials is not None else _material_cache
+        return owner.get(png, premultiplied, gray=gray, mip=mip)
 
     def begin(self, sample: BrushInput) -> QRectF:
         if self._finished:
@@ -617,7 +732,7 @@ class RasterBrushStroke:
         self._finished=True
         replay=RasterBrushStroke(self.tiles,self.object_id,definition,self._stroke_color,
                                  self.before,seed=self.seed,selection_tile=self.selection_tile,
-                                 defer_flush=self.defer_flush,
+                                 defer_flush=self.defer_flush, materials=self._materials,
                                  _path_length=path_length)
         if replay.dual_scheduler is not None:
             replay.dual_scheduler.path_length=dual_path_length
@@ -932,7 +1047,7 @@ class RasterBrushStroke:
         if tip.shape == "image" and tip.png:
             reduction = min(tip.width/max(width,1),tip.height/max(height,1))
             mip = max(0,int(math.floor(math.log2(reduction)))) if reduction > 1 and definition.antialiasing >= 2 else 0
-            material = _premultiplied_material(tip.png,mip)
+            material = self._brush_material(tip.png, True, mip=mip)
             sx = u*material.shape[1]-.5
             sy = v*material.shape[0]-.5
             if ribbon:
@@ -1048,7 +1163,7 @@ class RasterBrushStroke:
             return alpha
         value = self._texture_values.get(cache_key) if cache_key is not None else None
         if value is None:
-            gray = _material_cache.get(texture.png, gray=True)
+            gray = self._brush_material(texture.png, gray=True)
             angle, scale = math.radians(texture.angle), max(.01, texture.scale)
             c, s = math.cos(angle), math.sin(angle)
             value = _sample(gray, (c*xx+s*yy)/scale-.5, (-s*xx+c*yy)/scale-.5, wrap=True)
@@ -1376,10 +1491,34 @@ class RasterBrushStroke:
                 continue
             base = self._base_tile(key)[y0:y1,x0:x1]
             result = self._selected_result(key,base,composite_pixels(base,source,self._canvas_blend_mode()),region)
-            patch=pixels_image(_straight(result))
-            if region==(0,0,n,n):
+            original = self._original.get(key)
+            if original is not None and image_has_high_precision(original):
+                # Preserve the authoritative native source bytes outside the
+                # actual stroke coverage, even for a full-tile edge flush.
+                # New tiles and legacy byte tiles keep their existing policy.
+                straight = result.copy()
+                alpha = straight[..., 3:4]
+                np.divide(straight[..., :3], alpha, out=straight[..., :3], where=alpha > 0)
+                straight[..., :3] = np.where(alpha > 0, straight[..., :3], 0.)
+                patch = pixels_image(straight, native_format=original.format())
+                current = self.tiles.tile(self.object_id, key)
+                output = QImage(current if current is not None else original)
+                active = source[..., 3] > 0
+                if selection is not None:
+                    active &= selection[y0:y1, x0:x1] > 0
+                if not np.any(active):
+                    continue
+                pixel_bytes = output.depth() // 8
+                destination = np.frombuffer(output.bits(), np.uint8).reshape(output.height(), output.bytesPerLine())
+                destination = destination[y0:y1, x0*pixel_bytes:x1*pixel_bytes].reshape(y1-y0, x1-x0, pixel_bytes)
+                incoming = np.frombuffer(patch.constBits(), np.uint8).reshape(patch.height(), patch.bytesPerLine())
+                incoming = incoming[:, :patch.width()*pixel_bytes].reshape(y1-y0, x1-x0, pixel_bytes)
+                destination[active] = incoming[active]
+            elif region==(0,0,n,n):
+                patch=pixels_image(_straight(result))
                 output=patch
             else:
+                patch=pixels_image(_straight(result))
                 current=self.tiles.tile(self.object_id,key)
                 output=QImage(current) if current is not None else self.tiles._empty(n)
                 painter=QPainter(output)

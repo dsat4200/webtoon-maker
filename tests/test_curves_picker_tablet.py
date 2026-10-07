@@ -2,6 +2,7 @@
 import pytest
 from PySide6.QtCore import QCoreApplication, QEvent, QPointF, Qt
 from PySide6.QtGui import QColor, QImage, QPointingDevice, QTabletEvent
+from PySide6.QtTest import QTest
 
 from comic_editor.core.images import ImageStore
 from comic_editor.core.models import BoundGeometry, ChapterDocument, CurvesModifier, ImageObject
@@ -37,6 +38,10 @@ def test_tablet_curves_picker_commits_release_position_once_without_painting(qap
                 0., 0., 0., 0., 0., Qt.NoModifier, button, buttons)
             QCoreApplication.sendEvent(canvas, event)
             assert event.isAccepted()
+        import time
+        deadline = time.monotonic()+15
+        while canvas._curves_picker.state is not None and time.monotonic() < deadline:
+            QTest.qWait(5)
         points = canvas.chapter.modifiers[modifier.modifier_id].curves["rgb:master"]
         assert len(points) == 3
         assert points[1][1] == pytest.approx(points[1][0] + .2)

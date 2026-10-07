@@ -631,7 +631,7 @@ def test_solid_overlay_picker_coalesces_and_flushes_last_color(scene, qapp, acce
     owner.deleteLater()
 
 
-def test_solid_overlay_picker_drag_repaints_visible_canvas(scene, qapp):
+def test_solid_overlay_picker_drag_repaints_visible_canvas(scene, qapp, wait_scene):
     canvas, chapter, shape, _ = scene
     canvas.set_selection("layer", shape.layer_id)
     modifier = SolidColorOverlayModifier(color="#FFFF0000")
@@ -642,16 +642,19 @@ def test_solid_overlay_picker_drag_repaints_visible_canvas(scene, qapp):
     canvas.center_x, canvas.center_y, canvas.scale = 150, 100, 1
     canvas.show()
     qapp.processEvents()
+    wait_scene(canvas)
     before = pixels(canvas.grab().toImage())
     controls.color.click()
     popup = controls._popup
     qapp.processEvents()
     QTest.mousePress(popup.picker, Qt.LeftButton, pos=popup.picker.sv_rect().center().toPoint())
     wait(qapp, lambda: canvas._overlay_color_preview is not None)
+    wait_scene(canvas)
     assert not np.array_equal(before, pixels(canvas.grab().toImage()))
     assert modifier.color == "#FFFF0000"
     QTest.mouseRelease(popup.picker, Qt.LeftButton)
     popup.reject()
+    wait_scene(canvas)
     np.testing.assert_array_equal(before, pixels(canvas.grab().toImage()))
 
 
@@ -694,7 +697,7 @@ def wait(qapp, predicate, seconds=4):
     end = time.monotonic() + seconds
     while not predicate() and time.monotonic() < end:
         qapp.processEvents()
-        QTest.qWait(10)
+        time.sleep(.002)
     assert predicate()
 
 
@@ -730,7 +733,7 @@ def test_category_hover_thumbnails_selection_and_edge_scrolling(qapp, tmp_path):
     combo.deleteLater()
 
 
-def test_modifier_picker_controls_and_async_selection_undo(scene, qapp, tmp_path):
+def test_modifier_picker_controls_and_async_selection_undo(scene, qapp, tmp_path, monkeypatch):
     canvas, chapter, shape, raster = scene
     canvas.set_selection("object", raster.object_id)
     owner = ModifierControls(canvas)
@@ -748,6 +751,8 @@ def test_modifier_picker_controls_and_async_selection_undo(scene, qapp, tmp_path
     assert modifier.texture_quad == canvas._texture_default_quad(modifier)
     path = tmp_path / "selected.png"
     path.write_bytes(base64.b64decode(encoded()))
+    monkeypatch.setattr(ChapterDocument, 'to_dict', lambda *_a, **_k:
+        (_ for _ in ()).throw(AssertionError('Unrelated chapter serialization during texture import')))
     controls._import(path, "Paper")
     wait(qapp, lambda: bool(modifier.texture_data))
     assert modifier.texture_category == "Paper" and modifier.texture_name == path.name

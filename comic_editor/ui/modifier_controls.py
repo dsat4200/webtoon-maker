@@ -22,6 +22,7 @@ from comic_editor.core.models import (
 )
 from comic_editor.core.distort import DISTORT_TYPES
 from comic_editor.core.document_patch import RecordSnapshot
+from comic_editor.core.changes import ChangeSet, EntityChange
 from comic_editor.core.models import KuwaharaModifier
 from comic_editor.core.models import DitheringModifier, SharpnessModifier
 from comic_editor.ui.icons import iconoir
@@ -103,6 +104,7 @@ class ModifierCard(QFrame):
         title = ModifierTitleBar(
             modifier.modifier_id, modifier.name, self
         )
+        self.title_bar = title
         title.activated.connect(self.activated)
         title.dragStarted.connect(self.dragStarted)
         title.dragMoved.connect(self.dragMoved)
@@ -115,6 +117,7 @@ class ModifierCard(QFrame):
             ),
         )
         collapse.setObjectName("modifierCollapseButton")
+        self.collapse_button = collapse
         title.layout().insertWidget(0, collapse)
         self.preset_button = self._title_button("nav-arrow-down", "Modifier presets", lambda: None)
         self.preset_button.setObjectName("modifierPresetButton")
@@ -161,6 +164,7 @@ class ModifierCard(QFrame):
                 actions.addWidget(title.layout().takeAt(3).widget())
             outer.addLayout(actions)
         body = QWidget(self)
+        self.body_widget = body
         form = QVBoxLayout(body)
         form.setContentsMargins(6, 0, 6, 0)
         form.setSpacing(4)
@@ -387,6 +391,43 @@ class ModifierCard(QFrame):
             for control in controls:
                 with QSignalBlocker(control):
                     control.setValue(value)
+
+    def update_fields(self, fields) -> bool:
+        """Synchronize simple parameters without retiring an active slider."""
+        specialized = set()
+        if isinstance(self.modifier, CurvesModifier):
+            from comic_editor.ui.curves_controls import CurvesControls
+            specialized = {'curves', 'input_min', 'input_max', 'color_mode', 'channel', 'blend_mode'}
+            if fields & specialized:
+                controls = self.findChild(CurvesControls)
+                if controls is not None and not controls.graph.dragging and not controls._editing:
+                    controls.sync_from_modifier()
+        elif isinstance(self.modifier, SolidColorOverlayModifier):
+            from comic_editor.ui.overlay_controls import OverlayControls
+            specialized = {'color', 'blend_mode', 'apply_to_outline'}
+            if isinstance(self.modifier, TextureModifier):
+                specialized |= {'texture_data', 'texture_name', 'texture_category',
+                                'texture_quad', 'transform_mode'}
+            controls = self.findChild(OverlayControls)
+            if controls is not None and fields & specialized:
+                controls.sync_from_modifier(self.modifier)
+        if fields - (set(self._parameter_controls) | {'name', 'expanded', 'muted'} | specialized):
+            return False
+        for attribute in fields & self._parameter_controls.keys():
+            for control in self._parameter_controls[attribute]:
+                with QSignalBlocker(control):
+                    control.setValue(round(getattr(self.modifier, attribute)))
+        if 'muted' in fields:
+            with QSignalBlocker(self.mute_button):
+                self.mute_button.setChecked(self.modifier.muted)
+                self.mute_button.setIcon(iconoir('eye-closed' if self.modifier.muted else 'eye'))
+        if 'expanded' in fields:
+            self.body_widget.setVisible(self.modifier.expanded)
+            self.collapse_button.setIcon(iconoir('nav-arrow-down' if self.modifier.expanded else 'nav-arrow-right'))
+        if 'name' in fields:
+            self.title_bar.label.setText(self.modifier.name)
+            self.title_bar.label.setToolTip(self.modifier.name)
+        return True
 
     def mouseReleaseEvent(self, event):
         if event.button() == Qt.LeftButton:
@@ -615,6 +656,10 @@ class ModifierControls(QWidget):
         self.canvas.chapterReplaced.connect(self._chapter_replaced)
         self.canvas.hierarchyChanged.connect(self._validate_target_layer_pick)
         self.canvas.modifierSelectionChanged.connect(self._refresh_selection_style)
+        # History publishes focused records without changing selection. Each
+        # control observes those records, including when embedded without a
+        # MainWindow, so undo/redo updates its affected card immediately.
+        self.canvas.changesPublished.connect(self.apply_change)
 
     def _refresh_selection_style(self, _identifier=""):
         for identifier, card in self._cards.items():
@@ -646,10 +691,20 @@ class ModifierControls(QWidget):
         self.canvas.active_modifier_id = value
 
     def apply_modifier(self, modifier_id):
-        from comic_editor.ui.baking import apply_raster_modifiers
+        from comic_editor.ui.baking import request_apply_raster_modifiers
         from PySide6.QtWidgets import QMessageBox
+        import weakref
+        from shiboken6 import isValid
+        owner = weakref.ref(self)
+        def finished(error):
+            control = owner()
+            if control is None or not isValid(control):
+                return
+            if error:
+                QMessageBox.warning(control, 'Apply modifier', str(error))
+            control.refresh()
         try:
-            apply_raster_modifiers(self.canvas, modifier_id)
+            request_apply_raster_modifiers(self.canvas, modifier_id, finished)
         except (ValueError, MemoryError, OSError) as error:
             QMessageBox.warning(self, "Apply modifier", str(error))
         self.refresh()
@@ -731,7 +786,49 @@ class ModifierControls(QWidget):
             self._cards[modifier_id] = card
             self.stack_layout.insertWidget(self.stack_layout.count() - 1, card)
 
-    def _changed(self) -> None:
+    def apply_change(self, change) -> None:
+        targets = set(self.targets())
+        if any(item.entity in targets and item.fields & {'*', 'modifier_ids'} for item in change.entities):
+            self.refresh()
+            return
+        chapter = self.canvas.chapter
+        for item in change.entities:
+            if item.entity[0] != 'modifier':
+                continue
+            identifier = item.entity[1]
+            card = self._cards.get(identifier)
+            if card is None:
+                continue
+            modifier = chapter.modifiers.get(identifier)
+            if modifier is None:
+                self.refresh()
+                return
+            if type(card.modifier) is type(modifier):
+                card.modifier = modifier
+                if card.update_fields(set(item.fields)):
+                    continue
+            if change.transient:
+                # Specialized controls already own their changing values.
+                # Preserve their mouse capture until the gesture commits.
+                continue
+            index = self.stack_layout.indexOf(card)
+            self.stack_layout.removeWidget(card)
+            card.deleteLater()
+            replacement = ModifierCard(modifier, self, self.stack)
+            replacement.removeRequested.connect(self.remove_modifier)
+            replacement.linkRequested.connect(self.toggle_link_mode)
+            replacement.activated.connect(self.toggle_modifier)
+            replacement.dragStarted.connect(self.begin_reorder)
+            replacement.dragMoved.connect(self.move_reorder)
+            replacement.dragFinished.connect(self.finish_reorder)
+            self._cards[identifier] = replacement
+            self.stack_layout.insertWidget(index, replacement)
+
+    def _changed(self, change=None) -> None:
+        if change is not None:
+            self.canvas._publish_change_set(change, action='transient')
+            self.canvas._emit_typed_document_changed(None, change)
+            return
         # Shared effects can extend far beyond the selected target.
         self.canvas._compound_path_cache.clear()
         self.canvas._invalidate_scene_cache()
@@ -744,7 +841,7 @@ class ModifierControls(QWidget):
         after = before.after(self.canvas.chapter) if isinstance(before, RecordSnapshot) else self.canvas.chapter.to_dict()
         if before != after:
             self.canvas.push_model_change(before, after, label)
-            self.canvas.documentChanged.emit(None)
+            self.canvas._emit_typed_document_changed(None, self.canvas._last_published_change)
 
     def _default_bounds(self):
         rect = None
@@ -919,7 +1016,8 @@ class ModifierControls(QWidget):
         setattr(modifier, attribute, value)
         modifier.validate()
         if attribute == "muted" or not modifier.muted:
-            self._changed()
+            self._changed(ChangeSet((EntityChange(('modifier', modifier_id), frozenset({attribute})),),
+                                    transient=True, label='Modifier preview'))
         if commit and before is not None:
             self._push(before, "Edit modifier")
         if attribute in {"expanded", "muted"}:
@@ -981,7 +1079,8 @@ class ModifierControls(QWidget):
         binding.white_value = float(white)
         modifier.validate()
         if not modifier.muted:
-            self._changed()
+            self._changed(ChangeSet((EntityChange(('modifier', modifier_id), frozenset({'parameter_masks'})),),
+                                    transient=True, label='Modifier mask preview'))
         if commit:
             self.finish_parameter_drag()
 

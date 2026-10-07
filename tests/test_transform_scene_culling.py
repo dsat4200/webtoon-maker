@@ -197,8 +197,12 @@ def test_multi_image_translation_keeps_distant_tiles_and_commits_image(scene, mo
         [(x + 30, y + 20) for x, y in start_second])
     assert canvas.command_stack.can_undo
     canvas.command_stack.undo()
+    assert distant.valid
     assert canvas.chapter.objects[first.object_id].transform_quad is None
     assert canvas.chapter.objects[second.object_id].transform_quad is None
+    canvas.command_stack.redo()
+    assert distant.valid
+    assert canvas.chapter.objects[first.object_id].transform_quad == pytest.approx(preview)
 
 
 def test_object_preview_started_before_prepare_bypasses_stale_bounds(scene):

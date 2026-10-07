@@ -8,6 +8,9 @@ import numpy as np
 from PySide6.QtCore import QPointF, QRectF, Qt
 from PySide6.QtGui import QColor, QPainter, QPen, QPolygonF, QTransform
 
+from comic_editor.core.document_patch import RecordSnapshot
+from comic_editor.core.changes import ChangeSet, EntityChange
+
 from comic_editor.core.models import (
     BoundGeometry, ColorFillGradientObject, ColorGradientRamp,
     ColorGradientStop, LimitedMaskGradient, LineGradientField, PathNode, object_from_dict,
@@ -15,6 +18,16 @@ from comic_editor.core.models import (
 
 
 class MaskGradientFeatures:
+    def _mask_gradient_changed(self, mask, *, transient=False):
+        if transient:
+            change = ChangeSet((EntityChange(('mask', mask.mask_id),
+                frozenset({'gradient', 'limited_gradients', 'revision'})),),
+                transient=True, label='Edit mask gradient')
+            self._publish_change_set(change, action='transient')
+        else:
+            change = self._last_published_change
+        self._emit_typed_document_changed(QRectF(), change)
+
     def active_mask_gradient(self) -> ColorFillGradientObject | None:
         mask = (
             self.chapter.masks.get(self.active_tone_mask_id)
@@ -44,7 +57,7 @@ class MaskGradientFeatures:
         if mask is None or shape not in {"linear", "circular"}:
             return None
         self._finish_mask_gradient()
-        before = self.chapter.to_dict()
+        before = RecordSnapshot.capture(self.chapter, masks=(mask.mask_id,))
         center = self.widget_to_document(QPointF(self.width() / 2, self.height() / 2))
         center.setX(max(0, min(self.chapter.width, center.x())))
         center.setY(max(0, min(self.chapter.height, center.y())))
@@ -67,10 +80,9 @@ class MaskGradientFeatures:
         mask.touch()
         self._active_mask_gradient_id = obj.object_id
         self._gradient_tool_shape = shape
-        self.push_model_change(before, self.chapter.to_dict(), "Add limited mask gradient")
+        self.push_model_change(before, before.after(self.chapter), "Add limited mask gradient")
         self._invalidate_tone_mask_overlay()
-        self._invalidate_scene_cache()
-        self.documentChanged.emit(QRectF())
+        self._mask_gradient_changed(mask)
         self.maskContentChanged.emit()
         self.update()
         return limited
@@ -81,17 +93,16 @@ class MaskGradientFeatures:
         if mask is None or obj is None:
             return
         self._finish_mask_gradient()
-        before = self.chapter.to_dict()
+        before = RecordSnapshot.capture(self.chapter, masks=(mask.mask_id,))
         if mask.gradient is obj:
             mask.gradient = None
         else:
             mask.limited_gradients = [entry for entry in mask.limited_gradients if entry.gradient is not obj]
         mask.touch()
         self._active_mask_gradient_id = ""
-        self.push_model_change(before, self.chapter.to_dict(), "Remove mask gradient")
+        self.push_model_change(before, before.after(self.chapter), "Remove mask gradient")
         self._invalidate_tone_mask_overlay()
-        self._invalidate_scene_cache()
-        self.documentChanged.emit(QRectF())
+        self._mask_gradient_changed(mask)
         self.maskContentChanged.emit()
         self.update()
 
@@ -130,7 +141,7 @@ class MaskGradientFeatures:
         hit = ("bound", bound_hit) if bound_hit else self._gradient_control_hit(obj, point) if obj else None
         self._mask_gradient_drag = {
             "mask_id": mask.mask_id,
-            "before": self.chapter.to_dict(),
+            "before": RecordSnapshot.capture(self.chapter, masks=(mask.mask_id,)),
             "gradient": obj.to_dict() if obj else None,
             "limited": self.active_limited_mask_gradient().to_dict() if self.active_limited_mask_gradient() else None,
             "revision": mask.revision,
@@ -210,8 +221,7 @@ class MaskGradientFeatures:
         obj.touch_revision()
         mask.touch()
         self._invalidate_tone_mask_overlay()
-        self._invalidate_scene_cache()
-        self.documentChanged.emit(QRectF())
+        self._mask_gradient_changed(mask, transient=True)
         self.update()
 
     def _mask_gradient_hover(self, point: QPointF) -> None:
@@ -234,7 +244,7 @@ class MaskGradientFeatures:
             if commit:
                 mask.validate()
                 self.push_model_change(
-                    state["before"], self.chapter.to_dict(),
+                    state["before"], state["before"].after(self.chapter),
                     "Edit mask gradient" if state["gradient"] else "Add mask gradient",
                 )
             else:
@@ -248,8 +258,7 @@ class MaskGradientFeatures:
                     mask.gradient = object_from_dict(state["gradient"]) if state["gradient"] else None
                 mask.revision = state["revision"]
             self._invalidate_tone_mask_overlay()
-            self._invalidate_scene_cache()
-            self.documentChanged.emit(QRectF())
+            self._mask_gradient_changed(mask, transient=not commit)
             self.maskContentChanged.emit()
         self.interactionFinished.emit()
         self.update()

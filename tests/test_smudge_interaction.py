@@ -15,6 +15,16 @@ def no_network(monkeypatch):
     monkeypatch.setattr("comic_editor.ui.canvas.create_network_manager", lambda *_: None)
 
 
+@pytest.fixture(autouse=True)
+def matching_scene(canvas, wait_scene):
+    canvas._test_wait_scene = wait_scene
+
+
+def capture(canvas):
+    canvas._test_wait_scene(canvas)
+    return canvas.grab().toImage()
+
+
 def attach(canvas):
     canvas.scale, canvas.rotation = 1., 0.
     canvas.tiles.paint_dab(canvas.selected_object_id, QPointF(170, 175), 100,
@@ -75,14 +85,14 @@ def test_point_handle_drag_uses_transient_preview_and_cancel_preserves_curve(can
     pointer(canvas, stylus, "press", start)
     pointer(canvas, stylus, "move", start + QPointF(15, 20))
     assert canvas._mesh_warp_preview_modifier() is modifier
-    canvas.grab()
+    capture(canvas)
     assert canvas._mesh_warp_preview_presented
     assert canvas.smudge_selected_point()["position"] == [325, 230]
     escape(canvas)
     assert canvas.chapter.to_dict() == before
     assert canvas._modifier_handle_drag is None
     assert canvas.active_modifier_id == modifier.modifier_id
-    canvas.grab()
+    capture(canvas)
     assert not canvas._mesh_warp_preview_presented
     handle = QPointF(*original["points"][1]["handle"])
     pointer(canvas, stylus, "press", handle)
@@ -151,13 +161,13 @@ def test_handle_drag_partial_preview_matches_full_scene(canvas, monkeypatch):
     pointer(canvas, False, "press", start)
     assert canvas._smudge_preview_baseline is not None
     pointer(canvas, False, "move", start + QPointF(8, 12))
-    dirty = []
-    original = canvas._render_scene_cache_rect
-    monkeypatch.setattr(canvas, "_render_scene_cache_rect", lambda rect, **kwargs:
-                        (dirty.append(rect), original(rect, **kwargs))[1])
-    partial = canvas.grab().toImage()
-    assert dirty and dirty[-1].width() < canvas.width()
+    monkeypatch.setattr(canvas, "_render_scene_cache_rect", lambda *_args, **_kwargs:
+                        pytest.fail("Smudge preview evaluated the scene on the GUI"))
+    partial = capture(canvas)
+    assert canvas._projection_provisional_visible
+    assert canvas._projection_frame_pending
     canvas._smudge_preview_baseline = None
-    complete = canvas.grab().toImage()
+    canvas._invalidate_scene_cache()
+    complete = capture(canvas)
     assert partial == complete
     canvas._tool_release()

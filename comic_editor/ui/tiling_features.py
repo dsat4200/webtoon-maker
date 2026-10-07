@@ -524,7 +524,7 @@ class TilingFeatures:
         if hit is None:
             return False
         self._modifier_handle_drag = {"tiling": modifier.modifier_id, "handle": hit,
-            "before": self.chapter.to_dict(), "initial": copy.deepcopy(modifier),
+            "before": self._modifier_record_snapshot(modifier), "initial": copy.deepcopy(modifier),
             "press": self.widget_to_document(point)}
         if not hasattr(self, "_tiling_handle_timer"):
             self._tiling_handle_timer = QTimer(self)
@@ -563,7 +563,5 @@ class TilingFeatures:
             first, last = state["press"]-center, current-center
             modifier.rotation = initial.rotation+math.degrees(math.atan2(last.y(), last.x())-math.atan2(first.y(), first.x()))
         modifier.validate()
-        self._invalidate_scene_cache()
-        self.documentChanged.emit(None)
-        self.update()
+        self._modifier_preview_changed(modifier)
         return True

@@ -44,6 +44,17 @@ def position(canvas):
     return canvas.document_to_widget(QPointF(80, 80))
 
 
+def wait_for_picker(canvas, *, committed=True):
+    import time
+    deadline = time.monotonic()+15
+    while time.monotonic() < deadline:
+        state = canvas._curves_picker.state
+        if (state is None if committed else state is not None and not state['pending']):
+            return
+        QTest.qWait(5)
+    pytest.fail('Detached Curves input did not finish')
+
+
 def test_add_point_drag_has_one_undo_and_uses_release_coordinate(scene):
     canvas, mod, source, obj = scene
     tool, selection = canvas.tool, list(canvas.selected_entities)
@@ -53,6 +64,7 @@ def test_add_point_drag_has_one_undo_and_uses_release_coordinate(scene):
     QTest.mousePress(canvas, Qt.LeftButton, pos=where.toPoint())
     QTest.mouseMove(canvas, (where - QPointF(0, 20)).toPoint())
     QTest.mouseRelease(canvas, Qt.LeftButton, pos=(where - QPointF(0, 40)).toPoint())
+    wait_for_picker(canvas)
     points = canvas.chapter.modifiers[mod.modifier_id].curves["rgb:master"]
     assert len(points) == 3
     assert points[1][1] == pytest.approx(points[1][0] + .2)
@@ -71,6 +83,7 @@ def test_picker_selects_its_node_in_the_live_modifier_card(scene, picker_mode, s
     canvas, mod, _, _ = scene
     owner = ModifierControls(canvas)
     owner.refresh()
+    original_card = owner._cards[mod.modifier_id]
     controls = owner._cards[mod.modifier_id].findChild(CurvesControls)
     revision = canvas.command_stack.revision
     try:
@@ -78,6 +91,9 @@ def test_picker_selects_its_node_in_the_live_modifier_card(scene, picker_mode, s
         where = position(canvas)
         QTest.mousePress(canvas, Qt.LeftButton, pos=where.toPoint())
         QTest.mouseRelease(canvas, Qt.LeftButton, pos=(where - QPointF(0, 40)).toPoint())
+        wait_for_picker(canvas)
+        assert owner._cards[mod.modifier_id] is original_card
+        assert original_card.findChild(CurvesControls) is controls
         points = canvas.chapter.modifiers[mod.modifier_id].curves[f"rgb:{selected_channel}"]
         assert controls.channel == selected_channel
         assert controls.graph.selected_index == 1
@@ -93,12 +109,14 @@ def test_picker_selects_its_node_in_the_live_modifier_card(scene, picker_mode, s
 def test_cancel_rolls_back_uncommitted_drag(scene, cancel):
     canvas, mod, _, _ = scene
     before = copy.deepcopy(mod.curves)
+    original_chapter = canvas.chapter.to_dict()
     revision = canvas.command_stack.revision
     canvas.start_curves_picker(mod.modifier_id, "add_point", "rgb", "red")
     picker = canvas._curves_picker
     where = position(canvas)
     picker.press(where)
     picker.move(where - QPointF(0, 40))
+    wait_for_picker(canvas, committed=False)
     assert mod.curves != before
     if cancel == "escape":
         QTest.keyClick(canvas, Qt.Key_Escape)
@@ -107,7 +125,7 @@ def test_cancel_rolls_back_uncommitted_drag(scene, cancel):
     elif cancel == "selection":
         canvas.set_selection_set([])
     else:
-        canvas.replace_chapter(picker.state["before"])
+        canvas.replace_chapter(original_chapter)
     assert picker.state is None
     assert canvas.chapter.modifiers[mod.modifier_id].curves == before
     assert canvas.command_stack.revision == revision
@@ -120,6 +138,7 @@ def test_tonal_anchor_picker_maps_the_sampled_tone(scene, mode, expected):
     picker = canvas._curves_picker
     picker.press(position(canvas))
     picker.release(position(canvas))
+    wait_for_picker(canvas)
     points = canvas.chapter.modifiers[mod.modifier_id].curves["rgb:master"]
     sampled = picker.sampler.pixel(canvas, mod.modifier_id, QPointF(80, 80))[0].mean()
     assert float(evaluate_curve(points, sampled)) == pytest.approx(expected, abs=1e-5)
@@ -134,6 +153,7 @@ def test_white_balance_neutralizes_selected_pixel_without_changing_alpha(scene):
     picker = canvas._curves_picker
     picker.press(position(canvas))
     picker.release(position(canvas))
+    wait_for_picker(canvas)
     original = _qimage_premultiplied(source)
     actual = apply_curves(original, canvas.chapter.modifiers[mod.modifier_id])
     assert np.ptp(actual[40, 40, :3]) < 1 / 255
@@ -153,6 +173,7 @@ def test_master_black_white_anchors_neutralize_colored_samples(scene, color_mode
     picker = canvas._curves_picker
     picker.press(position(canvas))
     picker.release(position(canvas))
+    wait_for_picker(canvas)
     adjusted = apply_curves(_qimage_premultiplied(source), canvas.chapter.modifiers[mod.modifier_id])
     if color_mode == "gray" and expected == 1:
         # Gray changes luminance while preserving hue, so only its luminance
@@ -172,6 +193,7 @@ def test_alpha_picker_is_independent_of_master_and_transparent_click_is_noop(sce
     assert "rgb:alpha" not in mod.curves
     picker.press(position(canvas))
     picker.release(position(canvas) - QPointF(0, 20))
+    wait_for_picker(canvas)
     assert mod.curves["rgb:alpha"][1] == pytest.approx((180 / 255, 180 / 255 + .1))
     assert mod.curves["rgb:master"] == [(0., 1.), (1., 0.)]
 

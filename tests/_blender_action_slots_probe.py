@@ -314,6 +314,53 @@ def test_legacy_bake_migration_preserves_colliding_slot_keys():
     assert (target.timeline_frame, other.timeline_frame) == migrated_frames
 
 
+def test_verification_respects_rig_drivers():
+    scene = bpy.context.scene
+    mesh = bpy.data.meshes.new("Driven Flexion Mesh")
+    mesh.from_pydata([(0, 0, 0), (1, 0, 0), (0, 1, 0)], [], [(0, 1, 2)])
+    obj = bpy.data.objects.new("Driven Flexion", mesh)
+    scene.collection.objects.link(obj)
+    obj.shape_key_add(name="Basis")
+    flexion = obj.shape_key_add(name="Elbow Flexion")
+    controller = make_owner("Flexion Controller")
+    controller["flexion"] = 0.75
+    curve = flexion.driver_add("value")
+    variable = curve.driver.variables.new()
+    variable.name = "flexion"
+    variable.type = "SINGLE_PROP"
+    variable.targets[0].id = controller
+    variable.targets[0].data_path = '["flexion"]'
+    curve.driver.expression = "flexion"
+    bpy.context.view_layer.update()
+    candidate = snapshot(controller, properties={"flexion": 0.75})
+    candidate["objects"].append({"uuid": ensure_uuid(obj), "transform": {}})
+    candidate["shape_keys"] = [{
+        "object_uuid": ensure_uuid(obj), "name": flexion.name,
+        "value": 0.0, "mute": False,
+    }]
+    # A previously captured output can differ after Blender reevaluates the rig.
+    # Its controller is still verified, and the driver remains authoritative.
+    assert abs(flexion.value - 0.75) < 1e-5
+    assert timeline.verify_snapshot(scene, candidate) == []
+    controller["flexion"] = 0.25
+    assert timeline.verify_snapshot(scene, candidate) == [
+        'Flexion Controller[flexion]',
+    ]
+    controller["flexion"] = 0.75
+    curve.mute = True
+    assert timeline.verify_snapshot(scene, candidate) == [
+        'Driven Flexion.Elbow Flexion.value',
+    ]
+    curve.mute = False
+    camera = scene.camera
+    strict = snapshot(camera, location=[9.0, 0.0, 0.0])
+    camera_curve = camera.driver_add("location", 0)
+    camera_curve.driver.expression = "0.5"
+    bpy.context.view_layer.update()
+    assert any('location[0]' in label for label in timeline.verify_snapshot(scene, strict))
+    camera.driver_remove("location", 0)
+
+
 addon.register()
 try:
     addon._initialize_scenes()
@@ -322,6 +369,7 @@ try:
     test_failed_shared_bake_restores_slot_and_keys()
     test_created_structure_rollback()
     test_legacy_bake_migration_preserves_colliding_slot_keys()
+    test_verification_respects_rig_drivers()
 finally:
     addon.unregister()
 

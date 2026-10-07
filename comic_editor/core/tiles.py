@@ -93,7 +93,7 @@ class TileStore:
                 source.version(key)
                 value = source.entries[key]
                 if isinstance(value, Path):
-                    pin = source.snapshot_pins.get(key)
+                    pin = source.snapshot_pin(key)
                     if pin is None:
                         if self._snapshot_backing is None:
                             self._snapshot_backing = SnapshotBacking()
@@ -128,6 +128,14 @@ class TileStore:
             if self._snapshot_backing is None:
                 self._snapshot_backing = SnapshotBacking()
             self._snapshot_future = prefetch_pins(self._snapshot_backing, tuple(records))
+
+    def retain_snapshot_pins(self, job) -> None:
+        """Retain a capture's bounded IO batch for the live source owner too."""
+        for (object_id, key), (version, path) in job.records.items():
+            owner = self._tiles.get(object_id)
+            if (owner is not None and key in owner
+                    and (owner.version(key), owner.entries.get(key)) == (version, path)):
+                owner.pending_snapshot_pins[key] = version, path, job
 
     def finish_snapshot_prefetch(self) -> None:
         future, self._snapshot_future = self._snapshot_future, None
@@ -183,7 +191,8 @@ class TileStore:
             else self._alpha_bbox(image)
         )
         if bounds is None:
-            object_tiles.pop(key, None)
+            if key in object_tiles:
+                del object_tiles[key]
             self._alpha_bounds.setdefault(object_id, {}).pop(key, None)
         else:
             object_tiles[key] = QImage(image)
@@ -1251,20 +1260,24 @@ class TileStore:
 
     def replace_object_tiles(
         self, object_id: str, values: dict[tuple[int, int], QImage | None],
+        *, alpha_bounds=None,
     ) -> None:
         previous = set(self._tiles.get(object_id, {}))
-        replacement = {
-            key: QImage(image)
-            for key, image in values.items()
-            if image is not None and not image.isNull() and not self.is_empty(image)
-        }
+        replacement, prepared_bounds = {}, {}
+        for key, image in values.items():
+            if image is None or image.isNull():
+                continue
+            bounds = (alpha_bounds[key] if alpha_bounds is not None and key in alpha_bounds
+                      else self._alpha_bbox(image))
+            if bounds is not None:
+                replacement[key] = QImage(image)
+                prepared_bounds[key] = bounds
         object_tiles = self._object_tiles(object_id)
         object_tiles.clear()
         object_tiles.update(replacement)
         bounds_cache = self._alpha_bounds.setdefault(object_id, {})
         bounds_cache.clear()
-        for key, image in replacement.items():
-            bounds_cache[key] = self._alpha_bbox(image)
+        bounds_cache.update(prepared_bounds)
         self._alpha_bounds_dirty = {
             item for item in self._alpha_bounds_dirty if item[0] != object_id
         }
@@ -1381,6 +1394,14 @@ class TileStore:
     @staticmethod
     def _alpha_bbox(image: QImage) -> tuple[int, int, int, int] | None:
         try:
+            from .pixel_arrays import image_has_high_precision, native_rgba_pixels
+            if image_has_high_precision(image):
+                occupied = native_rgba_pixels(image)[0][..., 3] > 0.
+                xs = np.flatnonzero(np.any(occupied, axis=0))
+                ys = np.flatnonzero(np.any(occupied, axis=1))
+                if not len(xs) or not len(ys):
+                    return None
+                return int(xs[0]), int(ys[0]), int(xs[-1])+1, int(ys[-1])+1
             if image.format() in (QImage.Format_ARGB32, QImage.Format_ARGB32_Premultiplied):
                 import sys
                 rows = np.frombuffer(image.constBits(), np.uint8).reshape(image.height(), image.bytesPerLine())
@@ -1398,7 +1419,7 @@ class TileStore:
             maximum_x = maximum_y = -1
             for y in range(image.height()):
                 for x in range(image.width()):
-                    if image.pixelColor(x, y).alpha() <= 0:
+                    if image.pixelColor(x, y).alphaF() <= 0:
                         continue
                     minimum_x, minimum_y = min(minimum_x, x), min(minimum_y, y)
                     maximum_x, maximum_y = max(maximum_x, x), max(maximum_y, y)
@@ -1421,6 +1442,7 @@ class TileStore:
             index = json.loads((root / '.tile-index.json').read_text(encoding='utf-8'))
         except (OSError, ValueError):
             index = {}
+        native_alpha_bounds = index.get('.alpha-bounds-version') == 2
         saved = {}
         for object_id in object_ids:
             directory = root / object_id
@@ -1434,7 +1456,7 @@ class TileStore:
                     continue
                 stat = path.stat()
                 record = index.get(f'{object_id}/{path.name}')
-                if not (isinstance(record, list) and len(record) == 3
+                if not (native_alpha_bounds and isinstance(record, list) and len(record) == 3
                         and record[:2] == [stat.st_size, stat.st_mtime_ns]):
                     reader = QImageReader(str(path))
                     if not reader.canRead():
@@ -1484,7 +1506,7 @@ class TileStore:
                         self.preserve_backing(saved)
                         saved.unlink()
         versions = dict(known) if not complete else {}
-        index = {}
+        index = {'.alpha-bounds-version': 2}
         for object_id, x, y in sorted(targets):
             if object_id not in object_ids:
                 continue

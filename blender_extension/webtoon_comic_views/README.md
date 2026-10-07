@@ -28,7 +28,7 @@ as revisioned PNGs below `%LOCALAPPDATA%\Webtoon Maker\Comic View Frames`.
 
 ### Textures, materials, and UV guides (0.8.0)
 
-Install `webtoon_comic_views-0.8.0.zip` using **Install from Disk**, then restart
+Install `webtoon_comic_views-0.8.1.zip` using **Install from Disk**, then restart
 Blender when you have saved your work. Existing Comic Views and the configured
 external image editor continue to work.
 
@@ -119,6 +119,19 @@ or `BLENDER_EXECUTABLE` to use a custom installation. Package validation must
 succeed before the ZIP is built.
 
 ### Saving and rendering
+
+Version 0.8.1 fixes Save/New failures caused by comparing rig-driven shape-key
+outputs against stale captured values. The saved controllers remain verified;
+active drivers continue to evaluate their outputs. Failed New operations restore
+the previous panel selection, and reopening repairs invalid selections left by
+older versions. On Fourth Axis Blender, Save also captures native Spatial Optics
+camera controls, optical object settings, and linked portal identities.
+
+After adding warp objects, **Save** the panel before **Render**. Render uses the
+last successful Save and hides objects absent from that snapshot. A failed Save
+leaves the previous snapshot intact, so newly added warps cannot appear until
+Save succeeds. Older snapshots without native optical fields remain loadable;
+save them again to capture those controls.
 
 - **New** performs an initial Save and Render. **Save** captures the active
   camera and view layer, every object/rig control, visibility, collection and

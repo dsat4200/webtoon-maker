@@ -126,9 +126,16 @@ def test_gesture_reuses_bounded_tiles_and_invalidates_on_edit_and_solo(scene, mo
     red.fill_color, red.border_width = "#FFFF0000", 0
     blue = chapter.add_layer(page.layer_id, "Blue", BoundGeometry.rectangle(0, 0, 400, 300))
     blue.fill_color, blue.border_width = "#FF0000FF", 0
+    expected = unculled_color(canvas, QPointF(40, 40))
     canvas.set_tool(ToolKind.EYEDROPPER)
     canvas._sample_eyedropper(QPointF(40, 40))
     canvas._eyedropper_sampling = True
+    from PySide6.QtTest import QTest
+    import time
+    deadline = time.monotonic()+15
+    while not canvas._eyedropper_last_color and time.monotonic() < deadline:
+        QTest.qWait(5)
+    assert canvas._eyedropper_last_color == expected, repr(canvas._eyedropper_sampler.last_error)
     sampler = canvas._eyedropper_sampler
     first = canvas._eyedropper_last_color
     import comic_editor.ui.eyedropper_sampling as sampling

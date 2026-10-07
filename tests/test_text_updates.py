@@ -745,7 +745,7 @@ def test_delete_hotkey_yields_to_shape_and_gradient_point_editors(
         window.deleteLater()
 
 
-def test_free_text_transform_reuses_cached_render_until_commit(qapp, monkeypatch):
+def test_free_text_transform_evaluates_detached_preview_until_commit(qapp, monkeypatch, wait_scene):
     canvas, first, _second = _canvas_with_text()
     first.transform_behavior = "stretch"
     canvas.set_tool(ToolKind.TRANSFORM)
@@ -756,9 +756,8 @@ def test_free_text_transform_reuses_cached_render_until_commit(qapp, monkeypatch
 
     def counted(*args, **kwargs):
         nonlocal calls
-        # The static scene may legitimately lay out other visible text once.
-        # The selected item itself must be laid out exactly once into its
-        # dedicated transform cache and never again during pointer moves.
+        # Native text layout belongs to the detached scene. The widget must
+        # not prepare cold source bitmaps during the pointer interaction.
         if args[0].object_id == first.object_id:
             calls += 1
         return original(*args, **kwargs)
@@ -771,13 +770,14 @@ def test_free_text_transform_reuses_cached_render_until_commit(qapp, monkeypatch
         return original_grid(*args, **kwargs)
 
     monkeypatch.setattr(canvas, "_draw_grid", counted_grid)
+    monkeypatch.setattr(canvas.chapter, 'to_dict',
+                        lambda: pytest.fail('Text transform serialized the whole chapter'))
     try:
         start = canvas.document_to_widget(QPointF(80, 80))
         canvas._tool_press(start, 1)
-        assert not canvas._transform_static_cache.isNull()
-        assert not canvas._text_transform_cache.isNull()
-        assert calls == 1
-        assert grid_calls == 1
+        assert canvas._transform_static_cache.isNull()
+        assert canvas._text_transform_cache.isNull()
+        assert calls == 0
 
         for offset in range(4, 44, 4):
             canvas._tool_move(start + QPointF(-offset, -offset), 1)
@@ -785,14 +785,16 @@ def test_free_text_transform_reuses_cached_render_until_commit(qapp, monkeypatch
             assert canvas._selected_world_quad()[0] == (
                 80 - offset, 80 - offset
             )
-        assert calls == 1
-        assert grid_calls == 1
+        preview = wait_scene(canvas)
+        assert calls == 0
+        assert grid_calls == 0
         assert not canvas.grab().toImage().isNull()
-        assert calls == 1
+        assert calls == 0
 
         canvas._tool_release()
         assert canvas.chapter.objects[first.object_id].transform_quad[0] == (40, 40)
         assert canvas._text_transform_cache.isNull()
+        assert wait_scene(canvas) == preview
         canvas.command_stack.undo()
         assert canvas.chapter.objects[first.object_id].transform_quad[0] == (80, 80)
 
@@ -800,11 +802,16 @@ def test_free_text_transform_reuses_cached_render_until_commit(qapp, monkeypatch
         start = canvas.document_to_widget(QPointF(80, 80))
         canvas._tool_press(start, 1)
         canvas._tool_move(start + QPointF(-20, -20), 1)
-        assert not canvas._text_transform_cache.isNull()
+        assert canvas._text_transform_cache.isNull()
         QTest.keyClick(canvas, Qt.Key.Key_Escape)
         assert canvas._text_transform_cache.isNull()
         assert canvas._transform_static_cache.isNull()
         assert canvas.chapter.objects[first.object_id].transform_quad[0] == (80, 80)
     finally:
+        canvas._scene_controller.reset()
+        canvas._scene_controller.scheduler.close()
+        if getattr(canvas, '_scene_consumers', None) is not None:
+            canvas._scene_consumers.shutdown()
+            canvas._scene_consumers.executor.shutdown(wait=True, cancel_futures=True)
         canvas.hide()
         canvas.deleteLater()

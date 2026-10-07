@@ -1,6 +1,7 @@
 """Ordered shape overlays with a separately preserved owner outline."""
 from PySide6.QtCore import QRectF, Qt
 from PySide6.QtGui import QColor, QPainter, QTransform
+from comic_editor.render.pixels import working_color
 
 from comic_editor.core.models import SolidColorOverlayModifier, TextureModifier, StrokeModifier, DotDashModifier
 from comic_editor.ui.effect_pipeline import render_stages, empty_image, aligned
@@ -25,7 +26,7 @@ def paint_shape_outline(canvas, painter, layer):
         ring = outline_mesh(layer.bound, style.outline_thickness, path,
                             core=core, base_width=style.base_thickness, cache=canvas._outline_cache,
                             tolerance=tolerance, start_cap=style.start_cap, end_cap=style.end_cap)
-        painter.fillPath(ring, QColor(style.outline_color))
+        painter.fillPath(ring, working_color(style.outline_color))
     elif layer.compound_enabled:
         from comic_editor.ui.compound_strokes import paint_outline
         sources = canvas._compound_outline_mesh(layer, path, tolerance, sources_only=True)
@@ -41,7 +42,7 @@ def paint_shape_outline(canvas, painter, layer):
         else:
             from comic_editor.ui.compound_outline_painting import paint_closed_shape_outline
             paint_closed_shape_outline(painter, layer.bound, layer.border_width, path,
-                                       QColor(layer.border_color), cache=canvas._outline_cache, tolerance=tolerance)
+                                       working_color(layer.border_color), cache=canvas._outline_cache, tolerance=tolerance)
     painter.restore()
 
 

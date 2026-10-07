@@ -53,10 +53,19 @@ def canvas_pending(canvas):
     presented = getattr(canvas, "_projection_presented_revision", None)
     stale = bool(getattr(canvas, "_projection_async_enabled", False) and presented != revision)
     render_error = getattr(canvas, "_projection_render_error", None)
+    controller = getattr(canvas, "_scene_controller", None)
+    scheduler = getattr(controller, "scheduler", None)
+    scene_busy = bool(controller is not None and (controller.capture is not None
+        or (scheduler is not None and scheduler.busy)))
     return {
         "frame_pending": bool(getattr(canvas, "_projection_frame_pending", False) or stale),
         "presented_revision": presented, "requested_revision": revision,
-        "jobs_busy": jobs.running is not None or bool(jobs.pending),
+        "jobs_busy": jobs.running is not None or bool(jobs.pending) or scene_busy,
+        "scene_capture": bool(controller is not None and controller.capture is not None),
+        "scene_busy": scene_busy,
+        "scene_submitted": getattr(scheduler, "submitted", 0),
+        "scene_completed": getattr(scheduler, "completed", 0),
+        "scene_discarded": getattr(scheduler, "discarded", 0),
         "failed": bool(failures or render_error),
         "render_error": str(render_error) if render_error else None,
         "running": jobs.running is not None,

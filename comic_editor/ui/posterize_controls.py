@@ -17,6 +17,7 @@ from comic_editor.core.models import (
 )
 from comic_editor.core.posterize import HueStatistics, ValueStatistics, grayscale_source
 from comic_editor.ui.modifier_rendering import _qimage_premultiplied, _straight
+from comic_editor.render.pixels import current_contract
 
 
 class PosterizeSampler:
@@ -67,7 +68,7 @@ class PosterizeSampler:
                 continue
             scale = min(1., 512. / max(bounds.width(), bounds.height()))
             width, height = max(1, math.ceil(bounds.width() * scale)), max(1, math.ceil(bounds.height() * scale))
-            image = QImage(width, height, QImage.Format_ARGB32_Premultiplied)
+            image = QImage(width, height, current_contract().image_format)
             image.fill(Qt.transparent)
             painter = QPainter(image)
             painter.setRenderHint(QPainter.Antialiasing)
@@ -436,13 +437,23 @@ class PosterizeControls(QWidget):
     def refresh_statistics(self):
         if self.owner.canvas.chapter is None or self.modifier_id not in self.owner.canvas.chapter.modifiers:
             return
-        try:
-            self.wheel.statistics = self.sampler.sample(self.owner.canvas, self.owner.targets(), self.modifier_id)
-        except (ValueError, MemoryError) as error:
-            self.range_label.setText(f"Sample unavailable: {error}")
-            return
-        self.wheel.update()
-        self.update_selection()
+        from comic_editor.render.source_sampling import posterize_statistics
+        from comic_editor.ui.scene_consumers import scene_consumers
+        import weakref
+        reference = weakref.ref(self)
+        def accept(statistics, error):
+            from shiboken6 import isValid
+            control = reference()
+            if control is None or not isValid(control):
+                return
+            if error is not None:
+                control.range_label.setText(f'Sample unavailable: {error}')
+                return
+            control.wheel.statistics = statistics
+            control.wheel.update()
+            control.update_selection()
+        scene_consumers(self.owner.canvas).request(('posterize-statistics', self.modifier_id),
+            posterize_statistics, (tuple(self.owner.targets()), self.modifier_id, self.value_mode), accept)
 
     def update_selection(self, *_):
         index = next((i for i, item in enumerate(self.wheel.ranges) if item.range_id == self.wheel.selected_id), 0)

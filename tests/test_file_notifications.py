@@ -43,7 +43,7 @@ def test_project_title_and_successful_save_banner(tmp_path):
     try:
         assert window.open_series(repository.root)
         assert window.windowTitle() == f"{repository.root} — Project title — Webtoon Maker"
-        assert window.save()
+        assert window.save(wait=True)
         assert not window.file_notification.isHidden()
         assert window.file_notification.directory == repository.root
         assert "series.json" in window.file_notification.message.text()
@@ -63,10 +63,11 @@ def test_failed_save_does_not_report_success(tmp_path, monkeypatch):
         assert window.open_series(repository.root)
         def fail(*args, **kwargs):
             raise OSError("Disk full")
-        monkeypatch.setattr(window.repository, "save_chapter", fail)
+        # The worker owns its repository rather than borrowing the GUI object.
+        monkeypatch.setattr(SeriesRepository, "save_chapter", fail)
         errors = []
         monkeypatch.setattr(QMessageBox, "critical", lambda *args: errors.append(args[-1]))
-        assert not window.save()
+        assert not window.save(wait=True)
         assert errors == ["Disk full"]
         assert window.file_notification.isHidden()
     finally:

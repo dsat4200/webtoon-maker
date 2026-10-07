@@ -1,14 +1,19 @@
 """Cage tool transactions, selection, and on-canvas mesh/transform controls."""
 import copy
 import math
+import time
 import numpy as np
-from PySide6.QtCore import QPointF, QRectF, Qt, QTimer
+from PySide6.QtCore import QCoreApplication, QEventLoop, QPointF, QRectF, Qt, QTimer
 from PySide6.QtGui import QColor, QImage, QPainter, QPainterPath, QPen, QPolygonF, QTransform
 from comic_editor.core.cage import CageGrid, map_points, tessellate, homography, project
 from comic_editor.core.models import CageTransformModifier, RasterObject, VectorDrawingObject
 from comic_editor.ui.cage_rendering import transform_points, warp_image
 from comic_editor.ui.effect_pipeline import aligned, empty_image
 from comic_editor.ui.icons import iconoir
+from comic_editor.core.document_patch import RecordSnapshot, DocumentPatch
+from comic_editor.core.changes import ChangeSet, EntityChange, ResourceChange
+from comic_editor.core.commands import CallbackCommand
+from comic_editor.ui.tool_sessions import LatestValueInput, ToolSession
 
 
 class CageFeatures:
@@ -16,11 +21,16 @@ class CageFeatures:
         self.modifier_mode = False
         self._modifier_selection = {}
         self._cage_session = None
+        self._cage_prepare = None
+        self._cage_commit_pending = None
+        self._cage_commit_error = None
         self._cage_edit_before = None
         self._cage_drag = None
         self._cage_selected_points = set()
         self._cage_selection_owner = None
         self._cage_pending = None
+        self._cage_input = LatestValueInput(self._apply_cage_move)
+        self._cage_tool_session = None
         self._render_cage_source = False
         self._cage_timer = QTimer(self)
         self._cage_timer.setSingleShot(True)
@@ -62,7 +72,7 @@ class CageFeatures:
         if not self.chapter or not self.selected_entities:
             self.report_incompatible("Cage Transform", "Select raster/vector drawings, or images and shapes, to transform.", [])
             return False
-        if self._cage_session is not None:
+        if self._cage_session is not None or self._cage_prepare is not None:
             return True
         targets = list(self.selected_entities)
         drawings = [ref for ref in targets if ref[0] == "object" and isinstance(
@@ -76,32 +86,53 @@ class CageFeatures:
         if not drawings:
             self.cageModifierRequested.emit()
             return False  # modifier workflow keeps the existing canvas tool
-        from comic_editor.ui.baking import snapshot, visual_bounds
-        bounds = None
-        for kind, identifier in targets:
-            candidate = visual_bounds(self, kind, identifier)
-            bounds = candidate if bounds is None else bounds.united(candidate)
-        if bounds is None or bounds.isEmpty():
-            self.report_incompatible("Cage Transform", "The selected drawings contain no artwork to transform.", targets)
-            return False
         self._commit_text_edit()
-        grid = CageGrid(frame=self._rect_signature(bounds))
-        grid.validate_grid()
-        self._cage_session = {"grid": grid, "targets": targets,
-            "before": snapshot(self, {ref[1] for ref in targets}), "sources": {}}
-        self._cage_selected_points.clear()
-        self.incompatibleSelection.emit([])
-        self.cageChanged.emit()
-        self._invalidate_scene_cache()
-        self.update()
+        from comic_editor.render.input_capture import cage_initial
+        from comic_editor.ui.scene_consumers import scene_consumers
+        chapter = self.chapter
+        pending = self._cage_prepare = {'press': None, 'move': None, 'released': False, 'commit': False}
+        self._cage_commit_error = None
+        def discard():
+            if self._cage_prepare is pending:
+                self._cage_prepare = None
+                if pending['commit']:
+                    self._cage_commit_error = ValueError('The cage source changed before the accepted transform could start')
+        def valid():
+            return (self._cage_prepare is pending and self.chapter is chapter
+                    and list(self.selected_entities) == targets)
+        def ready(session, error):
+            self._cage_prepare = None
+            if error is not None:
+                self._cage_commit_error = error
+                self.report_incompatible('Cage Transform', str(error), targets)
+                return
+            self._cage_session = session
+            self._cage_selected_points.clear()
+            self.incompatibleSelection.emit([])
+            self.cageChanged.emit()
+            self._invalidate_scene_cache()
+            if pending['press'] is not None:
+                self._begin_cage_handle(*pending['press'])
+                if pending['move'] is not None:
+                    self._move_cage_handle(pending['move'])
+                if pending['released']:
+                    self._finish_cage_handle()
+            if pending['commit']:
+                self.finish_cage(True)
+            self.update()
+        scene_consumers(self).request(('cage-initial',), cage_initial, (tuple(targets),), ready,
+            valid=valid, discard=discard)
         return True
 
     def _start_cage_edit(self):
         cage = self._active_cage()
         if cage is not None and self._cage_session is None and self._cage_edit_before is None:
-            self._cage_edit_before = (cage.modifier_id, copy.deepcopy(cage.to_dict()), self.chapter.to_dict())
+            self._cage_edit_before = (cage.modifier_id, copy.deepcopy(cage.to_dict()),
+                                     RecordSnapshot.capture(self.chapter, modifiers=[cage.modifier_id]))
 
     def set_cage_parameter(self, name, value):
+        if self._cage_commit_pending is not None:
+            return
         cage = self._active_cage()
         if cage is None:
             return
@@ -116,13 +147,28 @@ class CageFeatures:
         self._cage_changed()
 
     def _cage_changed(self):
-        self._invalidate_scene_cache()
+        if self._cage_commit_pending is None:
+            self._cage_commit_error = None
+        publish = getattr(self, "_publish_change_set", None)
+        change_set = None
+        if publish is not None:
+            cage = self._active_cage()
+            changes = (EntityChange(("modifier", cage.modifier_id), frozenset({"grid"})),) if cage is not None and hasattr(cage, "modifier_id") else ()
+            change_set = ChangeSet(changes, transient=True, conservative=not bool(changes), label="Cage preview")
+            publish(change_set, action="transient")
+        else:
+            self._invalidate_scene_cache()
         self._compound_path_cache.clear()
         self.update()
-        self.visualChanged.emit(None)
+        if change_set is not None:
+            self._emit_typed_visual_changed(None, change_set)
+        else:
+            self.visualChanged.emit(None)
         self.cageChanged.emit()
 
     def flip_cage(self, vertical=False):
+        if self._cage_commit_pending is not None:
+            return
         cage = self._active_cage()
         if cage is None:
             return
@@ -134,17 +180,42 @@ class CageFeatures:
         cage.points = [tuple(p) for p in points]
         self._cage_changed()
 
-    def commit_active_cage(self):
+    def commit_active_cage(self, *, wait=False):
         """Explicit save/export accepts the current preview before persistence."""
-        if self._cage_session is None and self._cage_edit_before is None:
-            return True
-        return self.finish_cage(True)
+        if self._cage_session is not None or self._cage_edit_before is not None or self._cage_prepare is not None:
+            if not self.finish_cage(True):
+                return False
+        if wait:
+            # Clone/rebind must finish the accepted transaction before editor
+            # session capture retires tools. Ordinary Save remains queued.
+            while self._cage_prepare is not None or self._cage_commit_pending is not None:
+                QCoreApplication.processEvents(QEventLoop.ExcludeUserInputEvents)
+                time.sleep(.002)
+        return self._cage_commit_error is None
 
     def finish_cage(self, commit=True):
+        if self._cage_prepare is not None:
+            if commit:
+                self._cage_prepare['commit'] = True
+            else:
+                self._cage_prepare = None
+                from comic_editor.ui.scene_consumers import scene_consumers
+                scene_consumers(self).cancel(('cage-initial',))
+            return True
+        if self._cage_commit_pending is not None:
+            if commit:
+                return True
+            self._cage_commit_pending = None
+            from comic_editor.ui.scene_consumers import scene_consumers
+            scene_consumers(self).cancel(('cage-commit',))
         if self._cage_session is not None or self._cage_edit_before is not None:
             self._effect_jobs.cancel()
         self._cage_timer.stop()
         self._flush_cage_move()
+        if self._cage_tool_session is not None:
+            self._cage_tool_session.cancel()
+        self._cage_tool_session = None
+        self._cage_input.cancel()
         self._cage_drag = None
         session = self._cage_session
         if session is not None:
@@ -154,6 +225,8 @@ class CageFeatures:
                 except (ValueError, MemoryError, OSError) as error:
                     self.operationError.emit("Cage Transform", str(error))
                     return False
+                if self._cage_commit_pending is not None:
+                    return True
             self._cage_session = None
             from comic_editor.ui.canvas import ToolKind
             self.tool = ToolKind.TRANSFORM
@@ -162,14 +235,15 @@ class CageFeatures:
             identifier, original, before = self._cage_edit_before
             self._cage_edit_before = None
             if commit:
-                after = self.chapter.to_dict()
-                if before != after:
+                after = before.after(self.chapter)
+                _, new = DocumentPatch.pair(before, after)
+                if not new.empty:
                     self.push_model_change(before, after, "Cage Transform")
-                    self.documentChanged.emit(None)
+                    self._emit_typed_document_changed(None, self._last_published_change)
             else:
-                from comic_editor.core.models import modifier_from_dict
                 if identifier in self.chapter.modifiers:
-                    self.chapter.modifiers[identifier] = modifier_from_dict(original)
+                    old, _ = DocumentPatch.pair(before, before.after(self.chapter))
+                    old.apply(self.chapter)
         self._cage_changed()
         self.interactionFinished.emit()
         return True
@@ -233,53 +307,71 @@ class CageFeatures:
         return True
 
     def _commit_cage_drawings(self, session):
-        from comic_editor.ui.baking import snapshot, commit
         grid = session["grid"]
         if np.allclose(grid.points, grid.rest_points(), atol=1e-9, rtol=0):
             return
-        prepared = []
-        # Prepare every target before touching any document or resource.
-        for _, identifier in session["targets"]:
-            obj = self.chapter.objects[identifier]
-            mapping = self._drawing_local_to_world_transform(obj)
-            inverse, valid = mapping.inverted()
-            if not valid:
-                raise ValueError(f"{obj.name} has a singular placement")
-            if isinstance(obj, RasterObject):
-                bounds = aligned(self.tiles.content_bounds(identifier) or QRectF(*obj.interaction_rect))
-                image = empty_image(bounds)
-                painter = QPainter(image)
-                for (x, y), tile in self.tiles.iter_tiles(identifier):
-                    painter.drawImage(QPointF(x*obj.tile_size, y*obj.tile_size)-bounds.topLeft(), tile)
-                painter.end()
-                image, bounds = warp_image(image, bounds, grid, mapping)
-                tiles = {}
-                size = obj.tile_size
-                for y in range(math.floor(bounds.top()/size), math.ceil(bounds.bottom()/size)):
-                    for x in range(math.floor(bounds.left()/size), math.ceil(bounds.right()/size)):
-                        tile = empty_image(QRectF(0, 0, size, size))
-                        painter = QPainter(tile)
-                        painter.drawImage(bounds.topLeft()-QPointF(x*size, y*size), image)
-                        painter.end()
-                        if self.tiles._alpha_bbox(tile) is not None:
-                            tiles[x, y] = tile
-                prepared.append((obj, tiles, bounds))
-            else:
-                from comic_editor.ui.cage_vectors import warp_vector
-                replacement = warp_vector(obj, grid, mapping)
-                prepared.append((obj, replacement, None))
-        self._cage_session = None
-        for obj, value, bounds in prepared:
-            if isinstance(obj, RasterObject):
-                self.tiles.replace_object_tiles(obj.object_id, value)
-                obj.interaction_rect = self._rect_signature(QRectF(*obj.interaction_rect).united(bounds))
-                if obj.modifier_source_frame is not None:
-                    obj.modifier_source_frame = self._rect_signature(bounds)
-            else:
-                obj.__dict__.update(value.__dict__)
-        selection = session["targets"]
-        after = snapshot(self, {ref[1] for ref in selection})
-        commit(self, session["before"], after, "Cage Transform drawings", selection, selection)
+        from comic_editor.render.input_capture import cage_commit
+        from comic_editor.ui.scene_consumers import scene_consumers
+        chapter, targets = self.chapter, tuple(session['targets'])
+        pending = self._cage_commit_pending = object()
+        self._cage_commit_error = None
+        def valid():
+            return (self._cage_commit_pending is pending and self._cage_session is session
+                    and self.chapter is chapter and tuple(self.selected_entities) == targets)
+        def discard():
+            if self._cage_commit_pending is pending:
+                self._cage_commit_pending = None
+                self._cage_session = None
+                self._cage_changed()
+                self._cage_commit_error = ValueError('The cage source changed before the accepted transform could finish')
+        def ready(result, error):
+            self._cage_commit_pending = None
+            if error is not None:
+                self._cage_commit_error = error
+                self.operationError.emit('Cage Transform', str(error))
+                return
+            prepared, alpha, installed = result
+            before_models, before_tiles = session['before_models'], session['before_tiles']
+            after_models = {identifier: record for identifier, (record, _tiles) in prepared.items()}
+            after_tiles = {identifier: tiles for identifier, (_record, tiles) in prepared.items() if tiles is not None}
+            changes = tuple(EntityChange(('object', identifier), frozenset(
+                {'pixels', 'interaction_rect', 'modifier_source_frame'} if identifier in after_tiles else {'strokes', 'revision'}))
+                for identifier in prepared)
+            resources = tuple(ResourceChange(('object', identifier), 'raster', key)
+                for identifier, tiles in after_tiles.items() for key in set(tiles) | set(before_tiles.get(identifier, {})))
+            change = ChangeSet(changes, resources, label='Cage Transform drawings')
+            def restore(models, tiles, *, owned=False, known_alpha=None):
+                for identifier, record in models.items():
+                    current = self.chapter.objects.get(identifier)
+                    if current is None:
+                        continue
+                    current.__dict__.clear()
+                    current.__dict__.update(record.__dict__ if owned else copy.deepcopy(record.__dict__))
+                for identifier, values in tiles.items():
+                    owner = self.tiles._tiles.get(identifier)
+                    for key in set(values) | (set(owner) if owner is not None else set()):
+                        if known_alpha is not None:
+                            self.tiles.set_tile(identifier, key, values.get(key),
+                                _known_alpha_bounds=known_alpha.get(identifier, {}).get(key))
+                        else:
+                            self.tiles.set_tile(identifier, key, values.get(key))
+                self._emit_typed_document_changed(None, self.command_stack.applying_change or change)
+                self.update()
+            self._cage_session = None
+            restore(installed, after_tiles, owned=True, known_alpha=alpha)
+            self.command_stack.push(CallbackCommand('Cage Transform drawings',
+                lambda: restore(after_models, after_tiles), lambda: restore(before_models, before_tiles),
+                forward_change=change, backward_change=change.reversed()), already_done=True)
+            from comic_editor.core.tools import ToolKind
+            self.tool = ToolKind.TRANSFORM
+            self.toolChanged.emit(self.tool)
+            self._compound_path_cache.clear()
+            self._emit_typed_visual_changed(None, change)
+            self.cageChanged.emit()
+            self.update()
+            self.interactionFinished.emit()
+        scene_consumers(self).request(('cage-commit',), cage_commit,
+            (targets, grid), ready, valid=valid, discard=discard, capture_arguments=True)
 
     def _cage_controls(self, cage):
         points = [self.document_to_widget(QPointF(*p)) for p in cage.points]
@@ -359,6 +451,11 @@ class CageFeatures:
         return True
 
     def _begin_cage_handle(self, widget, modifiers):
+        if self._cage_prepare is not None:
+            self._cage_prepare['press'] = QPointF(widget), modifiers
+            return True
+        if self._cage_commit_pending is not None:
+            return True
         cage = self._active_cage()
         if cage is None:
             return False
@@ -404,19 +501,32 @@ class CageFeatures:
                            "points": np.asarray(cage.points).copy(), "pivot": tuple(cage.pivot),
                            "selected": set(self._cage_selected_points), "handle": handle,
                            "rect": rect, "uniform": cage.uniform or bool(modifiers & Qt.ShiftModifier)}
+        self._cage_input.cancel()
+        self._cage_tool_session = ToolSession(lambda sample: None,
+            self._cage_input.queue, self._finish_cage_handle_impl)
+        self._cage_tool_session.begin(QPointF(widget))
         self.update()
         return True
 
     def _move_cage_handle(self, widget):
+        if self._cage_prepare is not None:
+            if self._cage_prepare['press'] is not None:
+                self._cage_prepare['move'] = QPointF(widget)
+            return True
         if self._cage_drag is None:
             return False
         self._cage_pending = QPointF(widget)
+        self._cage_tool_session.update(self._cage_pending)
         if not self._cage_timer.isActive():
             self._cage_timer.start()
         return True
 
     def _flush_cage_move(self):
         widget, self._cage_pending = self._cage_pending, None
+        if widget is not None:
+            self._cage_input.finish(widget)
+
+    def _apply_cage_move(self, widget):
         drag, cage = self._cage_drag, self._active_cage()
         if widget is None or drag is None or cage is None:
             return
@@ -478,6 +588,16 @@ class CageFeatures:
         self._cage_changed()
 
     def _finish_cage_handle(self):
+        if self._cage_prepare is not None:
+            self._cage_prepare['released'] = True
+            return True
+        session = self._cage_tool_session
+        try:
+            return session.commit() if session is not None else self._finish_cage_handle_impl()
+        finally:
+            self._cage_tool_session = None
+
+    def _finish_cage_handle_impl(self):
         if self._cage_drag is None:
             return False
         self._cage_timer.stop()

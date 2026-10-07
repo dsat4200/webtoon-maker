@@ -158,6 +158,24 @@ def test_free_text_stays_visible_during_live_edit(
     def capture_without_caret():
         canvas._text_caret_timer.stop()
         canvas._text_caret_visible = False
+        result = canvas.grab().toImage()
+        document = canvas._render_document_state()
+        serial = canvas._scene_controller.serial
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            preview = canvas._scene_controller.preview
+            ready = (preview is not None and preview[0] == document
+                     and preview[1].key == ("preview", serial)) if document.live_preview else not canvas._projection_frame_pending
+            if ready:
+                break
+            QTest.qWait(5)
+            result = canvas.grab().toImage()
+        assert not canvas._scene_controller.error
+        preview = canvas._scene_controller.preview
+        if document.live_preview:
+            assert preview is not None and preview[0] == document and preview[1].key == ("preview", serial)
+        else:
+            assert not canvas._projection_frame_pending
         return canvas.grab().toImage()
 
     resting = capture_without_caret()

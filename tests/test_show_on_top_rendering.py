@@ -336,7 +336,7 @@ def test_promoted_artwork_retains_parent_blur_opacity_and_opacity_mask(scene, ta
     np.testing.assert_array_equal(pixels(preview(canvas)), pixels(first))
 
 
-def test_live_raster_object_transform_stays_below_promoted_artwork(scene, monkeypatch):
+def test_live_raster_object_transform_stays_below_promoted_artwork(scene, monkeypatch, wait_scene):
     canvas, page = scene
     back = layer(canvas, page, bounds=(0, 0, 300, 230))
     red = ink(canvas, back, center=(80, 100), width=60)
@@ -351,15 +351,17 @@ def test_live_raster_object_transform_stays_below_promoted_artwork(scene, monkey
     canvas._transform_drag_mode = "translate"
     canvas._update_transform_preview(start + QPointF(100, 0))
     assert canvas._transform_preview_quad != canvas._transform_start_quad
+    wait_scene(canvas)
     image = canvas.grab().toImage()
     assert viewport_rgb(canvas, image, 180, 100) == (0, 0, 255)
     top.visible = False
     canvas.documentChanged.emit(QRectF())
+    wait_scene(canvas)
     assert viewport_rgb(canvas, canvas.grab().toImage(), 180, 100) == (255, 0, 0)
     canvas._clear_transform_preview()
 
 
-def test_live_raster_lasso_selection_stays_below_promoted_artwork(scene, monkeypatch):
+def test_live_raster_lasso_selection_stays_below_promoted_artwork(scene, monkeypatch, wait_scene):
     canvas, page = scene
     back = layer(canvas, page, bounds=(0, 0, 300, 230))
     red = ink(canvas, back, center=(80, 100), width=60)
@@ -377,16 +379,18 @@ def test_live_raster_lasso_selection_stays_below_promoted_artwork(scene, monkeyp
         (x + 100, y) for x, y in canvas._selection_transform_start_quad
     ]
     canvas.documentChanged.emit(QRectF())
+    wait_scene(canvas)
     assert viewport_rgb(canvas, canvas.grab().toImage(), 180, 100) == (0, 0, 255)
     top.visible = False
     canvas.documentChanged.emit(QRectF())
+    wait_scene(canvas)
     assert viewport_rgb(canvas, canvas.grab().toImage(), 180, 100) == (255, 0, 0)
     # The moved pixels exist only in the preview until selection commit.
     assert canvas.tiles.tile(red.object_id, (0, 0)).pixelColor(80, 100) == QColor("red")
     assert canvas.tiles.tile(red.object_id, (0, 0)).pixelColor(180, 100).alpha() == 0
 
 
-def test_live_raster_predictive_ink_stays_below_top_and_clears_after_stroke(scene, monkeypatch):
+def test_live_raster_predictive_ink_stays_below_top_and_clears_after_stroke(scene, monkeypatch, wait_scene):
     canvas, page = scene
     back = layer(canvas, page, bounds=(0, 0, 350, 230))
     drawing = canvas.chapter.add_object(back.layer_id, RasterObject())
@@ -397,18 +401,22 @@ def test_live_raster_predictive_ink_stays_below_top_and_clears_after_stroke(scen
     canvas.primary_color = "#FF0000"
     canvas.settings.predictive_ink = True
     monkeypatch.setattr(canvas, "_draw_selection", lambda *_args: None)
+    wait_scene(canvas)
     canvas._begin_stroke(QPointF(70, 100), 1)
     try:
         canvas._continue_stroke(QPointF(170, 100), 1)
         assert canvas._predictive is not None
+        wait_scene(canvas)
         image = canvas.grab().toImage()
         assert viewport_rgb(canvas, image, 195, 100) == (0, 0, 255)
         # Removing the occluder shows the predictor, proving it was drawn.
         top.visible = False
         canvas.documentChanged.emit(QRectF())
+        wait_scene(canvas)
         predicted = viewport_rgb(canvas, canvas.grab().toImage(), 195, 100)
         assert predicted[0] > predicted[1] + 50
     finally:
         canvas._end_stroke()
+    wait_scene(canvas)
     ended = viewport_rgb(canvas, canvas.grab().toImage(), 195, 100)
     assert ended == (36, 36, 40)

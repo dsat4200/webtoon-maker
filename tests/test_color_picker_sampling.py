@@ -72,7 +72,13 @@ def test_layer_fill_eyedropper_releases_modal_input_samples_and_applies_once(lay
     point = window.canvas.document_to_widget(QPointF(280, 100)).toPoint()
     assert window.canvas.rect().contains(point)
     QTest.mouseClick(window.canvas, Qt.LeftButton, pos=point)
-    qapp.processEvents()
+    # A cold native sample finishes on the detached scene worker. The dialog
+    # regains its modality only when that exact sample has been published.
+    import time
+    deadline = time.monotonic() + 20
+    while not popup.isVisible() and time.monotonic() < deadline:
+        qapp.processEvents()
+        time.sleep(.002)
     assert popup.isVisible()
     assert QApplication.activeModalWidget() is popup
     assert popup.windowModality() == original_modality

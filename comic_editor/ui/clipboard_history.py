@@ -13,6 +13,8 @@ from PySide6.QtNetwork import QNetworkReply, QNetworkRequest
 
 from comic_editor.core.assets import _collect_subtree, _translate_object, extract_asset, instantiate_asset, entity_visual_bounds
 from comic_editor.core.commands import CallbackCommand
+from comic_editor.core.changes import ResourceChange
+from comic_editor.core.document_patch import DocumentPatch, RecordSnapshot
 from comic_editor.core.images import ImageStore
 from comic_editor.core.models import ChapterDocument, ImageObject, RasterObject, VectorDrawingObject
 from comic_editor.core.tiles import TileStore
@@ -172,55 +174,44 @@ class ClipboardImageHistory:
             ))
 
     def add_drawing(self, canvas, payload) -> None:
-        from comic_editor.ui.canvas import RasterSelectionClipboard, VectorSelectionClipboard
+        from comic_editor.core.clipboard import RasterSelectionClipboard, VectorSelectionClipboard
         if not isinstance(payload, (RasterSelectionClipboard, VectorSelectionClipboard)):
             return
         existing = next((entry for entry in self.entries if entry.payload is payload), None)
         if existing is not None:
             self.add(existing)
             return
-        document = ChapterDocument(document_kind="asset", background="#00000000")
-        page = document.add_page()
-        tiles = TileStore()
-        if isinstance(payload, RasterSelectionClipboard):
-            obj = document.add_object(page.layer_id, RasterObject(name=payload.source_name))
-            tiles.replace_object_tiles(obj.object_id, payload.tiles)
-            size = sum(image.sizeInBytes() for image in payload.tiles.values())
-        else:
-            obj = document.add_object(page.layer_id, VectorDrawingObject(
-                name=payload.source_name, strokes=copy.deepcopy(payload.strokes),
-            ))
-            size = len(json.dumps(obj.to_dict()).encode("utf-8"))
-        preview = canvas._render_entity_crop(document, tiles, "object", obj.object_id, maximum=72)
-        self.add(HistoryEntry("drawing", payload.source_name, payload, square_thumbnail(preview), size + 72 * 72 * 4, f"drawing:{id(payload)}"))
+        self._add_preview(canvas, 'drawing', payload, payload.source_name)
 
     def add_object(self, canvas, payload: ObjectClipboard) -> None:
         existing = next((entry for entry in self.entries if entry.payload is payload), None)
         if existing is not None:
             self.add(existing)
             return
-        manifest = payload.manifest
-        try:
-            current = canvas.chapter
-            original_available = current is not None and manifest.root_id in (
-                current.layers if manifest.root_kind == "layer" else current.objects)
-            preview = canvas._render_entity_crop(
-                current if original_available else manifest.document,
-                canvas.tiles if original_available else payload.tiles,
-                manifest.root_kind, manifest.root_id, maximum=72,
-                images=canvas.images if original_available else payload.images,
-            )
-        finally:
-            # History owns original compressed files and tiny previews. A solid
-            # 8K PNG can decode to 256 MiB despite being only a few KiB on disk.
-            for component in [payload, *payload.dependencies]:
-                component.images._decoded.clear()
-        size = 0
+        # The payload is already independently owned. Thumbnail decoding must
+        # not leave full-resolution image residency in clipboard history.
         for component in [payload, *payload.dependencies]:
-            size += len(json.dumps(component.manifest.to_dict()).encode("utf-8"))
-            size += sum(image.sizeInBytes() for values in component.tiles._tiles.values() for image in values.values())
-            size += sum(len(source.data) for source in component.images.snapshot().values())
-        self.add(HistoryEntry("object", manifest.name, payload, square_thumbnail(preview), size + 72 * 72 * 4, f"object:{id(payload)}"))
+            component.images._decoded.clear()
+        self._add_preview(canvas, 'object', payload, payload.manifest.name)
+
+    def _add_preview(self, canvas, kind, payload, label):
+        from comic_editor.render.input_capture import clipboard_preview
+        from comic_editor.ui.scene_consumers import scene_consumers
+        entry = HistoryEntry(kind, label, payload, square_thumbnail(QImage()),
+            72*72*4, f'{kind}:{id(payload)}')
+        if not self.add(entry):
+            return
+        def present():
+            return any(current is entry for current in self.entries)
+        def ready(result, error):
+            if error is not None or not present():
+                return
+            entry.thumbnail, entry.byte_size = result
+            self.byte_size = sum(current.byte_size for current in self.entries)
+            while self.entries and (len(self.entries) > self.max_items or self.byte_size > self.max_bytes):
+                self.byte_size -= self.entries.pop().byte_size
+        scene_consumers(canvas).request_detached(('clipboard-thumbnail', id(entry)), clipboard_preview,
+            (kind, payload), ready, valid=present)
 
 
 class ClipboardHistoryPopup(QDialog):
@@ -247,6 +238,11 @@ class ClipboardHistoryPopup(QDialog):
             self.list.addItem("Copy or paste an image or object to begin.")
             self.list.setEnabled(False)
         layout.addWidget(self.list)
+        self._thumbnail_keys = [entry.thumbnail.cacheKey() for entry in self.entries]
+        self._thumbnail_timer = QTimer(self)
+        self._thumbnail_timer.setInterval(50)
+        self._thumbnail_timer.timeout.connect(self._refresh_thumbnails)
+        self._thumbnail_timer.start()
 
         def chosen(item):
             if self._chosen:
@@ -261,6 +257,13 @@ class ClipboardHistoryPopup(QDialog):
         self.list.itemActivated.connect(chosen)
         if entries:
             self.list.setCurrentRow(0)
+
+    def _refresh_thumbnails(self):
+        for row, entry in enumerate(self.entries):
+            key = entry.thumbnail.cacheKey()
+            if self._thumbnail_keys[row] != key:
+                self.list.item(row).setIcon(QIcon(QPixmap.fromImage(entry.thumbnail)))
+                self._thumbnail_keys[row] = key
 
     def open_at(self, global_position: QPoint) -> None:
         geometry = self.screen().availableGeometry()
@@ -387,10 +390,20 @@ def _instantiated_identity_map(source, target, kind, source_id, target_id):
 def paste_object(canvas, payload: ObjectClipboard, parent_id: str, world: QPointF,
                  insertion_index: int | None = None, label="Paste object") -> str:
     """Use independent model/resource identities and one reversible command."""
-    before = canvas.chapter.to_dict()
-    before_images = canvas.images.snapshot()
+    ancestor = canvas.chapter.ancestor_layers(parent_id)[0].layer_id
+    before = RecordSnapshot.capture(canvas.chapter, scalars=('size', 'root_page_ids'),
+        layers={parent_id, ancestor}, objects=(), modifiers=(), masks=())
+    original_ids = {group: set(getattr(canvas.chapter, group)) for group in before.records}
     before_selection = canvas._selection_snapshot()
     before_resource_ids = set(canvas.chapter.objects) | set(canvas.chapter.masks)
+    def include_created():
+        created = {}
+        for group, identifiers in original_ids.items():
+            added = set(getattr(canvas.chapter, group)) - identifiers
+            created[group] = added
+            before.records[group].update({identifier: None for identifier in added})
+            before.selections[group] = tuple(set(before.selections[group]) | added)
+        return created
     try:
         kind, root_id, created_objects = instantiate_asset(
             payload.manifest, payload.tiles, canvas.chapter, canvas.tiles,
@@ -451,37 +464,47 @@ def paste_object(canvas, payload: ObjectClipboard, parent_id: str, world: QPoint
             children.insert(insertion_index, root)
     except Exception:
         created_ids = (set(canvas.chapter.objects) | set(canvas.chapter.masks)) - before_resource_ids
-        canvas.replace_chapter(before)
-        canvas.images.restore(before_images)
+        include_created()
+        old, _new = DocumentPatch.pair(before, before.after(canvas.chapter))
+        old.apply(canvas.chapter)
         for identifier in created_ids:
             canvas.tiles.remove_object(identifier)
+            canvas.images.remove(identifier)
         raise
-    after = canvas.chapter.to_dict()
-    after_images = canvas.images.snapshot()
+    include_created()
+    after = before.after(canvas.chapter)
+    old, new = DocumentPatch.pair(before, after)
     resource_ids = set(created_objects) | (set(canvas.chapter.masks) - before_resource_ids)
     tile_payload = {identifier: canvas.tiles.object_tiles(identifier) for identifier in resource_ids}
+    image_payload = canvas.images.clone(resource_ids)
+    change = new.change_set(old, label=label)
+    change = replace(change, resources=tuple(ResourceChange(
+        ('mask' if identifier in canvas.chapter.masks else 'object', identifier), 'raster', key)
+        for identifier, values in tile_payload.items() for key in values))
     canvas.set_selection(kind, root_id, activate_default_tool=True)
     after_selection = canvas._selection_snapshot()
 
-    def restore(state, resources, selection, with_tiles):
-        canvas.replace_chapter(state)
-        canvas.images.restore(resources)
+    def restore(patch, selection, with_tiles):
         for identifier in resource_ids:
             if with_tiles:
                 canvas.tiles.replace_object_tiles(identifier, tile_payload[identifier])
+                image_payload.copy_source_to(identifier, canvas.images, identifier)
             else:
                 canvas.tiles.remove_object(identifier)
+                canvas.images.remove(identifier)
+        canvas._restore_history_state(patch, document_patch=True)
         canvas._restore_selection_snapshot(selection)
-        canvas.hierarchyChanged.emit()
-        canvas.documentChanged.emit(QRectF())
+        canvas._emit_typed_hierarchy_changed(canvas.command_stack.applying_change or change)
+        canvas._emit_typed_document_changed(QRectF(), canvas.command_stack.applying_change or change)
         canvas.update()
 
     canvas.command_stack.push(CallbackCommand(
-        label, lambda: restore(after, after_images, after_selection, True),
-        lambda: restore(before, before_images, before_selection, False),
+        label, lambda: restore(new, after_selection, True),
+        lambda: restore(old, before_selection, False),
+        forward_change=change, backward_change=change.reversed(),
     ), already_done=True)
-    canvas.hierarchyChanged.emit()
-    canvas.documentChanged.emit(QRectF())
+    canvas._emit_typed_hierarchy_changed(change)
+    canvas._emit_typed_document_changed(QRectF(), change)
     canvas.interactionFinished.emit()
     canvas.update()
     return root_id

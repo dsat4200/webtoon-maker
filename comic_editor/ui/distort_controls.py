@@ -410,17 +410,31 @@ class DistortControls(QWidget):
         self.owner.refresh()
 
     def load_beneath(self):
-        try:
-            encoded = self.owner.canvas.capture_distort_beneath(self.modifier.modifier_id)
-        except (ValueError, MemoryError, OSError) as error:
-            QMessageBox.warning(self, "Displacement map", str(error))
-            return
-        if not encoded:
-            QMessageBox.information(self, "Displacement map", "There are no visible pixels beneath the selected object.")
-            return
-        parameters = {**self.modifier.parameters, "map_source": "embedded", "map_png": encoded}
-        self.owner.set_parameter(self.modifier.modifier_id, "parameters", parameters, True)
-        self.owner.refresh()
+        from comic_editor.render.source_sampling import distort_beneath
+        from comic_editor.ui.scene_consumers import scene_consumers
+        import weakref
+        from shiboken6 import isValid
+        reference = weakref.ref(self)
+        modifier_id = self.modifier.modifier_id
+        def accept(encoded, error):
+            control = reference()
+            if control is None or not isValid(control):
+                return
+            if error is not None:
+                QMessageBox.warning(control, 'Displacement map', str(error))
+                return
+            if not encoded:
+                QMessageBox.information(control, 'Displacement map',
+                    'There are no visible pixels beneath the selected object.')
+                return
+            modifier = control.owner.canvas.chapter.modifiers.get(modifier_id)
+            if modifier is None:
+                return
+            parameters = {**modifier.parameters, 'map_source': 'embedded', 'map_png': encoded}
+            control.owner.set_parameter(modifier_id, 'parameters', parameters, True)
+            control.owner.refresh()
+        scene_consumers(self.owner.canvas).request(('distort-beneath', modifier_id),
+                                                   distort_beneath, (modifier_id,), accept)
 
     def _lens_controls(self, form):
         from comic_editor.core.lens_profiles import load_lens_catalog

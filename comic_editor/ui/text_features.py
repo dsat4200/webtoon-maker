@@ -1,11 +1,20 @@
 """Free text placement and non-destructive layout/frame manipulation."""
+import copy
 import math
 from PySide6.QtCore import QPointF, QRectF, QTimer, Qt
 from PySide6.QtGui import QColor, QPen, QPolygonF, QTransform
 from comic_editor.core.models import TextObject, object_from_dict
+from comic_editor.core.document_patch import RecordSnapshot, DocumentPatch
+from comic_editor.core.changes import ChangeSet, EntityChange, GROUP_KINDS
+from comic_editor.ui.tool_sessions import LatestValueInput, ToolSession
 
 
 class TextFeatures:
+    def _text_record_snapshot(self, obj, fields):
+        """Retain only the authored fields participating in this text edit."""
+        return RecordSnapshot.capture(self.chapter, objects=(obj.object_id,),
+                                      attributes={'objects': tuple(fields)})
+
     @staticmethod
     def _text_dirty_union(first: QRectF, second: QRectF) -> QRectF:
         # Empty denotes a full invalidation and must survive a frame resize.
@@ -25,7 +34,7 @@ class TextFeatures:
             dirty = dirty.united(child_dirty)
         return dirty
 
-    def _text_visual_dirty(self, obj: TextObject | None, before: dict | None = None) -> QRectF:
+    def _text_visual_dirty(self, obj: TextObject | None, before: dict | RecordSnapshot | None = None) -> QRectF:
         """Invalidate the clipped text frame and its existing effect dependants."""
         if not isinstance(obj, TextObject) or self.chapter is None:
             return QRectF()
@@ -33,10 +42,16 @@ class TextFeatures:
         if world is None:
             return QRectF()
         if before is not None:
-            record = next((item for item in before["objects"]
-                           if item["id"] == obj.object_id), None)
+            record = (before.records.get('objects', {}).get(obj.object_id) if isinstance(before, RecordSnapshot)
+                      else next((item for item in before["objects"]
+                                 if item["id"] == obj.object_id), None))
             if record is not None:
-                original = object_from_dict(record)
+                if isinstance(before, RecordSnapshot) and 'objects' in before.attributes:
+                    original = copy.copy(obj)
+                    for name, value in record.items():
+                        setattr(original, name, copy.deepcopy(value))
+                else:
+                    original = object_from_dict(record)
                 quad = (self._rect_quad(self._strict_text_rect(original))
                         if original.layout_mode == "strict" else self._text_quad(original))
                 mapping = self.layer_world_transform(original.parent_layer_id)
@@ -66,6 +81,8 @@ class TextFeatures:
         self._text_placement = None
         self._free_text_drag = None
         self._free_text_pending = None
+        self._free_text_input = LatestValueInput(self._apply_free_text_drag)
+        self._free_text_tool_session = None
         self._free_text_timer = QTimer(self)
         self._free_text_timer.setSingleShot(True)
         self._free_text_timer.timeout.connect(self._flush_free_text_drag)
@@ -116,7 +133,7 @@ class TextFeatures:
                 return
             # Separate previous typing from the single color undo command.
             self.commit_active_text_edit()
-            before = self.chapter.to_dict()
+            before = self._text_record_snapshot(current, ('text_color', 'color_runs'))
             apply_text_color(current, start, end, color)
             self._finish_text_property_change(before, "Change text color")
 
@@ -213,13 +230,14 @@ class TextFeatures:
         if target is None or behavior not in {"bounds", "stretch"}:
             return
         self._commit_text_edit()
-        before = self.chapter.to_dict()
         entity = target[0]
-        setattr(entity, "transform_behavior" if isinstance(entity, TextObject) else "text_transform_behavior", behavior)
-        after = self.chapter.to_dict()
-        if before != after:
-            self.push_model_change(before, after, "Change text transform behavior")
-            self.documentChanged.emit(None)
+        attribute = 'transform_behavior' if isinstance(entity, TextObject) else 'text_transform_behavior'
+        group = 'objects' if isinstance(entity, TextObject) else 'layers'
+        identifier = entity.object_id if isinstance(entity, TextObject) else entity.layer_id
+        before = RecordSnapshot.capture(self.chapter, **{group: (identifier,)}, attributes={group: (attribute,)})
+        setattr(entity, attribute, behavior)
+        from comic_editor.ui.record_edits import commit_records
+        if commit_records(self, before, 'Change text transform behavior'):
             self.interactionFinished.emit()
             self.update()
 
@@ -297,9 +315,6 @@ class TextFeatures:
         inverse, valid = self.layer_world_transform(parent_id).inverted()
         if not valid:
             return True
-        before = self.chapter.to_dict()
-        if state["new"]:
-            parent_id = self.chapter.add_layer(parent_id, "Free Text", layer_kind="text_container").layer_id
         start, end = inverse.map(state["start"]), inverse.map(state["end"])
         rect = QRectF(start, end).normalized()
         if math.dist(self.document_to_widget(state["start"]).toTuple(), self.document_to_widget(state["end"]).toTuple()) < 3:
@@ -311,13 +326,20 @@ class TextFeatures:
         for key in ("font_family", "font_size", "bold", "italic", "kerning", "line_spacing",
                     "horizontal_alignment", "vertical_alignment", "margin"):
             setattr(obj, key, preset[key])
+        # Structural placement retains the parent order plus tombstones for
+        # the new records; unrelated drawings never enter this transaction.
+        before = RecordSnapshot.capture(self.chapter, layers=(parent_id,),
+                                        objects=(obj.object_id,), scalars=('size',))
+        if state['new']:
+            parent_id = self.chapter.add_layer(parent_id, 'Free Text', layer_kind='text_container').layer_id
+            before.records['layers'][parent_id] = None
         self.chapter.add_object(parent_id, obj)
         self._text_placement = None
-        self.push_model_change(before, self.chapter.to_dict(), "Add free text container" if state["new"] else "Add text box")
-        self.hierarchyChanged.emit()
+        self.push_model_change(before, before.after(self.chapter), "Add free text container" if state["new"] else "Add text box")
+        self._emit_typed_hierarchy_changed(self._last_published_change)
         self.set_selection("object", obj.object_id)
         self.start_text_edit(select_all=True)
-        self.documentChanged.emit(None)
+        self._emit_typed_document_changed(None, self._last_published_change)
         self.update()
         return True
 
@@ -326,9 +348,14 @@ class TextFeatures:
         self._text_placement = None
         self._free_text_timer.stop()
         self._free_text_pending = None
+        self._free_text_input.cancel()
+        if self._free_text_tool_session is not None:
+            self._free_text_tool_session.cancel()
+        self._free_text_tool_session = None
         drag, self._free_text_drag = self._free_text_drag, None
         if restore and drag:
-            self.replace_chapter(drag["before"])
+            old, _ = DocumentPatch.pair(drag["before"], drag["before"].after(self.chapter))
+            self._restore_history_state(old, document_patch=True)
         if restore and state:
             self.set_tool(state["previous_tool"])
         self.update()
@@ -356,17 +383,30 @@ class TextFeatures:
             return False
         self._commit_text_edit()
         parent_id = entity.parent_layer_id if isinstance(entity, TextObject) else entity.parent_id
+        from comic_editor.ui.attached_translation import moving_entities, ownership
+        moving = moving_entities(self.chapter, [(self.selected_kind, self.selected_id)])
+        modifiers, masks = ownership(self.chapter)
+        before = RecordSnapshot.capture(self.chapter,
+            layers=[identifier for kind, identifier in moving if kind == "layer"],
+            objects=[identifier for kind, identifier in moving if kind == "object"],
+            modifiers=[identifier for identifier, owners in modifiers.items() if owners and owners <= moving],
+            masks=[identifier for identifier, owners in masks.items() if owners and owners <= moving])
         self._free_text_drag = {"id": self.selected_id, "kind": self.selected_kind,
-            "before": self.chapter.to_dict(), "frame": QRectF(frame), "mapping": QTransform(mapping),
+            "before": before, "frame": QRectF(frame), "mapping": QTransform(mapping),
             "parent": parent_id, "mode": mode, "handle": handle, "behavior": behavior,
             "press": QPointF(world), "quad": quad,
             "pivot": QPointF(self._transform_pivot or mapping.map(frame.center()))}
+        self._free_text_input.cancel()
+        self._free_text_tool_session = ToolSession(lambda sample: None,
+            self._free_text_input.queue, self._finish_free_text_drag_impl)
+        self._free_text_tool_session.begin(QPointF(world))
         return True
 
     def _queue_free_text_drag(self, world):
         if self._free_text_drag is None:
             return False
         self._free_text_pending = QPointF(world)
+        self._free_text_tool_session.update(self._free_text_pending)
         if not self._free_text_timer.isActive():
             self._free_text_timer.start(16)
         return True
@@ -374,6 +414,10 @@ class TextFeatures:
     def _flush_free_text_drag(self):
         self._free_text_timer.stop()
         world, self._free_text_pending = self._free_text_pending, None
+        if world is not None:
+            self._free_text_input.finish(world)
+
+    def _apply_free_text_drag(self, world):
         state = self._free_text_drag
         if world is None or state is None or self.chapter is None:
             return
@@ -440,7 +484,7 @@ class TextFeatures:
             entity.x, entity.y = entity.transform_quad[0]
         elif resized is not None:
             sx, sy = resized.width()/frame.width(), resized.height()/frame.height()
-            originals = {o["id"]: o for o in state["before"]["objects"]}
+            originals = state["before"].records["objects"]
             for ref in entity.children:
                 child = self.chapter.objects[ref.entity_id]
                 original = object_from_dict(originals[ref.entity_id])
@@ -458,23 +502,50 @@ class TextFeatures:
             entity.transform_quad = [parent_inverse.map(QPointF(*p)).toTuple() for p in quad]
             entity.translate_x = entity.translate_y = 0.
         state["result_quad"] = quad
-        self.documentChanged.emit(self._text_dirty_union(dirty, self._text_frame_dirty(state["kind"], state["id"])))
+        new_dirty = self._text_frame_dirty(state["kind"], state["id"])
+        publish = getattr(self, "_publish_change_set", None)
+        change_set = None
+        if publish is not None:
+            changes = tuple(EntityChange((GROUP_KINDS[group], identifier),
+                frozenset({"transform_quad", "layout", "rig"}),
+                dirty.getRect() if not dirty.isEmpty() else None,
+                new_dirty.getRect() if not new_dirty.isEmpty() else None)
+                for group, records in state["before"].records.items() for identifier in records)
+            change_set = ChangeSet(changes, transient=True,
+                conservative=dirty.isEmpty() or new_dirty.isEmpty() or bool(state["before"].records["masks"]),
+                label="Text transform")
+            publish(change_set, action="transient")
+        if change_set is not None:
+            self._emit_typed_document_changed(self._text_dirty_union(dirty, new_dirty), change_set)
+        else:
+            self.documentChanged.emit(self._text_dirty_union(dirty, new_dirty))
         self.update()
 
     def _finish_free_text_drag(self):
+        session = self._free_text_tool_session
+        try:
+            return session.commit() if session is not None else self._finish_free_text_drag_impl()
+        finally:
+            self._free_text_tool_session = None
+
+    def _finish_free_text_drag_impl(self):
         self._flush_free_text_drag()
         state, self._free_text_drag = self._free_text_drag, None
         if state is None:
             return False
         if state["mode"] != "pivot":
+            final_dirty = None
             if state["mode"] != "translate" and "result_quad" in state and not (state["behavior"] == "bounds" and state["mode"] == "handle"):
                 dirty = self._text_frame_dirty(state["kind"], state["id"])
                 change = self._quad_to_quad_transform(state["quad"], state["result_quad"])
                 self._transform_single_target_focal_modifiers(state["kind"], state["id"], change)
-                self.documentChanged.emit(self._text_dirty_union(dirty, self._text_frame_dirty(state["kind"], state["id"])))
-            after = self.chapter.to_dict()
-            if state["before"] != after:
+                final_dirty = self._text_dirty_union(dirty, self._text_frame_dirty(state["kind"], state["id"]))
+            after = state["before"].after(self.chapter)
+            _, new = DocumentPatch.pair(state["before"], after)
+            if not new.empty:
                 self.push_model_change(state["before"], after, "Transform text bounds" if state["behavior"] == "bounds" else "Stretch text")
+                if final_dirty is not None:
+                    self._emit_typed_document_changed(final_dirty, self._last_published_change)
         self.interactionFinished.emit()
         self.update()
         return True

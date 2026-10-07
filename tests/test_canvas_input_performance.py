@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import gc
+import time
 
 import pytest
 from PySide6.QtCore import QPointF, QRectF, Qt
@@ -217,8 +218,11 @@ def test_raster_paint_error_restores_tiles_and_gc(qapp, monkeypatch):
             raise RuntimeError("synthetic paint failure")
 
         monkeypatch.setattr(canvas.tiles, "paint_segment", fail_segment)
-        with pytest.raises(RuntimeError, match="synthetic paint failure"):
-            canvas._continue_stroke(QPointF(60, 30), 1.0)
+        failures = []
+        canvas.operationError.connect(lambda title, message: failures.append((title, message)))
+        canvas._continue_stroke(QPointF(60, 30), 1.0)
+        assert failures == [('Drawing failed', 'synthetic paint failure')]
+        assert str(canvas._native_input_error) == 'synthetic paint failure'
         assert gc.isenabled()
         assert not canvas._drawing
         assert canvas.tiles.object_tiles(raster.object_id) == {}
@@ -436,6 +440,12 @@ def test_vector_eraser_first_press_paints_complete_live_result(
     before = QImage(800, 600, QImage.Format_ARGB32_Premultiplied)
     before.fill(Qt.transparent)
     canvas.render(before)
+    deadline = time.monotonic() + 10
+    while canvas._projection_frame_pending and time.monotonic() < deadline:
+        qapp.processEvents()
+        time.sleep(.005)
+        canvas.render(before)
+    assert not canvas._projection_frame_pending, canvas._scene_controller.error
     # Sample inside the ink but off its degenerate centerline selection cage.
     probe = canvas.document_to_widget(QPointF(200, 154)).toPoint()
     assert before.pixelColor(probe).red() < 100
@@ -448,6 +458,12 @@ def test_vector_eraser_first_press_paints_complete_live_result(
     live = QImage(800, 600, QImage.Format_ARGB32_Premultiplied)
     live.fill(Qt.transparent)
     canvas.render(live)
+    deadline = time.monotonic() + 10
+    while not getattr(canvas, "_projection_provisional_visible", False) and time.monotonic() < deadline:
+        qapp.processEvents()
+        time.sleep(.005)
+        canvas.render(live)
+    assert canvas._projection_provisional_visible, canvas._scene_controller.error
     before_color = before.pixelColor(probe)
     live_color = live.pixelColor(probe)
     assert live_color.red() > 220, (

@@ -57,12 +57,12 @@ def test_reopening_refreshes_uv_without_replacing_paint_or_duplicating_guide(tmp
         assert not guide.visible
         assert window.canvas.images.image(guide.object_id).pixelColor(32, 24).alpha() > 0
         assert window._dirty
-        assert window.save()
+        assert window.save(wait=True)
     finally:
         window.deleteLater()
 
 
-def test_uv_visible_in_editor_but_never_burned_into_export(tmp_path):
+def test_uv_visible_in_editor_but_never_burned_into_export(tmp_path, wait_outputs):
     path, _, _ = texture_with_uv(tmp_path)
     window = MainWindow()
     try:
@@ -79,6 +79,7 @@ def test_uv_visible_in_editor_but_never_burned_into_export(tmp_path):
         painter.end()
         assert live.pixelColor(32, 8).alpha() > 0
         assert window._write_export_png(tmp_path / "painted.png")
+        wait_outputs(window)
         with Image.open(tmp_path / "painted.png") as image:
             assert image.getpixel((32, 8)) == (80, 90, 100, 255)
     finally:

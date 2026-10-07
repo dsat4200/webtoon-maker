@@ -306,6 +306,15 @@ class PerformanceMonitorController(QObject):
         preview = getattr(self.window, "preview", None)
         if preview is not None:
             self._patch(preview, "_render_live_preview", "navigator.render")
+            navigator = getattr(preview, '_navigator_jobs', None)
+            if navigator is not None:
+                self._patch(navigator, 'request', 'navigator.request')
+                self._patch(navigator.scheduler, 'poll', 'navigator.publish')
+        scene = getattr(canvas, '_scene_controller', None)
+        if scene is not None:
+            self._patch(scene, 'request', 'scene.request')
+            self._patch(scene.scheduler, 'poll', 'scene.publish')
+            self._patch(canvas._scene_snapshot_compiler, 'capture', 'scene.capture_start')
         for attribute in ("selection_settings", "selection_common", "layer_settings",
                           "modifier_controls", "text_object_controls"):
             control = getattr(self.window, attribute, None)

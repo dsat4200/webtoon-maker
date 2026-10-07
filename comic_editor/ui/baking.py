@@ -1,17 +1,17 @@
 """Transactional, resource-aware flattening and Raster modifier prefix baking."""
-import math
-
-from PySide6.QtCore import QBuffer, QByteArray, QIODevice, QPointF, QRectF
-from PySide6.QtGui import QPainter, QTransform
+from dataclasses import replace
+from PySide6.QtCore import QRectF
+from PySide6.QtGui import QTransform
 
 from comic_editor.core.assets import entity_visual_bounds
 from comic_editor.core.commands import CallbackCommand
+from comic_editor.core.document_patch import DocumentPatch
+from comic_editor.core.changes import ResourceChange
 from comic_editor.core.models import (ChildRef, ImageObject, LayerNode, ArrayModifier, ColorFillGradientObject,
-    MirrorModifier, RasterObject, RadialBlurModifier, TilingModifier, DistortModifier,
+    MirrorModifier, RasterObject, RadialBlurModifier, DistortModifier,
     HalftoneModifier, PixelateModifier)
 from comic_editor.core.effect_geometry import effect_bounds
-from comic_editor.ui.effect_pipeline import aligned, empty_image, render_stages
-from comic_editor.ui.object_blending import suspend_object_blend
+from comic_editor.ui.effect_pipeline import empty_image
 
 
 def subtree(canvas, kind, identifier):
@@ -86,35 +86,47 @@ def visual_bounds(canvas, kind, identifier):
         canvas._active_modifier_instances(target.modifier_ids), mapping))
 
 
-def snapshot(canvas, object_ids):
-    return (canvas.chapter.to_dict(), canvas.images.snapshot(),
-            {identifier: canvas.tiles.object_tiles(identifier) for identifier in object_ids})
+def after_state(canvas, before):
+    from comic_editor.render.bake_sources import BakeState
+    return BakeState(before.model.after(canvas.chapter),
+        {identifier: canvas.images.source(identifier) for identifier in before.images},
+        {identifier: canvas.tiles.object_tiles(identifier) for identifier in before.tiles},
+        {identifier: dict(canvas.tiles._alpha_bounds.get(identifier, {})) for identifier in before.tiles})
 
 
 def commit(canvas, before, after, label, selection_before, selection_after):
-    def restore(state, selection):
-        model, images, tiles = state
-        canvas.replace_chapter(model)
-        canvas.images.restore(images)
-        for identifier, payload in tiles.items():
-            canvas.tiles.replace_object_tiles(identifier, payload)
+    old, new = DocumentPatch.pair(before.model, after.model)
+    forward = canvas._history_change_with_bounds(new.change_set(old, label=label), old, new)
+    resources = []
+    for identifier in before.tiles.keys() | after.tiles.keys():
+        for address in before.tiles.get(identifier, {}).keys() | after.tiles.get(identifier, {}).keys():
+            resources.append(ResourceChange(('object', identifier), 'raster', address))
+    for identifier in before.images.keys() | after.images.keys():
+        if before.images.get(identifier) is not after.images.get(identifier):
+            resources.append(ResourceChange(('object', identifier), 'image'))
+    forward = replace(forward, resources=tuple(resources))
+    def restore(state, patch, selection):
+        canvas.images.apply_patch(state.images)
+        for identifier, payload in state.tiles.items():
+            canvas.tiles.replace_object_tiles(identifier, payload,
+                                             alpha_bounds=state.alpha_bounds.get(identifier))
+        canvas._restore_history_state(patch, document_patch=True)
         if selection:
             canvas.set_selection_set(selection, primary=selection[-1])
-        canvas.hierarchyChanged.emit()
-        canvas.documentChanged.emit(None)
         canvas.update()
     canvas.command_stack.push(CallbackCommand(
-        label, lambda: restore(after, selection_after), lambda: restore(before, selection_before)
+        label, lambda: restore(after, new, selection_after), lambda: restore(before, old, selection_before),
+        forward, forward.reversed(),
     ), already_done=True)
     canvas.active_modifier_id = ""
     canvas.set_selection_set(selection_after, primary=selection_after[-1])
     canvas._compound_path_cache.clear()
-    canvas.hierarchyChanged.emit()
-    canvas.documentChanged.emit(None)
+    canvas._emit_typed_hierarchy_changed(forward)
+    canvas._emit_typed_document_changed(None, forward)
     canvas.update()
 
 
-def rasterize(canvas, kind, identifier):
+def rasterize(canvas, kind, identifier, *, prepared=None):
     reason = rasterize_reason(canvas, kind, identifier)
     if reason:
         raise ValueError(reason)
@@ -126,39 +138,12 @@ def rasterize(canvas, kind, identifier):
     parent_id = target.parent_id if kind == "layer" else target.parent_layer_id
     parent = chapter.layers[parent_id]
     position = next(i for i, ref in enumerate(parent.children) if ref.entity_id == identifier)
-    bounds = aligned(visual_bounds(canvas, kind, identifier))
-    image = empty_image(bounds)
-    mapping = canvas.layer_world_transform(parent_id)
-    inverse, valid = mapping.inverted()
-    if not valid:
-        raise ValueError("Cannot rasterize a singular transform")
-    painter = QPainter(image)
-    painter.setRenderHint(QPainter.Antialiasing, True)
-    painter.translate(-bounds.left(), -bounds.top())
-    painter.setTransform(mapping, True)
-    was_visible, was_mask_only = target.visible, target.mask_only
-    old_references = canvas._rendering_compound_references
-    old_interactive = canvas._interactive_render
-    try:
-        target.visible, target.mask_only = True, False
-        canvas._interactive_render = False
-        canvas._rendering_compound_references = True
-        with canvas.without_solo(), suspend_object_blend(canvas, identifier if kind == "object" else ""):
-            if kind == "layer":
-                canvas._render_layer(painter, target, 1.0, bounds)
-            else:
-                canvas._render_object(painter, target, 1.0, inverse.mapRect(bounds))
-    finally:
-        target.visible, target.mask_only = was_visible, was_mask_only
-        canvas._rendering_compound_references = old_references
-        canvas._interactive_render = old_interactive
-        painter.end()
-    data = QByteArray()
-    buffer = QBuffer(data)
-    buffer.open(QIODevice.WriteOnly)
-    if not image.save(buffer, "PNG"):
-        raise ValueError("Unable to encode the rasterized image")
-    buffer.close()
+    if prepared is None:
+        from comic_editor.render.bake_sources import prepare_rasterize
+        from comic_editor.render.pixels import pixel_scope
+        with pixel_scope(chapter.pixel_contract):
+            prepared = prepare_rasterize(canvas, kind, identifier, image_factory=empty_image)
+    bounds, image = prepared.bounds, prepared.image
     replacement = ImageObject(
         object_id=identifier, parent_layer_id=parent_id, name=target.name,
         custom_name=getattr(target, "custom_name", True), visible=target.visible,
@@ -171,13 +156,18 @@ def rasterize(canvas, kind, identifier):
         source_filename="rasterized.png", source_mime_type="image/png",
         pixel_width=image.width(), pixel_height=image.height(),
         transform_frame=(0, 0, image.width(), image.height()),
-        transform_quad=[inverse.map(point).toTuple() for point in
-                        (bounds.topLeft(), bounds.topRight(), bounds.bottomRight(), bounds.bottomLeft())],
+        transform_quad=list(prepared.placement),
     )
-    before = snapshot(canvas, objects)
+    if prepared.history is None:
+        from comic_editor.render.bake_sources import rasterize_history
+        before = rasterize_history(canvas, kind, identifier)
+    else:
+        before = prepared.history
+    if before.model.document_identity != id(chapter):
+        raise ValueError('The rasterize source belongs to a retired document')
     selection = list(canvas.selected_entities)
     # Decode/validate before removing any graph or resource.
-    canvas.images.put_decoded(identifier, "rasterized.png", bytes(data), image)
+    canvas.images.put_decoded(identifier, "rasterized.png", prepared.encoded, image)
     for member_kind, member_id in members:
         if member_kind == "layer":
             chapter.layers.pop(member_id)
@@ -196,10 +186,10 @@ def rasterize(canvas, kind, identifier):
             mask.contributors = [("object", identifier) if ref == (kind, identifier) else ref for ref in mask.contributors]
             mask.touch()
     chapter._garbage_collect_modifiers()
-    commit(canvas, before, snapshot(canvas, objects), "Rasterize", selection, [("object", identifier)])
+    commit(canvas, before, after_state(canvas, before), "Rasterize", selection, [("object", identifier)])
 
 
-def apply_raster_modifiers(canvas, modifier_id):
+def apply_raster_modifiers(canvas, modifier_id, *, prepared=None):
     chapter = canvas.chapter
     targets = list(canvas.selected_entities)
     if not targets or any(kind != "object" or not isinstance(chapter.objects.get(identifier), RasterObject) for kind, identifier in targets):
@@ -207,53 +197,24 @@ def apply_raster_modifiers(canvas, modifier_id):
     stage = chapter.modifiers.get(modifier_id)
     if stage is None or stage.muted:
         raise ValueError("Unmute the modifier before applying it")
-    prepared = []
     for _, identifier in targets:
-        obj = chapter.objects[identifier]
-        if modifier_id not in obj.modifier_ids:
+        if modifier_id not in chapter.objects[identifier].modifier_ids:
             raise ValueError("The modifier must be attached to every selected Raster")
-        prefix = obj.modifier_ids[:obj.modifier_ids.index(modifier_id) + 1]
-        baked = [mid for mid in prefix if not chapter.modifiers[mid].muted]
-        bounds = canvas.tiles.content_bounds(identifier) or QRectF(*obj.interaction_rect)
-        if obj.modifier_source_frame is not None:
-            bounds = bounds.united(QRectF(*obj.modifier_source_frame))
-        bounds = aligned(bounds)
-        image = empty_image(bounds)
-        painter = QPainter(image)
-        for (x, y), tile in canvas.tiles.iter_tiles(identifier):
-            painter.drawImage(QPointF(x * obj.tile_size, y * obj.tile_size) - bounds.topLeft(), tile)
-        painter.end()
-        tiling = canvas._own_tiling(obj)
-        placement = None
-        if tiling and tiling.modifier_id in baked:
-            world_image, world_bounds = canvas._tiling_stage(obj)
-            world_image, world_bounds = render_stages(canvas, world_image, world_bounds,
-                [chapter.modifiers[mid] for mid in baked if mid != tiling.modifier_id], QTransform(), nearest=True)
-            mapping = canvas.layer_world_transform(obj.parent_layer_id)
-            inverse, valid = mapping.inverted()
-            if not valid:
-                raise ValueError("Cannot apply tiling through a singular drawing transform")
-            # Bake in document pixels to avoid two resamplings through an
-            # existing projective raster transform.
-            image, bounds = world_image, world_bounds
-            placement = [inverse.map(p).toTuple() for p in
-                (bounds.topLeft(), bounds.topRight(), bounds.bottomRight(), bounds.bottomLeft())]
-        else:
-            image, bounds = render_stages(canvas, image, bounds, [chapter.modifiers[mid] for mid in baked], canvas._drawing_local_to_world_transform(obj), nearest=True)
-        tiles = {}
-        size = obj.tile_size
-        for y in range(math.floor(bounds.top() / size), math.ceil(bounds.bottom() / size)):
-            for x in range(math.floor(bounds.left() / size), math.ceil(bounds.right() / size)):
-                tile = empty_image(QRectF(0, 0, size, size))
-                painter = QPainter(tile)
-                painter.drawImage(bounds.topLeft() - QPointF(x * size, y * size), image)
-                painter.end()
-                if canvas.tiles._alpha_bbox(tile) is not None:
-                    tiles[x, y] = tile
-        prepared.append((obj, baked, bounds, tiles, placement))
+    if prepared is None:
+        from comic_editor.render.bake_sources import prepare_raster_modifiers
+        from comic_editor.render.pixels import pixel_scope
+        with pixel_scope(chapter.pixel_contract):
+            prepared = prepare_raster_modifiers(canvas, modifier_id, targets)
     identifiers = {identifier for _, identifier in targets}
-    before = snapshot(canvas, identifiers)
-    for obj, baked, bounds, tiles, placement in prepared:
+    before = getattr(prepared, 'history', None)
+    if before is None:
+        from comic_editor.render.bake_sources import raster_prefix_history
+        before = raster_prefix_history(canvas, modifier_id, targets)
+    if before.model.document_identity != id(chapter):
+        raise ValueError('The modifier source belongs to a retired document')
+    for source in prepared:
+        obj = chapter.objects[source.identifier]
+        baked, bounds, tiles, placement = source.baked, source.bounds, source.tiles, source.placement
         if placement is not None:
             obj.x, obj.y = 0., 0.
             obj.transform_frame = canvas._rect_signature(bounds)
@@ -265,8 +226,52 @@ def apply_raster_modifiers(canvas, modifier_id):
             for mid in obj.modifier_ids
         ):
             obj.modifier_source_frame = canvas._rect_signature(bounds)
-        canvas.tiles.replace_object_tiles(obj.object_id, tiles)
+        canvas.tiles.replace_object_tiles(obj.object_id, tiles, alpha_bounds=source.alpha_bounds)
         obj.modifier_ids = [mid for mid in obj.modifier_ids if mid not in baked]
         obj.interaction_rect = canvas._rect_signature(QRectF(*obj.interaction_rect).united(bounds))
     chapter._garbage_collect_modifiers()
-    commit(canvas, before, snapshot(canvas, identifiers), "Apply modifier prefix", targets, targets)
+    commit(canvas, before, after_state(canvas, before), "Apply modifier prefix", targets, targets)
+
+
+def request_rasterize(canvas, kind, identifier, finished):
+    """Capture incrementally and publish one bake transaction on completion."""
+    from comic_editor.render.bake_sources import rasterized_source
+    from comic_editor.ui.scene_consumers import scene_consumers
+    reason = rasterize_reason(canvas, kind, identifier)
+    if reason:
+        raise ValueError(reason)
+    canvas._commit_text_edit()
+    def accept(source, error):
+        if error is None:
+            try:
+                rasterize(canvas, kind, identifier, prepared=source)
+            except Exception as failure:
+                error = failure
+        finished(error)
+    scene_consumers(canvas).request(('rasterize', kind, identifier), rasterized_source,
+                                   (kind, identifier), accept)
+
+
+def request_apply_raster_modifiers(canvas, modifier_id, finished):
+    from comic_editor.render.bake_sources import applied_raster_sources
+    from comic_editor.ui.scene_consumers import scene_consumers
+    chapter, targets = canvas.chapter, tuple(canvas.selected_entities)
+    if not targets or any(kind != 'object' or not isinstance(chapter.objects.get(identifier), RasterObject)
+                          for kind, identifier in targets):
+        raise ValueError('Apply requires only Raster objects to be selected')
+    stage = chapter.modifiers.get(modifier_id)
+    if stage is None or stage.muted:
+        raise ValueError('Unmute the modifier before applying it')
+    if any(modifier_id not in chapter.objects[identifier].modifier_ids for _, identifier in targets):
+        raise ValueError('The modifier must be attached to every selected Raster')
+    def accept(sources, error):
+        if tuple(canvas.selected_entities) != targets:
+            return
+        if error is None:
+            try:
+                apply_raster_modifiers(canvas, modifier_id, prepared=sources)
+            except Exception as failure:
+                error = failure
+        finished(error)
+    scene_consumers(canvas).request(('apply-raster-prefix', modifier_id), applied_raster_sources,
+                                   (modifier_id, targets), accept)

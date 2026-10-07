@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import time
 
 import numpy as np
 import pytest
@@ -8,6 +9,7 @@ from PySide6.QtCore import QPointF, QRectF, QThreadPool, Qt
 from PySide6.QtGui import (
     QColor, QImage, QPainter, QPainterPath, QPen, QTransform,
 )
+from PySide6.QtTest import QTest
 
 from comic_editor.core.assets import AssetManifest
 from comic_editor.core.commands import CallbackCommand
@@ -24,6 +26,26 @@ from comic_editor.core.tiles import TileStore
 from comic_editor.ui.canvas import CanvasWidget, ToolKind
 from comic_editor.ui.tool_ribbon_pages import ToolSettingsControls
 from comic_editor.ui.tree_model import HierarchyModel
+
+
+def _coherent_frame(canvas):
+    canvas.update()
+    QTest.qWait(5)
+    document = canvas._render_document_state()
+    serial = canvas._scene_controller.serial
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        canvas.grab()
+        preview = canvas._scene_controller.preview
+        if document.live_preview:
+            ready = preview is not None and preview[0] == document and preview[1].key == ('preview', serial)
+        else:
+            ready = not canvas._projection_frame_pending
+        if ready:
+            break
+        QTest.qWait(5)
+    assert ready and not canvas._scene_controller.error
+    return canvas.grab().toImage()
 
 
 def _canvas_with_shape(qapp):
@@ -62,7 +84,7 @@ def test_shape_translation_repaints_child_art_live_and_commits_once(qapp):
     canvas.set_tool(ToolKind.SHAPE_EDIT)
     source = QPointF(160, 150)
     destination = source + QPointF(100, 40)
-    before = canvas.grab().toImage()
+    before = _coherent_frame(canvas)
     source_widget = canvas.document_to_widget(source).toPoint()
     destination_widget = canvas.document_to_widget(destination).toPoint()
     source_color = before.pixelColor(source_widget)
@@ -72,7 +94,7 @@ def test_shape_translation_repaints_child_art_live_and_commits_once(qapp):
     canvas._tool_press(canvas.document_to_widget(QPointF(180, 170)), 1.0)
     canvas._tool_move(canvas.document_to_widget(QPointF(280, 210)), 1.0)
     qapp.processEvents()
-    preview = canvas.grab().toImage()
+    preview = _coherent_frame(canvas)
 
     assert (layer.translate_x, layer.translate_y) == pytest.approx((100, 40))
     assert (raster.x, raster.y) == (0, 0)
@@ -225,11 +247,11 @@ def test_mask_only_raster_reveals_only_for_exact_selection_and_masks(qapp):
     point = canvas.document_to_widget(QPointF(160, 150)).toPoint()
     canvas.set_selection("layer", layer.layer_id)
     qapp.processEvents()
-    hidden_color = canvas.grab().toImage().pixelColor(point)
+    hidden_color = _coherent_frame(canvas).pixelColor(point)
 
     canvas.set_selection("object", raster.object_id)
     qapp.processEvents()
-    assert canvas.grab().toImage().pixelColor(point) != hidden_color
+    assert _coherent_frame(canvas).pixelColor(point) != hidden_color
     thumbnail = canvas.render_asset_thumbnail(
         AssetManifest(
             root_kind="object", root_id=raster.object_id,
@@ -251,13 +273,13 @@ def test_mask_only_raster_reveals_only_for_exact_selection_and_masks(qapp):
 
     canvas.set_selection("layer", layer.layer_id)
     qapp.processEvents()
-    assert canvas.grab().toImage().pixelColor(point) == hidden_color
+    assert _coherent_frame(canvas).pixelColor(point) == hidden_color
 
     canvas.set_selection("object", raster.object_id)
     raster.visible = False
     canvas._invalidate_scene_cache()
     qapp.processEvents()
-    assert canvas.grab().toImage().pixelColor(point) == hidden_color
+    assert _coherent_frame(canvas).pixelColor(point) == hidden_color
     field = canvas.render_tone_mask_field(
         mask.mask_id, 720, 600, QTransform(), QRectF(0, 0, 720, 600),
     )
@@ -500,8 +522,11 @@ def test_large_fill_selection_is_atomic_and_tool_change_cancels(qapp):
 
     canvas.set_tool(ToolKind.FILL)
     assert canvas.fill_active_selection()
-    assert QThreadPool.globalInstance().waitForDone(5000)
-    qapp.processEvents()
+    deadline = time.monotonic() + 5
+    while canvas._fill_job_cancel is not None and time.monotonic() < deadline:
+        qapp.processEvents()
+        time.sleep(.002)
+    assert canvas._fill_job_cancel is None and canvas._fill_job_error is None
     assert tiles.object_tiles(raster.object_id)
     assert len(canvas.command_stack._undo) == 1
 

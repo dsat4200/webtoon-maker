@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 import pytest
 from PySide6.QtCore import QEvent, QPointF, QRectF, Qt
 from PySide6.QtGui import (
@@ -106,12 +107,25 @@ def test_raster_selection_transform_renders_live_without_mutating_tiles(qapp):
     canvas.show()
     qapp.processEvents()
 
-    # Opening native projection may finish outlined source work asynchronously.
-    for _ in range(200):
-        if canvas._projection_completed_view is not None:
+    # A retained selection is an explicit provisional scene. Wait for its
+    # current document and request serial before comparing native pixels.
+    canvas.grab()
+    initial_document = canvas._render_document_state()
+    initial_serial = canvas._scene_controller.serial
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline:
+        resource = canvas._scene_controller.preview
+        if ((resource is not None and resource[0] == initial_document and resource[1].key == ("preview", initial_serial))
+                if initial_document.live_preview else not canvas._projection_frame_pending):
             break
         QTest.qWait(10)
-    assert canvas._projection_completed_view is not None
+        canvas.grab()
+    assert not canvas._scene_controller.error
+    resource = canvas._scene_controller.preview
+    if initial_document.live_preview:
+        assert resource is not None and resource[0] == initial_document and resource[1].key == ("preview", initial_serial)
+    else:
+        assert not canvas._projection_frame_pending
 
     source = QPointF(180, 180)
     destination = source + QPointF(120, 0)
@@ -138,6 +152,19 @@ def test_raster_selection_transform_renders_live_without_mutating_tiles(qapp):
     )
     qapp.processEvents()
     preview = canvas.grab().toImage()
+    document = canvas._render_document_state()
+    serial = canvas._scene_controller.serial
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline:
+        resource = canvas._scene_controller.preview
+        if resource is not None and resource[0] == document and resource[1].key == ("preview", serial):
+            break
+        QTest.qWait(5)
+        preview = canvas.grab().toImage()
+    assert not canvas._scene_controller.error
+    resource = canvas._scene_controller.preview
+    assert resource is not None and resource[0] == document and resource[1].key == ("preview", serial)
+    preview = canvas.grab().toImage()
 
     assert chapter.to_dict() == before_model
     assert {
@@ -153,11 +180,30 @@ def test_raster_selection_transform_renders_live_without_mutating_tiles(qapp):
     ])
 
     canvas._tool_release()
-    committed = canvas.grab().toImage()
+    def current_capture():
+        result = canvas.grab().toImage()
+        current = canvas._render_document_state()
+        expected_serial = canvas._scene_controller.serial
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            item = canvas._scene_controller.preview
+            ready = (item is not None and item[0] == current and item[1].key == ("preview", expected_serial)) if current.live_preview else not canvas._projection_frame_pending
+            if ready:
+                break
+            QTest.qWait(5)
+            result = canvas.grab().toImage()
+        assert not canvas._scene_controller.error
+        if current.live_preview:
+            item = canvas._scene_controller.preview
+            assert item is not None and item[0] == current and item[1].key == ("preview", expected_serial)
+        else:
+            assert not canvas._projection_frame_pending
+        return canvas.grab().toImage()
+    committed = current_capture()
     assert committed.pixelColor(source_widget) == destination_color
     assert committed.pixelColor(destination_widget) == source_color
     canvas.command_stack.undo()
-    restored = canvas.grab().toImage()
+    restored = current_capture()
     assert restored.pixelColor(source_widget) == source_color
     assert restored.pixelColor(destination_widget) == destination_color
 
@@ -928,6 +974,11 @@ def test_eyedropper_samples_normal_compositor_without_overlays(qapp):
     canvas._tool_press(pointer, 1.0)
     assert canvas._eyedropper_sampling
     assert canvas._eyedropper_widget_point == pointer
+    import time
+    deadline = time.monotonic()+15
+    while not canvas._eyedropper_last_color and time.monotonic() < deadline:
+        qapp.processEvents()
+        time.sleep(.002)
     assert canvas._eyedropper_last_color == "#FF336699"
     moved = pointer + QPointF(9, 7)
     canvas._tool_move(moved, 1.0)

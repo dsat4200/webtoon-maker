@@ -58,7 +58,7 @@ def test_extension_manifest_declares_supported_blender_windows_and_io_permission
     )
     assert manifest["schema_version"] == "1.0.0"
     assert manifest["id"] == "webtoon_comic_views"
-    assert manifest["version"] == "0.8.0"
+    assert manifest["version"] == "0.8.1"
     assert manifest["blender_version_min"] == "4.5.0"
     assert manifest["platforms"] == ["windows-x64"]
     assert "network" in manifest["permissions"]
@@ -68,6 +68,7 @@ def test_extension_manifest_declares_supported_blender_windows_and_io_permission
 @pytest.mark.parametrize("probe,marker", [
     ("_blender_comic_views_probe.py", "WEBTOON_COMIC_VIEWS_PROBE_OK"),
     ("_blender_action_slots_probe.py", "WEBTOON_ACTION_SLOTS_PROBE_OK"),
+    ("_blender_comic_regressions_probe.py", "WEBTOON_COMIC_REGRESSIONS_PROBE_OK"),
     ("_blender_bake_bookkeeping_probe.py", "WEBTOON_BAKE_BOOKKEEPING_PROBE_OK"),
     ("_blender_thumbnails_probe.py", "WEBTOON_THUMBNAILS_PROBE_OK"),
     ("_blender_textures_probe.py", "WEBTOON_TEXTURES_PROBE_OK"),

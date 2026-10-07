@@ -114,7 +114,7 @@ def test_each_tab_restores_its_selection_without_editing_history(editor, kind):
     for tab, project in enumerate(projects):
         window.project_tabs.setCurrentIndex(tab)
         _select(window, project, kind, tab)
-        assert window.save()
+        assert window.save(wait=True)
         saved.append((_selection(window.canvas), window.canvas.command_stack.revision))
     for tab in (0, 1, 0, 1):
         window.project_tabs.setCurrentIndex(tab)
@@ -227,16 +227,16 @@ def test_cut_saved_selection_stays_deleted_after_save_and_reopen(editor):
     window, projects = editor
     _select(window, projects[0], "raster")
     assert window._cut_drawing_selection()
-    assert window.save()
+    assert window.save(wait=True)
     _, loaded = projects[0].repository.load_chapter(projects[0].chapter_id)
     assert loaded.tile(projects[0].raster_id, (0, 0)) is None
     assert loaded.tile(projects[0].raster_id, (1, 0)) is not None
     window.canvas.command_stack.undo()
-    assert window.save()
+    assert window.save(wait=True)
     _, loaded = projects[0].repository.load_chapter(projects[0].chapter_id)
     assert loaded.tile(projects[0].raster_id, (0, 0)) is not None
     window.canvas.command_stack.redo()
-    assert window.save()
+    assert window.save(wait=True)
     _, loaded = projects[0].repository.load_chapter(projects[0].chapter_id)
     assert loaded.tile(projects[0].raster_id, (0, 0)) is None
 
@@ -258,10 +258,10 @@ def test_new_chapter_and_empty_canvas_have_no_previous_drawing_selection(editor)
     assert not canvas._selected_vector_point_ids
 
 
-def test_failed_chapter_switch_preserves_current_canvas_and_export_name(editor, monkeypatch):
+def test_failed_chapter_switch_preserves_current_canvas_and_export_name(editor, monkeypatch, wait_outputs):
     window, projects = editor
     _select(window, projects[0], "raster")
-    assert window.save()
+    assert window.save(wait=True)
     before = _selection(window.canvas)
     chapter, session, stack = window.chapter, window.active_session, window.canvas.command_stack
     revision = stack.revision
@@ -284,6 +284,7 @@ def test_failed_chapter_switch_preserves_current_canvas_and_export_name(editor, 
     # Keep export cheap while exercising its naming and publication path.
     monkeypatch.setattr(window.canvas, "render_preview", lambda image: image.fill(QColor("white")))
     window._export_png()
+    wait_outputs(window)
     assert len(list((window.repository.root / "exports").glob("First-*.png"))) == 1
 
 
@@ -295,8 +296,8 @@ def test_failed_manual_save_keeps_session_dirty(editor, monkeypatch):
     def fail_save(*args, **kwargs):
         raise OSError("Disk unavailable")
 
-    monkeypatch.setattr(window.repository, "save_chapter", fail_save)
-    assert not window.save()
+    monkeypatch.setattr(SeriesRepository, "save_chapter", fail_save)
+    assert not window.save(wait=True)
     assert window._dirty and window.active_session.dirty
 
 

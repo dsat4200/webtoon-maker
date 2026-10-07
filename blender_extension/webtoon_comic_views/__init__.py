@@ -249,6 +249,9 @@ class WEBTOON_OT_new_comic_view(Operator):
         scene = context.scene
         _ensure_project_uuid(scene)
         views = _views(scene)
+        previous = bridge.RUNTIME._active_view(scene)
+        previous_uuid = previous.view_uuid if previous is not None else ""
+        previous_loaded_uuid = _settings(scene).loaded_view_uuid
         view = views.add()
         view.view_uuid = uuid.uuid4().hex
         view.name = f"Comic View {len(views)}"
@@ -271,6 +274,11 @@ class WEBTOON_OT_new_comic_view(Operator):
             _settings(scene).loaded_view_uuid = view.view_uuid
         except Exception as error:
             views.remove(len(views) - 1)
+            _settings(scene).loaded_view_uuid = previous_loaded_uuid
+            if previous_uuid:
+                _select_index(scene, previous_uuid)
+            else:
+                _settings(scene).active_index = -1
             _operator_failed(self, "Create Comic View", error)
             return {"CANCELLED"}
         _report_warnings(self, warnings)
@@ -897,6 +905,10 @@ def _initialize_scenes() -> bool:
                 except (TypeError, ValueError):
                     pass
         settings = scene.webtoon_comic_settings
+        if not 0 <= int(settings.active_index) < len(scene.webtoon_comic_views):
+            # Recover selection left behind by older failed New operations
+            # without loading a snapshot over the user's working state.
+            _select_index(scene, settings.loaded_view_uuid)
         if not settings.loaded_view_uuid:
             index = int(settings.active_index)
             if 0 <= index < len(scene.webtoon_comic_views):

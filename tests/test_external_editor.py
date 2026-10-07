@@ -39,7 +39,7 @@ def make_image(path, size=(37, 23), color=(17, 83, 191, 128)):
     return path
 
 
-def test_open_image_creates_native_project_and_export_preserves_rgba(editor, tmp_path):
+def test_open_image_creates_native_project_and_export_preserves_rgba(editor, tmp_path, wait_outputs):
     path = make_image(tmp_path / "Blender texture ü & 100%.png")
     original = path.read_bytes()
     assert editor.open_path(path)
@@ -52,6 +52,7 @@ def test_open_image_creates_native_project_and_export_preserves_rgba(editor, tmp
     assert len(editor.chapter.objects) == 1
     assert (path.with_suffix("") / "series.json").is_file()
     editor._export_again()
+    wait_outputs(editor)
     with Image.open(path) as result:
         assert result.size == (37, 23)
         assert result.mode == "RGBA"
@@ -73,7 +74,7 @@ def test_repeat_open_keeps_unsaved_edits_then_reopens_saved_layers(editor, tmp_p
     assert editor._dirty
     assert obj.object_id in editor.chapter.objects
     assert editor.project_tabs.count() == 1
-    assert editor.save()
+    assert editor.save(wait=True)
     editor._close_project_tab(0)
     assert editor.open_path(path)
     assert obj.object_id in editor.chapter.objects
@@ -84,10 +85,11 @@ def test_repeat_open_keeps_unsaved_edits_then_reopens_saved_layers(editor, tmp_p
     (".jpg", "JPEG"), (".jpeg", "JPEG"), (".bmp", "BMP"),
     (".tif", "TIFF"), (".tiff", "TIFF"), (".tga", "TGA"), (".webp", "WEBP"),
 ])
-def test_export_again_uses_original_format(editor, tmp_path, suffix, format):
+def test_export_again_uses_original_format(editor, tmp_path, suffix, format, wait_outputs):
     path = make_image(tmp_path / ("texture" + suffix))
     assert editor.open_path(path)
     editor._export_again()
+    wait_outputs(editor)
     with Image.open(path) as result:
         assert result.format == format
         assert result.size == (37, 23)
@@ -95,18 +97,19 @@ def test_export_again_uses_original_format(editor, tmp_path, suffix, format):
     assert not path.with_suffix(".png").exists()
 
 
-def test_export_applies_edits_and_saved_project_remembers_destination(editor, tmp_path):
+def test_export_applies_edits_and_saved_project_remembers_destination(editor, tmp_path, wait_outputs):
     path = make_image(tmp_path / "paint.png")
     assert editor.open_path(path)
     page = editor.chapter.layers[editor.chapter.root_page_ids[0]]
     obj = editor.chapter.add_object(page.layer_id, RasterObject(), index=0)
     editor.canvas.tiles.paint_dab(obj.object_id, QPointF(2, 2), 5, QColor("red"), square=True, antialias=False)
-    assert editor.save()
+    assert editor.save(wait=True)
     root = editor.repository.root
     editor._close_project_tab(0)
     assert editor.open_path(root / "series.json")
     editor.settings.export_destinations.clear()
     editor._export_again()
+    wait_outputs(editor)
     with Image.open(path) as result:
         assert result.getpixel((2, 2)) == (255, 0, 0, 255)
         assert result.size == (37, 23)

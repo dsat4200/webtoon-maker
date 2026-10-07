@@ -2,8 +2,10 @@ from pathlib import Path
 
 import pytest
 import json
+import time
+import threading
 
-from PySide6.QtCore import QMimeData, QPointF, Qt
+from PySide6.QtCore import QCoreApplication, QMimeData, QPointF, QThread, Qt
 from PySide6.QtGui import QColor, QImage, QPainter
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QInputDialog, QMessageBox
@@ -78,10 +80,23 @@ def _window_with_asset(tmp_path, name="Hero"):
 
 
 def _dispose_window(window):
+    jobs = getattr(window, '_asset_copy_jobs', None)
+    if jobs is not None:
+        jobs.drain()
+        jobs.shutdown()
+        jobs.executor.shutdown(wait=True)
     for session in window.sessions.values():
         session.dirty = False
     window._dirty = False
     window.deleteLater()
+
+
+def _wait_asset_copy(window):
+    deadline = time.monotonic()+30
+    while getattr(window, '_asset_copy_jobs', None) is not None and window._asset_copy_jobs.busy:
+        QCoreApplication.processEvents()
+        time.sleep(.002)
+        assert time.monotonic() < deadline
 
 
 def test_asset_documents_allow_fitted_width_and_old_docs_default_to_chapter():
@@ -247,7 +262,7 @@ def test_copy_as_asset_reloads_clean_active_asset_tab_and_clears_undo(
         root.name = "Edited asset"
         window.canvas.push_model_change(before, window.chapter.to_dict(), "Edit asset")
         assert window.canvas.command_stack.can_undo
-        assert window.save()
+        assert window.save(wait=True)
         assert not session.dirty
 
         monkeypatch.setattr(
@@ -259,6 +274,7 @@ def test_copy_as_asset_reloads_clean_active_asset_tab_and_clears_undo(
         window._copy_selected_as_asset(
             session.asset_manifest.root_kind, session.asset_manifest.root_id
         )
+        _wait_asset_copy(window)
 
         assert session is window.active_session
         assert session.asset_manifest.asset_id == existing.asset_id
@@ -311,6 +327,7 @@ def test_copy_as_asset_dirty_tab_requires_discard_before_replacement(
 
         answers.extend([QMessageBox.Yes, QMessageBox.Yes])
         window._copy_selected_as_asset("layer", source.layer_id)
+        _wait_asset_copy(window)
 
         assert window._tab_index_for_key(asset_session.key) == asset_tab
         assert asset_session.asset_manifest.asset_id == existing.asset_id
@@ -345,7 +362,7 @@ def test_copy_as_asset_replace_error_preserves_existing_asset(
             QMessageBox, "question", lambda *args, **kwargs: QMessageBox.Yes
         )
         monkeypatch.setattr(
-            assets, "replace",
+            AssetRepository, "replace",
             lambda *args, **kwargs: (_ for _ in ()).throw(OSError("disk full")),
         )
         monkeypatch.setattr(
@@ -354,6 +371,7 @@ def test_copy_as_asset_replace_error_preserves_existing_asset(
         )
 
         window._copy_selected_as_asset("layer", source.layer_id)
+        _wait_asset_copy(window)
 
         after, _tiles = assets.load(existing.asset_id)
         assert after.to_dict() == before.to_dict()
@@ -466,7 +484,7 @@ def test_asset_tab_hides_container_and_save_refreshes_thumbnail(qapp, tmp_path):
         assert window.ribbon.is_page_visible("asset_library")
         window.chapter.layers[manifest.root_id].name = "Edited"
         window._mark_dirty(None)
-        assert window.save()
+        assert window.save(wait=True)
         assert window.active_session.context.assets.thumbnail_path(
             manifest.asset_id
         ).is_file()

@@ -5,9 +5,9 @@ Child artwork is rendered normally through the resulting compound clipping path.
 """
 from dataclasses import dataclass
 import numpy as np
-from scipy.spatial import cKDTree
 from PySide6.QtCore import QPointF, Qt
 from PySide6.QtGui import QColor, QPainter, QPainterPath
+from comic_editor.render.pixels import working_color
 
 from comic_editor.core.models import (
     BoundGeometry, PathContour, PathNode, StrokeModifier, DotDashModifier,
@@ -79,6 +79,7 @@ def _outline_styles(bound, loops):
                 enabled.append(first.outline_enabled)
     if not samples:
         return [(np.ones(len(loop.points)), np.ones(len(loop.points), dtype=bool)) for loop in loops]
+    from scipy.spatial import cKDTree
     tree = cKDTree(samples)
     widths, enabled = np.asarray(widths), np.asarray(enabled)
     return [(widths[indexes], enabled[indexes]) for loop in loops
@@ -237,7 +238,7 @@ def paint_outline(canvas, painter, layer, path, sources, tolerance=.125):
         if value is not None and (value.dots or any(np.any(opacity < 1) for opacity in value.opacity)):
             modified[index] = value
     ordinary = tuple(index for index in range(len(sources)) if index not in modified)
-    color = QColor(layer.border_color)
+    color = working_color(layer.border_color)
     indices = (*ordinary, -1)
     # A short final boundary can still produce hundreds of overlapping pieces
     # from a curved/tapered contributor. Qt's geometric clip can lose the inner

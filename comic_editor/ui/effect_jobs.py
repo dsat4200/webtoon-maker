@@ -226,7 +226,14 @@ class EffectJobs(QObject):
         # Contexts carry immutable render policy, never the live canvas. Each
         # admitted request owns a separate context, including when it queues.
         context = copy_context()
-        detached_compute = lambda cancelled: context.run(compute, cancelled)
+        def admitted_compute(cancelled):
+            from comic_editor.render.admission import RENDER_ADMISSION, WorkCancelled
+            try:
+                with RENDER_ADMISSION.reserve("effect", size, priority=0, cancelled=cancelled):
+                    return compute(cancelled)
+            except WorkCancelled:
+                return None
+        detached_compute = lambda cancelled: context.run(admitted_compute, cancelled)
         self.pending[scope] = (scope, key, Event(), detached_compute, size, require_exact)
         self._start()
         self.timer.start()
@@ -332,4 +339,30 @@ class EffectJobs(QObject):
         for job in self._running.values():
             job[2].set()
         if not self._running:
+            self.timer.stop()
+
+    def cancel_scopes(self, refs):
+        """Cancel only work whose explicit entity scope was changed by history.
+
+        Retained images keep their semantic keys, so unaffected and historical
+        exact results can remain warm. Unknown scopes are retired conservatively.
+        """
+        refs = frozenset(refs)
+        def changed(scope):
+            if isinstance(scope, tuple):
+                if len(scope) >= 2 and isinstance(scope[0], str) and isinstance(scope[1], str) and scope[:2] in refs:
+                    return True
+                if len(scope) >= 2 and isinstance(scope[0], str) and scope[0] in {"layer", "object", "mask", "modifier"}:
+                    return False
+                if scope and scope[0] == "output" and len(scope) > 1:
+                    return changed(scope[1])
+            return True
+        for mapping in (self.pending, self.waiting, self.exact_failures):
+            for scope in tuple(mapping):
+                if changed(scope):
+                    mapping.pop(scope, None)
+        for job in self._running.values():
+            if changed(job[0]):
+                job[2].set()
+        if not self._running and not self.pending:
             self.timer.stop()

@@ -1,8 +1,9 @@
 """Wand sampling isolates chosen artwork without changing the editor view."""
 from contextlib import contextmanager
+import time
 
 import pytest
-from PySide6.QtCore import QPointF, QRectF, Qt
+from PySide6.QtCore import QCoreApplication, QPointF, QRectF, Qt
 from PySide6.QtGui import QColor, QImage, QPainter, QTransform
 
 from comic_editor.core.models import (
@@ -160,6 +161,11 @@ def test_actual_wand_toggle_ignores_barrier_for_selected_modifier_mask(scene, co
     def click_and_read():
         canvas._mask_wand_press(QPointF(20, 30), Qt.NoModifier)
         assert getattr(canvas, "_mask_wand_sample_entities", None) is None
+        deadline = time.monotonic() + 10
+        while canvas._scene_consumers.contains(('mask-wand',)) and time.monotonic() < deadline:
+            QCoreApplication.processEvents()
+            time.sleep(.002)
+        assert not canvas._scene_consumers.contains(('mask-wand',))
         return canvas.render_tone_mask_field(mask.mask_id, 128, 96,
             QTransform(), QRectF(0, 0, 128, 96))
 

@@ -10,6 +10,8 @@ from PySide6.QtWidgets import (
 )
 
 from comic_editor.core.models import GridSettings
+from comic_editor.core.document_patch import RecordSnapshot
+from comic_editor.ui.record_edits import commit_records, preview_records
 from comic_editor.ui.show_on_top_controls import set_show_on_top
 
 
@@ -377,6 +379,16 @@ class LayerSettingsPanel(QGroupBox):
         self.grid_divisions.setEnabled(layer.grid_override is not None)
         self._updating = False
 
+    def _appearance_snapshot(self):
+        chapter = self.canvas.chapter
+        layer = chapter.layers[self.canvas.active_layer_id]
+        children = [child.entity_id for child in layer.children
+                    if child.kind == 'object' and chapter.objects[child.entity_id].opacity_locked]
+        return RecordSnapshot.capture(chapter, layers=[layer.layer_id], objects=children,
+            attributes={'layers': ('name', 'visible', 'ignore_parent_mask', 'opacity',
+                'shape_style', 'compound_enabled', 'compound_operation', 'grid_override',
+                'text_transform_behavior'), 'objects': ('opacity',)})
+
     def _text_behavior_changed(self):
         if self._updating or self.canvas.chapter is None:
             return
@@ -384,12 +396,11 @@ class LayerSettingsPanel(QGroupBox):
         if layer is None or layer.layer_kind != "text_container":
             return
         self.canvas.commit_active_text_edit()
-        before = self.canvas.chapter.to_dict()
+        before = self._appearance_snapshot()
         layer.text_transform_behavior = self.text_behavior.currentData()
-        after = self.canvas.chapter.to_dict()
+        after = before.after(self.canvas.chapter)
         if before != after:
-            self.canvas.push_model_change(before, after, "Change text container transform behavior")
-            self.canvas.documentChanged.emit(None)
+            commit_records(self.canvas, before, "Change text container transform behavior")
             self.changed.emit()
             self.canvas.update()
 
@@ -425,7 +436,7 @@ class LayerSettingsPanel(QGroupBox):
     def _begin_thickness_drag(self) -> None:
         if self._updating or self.canvas.chapter is None:
             return
-        self._thickness_drag_before = self.canvas.chapter.to_dict()
+        self._thickness_drag_before = self._appearance_snapshot()
 
     def _finish_thickness_drag(self) -> None:
         before, self._thickness_drag_before = (
@@ -433,11 +444,9 @@ class LayerSettingsPanel(QGroupBox):
         )
         if before is None or self.canvas.chapter is None:
             return
-        after = self.canvas.chapter.to_dict()
+        after = before.after(self.canvas.chapter)
         if before != after:
-            self.canvas.push_model_change(
-                before, after, "Edit layer settings"
-            )
+            commit_records(self.canvas, before, "Edit layer settings", hierarchy=True)
 
     def _show_on_top_changed(self, enabled: bool) -> None:
         if not self._updating:
@@ -450,7 +459,7 @@ class LayerSettingsPanel(QGroupBox):
         layer = chapter.layers.get(self.canvas.active_layer_id)
         if layer is None:
             return
-        before = chapter.to_dict()
+        before = self._appearance_snapshot()
         grid_before = (
             layer.grid_override.to_dict()
             if layer.grid_override is not None else None
@@ -491,14 +500,13 @@ class LayerSettingsPanel(QGroupBox):
             layer.grid_override.to_dict()
             if layer.grid_override is not None else None
         )
-        after = chapter.to_dict()
+        after = before.after(chapter)
         if before != after:
             if push_undo:
-                self.canvas.push_model_change(
-                    before, after, "Edit layer settings"
-                )
-            self.canvas.documentChanged.emit(None)
-            self.canvas.hierarchyChanged.emit()
+                commit_records(self.canvas, before, "Edit layer settings", hierarchy=True)
+            else:
+                preview_records(self.canvas, before, 'Layer appearance preview')
+                self.canvas._emit_typed_hierarchy_changed(self.canvas._last_published_change)
             self.changed.emit()
         if grid_before != grid_after:
             self.canvas.refresh_grid_settings()

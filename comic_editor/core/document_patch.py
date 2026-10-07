@@ -4,6 +4,7 @@ import copy
 
 from .models import GridSettings, LayerNode, ToneMask, modifier_from_dict, object_from_dict
 from .pixel_contract import PixelContract
+from .changes import ChangeSet, EntityChange, GROUP_KINDS, OrderChange
 
 
 FACTORIES = {'layers': LayerNode.from_dict, 'objects': object_from_dict,
@@ -117,7 +118,49 @@ class DocumentPatch:
     def empty(self):
         return not (self.records or self.scalars or self.orders)
 
-    def apply(self, chapter):
+    def change_set(self, previous=None, *, transient=False, label="", bounds=None):
+        """Describe this patch without serializing any live chapter records.
+
+        Passing its paired opposite patch gives precise fields for forward and
+        undo edits, including explicit additions/removals. Bounds come from the
+        renderer's owning-thread influence resolver, not guessed record frames.
+        """
+        changes = []
+        for group, records in self.records.items():
+            for identifier, payload in records.items():
+                old = previous.records.get(group, {}).get(identifier) if previous is not None else None
+                if payload is None or old is None:
+                    fields = frozenset({"*"})
+                    structural = True
+                else:
+                    fields = frozenset(name for name in old.keys() | payload.keys()
+                                       if old.get(name) != payload.get(name))
+                    structural = bool(fields & {"children", "parent_id", "parent_layer_id", "type"})
+                if fields:
+                    changes.append(EntityChange((GROUP_KINDS[group], identifier), fields, structural=structural))
+        change = ChangeSet(tuple(changes), document_fields=frozenset(self.scalars),
+                           transient=transient, label=label,
+                           orders=tuple(OrderChange(group, previous.orders.get(group, ()) if previous is not None else (), ids)
+                                        for group, ids in self.orders.items()))
+        return change.with_bounds(bounds) if bounds is not None else change
+
+    def view(self, chapter):
+        """Resolve historical influence against detached changed records only.
+
+        Untouched records are read-only shared references. Unlike restore this
+        must not normalize the live graph through chapter.validate().
+        """
+        result = copy.copy(chapter)
+        for group in FACTORIES:
+            collection = dict(getattr(chapter, group))
+            for identifier in self.records.get(group, {}):
+                if identifier in collection:
+                    collection[identifier] = copy.copy(collection[identifier])
+            setattr(result, group, collection)
+        self.apply(result, validate=False)
+        return result
+
+    def apply(self, chapter, *, validate=True):
         for group, records in self.records.items():
             collection = getattr(chapter, group)
             for identifier, payload in records.items():
@@ -156,4 +199,5 @@ class DocumentPatch:
                 chapter.export_rect = tuple(value) if value is not None else None
             else:
                 setattr(chapter, key, value)
-        chapter.validate()
+        if validate:
+            chapter.validate()

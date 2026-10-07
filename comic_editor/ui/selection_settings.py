@@ -14,6 +14,9 @@ from comic_editor.core.models import (
 )
 from comic_editor.core.blend_modes import OBJECT_BLEND_MODES, BLEND_MODE_HELP
 from comic_editor.core.commands import CallbackCommand
+from comic_editor.core.changes import ChangeSet, EntityChange
+from comic_editor.core.document_patch import RecordSnapshot
+from comic_editor.ui.record_edits import commit_records, preview_records, selected_snapshot
 from comic_editor.ui.layer_settings import LayerSettingsPanel
 from comic_editor.ui.tool_ribbon_pages import RasterObjectControls
 from comic_editor.ui.icons import iconoir
@@ -264,6 +267,12 @@ class SelectionCommonControls(QWidget):
             self.opacity_value.setText("—")
         self._updating = False
 
+    def _appearance_snapshot(self):
+        return selected_snapshot(self.canvas, layer_opacity=True, attributes={
+            'layers': ('visible', 'mask_only', 'opacity', 'opacity_mask'),
+            'objects': ('visible', 'mask_only', 'opacity', 'opacity_mask', 'opacity_locked'),
+        })
+
     def _mask_context(self):
         target = self._selected()
         if (
@@ -309,15 +318,14 @@ class SelectionCommonControls(QWidget):
         if target is None or binding is None or self._updating:
             return
         if self._opacity_before is None:
-            self._opacity_before = self.canvas.chapter.to_dict()
+            self._opacity_before = self._appearance_snapshot()
+        live_before = self._appearance_snapshot()
         binding.black_value = float(black) / 100.0
         binding.white_value = float(white) / 100.0
         target.opacity = binding.white_value
         if hasattr(target, "opacity_locked"):
             target.opacity_locked = False
-        self.canvas._invalidate_scene_cache()
-        self.canvas.documentChanged.emit(None)
-        self.canvas.update()
+        preview_records(self.canvas, live_before)
         if commit:
             self._finish_opacity_drag()
 
@@ -397,7 +405,7 @@ class SelectionCommonControls(QWidget):
         entities = self._selected_entities()
         if not entities:
             return
-        before = self.canvas.chapter.to_dict()
+        before = self._appearance_snapshot()
         for _, _, ent in entities:
             if bool(getattr(ent, "is_page", False)):
                 continue
@@ -417,7 +425,7 @@ class SelectionCommonControls(QWidget):
             entities = self._selected_entities()
             if not entities:
                 return
-        before = self.canvas.chapter.to_dict()
+        before = self._appearance_snapshot()
         for _, _, ent in entities:
             ent.visible = bool(checked)
         self._update_visibility_button(bool(checked), count=len(entities) if len(entities) > 1 else None)
@@ -435,7 +443,7 @@ class SelectionCommonControls(QWidget):
         target = self._selected()
         if target is not None:
             self._commit_text(target)
-        before = self.canvas.chapter.to_dict()
+        before = self._appearance_snapshot()
         for _, _, ent in lockable:
             ent.opacity_locked = bool(checked)
             if ent.opacity_locked:
@@ -453,7 +461,7 @@ class SelectionCommonControls(QWidget):
         target = self._selected()
         if target is None:
             return
-        self._opacity_before = self.canvas.chapter.to_dict()
+        self._opacity_before = self._appearance_snapshot()
         self._opacity_start_value = int(self.opacity.value())
 
     def _opacity_changed(self, value: int) -> None:
@@ -468,10 +476,11 @@ class SelectionCommonControls(QWidget):
             target = self._selected()
             if target is None:
                 return
-            before = self.canvas.chapter.to_dict()
+            before = self._appearance_snapshot()
             self._opacity_before = before
         else:
             before = None
+        live_before = self._appearance_snapshot()
         if bool(getattr(target, "opacity_locked", False)):
             target.opacity = self._opacity_start_value / 100.0
             target.opacity_locked = False
@@ -481,8 +490,7 @@ class SelectionCommonControls(QWidget):
             )
         else:
             target.opacity = value / 100.0
-        self.canvas.documentChanged.emit(None)
-        self.canvas.update()
+        preview_records(self.canvas, live_before)
         if before is not None and self._opacity_before is None:
             self._push(before, "Change opacity")
 
@@ -492,18 +500,9 @@ class SelectionCommonControls(QWidget):
             self._push(before, "Change opacity")
         self.refresh()
 
-    def _push(
-        self, before: dict, label: str, *, hierarchy: bool = False,
-    ) -> None:
-        after = self.canvas.chapter.to_dict()
-        if before == after:
-            return
-        self.canvas.push_model_change(before, after, label)
-        if hierarchy:
-            self.canvas.hierarchyChanged.emit()
-        self.canvas.documentChanged.emit(None)
-        self.canvas.update()
-        self.changed.emit()
+    def _push(self, before, label: str, *, hierarchy: bool = False) -> None:
+        if commit_records(self.canvas, before, label, hierarchy=hierarchy):
+            self.changed.emit()
 
 
 class VectorObjectSettings(QWidget):
@@ -591,7 +590,7 @@ class VectorObjectSettings(QWidget):
         target = self._selected()
         if self._updating or target is None:
             return
-        before = self.canvas.chapter.to_dict()
+        before = RecordSnapshot.capture(self.canvas.chapter, objects=[self.canvas.selected_id], attributes={'objects': ('name', 'ignore_parent_mask', 'underlay_opacity')})
         target.name = self.name.text().strip() or target.name
         if isinstance(target, VectorDrawingObject):
             target.ignore_parent_mask = self.ignore_parent_mask.isChecked()
@@ -601,7 +600,7 @@ class VectorObjectSettings(QWidget):
         if not self._updating and isinstance(
             self._selected(), VectorDrawingObject
         ):
-            self._underlay_before = self.canvas.chapter.to_dict()
+            self._underlay_before = RecordSnapshot.capture(self.canvas.chapter, objects=[self.canvas.selected_id], attributes={'objects': ('name', 'ignore_parent_mask', 'underlay_opacity')})
 
     def _underlay_changed(self, value: int) -> None:
         self.underlay_value.setText(f"{int(value)}%")
@@ -610,11 +609,11 @@ class VectorObjectSettings(QWidget):
             return
         before = (
             None if self._underlay_before is not None
-            else self.canvas.chapter.to_dict()
+            else RecordSnapshot.capture(self.canvas.chapter, objects=[self.canvas.selected_id], attributes={'objects': ('name', 'ignore_parent_mask', 'underlay_opacity')})
         )
+        live_before = RecordSnapshot.capture(self.canvas.chapter, objects=[self.canvas.selected_id], attributes={'objects': ('name', 'ignore_parent_mask', 'underlay_opacity')})
         target.underlay_opacity = value / 100.0
-        self.canvas.documentChanged.emit(None)
-        self.canvas.update()
+        preview_records(self.canvas, live_before)
         if before is not None:
             self._push(before, "Change vector underlay")
 
@@ -623,15 +622,9 @@ class VectorObjectSettings(QWidget):
         if before is not None:
             self._push(before, "Change vector underlay")
 
-    def _push(self, before: dict, label: str) -> None:
-        after = self.canvas.chapter.to_dict()
-        if before == after:
-            return
-        self.canvas.push_model_change(before, after, label)
-        self.canvas.hierarchyChanged.emit()
-        self.canvas.documentChanged.emit(None)
-        self.canvas.update()
-        self.changed.emit()
+    def _push(self, before, label: str) -> None:
+        if commit_records(self.canvas, before, label, hierarchy=True):
+            self.changed.emit()
         self.refresh()
 
 
@@ -766,7 +759,7 @@ class ImageObjectSettings(QWidget):
         obj = self._selected()
         if self._updating or obj is None:
             return
-        before = self.canvas.chapter.to_dict()
+        before = RecordSnapshot.capture(self.canvas.chapter, objects=[self.canvas.selected_id], attributes={'objects': ('name', 'ignore_parent_mask', 'geometry_reference', 'placement_mode', 'fit_mode', 'transform_frame', 'transform_quad', 'underlay_opacity')})
         old_placement = obj.placement_mode
         obj.name = self.name.text().strip() or obj.name
         obj.ignore_parent_mask = self.ignore_parent_mask.isChecked()
@@ -784,17 +777,17 @@ class ImageObjectSettings(QWidget):
 
     def _begin_underlay(self) -> None:
         if not self._updating and self._selected() is not None:
-            self._underlay_before = self.canvas.chapter.to_dict()
+            self._underlay_before = RecordSnapshot.capture(self.canvas.chapter, objects=[self.canvas.selected_id], attributes={'objects': ('name', 'ignore_parent_mask', 'geometry_reference', 'placement_mode', 'fit_mode', 'transform_frame', 'transform_quad', 'underlay_opacity')})
 
     def _underlay_changed(self, value: int) -> None:
         self.underlay_value.setText(f"{value}%")
         obj = self._selected()
         if self._updating or obj is None:
             return
-        before = None if self._underlay_before is not None else self.canvas.chapter.to_dict()
+        before = None if self._underlay_before is not None else RecordSnapshot.capture(self.canvas.chapter, objects=[self.canvas.selected_id], attributes={'objects': ('name', 'ignore_parent_mask', 'geometry_reference', 'placement_mode', 'fit_mode', 'transform_frame', 'transform_quad', 'underlay_opacity')})
+        live_before = RecordSnapshot.capture(self.canvas.chapter, objects=[self.canvas.selected_id], attributes={'objects': ('name', 'ignore_parent_mask', 'geometry_reference', 'placement_mode', 'fit_mode', 'transform_frame', 'transform_quad', 'underlay_opacity')})
         obj.underlay_opacity = value / 100.0
-        self.canvas.documentChanged.emit(None)
-        self.canvas.update()
+        preview_records(self.canvas, live_before)
         if before is not None:
             self._push(before, "Change image underlay")
 
@@ -803,14 +796,9 @@ class ImageObjectSettings(QWidget):
         if before is not None:
             self._push(before, "Change image underlay")
 
-    def _push(self, before: dict, label: str) -> None:
-        after = self.canvas.chapter.to_dict()
-        if before != after:
-            self.canvas.push_model_change(before, after, label)
-            self.canvas.hierarchyChanged.emit()
-            self.canvas.documentChanged.emit(None)
+    def _push(self, before, label: str) -> None:
+        if commit_records(self.canvas, before, label, hierarchy=True):
             self.changed.emit()
-        self.canvas.update()
         self.refresh()
 
 
@@ -934,7 +922,11 @@ class SelectionSettingsPanel(QWidget):
             self.changed.emit()
 
         self.canvas.command_stack.push(CallbackCommand(
-            "Change blend mode", lambda: apply(after), lambda: apply(before)))
+            "Change blend mode", lambda: apply(after), lambda: apply(before),
+            ChangeSet(tuple(EntityChange(('object', identifier), frozenset({'blend_mode'}))
+                            for identifier in before), label='Change blend mode'),
+            ChangeSet(tuple(EntityChange(('object', identifier), frozenset({'blend_mode'}))
+                            for identifier in before), label='Change blend mode')))
 
     def refresh(self) -> None:
         chapter = self.layer_page.canvas.chapter

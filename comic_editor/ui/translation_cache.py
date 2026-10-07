@@ -99,6 +99,11 @@ def output_key(canvas, target, bounds, mapping, modifiers, *, tile_space=False, 
         if entity.opacity_mask is not None:
             bindings.append(entity.opacity_mask)
         if is_layer:
+            # Selected mask-only layer visibility changes its assembled
+            # source even though saved settings and placement are unchanged.
+            # Use the complete ordinary dependency path for that subtree.
+            if entity.mask_only:
+                raise ValueError('Mask-only layer source')
             children = [subtree(canvas.chapter.modifier_target(child.kind, child.entity_id))
                         for child in entity.children]
             return data, effects, children

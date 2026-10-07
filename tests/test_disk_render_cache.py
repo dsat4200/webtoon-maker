@@ -271,13 +271,91 @@ def editor(qapp, tmp_path):
 
 def finish(window, qapp, seconds=15):
     end = time.monotonic() + seconds
-    while window.disk_cache.building and time.monotonic() < end:
+    while (window.disk_cache.building or window.disk_cache._maintenance is not None or
+            window.disk_cache.backing.verifications or any(not future.done() for future in
+                window.disk_cache.dependencies.hashes.values())) and time.monotonic() < end:
         window.disk_cache.tick()
         window.canvas._effect_jobs.poll()
         qapp.processEvents()
         time.sleep(.001)
     assert not window.disk_cache.building, window.disk_cache.message
+    assert window.disk_cache._maintenance is None, window.disk_cache.message
     assert not window.disk_cache.backing.error
+
+
+def test_sibling_cache_writers_merge_committed_index(tmp_path):
+    first,second = PersistentRenderCache(tmp_path),PersistentRenderCache(tmp_path)
+    try:
+        assert first.values_lock is second.values_lock
+        with first.record(),second.record():
+            first.retain('effect',('first',),np.ones((1,1,4),np.float32))
+            second.retain('effect',('second',),np.zeros((1,1,4),np.float32))
+        first.drain()
+        second.drain()
+        reopened = PersistentRenderCache(tmp_path)
+        try:
+            assert reopened.lookup('effect',('first',),wait=True) is not None
+            assert reopened.lookup('effect',('second',),wait=True) is not None
+        finally:
+            reopened.close()
+    finally:
+        first.close()
+        second.close()
+
+
+def test_sibling_clear_cancels_unpublished_exact_writes(tmp_path,monkeypatch):
+    from threading import Event
+    import comic_editor.render.cache as storage
+    first,second = PersistentRenderCache(tmp_path),PersistentRenderCache(tmp_path)
+    started,release = Event(),Event()
+    original = storage.encode_value
+    def delayed(value):
+        started.set()
+        assert release.wait(5)
+        return original(value)
+    monkeypatch.setattr(storage,'encode_value',delayed)
+    try:
+        with first.record():
+            first.retain('effect',('old',),np.ones((1,1,4),np.float32))
+        assert started.wait(5)
+        second.clear()
+        release.set()
+        first.drain()
+        reopened = PersistentRenderCache(tmp_path)
+        try:
+            assert not reopened.entries
+            assert first.lookup('effect',('old',),wait=True) is None
+        finally:
+            reopened.close()
+    finally:
+        release.set()
+        first.close()
+        second.close()
+
+
+def test_sibling_reader_observes_clear_and_reloads_remaining_committed_values(tmp_path):
+    writer = PersistentRenderCache(tmp_path)
+    try:
+        with writer.record():
+            for key in ('removed','kept'):
+                writer.retain('effect',(key,),np.ones((1,1,4),np.float32))
+        writer.drain()
+        reader = PersistentRenderCache(tmp_path)
+        try:
+            assert reader.lookup('effect',('removed',),wait=True) is not None
+            writer.clear(lambda entry:entry['key'] == ['removed'])
+            assert reader.poll()  # A navigator must retire the old green state.
+            end = time.monotonic()+5
+            while reader.pending and time.monotonic() < end:
+                reader.poll()
+                time.sleep(.001)
+            assert not reader.pending
+            assert reader.lookup('effect',('removed',),wait=True) is None
+            assert reader.lookup('effect',('kept',),wait=True) is not None
+        finally:
+            reader.close()
+    finally:
+        writer.close()
 
 
 def test_manual_range_reopens_without_scene_rendering(editor, qapp, monkeypatch):
@@ -339,7 +417,7 @@ def test_editing_lock_cancel_and_resume(editor, qapp):
             break
         time.sleep(.001)
     cache.cancel()
-    cache.backing.drain()
+    finish(window,qapp)
     assert not canvas.document_read_only
     assert cache.row_ready(0)
     assert cache.start()
@@ -376,6 +454,9 @@ def test_reopen_reuses_effect_sources_after_final_cache_is_cleared(editor, qapp,
     finish(window, qapp)
     window.disk_cache.backing.clear(lambda entry: entry["kind"] == "projection")
     window.disk_cache.detach()
+    # Cache recording and Save are independent detached consumers. Await the
+    # encoded chapter publication before copying its source/cache resources.
+    assert window.save(wait=True)
     copied = window.repository.root.parent / "copied project"
     shutil.copytree(window.repository.root, copied)
     second = reopen(copied)
@@ -436,11 +517,41 @@ def test_clear_selected_keeps_other_final_rows(editor, qapp):
     finish(window, qapp)
     cache.set_range(0, 256)
     cache.clear(selected=True)
+    finish(window,qapp)
     assert not cache.row_ready(0)
     assert cache.row_ready(1)
     cache.clear(selected=False)
+    finish(window,qapp)
     assert not cache.backing.entries
     assert not list((cache.backing.root / "values").glob("*.cache"))
+
+
+def test_explicit_recording_never_evaluates_or_drains_on_gui(editor,qapp,monkeypatch):
+    from threading import get_ident
+    from comic_editor.render.scene_kernels import SceneKernels
+    window,_,identifier = editor
+    gui = get_ident()
+    traversals = []
+    original = SceneKernels._render_scene_layers
+    def detached_scene(*args,**kwargs):
+        assert get_ident() != gui,'Explicit disk recording evaluated a scene on the GUI'
+        traversals.append(get_ident())
+        return original(*args,**kwargs)
+    def forbidden(*args,**kwargs):
+        raise AssertionError('Explicit recording called the live GUI render service')
+    monkeypatch.setattr(SceneKernels,'_render_scene_layers',detached_scene)
+    monkeypatch.setattr(window.canvas._render_service,'collect_tiles',forbidden)
+    original_close = PersistentRenderCache.close
+    def detached_close(*args,**kwargs):
+        assert get_ident() != gui,'A cache owner waited for IO on the GUI'
+        return original_close(*args,**kwargs)
+    monkeypatch.setattr(PersistentRenderCache,'close',detached_close)
+    window.disk_cache.set_range(0,512)
+    assert window.disk_cache.start()
+    finish(window,qapp)
+    assert traversals
+    assert window.disk_cache.row_ready(0) and window.disk_cache.row_ready(1)
+    window.disk_cache.detach()
 
 
 def test_cache_handles_choose_range_and_camera_stays_available(editor, qapp):

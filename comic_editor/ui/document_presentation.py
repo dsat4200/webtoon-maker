@@ -25,6 +25,9 @@ from PySide6.QtOpenGL import (
     QOpenGLShaderProgram, QOpenGLTexture, QOpenGLVertexArrayObject,
 )
 from shiboken6 import isValid
+from comic_editor.core.pixel_contract import LEGACY_PIXELS
+from comic_editor.render.device import DeviceImage
+from comic_editor.render.pixels import display_image, color_environment,pixel_scope
 
 
 @dataclass(frozen=True)
@@ -39,9 +42,11 @@ class PresentedTile:
     """
 
     key: Hashable
-    image: QImage
+    image: QImage | DeviceImage
     world_rect: QRectF
     source_rect: QRectF | None = None
+    pixel_contract: object = LEGACY_PIXELS
+    pixel_environment: object = None
 
 
 @dataclass(frozen=True)
@@ -57,6 +62,32 @@ class _TextureEntry:
     texture: QOpenGLTexture
     byte_count: int
     sampling: object = None
+
+
+class _BorrowedTexture:
+    """Hold a lease; texture ownership and deletion stay on the producer."""
+    def __init__(self, image, functions):
+        self.image,self.functions = image.copy(image.rect()),functions
+        if not isinstance(self.image,DeviceImage):
+            raise RuntimeError('Graphics storage expired before presentation borrowed it')
+
+    def bind(self, unit=0):
+        self.functions.glActiveTexture(0x84C0+unit)
+        self.functions.glBindTexture(0x0DE1,self.image.texture)
+        self.functions.glTexParameteri(0x0DE1,0x2802,0x812F)
+        self.functions.glTexParameteri(0x0DE1,0x2803,0x812F)
+
+    def setMinMagFilters(self, minimum, maximum):
+        self.bind()
+        self.functions.glTexParameteri(0x0DE1,0x2801,int(getattr(minimum,'value',minimum)))
+        self.functions.glTexParameteri(0x0DE1,0x2800,int(getattr(maximum,'value',maximum)))
+
+    def destroy(self):
+        # Presentation owns an independent view, so releasing the caller's
+        # view cannot expire a borrowed texture still retained in this cache.
+        if self.image is not None:
+            self.image.release()
+        self.image = None
 
 
 VERTEX = """#version 330 core
@@ -104,10 +135,13 @@ def tile_vertices(tile: PresentedTile, camera: QTransform, viewport: QSizeF,
     vertices = []
     for index in (0, 1, 2, 2, 1, 3):
         point, pixel = camera.map(points[index]), pixels[index]
+        origin = getattr(tile.image,'source_origin',(0,0))
+        width = getattr(tile.image,'texture_width',tile.image.width())
+        height = getattr(tile.image,'texture_height',tile.image.height())
         vertices.append((
             point.x() * 2 / viewport.width() - 1,
             1 - point.y() * 2 / viewport.height(),
-            pixel.x() / tile.image.width(), pixel.y() / tile.image.height(),
+            (pixel.x()+origin[0]) / width, (pixel.y()+origin[1]) / height,
         ))
     return np.asarray(vertices, dtype=np.float32)
 
@@ -142,16 +176,22 @@ class GpuTilePresenter:
         # remain fixed. Keep geometry independent of texture content/revisions.
         configuration = (tuple(getattr(camera, f'm{row}{column}')()
             for row in range(1, 4) for column in range(1, 4)),
-            viewport.width(), viewport.height(),
-            None if clip_world is None else tuple(clip_world.getRect()))
+            viewport.width(), viewport.height())
         if configuration != self._geometry_configuration:
             self._geometry.clear()
             self._geometry_configuration = configuration
         prepared = []
         for tile in tiles:
-            key = (tuple(tile.world_rect.getRect()),
+            # Exact and live feedback batches may alternate document clips
+            # under the same camera. Their independent positions share this
+            # bounded LRU instead of retiring one another on every draw.
+            key = (None if clip_world is None else tuple(clip_world.getRect()),
+                   tuple(tile.world_rect.getRect()),
                    None if tile.source_rect is None else tuple(tile.source_rect.getRect()),
-                   tile.image.width(), tile.image.height())
+                   tile.image.width(), tile.image.height(),
+                   getattr(tile.image,'texture_width',tile.image.width()),
+                   getattr(tile.image,'texture_height',tile.image.height()),
+                   getattr(tile.image,'source_origin',(0,0)))
             vertices = self._geometry.pop(key, None)
             if vertices is None:
                 vertices = tile_vertices(tile, camera, viewport, clip_world)
@@ -194,7 +234,9 @@ class GpuTilePresenter:
     @staticmethod
     def _key(tile):
         # QImage's token changes when a tile is replaced or detached for edits.
-        return tile.key, int(tile.image.cacheKey())
+        return (tile.key, int(tile.image.cacheKey()),tile.pixel_contract.signature,
+                tile.pixel_environment.signature if tile.pixel_environment is not None
+                else color_environment(tile.pixel_contract))
 
     def _remove(self, key):
         entry = self._textures.pop(key)
@@ -202,7 +244,11 @@ class GpuTilePresenter:
         self.texture_bytes -= entry.byte_count
 
     def _upload(self, tile):
-        rgba = tile.image.convertToFormat(QImage.Format_RGBA8888_Premultiplied)
+        if isinstance(tile.image,DeviceImage):
+            self._textures[self._key(tile)] = _TextureEntry(_BorrowedTexture(tile.image,self.functions),0)
+            return
+        with pixel_scope(tile.pixel_contract,environment=tile.pixel_environment):
+            rgba = display_image(tile.image,tile.pixel_contract).convertToFormat(QImage.Format_RGBA8888_Premultiplied)
         # Preserve premultiplication: Qt's convenience texture constructor would
         # otherwise convert premultiplied images to straight RGBA before upload.
         raw = QImage(rgba.constBits(), rgba.width(), rgba.height(),
@@ -285,6 +331,19 @@ class GpuTilePresenter:
         try:
             self._initialize()
             state = self._save_state()
+            from comic_editor.render.gpu.sync import GlSync
+            for tile in needed.values():
+                if isinstance(tile.image,DeviceImage):
+                    image = tile.image
+                    worker = image.owner
+                    if (image.isNull() or worker.render_context is None
+                            or not QOpenGLContext.areSharing(self.context,worker.render_context)
+                            or tile.pixel_contract != image.contract):
+                        self.reason = 'A device image needs its owning shared context'
+                        return False
+                    if not GlSync(self.context).ready(image.fence):
+                        self.reason = 'A device image is not ready for presentation'
+                        return False
             if any(max(tile.image.width(), tile.image.height()) > self._max_texture_size
                    for tile in needed.values()):
                 self.reason = "A document tile exceeds the driver's texture limit"
@@ -443,6 +502,13 @@ def draw_document_tiles(painter: QPainter, tiles: Iterable[PresentedTile],
         if rendered:
             return PresentationStats("gpu", len(tiles), presenter.uploads - uploads_before,
                                      presenter.texture_bytes)
+    if any(isinstance(tile.image,DeviceImage) for tile in tiles):
+        # A GUI fallback may not synchronously materialize a device image. Its
+        # consumer must request the CPU edge through the background scheduler.
+        controller = getattr(owner,'_scene_controller',None)
+        if controller is not None:
+            controller.ensure_cpu_tiles(tiles)
+        return PresentationStats('pending',0)
     painter.save()
     painter.setTransform(camera)
     painter.setRenderHint(QPainter.SmoothPixmapTransform, bool(smooth))
@@ -450,7 +516,8 @@ def draw_document_tiles(painter: QPainter, tiles: Iterable[PresentedTile],
         rectangles = _tile_rectangles(tile, clip_world)
         if rectangles is not None:
             world, source = rectangles
-            painter.drawImage(world, tile.image, source)
+            with pixel_scope(tile.pixel_contract,environment=tile.pixel_environment):
+                painter.drawImage(world, display_image(tile.image,tile.pixel_contract), source)
     painter.restore()
     return PresentationStats("raster", len(tiles))
 

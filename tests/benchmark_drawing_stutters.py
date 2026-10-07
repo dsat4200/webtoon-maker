@@ -62,6 +62,8 @@ parser.add_argument("--effect-workers", type=int, choices=range(1, 5),
                     help="Limit detached effect concurrency for matched diagnostic runs.")
 parser.add_argument("--async-warm-start", action="store_true",
                     help="With async-exact, wait for the initial exact view before sustained input/navigation.")
+parser.add_argument('--input-after-exposure', action='store_true',
+                    help='Start cold input after the first native paint, without waiting for source/scene readiness.')
 parser.add_argument("--warm-from", choices=CAMERAS,
                     help="Warm this camera outside measurement, then measure an exact jump to scenario (cold-only).")
 parser.add_argument("--no-stroke-warmup", action="store_true",
@@ -71,6 +73,7 @@ RASTER_ID = args.raster_id
 assert not (args.baseline and args.source_code)
 assert 1 <= args.hz <= 1000 and 0 < args.stroke_seconds <= 30 and 1 <= args.strokes <= 20
 assert not args.async_warm_start or args.async_exact
+assert not args.input_after_exposure or (args.async_exact and not args.async_warm_start)
 assert not args.warm_from or (args.async_exact and args.cold_only)
 if args.warm_from:
     args.async_warm_start = True
@@ -157,8 +160,12 @@ class Probe:
         self.pending_exact_inputs = []
         self.exact_progress = ExactProgress()
         self.presentation_started = None
+        self.exposure_requested_at = self.first_native_paint_at = None
+        self.input_start = None
         self.signals = Counter()
         self.last_presented_sequence = -1
+        self.feedback_tiles = 0
+        self.feedback_contact_covered = False
         self.gui_thread = threading.get_ident()
         self.local = threading.local()
 
@@ -212,6 +219,12 @@ class Probe:
                         row["distance_builds"] = values[0].computations-distance_before
                     if label == "canvas.promoted_ink":
                         row["result"] = bool(result)
+                    if label == "canvas.raster_feedback":
+                        self.feedback_tiles = int(result or 0)
+                        self.feedback_contact_covered = bool(getattr(
+                            values[0].canvas, '_raster_feedback_contact_covered', False))
+                        row["result"] = self.feedback_tiles
+                        row['current_contact_covered'] = self.feedback_contact_covered
                     self.rows.append(row)
                     if label == "canvas.paint":
                         self.frame(end, ms, phase, activity)
@@ -221,7 +234,10 @@ class Probe:
     def frame(self, ended, ms, phase, activity):
         pending, self.pending_inputs = self.pending_inputs, []
         frame = {"phase": phase, "activity": activity, "end_ms": (ended-self.started)*1000, "paint_ms": ms,
-                 "newly_dispatched_inputs": len(pending)}
+                 "newly_dispatched_inputs": len(pending), "raster_feedback_tiles": self.feedback_tiles,
+                 "current_raster_contact_covered": self.feedback_contact_covered}
+        self.feedback_tiles = 0
+        self.feedback_contact_covered = False
         if pending:
             frame.update(oldest_input_to_paint_ms=(ended-pending[0]["scheduled_at"])*1000,
                          newest_input_to_paint_ms=(ended-pending[-1]["scheduled_at"])*1000,
@@ -242,6 +258,10 @@ class Probe:
                     row["scheduled_to_exact_paint_ms"] = (ended-row["scheduled_at"])*1000
                 self.pending_exact_inputs.clear()
         self.frames.append(frame)
+        if self.first_native_paint_at is None:
+            self.first_native_paint_at = ended
+            if args.input_after_exposure:
+                QTimer.singleShot(0, start_producer)
 
 
 settings_module.settings_path = lambda: OUT / "settings.json"
@@ -297,6 +317,13 @@ probe.patch(GpuPatternRenderer, "render", "effects.pattern")
 probe.patch(modifier_rendering, "_outside_distance", "effects.outline_distance")
 probe.patch(modifier_rendering, "_outline_qimage", "effects.outline")
 probe.patch(modifier_rendering.OutlineDistanceCache, "field", "effects.outline_field")
+try:
+    from comic_editor.ui import tile_input
+except ImportError:
+    pass
+else:
+    probe.patch(tile_input, 'prepare_input_tiles', 'sources.native_input')
+    probe.patch(tile_input, 'prepare_input_bounds', 'sources.native_bounds')
 
 before_hashes = manifest()
 write_json("project-files-before.json", before_hashes)
@@ -326,6 +353,8 @@ window = window_module.MainWindow()
 window.setAttribute(Qt.WA_DontShowOnScreen, True)
 window.setAttribute(Qt.WA_ShowWithoutActivating, True)
 canvas = window.canvas
+if getattr(canvas, '_scene_controller', None) is not None:
+    probe.patch(type(canvas._scene_controller), 'present_feedback', 'canvas.raster_feedback')
 if args.effect_workers is not None:
     available_workers = getattr(canvas._effect_jobs, 'worker_limit', 1)
     assert args.effect_workers <= available_workers, 'Requested concurrency exceeds the configured pool'
@@ -592,6 +621,8 @@ def heartbeat():
 thread = None
 def start_producer():
     global thread, input_started, last_heartbeat
+    if thread is not None:
+        return
     if args.profile and args.async_warm_start and gui_profile is not None:
         gui_profile.enable()
     if args.warm_from:
@@ -615,6 +646,33 @@ def start_producer():
                                "dispatch_ms": 0., "camera": list(CAMERAS[args.scenario]),
                                "expected_camera": list(CAMERAS[args.scenario])})
     input_started = time.perf_counter()
+    source = canvas.tiles._tiles.get(RASTER_ID)
+    controller = getattr(canvas, '_scene_controller', None)
+    source_evictions = 0
+    if args.input_after_exposure and source is not None:
+        # Project setup can establish native alpha bounds by loading sources.
+        # This explicit cold case retires only the selected original borrowers;
+        # native backings, versions and every other source remain unchanged.
+        versions = {key: source.version(key) for key in source}
+        for key in source:
+            if (source, key) in canvas.tiles.residency.entries:
+                canvas.tiles.residency.evict(source, key)
+                source_evictions += 1
+        assert versions == {key: source.version(key) for key in source}
+    probe.input_start = {
+        'policy': 'after-first-native-paint' if args.input_after_exposure else
+                  'after-exact-readiness' if args.async_warm_start else 'before-native-exposure',
+        'at_ms': (input_started-probe.started)*1000,
+        'target_source_tiles': len(source) if source is not None else 0,
+        'target_source_evictions': source_evictions,
+        'target_resident_tiles': sum((source, key) in canvas.tiles.residency.entries
+                                     for key in source) if source is not None else 0,
+        'live_tile_decodes': canvas.tiles.residency.decodes,
+        'scene_state': canvas_pending(canvas),
+        'target_feedback_prepared': bool(controller is not None and getattr(controller, 'feedback', None) is not None),
+        'native_source_preparation_busy': any(gate.busy for gate in canvas._native_input_gates())
+            if hasattr(canvas, '_native_input_gates') else False,
+    }
     probe.phase = "cold" if args.cold_only else "input"
     thread = threading.Thread(target=produce, name="synthetic-tablet-producer", daemon=True)
     thread.start()
@@ -631,9 +689,10 @@ def start():
     last_heartbeat = time.perf_counter()
     timer.start()
     probe.presentation_started = time.perf_counter()
-    if not args.async_warm_start:
+    if not args.async_warm_start and not args.input_after_exposure:
         start_producer()
     if args.async_exact:
+        probe.exposure_requested_at = time.perf_counter()
         window.show()
         assert canvas.isValid(), "A real hidden OpenGL canvas is required"
 
@@ -659,6 +718,9 @@ write_json("setup.json", {
     "device_pixel_ratio": canvas.devicePixelRatioF(),
     "effect_workers": getattr(canvas._effect_jobs, 'worker_limit', 1),
     "args": {key: str(value) if isinstance(value, Path) else value for key, value in vars(args).items()},
+    'input_start_policy': 'first completed native paint; source and scene readiness are not awaited'
+        if args.input_after_exposure else 'initial exact readiness' if args.async_warm_start
+        else 'producer starts before native exposure',
     "limitations": ["Synthetic pen trajectory and constant pressure; no original raw pen samples exist.",
                     "Input deadlines include producer GIL delay; posted queue delay is reported separately.",
                     "Frame completion is Qt paint completion, not physical display presentation.",
@@ -741,24 +803,46 @@ finally:
             validation_started = time.perf_counter()
             finished = read_native_frame(canvas)
             finished.save(str(OUT / "finished-async-native.png"))
-            canvas._projection_async_enabled = False
-            canvas._projection_cull_outside_view = False
-            canvas._effect_jobs.cancel()
-            canvas._modifier_render_cache.clear()
-            canvas._modifier_render_cache_bytes = 0
-            canvas._modifier_source_cache.clear()
-            canvas._modifier_source_cache_bytes = 0
-            canvas._distort_preparation_cache = None
-            canvas._document_projection.clear()
-            canvas._invalidate_scene_cache()
-            canvas._ensure_scene_cache()
-            QImage(canvas._scene_cache).save(str(OUT / "synchronous-scene.png"))
-            canvas.repaint()
-            reference = read_native_frame(canvas)
-            reference.save(str(OUT / "synchronous-native.png"))
-            exact_status["finished_vs_synchronous"] = pixel_difference(finished, reference)
-            exact_status["validation_ms"] = (time.perf_counter()-validation_started)*1000
-            exact_status["oracle_pending"] = canvas_pending(canvas)
+            controller = getattr(canvas, '_scene_controller', None)
+            projection = canvas._document_projection
+            backing_callbacks = projection.backing_lookup, projection.backing_retain
+            if controller is not None:
+                controller.reset()
+                # This validation deliberately uses the explicit synchronous
+                # widget oracle. Production ready presentation must not queue
+                # another detached capture while that oracle is measured.
+                canvas._scene_controller = None
+            try:
+                canvas._projection_async_enabled = False
+                canvas._projection_cull_outside_view = False
+                # Production backing lookup defers source verification/reads.
+                # This independent synchronous oracle must evaluate every
+                # native tile rather than retain previous coverage on a miss.
+                projection.backing_lookup = projection.backing_retain = None
+                canvas._effect_jobs.cancel()
+                canvas._modifier_render_cache.clear()
+                canvas._modifier_render_cache_bytes = 0
+                canvas._modifier_source_cache.clear()
+                canvas._modifier_source_cache_bytes = 0
+                canvas._distort_preparation_cache = None
+                canvas._document_projection.clear()
+                canvas._invalidate_scene_cache()
+                canvas._ensure_scene_cache()
+                QImage(canvas._scene_cache).save(str(OUT / "synchronous-scene.png"))
+                canvas.repaint()
+                reference = read_native_frame(canvas)
+                reference.save(str(OUT / "synchronous-native.png"))
+                exact_status["oracle_pending"] = canvas_pending(canvas)
+                assert not exact_status["oracle_pending"]["frame_pending"], (
+                    "Synchronous oracle did not finish its native frame", exact_status["oracle_pending"])
+                assert not exact_status["oracle_pending"]["jobs_busy"], (
+                    "Synchronous oracle deferred effect work", exact_status["oracle_pending"])
+                exact_status["finished_vs_synchronous"] = pixel_difference(finished, reference)
+                exact_status["validation_ms"] = (time.perf_counter()-validation_started)*1000
+            finally:
+                projection.backing_lookup, projection.backing_retain = backing_callbacks
+                if controller is not None:
+                    canvas._scene_controller = controller
             probe.phase = "shutdown"
     write_json("phases.json", probe.rows)
     write_json("inputs.json", probe.input_rows)
@@ -773,6 +857,15 @@ finally:
         max_depth = max(max_depth, depth)
     summary = {
         "timed_out": timed_out, "posted_inputs": len(probe.input_rows),
+        'input_start': probe.input_start,
+        'first_native_display_ms': (probe.first_native_paint_at-probe.exposure_requested_at)*1000
+            if probe.first_native_paint_at is not None and probe.exposure_requested_at is not None else None,
+        'native_source_preparation': {
+            'worker_calls': sum(not row['gui_thread'] for row in probe.rows
+                                if row['name'] == 'sources.native_input'),
+            'gui_calls': sum(row['gui_thread'] for row in probe.rows
+                             if row['name'] == 'sources.native_input'),
+        },
         "dispatched_inputs": sum("dispatched_at" in r for r in probe.input_rows),
         "maximum_queued_tablet_events": max_depth,
         "remaining_queued_tablet_events": depth,
@@ -788,6 +881,13 @@ finally:
                                           default=0.),
         "input_to_next_paint": distribution([r["oldest_input_to_paint_ms"] for r in probe.frames
                                              if "oldest_input_to_paint_ms" in r]),
+        "input_to_prepared_raster_feedback_paint": distribution([
+            r["oldest_input_to_paint_ms"] for r in probe.frames
+            if "oldest_input_to_paint_ms" in r and r['raster_feedback_tiles']
+            and r['current_raster_contact_covered']]),
+        "prepared_raster_feedback_frames": sum(bool(r['raster_feedback_tiles']) for r in probe.frames),
+        "prepared_current_raster_contact_frames": sum(bool(r['raster_feedback_tiles'])
+            and r['current_raster_contact_covered'] for r in probe.frames),
         "first_press_after_navigation": distribution([r["posted_to_dispatch_ms"] for r in probe.input_rows
                                                        if r.get("after_navigation") and r["kind"] == "press"
                                                        and "posted_to_dispatch_ms" in r]),
@@ -844,4 +944,5 @@ finally:
         assert not timed_out and exact_status["terminal_ready"], "Exact projection did not finish cleanly"
         assert not exact_status["unpresented_exact_inputs"], "Input never reached a finished exact frame"
         assert exact_status["finished_vs_synchronous"]["identical"], "Async pixels differ from exact oracle"
+        assert not exact_status["oracle_pending"]["frame_pending"], "Synchronous oracle did not finish its native frame"
         assert not exact_status["oracle_pending"]["jobs_busy"], "Synchronous oracle deferred effect work"

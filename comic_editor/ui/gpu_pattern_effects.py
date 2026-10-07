@@ -306,7 +306,7 @@ void main() {
 class GpuPatternRenderer:
     """One canvas-owned renderer; caches survive changes to modifier sliders."""
 
-    def __init__(self, *, allow_offscreen=False, fragment=FRAGMENT):
+    def __init__(self, *, allow_offscreen=False, fragment=FRAGMENT, surface=None):
         self.available = False
         self.reason = ""
         self.context = self.surface = self.functions = None
@@ -334,9 +334,13 @@ class GpuPatternRenderer:
             self.context.setFormat(fmt)
             if not self.context.create():
                 raise RuntimeError("OpenGL context unavailable")
-            self.surface = QOffscreenSurface()
-            self.surface.setFormat(self.context.format())
-            self.surface.create()
+            self.surface = surface
+            if self.surface is None:
+                if QThread.currentThread() != QGuiApplication.instance().thread():
+                    raise RuntimeError("Graphics surfaces must be created on the application thread")
+                self.surface = QOffscreenSurface()
+                self.surface.setFormat(self.context.format())
+                self.surface.create()
             if not self.context.makeCurrent(self.surface):
                 raise RuntimeError("Offscreen OpenGL surface unavailable")
             self.functions = QOpenGLFunctions_3_3_Core()
@@ -626,23 +630,33 @@ class GpuPatternRenderer:
             return
         previous = QOpenGLContext.currentContext()
         previous_surface = previous.surface() if previous else None
-        if self.context.makeCurrent(self.surface):
-            for texture in (self.source,self.gradient,self.color_source_texture,self.mask):
-                if texture:
-                    texture.destroy()
-            if self.buffer:
-                self.buffer.destroy()
-            if self.triangle_buffer:
-                self.triangle_buffer.destroy()
-            if self.vao:
-                self.vao.destroy()
+        context = self.context
+        activated = False
+        try:
+            activated = context.makeCurrent(self.surface)
+            if activated:
+                for texture in (self.source,self.gradient,self.color_source_texture,self.mask):
+                    if texture:
+                        texture.destroy()
+                if self.buffer:
+                    self.buffer.destroy()
+                if self.triangle_buffer:
+                    self.triangle_buffer.destroy()
+                if self.vao:
+                    self.vao.destroy()
+        finally:
+            # Retire Qt guards on this graphics owner even when the context
+            # was lost and explicit GL deletion is no longer possible.
             self.source = self.gradient = self.color_source_texture = self.mask = None
             self.output = self.blur_x = self.blur_y = self.triangle_output = None
             self.program = self.blur_program = self.triangle_program = self.buffer = self.triangle_buffer = self.vao = None
             self.triangle_key = None
-            self.context.doneCurrent()
-        if previous and previous_surface:
-            previous.makeCurrent(previous_surface)
+            self.functions = None
+            if activated:
+                context.doneCurrent()
+            if previous is not context and previous and previous_surface:
+                previous.makeCurrent(previous_surface)
+            self.context = self.surface = None
 
 
 def renderer_for(canvas):
@@ -651,6 +665,9 @@ def renderer_for(canvas):
         return None
     if getattr(canvas.settings,"canvas_renderer","auto") == "raster":
         return None
+    if QThread.currentThread() != QGuiApplication.instance().thread():
+        from comic_editor.render.gpu.worker import helper_for
+        return helper_for(canvas, "pattern")
     renderer = getattr(canvas,"_gpu_pattern_renderer",None)
     if renderer is None:
         renderer = GpuPatternRenderer()

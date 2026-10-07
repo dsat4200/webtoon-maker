@@ -141,7 +141,14 @@ def test_world_painted_hsl_mask_keeps_geometry_and_matches_preview_commit(page_s
     canvas.tiles.paint_dab(mask.mask_id, QPointF(110, 134), 80, QColor("white"))
     effect = HueSaturationLightnessModifier(hue=80, parameter_masks={
         "intensity": ParameterMaskBinding(mask.mask_id, 0., 100.)})
-    canvas.chapter.add_modifier(effect, [("object", obj.object_id)])
+    # A wholly-owned mask follows its moving owners. Sharing this painted
+    # mask with an unmoved object makes it an actual chapter-fixed dependency.
+    other_page = canvas.chapter.add_page('Unmoved mask owner', BoundGeometry.rectangle(450, 20, 160, 260))
+    other_page.fill_color, other_page.border_width = None, 0
+    other = canvas.chapter.add_object(other_page.layer_id,
+        ImageObject(x=470, y=70, pixel_width=128, pixel_height=128))
+    canvas.images.put_decoded(other.object_id, 'other.png', b'', canvas.images.image(obj.object_id))
+    canvas.chapter.add_modifier(effect, [("object", obj.object_id), ("object", other.object_id)])
     before = pixels(canvas).reshape(320, 320, 4)
     mask_state = copy.deepcopy(mask.to_dict())
     paint = {key: bytes(tile.constBits()) for key, tile in canvas.tiles.object_tiles(mask.mask_id).items()}

@@ -3,7 +3,7 @@ import copy
 import time
 import numpy as np
 import pytest
-from PySide6.QtCore import QPointF, QRectF, Qt
+from PySide6.QtCore import QCoreApplication, QPointF, QRectF, Qt
 from PySide6.QtGui import QColor, QImage, QPainter, QTransform
 from comic_editor.core.cage import CageGrid, map_points
 from comic_editor.core.models import (BoundGeometry, ChapterDocument, CageTransformModifier,
@@ -44,6 +44,18 @@ def translated(grid, dx, dy):
     grid.validate_grid()
     grid.points = [(x+dx, y+dy) for x, y in grid.points]
     return grid
+
+
+def wait_cage(canvas, *, committed=False):
+    deadline = time.monotonic()+15
+    def ready():
+        return (canvas._cage_session is None and canvas._cage_commit_pending is None
+                if committed else canvas._active_cage() is not None)
+    while not ready() and time.monotonic() < deadline:
+        QCoreApplication.processEvents()
+        time.sleep(.002)
+    assert canvas._cage_commit_error is None
+    assert ready()
 
 
 def test_grid_affine_exactness_density_and_validation():
@@ -159,6 +171,7 @@ def test_cage_raster_and_vector_commit_cancel_undo(qapp):
     canvas.set_selection_set(refs)
     before = render(canvas)
     assert canvas.set_tool(ToolKind.CAGE_TRANSFORM)
+    wait_cage(canvas)
     translated(canvas._active_cage(), 45, 0)
     canvas._cage_changed()
     preview = render(canvas)
@@ -167,8 +180,10 @@ def test_cage_raster_and_vector_commit_cancel_undo(qapp):
     assert canvas.finish_cage(False)
     assert render(canvas) == before
     assert canvas.set_tool(ToolKind.CAGE_TRANSFORM)
+    wait_cage(canvas)
     translated(canvas._active_cage(), 45, 0)
     assert canvas.finish_cage(True)
+    wait_cage(canvas, committed=True)
     assert not doc.modifiers
     assert doc.objects[vector.object_id].strokes[0].points[0].x == pytest.approx(65)
     assert render(canvas).pixelColor(75, 30).red() > 200
@@ -179,7 +194,7 @@ def test_cage_raster_and_vector_commit_cancel_undo(qapp):
     canvas.close()
 
 
-def test_export_accepts_pending_cage_as_one_undoable_edit(qapp, tmp_path):
+def test_export_accepts_pending_cage_as_one_undoable_edit(qapp, tmp_path, wait_outputs):
     window = MainWindow()
     canvas, doc, page = scene(qapp)
     raster = doc.add_object(page.layer_id, RasterObject(interaction_rect=(0, 0, 100, 80)))
@@ -189,9 +204,11 @@ def test_export_accepts_pending_cage_as_one_undoable_edit(qapp, tmp_path):
     window.hierarchy_model.set_chapter(doc)
     window.canvas.set_selection("object", raster.object_id)
     assert window.canvas.set_tool(ToolKind.CAGE_TRANSFORM)
+    wait_cage(window.canvas)
     translated(window.canvas._active_cage(), 45, 0)
     destination = tmp_path/"accepted-cage.png"
     assert window._write_export_image(destination)
+    wait_outputs(window)
     assert window.canvas._cage_session is None
     exported = QImage(str(destination))
     assert exported.pixelColor(75, 30).red() > 200

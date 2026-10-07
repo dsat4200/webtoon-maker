@@ -77,6 +77,23 @@ def test_geometry_reuses_positions_across_pixel_edits_and_retires_camera_changes
     assert len(presenter._geometry) == presenter.geometry_limit
 
 
+@pytest.mark.parametrize('angle', [0., 17.25])
+def test_geometry_reuses_alternating_exact_and_feedback_clips_without_changing_vertices(angle):
+    presenter = GpuTilePresenter()
+    camera, viewport = QTransform.fromTranslate(9.25, 7.75), QSizeF(64, 64)
+    camera.rotate(angle)
+    tile = PresentedTile('edge', solid(size=20), QRectF(-3.25, 4.5, 16, 16), QRectF(2, 2, 16, 16))
+    clips = [None, QRectF(0.25, 0.5, 48, 48)]
+    first = [presenter._prepare_geometry([tile], camera, viewport, clip)[0][1] for clip in clips]
+    assert not np.array_equal(*first)
+    for _ in range(4):
+        for index, clip in enumerate(clips):
+            actual = presenter._prepare_geometry([tile], camera, viewport, clip)[0][1]
+            assert actual is first[index]
+            np.testing.assert_array_equal(actual, tile_vertices(tile, camera, viewport, clip))
+    assert presenter.geometry_builds == 2 and presenter.geometry_hits == 8
+
+
 def test_raster_fallback_uses_gutters_and_restores_painter():
     tile_image = solid("green", 20)
     painter = QPainter(tile_image)
@@ -205,6 +222,31 @@ def test_gpu_repeated_frame_keeps_vertices_filters_and_context_limits(gl_context
     assert len(filters) == 1 and presenter.geometry_uploads == 1
     assert presenter.draw([tile], QTransform(), QSizeF(64,64), smooth=False)
     assert len(filters) == 2
+    target.release()
+
+
+@pytest.mark.parametrize('angle', [0., 17.25])
+def test_gpu_alternating_document_clips_reuse_geometry_and_keep_identical_frames(gl_context, angle):
+    presenter = gl_context
+    target = framebuffer(presenter)
+    camera, viewport = QTransform.fromTranslate(9.25, 7.75), QSizeF(64, 64)
+    camera.rotate(angle)
+    tile = PresentedTile('edge', solid(QColor(231, 59, 93, 127), 20),
+                         QRectF(-3.25, 4.5, 16, 16), QRectF(2, 2, 16, 16))
+    clips = [None, QRectF(0.25, 0.5, 48, 48)]
+    expected = []
+    for _ in range(4):
+        for index, clip in enumerate(clips):
+            presenter.functions.glClear(0x4000)
+            assert presenter.draw([tile], camera, viewport, clip_world=clip)
+            actual = pixels(target.toImage())
+            if len(expected) < 2:
+                expected.append(actual)
+            else:
+                np.testing.assert_array_equal(actual, expected[index])
+    assert not np.array_equal(*expected)
+    assert presenter.geometry_builds == 2 and presenter.geometry_hits == 6
+    assert presenter.uploads == 1
     target.release()
 
 

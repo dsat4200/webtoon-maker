@@ -76,11 +76,12 @@ def test_prediction_matches_finished_legacy_order(scene, promoted, underlay, ove
         assert actual.pixelColor(260, 240) == QColor("red")
 
 
-def test_prediction_reuses_both_phases_without_legacy_or_effect_work(scene, monkeypatch):
+def test_prediction_reuses_both_phases_without_legacy_or_effect_work(scene, monkeypatch, wait_scene):
     canvas, _, top = scene
     canvas.chapter.add_modifier(OutlineModifier(thickness=5), [("object", top.object_id)])
     canvas._predictive = (QPointF(80, 240), QPointF(160, 240), 24, QColor("green"))
     canvas.grab()
+    wait_scene(canvas)
     calls, requests, _ = watch_effect_work(canvas, monkeypatch)
     def forbidden(*args, **kwargs):
         raise AssertionError("Prediction recaptured the reusable document")

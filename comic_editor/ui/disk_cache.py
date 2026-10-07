@@ -1,6 +1,8 @@
 """Manual navigator caching through the ordinary document render service."""
 from collections import OrderedDict, deque
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
+from dataclasses import replace
 import math
 import time
 
@@ -11,9 +13,12 @@ from PySide6.QtWidgets import (
     QPlainTextEdit, QTreeView, QWidget, QWidgetAction,
 )
 
-from comic_editor.render.cache import PersistentRenderCache, WRITE_BUDGET
-from comic_editor.render.service import TileBatchPolicy, RenderPending, RenderFailed
+from comic_editor.render.cache import PersistentRenderCache
+from comic_editor.render.service import RenderPending, RenderFailed
+from comic_editor.render.scene import SceneSnapshotCompiler
+from comic_editor.render.scheduler import SceneDemand, SceneScheduler
 from comic_editor.ui.cache_dependencies import RenderDependencies
+from comic_editor.ui.color_resources import semantic_color_identity
 
 
 class DiskCacheController(QObject):
@@ -25,7 +30,24 @@ class DiskCacheController(QObject):
         teardown = self._teardown = [None]
         # deleteLater() bypasses closeEvent in tests and during Qt teardown.
         # Capture storage only: QObject children may already be destroyed.
-        self.destroyed.connect(lambda: teardown[0].close() if teardown[0] is not None else None)
+        self.scheduler = SceneScheduler()
+        self.cleanup = ThreadPoolExecutor(max_workers=1,thread_name_prefix='cache-retire')
+        scheduler,cleanup = self.scheduler,self.cleanup
+        def destroy_storage():
+            scheduler.close()
+            if teardown[0] is not None:
+                try:
+                    cleanup.submit(teardown[0].close)
+                except RuntimeError:
+                    pass
+            cleanup.shutdown(wait=False)
+        self.destroyed.connect(destroy_storage)
+        self.compiler = SceneSnapshotCompiler()
+        self._capture = self._snapshot = None
+        self._serial = 0
+        self._maintenance = None
+        self._pending_rows = set()
+        self._evaluation_done = False
         self.building = False
         self.start_y = self.end_y = 0.
         self.status = {}
@@ -55,7 +77,8 @@ class DiskCacheController(QObject):
             self.refresh_ui()
             return
         self.backing = PersistentRenderCache(repository.chapter_root(chapter.chapter_id) / ".render-cache",
-            contract=chapter.pixel_contract.signature, environment=RenderDependencies.environment())
+            contract=chapter.pixel_contract.signature,
+            environment=(*RenderDependencies.environment(), semantic_color_identity(self.canvas, chapter.pixel_contract)))
         self._teardown[0] = self.backing
         self.dependencies = RenderDependencies(self.canvas, self.backing)
         self.canvas._persistent_render_cache = self.backing
@@ -82,13 +105,16 @@ class DiskCacheController(QObject):
             self.canvas.images.render_fingerprint = None
         self.canvas._persistent_render_cache = self.canvas._render_dependencies = None
         if self.backing is not None:
-            self.backing.close()
+            self.cleanup.submit(self.backing.close)
         self._teardown[0] = None
         self.backing = self.dependencies = None
         self.status.clear()
         self._keys.clear()
         self.observed.clear()
         self._status_queue.clear()
+        self._pending_rows.clear()
+        self._serial += 1
+        self._capture = self._snapshot = None
 
     def set_range(self, start, end, *, save=True):
         if self.canvas.chapter is None or self.building:
@@ -124,7 +150,14 @@ class DiskCacheController(QObject):
             chapter.width, min(projection.tile_size, chapter.height - row * projection.tile_size)), 1.)
 
     def tile_key(self, request, configuration):
-        marker = (self.canvas._document_projection.revision, request.address, tuple(configuration[3:]))
+        contract = self.canvas.chapter.pixel_contract
+        color = semantic_color_identity(self.canvas, contract)
+        # Both tiers share this captured policy/resource identity. Updating the
+        # binding also keeps newly saved exact entries reusable after reopening.
+        self.backing.contract = contract.signature
+        self.backing.environment = (*RenderDependencies.environment(), color)
+        marker = (self.canvas._document_projection.revision, request.address,
+                  tuple(configuration[3:]), contract.signature, color)
         key = self._keys.get(marker)
         if key is None:
             previous = self.dependencies.deferred
@@ -137,7 +170,9 @@ class DiskCacheController(QObject):
         return key
 
     def reusable(self, configuration):
-        return (self.backing is not None and not self.canvas._projection_has_live_preview()
+        return (self.backing is not None and (self._maintenance is None or self._maintenance[2] != 'clear')
+                and semantic_color_identity(self.canvas, self.canvas.chapter.pixel_contract) != ('color-resources-pending',)
+                and not self.canvas._projection_has_live_preview()
                 and configuration[7] == ("", 0.) and not configuration[8] and configuration[9] is None)
 
     def lookup_tile(self, request, configuration):
@@ -183,7 +218,7 @@ class DiskCacheController(QObject):
             self.start()
 
     def start(self):
-        if self.backing is None or self.building:
+        if self.backing is None or self.building or self._maintenance is not None:
             return False
         if not self.window.save():
             return False
@@ -196,9 +231,14 @@ class DiskCacheController(QObject):
         self._keys.clear()
         self.backing.error = ""
         self._work = deque(self.selected_rows)
-        side = self.canvas._document_projection.tile_size
-        selected = QRectF(0, self._work[0] * side, self.canvas.chapter.width, len(self._work) * side)
-        self._warm = deque(marker for marker, (region, state) in self.observed.items() if region.intersects(selected))
+        self._serial += 1
+        self._pending_rows.clear()
+        self._evaluation_done = False
+        self.compiler.invalidate()
+        with self.capture():
+            document = self.canvas._render_document_state()
+            self._capture = self.compiler.capture(self.canvas,document)
+        self._snapshot = None
         self.building = True
         self._lock(True)
         self.message = "Caching… edits paused"
@@ -260,9 +300,50 @@ class DiskCacheController(QObject):
             self.building = False
             self._work.clear()
             self._warm.clear()
+            self._capture = self._snapshot = None
+            self.scheduler.cancel()
+            backing,serial = self.backing,self._serial
+            def drain_recording():
+                # Queued after the canceled evaluator: its completed immutable
+                # writes and index publication finish on the detached lane.
+                self.scheduler._close_backend()
+                if backing is None:
+                    return None
+                return self._read_manifest(backing)
+            self._maintenance = self.scheduler.executor.submit(drain_recording),serial,'cancel'
             self._lock(False)
             self.message = "Canceled; completed sections kept"
             self.refresh_ui()
+
+    @staticmethod
+    def _read_manifest(backing):
+        committed = PersistentRenderCache(backing.root,contract=backing.contract,environment=backing.environment)
+        try:
+            return committed.entries,committed.source_digests
+        finally:
+            committed.close()
+
+    def _adopt_manifest(self,manifest):
+        if manifest is None or self.backing is None:
+            return
+        # This GUI binding is a reader. Only the recording owner publishes an
+        # index; reload its committed entries, then validate blobs normally.
+        entries,sources = manifest
+        verified = {identity for identity in self.backing.verified
+            if identity in entries and self.backing.entries.get(identity) == entries[identity]}
+        self.backing.entries,self.backing.source_digests = entries,sources
+        self.backing._root_epoch = self.backing._root_state.epoch
+        self.backing.verified = verified
+        self.backing.reads.clear()
+        self.backing.verifications.clear()
+        self.backing.ready.clear()
+        self.backing.ready_bytes = 0
+        self.dependencies.memo.clear()
+        self.dependencies.tile_memo.clear()
+        self._keys.clear()
+        self._status_queue.extend(row for row in range(math.ceil(self.canvas.chapter.height /
+            self.canvas._document_projection.tile_size)) if row not in self._status_queue)
+        self.canvas._invalidate_scene_cache(projection=False)
 
     def _reset_status(self):
         self._revision = self.canvas._document_projection.revision
@@ -273,6 +354,10 @@ class DiskCacheController(QObject):
         self._status_queue = deque(sorted(range(count), key=lambda row: abs(row - visible)))
 
     def row_ready(self, row):
+        if self.backing is None or (self._maintenance is not None and self._maintenance[2] == 'clear'):
+            return False
+        if semantic_color_identity(self.canvas, self.canvas.chapter.pixel_contract) == ('color-resources-pending',):
+            return False
         with self.capture():
             configuration = (*self.canvas._projection_configuration(), None)
             try:
@@ -286,6 +371,34 @@ class DiskCacheController(QObject):
     def tick(self):
         if self.backing is None:
             return
+        deadline = time.perf_counter() + .008
+        if self._maintenance is not None:
+            future,serial,operation = self._maintenance
+            if not future.done():
+                return
+            self._maintenance = None
+            try:
+                manifest = future.result()
+                if serial == self._serial:
+                    self._adopt_manifest(manifest)
+                    if operation == 'clear':
+                        self._reset_status()
+                        self.message = 'Cache cleared'
+            except Exception as error:
+                if serial == self._serial:
+                    self.backing.error = str(error)
+                    self.message = 'Cache failed: '+str(error)
+            self.refresh_ui()
+        for completion in self.scheduler.poll():
+            if completion.demand.serial != self._serial:
+                continue
+            if completion.cache_manifest is not None:
+                self._adopt_manifest(completion.cache_manifest)
+                self._pending_rows.update(completion.recorded_rows)
+            if completion.error:
+                self.backing.error = completion.error
+            if completion.done:
+                self._evaluation_done = completion.recorded and not completion.error
         changed = self.backing.poll()
         reads_ready = any(future.done() for future in self.backing.reads.values())
         if changed or reads_ready:
@@ -296,41 +409,31 @@ class DiskCacheController(QObject):
             self.cancel()
             self.message = "Cache failed: " + self.backing.error
             self.refresh_ui()
-        deadline = time.perf_counter() + .008
-        if self.building:
-            with self.capture(), self.backing.record():
-                while self._warm and self.backing.write_bytes < WRITE_BUDGET:
-                    marker = self._warm[0]
-                    image = self._warm_value(marker)
-                    if image is not None and not self.backing.retain(*marker, image, state=self.observed[marker][1]):
-                        break
-                    self._warm.popleft()
-                    if time.perf_counter() >= deadline:
-                        break
-                if not self._warm and self._work and self.backing.write_bytes < WRITE_BUDGET:
-                    row = self._work[0]
-                    document = self.canvas._render_document_state()
-                    phases = (None, "base", "top") if self.canvas._show_on_top_plan().entries else (None,)
-                    complete = True
-                    for phase in phases:
-                        requests = self.requests(row)
-                        tiles = self.canvas._render_service.collect_tiles(document, requests,
-                            TileBatchPolicy((document.width / 2, row * 256), deadline), phase=phase, defer_effects=True)
-                        complete &= len(tiles) == len(requests) and all(tile.valid for tile in tiles)
-                    if complete:
-                        # Advance only when every selected final tile is durable.
-                        if self.row_ready(row):
-                            self.status[row] = True
-                            self._work.popleft()
-                        else:
-                            self.status[row] = False
-                    error = self.canvas._render_service.last_error
-                    if error:
-                        self.backing.error = error
-            if not self._work and not self._warm and not self.backing.writes and self.backing.publication is None:
-                self.building = False
-                self._lock(False)
-                self.message = "Cached to disk"
+        if self.building and self._capture is not None:
+            try:
+                with self.capture():
+                    complete = self._capture.advance(.004)
+            except Exception as error:
+                self.backing.error = f'{type(error).__name__}: {error}'
+                self.cancel()
+                self.message = 'Cache failed: ' + self.backing.error
+                self.refresh_ui()
+                return
+            if complete:
+                if self._capture.stale or self._capture.result is None:
+                    self.backing.error = 'Document changed while capturing the cache'
+                else:
+                    snapshot = self._capture.result
+                    # Recording freezes normal durable visibility even when
+                    # the editor currently isolates a selected object or mask.
+                    state = dict(snapshot.state,_solo_entities=set(),_solo_suspended=True,
+                        _disk_cache_capture=True,_live_underlay_object_id='',_live_underlay_amount=0.)
+                    self._snapshot = snapshot = replace(snapshot,state=state)
+                    phases = (None,'base','top') if self.canvas._show_on_top_plan().entries else (None,)
+                    requests = tuple(request for row in self._work for request in self.requests(row))
+                    self.scheduler.submit(SceneDemand(self._serial,snapshot,requests,phases,
+                        (snapshot.document.width/2,self.start_y),record=True))
+                self._capture = None
         checked = 0
         status_changed = False
         while self._status_queue and checked < 8 and time.perf_counter() < deadline:
@@ -338,38 +441,55 @@ class DiskCacheController(QObject):
             ready = self.row_ready(row)
             status_changed |= self.status.get(row) != ready
             self.status[row] = ready
+            if ready and row in self._pending_rows:
+                self._pending_rows.discard(row)
+                try:
+                    self._work.remove(row)
+                except ValueError:
+                    pass
             if not self.status[row] and (self.backing.verifications or self.dependencies.hashes):
                 self._status_queue.append(row)
             checked += 1
         if changed:
             queued = set(self._status_queue)
             self._status_queue.extend(row for row in self.status if row not in queued)
+        if self.building and self._evaluation_done and not self._work:
+            self.building = False
+            self._lock(False)
+            self.message = 'Cached to disk'
         if changed or status_changed or self.building:
             self.refresh_ui()
-        self.timer.setInterval(20 if self.building or self.backing.pending or self._status_queue or self.dependencies.hashes else 150)
+        self.timer.setInterval(20 if self.building or self._maintenance is not None or self.scheduler.busy or
+            self.backing.pending or self._status_queue or self.dependencies.hashes else 150)
 
     def clear(self, *, selected):
         if self.backing is None:
             return
         self.cancel()
-        if selected:
-            rows = set(self.selected_rows)
-            # Source/effect intermediates are shared; clearing a segment also
-            # retires these shared values, leaving other final rows reusable.
-            self.backing.clear(lambda entry: entry["kind"] != "projection" or
-                (len(entry.get("key", ())) > 3 and entry["key"][3] in rows))
-        else:
-            self.backing.clear()
-        self._reset_status()
-        self.message = "Cache cleared"
+        backing,serial,rows = self.backing,self._serial,set(self.selected_rows)
+        def clear_committed():
+            self.scheduler._close_backend()
+            # Reload after any canceled writer has committed, avoiding an
+            # older GUI index overwriting completed immutable sections.
+            committed = PersistentRenderCache(backing.root,contract=backing.contract,environment=backing.environment)
+            try:
+                committed.clear((lambda entry:entry['kind'] != 'projection' or
+                    (len(entry.get('key',())) > 3 and entry['key'][3] in rows)) if selected else None)
+                return committed.entries,committed.source_digests
+            finally:
+                committed.close()
+        self._maintenance = self.scheduler.executor.submit(clear_committed),serial,'clear'
+        self.status.clear()
+        self.message = 'Clearing cache…'
+        self.timer.start(20)
         self.refresh_ui()
 
     def refresh_ui(self):
         panel = self.window.navigator_panel
-        panel.cache_button.setEnabled(self.backing is not None)
+        panel.cache_button.setEnabled(self.backing is not None and self._maintenance is None)
         panel.cache_button.setText("Cancel" if self.building else "Cache to disk")
-        panel.clear_selected_action.setEnabled(self.backing is not None and not self.building)
-        panel.clear_all_action.setEnabled(self.backing is not None and not self.building)
+        panel.clear_selected_action.setEnabled(self.backing is not None and not self.building and self._maintenance is None)
+        panel.clear_all_action.setEnabled(self.backing is not None and not self.building and self._maintenance is None)
         size = self.backing.disk_bytes / (1024 * 1024) if self.backing else 0
         panel.cache_status.setText(f"{size:.1f} MB")
         panel.cache_status.setEnabled(self.backing is not None and not self.building)

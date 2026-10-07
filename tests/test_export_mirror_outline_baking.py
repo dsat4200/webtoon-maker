@@ -215,7 +215,7 @@ def test_rasterize_image_undo_resources_and_opacity(scene):
     assert isinstance(canvas.chapter.objects[obj.object_id], ImageObject)
 
 
-def test_named_export_restart_repeat_cancel_and_failure(qapp, tmp_path, monkeypatch):
+def test_named_export_restart_repeat_cancel_and_failure(qapp, tmp_path, monkeypatch, wait_outputs):
     from comic_editor.core.persistence import SeriesRepository
     from comic_editor.ui.main_window import MainWindow
     repository = SeriesRepository(tmp_path / "Series")
@@ -231,18 +231,28 @@ def test_named_export_restart_repeat_cancel_and_failure(qapp, tmp_path, monkeypa
             return str(destination), "PNG"
         monkeypatch.setattr(QFileDialog, "getSaveFileName", choose)
         window._export_again()
+        wait_outputs(window)
         assert destination.exists() and len(dialogs) == 1
         key = window._export_destination_key()
         assert load_settings().export_destinations[key] == str(destination)
         window._export_again()
+        wait_outputs(window)
         assert len(dialogs) == 1
         saved = destination.read_bytes()
         monkeypatch.setattr(QFileDialog, "getSaveFileName", lambda *a: ("", ""))
         window._export_as()
         assert destination.read_bytes() == saved
         monkeypatch.setattr(QMessageBox, "critical", lambda *a: None)
-        monkeypatch.setattr(window.canvas, "render_preview", lambda *a: (_ for _ in ()).throw(ValueError("test")))
+        monkeypatch.setattr('comic_editor.ui.output_jobs.write_export',
+                            lambda *a, **k: (_ for _ in ()).throw(ValueError('test')))
         window._export_again()
+        from PySide6.QtTest import QTest
+        import time
+        deadline = time.monotonic()+20
+        while window._output_jobs.busy and time.monotonic() < deadline:
+            QTest.qWait(5)
+        assert not window._output_jobs.busy
+        assert isinstance(window._output_jobs.completed[-1][1], ValueError)
         assert destination.read_bytes() == saved
         assert window.settings.export_destinations[key] == str(destination)
     finally:

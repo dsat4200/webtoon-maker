@@ -4,6 +4,7 @@ Run with QT_QPA_PLATFORM=windows to use the installed GL driver. Artwork is
 synthetic and all framebuffer readback belongs to this verification code.
 """
 import ctypes
+import time
 
 import numpy as np
 import pytest
@@ -60,7 +61,7 @@ class CapturedGpuCanvas(GpuCanvasWidget):
 
 
 @pytest.fixture
-def native_scene(qapp, monkeypatch):
+def native_scene(qapp, monkeypatch, wait_scene):
     if QGuiApplication.platformName() in {"offscreen", "minimal"}:
         pytest.skip("Native OpenGL widget requires a desktop Qt backend")
     # The scene is entirely synthetic; external-image downloading is unrelated
@@ -88,8 +89,11 @@ def native_scene(qapp, monkeypatch):
         canvas.close()
         canvas.deleteLater()
         pytest.skip("No valid native OpenGL widget")
+    wait_scene(canvas)
     yield canvas
     if isValid(canvas):
+        canvas._scene_controller.reset()
+        canvas._scene_controller.scheduler.close()
         canvas._effect_jobs.cancel()
         presenter = getattr(canvas, "_document_tile_presenter", None)
         if presenter is not None:
@@ -103,6 +107,25 @@ def assert_pixel(canvas, x, y, color):
     ratio = canvas.devicePixelRatioF()
     np.testing.assert_allclose(canvas.frame_pixels[round(y * ratio), round(x * ratio)],
                                color, atol=1)
+
+
+def wait_native_mask_frame(canvas, qapp, wait_scene):
+    """Capture the matching detached artwork and mask presentation resources."""
+    wait_scene(canvas, timeout=60)
+    deadline = time.monotonic() + 60
+    while time.monotonic() < deadline:
+        frames = canvas.frames
+        canvas.update()
+        qapp.processEvents()
+        controller = getattr(canvas, '_mask_overlay_controller', None)
+        assert controller is None or controller.error is None, controller.error
+        if (controller is not None and controller.ready_key == controller.key(controller.context())
+                and not controller.jobs.pending and controller.jobs.active is None
+                and canvas.frames > frames and not canvas._projection_frame_pending
+                and canvas._projection_presented_revision == canvas._document_projection.revision):
+            return
+        time.sleep(.002)
+    pytest.fail('Matching native mask presentation did not finish')
 
 
 def test_native_canvas_displays_retained_artwork_and_reuses_navigation(native_scene, qapp):
@@ -149,7 +172,7 @@ def test_small_native_update_preserves_overlay_outside_dirty_region(native_scene
 
 @pytest.mark.parametrize("smudge_preview", [False, True], ids=["retained-tiles", "smudge-preview"])
 def test_collected_previous_frame_cannot_end_current_native_painter(native_scene, qapp, monkeypatch,
-                                                                  smudge_preview):
+                                                                  smudge_preview, wait_scene):
     """Caught effect tracebacks may outlive their frame and be collected mid-paint."""
     import gc
 
@@ -160,6 +183,8 @@ def test_collected_previous_frame_cannot_end_current_native_painter(native_scene
         modifier = DistortModifier(modifier_type="distort_smudge", frame=(0, 0, 1024, 1024))
         canvas.chapter.add_modifier(modifier, [("object", artwork.object_id)])
         canvas._smudge_parameter_drag_id = modifier.modifier_id
+        canvas.documentChanged.emit(None)
+        wait_scene(canvas)
     frame = canvas._paint_canvas_frame
     retained = []
     old_painters = []
@@ -198,7 +223,7 @@ def test_collected_previous_frame_cannot_end_current_native_painter(native_scene
     assert_pixel(canvas, 12, 12, [0, 255, 0, 255])
 
 
-def test_native_radial_handle_stays_responsive_until_final_exact_frame(native_scene, qapp, monkeypatch):
+def test_native_radial_handle_stays_responsive_until_final_exact_frame(native_scene, qapp, monkeypatch, wait_scene):
     from threading import Event, get_ident
     from comic_editor.ui import radial_blur
 
@@ -210,7 +235,7 @@ def test_native_radial_handle_stays_responsive_until_final_exact_frame(native_sc
     canvas.modifier_mode, canvas.active_modifier_id = True, modifier.modifier_id
     canvas.documentChanged.emit(None)
     canvas.update()
-    qapp.processEvents()
+    wait_scene(canvas)
     before = canvas.frame_pixels.copy()
     center, end = canvas._radial_handle_points(modifier)
     assert canvas._begin_modifier_handle(end)
@@ -220,7 +245,7 @@ def test_native_radial_handle_stays_responsive_until_final_exact_frame(native_sc
     def blocked(*args, **kwargs):
         assert get_ident() != gui, "Native handle drag ran radial integration on the GUI thread"
         entered.set()
-        assert release.wait(5)
+        assert release.wait(10)
         return original(*args, **kwargs)
 
     monkeypatch.setattr(radial_blur, "radial_blur", blocked)
@@ -229,27 +254,26 @@ def test_native_radial_handle_stays_responsive_until_final_exact_frame(native_sc
         canvas._flush_radial_handle()
         frames = canvas.frames
         canvas.update()
-        qapp.processEvents()
-        assert entered.wait(2)
+        deadline = time.monotonic()+2
+        while not entered.is_set() and time.monotonic() < deadline:
+            qapp.processEvents()
+            time.sleep(.002)
+        assert entered.is_set()
         assert canvas.frames > frames and canvas._projection_frame_pending
-        assert canvas._effect_jobs.running is not None
+        assert canvas._scene_controller.scheduler.busy
         canvas._finish_modifier_handle()
         canvas.update()
         qapp.processEvents()
-        assert canvas._projection_can_defer_effects()
         assert canvas._projection_frame_pending
     finally:
         release.set()
-    canvas._effect_jobs.running[3].result(timeout=30)
-    canvas._effect_jobs.poll()
-    canvas.update()
-    qapp.processEvents()
+    wait_scene(canvas, timeout=60)
     assert not canvas._projection_frame_pending
     assert canvas._projection_presented_revision == canvas._document_projection.revision
     assert np.any(canvas.frame_pixels != before)
 
 
-def test_native_intensity_gradient_pen_edit_reuses_full_quality_blur(native_scene, qapp, monkeypatch):
+def test_native_intensity_gradient_pen_edit_reuses_full_quality_blur(native_scene, qapp, monkeypatch, wait_scene):
     from comic_editor.ui import radial_blur
     canvas = native_scene
     artwork = next(iter(canvas.chapter.objects.values()))
@@ -263,26 +287,23 @@ def test_native_intensity_gradient_pen_edit_reuses_full_quality_blur(native_scen
     canvas._mask_gradient_move(QPointF(900, 512))
     canvas._finish_mask_gradient()
     # Warm exact artwork before testing the actual interactive paintEvent.
-    canvas._projection_async_enabled = False
     canvas.update()
-    qapp.processEvents()
+    wait_native_mask_frame(canvas, qapp, wait_scene)
     before = canvas.frame_pixels.copy()
-    canvas._projection_async_enabled = True
     def forbidden(*_args, **_kwargs):
         raise AssertionError("Intensity-gradient edit repeated angular integration")
     monkeypatch.setattr(radial_blur, "radial_blur", forbidden)
     canvas._mask_gradient_press(QPointF(900, 512))
     canvas._pen_contact_active = True
     canvas._mask_gradient_move(QPointF(600, 512))
-    assert canvas._projection_can_defer_effects()
     canvas.update()
-    qapp.processEvents()
-    assert not canvas._projection_frame_pending
+    wait_native_mask_frame(canvas, qapp, wait_scene)
+    assert canvas.active_mask_gradient().line_field.geometry.nodes[-1].position == (600., 512.)
     assert np.any(canvas.frame_pixels != before)
     canvas._finish_mask_gradient()
     canvas._pen_contact_active = False
     canvas.update()
-    qapp.processEvents()
+    wait_native_mask_frame(canvas, qapp, wait_scene)
     assert not canvas._projection_frame_pending
     assert canvas._projection_presented_revision == canvas._document_projection.revision
     assert canvas._effect_jobs.running is None and not canvas._effect_jobs.pending
@@ -340,7 +361,7 @@ def test_rotated_grid_preserves_raster_antialiasing_without_rebuilding_artwork(n
     assert canvas._projection_grid_cache[1].cacheKey() == image_key
 
 
-def test_native_prediction_between_retained_phases_keeps_top_art_and_ui(native_scene, qapp, monkeypatch):
+def test_native_prediction_between_retained_phases_keeps_top_art_and_ui(native_scene, qapp, monkeypatch, wait_scene):
     canvas = native_scene
     top = next(iter(canvas.chapter.objects.values()))
     top.show_on_top = True
@@ -350,7 +371,7 @@ def test_native_prediction_between_retained_phases_keeps_top_art_and_ui(native_s
     canvas._predictive = (QPointF(350, 450), QPointF(600, 450), 30, QColor("green"))
     canvas._invalidate_scene_cache()
     canvas.update()
-    qapp.processEvents()
+    wait_scene(canvas)
     assert canvas._document_presentation_stats.backend == "gpu"
     assert canvas._scene_cache.isNull()
     assert_pixel(canvas, 225, 225, [0, 0, 255, 255])
@@ -370,3 +391,85 @@ def test_native_prediction_between_retained_phases_keeps_top_art_and_ui(native_s
         assert presenter.uploads == uploads
         assert canvas._document_projection.renders == renders
         assert canvas._document_presentation_stats.uploads == 0
+
+
+@pytest.mark.parametrize('erasing', [False, True])
+@pytest.mark.parametrize('scale,rotation', [(1., 0.), (.73, 17.)])
+def test_prepared_native_contact_batch_matches_qpainter_images_and_reuses_textures(
+        native_scene, qapp, monkeypatch, wait_scene, erasing, scale, rotation):
+    """Only the display edge changes; native composed patch bytes are retained."""
+    from threading import Event
+    from comic_editor.ui.canvas import ToolKind
+    import comic_editor.ui.raster_feedback as feedback_ui
+
+    canvas = native_scene
+    page = canvas.chapter.layers[canvas.chapter.root_page_ids[0]]
+    page.bound = BoundGeometry.circle(512.25, 512.75, 490.5)
+    page.border_width, page.border_color = 4., '#ffcc8800'
+    drawing = canvas.chapter.add_object(page.layer_id, RasterObject(x=-239., y=-227., opacity=.5))
+    # A retained native source spanning odd/negative placement and tile seams.
+    for y in range(1, 4):
+        for x in range(1, 4):
+            tile = QImage(256, 256, QImage.Format_ARGB32_Premultiplied)
+            tile.fill(QColor('#7f800080') if erasing else Qt.transparent)
+            canvas.tiles.set_tile(drawing.object_id, (x, y), tile)
+    canvas.set_selection('object', drawing.object_id)
+    canvas.set_tool(ToolKind.RASTER_ERASER if erasing else ToolKind.RASTER_PENCIL)
+    canvas.settings.predictive_ink = not erasing
+    canvas.primary_color = '#ff00aa33'
+    canvas.settings.brush_size = 24
+    canvas.scale, canvas.rotation = scale / canvas.devicePixelRatioF(), rotation
+    canvas._invalidate_scene_cache()
+    wait_scene(canvas)
+    assert canvas._scene_controller.feedback is not None
+    release = Event()
+    scheduler = canvas._scene_controller.scheduler
+    evaluate = scheduler._evaluate_admitted
+    def blocked(*args):
+        assert release.wait(20)
+        return evaluate(*args)
+    monkeypatch.setattr(scheduler, '_evaluate_admitted', blocked)
+    try:
+        canvas._begin_stroke(QPointF(500, 512), 1.)
+        canvas._continue_stroke(QPointF(570, 512), .7)
+        before = canvas.frames
+        canvas.update()
+        deadline = time.monotonic() + 2
+        while canvas.frames == before and time.monotonic() < deadline:
+            qapp.processEvents()
+            time.sleep(.002)
+        assert canvas.frames > before and canvas._raster_feedback_contact_covered
+        batch = canvas.frame_pixels.copy()
+        presenter = canvas._document_tile_presenter
+        feedback_textures = [key for key in presenter._textures
+                             if isinstance(key[0], tuple) and key[0][0] == 'raster-feedback']
+        assert feedback_textures, 'Current contact must use retained native presentation'
+        uploads = presenter.uploads
+        canvas.update()
+        qapp.processEvents()
+        assert presenter.uploads == uploads
+        np.testing.assert_array_equal(canvas.frame_pixels, batch)
+        # Original native Qt image presentation, using exactly the same patch
+        # buffers/gutters. Filtering may differ by one display byte; artwork
+        # bytes and the final exact document path are unchanged.
+        def qt_images(painter, tiles, camera, size, *, owner, smooth, clip_world):
+            painter.save()
+            try:
+                painter.setTransform(camera)
+                painter.setClipRect(clip_world, Qt.IntersectClip)
+                painter.setRenderHint(QPainter.SmoothPixmapTransform, smooth)
+                for tile in tiles:
+                    painter.drawImage(tile.world_rect, tile.image, tile.source_rect)
+            finally:
+                painter.restore()
+        monkeypatch.setattr(feedback_ui, 'draw_document_tiles', qt_images)
+        canvas.update()
+        qapp.processEvents()
+        np.testing.assert_allclose(canvas.frame_pixels, batch, atol=1)
+        assert canvas._raster_feedback_contact_covered
+        canvas._end_stroke()
+    finally:
+        release.set()
+    wait_scene(canvas)
+    assert not canvas._projection_frame_pending
+    assert not canvas._projection_provisional_visible

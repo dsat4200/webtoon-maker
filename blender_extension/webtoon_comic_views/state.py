@@ -326,6 +326,13 @@ CAMERA_FIELDS = (
     "shift_x", "shift_y", "clip_start", "clip_end", "ortho_scale",
     "dof.use_dof", "dof.focus_distance", "dof.aperture_fstop",
     "dof.aperture_blades", "dof.aperture_rotation", "dof.aperture_ratio",
+    "spatial_optics.enabled", "spatial_optics.ray_step",
+    "spatial_optics.max_steps", "spatial_optics.max_portal_depth",
+)
+SPATIAL_EFFECT_FIELDS = (
+    "type", "enabled", "profile", "strength", "core_fraction", "twist",
+    "frequency", "phase", "portal_mode", "portal_shape", "portal_depth",
+    "portal_sectors", "portal_phase", "portal_zoom", "portal_twist", "two_sided",
 )
 LIGHT_FIELDS = (
     "type", "energy", "color", "use_shadow", "specular_factor",
@@ -444,6 +451,7 @@ def capture_state(
     cameras: list[dict[str, Any]] = []
     lights: list[dict[str, Any]] = []
     fallback_warnings: set[str] = set()
+    spatial_defaults: dict[str, Any] | None = None
 
     def note_linked(value: object, label: str) -> None:
         if _editable(value):
@@ -470,6 +478,26 @@ def capture_state(
             "hidden_in_view_layer": bool(obj.hide_get(view_layer=view_layer)),
             "custom_properties": _custom_properties(obj),
         })
+        effect = getattr(obj, "spatial_effect", None)
+        if effect is not None:
+            if spatial_defaults is None:
+                spatial_defaults = {
+                    name: effect.bl_rna.properties[name].default
+                    for name in SPATIAL_EFFECT_FIELDS
+                    if name in effect.bl_rna.properties
+                }
+            values = _attrs(effect, SPATIAL_EFFECT_FIELDS)
+            target = effect.portal_target
+            # Keep ordinary objects compact, but retain NONE so an older panel
+            # cannot inherit an optical role added to an existing object later.
+            objects[-1]["spatial_effect"] = (
+                {"type": "NONE"} if values == spatial_defaults and target is None
+                else values
+            )
+            if len(objects[-1]["spatial_effect"]) > 1:
+                objects[-1]["spatial_effect_target_uuid"] = (
+                    ensure_uuid(target) if target is not None else ""
+                )
         if obj.pose is not None:
             for bone in obj.pose.bones:
                 poses.append({
@@ -907,6 +935,15 @@ def apply_state(
             continue
         _apply_transform(obj, item.get("transform", {}), obj=True)
         _set_custom_properties(obj, item.get("custom_properties", {}))
+        effect = getattr(obj, "spatial_effect", None)
+        if effect is not None and "spatial_effect" in item:
+            _apply_attrs(effect, item["spatial_effect"])
+            if "spatial_effect_target_uuid" in item:
+                target_uuid = item["spatial_effect_target_uuid"]
+                target = objects.get(target_uuid) if target_uuid else None
+                if target_uuid and target is None:
+                    warnings.append(f"Missing linked portal for {obj.name}")
+                effect.portal_target = target
         stored_custom = set(item.get("custom_properties", {}))
         for key in _custom_properties(obj):
             if key not in stored_custom:

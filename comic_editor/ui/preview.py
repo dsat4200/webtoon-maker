@@ -14,6 +14,10 @@ class ChapterPreview(QWidget):
     def __init__(self, canvas, parent=None):
         super().__init__(parent)
         self.canvas = canvas
+        self._navigator_jobs = None
+        if hasattr(canvas, "_scene_snapshot_compiler"):
+            from comic_editor.ui.navigator_jobs import NavigatorJobs
+            self._navigator_jobs = NavigatorJobs(self)
         self.disk_cache = None
         self._cache_drag = None
         self._cache = QImage()
@@ -38,12 +42,16 @@ class ChapterPreview(QWidget):
         canvas.interactionFinished.connect(self._schedule_refresh)
 
     def invalidate_all(self) -> None:
+        if self._metadata_notice():
+            return
         self._abandon_build()
         self._dirty_full = True
         self._dirty_bands.clear()
         self._schedule_refresh()
 
     def invalidate(self, world_rect) -> None:
+        if self._metadata_notice():
+            return
         self._abandon_build()
         chapter = self.canvas.chapter
         if (
@@ -66,12 +74,24 @@ class ChapterPreview(QWidget):
             self._dirty_bands[:] = [dirty]
         self._schedule_refresh()
 
+    def _metadata_notice(self) -> bool:
+        """Legacy notifications retain their API without refreshing artwork."""
+        commands = getattr(self.canvas, "command_stack", None)
+        change = getattr(commands, "applying_change", None)
+        if change is None or change.conservative or change.structural or change.resources:
+            return False
+        from comic_editor.core.changes import EDITOR_FIELDS
+        return (not (change.document_fields - EDITOR_FIELDS)
+                and all(not item.affects_artwork for item in change.entities))
+
     def _schedule_refresh(self) -> None:
         if self.isVisible() and (self._dirty_full or self._dirty_bands or not self._pending_image.isNull()):
             self._refresh_timer.start(self.REFRESH_DELAY_MS)
 
     def _abandon_build(self) -> None:
         """Keep the uncommitted region dirty if content changes between bands."""
+        if self._navigator_jobs is not None:
+            self._navigator_jobs.cancel()
         if self._pending_image.isNull():
             return
         self._dirty_full |= self._pending_full
@@ -110,6 +130,9 @@ class ChapterPreview(QWidget):
             return
         if self._interaction_active():
             self._schedule_refresh()
+            return
+        if self._navigator_jobs is not None:
+            self._navigator_jobs.request()
             return
         size = self.content_rect().size()
         if (not self._pending_image.isNull() and

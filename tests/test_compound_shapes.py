@@ -33,12 +33,12 @@ def _compound_canvas():
 
 
 def test_compound_geometry_scan_waits_for_a_path_request(qapp, monkeypatch):
-    import comic_editor.ui.canvas as canvas_module
+    import comic_editor.render.scene_kernels as kernels_module
 
     canvas, chapter, page, root = _compound_canvas()
     calls = []
-    original = canvas_module.geometry_key
-    monkeypatch.setattr(canvas_module, "geometry_key", lambda bound: (
+    original = kernels_module.geometry_key
+    monkeypatch.setattr(kernels_module, "geometry_key", lambda bound: (
         calls.append(bound), original(bound)
     )[1])
     try:

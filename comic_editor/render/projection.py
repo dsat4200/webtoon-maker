@@ -68,6 +68,7 @@ class ProjectionTile:
     image: QImage
     revision: int
     valid: bool = True
+    pixel_environment: object = None
 
 
 class DocumentProjection:
@@ -138,6 +139,27 @@ class DocumentProjection:
         right, bottom = math.ceil(world.right() / side), math.ceil(world.bottom() / side)
         return [ProjectionRequest(ProjectionAddress(level, x, y), self.tile_size, self.gutter)
                 for y in range(top, bottom) for x in range(left, right)]
+
+    def adopt(self, request, image, *, configuration, document, revision, pixel_environment=None):
+        """Admit an already completed ordinary tile without evaluating pixels."""
+        if (document != self._document or revision != self.revision or image.isNull()):
+            return False
+        if image.width() != request.pixel_size or image.height() != request.pixel_size:
+            raise ValueError("Completed projection tile has the wrong dimensions")
+        tiles = self._configurations.setdefault(configuration, OrderedDict())
+        previous = tiles.pop(request.address, None)
+        if previous is not None:
+            self.bytes -= previous.image.sizeInBytes()
+        tiles[request.address] = ProjectionTile(request, image, revision, pixel_environment=pixel_environment)
+        self.bytes += image.sizeInBytes()
+        self.renders += 1
+        return True
+
+    def ready(self, requests, *, configuration):
+        """Return finished resident tiles. This method cannot invoke a renderer."""
+        tiles = self._configurations.get(configuration, {})
+        return [tile for request in requests if (tile := tiles.get(request.address)) is not None
+                and tile.valid and not tile.image.isNull()]
 
     def collect(self, requests: list[ProjectionRequest],
                 render: Callable[[ProjectionRequest], tuple[QImage, bool]], *,

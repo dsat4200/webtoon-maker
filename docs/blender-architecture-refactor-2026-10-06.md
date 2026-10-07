@@ -2,6 +2,8 @@
 
 October 6, 2026
 
+The subsequent implementation and verification are recorded in the [implementation report](blender-architecture-implementation-2026-10-06.md). The analysis and baseline below describe the original checkout.
+
 Webtoon Maker should evolve toward a renderer that consumes versioned scene inputs independently of the canvas, with short input callbacks, explicit dependencies, retained CPU and GPU results, and bounded background work. Python and Qt can remain the application shell. The largest architectural opportunity is removing scene preparation and evaluation from the path that receives input and presents frames.
 
 The current application already has retained native document tiles, regional effect evaluation, parallel CPU effects, a dedicated graphics worker, lazy source storage, focused history patches, and asynchronous recovery saves. A large refactor should develop these components into a coherent system. Replacing them would discard useful correctness and ownership work.

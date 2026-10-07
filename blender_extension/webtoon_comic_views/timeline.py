@@ -249,6 +249,12 @@ def snapshot_channels(
                 result, obj, field, record.get(field), f"{obj.name}.{field}",
                 lookup=lookup,
             )
+        for field, value in record.get("spatial_effect", {}).items():
+            _add_channel(
+                result, obj, f"spatial_effect.{field}", value,
+                f"{obj.name}.spatial_effect.{field}",
+                strict_driver=True, lookup=lookup,
+            )
         for name, value in record.get("custom_properties", {}).items():
             path = f'["{_escape(name)}"]'
             _add_channel(
@@ -1025,7 +1031,17 @@ def verify_snapshot(
     scene: bpy.types.Scene, snapshot: dict[str, Any], *, limit: int = 20,
 ) -> list[str]:
     failures: list[str] = []
+    driver_cache: dict[int, set[tuple[str, int]]] = {}
     for channel in snapshot_channels(scene, snapshot).values():
+        # Match prepare_bake: rig outputs are evaluated from saved controllers,
+        # not keyed or required to reproduce a stale captured driver result.
+        # Camera and explicitly registered properties retain strict checking.
+        if not channel.strict_driver:
+            pointer = channel.key.owner_pointer
+            if pointer not in driver_cache:
+                driver_cache[pointer] = _active_drivers(channel.owner)
+            if (channel.key.data_path, channel.key.array_index) in driver_cache[pointer]:
+                continue
         actual = _read_channel(channel)
         if actual is None or abs(actual - channel.value) > VALUE_EPSILON:
             failures.append(channel.label)

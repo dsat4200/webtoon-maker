@@ -153,8 +153,9 @@ def test_native_qt_paints_are_timed_and_stop_restores_every_probe(editor, contro
     phases = _phases(controller)
     assert phases["canvas.paintEvent"]["count"] >= 1
     assert phases["canvas.paint_document_projection"]["count"] >= 1
-    assert phases["navigator.render"]["count"] >= 1
-    assert phases["canvas.render_preview"]["count"] >= 1
+    assert phases["navigator.request"]["count"] >= 1
+    assert phases["scene.request"]["count"] >= 1
+    assert "canvas.render_preview" not in phases
     assert controller._counts["paint.request"] >= 1
     controller.stop()
     assert not controller.enabled and not controller.timer.isActive()

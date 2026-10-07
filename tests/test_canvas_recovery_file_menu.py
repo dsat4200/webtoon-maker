@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 import json
+from threading import Event, get_ident
 from datetime import datetime
 from pathlib import Path
 
-from PySide6.QtCore import QPointF, Qt
+from PySide6.QtCore import QPointF, QTimer, Qt
 from PySide6.QtGui import QColor, QImage
 from PySide6.QtWidgets import QFileDialog, QInputDialog, QMessageBox, QToolButton
 
@@ -92,7 +93,7 @@ def test_file_menu_replaces_project_file_controls_and_handles_stale_recent(
 
 
 def test_export_png_uses_full_chapter_size_and_collision_suffix(
-    qapp, tmp_path, monkeypatch,
+    qapp, tmp_path, monkeypatch, wait_outputs,
 ):
     monkeypatch.setattr(main_window_module, "save_settings", lambda _value: None)
     repository = SeriesRepository(tmp_path / "Series")
@@ -110,6 +111,7 @@ def test_export_png_uses_full_chapter_size_and_collision_suffix(
     try:
         window._export_png()
         window._export_png()
+        wait_outputs(window)
         exports = sorted((repository.root / "exports").glob("*.png"))
         assert [path.name for path in exports] == [
             "Bad-Name-20260816-123456-2.png",
@@ -278,6 +280,9 @@ def test_save_as_clones_open_state_rebinds_project_and_excludes_recovery(
         assert asset_session.key != original_asset_key
         assert window.canvas.command_stack is asset_stack
         assert series_session.canvas_state.command_stack is series_stack
+        assert all(path.is_relative_to(destination.resolve())
+            for owner in series_session.tiles._tiles.values()
+            for path in owner.entries.values() if isinstance(path, Path))
         assert window.settings.recent_series[0] == str(destination.resolve())
 
         assert window.sessions[unrelated_key] is unrelated_session
@@ -319,7 +324,7 @@ def test_save_as_failure_removes_only_staging_and_keeps_original_bindings(
             lambda _parent, _title, message, *args, **kwargs: errors.append(message),
         )
         monkeypatch.setattr(
-            window, "_write_session_to_clone",
+            main_window_module, "write_series_clone",
             lambda *args, **kwargs: (_ for _ in ()).throw(
                 RuntimeError("injected clone failure")
             ),
@@ -335,4 +340,66 @@ def test_save_as_failure_removes_only_staging_and_keeps_original_bindings(
         assert window.repository.root == source.root
         assert window.canvas.command_stack is original_stack
     finally:
+        _dispose(window)
+
+
+def test_save_as_owns_writer_snapshot_and_keeps_newer_edits_dirty(qapp, tmp_path, monkeypatch):
+    import pytest
+    from comic_editor.ui.autosave import RecoverySnapshot
+    monkeypatch.setattr(main_window_module, 'save_settings', lambda _value: None)
+    source, _series, _chapter, _manifest = _repository_with_asset(tmp_path/'Source')
+    window = MainWindow()
+    assert window.open_series(source.root)
+    session = window.active_session
+    raster = next(obj for obj in session.chapter.objects.values() if isinstance(obj, RasterObject))
+    session.tiles.paint_dab(raster.object_id, QPointF(40, 40), 12, QColor('red'), antialias=False)
+    window._mark_dirty(None)
+    captured_revision = session.edit_revision
+    owner, calls = get_ident(), []
+    entered, release = Event(), Event()
+    original_clone = SeriesRepository.clone_to
+    original_write = RecoverySnapshot.write
+    original_serialize = type(session.chapter).to_dict
+    def serialize(chapter):
+        assert get_ident() != owner, 'Save As serialized a chapter on the GUI thread'
+        return original_serialize(chapter)
+    def clone(*args, **kwargs):
+        calls.append(('clone', get_ident()))
+        entered.set()
+        assert release.wait(5)
+        return original_clone(*args, **kwargs)
+    def write(snapshot):
+        calls.append(('write', get_ident()))
+        return original_write(snapshot)
+    monkeypatch.setattr(type(session.chapter), 'to_dict', serialize)
+    monkeypatch.setattr(SeriesRepository, 'clone_to', clone)
+    monkeypatch.setattr(RecoverySnapshot, 'write', write)
+    monkeypatch.setattr(QFileDialog, 'getExistingDirectory', lambda *_a, **_k: str(tmp_path))
+    monkeypatch.setattr(QInputDialog, 'getText', lambda *_a, **_k: ('Clone', True))
+    monkeypatch.setattr(QMessageBox, 'critical', lambda _p, _t, message, *_a: pytest.fail(message))
+    def edit_when_started():
+        if not entered.is_set():
+            QTimer.singleShot(1, edit_when_started)
+            return
+        session.tiles.paint_dab(raster.object_id, QPointF(40, 40), 12, QColor('blue'), antialias=False)
+        window._mark_dirty(None)
+        release.set()
+    QTimer.singleShot(0, edit_when_started)
+    try:
+        assert window._save_as()
+        assert calls and all(thread != owner for _action, thread in calls)
+        assert {action for action, _thread in calls} == {'clone', 'write'}
+        assert session.context.repository.root == (tmp_path/'Clone').resolve()
+        assert session.edit_revision > captured_revision
+        assert session.dirty and window._dirty
+        assert session.tiles.tile(raster.object_id, (0, 0)).pixelColor(40, 40) == QColor('blue')
+        # Reopening invokes the public validator, so restore the spy first.
+        monkeypatch.setattr(type(session.chapter), 'to_dict', original_serialize)
+        _cloned_chapter, cloned_tiles = SeriesRepository(tmp_path/'Clone').load_chapter(session.chapter.chapter_id)
+        assert cloned_tiles.tile(raster.object_id, (0, 0)).pixelColor(40, 40) == QColor('red')
+        assert window.save(wait=True)
+        _saved_chapter, saved_tiles = SeriesRepository(tmp_path/'Clone').load_chapter(session.chapter.chapter_id)
+        assert saved_tiles.tile(raster.object_id, (0, 0)).pixelColor(40, 40) == QColor('blue')
+    finally:
+        release.set()
         _dispose(window)

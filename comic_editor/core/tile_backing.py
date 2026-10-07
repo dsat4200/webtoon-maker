@@ -50,6 +50,14 @@ class PrefetchedPins:
     def done(self):
         return self.future.done()
 
+    def ready_pin(self, identifier, key):
+        """Read a completed address without starting or waiting for file IO."""
+        with self.lock:
+            future = self.values.get((identifier, key))
+        if future is None or not future.done():
+            return None
+        return future.result()
+
     def result(self):
         return self.future.result()
 
@@ -165,7 +173,9 @@ class TileResidency:
             image = QImage(str(path))
             if image.isNull():
                 raise OSError(f'Unable to read raster tile {path}')
-            image = image.convertToFormat(QImage.Format_ARGB32_Premultiplied)
+            from .pixel_arrays import image_has_high_precision
+            if not image_has_high_precision(image):
+                image = image.convertToFormat(QImage.Format_ARGB32_Premultiplied)
         self.decodes += 1
         self.retain(owner, key, image)
         return image
@@ -189,9 +199,11 @@ class DiskTileMap(MutableMapping):
         self.versions = {}
         self.content_keys = {}
         self.snapshot_pins = {}
+        self.pending_snapshot_pins = {}
 
     def register(self, key, path):
         self.snapshot_pins.pop(key, None)
+        self.pending_snapshot_pins.pop(key, None)
         self.entries[key] = Path(path)
         self.versions[key] = 0
 
@@ -199,6 +211,7 @@ class DiskTileMap(MutableMapping):
         content_key = int(image.cacheKey())
         if content_key != original_key and key in self.entries:
             self.snapshot_pins.pop(key, None)
+            self.pending_snapshot_pins.pop(key, None)
             self.entries[key] = EditableTile()
             self.content_keys[key] = content_key
             self.versions[key] = self.versions.get(key, 0) + 1
@@ -219,15 +232,20 @@ class DiskTileMap(MutableMapping):
             self.residency.remove(self, key)
 
     def __getitem__(self, key):
+        # A resident borrower already owns its pixels. Pending snapshot file
+        # ownership must not delay painting or force filesystem work here.
+        if (self, key) in self.residency.entries:
+            return self.residency.get(self, key, self.entries[key])
         self.residency.prepare(self, key)
         value = self.entries[key]
         if isinstance(value, Path):
-            pin = self.snapshot_pins.get(key)
+            pin = self.snapshot_pin(key)
             return self.residency.get(self, key, pin.path if pin is not None else value)
         return self.residency.get(self, key, value)
 
     def __setitem__(self, key, image):
         self.snapshot_pins.pop(key, None)
+        self.pending_snapshot_pins.pop(key, None)
         self.entries[key] = EditableTile()
         self.content_keys[key] = int(image.cacheKey())
         self.residency.retain(self, key, image)
@@ -236,10 +254,18 @@ class DiskTileMap(MutableMapping):
 
     def __delitem__(self, key):
         self.snapshot_pins.pop(key, None)
+        self.pending_snapshot_pins.pop(key, None)
         del self.entries[key]
         self.residency.remove(self, key)
         self.versions[key] = self.versions.get(key, 0) + 1
         self.changed((self.object_id, *key))
+
+    def clear(self):
+        # MutableMapping.clear() first reads each value through popitem().
+        # Retiring a cold mapping must only discard its ownership; decoding
+        # originals here would turn prepared replacement back into GUI IO.
+        for key in tuple(self.entries):
+            del self[key]
 
     def __iter__(self):
         return iter(self.entries)
@@ -250,9 +276,37 @@ class DiskTileMap(MutableMapping):
     def __contains__(self, key):
         return key in self.entries
 
+    def snapshot_pin(self, key, *, ready_only=False):
+        """Adopt a captured pin on the owner thread, only for matching pixels.
+
+        The pending job keeps the original alive before save completion, even
+        when the writer has already removed its recovery filename. Capture
+        only adopts ready addresses; a cold visible read can prioritize its IO.
+        """
+        pin = self.snapshot_pins.get(key)
+        if pin is not None:
+            self.pending_snapshot_pins.pop(key, None)
+            return pin
+        pending = self.pending_snapshot_pins.get(key)
+        if pending is None:
+            return None
+        version, path, job = pending
+        if (self.version(key), self.entries.get(key)) != (version, path):
+            self.pending_snapshot_pins.pop(key, None)
+            return None
+        if ready_only:
+            pin = job.ready_pin(self.object_id, key)
+            if pin is None:
+                return None
+        else:
+            pin = job.pin(self.object_id, key)
+        self.snapshot_pins[key] = pin
+        self.pending_snapshot_pins.pop(key, None)
+        return pin
+
     def backing(self, key):
         value = self.entries.get(key)
         if not isinstance(value, Path):
             return None
-        pin = self.snapshot_pins.get(key)
+        pin = self.snapshot_pin(key)
         return pin.path if pin is not None else value

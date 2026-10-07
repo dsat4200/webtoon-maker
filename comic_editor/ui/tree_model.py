@@ -14,6 +14,7 @@ from comic_editor.core.models import (
     ChapterDocument, GradientObject, ImageObject, LayerNode, SpeedLinesGradientObject,
     RasterObject, TextObject, VectorDrawingObject,
 )
+from comic_editor.core.document_patch import RecordSnapshot
 
 
 @dataclass
@@ -59,6 +60,7 @@ class HierarchyModel(QAbstractItemModel):
         super().__init__(parent)
         self.chapter = chapter
         self.prepare_text_move = None
+        self.focused_mutations = False
         self.root = TreeItem("root", "")
         self._items: dict[tuple[str, str], TreeItem] = {}
         self.link_highlights: set[tuple[str, str]] = set()
@@ -78,6 +80,24 @@ class HierarchyModel(QAbstractItemModel):
         self.beginResetModel()
         self._build()
         self.endResetModel()
+
+    def apply_change(self, change) -> None:
+        """Keep indices and scroll position when only existing row data changes."""
+        if change.hierarchy_changed:
+            self.rebuild()
+            return
+        for item in change.entities:
+            index = self.index_for_entity(*item.entity)
+            if not index.isValid():
+                continue
+            if item.fields <= {'name', 'custom_name', 'text'}:
+                last = index
+            elif item.fields <= {'opacity', 'opacity_locked'}:
+                index = index.siblingAtColumn(2)
+                last = index
+            else:
+                last = index.siblingAtColumn(2)
+            self.dataChanged.emit(index, last, [])
 
     def _build(self) -> None:
         self.root = TreeItem("root", "")
@@ -262,7 +282,15 @@ class HierarchyModel(QAbstractItemModel):
             self.chapter.layers[item.entity_id]
             if item.kind == "layer" else self.chapter.objects[item.entity_id]
         )
-        before = self.chapter.to_dict()
+        if role == Qt.CheckStateRole and index.column() == 0:
+            fields = ('visible',)
+        elif role == Qt.EditRole and index.column() == 0 and str(value).strip():
+            fields = ('name', 'custom_name') if isinstance(entity, TextObject) else ('name',)
+        else:
+            return False
+        group = 'layers' if item.kind == 'layer' else 'objects'
+        before = (RecordSnapshot.capture(self.chapter, **{group: [item.entity_id]},
+                    attributes={group: fields}) if self.focused_mutations else self.chapter.to_dict())
         if role == Qt.CheckStateRole and index.column() == 0:
             try:
                 check_state = Qt.CheckState(value)
@@ -280,7 +308,7 @@ class HierarchyModel(QAbstractItemModel):
             label = "Rename entity"
         else:
             return False
-        after = self.chapter.to_dict()
+        after = before.after(self.chapter) if isinstance(before, RecordSnapshot) else self.chapter.to_dict()
         self.dataChanged.emit(index, index, [role, Qt.DisplayRole])
         self.mutationCommitted.emit(before, after, label)
         return True

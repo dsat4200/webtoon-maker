@@ -79,17 +79,17 @@ class TextureOverlayFeatures:
         if modifier is None or hit is None:
             return False
         if hit == "mode":
-            before = self.chapter.to_dict()
+            before = self._modifier_record_snapshot(modifier)
             modifier.transform_mode = "free" if modifier.transform_mode == "uniform" else "uniform"
-            self.push_model_change(before, self.chapter.to_dict(), "Texture transform mode")
-            self.documentChanged.emit(None)
+            self.push_model_change(before, before.after(self.chapter), "Texture transform mode")
+            self._emit_typed_document_changed(None, self._last_published_change)
             self.interactionFinished.emit()
             self.update()
             return True
         keys = self._input_press_modifiers
         keys = QGuiApplication.keyboardModifiers() if keys is None else keys
         self._modifier_handle_drag = dict(texture=modifier.modifier_id, handle=hit,
-            before=self.chapter.to_dict(), quad=list(self._texture_quad(modifier)),
+            before=self._modifier_record_snapshot(modifier), quad=list(self._texture_quad(modifier)),
             press=self.widget_to_document(widget),
             uniform=modifier.transform_mode == "uniform" or bool(keys & Qt.ShiftModifier))
         return True
@@ -130,7 +130,5 @@ class TextureOverlayFeatures:
         if self._quad_is_valid(candidate):
             modifier.texture_quad = candidate
             modifier.validate()
-            self._invalidate_scene_cache()
-            self.documentChanged.emit(None)
-            self.update()
+            self._modifier_preview_changed(modifier)
         return True

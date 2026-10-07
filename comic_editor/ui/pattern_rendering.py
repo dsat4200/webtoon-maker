@@ -10,7 +10,9 @@ import math
 
 import numpy as np
 from comic_editor.core.pixel_arrays import normalized_bytes
-from comic_editor.render.pixels import current_contract, premultiplied_pixels, working_image
+from comic_editor.render.pixels import (
+    current_contract, premultiplied_pixels, working_image, working_rgba, transform_pixels,
+)
 from PySide6.QtCore import QRect, Qt
 from PySide6.QtGui import QColor, QImage, QPainter
 from scipy.ndimage import gaussian_filter, map_coordinates
@@ -46,7 +48,8 @@ def _image(array: np.ndarray) -> QImage:
 
 def _straight(array: np.ndarray) -> np.ndarray:
     return np.divide(array[..., :3], array[..., 3:4],
-                     out=np.zeros_like(array[..., :3]), where=array[..., 3:4] > 1e-6)
+                     out=np.zeros_like(array[..., :3]),
+                     where=array[..., 3:4] > (0. if current_contract().floating else 1e-6))
 
 
 def _color(value: str) -> np.ndarray:
@@ -320,12 +323,17 @@ def _ink(sample: np.ndarray, level: np.ndarray, modifier,
         return np.concatenate((rgb, np.ones_like(sample[..., 3:4])), axis=-1)
     if modifier.color_mode == "gradient":
         lut = gradient_lut(modifier.gradient_stops, modifier.gradient_interpolation, 1024)
+        if current_contract().floating:
+            # Authored ramp interpolation (including OKLCH) is defined in its
+            # source color space. Enter the working space after sampling it.
+            lut = transform_pixels(lut[None, ...], 'srgb', current_contract().working_space,
+                                   contract=current_contract(), premultiplied=False)[0]
         return lut[np.minimum(1023, np.rint((1. - level) * 1023).astype(np.int32))]
-    return np.broadcast_to(_color(modifier.foreground), sample.shape)
+    return np.broadcast_to(working_rgba(modifier.foreground), sample.shape)
 
 
 def _composite(source: np.ndarray, ink: np.ndarray, coverage: np.ndarray, modifier) -> np.ndarray:
-    background = _color(modifier.background)
+    background = working_rgba(modifier.background)
     if modifier.transparent_background:
         background = background.copy()
         background[3] = 0.

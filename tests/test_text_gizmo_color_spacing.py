@@ -227,7 +227,13 @@ def test_text_color_eyedropper_restores_range_and_apply_cancel(qapp, monkeypatch
         assert canvas.tool == ToolKind.EYEDROPPER
         point = canvas.document_to_widget(QPointF(570, 150)).toPoint()
         QTest.mouseClick(canvas, Qt.LeftButton, pos=point)
-        qapp.processEvents()
+        # Cold input sampling finishes on the detached scene consumer. The
+        # released click keeps its text range until that exact sample arrives.
+        import time
+        deadline = time.monotonic() + 15
+        while not popup.isVisible() and time.monotonic() < deadline:
+            qapp.processEvents()
+            time.sleep(.002)
         assert popup.isVisible()
         assert popup.color_argb() == "#FF2266CC"
         assert canvas.tool == ToolKind.TEXT_EDIT

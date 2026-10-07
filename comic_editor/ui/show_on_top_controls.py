@@ -1,4 +1,6 @@
 """Shared undoable action for settings and the outliner crown."""
+from comic_editor.core.document_patch import RecordSnapshot
+from comic_editor.ui.record_edits import commit_records
 
 
 def set_show_on_top(canvas, kind, identifier, enabled):
@@ -12,10 +14,8 @@ def set_show_on_top(canvas, kind, identifier, enabled):
         return False
     # A crown can belong to a different row while typing remains active.
     canvas.commit_active_text_edit()
-    before = chapter.to_dict()
+    group = 'layers' if kind == 'layer' else 'objects'
+    before = RecordSnapshot.capture(chapter, **{group: [identifier]}, attributes={group: ('show_on_top',)})
     entity.show_on_top = enabled
-    canvas.push_model_change(before, chapter.to_dict(), "Change show on top")
-    canvas.documentChanged.emit(None)
-    canvas.hierarchyChanged.emit()
-    canvas.update()
+    commit_records(canvas, before, "Change show on top", hierarchy=True)
     return True

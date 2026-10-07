@@ -8,6 +8,8 @@ from PySide6.QtGui import QColor
 from PySide6.QtWidgets import QCheckBox, QComboBox, QLabel, QMessageBox, QPushButton, QVBoxLayout, QWidget, QDialog
 
 from comic_editor.core.models import LayerNode, TextureModifier, OVERLAY_BLEND_MODES
+from comic_editor.core.changes import ChangeSet, EntityChange
+from comic_editor.core.document_patch import RecordSnapshot
 from comic_editor.core.texture_library import import_texture
 from comic_editor.ui.texture_picker import TextureCombo
 
@@ -129,16 +131,33 @@ class OverlayControls(QWidget):
             return
         if self.owner.canvas.chapter is not self._chapter or self._chapter.modifiers.get(self.modifier.modifier_id) is not self.modifier:
             return
-        before = self._chapter.to_dict()
+        before = RecordSnapshot.capture(self._chapter,
+            modifiers=(self.modifier.modifier_id,), scalars=('modifier_preset_ids',))
         self.modifier.texture_data = data
         self.modifier.texture_name = self._path.name
         self.modifier.texture_category = self._category
         if self.modifier.texture_quad is None:
             self.modifier.texture_quad = self.owner.canvas._texture_default_quad(self.modifier)
-        self.owner._changed()
+        self.owner._changed(ChangeSet((EntityChange(('modifier', self.modifier.modifier_id),
+            frozenset({'texture_data', 'texture_name', 'texture_category', 'texture_quad'})),),
+            transient=True, label='Texture preview'))
         self.owner._push(before, "Choose texture")
         self.texture.texture_name, self.texture.category = self._path.name, self._category
         self.texture.setItemText(0, self._path.name)
+
+    def sync_from_modifier(self, modifier):
+        """Refresh this card without retiring a popup or a pending import."""
+        self.modifier = modifier
+        with QSignalBlocker(self.blend):
+            self.blend.setCurrentIndex(self.blend.findData(modifier.blend_mode))
+        with QSignalBlocker(self.outline):
+            self.outline.setChecked(modifier.apply_to_outline)
+        if isinstance(modifier, TextureModifier):
+            self._sync_transform_mode()
+            self.texture.texture_name, self.texture.category = modifier.texture_name, modifier.texture_category
+            self.texture.setItemText(0, modifier.texture_name or 'Choose texture…')
+        elif self._color_edit is None:
+            self._set_color(modifier.color)
 
     def _set_color(self, value):
         color = QColor(value)

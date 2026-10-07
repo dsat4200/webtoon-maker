@@ -6,7 +6,6 @@ A separately processed fill allows dots and opacity noise to reveal the shape fi
 """
 import numpy as np
 from scipy.ndimage import map_coordinates
-from scipy.spatial import cKDTree
 from PySide6.QtCore import QPointF, QRectF, Qt
 from PySide6.QtGui import QImage, QPainter, QPainterPath, QTransform
 
@@ -77,6 +76,7 @@ def mask_parameters(canvas, modifier, loops, bounds, mapping):
 
 def nearest_coordinates(loops, bounds):
     points = np.vstack([loop.points for loop in loops])
+    from scipy.spatial import cKDTree
     tree = cKDTree(points)
     width, height = int(bounds.width()), int(bounds.height())
     # Bounded chunks keep the temporary query allocation independent of page size.

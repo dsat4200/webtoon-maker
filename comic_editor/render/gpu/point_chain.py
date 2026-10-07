@@ -7,6 +7,7 @@ for upload/readback, so HDR, sub-byte color, and alpha retain float precision.
 from collections import OrderedDict
 from contextlib import contextmanager
 from dataclasses import dataclass
+import ctypes
 
 import numpy as np
 from PySide6.QtCore import QThread
@@ -15,6 +16,7 @@ from PySide6.QtOpenGL import (
     QOpenGLFunctions_4_3_Core, QOpenGLFramebufferObject, QOpenGLFramebufferObjectFormat,
     QOpenGLTexture, QOpenGLShader, QOpenGLShaderProgram, QOpenGLVertexArrayObject,
 )
+from .residency import GRAPHICS_RESIDENCY
 
 
 VERTEX = '''#version 430 core
@@ -62,6 +64,35 @@ void main() {
 }
 '''
 
+QUANTIZE = '''#version 430 core
+uniform sampler2D sourceTexture;
+uniform sampler2D normalizationTable;
+uniform int integerOutput;
+out vec4 outputColor;
+void main() {
+    precise vec4 source = texelFetch(sourceTexture, ivec2(gl_FragCoord.xy), 0);
+    precise vec4 scaled = source * 255.;
+    ivec4 v = ivec4(clamp(scaled, 0., 255.));
+    outputColor = vec4(texelFetch(normalizationTable,ivec2(v.r,0),0).r,
+                       texelFetch(normalizationTable,ivec2(v.g,0),0).r,
+                       texelFetch(normalizationTable,ivec2(v.b,0),0).r,
+                       texelFetch(normalizationTable,ivec2(v.a,0),0).r);
+}
+'''
+
+NATIVE_COPY = '''#version 430 core
+uniform sampler2D sourceTexture;
+uniform int offsetX;
+uniform int offsetY;
+out vec4 outputColor;
+void main() {
+    ivec2 source = ivec2(gl_FragCoord.xy) - ivec2(offsetX,offsetY);
+    ivec2 extent = textureSize(sourceTexture,0);
+    outputColor = (all(greaterThanEqual(source,ivec2(0))) && all(lessThan(source,extent)))
+        ? texelFetch(sourceTexture,source,0) : vec4(0.);
+}
+'''
+
 
 @dataclass
 class _Resource:
@@ -70,21 +101,26 @@ class _Resource:
     width: int
     height: int
     bytes: int
+    kind: str = 'float'
 
 
 class GpuPointChain:
     """A bounded source/result cache; all GL work stays on its owning thread."""
-    def __init__(self, *, budget=128 * 1024 * 1024, surface=None):
+    def __init__(self, *, budget=128 * 1024 * 1024, surface=None, share_context=None,
+                 context=None):
         self.budget = max(0, int(budget))
         self.bytes = 0
         self.resources = OrderedDict()
         self.context = self.surface = self.functions = self.vao = self.program = None
         self.lut_program = None
+        self.quantize_program = None
         self.blur = None
         self.available = False
         self.reason = ''
         self.uploads = self.readbacks = self.draws = self.hits = self.compiles = 0
         self.owner_thread = QThread.currentThread()
+        self.leases = {}
+        self.residency_token = GRAPHICS_RESIDENCY.token()
         app = QGuiApplication.instance()
         if app is None or (surface is None and app.thread() != self.owner_thread):
             self.reason = 'GPU initialization requires the application thread'
@@ -92,9 +128,12 @@ class GpuPointChain:
         fmt = QSurfaceFormat()
         fmt.setVersion(4, 3)
         fmt.setProfile(QSurfaceFormat.CoreProfile)
-        self.context = QOpenGLContext()
-        self.context.setFormat(surface.format() if surface is not None else fmt)
-        if not self.context.create():
+        self.context = context or QOpenGLContext()
+        if context is None:
+            if share_context is not None:
+                self.context.setShareContext(share_context)
+            self.context.setFormat(surface.format() if surface is not None else fmt)
+        if context is None and not self.context.create():
             self.reason = 'OpenGL 4.3 context unavailable'
             return
         actual = self.context.format()
@@ -138,6 +177,7 @@ class GpuPointChain:
         previous = QOpenGLContext.currentContext()
         previous_surface = previous.surface() if previous is not None else None
         if not self.context.makeCurrent(self.surface):
+            self.available = False
             raise RuntimeError('Could not activate point-operation context')
         try:
             yield
@@ -149,12 +189,15 @@ class GpuPointChain:
     def _reserve(self, size, protected=()):
         if size > self.budget:
             return False
-        while self.bytes + size > self.budget:
-            victim = next((key for key in self.resources if key not in protected), None)
+        while (self.bytes + size > self.budget or
+               not GRAPHICS_RESIDENCY.change(self.residency_token,self.bytes+size)):
+            leased = set(self.leases.values())
+            victim = next((key for key in self.resources if key not in protected and key not in leased), None)
             if victim is None:
                 return False
             resource = self.resources.pop(victim)
             self.bytes -= resource.bytes
+            GRAPHICS_RESIDENCY.change(self.residency_token,self.bytes)
             if hasattr(resource.owner, 'destroy'):
                 resource.owner.destroy()
             # A framebuffer's texture belongs to its Qt framebuffer owner.
@@ -210,25 +253,30 @@ class GpuPointChain:
         self.uploads += 1
         return value
 
-    def _apply(self, pixels, parameters, *, source_key, lut=None):
+    def _apply(self, pixels, parameters, *, source_key, lut=None, resident=False):
         if not self.available or (lut is None and not 1 <= len(parameters) <= 16):
             return None
-        pixels = np.asarray(pixels)
-        if pixels.ndim != 3 or pixels.shape[2] != 4:
-            raise ValueError('GPU point operations require an H × W × RGBA array')
-        height, width = pixels.shape[:2]
+        source_resource = pixels if isinstance(pixels, _Resource) else None
+        if source_resource is not None:
+            height, width = source_resource.height, source_resource.width
+        else:
+            pixels = np.asarray(pixels)
+            if pixels.ndim != 3 or pixels.shape[2] != 4:
+                raise ValueError('GPU point operations require an H × W × RGBA array')
+            height, width = pixels.shape[:2]
         size = width * height * 16
         table_size = int(lut[1].nbytes) if lut is not None else 0
         if min(width, height) <= 0 or max(width, height) > self.max_size or size * 2 + table_size > self.budget:
             return None
         parameters = tuple(tuple(float(np.float32(value)) for value in stage) for stage in parameters)
-        input_key = ('source', source_key, width, height, 'rgba32f')
+        input_key = (source_key if source_resource is not None else
+                     ('source', source_key, width, height, 'rgba32f'))
         output_key = (('point-lut', input_key, lut[0]) if lut is not None
                       else ('brightness', input_key, parameters))
         with self._current():
             result = self._get(output_key)
             if result is None:
-                source = self._get(input_key)
+                source = source_resource or self._get(input_key)
                 if source is None:
                     if not self._reserve(size):
                         return None
@@ -275,32 +323,188 @@ class GpuPointChain:
                 self.draws += 1
             else:
                 self.hits += 1
-            result.owner.bind()
-            output = np.empty((height, width, 4), np.float32)
-            # Qt's toImage() converts floating-point FBOs to byte images. Read
-            # explicitly, preserving the top-first logical row convention.
-            self.functions.glReadPixels(0, 0, width, height, 0x1908, 0x1406, output)
-            result.owner.release()
+            return (result, output_key) if resident else self.read_resource(result)
+
+    def read_resource(self, result):
+        """Explicit CPU edge; called only on the graphics owner."""
+        with self._current():
+            temporary = None
+            if isinstance(result.owner,QOpenGLTexture):
+                temporary = QOpenGLFramebufferObject(1,1)
+                temporary.bind()
+                self.functions.glFramebufferTexture2D(0x8D40,0x8CE0,0x0DE1,result.texture,0)
+            else:
+                result.owner.bind()
+            output = np.empty((result.height, result.width, 4), np.float32)
+            # Pixel pack state belongs to the context, including state changed
+            # by Qt helpers. Never let a row stride, skip, or PBO reinterpret
+            # the CPU allocation. Use an explicit pointer instead of a generated
+            # Python buffer overload for this writable native boundary.
+            gl = self.functions
+            pack_names = (0x0D05, 0x0D02, 0x0D03, 0x0D04)
+            pack = {name: gl.glGetIntegerv(name) for name in pack_names}
+            pack_buffer = gl.glGetIntegerv(0x88ED)
+            try:
+                gl.glBindBuffer(0x88EB, 0)  # GL_PIXEL_PACK_BUFFER
+                for name,value in zip(pack_names,(4,0,0,0)):
+                    gl.glPixelStorei(name,value)
+                call = getattr(ctypes,'WINFUNCTYPE',ctypes.CFUNCTYPE)
+                read = call(None,ctypes.c_int,ctypes.c_int,ctypes.c_int,ctypes.c_int,
+                    ctypes.c_uint,ctypes.c_uint,ctypes.c_void_p)(
+                    self.context.getProcAddress(b'glReadPixels'))
+                read(0,0,result.width,result.height,0x1908,0x1406,output.ctypes.data)
+            finally:
+                for name,value in pack.items():
+                    gl.glPixelStorei(name,value)
+                gl.glBindBuffer(0x88EB,pack_buffer)
+            if temporary is not None:
+                temporary.release()
+                del temporary
+            else:
+                result.owner.release()
             self.readbacks += 1
             return output
+
+    def quantize(self, source, key):
+        """Keep the reference's final byte boundary without a CPU round trip."""
+        from .blur import GpuBlur
+        if self.blur is None:
+            self.blur = GpuBlur(self)
+        output_key = ('byte-normalized', key)
+        with self._current():
+            result = self._get(output_key)
+            if result is not None:
+                self.hits += 1
+                return result, output_key
+            if self.quantize_program is None:
+                self.quantize_program = QOpenGLShaderProgram()
+                if not (self.quantize_program.addShaderFromSourceCode(QOpenGLShader.Vertex, VERTEX)
+                        and self.quantize_program.addShaderFromSourceCode(QOpenGLShader.Fragment, QUANTIZE)
+                        and self.quantize_program.link()):
+                    raise RuntimeError(self.quantize_program.log())
+                self.compiles += 1
+            table_key = ('blur-normalization-table',)
+            table = self.blur._upload(table_key, (np.arange(256,dtype=np.float32)/255.).reshape(1,256),
+                QOpenGLTexture.R32F, QOpenGLTexture.Red, QOpenGLTexture.Float32, [key])
+            result = self.blur._draw(output_key, (source.width,source.height), self.quantize_program,
+                [('sourceTexture',source),('normalizationTable',table)], {}, [key,table_key], floating=True)
+            return result, output_key
+
+    def segment(self, pixels, stages, *, source_key, canonical_input=False):
+        """Evaluate a compatible segment; no intermediate or final readback."""
+        from comic_editor.render.device import PointTableStage, ScalarBlurStage, ByteQuantizeStage, NativeCopyStage
+        from .blur import GpuBlur, _BudgetExceeded
+        with self._current():
+            if isinstance(pixels, _Resource):
+                result, key = pixels, source_key
+            else:
+                pixels = np.asarray(pixels)
+                if pixels.dtype == np.uint8:
+                    pixels = pixels.astype(np.float32)/255.
+                    canonical_input = True
+                key = ('source',source_key,pixels.shape[1],pixels.shape[0],'rgba32f')
+                result = self._get(key)
+                if result is None:
+                    if not self._reserve(pixels.nbytes):
+                        return None
+                    result = self._upload(key,pixels)
+            canonical = bool(canonical_input)
+            try:
+                for stage in stages:
+                    if isinstance(stage, PointTableStage):
+                        if not canonical:
+                            return None
+                        value = self._apply(result, (), source_key=key,
+                                            lut=(stage.identity,stage.table), resident=True)
+                        canonical = stage.quantized_output
+                    elif isinstance(stage, ScalarBlurStage):
+                        if float(stage.strength) <= 1e-6:
+                            continue
+                        if self.blur is None:
+                            self.blur = GpuBlur(self)
+                        value = self.blur.apply(result, stage.strength,source_key=key,
+                                                algorithm=stage.algorithm,resident=True)
+                        canonical = True
+                    elif isinstance(stage, ByteQuantizeStage):
+                        value = self.quantize(result,key)
+                        canonical = True
+                    elif isinstance(stage, NativeCopyStage):
+                        value = self.native_copy(result,key,stage.size,stage.origin)
+                    else:
+                        raise ValueError('Unsupported device segment stage')
+                    if value is None:
+                        return None
+                    result, key = value
+                return result,key,canonical
+            except _BudgetExceeded:
+                return None
+
+    def native_copy(self, source, key, size, origin):
+        """Preserve integer grids when a spatial stage expands or crops a frame."""
+        from .blur import GpuBlur
+        if min(size) <= 0 or max(size) > self.max_size:
+            return None
+        if size == (source.width,source.height) and origin == (0,0):
+            return source,key
+        if self.blur is None:
+            self.blur = GpuBlur(self)
+        with self._current():
+            program = getattr(self,'native_copy_program',None)
+            if program is None:
+                program = QOpenGLShaderProgram()
+                if not (program.addShaderFromSourceCode(QOpenGLShader.Vertex,VERTEX)
+                        and program.addShaderFromSourceCode(QOpenGLShader.Fragment,NATIVE_COPY)
+                        and program.link()):
+                    raise RuntimeError(program.log())
+                self.native_copy_program = program
+                self.compiles += 1
+            output_key = ('native-copy',key,tuple(size),tuple(origin))
+            result = self.blur._draw(output_key,size,program,[('sourceTexture',source)],
+                dict(offsetX=origin[0],offsetY=origin[1]),[key],floating=True)
+            return result,output_key
 
     def close(self):
         if self.context is None or self.surface is None:
             return
-        with self._current():
+        if QThread.currentThread() != self.owner_thread:
+            raise RuntimeError('GPU cleanup must stay on its owning thread')
+        previous = QOpenGLContext.currentContext()
+        previous_surface = previous.surface() if previous is not None else None
+        activated = False
+        try:
+            # A failed kernel/context guard must not suppress a best-effort
+            # native cleanup when Qt can still activate this owner's context.
+            activated = self.context.makeCurrent(self.surface)
+            if activated:
+                self.functions.glFinish()
+                if self.blur is not None:
+                    self.blur.close()
+                    self.blur = None
+                while self.resources:
+                    _key, resource = self.resources.popitem()
+                    if hasattr(resource.owner, 'destroy'):
+                        resource.owner.destroy()
+                    del resource
+                if self.vao is not None:
+                    self.vao.destroy()
+        finally:
+            # A lost context can prevent explicit GL deletion. Retire Qt's
+            # resource guards and break kernel references on this same owner,
+            # never leave a cycle for a later GUI-thread garbage collection.
             if self.blur is not None:
                 self.blur.close()
                 self.blur = None
-            while self.resources:
-                _key, resource = self.resources.popitem()
-                if hasattr(resource.owner, 'destroy'):
-                    resource.owner.destroy()
-                del resource
+            self.resources.clear()
             self.bytes = 0
-            if self.vao is not None:
-                self.vao.destroy()
-                self.vao = None
+            GRAPHICS_RESIDENCY.change(self.residency_token,0)
+            self.vao = None
             self.program = None
             self.lut_program = None
+            self.quantize_program = None
+            self.native_copy_program = None
             self.functions = None
-        self.available = False
+            self.available = False
+            if activated:
+                self.context.doneCurrent()
+                if previous is not self.context and previous is not None and previous_surface is not None:
+                    previous.makeCurrent(previous_surface)

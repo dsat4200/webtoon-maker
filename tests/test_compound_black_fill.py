@@ -50,7 +50,7 @@ def spiky_bubble(qapp):
 
 
 @pytest.mark.parametrize("scale", [.5, .75, 1., 1.5, 2.])
-def test_visible_tail_preserves_white_scream_interior_at_every_viewport_scale(spiky_bubble, scale):
+def test_visible_tail_preserves_white_scream_interior_at_every_viewport_scale(spiky_bubble, scale, wait_scene):
     canvas, root, tail = spiky_bubble
     canvas.scale = scale
     before = root.to_dict(), tail.to_dict()
@@ -59,7 +59,7 @@ def test_visible_tail_preserves_white_scream_interior_at_every_viewport_scale(sp
     for visible in (True, False, True):
         tail.visible = visible
         canvas.documentChanged.emit(QRectF())
-        image = canvas.grab().toImage()
+        image = wait_scene(canvas)
         assert image.pixelColor(probe).name() == "#ffffff"
     assert (root.to_dict(), tail.to_dict()) == before
 

@@ -30,6 +30,8 @@ from PySide6.QtWidgets import (
 )
 
 from comic_editor.core.models import RasterObject, TextObject
+from comic_editor.core.document_patch import RecordSnapshot
+from comic_editor.ui.record_edits import commit_records, preview_records
 from comic_editor.core.settings import (
     FILL_BLEND_MODES, FILL_SUBTOOLS, TextPreset,
 )
@@ -1243,12 +1245,8 @@ class TextObjectControls(QObject):
     def _commit_text_session(self) -> None:
         self.canvas.commit_active_text_edit()
 
-    def _push_change(self, before: dict, label: str) -> None:
-        after = self.canvas.chapter.to_dict()
-        if before != after:
-            self.canvas.push_model_change(before, after, label)
-            self.canvas.documentChanged.emit(self.canvas._text_visual_dirty(self._selected(), before))
-            self.canvas.update()
+    def _push_change(self, before, label: str) -> None:
+        if commit_records(self.canvas, before, label):
             self.objectChanged.emit()
 
     def _apply_field(self, key: str, value) -> None:
@@ -1259,7 +1257,7 @@ class TextObjectControls(QObject):
         entity = self._selected()
         if entity is None:
             return
-        before = self.canvas.chapter.to_dict()
+        before = RecordSnapshot.capture(self.canvas.chapter, objects=[self.canvas.selected_id])
         if key == "font_size":
             value = max(6, min(250, int(value)))
         elif key == "line_spacing":
@@ -1283,7 +1281,7 @@ class TextObjectControls(QObject):
         entity = self._selected()
         if entity is None:
             return
-        before = self.canvas.chapter.to_dict()
+        before = RecordSnapshot.capture(self.canvas.chapter, objects=[self.canvas.selected_id])
         entity.horizontal_alignment = horizontal
         entity.vertical_alignment = vertical
         self.align_menu.close()
@@ -1306,7 +1304,7 @@ class TextObjectControls(QObject):
         entity = self._selected()
         if entity is None:
             return
-        before = self.canvas.chapter.to_dict()
+        before = RecordSnapshot.capture(self.canvas.chapter, objects=[self.canvas.selected_id])
         entity.opacity_locked = bool(checked)
         if entity.opacity_locked:
             entity.opacity = self.canvas.chapter.layers[
@@ -1342,7 +1340,7 @@ class TextObjectControls(QObject):
         if entity is None:
             return
         preset = TextPreset.from_dict(self.settings.text_presets[index])
-        before = self.canvas.chapter.to_dict()
+        before = RecordSnapshot.capture(self.canvas.chapter, objects=[self.canvas.selected_id])
         properties = {key: getattr(preset, key) for key in (
             "font_family", "font_size", "bold", "italic", "kerning",
             "line_spacing",
@@ -1950,23 +1948,16 @@ class RasterObjectControls(QObject):
         entity = self._selected()
         if self._loading or entity is None:
             return
-        before = self.canvas.chapter.to_dict()
+        before = RecordSnapshot.capture(self.canvas.chapter, objects=[self.canvas.selected_id], attributes={'objects': ('name', 'ignore_parent_mask', 'geometry_reference', 'opacity', 'underlay_opacity')})
         self._write_controls(entity)
-        after = self.canvas.chapter.to_dict()
-        if before != after:
-            self.canvas.push_model_change(
-                before, after, "Edit raster object"
-            )
-            self.canvas.hierarchyChanged.emit()
-            self.canvas.documentChanged.emit(None)
-            self.canvas.update()
+        if commit_records(self.canvas, before, 'Edit raster object', hierarchy=True):
             self.objectChanged.emit()
         self.refresh()
 
     def _begin_slider(self, key: str) -> None:
         if self._loading or self._selected() is None:
             return
-        self._slider_before[key] = self.canvas.chapter.to_dict()
+        self._slider_before[key] = RecordSnapshot.capture(self.canvas.chapter, objects=[self.canvas.selected_id], attributes={'objects': ('name', 'ignore_parent_mask', 'geometry_reference', 'opacity', 'underlay_opacity')})
 
     def _slider_changed(self, key: str, value: int) -> None:
         label = self.opacity_value if key == "opacity" else self.underlay_value
@@ -1976,15 +1967,15 @@ class RasterObjectControls(QObject):
             return
         before = (
             None if key in self._slider_before
-            else self.canvas.chapter.to_dict()
+            else RecordSnapshot.capture(self.canvas.chapter, objects=[self.canvas.selected_id], attributes={'objects': ('name', 'ignore_parent_mask', 'geometry_reference', 'opacity', 'underlay_opacity')})
         )
+        live_before = RecordSnapshot.capture(self.canvas.chapter, objects=[self.canvas.selected_id], attributes={'objects': ('name', 'ignore_parent_mask', 'geometry_reference', 'opacity', 'underlay_opacity')})
         if key == "opacity":
             if not entity.opacity_locked:
                 entity.opacity = value / 100.0
         else:
             entity.underlay_opacity = value / 100.0
-        self.canvas.documentChanged.emit(None)
-        self.canvas.update()
+        preview_records(self.canvas, live_before)
         if before is not None:
             self._push_slider_change(before, key)
 
@@ -1993,15 +1984,10 @@ class RasterObjectControls(QObject):
         if before is not None:
             self._push_slider_change(before, key)
 
-    def _push_slider_change(self, before: dict, key: str) -> None:
+    def _push_slider_change(self, before, key: str) -> None:
         if self.canvas.chapter is None:
             return
-        after = self.canvas.chapter.to_dict()
-        if before != after:
-            self.canvas.push_model_change(
-                before, after,
-                "Change raster opacity"
-                if key == "opacity" else "Change raster underlay",
-            )
+        if commit_records(self.canvas, before,
+                'Change raster opacity' if key == 'opacity' else 'Change raster underlay'):
             self.objectChanged.emit()
         self.canvas.interactionFinished.emit()
