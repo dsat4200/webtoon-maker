@@ -642,6 +642,10 @@ def test_solid_overlay_picker_drag_repaints_visible_canvas(scene, qapp):
     canvas.center_x, canvas.center_y, canvas.scale = 150, 100, 1
     canvas.show()
     qapp.processEvents()
+    # The cold widget may return a pending frame; cancellation compares
+    # against completed artwork rather than that loading presentation.
+    canvas._ensure_scene_cache()
+    assert not canvas._projection_frame_pending
     before = pixels(canvas.grab().toImage())
     controls.color.click()
     popup = controls._popup

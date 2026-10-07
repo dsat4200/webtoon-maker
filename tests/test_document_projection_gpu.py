@@ -17,7 +17,7 @@ from comic_editor.core.models import (
 )
 from comic_editor.core.settings import EditorSettings
 from comic_editor.core.tiles import TileStore
-from comic_editor.ui.canvas import GpuCanvasWidget
+from comic_editor.ui.canvas import CanvasWidget, GpuCanvasWidget
 
 
 class CapturedGpuCanvas(GpuCanvasWidget):
@@ -103,6 +103,52 @@ def assert_pixel(canvas, x, y, color):
     ratio = canvas.devicePixelRatioF()
     np.testing.assert_allclose(canvas.frame_pixels[round(y * ratio), round(x * ratio)],
                                color, atol=1)
+
+
+def radial_artwork_roi(canvas, pixels=None):
+    # The source's blue patch and its changing blurred edge lie here. The
+    # radial center/arc/end handles, selection border, gradient line and cursor
+    # lie outside it, so UI changes cannot satisfy the artwork assertions.
+    ratio = canvas.devicePixelRatioF()
+    pixels = canvas.frame_pixels if pixels is None else pixels
+    left, top = round(185 * ratio), round(185 * ratio)
+    roi = pixels[top:round(245 * ratio), left:round(245 * ratio)]
+    yy, xx = np.indices(roi.shape[:2], dtype=float)
+    center = canvas.document_to_widget(QPointF(512, 512))
+    radius2 = ((xx + left + .5) / ratio - center.x())**2 + (
+        (yy + top + .5) / ratio - center.y())**2
+    # Exclude the whole dotted 72px circle, not just its angle/center handles.
+    return roi[(radius2 < 64**2) & (radius2 > 16**2)]
+
+
+def fresh_radial_artwork(canvas):
+    """Independent exact caches/source capture, presented at the same camera."""
+    oracle = CanvasWidget(EditorSettings(canvas_renderer="raster", grid_overlay_visible=False))
+    oracle.setMinimumSize(1, 1)
+    oracle.resize(canvas.size())
+    chapter = ChapterDocument.from_dict(canvas.chapter.to_dict())
+    images = ImageStore()
+    for obj in chapter.objects.values():
+        images.put_decoded(obj.object_id, "oracle.png", b"", QImage(canvas.images.image(obj.object_id)))
+    oracle.set_document(chapter, TileStore(), images)
+    oracle.center_x, oracle.center_y = canvas.center_x, canvas.center_y
+    oracle.scale, oracle.rotation = canvas.scale, canvas.rotation
+    oracle._projection_async_enabled = False
+    output = QImage(canvas.frame_pixels.shape[1], canvas.frame_pixels.shape[0],
+                    QImage.Format_RGBA8888)
+    output.setDevicePixelRatio(canvas.devicePixelRatioF())
+    output.fill(QColor("#242428"))
+    painter = QPainter(output)
+    try:
+        oracle._paint_document_projection(painter)
+    finally:
+        painter.end()
+        oracle._effect_jobs.cancel()
+        oracle._effect_jobs.executor.shutdown(wait=True, cancel_futures=True)
+        oracle.deleteLater()
+    return np.frombuffer(output.constBits(), np.uint8).reshape(
+        output.height(), output.bytesPerLine())[:, :output.width()*4].reshape(
+        output.height(), output.width(), 4).copy()
 
 
 def test_native_canvas_displays_retained_artwork_and_reuses_navigation(native_scene, qapp):
@@ -212,13 +258,18 @@ def test_native_radial_handle_stays_responsive_until_final_exact_frame(native_sc
     canvas.update()
     qapp.processEvents()
     before = canvas.frame_pixels.copy()
+    completed = canvas._projection_completed_view
+    published = canvas._projection_presented_revision
+    submitted = canvas._effect_jobs.submitted
     center, end = canvas._radial_handle_points(modifier)
     assert canvas._begin_modifier_handle(end)
     entered, release = Event(), Event()
     gui, original = get_ident(), radial_blur.radial_blur
+    integrations = []
 
     def blocked(*args, **kwargs):
         assert get_ident() != gui, "Native handle drag ran radial integration on the GUI thread"
+        integrations.append(1)
         entered.set()
         assert release.wait(5)
         return original(*args, **kwargs)
@@ -233,11 +284,17 @@ def test_native_radial_handle_stays_responsive_until_final_exact_frame(native_sc
         assert entered.wait(2)
         assert canvas.frames > frames and canvas._projection_frame_pending
         assert canvas._effect_jobs.running is not None
+        assert canvas._projection_completed_view is completed
+        assert canvas._projection_presented_revision == published
+        assert published != canvas._document_projection.revision
+        assert canvas._projection_interaction_preview is None
         canvas._finish_modifier_handle()
         canvas.update()
         qapp.processEvents()
         assert canvas._projection_can_defer_effects()
         assert canvas._projection_frame_pending
+        assert canvas._projection_presented_revision == published
+        assert len(integrations) == 1
     finally:
         release.set()
     canvas._effect_jobs.running[3].result(timeout=30)
@@ -247,11 +304,18 @@ def test_native_radial_handle_stays_responsive_until_final_exact_frame(native_sc
     assert not canvas._projection_frame_pending
     assert canvas._projection_presented_revision == canvas._document_projection.revision
     assert np.any(canvas.frame_pixels != before)
+    assert len(integrations) == 1 and canvas._effect_jobs.submitted == submitted + 1
+    assert np.any(radial_artwork_roi(canvas) != radial_artwork_roi(canvas, before))
+    monkeypatch.setattr(radial_blur, "radial_blur", original)
+    np.testing.assert_allclose(radial_artwork_roi(canvas),
+                               radial_artwork_roi(canvas, fresh_radial_artwork(canvas)), atol=1)
 
 
 def test_native_intensity_gradient_pen_edit_reuses_full_quality_blur(native_scene, qapp, monkeypatch):
     from comic_editor.ui import radial_blur
     canvas = native_scene
+    # Test the changed artwork itself rather than the blue mask visualization.
+    monkeypatch.setattr(canvas, "_draw_tone_mask_preview", lambda _painter: None)
     artwork = next(iter(canvas.chapter.objects.values()))
     modifier = RadialBlurModifier(center=(512, 512), angle=1)
     mask = ToneMask(saved=True)
@@ -268,6 +332,8 @@ def test_native_intensity_gradient_pen_edit_reuses_full_quality_blur(native_scen
     qapp.processEvents()
     before = canvas.frame_pixels.copy()
     canvas._projection_async_enabled = True
+    submitted = canvas._effect_jobs.submitted
+    original = radial_blur.radial_blur
     def forbidden(*_args, **_kwargs):
         raise AssertionError("Intensity-gradient edit repeated angular integration")
     monkeypatch.setattr(radial_blur, "radial_blur", forbidden)
@@ -279,6 +345,7 @@ def test_native_intensity_gradient_pen_edit_reuses_full_quality_blur(native_scen
     qapp.processEvents()
     assert not canvas._projection_frame_pending
     assert np.any(canvas.frame_pixels != before)
+    assert np.any(radial_artwork_roi(canvas) != radial_artwork_roi(canvas, before))
     canvas._finish_mask_gradient()
     canvas._pen_contact_active = False
     canvas.update()
@@ -286,6 +353,11 @@ def test_native_intensity_gradient_pen_edit_reuses_full_quality_blur(native_scen
     assert not canvas._projection_frame_pending
     assert canvas._projection_presented_revision == canvas._document_projection.revision
     assert canvas._effect_jobs.running is None and not canvas._effect_jobs.pending
+    assert canvas._effect_jobs.submitted == submitted
+    assert canvas._projection_interaction_preview is None
+    monkeypatch.setattr(radial_blur, "radial_blur", original)
+    np.testing.assert_allclose(radial_artwork_roi(canvas),
+                               radial_artwork_roi(canvas, fresh_radial_artwork(canvas)), atol=1)
 
 
 def test_widget_destruction_releases_presenter_without_explicit_close(native_scene):

@@ -15,11 +15,39 @@ from comic_editor.ui.effect_regions import projection_requires_exact
 from comic_editor.ui.async_projection import (
     ProjectionPending, projection_deferred, projection_result_or_pending,
 )
+from comic_editor.render.pixels import current_contract
 
 
 _worker_preparation = None
 _worker_preparation_lock = Lock()
 _worker_local = local()
+
+
+_BASE_FREE_TYPES = {
+    'distort_twirl', 'distort_deform', 'distort_mesh_warp',
+    'distort_lens_distortion', 'distort_pinch_punch',
+}
+
+
+def can_omit_deferred_base(canvas, image, target, modifier, scope, provisional, navigator):
+    """Only a full-strength exact CPU warp has no padded blend dependency."""
+    return bool(projection_requires_exact(canvas) and projection_deferred(canvas)
+                and scope is not None and not provisional and not navigator
+                and not image.isNull()
+                and modifier.modifier_type in _BASE_FREE_TYPES
+                and modifier.intensity == 100 and not modifier.parameter_masks
+                and max(image.width() * image.height(),
+                        target.width() * target.height()) > 128 * 128)
+
+
+def _native_frame_bytes(width, height):
+    # Use Qt's current native format and 32-bit row alignment, including
+    # float16/float32 contracts. This reserves the same padded output working
+    # memory even when the unused blend image is never allocated.
+    probe = QImage(1, 1, current_contract().image_format)
+    if probe.isNull():
+        raise MemoryError('Could not inspect the native effect image format')
+    return ((width * probe.depth() + 31) // 32) * 4 * height
 
 
 def _worker_preparation_cache():
@@ -44,11 +72,26 @@ def _worker_preparation_cache():
 
 
 def render_distort_stage(canvas, image, base, bounds, target, modifier,
-                         local_to_world, fields, key, scope, provisional, navigator):
+                         local_to_world, fields, key, scope, provisional, navigator,
+                         *, base_size=None):
+    exact = projection_requires_exact(canvas)
+    if (exact and provisional and getattr(canvas, '_projection_defer_effects', False)
+            and canvas._interactive_render):
+        raise ProjectionPending(scope, key)
     from comic_editor.ui.distort_rendering import PreparedDistortCache, render_distort
 
-    exact = projection_requires_exact(canvas)
-    large = max(image.width() * image.height(), base.width() * base.height()) > 128 * 128
+    if base is None:
+        if not can_omit_deferred_base(canvas, image, target, modifier, scope, provisional, navigator):
+            raise ValueError('An omitted distortion base requires deferred full-strength exact work')
+        expected_size = (max(1, math.ceil(target.width())), max(1, math.ceil(target.height())))
+        if base_size != expected_size or base_size[0] * base_size[1] > 64 * 1024 * 1024:
+            raise ValueError('Invalid native distortion base dimensions')
+        base_width, base_height = base_size
+        base_bytes = _native_frame_bytes(base_width, base_height)
+    else:
+        base_width, base_height = base.width(), base.height()
+        base_bytes = int(base.sizeInBytes())
+    large = max(image.width() * image.height(), base_width * base_height) > 128 * 128
     interactive = (canvas._interactive_render and not canvas._render_base_alpha
                    and canvas._rendering_mask_contributor <= 0)
     contact = (not exact and interactive
@@ -65,14 +108,16 @@ def render_distort_stage(canvas, image, base, bounds, target, modifier,
         completed = projection_result_or_pending(canvas, scope, key)
         if completed is not None:
             return completed, False
-    incoming, original = QImage(image), QImage(base)
+    incoming, original = QImage(image), QImage(base) if base is not None else None
     effect = copy.deepcopy(modifier)
     source_bounds, output_bounds = QRectF(bounds), QRectF(target)
     placement = QTransform(local_to_world)
     amount = np.array(_parameter_field(modifier, "intensity", modifier.intensity,
-                                       (base.height(), base.width()), fields),
+                                       (base_height, base_width), fields),
                       dtype=np.float32, copy=True)
     amount /= 100.0
+    if original is None and (amount.ndim != 0 or float(amount) != 1.0):
+        raise ValueError('An omitted distortion base cannot blend a parameter field')
     preparation_cache = None
     if (exact or mesh_preview) and not deferred:
         preparation_cache = getattr(canvas, "_distort_preparation_cache", None)
@@ -86,6 +131,8 @@ def render_distort_stage(canvas, image, base, bounds, target, modifier,
                                 preparation_cache=cache)
         if warped is None:
             return None
+        if original is None:
+            return warped
         blend_base, blend_amount = original, amount
         if warped.size() != original.size():
             blend_base = original.scaled(warped.size(), Qt.IgnoreAspectRatio, Qt.SmoothTransformation)
@@ -116,7 +163,7 @@ def render_distort_stage(canvas, image, base, bounds, target, modifier,
         # must never access the GUI-only prepared-source cache or canvas.
         canvas._effect_jobs.request(
             scope, key, compute,
-            12 * int(incoming.sizeInBytes()) + 8 * int(original.sizeInBytes()) + amount.nbytes,
+            12 * int(incoming.sizeInBytes()) + 8 * base_bytes + amount.nbytes,
             allow_oversized=True, require_exact=True)
         raise ProjectionPending(scope, key)
     asynchronous = (interactive and not exact and not contact and large

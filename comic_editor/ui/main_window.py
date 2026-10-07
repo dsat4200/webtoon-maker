@@ -385,7 +385,10 @@ class MainWindow(QMainWindow):
     def _build_ui(self) -> None:
         style = Path(__file__).with_name("style.qss")
         if style.is_file():
-            QApplication.instance().setStyleSheet(style.read_text(encoding="utf-8"))
+            application = QApplication.instance()
+            stylesheet = style.read_text(encoding="utf-8")
+            if application.styleSheet() != stylesheet:
+                application.setStyleSheet(stylesheet)
 
         self.file_menu = QMenu("File", self)
         self.new_series_action = self.file_menu.addAction("New Series")

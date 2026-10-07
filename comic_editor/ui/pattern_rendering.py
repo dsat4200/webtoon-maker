@@ -5,6 +5,7 @@ intensity and mask blending so both rendering paths use exactly one blend.
 """
 from __future__ import annotations
 
+from dataclasses import dataclass
 from functools import lru_cache
 import math
 
@@ -17,6 +18,9 @@ from scipy.ndimage import gaussian_filter, map_coordinates
 from scipy.spatial import Delaunay, QhullError
 
 from comic_editor.core.models import HalftoneModifier, PixelateModifier
+
+
+HALFTONE_GEOMETRY_ROWS = 128
 
 
 def _check_cancelled(cancelled):
@@ -497,13 +501,30 @@ def _cell_sample_table(prepared, color_source, cell_x, cell_y, spacing, angle,
 
 def _halftone(source: np.ndarray, modifier: HalftoneModifier,
               color_source: np.ndarray | None = None, cancelled=None, *,
-              frame_size=None, origin=(0, 0)) -> np.ndarray:
+              frame_size=None, origin=(0, 0), output_region=None, _prepared=None) -> np.ndarray:
     height, width = source.shape[:2]
     frame_width, frame_height = frame_size or (width, height)
     ox, oy = origin
+    sample_ox, sample_oy = origin
     unit = halftone_unit(frame_width, frame_height, modifier)
     spacing = max(.5, modifier.spacing * unit)
-    prepared = _blur(source, modifier.blur * unit)
+    prepared = _blur(source, modifier.blur * unit) if _prepared is None else _prepared
+    chosen = prepared
+    chosen_color = color_source
+    if output_region is not None:
+        # Regular marks have analytic AA. Keep the padded source/blur sampling
+        # unchanged, but omit geometry and output arrays for discarded margins.
+        # Merged marks and curved bands use neighboring output derivatives and
+        # retain their complete padded evaluation instead.
+        if (modifier.grid_type not in {"square", "hexagonal"}
+                or modifier.dot_style in {"blob", "liquid", "delaunay"}):
+            raise ValueError("This halftone needs its complete output neighborhood")
+        left, top, width, height = output_region
+        source = source[top:top+height, left:left+width]
+        chosen = prepared[top:top+height, left:left+width]
+        chosen_color = (color_source[top:top+height, left:left+width]
+                        if color_source is not None else None)
+        ox, oy = ox + left, oy + top
     _check_cancelled(cancelled)
     if modifier.dot_style == "delaunay" and modifier.grid_type not in {"line", "ring"}:
         if frame_size is not None:
@@ -532,20 +553,19 @@ def _halftone(source: np.ndarray, modifier: HalftoneModifier,
             cx, cy = np.cos(theta) * band, np.sin(theta) * band
         sx = cx * math.cos(angle) - cy * math.sin(angle) + frame_width / 2.
         sy = cx * math.sin(angle) + cy * math.cos(angle) + frame_height / 2.
-        sampled = _sample(prepared, sx - ox, sy - oy)
+        sampled = _sample(prepared, sx - sample_ox, sy - sample_oy)
         level, visible = _tone(sampled, modifier)
         line_level = np.clip(level * getattr(modifier, "line_level_scale", 1.), 0., 1.)
         thickness = spacing * .5 * getattr(modifier, "line_width", 1.) * (1. - modifier.scale_factor + modifier.scale_factor * line_level)
         coverage = _edge_coverage(np.abs(coordinate - band) - thickness, coordinate)
         coverage *= visible & (thickness > 1e-6)
-        color_sample = _sample(color_source, sx - ox, sy - oy) if color_source is not None else None
+        color_sample = (_sample(color_source, sx - sample_ox, sy - sample_oy)
+                        if color_source is not None else None)
         return _composite(source, _ink(sampled, level, modifier, color_sample), coverage, modifier)
 
     coverage = np.zeros((height, width), dtype=np.float32)
     # Sampling at the original pixel centers is exactly an identity.
-    chosen = prepared
     chosen_tone = np.zeros((height, width), dtype=np.float32) if modifier.color_mode == "gradient" else None
-    chosen_color = color_source
     merged_marks = modifier.dot_style in {"blob", "liquid"}
     joined = np.full((height, width), 1e20, dtype=np.float32) if merged_marks else None
     joins = np.zeros((height, width), dtype=np.int16) if merged_marks else None
@@ -607,7 +627,7 @@ def _halftone(source: np.ndarray, modifier: HalftoneModifier,
                     cx, cy = cx + jitter[..., 0], cy + jitter[..., 1]
                 sx = cx * math.cos(angle) - cy * math.sin(angle) + frame_width / 2.
                 sy = cx * math.sin(angle) + cy * math.cos(angle) + frame_height / 2.
-                sampled = _sample(prepared, sx - ox, sy - oy)
+                sampled = _sample(prepared, sx - sample_ox, sy - sample_oy)
                 level, visible = _tone(sampled, modifier)
                 visible &= candidate_valid
             mark = _dot_coverage(xx - sx, yy - sy, level, spacing, modifier) * visible
@@ -641,12 +661,39 @@ def _halftone(source: np.ndarray, modifier: HalftoneModifier,
             if chosen_tone is not None:
                 chosen_tone = np.where(replace, level, chosen_tone)
             if color_source is not None:
-                color_sample = colors[ids] if cell_samples is not None else _sample(color_source, sx - ox, sy - oy)
+                color_sample = (colors[ids] if cell_samples is not None
+                                else _sample(color_source, sx - sample_ox, sy - sample_oy))
                 chosen_color = np.where(replace[..., None], color_sample, chosen_color)
     if modifier.dot_style in {"blob", "liquid"}:
         coverage = _edge_coverage(joined)
     ink = _ink(chosen, chosen_tone, modifier, chosen_color)
     return _composite(source, ink, coverage, modifier)
+
+
+def _halftone_output(source, modifier, color_source, cancelled, *, frame_size, origin, output):
+    """Render a crop using the original padded sampling frame and native grid."""
+    if (modifier.grid_type in {"square", "hexagonal"}
+            and modifier.dot_style not in {"blob", "liquid", "delaunay"}):
+        left, top, width, height = output
+        if height <= HALFTONE_GEOMETRY_ROWS:
+            return _halftone(source, modifier, color_source, cancelled,
+                             frame_size=frame_size, origin=origin, output_region=output)
+        # Blur the identical padded sample frame once. Each independent mark's
+        # geometry can then use bounded row arrays without dropping neighbors,
+        # moving the lattice, or altering analytic antialiasing.
+        _check_cancelled(cancelled)
+        prepared = _blur(source, modifier.blur * halftone_unit(*frame_size, modifier))
+        result = np.empty((height, width, 4), dtype=np.float32)
+        for row in range(0, height, HALFTONE_GEOMETRY_ROWS):
+            _check_cancelled(cancelled)
+            count = min(HALFTONE_GEOMETRY_ROWS, height-row)
+            result[row:row+count] = _halftone(source, modifier, color_source, cancelled,
+                frame_size=frame_size, origin=origin,
+                output_region=(left, top+row, width, count), _prepared=prepared)
+        return result
+    left, top, width, height = output
+    return _halftone(source, modifier, color_source, cancelled,
+                     frame_size=frame_size, origin=origin)[top:top+height, left:left+width]
 
 
 def _halftone_strips(image, modifier, color_source, cancelled, *,
@@ -683,16 +730,83 @@ def _halftone_strips(image, modifier, color_source, cancelled, *,
                           if color_source is not None else None)
                 pixels = _rgba(crop)
                 color_pixels = _rgba(colors) if colors is not None else None
-                rendered = _halftone(pixels, modifier, color_pixels, cancelled,
-                                     frame_size=(width, height),
-                                     origin=(source_left, source_top))
-                tile = _image(rendered[top-source_top:bottom-source_top,
-                                       left-source_left:right-source_left])
+                rendered = _halftone_output(pixels, modifier, color_pixels, cancelled,
+                    frame_size=(width, height), origin=(source_left, source_top),
+                    output=(left-source_left, top-source_top, right-left, bottom-top))
+                tile = _image(rendered)
                 painter.drawImage(left, top, tile)
                 del crop, colors, pixels, color_pixels, rendered, tile
     finally:
         painter.end()
     return result
+
+
+def _halftone_region_padding(frame_size, modifier):
+    unit = halftone_unit(*frame_size, modifier)
+    spacing = max(.5, modifier.spacing * unit)
+    half_span = 2 if modifier.size > 1.5 else 1
+    return math.ceil((half_span + 4) * spacing * math.sqrt(2)
+                     + 3 * modifier.blur * unit + 8)
+
+
+@dataclass(frozen=True)
+class HalftoneRegionSnapshot:
+    """Detached padded input with the original pattern frame and sample origin."""
+
+    image: QImage
+    frame_size: tuple[int, int]
+    origin: tuple[int, int]
+    output: tuple[int, int, int, int]
+
+
+def capture_halftone_region(image: QImage, modifier: HalftoneModifier,
+                            region: QRect, *, tile_size=1536):
+    """Copy the same source rectangle as one ordinary regional kernel tile.
+
+    Larger requests retain the established multi-tile path: replacing those
+    padded tiles with one differently padded blur would change their samples.
+    """
+    requested = region.intersected(image.rect())
+    if (requested.isEmpty() or requested.width() > tile_size
+            or requested.height() > tile_size):
+        return None
+    frame_size = (image.width(), image.height())
+    padding = _halftone_region_padding(frame_size, modifier)
+    source = requested.adjusted(-padding, -padding, padding, padding).intersected(image.rect())
+    return HalftoneRegionSnapshot(image.copy(source), frame_size,
+        (source.x(), source.y()),
+        (requested.x()-source.x(), requested.y()-source.y(),
+         requested.width(), requested.height()))
+
+
+def render_halftone_snapshot(snapshot: HalftoneRegionSnapshot,
+                             modifier: HalftoneModifier, *, cancelled=None):
+    """Run the ordinary exact kernel with its unchanged frame and padding."""
+    _check_cancelled(cancelled)
+    rendered = _halftone_output(_rgba(snapshot.image), modifier, None, cancelled,
+        frame_size=snapshot.frame_size, origin=snapshot.origin, output=snapshot.output)
+    return _image(rendered)
+
+
+def halftone_snapshot_working_bytes(snapshot: HalftoneRegionSnapshot,
+                                    modifier: HalftoneModifier):
+    """Conservative peak admission estimate for this unchanged exact kernel.
+
+    Count the detached QImage, float RGBA source/blur (32 bytes per sample),
+    the assembled float output (16 bytes), and bounded geometry/cell-table
+    temporaries (192 bytes per geometry pixel). Conversion and scalar
+    intensity blending occur after source/blur release; their separate peak
+    allowance is 96 bytes per output pixel. Derivative marks retain the whole
+    padded geometry, so they cannot claim the analytic row bound.
+    """
+    sampled = snapshot.image.width() * snapshot.image.height()
+    _left, _top, width, height = snapshot.output
+    output = width * height
+    geometry = (width * min(height, HALFTONE_GEOMETRY_ROWS)
+                if modifier.dot_style not in {"blob", "liquid", "delaunay"}
+                else sampled)
+    return int(snapshot.image.sizeInBytes()) + max(
+        32 * sampled + 16 * output + 192 * geometry, 96 * output)
 
 
 def halftone_region(image: QImage, modifier: HalftoneModifier, region: QRect,
@@ -708,11 +822,6 @@ def halftone_region(image: QImage, modifier: HalftoneModifier, region: QRect,
     requested = region.intersected(QRect(0, 0, width, height))
     if requested.isEmpty():
         return QImage()
-    unit = halftone_unit(width, height, modifier)
-    spacing = max(.5, modifier.spacing * unit)
-    half_span = 2 if modifier.size > 1.5 else 1
-    padding = math.ceil((half_span + 4) * spacing * math.sqrt(2)
-                        + 3 * modifier.blur * unit + 8)
     result = QImage(requested.size(), current_contract().image_format)
     if result.isNull():
         raise MemoryError("Could not allocate regional halftone result")
@@ -724,18 +833,11 @@ def halftone_region(image: QImage, modifier: HalftoneModifier, region: QRect,
             for left in range(requested.left(), requested.right() + 1, tile_size):
                 _check_cancelled(cancelled)
                 right = min(requested.right() + 1, left + tile_size)
-                source_rect = QRect(left, top, right - left, bottom - top)
-                source_rect = source_rect.adjusted(-padding, -padding, padding, padding)
-                source_rect = source_rect.intersected(QRect(0, 0, width, height))
-                crop = image.copy(source_rect)
-                rendered = _halftone(_rgba(crop), modifier, cancelled=cancelled,
-                                     frame_size=(width, height),
-                                     origin=(source_rect.x(), source_rect.y()))
-                local_top, local_left = top - source_rect.y(), left - source_rect.x()
-                tile = _image(rendered[local_top:local_top + bottom - top,
-                                       local_left:local_left + right - left])
+                snapshot = capture_halftone_region(image, modifier,
+                    QRect(left, top, right-left, bottom-top), tile_size=tile_size)
+                tile = render_halftone_snapshot(snapshot, modifier, cancelled=cancelled)
                 painter.drawImage(left - requested.x(), top - requested.y(), tile)
-                del crop, rendered, tile
+                del snapshot, tile
     finally:
         painter.end()
     return result

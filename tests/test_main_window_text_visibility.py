@@ -72,10 +72,14 @@ def capture(canvas, qapp):
 
 @pytest.mark.parametrize("effect", ["plain", "object", "container", "muted", "zero"])
 @pytest.mark.parametrize("ignore_parent_mask", [False, True])
-def test_window_typed_text_matches_committed_visibility(text_window, qapp, effect, ignore_parent_mask):
+def test_window_typed_text_matches_committed_visibility(
+        text_window, qapp, await_completed_projection, effect, ignore_parent_mask):
     window, canvas = text_window, text_window.canvas
     obj = create_text(window, effect, ignore_parent_mask)
     canvas.setFocus()
+    # The resting comparison must contain finished artwork, rather than a
+    # cold async frame's loading label. Later live/commit captures stay immediate.
+    await_completed_projection(canvas)
     resting = capture(canvas, qapp)
     assert canvas.start_text_edit()
     editing = capture(canvas, qapp)

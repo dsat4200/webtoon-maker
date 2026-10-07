@@ -20,6 +20,7 @@ from comic_editor.ui.async_projection import (
     ProjectionPending, projection_deferred, projection_result_or_pending,
 )
 from comic_editor.render.pixels import current_contract
+from comic_editor.render.geometry_cache import settings_signature
 
 
 REGIONAL_HALFTONE_MIN_PIXELS = 2_000_000
@@ -47,10 +48,15 @@ def aligned(bounds):
     return QRectF(bounds.toAlignedRect())
 
 
-def empty_image(bounds):
+def _empty_image_size(bounds):
     width, height = max(1, math.ceil(bounds.width())), max(1, math.ceil(bounds.height()))
     if width * height > 64 * 1024 * 1024:
         raise ValueError("Effect bounds are too large to render. Reduce the effect or move its axis/center closer to the artwork.")
+    return width, height
+
+
+def empty_image(bounds):
+    width, height = _empty_image_size(bounds)
     image = QImage(width, height, current_contract().image_format)
     if image.isNull():
         raise MemoryError("Could not allocate effect image")
@@ -108,6 +114,7 @@ class _StagePlan:
     placement: tuple
     geometry: tuple
     targets: tuple
+    origins: tuple
     key: tuple
 
 
@@ -116,7 +123,7 @@ def _stage_plan(canvas, bounds, modifiers, local_to_world, source_identity, near
     initial_bounds = canvas._rect_signature(bounds)
     transform_signature = tuple(getattr(local_to_world, f"m{i}{j}")()
                                 for i in range(1, 4) for j in range(1, 4))
-    signatures = tuple((repr(modifier_render_settings(modifier)),
+    signatures = tuple((settings_signature(modifier, modifier_render_settings),
                         canvas._modifier_parameter_signature([modifier.modifier_id]),
                         _color_signature(canvas, modifier)) for modifier in modifiers)
     placement = (initial_bounds, transform_signature, nearest)
@@ -165,9 +172,12 @@ def _stage_plan(canvas, bounds, modifiers, local_to_world, source_identity, near
     # stage extent unchanged. Keep the concrete prefix extents instead: an
     # earlier crop can change later pixels even if a later warp expands back
     # to the same rectangle. Plan once, then use these rectangles for rendering.
-    geometry, targets = [], []
+    geometry, targets, origins = [], [], []
     incoming_bounds = QRectF(bounds)
     for index, modifier in enumerate(modifiers):
+        # Cache placement signatures retain their established rounding, but
+        # source sampling origins must keep the complete mapped coordinates.
+        origins.append(tuple(local_to_world.map(incoming_bounds.topLeft()).toTuple()))
         skipped = (modifier.muted or modifier.intensity <= 0 and "intensity" not in modifier.parameter_masks
                    or isinstance(modifier, RadialBlurModifier) and modifier.angle <= 0
                    and "angle" not in modifier.parameter_masks)
@@ -181,7 +191,7 @@ def _stage_plan(canvas, bounds, modifiers, local_to_world, source_identity, near
         incoming_bounds = target
     geometry = tuple(geometry)
     pipeline_key = ("stage-stack", source_identity, signatures, placement, geometry)
-    return _StagePlan(signatures, transform_signature, placement, geometry, tuple(targets), pipeline_key)
+    return _StagePlan(signatures, transform_signature, placement, geometry, tuple(targets), tuple(origins), pipeline_key)
 
 
 def _checkpoint_enabled(canvas, request_scope, provisional=False):
@@ -191,8 +201,56 @@ def _checkpoint_enabled(canvas, request_scope, provisional=False):
             and canvas._rendering_mask_contributor <= 0)
 
 
+def _reject_deferred_provisional(canvas, provisional, scope=None):
+    # A live descendant or mask can make an exact capture's input provisional.
+    # Waiting for its next complete capture is safe; forcing native kernels
+    # inline cannot turn those draft pixels into an exact dependency.
+    if (provisional and projection_requires_exact(canvas)
+            and getattr(canvas, '_projection_defer_effects', False)
+            and canvas._interactive_render):
+        raise ProjectionPending(scope)
+
+
+def _draft_image_prefix(canvas, source_key, modifiers):
+    """Only a compact original-image capture proves provisional source pixels.
+
+    A live descendant or contributor may improve without a model edit. Such
+    inputs cannot reuse a provisional stage just because their model key is
+    unchanged. Original image content and paint-only parameter fields have no
+    pending derived dependency; their established semantic keys are sufficient.
+    """
+    from comic_editor.core.models import ImageObject
+    from comic_editor.ui.thumbnail_effects import live_effect_draft, compact_effects_supported
+    if (not live_effect_draft(canvas) or not compact_effects_supported(modifiers)
+            or not isinstance(source_key, tuple) or len(source_key) != 3
+            or source_key[0] != 'live-effect-draft-source'):
+        return False
+    original = source_key[2]
+    obj = (canvas.chapter.objects.get(original[2])
+           if isinstance(original, tuple) and len(original) > 2
+           and original[:2] == ('mirror-source', 'object') else None)
+    # Fitted images sample the parent's effective shape bounds. An edit can
+    # change their destination quad without changing the aligned capture frame;
+    # those sources need a fresh stage until that geometry is an explicit key.
+    return (isinstance(original, tuple) and len(original) > 2
+            and original[:2] == ('mirror-source', 'object')
+            and isinstance(obj, ImageObject) and obj.placement_mode != 'fit_parent')
+
+
+def _paint_only_stage_masks(canvas, modifier):
+    if isinstance(modifier, HalftoneModifier) and modifier.color_mode == 'target_layer':
+        return False
+    for binding in modifier.parameter_masks.values():
+        mask = canvas.chapter.masks.get(binding.mask_id)
+        if (mask is None or mask.contributors or mask.gradient is not None
+                or mask.limited_gradients):
+            return False
+    return True
+
+
 def cached_stage_output(canvas, bounds, modifiers, local_to_world, *, nearest=False,
-                        required=None, request_scope=None, source_key=None):
+                        required=None, request_scope=None, source_key=None,
+                        tile_evaluation=True):
     """Return a completed exact checkpoint before recapturing unchanged artwork.
 
     The caller must supply the same semantic source key and capture bounds used
@@ -201,30 +259,62 @@ def cached_stage_output(canvas, bounds, modifiers, local_to_world, *, nearest=Fa
     """
     if source_key is None or not _checkpoint_enabled(canvas, request_scope):
         return None
-    from comic_editor.ui.tile_effects import tile_output
-    tiled = tile_output(canvas, None, bounds, modifiers, local_to_world,
-        required=required, request_scope=request_scope, source_identity=source_key, nearest=nearest)
-    if tiled is not None:
-        return tiled
+    input_revision = getattr(canvas, '_effect_provisional_revision', 0)
+    if tile_evaluation:
+        from comic_editor.ui.tile_effects import tile_output
+        tiled = tile_output(canvas, None, bounds, modifiers, local_to_world,
+            required=required, request_scope=request_scope, source_identity=source_key, nearest=nearest)
+        _reject_deferred_provisional(canvas,
+            input_revision != getattr(canvas, '_effect_provisional_revision', 0), request_scope)
+        if tiled is not None:
+            return tiled
     plan = _stage_plan(canvas, bounds, modifiers, local_to_world, source_key, nearest, required)
     regional = pointwise_output(canvas, None, bounds, modifiers, local_to_world,
         required=required, signatures=plan.signatures, placement=plan.placement,
         source_identity=source_key, request_scope=request_scope, nearest=nearest)
+    _reject_deferred_provisional(canvas,
+        input_revision != getattr(canvas, '_effect_provisional_revision', 0), request_scope)
     if regional is not None:
         return regional
-    request_scope = region_scope(canvas, request_scope, plan.targets[-1] if plan.targets else bounds)
-    checkpoint = canvas._effect_jobs.retained_get(("pipeline", request_scope), plan.key)
-    if checkpoint is None:
-        return None
-    image, (completed, placement) = checkpoint
-    if completed != len(modifiers):
-        return None
-    return image, QRectF(placement)
+    checkpoint_scope = region_scope(canvas, request_scope, plan.targets[-1] if plan.targets else bounds)
+    checkpoint = canvas._effect_jobs.retained_get(("pipeline", checkpoint_scope), plan.key)
+    if checkpoint is not None:
+        image, (completed, placement) = checkpoint
+        if completed == len(modifiers):
+            return image, QRectF(placement)
+    # A spatial graph has not necessarily resumed far enough to write its
+    # pipeline checkpoint. Its one-stage worker result still has the same
+    # semantic key and can be adopted without capturing the complete input.
+    if not tile_evaluation and len(modifiers) == 1:
+        modifier, target = modifiers[0], plan.targets[0]
+        if (not modifier.muted and (modifier.intensity > 0 or "intensity" in modifier.parameter_masks)
+                and not target.isEmpty()):
+            key = _stage_key(canvas, plan, source_key, 0, local_to_world, nearest)
+            scope = region_scope(canvas, (*request_scope, modifier.modifier_id), target)
+            cached = canvas._modifier_cache_get(key)
+            if cached is None:
+                cached = (projection_result_or_pending(canvas, scope, key) if projection_deferred(canvas)
+                          else canvas._effect_jobs.result(scope, key))
+            if cached is not None:
+                return cached, QRectF(target)
+    return None
+
+
+def _stage_key(canvas, plan, source_identity, index, local_to_world, nearest):
+    incoming, target = plan.geometry[index]
+    upstream = ("stage-input", source_identity, plan.signatures[:index], plan.placement,
+                plan.geometry[:index])
+    return ("stage", upstream, incoming, target,
+            plan.signatures[index][0], plan.signatures[index][1],
+            plan.origins[index], nearest,
+            plan.signatures[index][2], plan.transform_signature)
 
 
 def render_stages(canvas, image, bounds, modifiers, local_to_world, *, nearest=False,
                   required=None, request_scope=None, provisional=False, source_key=None,
                   tile_evaluation=True):
+    _reject_deferred_provisional(canvas, provisional, request_scope)
+    input_revision = getattr(canvas, '_effect_provisional_revision', 0)
     bounds = QRectF(bounds)
     exact = projection_requires_exact(canvas)
     reference = exact_reference_sampling(canvas)
@@ -234,6 +324,8 @@ def render_stages(canvas, image, bounds, modifiers, local_to_world, *, nearest=F
         from comic_editor.ui.tile_effects import tile_output
         tiled = tile_output(canvas, image, bounds, modifiers, local_to_world,
             required=required, request_scope=request_scope, source_identity=source_identity, nearest=nearest)
+        _reject_deferred_provisional(canvas,
+            input_revision != getattr(canvas, '_effect_provisional_revision', 0), request_scope)
         if tiled is not None:
             return tiled
     plan = _stage_plan(canvas, bounds, modifiers, local_to_world, source_identity, nearest, required)
@@ -241,6 +333,8 @@ def render_stages(canvas, image, bounds, modifiers, local_to_world, *, nearest=F
         regional = pointwise_output(canvas, image, bounds, modifiers, local_to_world,
             required=required, signatures=plan.signatures, placement=plan.placement,
             source_identity=source_identity, request_scope=request_scope, nearest=nearest)
+        _reject_deferred_provisional(canvas,
+            input_revision != getattr(canvas, '_effect_provisional_revision', 0), request_scope)
         if regional is not None:
             return regional
     signatures, transform_signature = plan.signatures, plan.transform_signature
@@ -253,6 +347,7 @@ def render_stages(canvas, image, bounds, modifiers, local_to_world, *, nearest=F
     request_scope = region_scope(canvas, request_scope, plan.targets[-1] if plan.targets else bounds)
     checkpoint_scope = ("pipeline", request_scope)
     checkpointing = _checkpoint_enabled(canvas, request_scope, provisional)
+    draft_prefix = provisional and _draft_image_prefix(canvas, source_key, modifiers)
     start = 0
     inverse, valid = local_to_world.inverted()
     if checkpointing:
@@ -273,16 +368,18 @@ def render_stages(canvas, image, bounds, modifiers, local_to_world, *, nearest=F
         if target.isEmpty():
             image, bounds = empty_image(QRectF(0, 0, 1, 1)), target
             continue
+        draft_prefix = draft_prefix and _paint_only_stage_masks(canvas, modifier)
         # A semantic capture key survives source-LRU eviction. Only the exact
         # upstream prefix contributes, so editing a later slider still reuses
         # every earlier stage.
         upstream_key = ("stage-input", source_identity, signatures[:index], placement,
                         geometry[:index]) if source_key is not None else int(image.cacheKey())
-        key = ("stage", upstream_key, canvas._rect_signature(bounds),
-               canvas._rect_signature(target),
-               signatures[index][0], signatures[index][1],
-               tuple(local_to_world.map(bounds.topLeft()).toTuple()), nearest, signatures[index][2],
-               transform_signature)
+        key = (_stage_key(canvas, plan, source_identity, index, local_to_world, nearest)
+               if source_key is not None else
+               ("stage", upstream_key, canvas._rect_signature(bounds), canvas._rect_signature(target),
+                signatures[index][0], signatures[index][1],
+                tuple(local_to_world.map(bounds.topLeft()).toTuple()), nearest, signatures[index][2],
+                transform_signature))
         stage_base_scope = (*base_request_scope, modifier.modifier_id) if base_request_scope is not None else None
         stage_scope = region_scope(canvas, stage_base_scope, target)
         regional_halftone = (
@@ -311,7 +408,12 @@ def render_stages(canvas, image, bounds, modifiers, local_to_world, *, nearest=F
             # separate scopes so retaining a stage cannot replace this image.
             pattern_frame_scope = (("pattern-frame", shared_scope)
                                    if shared_scope is not None else None)
-        cached = None if provisional else canvas._modifier_cache_get(key)
+        # Reassembled Qt handles do not invalidate deterministic compact image
+        # prefixes. This separate key retains only fresh transient pixels; exact
+        # requests and derived/contributor sources can never read these entries.
+        live_prefix_key = ('live-effect-draft-stage', current_contract().signature, key) if draft_prefix else None
+        cached = (canvas._modifier_cache_get(live_prefix_key) if live_prefix_key is not None
+                  else None if provisional else canvas._modifier_cache_get(key))
         if cached is None and not provisional and stage_scope is not None:
             cached = (projection_result_or_pending(canvas, stage_scope, key) if deferred
                       else canvas._effect_jobs.result(stage_scope, key))
@@ -354,15 +456,22 @@ def render_stages(canvas, image, bounds, modifiers, local_to_world, *, nearest=F
             continue
         if cached is None:
             if regional_halftone:
-                from comic_editor.ui.pattern_rendering import halftone_region
+                from comic_editor.ui.pattern_rendering import (capture_halftone_region,
+                    halftone_region, halftone_snapshot_working_bytes, render_halftone_snapshot)
                 region = QRectF(target).translated(-bounds.topLeft()).toAlignedRect()
-                incoming, effect = QImage(image), copy.deepcopy(modifier)
+                effect = copy.deepcopy(modifier)
+                snapshot = capture_halftone_region(image, effect, region)
+                incoming = QImage(image) if snapshot is None else None
+                size = (halftone_snapshot_working_bytes(snapshot, effect)
+                        if snapshot is not None else 8 * int(incoming.sizeInBytes()))
                 def compute(cancelled=None, incoming=incoming, effect=effect,
-                            region=region):
-                    result = halftone_region(incoming, effect, region,
-                                             cancelled=cancelled)
+                            region=region, snapshot=snapshot):
+                    result = (render_halftone_snapshot(snapshot, effect, cancelled=cancelled)
+                              if snapshot is not None else
+                              halftone_region(incoming, effect, region, cancelled=cancelled))
                     if effect.intensity < 100:
-                        original = incoming.copy(region)
+                        original = (snapshot.image.copy(*snapshot.output)
+                                    if snapshot is not None else incoming.copy(region))
                         amount = max(0., effect.intensity / 100.)
                         result = _premultiplied_qimage(
                             _qimage_premultiplied(original) * (1. - amount)
@@ -370,7 +479,7 @@ def render_stages(canvas, image, bounds, modifiers, local_to_world, *, nearest=F
                     return result
                 if deferred and not provisional and stage_scope is not None:
                     canvas._effect_jobs.request(stage_scope, key, compute,
-                        8 * int(incoming.sizeInBytes()),
+                        size,
                         allow_oversized=True, require_exact=True)
                     raise ProjectionPending(stage_scope, key)
                 cached = compute()
@@ -402,6 +511,11 @@ def render_stages(canvas, image, bounds, modifiers, local_to_world, *, nearest=F
                 work_target = bounds
             # Keep the upstream image identity for cached GPU uploads and blur
             # passes when a pattern slider changes.
+            omit_distort_base = False
+            if isinstance(modifier, DistortModifier) and valid:
+                from comic_editor.ui.distort_pipeline import can_omit_deferred_base
+                omit_distort_base = can_omit_deferred_base(
+                    canvas, image, target, modifier, stage_scope, provisional, navigator)
             source = image if pattern else None
             if outline:
                 padding_key = ("outline-stage-source", upstream_key,
@@ -415,10 +529,14 @@ def render_stages(canvas, image, bounds, modifiers, local_to_world, *, nearest=F
                     painter.end()
                     if not provisional:
                         canvas._modifier_source_cache_put(padding_key, source)
-            if source is None:
+            if source is None and not omit_distort_base:
                 source = empty_image(work_target)
-            mapping = canvas._world_to_image_transform(local_to_world, work_target, source.width(), source.height())
-            fields = canvas._modifier_mask_fields([modifier], source.width(), source.height(), mapping, local_to_world.mapRect(work_target))
+            source_size = (_empty_image_size(work_target) if omit_distort_base
+                           else (source.width(), source.height()))
+            mapping = canvas._world_to_image_transform(local_to_world, work_target, *source_size)
+            fields = canvas._modifier_mask_fields([modifier], *source_size, mapping, local_to_world.mapRect(work_target))
+            _reject_deferred_provisional(canvas,
+                input_revision != getattr(canvas, '_effect_provisional_revision', 0), stage_scope)
             if pattern:
                 from comic_editor.ui.gpu_pattern_effects import renderer_for
                 from comic_editor.ui.modifier_rendering import apply_pattern_modifier
@@ -503,12 +621,14 @@ def render_stages(canvas, image, bounds, modifiers, local_to_world, *, nearest=F
                         local_to_world, key, stage_base_scope)
                 else:
                     from comic_editor.ui.distort_pipeline import render_distort_stage
-                    painter = QPainter(source)
-                    painter.drawImage(bounds.topLeft() - target.topLeft(), image)
-                    painter.end()
+                    if not omit_distort_base:
+                        painter = QPainter(source)
+                        painter.drawImage(bounds.topLeft() - target.topLeft(), image)
+                        painter.end()
                     cached, provisional = render_distort_stage(
                         canvas, image, source, bounds, target, modifier,
-                        local_to_world, fields, key, stage_scope, provisional, navigator)
+                        local_to_world, fields, key, stage_scope, provisional, navigator,
+                        base_size=source_size if omit_distort_base else None)
             elif isinstance(modifier, CageTransformModifier) and valid:
                 from comic_editor.ui.cage_rendering import warp_image
                 painter = QPainter(source)
@@ -625,7 +745,9 @@ def render_stages(canvas, image, bounds, modifiers, local_to_world, *, nearest=F
                 cached, provisional = render_radial_stage(canvas, image, source, modifier, fields,
                     image_mapping, origin, source_key=upstream_key, scope=stage_scope,
                     asynchronous=asynchronous, deferred=deferred, provisional=provisional,
-                    navigator=navigator, exact=exact)
+                    navigator=navigator, exact=exact,
+                    bounded_preview=(provisional and not exact and isinstance(source_key, tuple)
+                                     and source_key[:1] == ('live-effect-draft-source',)))
             else:
                 if not outline:
                     painter = QPainter(source)
@@ -649,8 +771,12 @@ def render_stages(canvas, image, bounds, modifiers, local_to_world, *, nearest=F
                     cropped = QRectF(target)
                     cropped.translate(-work_target.topLeft())
                     cached = cached.copy(cropped.toAlignedRect())
+            _reject_deferred_provisional(canvas, provisional or
+                input_revision != getattr(canvas, '_effect_provisional_revision', 0), stage_scope)
             if not provisional:
                 canvas._modifier_cache_put(key, cached)
+            elif live_prefix_key is not None:
+                canvas._modifier_cache_put(live_prefix_key, cached)
         image, bounds = cached, target
         if checkpointing and not provisional:
             if region_requests_enabled(canvas) or reference:

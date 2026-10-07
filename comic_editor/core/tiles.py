@@ -22,6 +22,7 @@ from scipy.ndimage import (
 
 TILE_SIZE = 256
 _UNKNOWN_ALPHA_BOUNDS = object()
+_ALPHA_BOUNDS_VERSION = 2
 
 
 class TileStore:
@@ -51,6 +52,20 @@ class TileStore:
     def _file_stamp(stat):
         return stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns
 
+    @staticmethod
+    def _legacy_bounds_compatible(path):
+        # Old bounds were computed through RGBA8. A matching PNG stamp alone
+        # cannot validate low-coverage 16-bit pixels. Inspect only its fixed
+        # header; pixel decode and the shared bounds calculation stay lazy.
+        try:
+            with path.open('rb') as handle:
+                header = handle.read(26)
+        except OSError:
+            return False
+        return (len(header) == 26 and header[:8] == b'\x89PNG\r\n\x1a\n'
+                and header[8:12] == b'\x00\x00\x00\r' and header[12:16] == b'IHDR'
+                and header[24] in (1, 2, 4, 8))
+
     def _tile_changed(self, marker):
         self.dirty.add(marker)
         self._alpha_bounds_dirty.add(marker)
@@ -74,14 +89,18 @@ class TileStore:
                 shutil.copyfile(path, target)
                 object_tiles.entries[key] = target
 
-    def detached_snapshot(self, object_ids: set[str]) -> "TileStore":
+    def detached_snapshot(self, object_ids: set[str], *, wait_for_prefetch=True,
+                          selected_keys=None) -> "TileStore":
         """Freeze a worker's pixels without decoding unchanged disk tiles.
 
         Resource writers always replace files. Hard links therefore pin the
         captured revision, even if its original filename is replaced or removed.
         QImage copies pin edited buffers through Qt's copy-on-write ownership.
         """
-        self.finish_snapshot_prefetch()
+        # A visible dependency must not wait for unrelated chapter-wide pins.
+        # Its own unchanged files are pinned below on the document thread.
+        if wait_for_prefetch or self._snapshot_future is not None and self._snapshot_future.done():
+            self.finish_snapshot_prefetch()
         snapshot = TileStore(self.tile_size, cache_budget=self.residency.budget)
         for object_id in object_ids:
             source = self._tiles.get(object_id)
@@ -89,6 +108,8 @@ class TileStore:
                 continue
             detached = snapshot._object_tiles(object_id)
             for key in source:
+                if selected_keys is not None and key not in selected_keys.get(object_id, ()):
+                    continue
                 # Detect edits made through a borrowed clean QImage first.
                 source.version(key)
                 value = source.entries[key]
@@ -107,11 +128,17 @@ class TileStore:
                 detached.versions[key] = source.versions.get(key, 0)
                 if key in source.content_keys:
                     detached.content_keys[key] = source.content_keys[key]
-            snapshot._alpha_bounds[object_id] = dict(self._alpha_bounds.get(object_id, {}))
+            snapshot._alpha_bounds[object_id] = {key: value for key, value
+                in self._alpha_bounds.get(object_id, {}).items()
+                if selected_keys is None or key in detached}
         snapshot._alpha_bounds_dirty = {
-            marker for marker in self._alpha_bounds_dirty if marker[0] in object_ids
+            marker for marker in self._alpha_bounds_dirty
+            if marker[0] in object_ids and (selected_keys is None
+                or (marker[1], marker[2]) in snapshot._tiles.get(marker[0], {}))
         }
-        snapshot.dirty = {marker for marker in self.dirty if marker[0] in object_ids}
+        snapshot.dirty = {marker for marker in self.dirty
+            if marker[0] in object_ids and (selected_keys is None
+                or (marker[1], marker[2]) in snapshot._tiles.get(marker[0], {}))}
         return snapshot
 
     def prefetch_snapshot_backing(self) -> None:
@@ -1381,6 +1408,29 @@ class TileStore:
     @staticmethod
     def _alpha_bbox(image: QImage) -> tuple[int, int, int, int] | None:
         try:
+            native_type = {
+                QImage.Format_RGBA64: np.uint16,
+                QImage.Format_RGBA64_Premultiplied: np.uint16,
+                QImage.Format_RGBA16FPx4: np.float16,
+                QImage.Format_RGBA16FPx4_Premultiplied: np.float16,
+                QImage.Format_RGBA32FPx4: np.float32,
+                QImage.Format_RGBA32FPx4_Premultiplied: np.float32,
+            }.get(image.format())
+            if native_type is not None:
+                rows = np.frombuffer(image.constBits(), native_type).reshape(
+                    image.height(), image.bytesPerLine() // np.dtype(native_type).itemsize)
+                alpha = rows[:, 3:image.width()*4:4]
+                bounds = None
+                block_rows = max(1, 262144 // max(image.width(), 1))
+                for top in range(0, image.height(), block_rows):
+                    bbox = PILImage.fromarray(alpha[top:top+block_rows] > 0).getbbox()
+                    if bbox is not None:
+                        left, first, right, last = bbox
+                        current = left, top+first, right, top+last
+                        bounds = current if bounds is None else (
+                            min(bounds[0], current[0]), min(bounds[1], current[1]),
+                            max(bounds[2], current[2]), max(bounds[3], current[3]))
+                return bounds
             if image.format() in (QImage.Format_ARGB32, QImage.Format_ARGB32_Premultiplied):
                 import sys
                 rows = np.frombuffer(image.constBits(), np.uint8).reshape(image.height(), image.bytesPerLine())
@@ -1398,7 +1448,7 @@ class TileStore:
             maximum_x = maximum_y = -1
             for y in range(image.height()):
                 for x in range(image.width()):
-                    if image.pixelColor(x, y).alpha() <= 0:
+                    if image.pixelColor(x, y).alphaF() <= 0:
                         continue
                     minimum_x, minimum_y = min(minimum_x, x), min(minimum_y, y)
                     maximum_x, maximum_y = max(maximum_x, x), max(maximum_y, y)
@@ -1434,8 +1484,10 @@ class TileStore:
                     continue
                 stat = path.stat()
                 record = index.get(f'{object_id}/{path.name}')
-                if not (isinstance(record, list) and len(record) == 3
-                        and record[:2] == [stat.st_size, stat.st_mtime_ns]):
+                if not (isinstance(record, list) and len(record) in (3, 4)
+                        and record[:2] == [stat.st_size, stat.st_mtime_ns]
+                        and (record[3] == _ALPHA_BOUNDS_VERSION if len(record) == 4
+                             else self._legacy_bounds_compatible(path))):
                     reader = QImageReader(str(path))
                     if not reader.canRead():
                         continue
@@ -1534,7 +1586,8 @@ class TileStore:
             if key not in bounds_cache or marker in self._alpha_bounds_dirty:
                 self._cached_alpha_bbox(object_id, key, object_tiles[key])
             stat = target.stat()
-            index[f'{object_id}/{target.name}'] = [stat.st_size, stat.st_mtime_ns, bounds_cache[key]]
+            index[f'{object_id}/{target.name}'] = [stat.st_size, stat.st_mtime_ns,
+                                                bounds_cache[key], _ALPHA_BOUNDS_VERSION]
         if complete:
             from .persistence import atomic_json
             atomic_json(root / '.tile-index.json', index)

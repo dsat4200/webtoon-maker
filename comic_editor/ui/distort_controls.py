@@ -47,7 +47,7 @@ class DistortNumber(QWidget):
         value.setValue(controls.modifier.parameters[key])
         row.addWidget(value)
         layout.addLayout(row)
-        slider = QSlider(Qt.Horizontal, self)
+        slider = DistortParameterSlider(controls, self)
         slider.setObjectName("distortSlider_" + key)
         slider.setAccessibleName(spec["label"])
         slider.setRange(round(spec["minimum"] * factor), round(spec["maximum"] * factor))
@@ -74,6 +74,25 @@ class DistortNumber(QWidget):
         slider.sliderReleased.connect(controls.owner.finish_parameter_drag)
         slider.valueChanged.connect(from_slider)
         value.valueChanged.connect(from_value)
+
+
+class DistortParameterSlider(QSlider):
+    """A groove jump and subsequent handle drag share one original snapshot."""
+    def __init__(self, controls, parent=None):
+        super().__init__(Qt.Horizontal, parent)
+        self._controls = controls
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            # QSlider can change its value on the groove before sliderPressed.
+            self._controls.owner.begin_parameter_drag(self._controls.modifier.modifier_id)
+        super().mousePressEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        super().mouseReleaseEvent(event)
+        if event.button() == Qt.LeftButton:
+            # A groove press need not emit sliderReleased at all.
+            self._controls.owner.finish_parameter_drag()
 
 
 class ShearCurveEditor(QWidget):
@@ -259,7 +278,7 @@ class DistortControls(QWidget):
             radius.setKeyboardTracking(False)
             row.addWidget(radius)
             form.addLayout(row)
-            radius_slider = QSlider(Qt.Horizontal, self)
+            radius_slider = DistortParameterSlider(self, self)
             radius_slider.setObjectName("distortRadiusSlider")
             radius_slider.setAccessibleName("Radius")
             # A logarithmic scale keeps small radii controllable while retaining

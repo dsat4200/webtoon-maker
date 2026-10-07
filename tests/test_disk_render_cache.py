@@ -318,6 +318,96 @@ def test_manual_range_reopens_without_scene_rendering(editor, qapp, monkeypatch)
     assert second_cache.backing.entries == first
 
 
+def test_selected_mask_only_descendant_cannot_contaminate_recorded_projection(editor, qapp, monkeypatch):
+    from comic_editor.core.models import BlurModifier, BoundGeometry, HueSaturationLightnessModifier
+    from comic_editor.core.settings import EditorSettings
+    from comic_editor.render.service import TileBatchPolicy
+    from comic_editor.ui.canvas import CanvasWidget
+
+    window, reopen, identifier = editor
+    canvas, chapter, cache = window.canvas, window.chapter, window.disk_cache
+    window.autosave_timer.stop()
+    canvas.setUpdatesEnabled(False)
+    window.preview.setUpdatesEnabled(False)
+    obj = chapter.objects[identifier]
+    parent = chapter.layers[obj.parent_layer_id]
+    descendant = chapter.add_layer(parent.layer_id, 'Mask-only child',
+                                    BoundGeometry.rectangle(0, 0, 1080, 768))
+    descendant.fill_color, descendant.border_width, descendant.mask_only = None, 0, True
+    chapter.move_entity('object', identifier, descendant.layer_id, 0)
+    chapter.add_modifier(HueSaturationLightnessModifier(hue=30), [('object', identifier)])
+    chapter.add_modifier(BlurModifier(strength=3), [('layer', parent.layer_id)])
+    window.repository.save_chapter(chapter, canvas.tiles, canvas.images)
+
+    def configure(target):
+        config = target._projection_configuration()
+        target._render_service.configure((*config, None), document=config[:3])
+        return target._render_document_state()
+
+    canvas.set_selection('layer', descendant.layer_id)
+    request = canvas._document_projection.requests(QRectF(0, 0, 256, 256), 1.)[0]
+    document = configure(canvas)
+    selected = canvas._render_service.render_tiles(document, [request], TileBatchPolicy((128., 128.)))
+    selected_image, exact = selected.tiles[request.address]
+    assert exact and not selected_image.isNull()
+    selected_bytes = bytes(selected_image.constBits())
+    cache.set_range(0, 256)
+    assert cache.start()
+    finish(window, qapp)
+    assert cache.row_ready(0)
+    with cache.capture():
+        document = configure(canvas)
+        key = cache.tile_key(request, (*document.configuration, None))
+        recorded = cache.backing.lookup('projection', key, wait=True)
+        assert recorded is not None
+        recorded_bytes = bytes(recorded.constBits())
+
+    # A newly loaded canvas has neither persistent backing nor effect caches.
+    # Its normal exact scene renderer is the independent visibility oracle.
+    fresh_chapter, fresh_tiles, fresh_images = window.repository.load_chapter(chapter.chapter_id, include_images=True)
+    oracle = CanvasWidget(EditorSettings(grid_overlay_visible=False))
+    try:
+        oracle.set_document(fresh_chapter, fresh_tiles, fresh_images)
+        oracle.setUpdatesEnabled(False)
+        oracle._disk_cache_capture = True
+        assert getattr(oracle, '_persistent_render_cache', None) is None
+        document = configure(oracle)
+        result = oracle._render_service.collect_tiles(document, [request], TileBatchPolicy((128., 128.)))
+        assert result and result[0].valid
+        expected = bytes(result[0].image.constBits())
+    finally:
+        oracle._effect_jobs.cancel()
+        oracle.close()
+        oracle.deleteLater()
+    assert selected_bytes != expected
+    assert recorded_bytes == expected
+
+    cache.detach()
+    second = reopen()
+    second.autosave_timer.stop()
+    second.canvas.setUpdatesEnabled(False)
+    second.preview.setUpdatesEnabled(False)
+    second_cache = second.disk_cache
+    def forbidden(*args, **kwargs):
+        raise AssertionError('The correct durable projection must reopen without scene traversal')
+    monkeypatch.setattr(second.canvas._render_service, 'render_region', forbidden)
+    with second_cache.capture():
+        document = configure(second.canvas)
+        key = second_cache.tile_key(request, (*document.configuration, None))
+        assert bytes(second_cache.backing.lookup('projection', key, wait=True).constBits()) == expected
+        deadline = time.monotonic()+10
+        result = []
+        while time.monotonic() < deadline:
+            result = second.canvas._render_service.collect_tiles(document, [request], TileBatchPolicy((128., 128.)))
+            if result and result[0].valid:
+                break
+            second_cache.backing.poll()
+            qapp.processEvents()
+            time.sleep(.001)
+        assert result and result[0].valid
+        assert bytes(result[0].image.constBits()) == expected
+
+
 def test_editing_lock_cancel_and_resume(editor, qapp):
     window, _, identifier = editor
     cache, canvas = window.disk_cache, window.canvas

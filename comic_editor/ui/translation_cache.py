@@ -99,6 +99,11 @@ def output_key(canvas, target, bounds, mapping, modifiers, *, tile_space=False, 
         if entity.opacity_mask is not None:
             bindings.append(entity.opacity_mask)
         if is_layer:
+            # Descendant layer visibility and live geometry also affect this
+            # source. Keep them on the established dependency path, as for
+            # objects, instead of admitting an incomplete translation alias.
+            if canvas._modifier_layer_signature(entity.layer_id)[4]:
+                raise ValueError("Live source")
             children = [subtree(canvas.chapter.modifier_target(child.kind, child.entity_id))
                         for child in entity.children]
             return data, effects, children
@@ -130,6 +135,10 @@ def output_key(canvas, target, bounds, mapping, modifiers, *, tile_space=False, 
            phase, relative(bounds), tuple((relative(a), relative(b)) for a, b in geometry),
            repr(current_contract()), canvas._render_exclude_text,
            getattr(canvas, "_suppress_outline_for_mask", False))
+    from comic_editor.render.source_context import source_color_context
+    context = source_color_context(canvas.chapter.pixel_contract)
+    if context:
+        key = (*key, context)
     return ("translated-exact-output", target.layer_id if layer else target.object_id,
             json.dumps(key, sort_keys=True, separators=(",", ":")))
 

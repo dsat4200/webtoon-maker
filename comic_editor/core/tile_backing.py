@@ -13,6 +13,7 @@ import tempfile
 import uuid
 
 from PySide6.QtGui import QImage
+from .pixel_arrays import image_has_high_precision
 
 
 _snapshot_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix='tile-pins')
@@ -165,7 +166,8 @@ class TileResidency:
             image = QImage(str(path))
             if image.isNull():
                 raise OSError(f'Unable to read raster tile {path}')
-            image = image.convertToFormat(QImage.Format_ARGB32_Premultiplied)
+            if not image_has_high_precision(image):
+                image = image.convertToFormat(QImage.Format_ARGB32_Premultiplied)
         self.decodes += 1
         self.retain(owner, key, image)
         return image

@@ -9,9 +9,13 @@ from PySide6.QtCore import QRect
 from PySide6.QtGui import QImage
 
 from comic_editor.core.models import HALFTONE_DOT_STYLES, HALFTONE_GRIDS, HalftoneModifier, PixelateModifier
+from comic_editor.core.pixel_contract import LEGACY_PIXELS, PixelContract
+from comic_editor.render.pixels import pixel_scope, premultiplied_pixels, working_image
 from comic_editor.ui.pattern_rendering import (
-    _halftone_strips, apply_pattern_effect, delaunay_triangles, gradient_lut,
-    halftone_points, halftone_region, halftone_unit,
+    _halftone, _halftone_output, _halftone_strips, _image, _rgba,
+    apply_pattern_effect, delaunay_triangles, gradient_lut,
+    capture_halftone_region, halftone_points, halftone_region, halftone_unit,
+    render_halftone_snapshot,
 )
 
 
@@ -74,6 +78,144 @@ def test_regional_halftone_matches_complete_frame(grid, rotation):
         actual = halftone_region(source, modifier, region, tile_size=17)
         np.testing.assert_array_equal(rgba_from_image(actual),
                                       rgba_from_image(complete.copy(region)))
+
+
+@pytest.mark.parametrize("contract", [LEGACY_PIXELS,
+    PixelContract(version=2, precision="float16", working_space="linear_srgb"),
+    PixelContract(version=2, precision="float32", working_space="linear_srgb")])
+@pytest.mark.parametrize("grid,style,mode", [("square", "circle", "two"),
+    ("hexagonal", "polygon", "source"), ("square", "incircle", "gradient"),
+    ("hexagonal", "square", "target_layer")])
+def test_output_geometry_preserves_padded_sampling_and_native_precision(contract, grid, style, mode):
+    rng = np.random.default_rng(710)
+    values = rng.random((177, 233, 4), dtype=np.float32)
+    values[..., :3] *= values[..., 3:4] * (2.5 if contract.floating else 1.)
+    modifier = HalftoneModifier(grid_type=grid, dot_style=style, color_mode=mode,
+        base_resolution=1000, spacing=10., blur=5., size=1.65, rotation=-38.2,
+        corner_rounding=.3, target_hue=-45., target_saturation=61.,
+        target_lightness=-9., transparent_background=True)
+    output = (79, 51, 83, 69)
+    with pixel_scope(contract):
+        source = _rgba(working_image(values))
+        colors = _rgba(working_image(np.roll(values, 19, axis=1)))
+        arguments = dict(frame_size=(1527, 6127), origin=(100, 2000))
+        reference = _halftone(source, modifier, colors, **arguments)[51:120, 79:162]
+        actual = _halftone_output(source, modifier, colors, None, output=output, **arguments)
+        np.testing.assert_array_equal(actual, reference)
+        expected_image, actual_image = _image(reference), _image(actual)
+        assert expected_image.format() == actual_image.format() == contract.image_format
+        np.testing.assert_array_equal(premultiplied_pixels(actual_image),
+                                      premultiplied_pixels(expected_image))
+
+
+@pytest.mark.parametrize("grid,style", [("square", "blob"), ("hexagonal", "liquid"),
+                                       ("line", "circle"), ("ring", "circle")])
+def test_derivative_dependent_marks_keep_full_padded_output(grid, style):
+    values = np.random.default_rng(615).random((101, 133, 4), dtype=np.float32)
+    values[..., :3] *= values[..., 3:4]
+    modifier = HalftoneModifier(grid_type=grid, dot_style=style, spacing=12,
+                                base_resolution=133, blur=1., size=1.65)
+    reference = _halftone(values, modifier)[19:74, 27:82]
+    actual = _halftone_output(values, modifier, None, None,
+        frame_size=(133, 101), origin=(0, 0), output=(27, 19, 55, 55))
+    np.testing.assert_array_equal(actual, reference)
+
+
+@pytest.mark.parametrize("rotation", [-38.2, 0.])
+def test_rewritten_gradient_parameters_match_full_frame_at_region_edges(rotation):
+    values = np.random.default_rng(44).random((381, 247, 4), dtype=np.float32)
+    values[..., :3] *= values[..., 3:4]
+    source = _image(values)
+    modifier = HalftoneModifier(grid_type="square", dot_style="circle", color_mode="two",
+        base_resolution=1000, spacing=10., blur=5., size=1.65, rotation=rotation,
+        transparent_background=True, foreground="#FFF1F1F1")
+    complete = apply_pattern_effect(source, modifier)
+    for region in (QRect(0, 0, 21, 23), QRect(97, 129, 39, 47), QRect(221, 350, 26, 31)):
+        actual = halftone_region(source, modifier, region, tile_size=23)
+        assert actual == complete.copy(region)
+
+
+@pytest.mark.parametrize("contract", [LEGACY_PIXELS,
+    PixelContract(version=2, precision="float16", working_space="linear_srgb"),
+    PixelContract(version=2, precision="float32", working_space="linear_srgb")])
+@pytest.mark.parametrize("style", ["circle", "blob", "liquid"])
+def test_detached_halftone_region_preserves_native_sampling_and_precision(contract, style):
+    values = np.random.default_rng(451).random((313, 229, 4), dtype=np.float32)
+    values[..., :3] *= values[..., 3:4] * (2.5 if contract.floating else 1.)
+    modifier = HalftoneModifier(grid_type="hexagonal", dot_style=style,
+        color_mode="source", base_resolution=1000, spacing=10, blur=5,
+        size=1.65, rotation=-38.2, transparent_background=True)
+    with pixel_scope(contract):
+        image = working_image(values)
+        for region in (QRect(0, 0, 27, 37), QRect(79, 111, 57, 69), QRect(211, 284, 18, 29)):
+            snapshot = capture_halftone_region(image, modifier, region)
+            assert snapshot.frame_size == (229, 313)
+            assert snapshot.image.sizeInBytes() < image.sizeInBytes()
+            reference = halftone_region(image, modifier, region)
+            result = render_halftone_snapshot(snapshot, modifier)
+            assert result.format() == contract.image_format
+            assert result == reference
+        # A UI write after capture detaches and cannot change the worker input.
+        snapshot = capture_halftone_region(image, modifier, QRect(79, 111, 57, 69))
+        expected = render_halftone_snapshot(snapshot, modifier)
+        image.fill(0)
+        assert render_halftone_snapshot(snapshot, modifier) == expected
+
+
+def test_detached_halftone_rejects_requests_with_multiple_padding_frames():
+    source = solid(width=101, height=109)
+    modifier = replace(halftone(), blur=1.)
+    assert capture_halftone_region(source, modifier, QRect(8, 9, 41, 37), tile_size=40) is None
+    assert capture_halftone_region(source, modifier, QRect(200, 200, 8, 9)) is None
+    snapshot = capture_halftone_region(source, modifier, QRect(-7, -8, 41, 37), tile_size=40)
+    assert snapshot.output[2:] == (34, 29)
+    assert render_halftone_snapshot(snapshot, modifier) == halftone_region(source, modifier,
+        QRect(-7, -8, 41, 37), tile_size=40)
+
+
+@pytest.mark.parametrize("contract", [LEGACY_PIXELS,
+    PixelContract(version=2, precision="float16", working_space="linear_srgb"),
+    PixelContract(version=2, precision="float32", working_space="linear_srgb")])
+@pytest.mark.parametrize("grid,style,mode", [("square", "circle", "two"),
+    ("hexagonal", "polygon", "source"), ("square", "incircle", "gradient"),
+    ("hexagonal", "square", "target_layer")])
+def test_chunked_geometry_keeps_all_neighbor_samples_and_native_values(contract, grid, style, mode):
+    values = np.random.default_rng(881).random((431, 333, 4), dtype=np.float32)
+    values[..., :3] *= values[..., 3:4] * (2.5 if contract.floating else 1.)
+    modifier = HalftoneModifier(grid_type=grid, dot_style=style, color_mode=mode,
+        base_resolution=1000, spacing=10, blur=5, size=1.65, rotation=-38.2,
+        corner_rounding=.3, target_hue=-45, target_saturation=61,
+        target_lightness=-9, transparent_background=True)
+    output = (53, 51, 183, 279)
+    with pixel_scope(contract):
+        source = _rgba(working_image(values))
+        colors = _rgba(working_image(np.roll(values, 19, axis=1)))
+        arguments = dict(frame_size=(1527, 6127), origin=(100, 2000))
+        reference = _halftone(source, modifier, colors, **arguments)[51:330, 53:236]
+        actual = _halftone_output(source, modifier, colors, None, output=output, **arguments)
+        np.testing.assert_array_equal(actual, reference)
+        assert _image(actual) == _image(reference)
+
+
+def test_chunked_geometry_preserves_values_when_cell_table_admission_changes(monkeypatch):
+    import comic_editor.ui.pattern_rendering as patterns
+    values = np.random.default_rng(177).random((431, 231, 4), dtype=np.float32)
+    values[..., :3] *= values[..., 3:4]
+    modifier = HalftoneModifier(grid_type="square", dot_style="circle", color_mode="source",
+        base_resolution=1000, spacing=2.3, blur=0, rotation=45, size=1.1)
+    decisions = []
+    ordinary = patterns._cell_sample_table
+    def record(*arguments, **keywords):
+        result = ordinary(*arguments, **keywords)
+        decisions.append(result is not None)
+        return result
+    monkeypatch.setattr(patterns, "_cell_sample_table", record)
+    arguments = dict(frame_size=(1000, 1600), origin=(100, 2000))
+    expected = _halftone(values, modifier, **arguments)[13:413, 9:209]
+    actual = _halftone_output(values, modifier, None, None,
+        output=(9, 13, 200, 400), **arguments)
+    assert decisions[0] and not all(decisions[1:])
+    np.testing.assert_array_equal(actual, expected)
 
 
 @pytest.mark.parametrize("grid", HALFTONE_GRIDS)

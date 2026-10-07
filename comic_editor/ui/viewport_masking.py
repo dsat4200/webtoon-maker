@@ -3,6 +3,7 @@ from PySide6.QtCore import QRectF
 from PySide6.QtGui import QTransform
 
 from comic_editor.ui.modifier_rendering import apply_opacity_mask
+from comic_editor.render.pixels import current_contract
 
 
 def mask_output(canvas, image, bounds, mapping, binding, visible, painter, *, target=None, source_key=None):
@@ -41,13 +42,16 @@ def mask_output(canvas, image, bounds, mapping, binding, visible, painter, *, ta
            tuple(bounds.getRect()), tuple(getattr(mapping, f"m{i}{j}")()
                for i in range(1, 4) for j in range(1, 4)),
            binding.black_value, binding.white_value,
-           canvas._tone_mask_signature(binding.mask_id))
+           canvas._tone_mask_signature(binding.mask_id), current_contract().signature)
+    from comic_editor.ui.thumbnail_effects import live_effect_draft
+    if live_effect_draft(canvas):
+        key = ('live-effect-draft-opacity-mask', key)
     from comic_editor.ui import translation_cache
     move_key = None
-    if target is not None and source_key is not None:
+    if target is not None and source_key is not None and not live_effect_draft(canvas):
         mask_key = translation_cache.output_key(canvas, target, bounds, mapping, [])
         if mask_key is not None:
-            move_key = ("translated-opacity-output", source_key, mask_key)
+            move_key = ("translated-opacity-output", source_key, mask_key, current_contract().signature)
     reused = translation_cache.get(canvas, move_key)
     if reused is not None:
         return reused, bounds
@@ -57,6 +61,15 @@ def mask_output(canvas, image, bounds, mapping, binding, visible, painter, *, ta
     if crop != image.rect():
         image = image.copy(crop)
     revision = getattr(canvas, "_effect_provisional_revision", 0)
+    from comic_editor.ui.async_projection import projection_deferred
+    if projection_deferred(canvas):
+        from comic_editor.ui.deferred_opacity import paint_only_output
+        result = paint_only_output(canvas, image, bounds, mapping, binding, key, target=target)
+        if result is not None:
+            if revision == getattr(canvas, "_effect_provisional_revision", 0):
+                canvas._modifier_cache_put(key, result)
+                translation_cache.put(canvas, move_key, result, revision)
+            return result, bounds
     field = canvas.render_tone_mask_field(
         binding.mask_id, image.width(), image.height(),
         canvas._world_to_image_transform(mapping, bounds, image.width(), image.height()),

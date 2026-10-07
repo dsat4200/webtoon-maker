@@ -20,6 +20,8 @@ from enum import Enum
 from pathlib import Path
 from typing import Iterable
 
+from comic_editor.ui.render_signatures import capture_signature
+
 import numpy as np
 
 from PySide6.QtCore import (
@@ -86,6 +88,7 @@ from comic_editor.ui.modifier_rendering import (
     apply_opacity_mask,
 )
 from comic_editor.core.effect_geometry import effect_bounds, reflection_transform, outline_blur_padding
+from comic_editor.render.pixels import current_contract
 from comic_editor.ui.effect_pipeline import render_stages, empty_image, aligned
 from comic_editor.ui.shape_contours import (
     compile_contour, bound_path as compiled_bound_path, geometry_key, transform_stretch,
@@ -110,7 +113,7 @@ from comic_editor.ui.mask_selection import MaskSelectionFeatures
 from comic_editor.ui.solo_features import SoloFeatures
 from comic_editor.ui.show_on_top_features import ShowOnTopFeatures
 from comic_editor.render.service import DocumentRenderService
-from comic_editor.ui.scene_render_backend import CanvasSceneBackend
+from comic_editor.ui.scene_render_backend import CanvasSceneBackend, source_capture_key
 from comic_editor.ui.document_projection_features import DocumentProjectionFeatures
 from comic_editor.ui.scene_culling import SceneRenderBounds
 from comic_editor.ui.network import create_network_manager
@@ -610,6 +613,7 @@ class _CanvasLogic(LassoBrushFeatures, BrushFeatures, DocumentProjectionFeatures
     documentChanged = Signal(object)
     viewSettingsChanged = Signal()
     visualChanged = Signal(object)
+    derivedResultReady = Signal()
     selectionChanged = Signal(str, str)
     selectionSetChanged = Signal(object)
     soloChanged = Signal(object)
@@ -1479,7 +1483,7 @@ class _CanvasLogic(LassoBrushFeatures, BrushFeatures, DocumentProjectionFeatures
             if self.chapter is not None and self.chapter.view_overflow > 0 else (),
         )
 
-    def _ensure_scene_cache(self) -> None:
+    def _ensure_scene_cache(self, *, interactive=False) -> None:
         if self.chapter is None or self.width() <= 0 or self.height() <= 0:
             return
         key = self._scene_key()
@@ -1507,8 +1511,10 @@ class _CanvasLogic(LassoBrushFeatures, BrushFeatures, DocumentProjectionFeatures
         )
         if dirty.isEmpty():
             return
-        self._render_scene_cache_rect(dirty)
-        self._scene_dirty_full = False
+        self._render_scene_cache_rect(dirty, interactive=interactive)
+        # A raster widget presents through this image, but unfinished exact
+        # work still needs another presentation when its frame budget yields.
+        self._scene_dirty_full = bool(interactive and self._projection_frame_pending)
         self._scene_dirty_widget = QRect()
 
     def _invalidate_render_bounds(self, kind: str, entity_id: str) -> None:
@@ -1516,13 +1522,16 @@ class _CanvasLogic(LassoBrushFeatures, BrushFeatures, DocumentProjectionFeatures
 
     def _render_scene_cache_rect(
         self, dirty: QRect, *, target: QImage | None = None, live_ink=False, projection=True,
+        interactive=False,
     ) -> None:
         if projection and self._uses_document_projection() and not live_ink:
             painter = QPainter(self._scene_cache if target is None else target)
             try:
                 painter.setClipRect(dirty)
                 painter.fillRect(dirty, QColor("#242428"))
-                self._paint_document_projection(painter)
+                from comic_editor.ui.acquired_source_preview import presentation_scope
+                with presentation_scope(self, interactive and target is None):
+                    self._paint_document_projection(painter, interactive=interactive)
             finally:
                 painter.end()
             return
@@ -1554,8 +1563,14 @@ class _CanvasLogic(LassoBrushFeatures, BrushFeatures, DocumentProjectionFeatures
         self._cancel_lasso_brush()
         self._cancel_paint_brush()
         self._projection_completed_view = None
+        self._projection_completed_pixel_contract = None
+        self._projection_last_exact_metadata = None
         self._projection_progress_view = None
         self._projection_stroke_preview = None
+        self._projection_interaction_preview = None
+        self._projection_interaction_dirty = None
+        self._modifier_parameter_drag_id = None
+        self._modifier_parameter_drag_owner = None
         self._mesh_warp_parameter_drag_id = None
         self._smudge_parameter_drag_id = None
         self._overlay_color_preview = None
@@ -1939,6 +1954,9 @@ class _CanvasLogic(LassoBrushFeatures, BrushFeatures, DocumentProjectionFeatures
 
     def _restore_history_state(self, state: dict, *, objects_only: bool = False, document_patch: bool = False) -> None:
         """Restore history, optionally retaining an unchanged document graph."""
+        from comic_editor.ui import live_image_prefix_history
+        draft_prefixes = (live_image_prefix_history.snapshot(self)
+                          if objects_only or document_patch else None)
         self._history_generation = getattr(self, '_history_generation', 0) + 1
         self._cancel_lasso_brush()
         self._cancel_paint_brush()
@@ -1960,6 +1978,10 @@ class _CanvasLogic(LassoBrushFeatures, BrushFeatures, DocumentProjectionFeatures
         self._radial_handle_pending = None
         self._radial_effect_revision = None
         self._modifier_handle_drag = None
+        self._projection_interaction_preview = None
+        self._projection_interaction_dirty = None
+        self._modifier_parameter_drag_id = None
+        self._modifier_parameter_drag_owner = None
         self._mesh_warp_parameter_drag_id = None
         self._smudge_parameter_drag_id = None
         self._overlay_color_preview = None
@@ -2024,6 +2046,7 @@ class _CanvasLogic(LassoBrushFeatures, BrushFeatures, DocumentProjectionFeatures
             self.hierarchyChanged.emit()
             self.selectionChanged.emit(self.selected_kind, self.selected_id)
             self.selectionSetChanged.emit(list(self.selected_entities))
+        live_image_prefix_history.restore(self, draft_prefixes)
         self.update()
 
     def push_model_change(self, before: dict, after: dict, label: str) -> None:
@@ -3449,7 +3472,7 @@ class _CanvasLogic(LassoBrushFeatures, BrushFeatures, DocumentProjectionFeatures
             elif self._uses_document_projection() and (isinstance(self, QOpenGLWidget) or promoted_ink):
                 self._paint_document_projection(painter, live_ink=promoted_ink)
             elif promoted_ink:
-                self._ensure_scene_cache()
+                self._ensure_scene_cache(interactive=True)
                 # Keep prediction and unfinished vector ink out of the reusable
                 # scene image, while compositing them below on-top artwork.
                 frame = QImage(self._scene_cache.size(), self._scene_cache.format())
@@ -3457,7 +3480,7 @@ class _CanvasLogic(LassoBrushFeatures, BrushFeatures, DocumentProjectionFeatures
                 self._render_scene_cache_rect(self.rect(), target=frame, live_ink=True)
                 painter.drawImage(0, 0, frame)
             else:
-                self._ensure_scene_cache()
+                self._ensure_scene_cache(interactive=True)
                 painter.drawImage(0, 0, self._scene_cache)
             painter.setTransform(self.camera_transform())
             painter.save()
@@ -4973,8 +4996,11 @@ class _CanvasLogic(LassoBrushFeatures, BrushFeatures, DocumentProjectionFeatures
             return
         if self._render_tiled_target(painter, layer, parent_opacity, visible_world):
             return
+        from comic_editor.ui.thumbnail_effects import live_effect_draft, compact_effects_supported
         if (self._interactive_render
-                and getattr(self, "_effect_preview_channel", "canvas") == "navigator"):
+                and (getattr(self, "_effect_preview_channel", "canvas") == "navigator"
+                     or live_effect_draft(self) and compact_effects_supported(
+                         self._active_modifier_instances(layer.modifier_ids)))):
             self._render_mirror_target(painter, layer, parent_opacity, visible_world)
             return
         if any(isinstance(m, SolidColorOverlayModifier) for m in self._active_modifier_instances(layer.modifier_ids)):
@@ -5061,6 +5087,7 @@ class _CanvasLogic(LassoBrushFeatures, BrushFeatures, DocumentProjectionFeatures
         layer_signature = self._modifier_layer_signature(layer.layer_id)
         from comic_editor.ui import translation_cache
         move_key = translation_cache.output_key(self, layer, bounds, parent_transform, modifiers)
+        move_key = source_capture_key(self, move_key)
         move_revision = getattr(self, "_effect_provisional_revision", 0)
         cache_key = (
             "layer", layer.layer_id,
@@ -5069,6 +5096,7 @@ class _CanvasLogic(LassoBrushFeatures, BrushFeatures, DocumentProjectionFeatures
             self._rect_signature(bounds), world_origin.toTuple(),
             self._modifier_mapping_signature(parent_transform),
         )
+        cache_key = source_capture_key(self, cache_key)
         from comic_editor.ui.interactive_effects import render_interactive_stack
         processed = translation_cache.get(self, move_key)
         if processed is None:
@@ -5086,6 +5114,7 @@ class _CanvasLogic(LassoBrushFeatures, BrushFeatures, DocumentProjectionFeatures
                 self._rect_signature(bounds), world_origin.toTuple(),
                 self._modifier_mapping_signature(parent_transform),
             )
+            source_key = source_capture_key(self, source_key)
             source_provisional = False
             image = self._modifier_source_cache_get(source_key)
             if image is None:
@@ -5093,7 +5122,7 @@ class _CanvasLogic(LassoBrushFeatures, BrushFeatures, DocumentProjectionFeatures
                 image = QImage(
                     max(1, math.ceil(bounds.width())),
                     max(1, math.ceil(bounds.height())),
-                    QImage.Format.Format_ARGB32_Premultiplied,
+                    current_contract().image_format,
                 )
                 image.fill(Qt.GlobalColor.transparent)
                 source = QPainter(image)
@@ -7841,6 +7870,7 @@ class _CanvasLogic(LassoBrushFeatures, BrushFeatures, DocumentProjectionFeatures
             return QRectF(viewport)
         return QRectF(fallback_world)
 
+    @capture_signature("parameters")
     def _modifier_parameter_signature(self, ids: Iterable[str]) -> tuple[str, ...]:
         from comic_editor.ui.modifier_rendering import modifier_render_settings
         from comic_editor.ui.transform_modifier_preview import effective_preview_modifier
@@ -8212,27 +8242,11 @@ class _CanvasLogic(LassoBrushFeatures, BrushFeatures, DocumentProjectionFeatures
             self._tone_mask_contributor_cache[contributor_key] = cached
             result = cached.copy()
         if include_paint:
-            paint = QImage(
-                width, height, QImage.Format.Format_ARGB32_Premultiplied
-            )
-            paint.fill(Qt.GlobalColor.transparent)
-            painter = QPainter(paint)
-            painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
-            painter.setTransform(world_to_image)
-            painter.translate(*mask.paint_offset)
-            for (tile_x, tile_y), tile in self.tiles.iter_tiles(
-                mask_id, visible_world.translated(-mask.paint_offset[0], -mask.paint_offset[1])
-            ):
-                painter.drawImage(
-                    tile_x * self.tiles.tile_size,
-                    tile_y * self.tiles.tile_size,
-                    tile,
-                )
-            painter.end()
-            if mask.paint_has_subtractions:
-                result += self._signed_mask_paint(paint)
-            else:
-                self._add_image_alpha_to_field(result, paint)
+            from comic_editor.ui.mask_paint import add_paint
+            add_paint(result, self.tiles, mask_id, width, height,
+                      world_to_image, visible_world, mask.paint_offset,
+                      mask.paint_has_subtractions, self._add_image_alpha_to_field,
+                      self._signed_mask_paint)
         np.clip(result, 0.0, 1.0, out=result)
         if full_key is not None:
             size = int(result.nbytes)
@@ -8357,12 +8371,18 @@ class _CanvasLogic(LassoBrushFeatures, BrushFeatures, DocumentProjectionFeatures
             live = (*live, repr(self._cage_session["grid"].grid_dict()))
         return live
 
+    @capture_signature("object")
     def _modifier_object_signature(self, obj: DocumentObject, *, pixel_signature=None) -> tuple:
         pixels: tuple = ()
         if isinstance(obj, RasterObject):
             pixels = self.tiles.object_signature(obj.object_id) if pixel_signature is None else pixel_signature
         elif isinstance(obj, ImageObject):
             pixels = self.images.pixel_signature(obj.object_id)
+            if obj.placement_mode == "fit_parent":
+                # Parent shape edits can move the fitted destination within
+                # unchanged aligned capture bounds. Keep its exact source quad
+                # in the existing source/stage and durable dependency keys.
+                pixels = (pixels, ("image-fit-quad", tuple(self._image_model_local_quad(obj))))
         elif isinstance(obj, ColorFillGradientObject):
             # Shape gradients and line-field coverage also depend on the
             # effective parent shape, including edits with unchanged bounds.
@@ -8396,6 +8416,7 @@ class _CanvasLogic(LassoBrushFeatures, BrushFeatures, DocumentProjectionFeatures
                     tuple(self._transform_start_quad or ()), tuple(self._transform_preview_quad))
         return ()
 
+    @capture_signature("layer")
     def _modifier_layer_signature(self, layer_id: str) -> tuple:
         layer = self.chapter.layers[layer_id]
         children = []
@@ -8482,8 +8503,23 @@ class _CanvasLogic(LassoBrushFeatures, BrushFeatures, DocumentProjectionFeatures
         previous = self._modifier_render_cache.pop(key, None)
         if previous is not None:
             self._modifier_render_cache_bytes -= int(previous.sizeInBytes())
+        jobs = getattr(self, "_effect_jobs", None)
+        if (size > self._modifier_render_cache_budget and jobs is not None
+                and any(entry[0] == key
+                        and entry[3] == size
+                        and entry[1].size() == image.size()
+                        and entry[1].format() == image.format()
+                        and int(entry[1].cacheKey()) == int(image.cacheKey())
+                        for entry in jobs.retained.values())):
+            # Exact completions already own a force-admitted handoff before
+            # this ordinary alias is written. Duplicating an oversized frame
+            # here would evict every unchanged compact live prefix. Only the
+            # identical semantic key/storage qualifies; a different result or
+            # an unretained synchronous frame keeps exclusive LRU admission.
+            return
         self._modifier_render_cache[key] = QImage(image)
         self._modifier_render_cache_bytes += size
+        protected = None
         # Admit one oversized result exclusively so exact worker completions
         # remain consumable even when a document image exceeds the usual LRU.
         while (
@@ -8491,9 +8527,31 @@ class _CanvasLogic(LassoBrushFeatures, BrushFeatures, DocumentProjectionFeatures
             and self._modifier_render_cache_bytes
             > max(self._modifier_render_cache_budget, size)
         ):
-            _old_key, old_image = self._modifier_render_cache.popitem(
-                last=False
-            )
+            oldest = next(iter(self._modifier_render_cache))
+            if (size <= self._modifier_render_cache_budget
+                    and oldest[:1] == ('live-effect-draft-stage',)):
+                if protected is None:
+                    # The measured heavy scene needs 6.075 MiB of compact
+                    # prefixes while small native tiles fill this same LRU.
+                    # Give only its newest bounded subset eviction priority;
+                    # all bytes still share the unchanged ordinary budget.
+                    remaining = min(8 * 1024 * 1024,
+                                    max(0, self._modifier_render_cache_budget // 4))
+                    protected = set()
+                    for candidate in reversed(self._modifier_render_cache):
+                        if candidate[:1] != ('live-effect-draft-stage',):
+                            continue
+                        candidate_size = int(self._modifier_render_cache[candidate].sizeInBytes())
+                        if candidate_size <= remaining:
+                            protected.add(candidate)
+                            remaining -= candidate_size
+                            if len(protected) == 64:
+                                break
+                # The incoming result must remain consumable. If it needs
+                # space reserved for drafts, fall back to the oldest prefix.
+                oldest = next((candidate for candidate in self._modifier_render_cache
+                               if candidate != key and candidate not in protected), oldest)
+            old_image = self._modifier_render_cache.pop(oldest)
             self._modifier_render_cache_bytes -= int(old_image.sizeInBytes())
 
     def _modifier_source_cache_get(self, key: tuple) -> QImage | None:
@@ -8550,8 +8608,13 @@ class _CanvasLogic(LassoBrushFeatures, BrushFeatures, DocumentProjectionFeatures
         if any(isinstance(m, (MirrorModifier, ArrayModifier, RadialBlurModifier, CageTransformModifier, StrokeModifier, HalftoneModifier, PixelateModifier, DistortModifier, KuwaharaModifier, DitheringModifier, SharpnessModifier, SolidColorOverlayModifier)) for m in self._active_modifier_instances(obj.modifier_ids)):
             self._render_mirror_target(painter, obj, parent_opacity, local_visible)
             return
+        from comic_editor.ui.thumbnail_effects import live_effect_draft, compact_effects_supported
         if (self._interactive_render
-                and getattr(self, "_effect_preview_channel", "canvas") == "navigator"):
+                and (getattr(self, "_effect_preview_channel", "canvas") == "navigator"
+                     # Text's generic capture already follows its live quad;
+                     # a stored mirror-source frame would clip moving glyphs.
+                     or not isinstance(obj, TextObject) and live_effect_draft(self) and compact_effects_supported(
+                         self._active_modifier_instances(obj.modifier_ids)))):
             self._render_mirror_target(painter, obj, parent_opacity, local_visible)
             return
         modifiers = self._active_modifier_instances(
@@ -8632,6 +8695,7 @@ class _CanvasLogic(LassoBrushFeatures, BrushFeatures, DocumentProjectionFeatures
         object_signature = self._modifier_object_signature(obj)
         from comic_editor.ui import translation_cache
         move_key = translation_cache.output_key(self, obj, bounds, layer_transform, modifiers)
+        move_key = source_capture_key(self, move_key)
         move_revision = getattr(self, "_effect_provisional_revision", 0)
         cache_key = (
             "object", obj.object_id,
@@ -8639,6 +8703,7 @@ class _CanvasLogic(LassoBrushFeatures, BrushFeatures, DocumentProjectionFeatures
             self._rect_signature(bounds), world_origin.toTuple(),
             self._modifier_mapping_signature(layer_transform),
         )
+        cache_key = source_capture_key(self, cache_key)
         from comic_editor.ui.interactive_effects import render_interactive_stack
         processed = translation_cache.get(self, move_key)
         if processed is None:
@@ -8654,6 +8719,7 @@ class _CanvasLogic(LassoBrushFeatures, BrushFeatures, DocumentProjectionFeatures
                 object_signature[0], object_signature[3], object_signature[4],
                 self._rect_signature(bounds), world_origin.toTuple(),
             )
+            source_key = source_capture_key(self, source_key)
             source_provisional = False
             image = self._modifier_source_cache_get(source_key)
             if image is None:
@@ -8661,7 +8727,7 @@ class _CanvasLogic(LassoBrushFeatures, BrushFeatures, DocumentProjectionFeatures
                 image = QImage(
                     max(1, math.ceil(bounds.width())),
                     max(1, math.ceil(bounds.height())),
-                    QImage.Format.Format_ARGB32_Premultiplied,
+                    current_contract().image_format,
                 )
                 image.fill(Qt.GlobalColor.transparent)
                 source = QPainter(image)
@@ -8768,9 +8834,10 @@ class _CanvasLogic(LassoBrushFeatures, BrushFeatures, DocumentProjectionFeatures
         modifiers = self._active_modifier_instances(target.modifier_ids, suppress_outline=self._suppress_outline_for_mask)
         if layer and scoped(self, target):
             modifiers = [modifier for modifier in modifiers if not isinstance(modifier, StrokeModifier)]
-        from comic_editor.ui.thumbnail_effects import capture_scale, scaled_modifiers
+        from comic_editor.ui.thumbnail_effects import capture_scale, scaled_modifiers, live_effect_draft, compact_effects_supported
         thumbnail_scale = capture_scale(self, bounds, modifiers)
         navigator = self._interactive_render and getattr(self, "_effect_preview_channel", "canvas") == "navigator"
+        live_draft = live_effect_draft(self) and compact_effects_supported(modifiers)
         stage_mapping = mapping
         capture_bounds = bounds
         if thumbnail_scale < 1.:
@@ -8790,6 +8857,9 @@ class _CanvasLogic(LassoBrushFeatures, BrushFeatures, DocumentProjectionFeatures
             key = (*key, self._modifier_mapping_signature(mapping))
         if navigator:
             key = ("navigator-source", thumbnail_scale, key)
+        elif live_draft:
+            key = ("live-effect-draft-source", thumbnail_scale, key)
+        key = source_capture_key(self, key)
         if layer and scoped(self, target):
             key = (*key, self._modifier_parameter_signature([mid for mid in target.modifier_ids
                 if isinstance(self.chapter.modifiers.get(mid), StrokeModifier)]))
@@ -8826,17 +8896,18 @@ class _CanvasLogic(LassoBrushFeatures, BrushFeatures, DocumentProjectionFeatures
         from comic_editor.ui import translation_cache
         move_key = None
         move_revision = getattr(self, "_effect_provisional_revision", 0)
-        if not has_stroke and not direct_mirror and not shape_overlay and thumbnail_scale == 1. and not navigator:
+        if not has_stroke and not direct_mirror and not shape_overlay and thumbnail_scale == 1. and not navigator and not live_draft:
             from comic_editor.ui.effect_pipeline import _stage_plan
             move_plan = _stage_plan(self, bounds, modifiers, stage_mapping, key, isinstance(target, RasterObject), required)
             move_key = translation_cache.output_key(self, target, bounds, stage_mapping, modifiers,
                 geometry=move_plan.geometry, opacity=False)
+            move_key = source_capture_key(self, move_key)
         reused = translation_cache.get(self, move_key)
         completed = ((reused, QRectF(move_plan.targets[-1] if move_plan.targets else bounds))
             if reused is not None else cached_stage_output(self, bounds, modifiers, stage_mapping,
             nearest=isinstance(target, RasterObject), required=required,
             request_scope=request_scope, source_key=key)
-            if not has_stroke and not direct_mirror and not shape_overlay else None)
+            if not has_stroke and not direct_mirror and not shape_overlay and not live_draft else None)
         source_provisional = False
         def capture_region(region):
             revision = getattr(self, "_effect_provisional_revision", 0)
@@ -8865,7 +8936,7 @@ class _CanvasLogic(LassoBrushFeatures, BrushFeatures, DocumentProjectionFeatures
                 self._render_modifier_sources.discard((kind, identifier))
                 source.end()
             return image, revision != getattr(self, "_effect_provisional_revision", 0)
-        if completed is None and not has_stroke and not direct_mirror and not shape_overlay and thumbnail_scale == 1. and not navigator:
+        if completed is None and not has_stroke and not direct_mirror and not shape_overlay and thumbnail_scale == 1. and not navigator and not live_draft:
             from comic_editor.ui.tile_effects import tile_output
             from comic_editor.render.tile_graph import TileCacheMiss
             def exact_capture(region):
@@ -8881,7 +8952,7 @@ class _CanvasLogic(LassoBrushFeatures, BrushFeatures, DocumentProjectionFeatures
             image, source_provisional = capture_region(bounds)
             if not source_provisional:
                 self._modifier_source_cache_put(key, image)
-        source_provisional |= navigator
+        source_provisional |= navigator or live_draft
         if direct_mirror and not shape_overlay:
             # Axis dragging reuses the source stages without allocating the gap.
             image, bounds = render_stages(self, image, bounds, modifiers[:-1], stage_mapping, nearest=isinstance(target, RasterObject), request_scope=request_scope, provisional=source_provisional, source_key=key)
@@ -9709,7 +9780,8 @@ class _CanvasLogic(LassoBrushFeatures, BrushFeatures, DocumentProjectionFeatures
         return self._image_model_local_quad(obj)
 
     def _render_image_object(self, painter: QPainter, obj: ImageObject) -> None:
-        image = self.images.image(obj.object_id)
+        from comic_editor.ui.source_images import image_for_render
+        image = image_for_render(self, obj.object_id)
         if image.isNull() and (not obj.is_blender_linked
                 or getattr(self, "_rendering_halftone_source", False)):
             return
@@ -24332,7 +24404,11 @@ class _CanvasLogic(LassoBrushFeatures, BrushFeatures, DocumentProjectionFeatures
     ) -> bool:
         if not self._is_transformable_object(obj):
             return False
-        if self.tool in {ToolKind.BRUSH, ToolKind.LASSO_BRUSH}:
+        if self.tool in {
+            ToolKind.BRUSH, ToolKind.LASSO_BRUSH,
+            ToolKind.BOX_BOUND, ToolKind.CIRCLE_BOUND,
+            ToolKind.SHAPE_CREATE, ToolKind.DRAW_SHAPE, ToolKind.RASTER_CREATE,
+        }:
             return False
         if isinstance(obj, ImageObject) and obj.placement_mode == "fit_parent":
             return False

@@ -2,6 +2,7 @@
 import math
 from PySide6.QtCore import QPointF, QRectF
 from PySide6.QtGui import QTransform
+from comic_editor.render.geometry_cache import cached_bounds
 
 from comic_editor.core.models import ArrayModifier, BlurModifier, MirrorModifier, OutlineModifier, RadialBlurModifier, CageTransformModifier, ScreamModifier, WobbleModifier, DistortModifier
 
@@ -80,6 +81,14 @@ def outline_blur_padding(modifier):
 
 
 def effect_bounds(bounds, modifiers, local_to_world=None):
+    modifiers = tuple(modifiers)
+    if any(isinstance(modifier, (DistortModifier, CageTransformModifier)) for modifier in modifiers):
+        return cached_bounds(bounds, modifiers, local_to_world,
+                             lambda: _effect_bounds(bounds, modifiers, local_to_world))
+    return _effect_bounds(bounds, modifiers, local_to_world)
+
+
+def _effect_bounds(bounds, modifiers, local_to_world=None):
     result = QRectF(bounds)
     transform = local_to_world or QTransform()
     inverse, valid = transform.inverted()

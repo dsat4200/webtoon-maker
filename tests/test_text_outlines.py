@@ -189,7 +189,8 @@ def test_text_outline_stack_order_and_partial_render(canvas, target_kind):
 
 
 @pytest.mark.parametrize("target_kind", ["object", "container"])
-def test_text_outline_live_caret_selection_typing_and_clean_export(canvas, qapp, target_kind):
+def test_text_outline_live_caret_selection_typing_and_clean_export(
+        canvas, qapp, await_completed_projection, target_kind):
     obj, _, target = add_text(canvas, target_kind)
     outline(canvas, target)
     canvas.set_selection("object", obj.object_id)
@@ -197,6 +198,7 @@ def test_text_outline_live_caret_selection_typing_and_clean_export(canvas, qapp,
     canvas.activateWindow()
     canvas.setFocus()
     qapp.processEvents()
+    await_completed_projection(canvas)
 
     def capture_without_caret():
         canvas._text_caret_timer.stop()

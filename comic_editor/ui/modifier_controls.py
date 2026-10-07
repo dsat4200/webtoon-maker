@@ -1,5 +1,6 @@
 """Contextual nondestructive modifier stack controls."""
 from __future__ import annotations
+from copy import deepcopy
 
 from PySide6.QtCore import QPoint, Qt, Signal, QSignalBlocker
 from PySide6.QtGui import QColor, QMouseEvent
@@ -26,6 +27,9 @@ from comic_editor.core.models import KuwaharaModifier
 from comic_editor.core.models import DitheringModifier, SharpnessModifier
 from comic_editor.ui.icons import iconoir
 from comic_editor.ui.mask_controls import DualEndpointSlider, MaskButton
+from comic_editor.ui.modifier_edit_bounds import (
+    clear_parameter_preview, modifier_edit_bounds, modifier_edit_dirty,
+)
 
 
 class ModifierTitleBar(QFrame):
@@ -545,10 +549,17 @@ class ModifierControls(QWidget):
         self._target_layer_pick_chapter = None
         self.preset_controller = None
         self._parameter_before = None
+        self._parameter_notified = False
+        self._parameter_preview_owner = object()
+        preview_owner = self._parameter_preview_owner
+        # A deleted inspector can never deliver sliderReleased. Capture only
+        # its plain owner token, so cleanup does not call a deleted QWidget.
+        self.destroyed.connect(lambda *_: clear_parameter_preview(canvas, preview_owner))
         self._mesh_warp_parameter_chapter = None
         self._smudge_parameter_chapter = None
         self._reorder_before = None
         self._cards: dict[str, ModifierCard] = {}
+        self._rendered_inspector = None
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         self.summary = QLabel("Select a drawing, image, gradient, text, or shape.", self)
@@ -604,6 +615,11 @@ class ModifierControls(QWidget):
         menu.addAction("Cage Transform").triggered.connect(lambda: self.add_modifier("cage_transform"))
         self.add_button.setMenu(menu)
         layout.addWidget(self.add_button)
+        self._posterize_add_request = None
+        self._posterize_add_status = QLabel(self)
+        self._posterize_add_status.setWordWrap(True)
+        self._posterize_add_status.hide()
+        layout.addWidget(self._posterize_add_status)
         self.stack = QWidget(self)
         self.stack_layout = QVBoxLayout(self.stack)
         self.stack_layout.setContentsMargins(0, 0, 0, 0)
@@ -613,14 +629,18 @@ class ModifierControls(QWidget):
         self.canvas.selectionChanged.connect(lambda *_: self.refresh())
         self.canvas.selectionSetChanged.connect(lambda *_: self.refresh())
         self.canvas.chapterReplaced.connect(self._chapter_replaced)
+        self.canvas.objectRecordsChanged.connect(self._validate_parameter_context)
+        self.canvas.documentChanged.connect(self._validate_parameter_context)
         self.canvas.hierarchyChanged.connect(self._validate_target_layer_pick)
         self.canvas.modifierSelectionChanged.connect(self._refresh_selection_style)
 
     def _refresh_selection_style(self, _identifier=""):
         for identifier, card in self._cards.items():
             selected = self.canvas.modifier_mode and self.canvas.active_modifier_id == identifier
-            card.setStyleSheet("#modifierCard { border: 2px solid " +
+            style = ("#modifierCard { border: 2px solid " +
                 ("#65bcff; background-color: #203f59" if selected else "transparent") + "; border-radius: 4px; }")
+            if card.styleSheet() != style:
+                card.setStyleSheet(style)
 
     def targets(self) -> list[tuple[str, str]]:
         if self.canvas.chapter is None:
@@ -667,8 +687,112 @@ class ModifierControls(QWidget):
             )
         return [item for item in primary.modifier_ids if item in common]
 
+    def _inspector_fingerprint(self):
+        """Detach every model record used by the current inspector's widgets.
+
+        Selection and history emit several public notifications for one state.
+        A record snapshot avoids rebuilding the same Qt subtree for each one,
+        while mutable masks, shared owners and referenced source names remain
+        observable even when a caller explicitly refreshes without a signal.
+        This copies model metadata only, never source images or raster tiles.
+        """
+        chapter = self.canvas.chapter
+        selection = tuple(tuple(ref) for ref in self.canvas.selected_entities)
+        context = (id(chapter), getattr(self.canvas, '_history_generation', 0),
+                   selection, self.canvas.selected_kind, self.canvas.selected_id,
+                   self.canvas.modifier_mode, self.canvas.active_modifier_id,
+                   self.link_modifier_id, frozenset(self.link_original), frozenset(self.link_working),
+                   self.target_layer_pick_id, tuple(self._target_layer_pick_owners),
+                   getattr(self.canvas, 'active_tone_mask_id', ''),
+                   getattr(self.canvas, 'distort_edit_source', False),
+                   getattr(self.canvas, 'distort_pin_mode', 'move'),
+                   getattr(self.canvas, 'distort_show_grid', True))
+        if chapter is None:
+            return context
+        modifiers = []
+        pending = [(kind, identifier, kind == 'layer') for kind, identifier in selection]
+        for identifier in self.common_ids():
+            modifier = chapter.modifiers.get(identifier)
+            if modifier is None:
+                continue
+            modifiers.append((identifier, id(modifier), deepcopy(modifier)))
+            pending.extend((kind, owner, kind == 'layer')
+                           for kind, owner in chapter.modifier_target_ids(identifier))
+            source = getattr(modifier, 'target_layer_id', '')
+            if source:
+                pending.append(('layer' if source in chapter.layers else 'object', source, False))
+        masks = []
+        for identifier, mask in chapter.masks.items():
+            masks.append((identifier, id(mask), deepcopy(mask)))
+            pending.extend((kind, contributor, False) for kind, contributor in mask.contributors)
+        entities, seen, expanded = [], set(), set()
+        while pending:
+            kind, identifier, descendants = pending.pop()
+            ref = kind, identifier
+            entity = (chapter.layers if kind == 'layer' else chapter.objects).get(identifier)
+            if entity is None:
+                if ref not in seen:
+                    entities.append((kind, identifier, id(entity), None))
+                    seen.add(ref)
+                continue
+            if ref not in seen:
+                seen.add(ref)
+                entities.append((kind, identifier, id(entity), deepcopy(entity)))
+                parent = entity.parent_id if kind == 'layer' else entity.parent_layer_id
+                if parent:
+                    pending.append(('layer', parent, False))
+            if kind == 'layer' and descendants and identifier not in expanded:
+                expanded.add(identifier)
+                pending.extend((child.kind, child.entity_id, child.kind == 'layer')
+                               for child in entity.children)
+        return (context, chapter.pixel_contract, tuple(modifiers),
+                tuple(sorted(masks, key=lambda item: item[0])),
+                tuple(sorted(entities, key=lambda item: item[:2])))
+
+    def _unchanged_append_prefix(self, fingerprint):
+        """Retain cards only for a strictly unchanged stack prefix.
+
+        Appending an effect does not change the old controls' model bindings.
+        History, selection, owner/mask/source metadata, and any old modifier
+        change still require rebuilding the inspector. Compare detached records,
+        including identities, rather than assuming a notification was local.
+        """
+        previous = self._rendered_inspector
+        if (previous is None or len(previous) != 5 or len(fingerprint) != 5
+                or self.link_modifier_id or self.target_layer_pick_id):
+            return 0
+        old_context, old_contract, old_modifiers, old_masks, old_entities = previous
+        context, contract, modifiers, masks, entities = fingerprint
+        # Active-card styling is updated separately; no other UI context changes.
+        if (old_context[:6] != context[:6] or old_context[7:] != context[7:]
+                or old_contract != contract or old_masks != masks
+                or not old_modifiers or len(modifiers) <= len(old_modifiers)
+                or modifiers[:len(old_modifiers)] != old_modifiers
+                or tuple(self._cards) != tuple(item[0] for item in old_modifiers)
+                or len(old_entities) != len(entities)):
+            return 0
+        appended = [item[0] for item in modifiers[len(old_modifiers):]]
+        selected = set(context[2])
+        for old, current in zip(old_entities, entities):
+            if old[:3] != current[:3]:
+                return 0
+            before, after = old[3], current[3]
+            if old[:2] not in selected:
+                if before != after:
+                    return 0
+                continue
+            if (before is None or after is None
+                    or after.modifier_ids != before.modifier_ids + appended):
+                return 0
+            before_fields, after_fields = dict(vars(before)), dict(vars(after))
+            before_fields.pop('modifier_ids', None)
+            after_fields.pop('modifier_ids', None)
+            if before_fields != after_fields:
+                return 0
+        return len(old_modifiers)
+
     def refresh(self) -> None:
-        if self._mesh_warp_parameter_chapter is not None or self._smudge_parameter_chapter is not None:
+        if self._parameter_before is not None:
             # Replacing a slider can destroy it before sliderReleased fires.
             # Finish its transient preview before rebuilding the controls.
             self.finish_parameter_drag()
@@ -678,11 +802,18 @@ class ModifierControls(QWidget):
                     or self.targets() != self._target_layer_pick_owners):
                 self.cancel_target_layer_pick()
                 return
-        while self.stack_layout.count() > 1:
-            item = self.stack_layout.takeAt(0)
-            if item.widget() is not None:
-                item.widget().deleteLater()
-        self._cards.clear()
+        fingerprint = self._inspector_fingerprint()
+        if fingerprint == self._rendered_inspector:
+            self._refresh_selection_style()
+            return
+        append_start = self._unchanged_append_prefix(fingerprint)
+        self._rendered_inspector = None
+        if not append_start:
+            while self.stack_layout.count() > 1:
+                item = self.stack_layout.takeAt(0)
+                if item.widget() is not None:
+                    item.widget().deleteLater()
+            self._cards.clear()
         chapter = self.canvas.chapter
         targets = self.targets()
         eligible = bool(targets) and len(targets) == len(
@@ -712,12 +843,13 @@ class ModifierControls(QWidget):
             chapter.incompatible_modifier_targets(TextureModifier(), targets)))
         if not eligible:
             self.summary.setText("Select a drawing, image, gradient, text, layer, or page.")
+            self._rendered_inspector = fingerprint
             return
         ids = self.common_ids()
         self.summary.setText(
             "Shared modifiers" if len(targets) > 1 else "Gradient modifiers" if has_gradient else "Modifier stack"
         )
-        for modifier_id in ids:
+        for modifier_id in ids[append_start:]:
             modifier = chapter.modifiers.get(modifier_id)
             if modifier is None:
                 continue
@@ -730,21 +862,31 @@ class ModifierControls(QWidget):
             card.dragFinished.connect(self.finish_reorder)
             self._cards[modifier_id] = card
             self.stack_layout.insertWidget(self.stack_layout.count() - 1, card)
+        self._refresh_selection_style()
+        self._rendered_inspector = self._inspector_fingerprint()
 
-    def _changed(self) -> None:
-        # Shared effects can extend far beyond the selected target.
-        self.canvas._compound_path_cache.clear()
-        self.canvas._invalidate_scene_cache()
+    def _changed(self, world_rect=None) -> None:
+        # The canvas signal handlers own invalidation. Invalidating explicitly
+        # as well advanced the revision twice and retired unrelated exact tiles.
+        completed_contract = getattr(self.canvas, '_projection_completed_pixel_contract', None)
+        if (completed_contract is not None
+                and completed_contract != self.canvas.chapter.pixel_contract):
+            world_rect = None
+        revision = self.canvas._document_projection.revision
+        self.canvas.documentChanged.emit(world_rect)
+        self.canvas._note_interaction_projection_dirty(world_rect, revision)
+        if self._parameter_before is not None:
+            self._parameter_notified = True
         self.canvas.update()
-        self.canvas.documentChanged.emit(None)
 
-    def _push(self, before, label: str) -> None:
+    def _push(self, before, label: str, *, notify=True) -> None:
         if isinstance(before, RecordSnapshot) and before.document_identity != id(self.canvas.chapter):
             return
         after = before.after(self.canvas.chapter) if isinstance(before, RecordSnapshot) else self.canvas.chapter.to_dict()
         if before != after:
             self.canvas.push_model_change(before, after, label)
-            self.canvas.documentChanged.emit(None)
+            if notify:
+                self.canvas.documentChanged.emit(None)
 
     def _default_bounds(self):
         rect = None
@@ -792,12 +934,22 @@ class ModifierControls(QWidget):
             )
             if not accepted:
                 return
-            from comic_editor.ui.posterize_controls import PosterizeSampler
-            try:
-                modifier.ranges = PosterizeSampler(value_mode=value_mode).sample(self.canvas, targets).initialize(count)
-            except (ValueError, MemoryError) as error:
-                QMessageBox.warning(self, modifier.name, str(error))
+            if chapter is not self.canvas.chapter or tuple(targets) != tuple(self.canvas.selected_entities):
                 return
+            from comic_editor.ui.posterize_controls import PosterizeSampleRequest, PosterizeSampler
+            if self._posterize_add_request is not None:
+                self._posterize_add_request.cancel()
+                self._posterize_add_request.deleteLater()
+            request = self._posterize_add_request = PosterizeSampleRequest(
+                self.canvas, targets, sampler=PosterizeSampler(value_mode=value_mode), parent=self)
+            self._posterize_add_status.setText(f"Preparing {modifier.name} colors… You can keep editing.")
+            self._posterize_add_status.show()
+            request.finished.connect(lambda statistics: self._finish_posterize_add(
+                request, modifier, targets, count, statistics))
+            request.cancelled.connect(lambda: self._posterize_add_cancelled(request))
+            request.failed.connect(lambda message: self._posterize_add_failed(request, message))
+            request.start()
+            return
         elif modifier_type == "dithering":
             modifier = DitheringModifier()
         elif modifier_type == "sharpness":
@@ -845,6 +997,30 @@ class ModifierControls(QWidget):
             modifier = MirrorModifier(axis_start=(center.x(), center.y() - radius), axis_end=(center.x(), center.y() + radius))
         else:
             modifier = OutlineModifier()
+        self._install_modifier(modifier, targets, before)
+
+    def _posterize_add_cancelled(self, request):
+        if self._posterize_add_request is request:
+            self._posterize_add_status.setText("Posterize cancelled because the selection or artwork changed.")
+
+    def _posterize_add_failed(self, request, message):
+        if self._posterize_add_request is request:
+            self._posterize_add_status.setText(f"Could not prepare Posterize colors: {message}")
+
+    def _finish_posterize_add(self, request, modifier, targets, count, statistics):
+        if self._posterize_add_request is not request:
+            return
+        # The request validated model/history/source/selection immediately
+        # before emitting. Snapshot only now, so intervening edits cannot be
+        # folded into this command or silently overwritten by its undo.
+        before = self._graph_snapshot(targets, modifiers=None)
+        modifier.ranges = statistics.initialize(count)
+        self._posterize_add_request = None
+        self._posterize_add_status.hide()
+        self._install_modifier(modifier, targets, before)
+
+    def _install_modifier(self, modifier, targets, before):
+        chapter = self.canvas.chapter
         incompatible = chapter.incompatible_modifier_targets(modifier, targets)
         if incompatible:
             self.canvas.report_incompatible("Add modifier", chapter.modifier_compatibility_message(modifier, incompatible), incompatible)
@@ -892,10 +1068,13 @@ class ModifierControls(QWidget):
         if self.canvas._cage_edit_before is not None:
             self.canvas.finish_cage(True)
         if self._parameter_before is None and self.canvas.chapter is not None:
+            self._parameter_notified = False
             self._parameter_before = RecordSnapshot.capture(self.canvas.chapter,
                 modifiers=[modifier_id] if modifier_id is not None else None,
                 scalars=('modifier_preset_ids',))
             self._parameter_history_generation = getattr(self.canvas, '_history_generation', 0)
+            self.canvas._modifier_parameter_drag_id = modifier_id or "all"
+            self.canvas._modifier_parameter_drag_owner = self._parameter_preview_owner
 
     def set_parameter(
         self, modifier_id: str, attribute: str, value, commit: bool,
@@ -908,6 +1087,7 @@ class ModifierControls(QWidget):
             return
         before = (RecordSnapshot.capture(chapter, modifiers=[modifier_id], scalars=('modifier_preset_ids',))
                   if commit and self._parameter_before is None else None)
+        old_bounds = modifier_edit_bounds(self.canvas, modifier_id)
         if (self._parameter_before is not None
                 and modifier.modifier_type == "distort_mesh_warp"):
             self.canvas._mesh_warp_parameter_drag_id = modifier_id
@@ -918,10 +1098,12 @@ class ModifierControls(QWidget):
             self._smudge_parameter_chapter = chapter
         setattr(modifier, attribute, value)
         modifier.validate()
-        if attribute == "muted" or not modifier.muted:
-            self._changed()
+        visual_change = attribute == "muted" or not modifier.muted
+        if visual_change:
+            new_bounds = modifier_edit_bounds(self.canvas, modifier_id)
+            self._changed(modifier_edit_dirty(old_bounds, new_bounds))
         if commit and before is not None:
-            self._push(before, "Edit modifier")
+            self._push(before, "Edit modifier", notify=not visual_change)
         if attribute in {"expanded", "muted"}:
             self.refresh()
         if (attribute == "color_mode" and value != "target_layer"
@@ -930,6 +1112,7 @@ class ModifierControls(QWidget):
 
     def finish_parameter_drag(self) -> None:
         before, self._parameter_before = self._parameter_before, None
+        notified, self._parameter_notified = self._parameter_notified, False
         chapter, self._mesh_warp_parameter_chapter = self._mesh_warp_parameter_chapter, None
         smudge_chapter, self._smudge_parameter_chapter = self._smudge_parameter_chapter, None
         chapter = chapter if chapter is not None else smudge_chapter
@@ -937,14 +1120,35 @@ class ModifierControls(QWidget):
         smudge_preview = getattr(self.canvas, "_smudge_parameter_drag_id", None)
         self.canvas._mesh_warp_parameter_drag_id = None
         self.canvas._smudge_parameter_drag_id = None
+        generic_preview = clear_parameter_preview(self.canvas, self._parameter_preview_owner)
         # Undo/document replacement may already have restored another model.
         # Never append the abandoned gesture to that model's history.
         if (before is not None and (chapter is None or chapter is self.canvas.chapter)
                 and getattr(self, '_parameter_history_generation', 0) == getattr(self.canvas, '_history_generation', 0)):
-            self._push(before, "Edit modifier")
-        if mesh_preview is not None or smudge_preview is not None:
+            # Each live value already notified the canvas. Recording history
+            # must not turn a local slider edit into another full repaint.
+            self._push(before, "Edit modifier", notify=not notified)
+        if not generic_preview and (mesh_preview is not None or smudge_preview is not None):
             self.canvas._invalidate_scene_cache()
             self.canvas.update()
+        if generic_preview:
+            self.canvas.interactionFinished.emit()
+
+    def _validate_parameter_context(self, *_args) -> None:
+        before = self._parameter_before
+        if before is not None and (
+            before.document_identity != id(self.canvas.chapter)
+            or getattr(self, '_parameter_history_generation', 0)
+            != getattr(self.canvas, '_history_generation', 0)
+        ):
+            self.cancel_parameter_drag()
+
+    def cancel_parameter_drag(self) -> None:
+        """Abandon a gesture after history/document state has been replaced."""
+        self._parameter_before = None
+        self._parameter_notified = False
+        self._mesh_warp_parameter_chapter = self._smudge_parameter_chapter = None
+        clear_parameter_preview(self.canvas, self._parameter_preview_owner)
 
     def request_mask(self, context: tuple) -> None:
         self.maskRequested.emit(context)
@@ -975,8 +1179,7 @@ class ModifierControls(QWidget):
         if binding is None:
             return
         if self._parameter_before is None:
-            self._parameter_before = RecordSnapshot.capture(chapter, modifiers=[modifier_id], scalars=('modifier_preset_ids',))
-            self._parameter_history_generation = getattr(self.canvas, '_history_generation', 0)
+            self.begin_parameter_drag(modifier_id)
         binding.black_value = float(black)
         binding.white_value = float(white)
         modifier.validate()
@@ -1104,8 +1307,8 @@ class ModifierControls(QWidget):
         return True
 
     def _chapter_replaced(self, *_):
-        self._parameter_before = self._reorder_before = None
-        self._mesh_warp_parameter_chapter = self._smudge_parameter_chapter = None
+        self.cancel_parameter_drag()
+        self._reorder_before = None
         self.cancel_target_layer_pick()
         self.refresh()
 

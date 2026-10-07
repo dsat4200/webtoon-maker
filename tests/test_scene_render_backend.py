@@ -36,6 +36,7 @@ def test_capture_restores_ambient_state_on_every_exit(canvas, monkeypatch, outco
         _vector_render_scale_override=3., _effect_region_requests=False,
         _projection_tile_key=("ambient",), _effect_preview_channel="navigator",
         _projection_exact=False, _projection_defer_effects=False,
+        _bounded_effect_preview=True,
         _live_underlay_object_id="ambient-underlay", _live_underlay_amount=.25)
     for name, saved in ambient.items():
         setattr(canvas, name, saved)
@@ -43,6 +44,7 @@ def test_capture_restores_ambient_state_on_every_exit(canvas, monkeypatch, outco
     def scene(painter, visible, **kwargs):
         assert canvas._projection_tile_key == ("base", ("isolated",))
         assert canvas._projection_exact and canvas._projection_defer_effects
+        assert not canvas._bounded_effect_preview
         assert canvas._effect_preview_channel == "canvas"
         assert canvas._effect_viewport_world == document.bounds
         assert canvas._live_underlay_object_id == document.underlay[0]
@@ -69,6 +71,25 @@ def test_capture_restores_ambient_state_on_every_exit(canvas, monkeypatch, outco
         assert result.status.value == outcome
         assert result.exact == (outcome == "exact")
     assert {name: getattr(canvas, name) for name in ambient} == ambient
+
+
+@pytest.mark.parametrize('quality,key,bounded', [
+    (RenderQuality.EXACT, ('native-preview', 0, 0), False),
+    (RenderQuality.INTERACTIVE, ('native-preview', 0, 0), True),
+    (RenderQuality.INTERACTIVE, ('interaction-preview',), True),
+    (RenderQuality.INTERACTIVE, ('stroke-preview',), False),
+])
+def test_bounded_effect_flag_is_explicit_and_scoped(canvas, monkeypatch, quality, key, bounded):
+    document = canvas._render_document_state()
+    value = RenderRequest((0., 0., 64., 64.), 1., (64, 64), key, document.revision, quality=quality)
+    assert not hasattr(canvas, '_bounded_effect_preview')
+    def paint(painter, visible, **_):
+        assert canvas._bounded_effect_preview == bounded
+        assert canvas._effect_preview_channel == 'canvas'
+        painter.fillRect(visible, QColor('red'))
+    monkeypatch.setattr(canvas, '_render_scene_layers', paint)
+    assert not canvas._render_service.render_region(document, value).image.isNull()
+    assert not hasattr(canvas, '_bounded_effect_preview')
 
 
 def test_backend_cannot_read_live_canvas_from_worker_thread(canvas):

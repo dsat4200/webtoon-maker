@@ -141,7 +141,10 @@ class DiskCacheController(QObject):
                 and configuration[7] == ("", 0.) and not configuration[8] and configuration[9] is None)
 
     def lookup_tile(self, request, configuration):
-        if not self.reusable(configuration):
+        # An empty published index has nothing to validate against. Avoid the
+        # full scene dependency traversal before that definite miss is known.
+        if (self.backing is None or not self.backing.can_lookup
+                or not self.reusable(configuration)):
             return None
         try:
             return self.backing.lookup("projection", self.tile_key(request, configuration))
@@ -150,9 +153,18 @@ class DiskCacheController(QObject):
             return None
 
     def retain_tile(self, request, configuration, image):
-        if self.reusable(configuration):
+        # Unlike intermediate warm-cache observation, this callback has no
+        # metadata side effect when recording is off. The backing would reject
+        # the write, so constructing a regional scene key cannot help it.
+        if (self.backing is not None and self.backing.recording
+                and not self.backing.closed and self.reusable(configuration)):
             try:
                 self.backing.retain("projection", self.tile_key(request, configuration), image)
+            except RenderPending:
+                # The empty-index fast miss may let exact pixels finish before
+                # their first saved-source hash. Valid memory tiles call this
+                # hook again on the next collect; never write an unvalidated key.
+                return
             except RenderFailed as error:
                 self.backing.error = str(error)
 
@@ -273,6 +285,8 @@ class DiskCacheController(QObject):
         self._status_queue = deque(sorted(range(count), key=lambda row: abs(row - visible)))
 
     def row_ready(self, row):
+        if self.backing is None or not self.backing.can_lookup:
+            return False
         with self.capture():
             configuration = (*self.canvas._projection_configuration(), None)
             try:

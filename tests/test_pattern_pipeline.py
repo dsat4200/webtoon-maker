@@ -1,4 +1,7 @@
 """Pattern integration: stable coordinates, GPU reuse, masks and raster baking."""
+from dataclasses import replace
+from threading import Event, get_ident
+
 import numpy as np
 import pytest
 from PySide6.QtCore import QPointF, QRectF, Qt
@@ -76,6 +79,122 @@ def test_exact_projection_uses_regional_halftone_pixels(pattern_scene, monkeypat
         QTransform(), required=requested, request_scope=("test", "halftone"))
     assert placement == requested
     assert regional == complete.copy(27, 16, 39, 43)
+
+
+def test_padded_halftone_snapshots_admit_two_exact_workers_with_unchanged_budget(pattern_scene, monkeypatch):
+    import comic_editor.ui.pattern_rendering as patterns
+    from comic_editor.ui.async_projection import ProjectionPending
+    canvas, _, _ = pattern_scene
+    canvas._interactive_render = canvas._effect_region_requests = True
+    canvas._projection_exact = canvas._projection_defer_effects = True
+    image = QImage(1527, 6127, QImage.Format_ARGB32_Premultiplied)
+    image.fill(QColor(96, 43, 121, 173))
+    frame = QRectF(0, 0, 1527, 6127)
+    modifier = HalftoneModifier(grid_type="square", dot_style="circle", color_mode="two",
+        base_resolution=1000, spacing=10, blur=5, size=1.65, rotation=-38.2, intensity=70)
+    release, entered = Event(), [Event(), Event()]
+    captured = []
+    ordinary = patterns.render_halftone_snapshot
+    gui = get_ident()
+    def blocked(snapshot, effect, **kwargs):
+        assert get_ident() != gui
+        number = len(captured)
+        captured.append((snapshot, effect))
+        entered[number].set()
+        assert release.wait(20)
+        return ordinary(snapshot, effect, **kwargs)
+    monkeypatch.setattr(patterns, "render_halftone_snapshot", blocked)
+    requested = [QRectF(140, 1120, 1028, 1028), QRectF(140, 2148, 1028, 1028)]
+    arguments = dict(source_key=("native-source",), request_scope=("test", "parallel-halftone"))
+    try:
+        for region in requested:
+            with pytest.raises(ProjectionPending):
+                render_stages(canvas, image, frame, [modifier], QTransform(), required=region, **arguments)
+        assert all(event.wait(2) for event in entered)
+        jobs = canvas._effect_jobs
+        assert len(jobs.running_jobs) == 2 and not jobs.pending
+        assert jobs.budget == 256 * 1024 * 1024
+        assert 8 * image.sizeInBytes() > jobs.budget
+        assert jobs.bytes_in_flight <= jobs.budget
+        assert all(snapshot.frame_size == (1527, 6127)
+                   and snapshot.image.sizeInBytes() < image.sizeInBytes() / 4
+                   for snapshot, _effect in captured)
+        modifier.intensity = 30
+        assert all(effect.intensity == 70 for _snapshot, effect in captured)
+    finally:
+        release.set()
+    for job in canvas._effect_jobs.running_jobs:
+        job[3].result(timeout=20)
+    canvas._effect_jobs.poll()
+    # The mutable UI effect was detached; results retain exactly their captured
+    # native sampling and scalar blend. They publish under their original keys.
+    captured_effect = replace(modifier, intensity=70)
+    for region, (snapshot, effect) in zip(requested, captured):
+        result, placement = render_stages(canvas, image, frame, [captured_effect],
+            QTransform(), required=region, **arguments)
+        filtered = ordinary(snapshot, effect)
+        original = snapshot.image.copy(*snapshot.output)
+        from comic_editor.ui.modifier_rendering import _premultiplied_qimage
+        expected = _premultiplied_qimage(_qimage_premultiplied(original) * .3
+                                        + _qimage_premultiplied(filtered) * .7)
+        assert placement == region and result == expected
+    assert canvas._effect_jobs.completed == 2 and canvas._effect_jobs.submitted == 2
+
+
+@pytest.mark.parametrize("guard", ["intensity_mask", "target_layer"])
+def test_masked_and_target_halftones_keep_their_existing_complete_sampling_path(pattern_scene, monkeypatch, guard):
+    import comic_editor.ui.effect_pipeline as pipeline
+    import comic_editor.ui.pattern_rendering as patterns
+    canvas, _, _ = pattern_scene
+    canvas._interactive_render = canvas._effect_region_requests = canvas._projection_exact = True
+    monkeypatch.setattr(pipeline, "REGIONAL_HALFTONE_MIN_PIXELS", 0)
+    monkeypatch.setattr(patterns, "capture_halftone_region", lambda *_a, **_k:
+        pytest.fail("A field-dependent pattern was detached as a scalar regional snapshot"))
+    modifier = HalftoneModifier(base_resolution=1000, spacing=15.4, blur=5)
+    if guard == "intensity_mask":
+        modifier.parameter_masks["intensity"] = ParameterMaskBinding("missing", 0, 100)
+    else:
+        modifier.color_mode = "target_layer"
+    image = sample_image()
+    result, bounds = render_stages(canvas, image, QRectF(0, 0, 120, 90), [modifier],
+        QTransform(), required=QRectF(7, 9, 39, 43), request_scope=("test", guard))
+    assert not result.isNull() and bounds == QRectF(7, 9, 39, 43)
+
+
+def test_document_reset_discards_an_old_exact_halftone_snapshot(pattern_scene, monkeypatch):
+    import comic_editor.ui.effect_pipeline as pipeline
+    import comic_editor.ui.pattern_rendering as patterns
+    from comic_editor.ui.async_projection import ProjectionPending
+    from comic_editor.ui.radial_blur import RadialRenderCancelled
+    canvas, chapter, _ = pattern_scene
+    canvas._interactive_render = canvas._effect_region_requests = True
+    canvas._projection_exact = canvas._projection_defer_effects = True
+    monkeypatch.setattr(pipeline, "REGIONAL_HALFTONE_MIN_PIXELS", 0)
+    image, frame = sample_image(), QRectF(0, 0, 120, 90)
+    modifier = HalftoneModifier(base_resolution=1000, spacing=15.4, blur=5)
+    entered, release = Event(), Event()
+    ordinary = patterns.render_halftone_snapshot
+    def blocked(snapshot, effect, **kwargs):
+        entered.set()
+        assert release.wait(5)
+        return ordinary(snapshot, effect, **kwargs)
+    monkeypatch.setattr(patterns, "render_halftone_snapshot", blocked)
+    try:
+        with pytest.raises(ProjectionPending):
+            render_stages(canvas, image, frame, [modifier], QTransform(),
+                required=QRectF(7, 9, 39, 43), request_scope=("test", "old-snapshot"))
+        assert entered.wait(2)
+        job = canvas._effect_jobs.running
+        canvas.set_document(chapter, canvas.tiles)
+        assert job[2].is_set()
+    finally:
+        release.set()
+    with pytest.raises(RadialRenderCancelled):
+        job[3].result(timeout=5)
+    canvas._effect_jobs.poll()
+    assert canvas._effect_jobs.discarded == 1
+    assert canvas._effect_jobs.completed == 0
+    assert not canvas._effect_jobs.retained and not canvas._modifier_render_cache
 
 
 def test_slider_edit_reuses_original_gpu_source(pattern_scene, monkeypatch):

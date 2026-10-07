@@ -98,6 +98,146 @@ def test_worker_checkpoint_handoff_preserves_other_completed_target(owner):
     assert jobs.retained_bytes == first.sizeInBytes() + second.sizeInBytes()
 
 
+def test_cancel_exact_preserves_nonexact_jobs_and_completed_checkpoints(owner):
+    jobs = owner._effect_jobs
+    source = image()
+    jobs.retained_put(('pipeline', 'stable'), 'prefix', source, shared=True)
+    started, release = Event(), Event()
+    def gated(cancelled):
+        started.set()
+        assert release.wait(5)
+        return image('red')
+    jobs.request('old-exact', 'old-key', gated, 100, require_exact=True)
+    try:
+        assert started.wait(1)
+        jobs.request('live-preview', 'preview-key', lambda _: image('blue'), 100)
+        jobs.request('queued-exact', 'queued-key', lambda _: image('red'), 100, require_exact=True)
+        jobs.waiting['memory-wait'] = 'old-key'
+        jobs.exact_failures['old-failure'] = ('old-key', 'obsolete')
+        assert jobs.cancel_exact()
+        assert jobs.running[2].is_set()
+        assert list(jobs.pending) == ['live-preview']
+        assert not jobs.waiting and not jobs.exact_failures
+        assert jobs.retained_get(('pipeline', 'stable'), 'prefix')[0] == source
+    finally:
+        release.set()
+    jobs.running[3].result(timeout=5)
+    jobs.poll()
+    assert jobs.discarded == 1 and 'old-key' not in owner.results
+    jobs.running[3].result(timeout=5)
+    jobs.poll()
+    assert jobs.completed == 1
+    assert jobs.result('live-preview', 'preview-key') == image('blue')
+    assert jobs.retained_get(('pipeline', 'stable'), 'prefix')[0] == source
+
+
+def test_cancel_exact_marks_finished_futures_before_they_can_publish(owner):
+    jobs = owner._effect_jobs
+    jobs.request('old-exact', 'old-key', lambda _: image('red'), 100, require_exact=True)
+    jobs.running[3].result(timeout=5)
+    assert jobs.has_finished
+    assert jobs.cancel_exact()
+    jobs.poll()
+    assert jobs.discarded == 1 and jobs.completed == 0
+    assert not owner.results and not jobs.retained and not jobs.exact_failures
+
+
+def test_cancel_exact_keeps_running_preview_and_its_memory_retry(owner):
+    jobs = owner._effect_jobs
+    jobs.budget = 100
+    started, release = Event(), Event()
+    def preview(cancelled):
+        started.set()
+        assert release.wait(5)
+        return image('blue')
+    jobs.request('live-preview', 'preview-key', preview, 80)
+    try:
+        assert started.wait(1)
+        jobs.request('waiting-exact', 'old-key', lambda _: image('red'), 80, require_exact=True)
+        assert jobs.waiting and jobs.retry_on_release
+        assert jobs.cancel_exact()
+        assert not jobs.running[2].is_set()
+        assert not jobs.waiting and jobs.retry_on_release
+    finally:
+        release.set()
+    jobs.running[3].result(timeout=5)
+    jobs.poll()
+    assert jobs.completed == 1 and not jobs.discarded
+    assert jobs.result('live-preview', 'preview-key') == image('blue')
+
+
+def test_live_exact_cancellation_preserves_immutable_source_decode_then_full_cancel_retires_it(owner):
+    jobs = owner._effect_jobs
+    started, release = Event(), Event()
+    scope = ('source-image-decode', 'image', 'legacy')
+    queued = ('source-image-decode', 'other-image', 'native')
+    failure = ('source-image-decode', 'missing-image', 'legacy')
+    def decode(cancelled):
+        started.set()
+        assert release.wait(5)
+        return image('blue')
+    jobs.request(scope, 'immutable-bytes', decode, 100, require_exact=True)
+    try:
+        assert started.wait(1)
+        jobs.request(queued, 'other-immutable-bytes', decode, 100, require_exact=True)
+        jobs.waiting[('source-image-decode', 'waiting', 'legacy')] = 'waiting-bytes'
+        jobs.exact_failures[failure] = ('missing-bytes', 'Source could not be read')
+        jobs.request('obsolete-artwork', 'gesture-pose', lambda _: image('red'), 100, require_exact=True)
+        jobs.retry_on_release = True
+        assert jobs.cancel_exact()
+        assert not jobs.running[2].is_set()
+        assert list(jobs.pending) == [queued]
+        assert jobs.waiting and failure in jobs.exact_failures and jobs.retry_on_release
+        jobs.cancel(clear_retained=False)
+        assert jobs.running[2].is_set()
+        assert not jobs.pending and not jobs.waiting and not jobs.exact_failures
+    finally:
+        release.set()
+    jobs.running[3].result(timeout=5)
+    jobs.poll()
+    assert not jobs.completed and not owner.results
+
+
+def test_finished_source_decode_publishes_across_live_cancellation(owner):
+    jobs = owner._effect_jobs
+    scope = ('source-image-decode', 'image', 'legacy')
+    jobs.request(scope, 'immutable-bytes', lambda _: image('blue'), 100, require_exact=True)
+    jobs.running[3].result(timeout=5)
+    assert not jobs.cancel_exact()
+    jobs.poll()
+    assert jobs.completed == 1 and not jobs.discarded
+    assert jobs.result(scope, 'immutable-bytes') == image('blue')
+
+
+def test_memory_waiting_source_decode_keeps_retry_when_obsolete_artwork_unwinds(owner):
+    jobs = owner._effect_jobs
+    jobs.budget = 100
+    started, release = Event(), Event()
+    scope = ('source-image-decode', 'image', 'legacy')
+    def old_artwork(cancelled):
+        started.set()
+        assert release.wait(5)
+        return image('red')
+    jobs.request('obsolete-artwork', 'old-pose', old_artwork, 80, require_exact=True)
+    try:
+        assert started.wait(1)
+        jobs.request(scope, 'immutable-bytes', lambda _: image('blue'), 80, require_exact=True)
+        assert jobs.waiting[scope] == 'immutable-bytes' and jobs.retry_on_release
+        assert jobs.cancel_exact()
+        assert jobs.running[2].is_set()
+        assert jobs.waiting[scope] == 'immutable-bytes' and jobs.retry_on_release
+    finally:
+        release.set()
+    jobs.running[3].result(timeout=5)
+    jobs.poll()
+    assert jobs.discarded == 1 and not jobs.waiting
+    assert owner.repaints
+    jobs.request(scope, 'immutable-bytes', lambda _: image('blue'), 80, require_exact=True)
+    jobs.running[3].result(timeout=5)
+    jobs.poll()
+    assert jobs.result(scope, 'immutable-bytes') == image('blue')
+
+
 def test_shared_storage_is_released_only_after_last_scope_and_read_is_detached(owner):
     jobs = owner._effect_jobs
     source = image()

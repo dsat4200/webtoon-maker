@@ -1,5 +1,6 @@
 """Radial handle edits stay interactive through exact GPU projection work."""
 import math
+from dataclasses import replace
 from threading import Event, get_ident
 
 import pytest
@@ -11,8 +12,10 @@ from comic_editor.core.models import (
     BoundGeometry, ChapterDocument, ImageObject, ParameterMaskBinding, RadialBlurModifier, ToneMask,
 )
 from comic_editor.core.settings import EditorSettings
+from comic_editor.core.pixel_contract import FLOAT_PIXELS
 from comic_editor.core.tiles import TileStore
-from comic_editor.ui.canvas import CanvasWidget
+from comic_editor.render.service import RenderQuality, RenderRequest
+from comic_editor.ui.canvas import CanvasWidget, ToolKind
 from comic_editor.ui.modifier_controls import ModifierControls
 
 
@@ -56,6 +59,196 @@ def frame(canvas, deferred=False):
     finally:
         painter.end()
     return image
+
+
+def widget_frame(canvas):
+    image = QImage(canvas.size(), QImage.Format_ARGB32_Premultiplied)
+    image.fill(QColor("#242428"))
+    painter = QPainter(image)
+    try:
+        canvas._paint_document_projection(painter, interactive=True)
+    finally:
+        painter.end()
+    return image
+
+
+@pytest.mark.parametrize("pen", [False, True])
+def test_widget_radial_edit_queues_one_native_worker_without_compact_integration(scene, monkeypatch, pen):
+    from comic_editor.ui import radial_blur
+    canvas, modifier = scene
+    before = frame(canvas)
+    completed = canvas._projection_completed_view
+    published, submitted = canvas._projection_presented_revision, canvas._effect_jobs.submitted
+    center, end = canvas._radial_handle_points(modifier)
+    assert canvas._begin_modifier_handle(end)
+    canvas._pen_contact_active = pen
+    canvas._move_modifier_handle(center + QPointF(0, 72))
+    canvas._flush_radial_handle()
+    entered, release = Event(), Event()
+    gui, original = get_ident(), radial_blur.radial_blur
+    integrations = []
+
+    def blocked(*args, **kwargs):
+        assert get_ident() != gui, "Widget evaluated angular integration on the GUI thread"
+        integrations.append(1)
+        entered.set()
+        assert release.wait(5)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(radial_blur, "radial_blur", blocked)
+    try:
+        # The pending banner is a UI update outside the chapter artwork.
+        area = canvas.camera_transform().mapRect(QRectF(0, 0, 180, 160)).toAlignedRect()
+        assert widget_frame(canvas).copy(area) == before.copy(area)
+        assert entered.wait(2)
+        assert canvas._projection_frame_pending and canvas._projection_interaction_preview is None
+        assert canvas._projection_completed_view is completed
+        assert canvas._projection_presented_revision == published
+        assert published < canvas._document_projection.revision
+        canvas._finish_modifier_handle()
+        canvas._pen_contact_active = False
+        assert widget_frame(canvas).copy(area) == before.copy(area)
+        assert canvas._projection_presented_revision == published and len(integrations) == 1
+    finally:
+        release.set()
+    canvas._effect_jobs.running[3].result(timeout=10)
+    canvas._effect_jobs.poll()
+    after = widget_frame(canvas)
+    assert after != before and not canvas._projection_frame_pending
+    assert canvas._projection_presented_revision == canvas._document_projection.revision
+    assert canvas._effect_jobs.submitted == submitted + 1 and len(integrations) == 1
+    # A synchronous fresh integration verifies the artwork, not a UI control.
+    monkeypatch.setattr(radial_blur, "radial_blur", original)
+    canvas._effect_jobs.cancel()
+    canvas._modifier_render_cache.clear()
+    canvas._modifier_render_cache_bytes = 0
+    canvas._modifier_source_cache.clear()
+    canvas._modifier_source_cache_bytes = 0
+    canvas._render_service.invalidate()
+    assert frame(canvas) == after
+
+
+@pytest.mark.parametrize("invalid", ["marker", "configuration", "contract", "coverage", "history", "future"])
+def test_widget_radial_gate_requires_a_coherent_previous_exact_view(scene, monkeypatch, invalid):
+    canvas, modifier = scene
+    frame(canvas)
+    completed = canvas._projection_completed_view
+    published = canvas._projection_presented_revision
+    modifier.angle = 50
+    canvas.documentChanged.emit(None)
+    if invalid == "marker":
+        canvas._radial_effect_revision = (id(canvas.chapter), canvas._document_projection.revision - 1)
+    elif invalid == "configuration":
+        canvas._projection_completed_view = (("different",), completed[1], completed[2])
+    elif invalid == "contract":
+        canvas._projection_completed_pixel_contract = FLOAT_PIXELS
+    elif invalid == "coverage":
+        canvas._projection_completed_view = (completed[0], [(phase,
+            [replace(tile, world_rect=QRectF(1000, 1000, 1, 1)) for tile in tiles])
+            for phase, tiles in completed[1]], completed[2])
+    elif invalid == "history":
+        canvas._history_generation = getattr(canvas, "_history_generation", 0) + 1
+    else:
+        canvas._projection_completed_view = (*completed[:2], canvas._document_projection.revision + 1)
+    captures, render = [], canvas._render_service.render_region
+    def observed(document, request):
+        captures.append(request)
+        return render(document, request)
+    monkeypatch.setattr(canvas._render_service, "render_region", observed)
+    assert canvas._capture_interaction_projection_preview()
+    assert captures and captures[0].key == ("interaction-preview",)
+    preview = canvas._projection_interaction_preview
+    assert preview.revision == canvas._document_projection.revision
+    assert preview.pixel_contract == canvas.chapter.pixel_contract
+    assert canvas._projection_presented_revision == published
+    assert preview.tile.image == render(canvas._render_document_state(), captures[0]).image
+
+
+@pytest.mark.parametrize("cold", ["initial", "uncovered"])
+def test_cold_radial_view_still_captures_current_compact_blur(scene, monkeypatch, cold):
+    from comic_editor.ui import radial_blur
+    canvas, modifier = scene
+    if cold == "uncovered":
+        frame(canvas)
+        completed = canvas._projection_completed_view
+        canvas._projection_completed_view = (completed[0], [(phase,
+            [replace(tile, world_rect=QRectF(1000, 1000, 1, 1)) for tile in tiles])
+            for phase, tiles in completed[1]], completed[2])
+    modifier.angle = 50
+    canvas.documentChanged.emit(None)
+    calls, original = [], radial_blur.radial_blur
+    def observed(pixels, *args, **kwargs):
+        assert not canvas._projection_exact
+        calls.append(pixels.shape)
+        return original(pixels, *args, **kwargs)
+    monkeypatch.setattr(radial_blur, "radial_blur", observed)
+    assert canvas._capture_interaction_projection_preview()
+    assert calls and max(shape[0]*shape[1] for shape in calls) <= 32768
+    assert canvas._projection_interaction_preview.revision == canvas._document_projection.revision
+    assert canvas._effect_jobs.running is None and not canvas._effect_jobs.pending
+
+
+def test_radial_mask_paint_contact_keeps_current_compact_feedback(scene):
+    canvas, modifier = scene
+    mask = ToneMask(saved=True)
+    canvas.chapter.masks[mask.mask_id] = mask
+    modifier.parameter_masks["intensity"] = ParameterMaskBinding(mask.mask_id, 0, 100)
+    canvas.set_tone_mask_mode(mask.mask_id)
+    canvas.set_tool(ToolKind.RASTER_PENCIL)
+    frame(canvas)
+    completed = canvas._projection_completed_view
+    published = canvas._projection_presented_revision
+    canvas._begin_mask_stroke(QPointF(120, 60), 1.)
+    try:
+        # Live tile invalidation need not set the settings-edit marker. Make
+        # the radial seed otherwise eligible to exercise contact's exclusion.
+        canvas._radial_effect_revision = (id(canvas.chapter), canvas._document_projection.revision)
+        assert canvas._radial_preview_current()
+        assert canvas._capture_interaction_projection_preview(mask_contact=True)
+        preview = canvas._projection_interaction_preview
+        assert preview.revision == canvas._document_projection.revision
+        assert canvas._projection_completed_view is completed
+        assert canvas._projection_presented_revision == published
+        canvas._modifier_render_cache.clear()
+        canvas._modifier_render_cache_bytes = 0
+        canvas._modifier_source_cache.clear()
+        canvas._modifier_source_cache_bytes = 0
+        document = canvas._render_document_state()
+        request = RenderRequest(tuple(preview.coverage.getRect()), preview.density,
+            (preview.tile.image.width(), preview.tile.image.height()),
+            ("radial-contact-oracle",), document.revision, quality=RenderQuality.INTERACTIVE)
+        assert canvas._render_service.render_region(document, request).image == preview.tile.image
+    finally:
+        canvas._end_mask_stroke()
+
+
+def test_radial_preview_gate_cannot_publish_after_reentrant_cancellation(scene, monkeypatch):
+    canvas, modifier = scene
+    before = frame(canvas)
+    completed = canvas._projection_completed_view
+    published = canvas._projection_presented_revision
+    center, end = canvas._radial_handle_points(modifier)
+    assert canvas._begin_modifier_handle(end)
+    canvas._move_modifier_handle(center + QPointF(0, 72))
+    canvas._flush_radial_handle()
+    covers = canvas._completed_projection_covers
+    cancelled = []
+    def cancel(composite, visible):
+        result = covers(composite, visible)
+        if not cancelled:
+            cancelled.append(True)
+            QTest.keyClick(canvas, Qt.Key_Escape)
+        return result
+    monkeypatch.setattr(canvas, "_completed_projection_covers", cancel)
+    assert not canvas._capture_interaction_projection_preview()
+    assert cancelled and canvas._modifier_handle_drag is None
+    assert canvas.chapter.modifiers[modifier.modifier_id].angle == 24
+    assert canvas._projection_interaction_preview is None
+    assert canvas._projection_presented_revision == published
+    assert canvas._document_projection.revision != completed[2]
+    monkeypatch.setattr(canvas, "_completed_projection_covers", covers)
+    assert frame(canvas) == before
+    assert canvas._projection_presented_revision == canvas._document_projection.revision
 
 
 @pytest.mark.parametrize("pen", [False, True])
@@ -145,7 +338,8 @@ def test_radial_drag_cancels_obsolete_work_and_noop_keeps_revision(scene):
     assert canvas._effect_jobs.result("old", "old") is None
     canvas._finish_modifier_handle()
     canvas._invalidate_scene_cache()
-    assert not canvas._projection_can_defer_effects(), "Unrelated edits retain their publication policy"
+    assert canvas._modifier_handle_drag is None
+    assert canvas._projection_can_defer_effects(), "Committed widget edits keep exact work asynchronous"
 
 
 def test_angle_card_sync_and_escape_restore_pending_drag(scene):

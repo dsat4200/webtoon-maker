@@ -141,7 +141,18 @@ def test_world_painted_hsl_mask_keeps_geometry_and_matches_preview_commit(page_s
     canvas.tiles.paint_dab(mask.mask_id, QPointF(110, 134), 80, QColor("white"))
     effect = HueSaturationLightnessModifier(hue=80, parameter_masks={
         "intensity": ParameterMaskBinding(mask.mask_id, 0., 100.)})
-    canvas.chapter.add_modifier(effect, [("object", obj.object_id)])
+    # A nonmoving consumer keeps this mask fixed in chapter coordinates.
+    # Place it outside both capture rectangles so this test compares only
+    # the moving object's painted parameter field and native warped pixels.
+    fixed_page = canvas.chapter.add_page("Fixed mask consumer",
+        BoundGeometry.rectangle(700, 20, 260, 260))
+    fixed_page.fill_color, fixed_page.border_width = None, 0
+    fixed = canvas.chapter.add_object(fixed_page.layer_id,
+        ImageObject(x=750, y=70, pixel_width=128, pixel_height=128))
+    canvas.images.put_decoded(fixed.object_id, "fixed-consumer.png", b"",
+                             canvas.images.image(obj.object_id))
+    canvas.chapter.add_modifier(effect,
+        [("object", obj.object_id), ("object", fixed.object_id)])
     before = pixels(canvas).reshape(320, 320, 4)
     mask_state = copy.deepcopy(mask.to_dict())
     paint = {key: bytes(tile.constBits()) for key, tile in canvas.tiles.object_tiles(mask.mask_id).items()}
@@ -152,4 +163,35 @@ def test_world_painted_hsl_mask_keeps_geometry_and_matches_preview_commit(page_s
     canvas._commit_geometry_transform()
     np.testing.assert_array_equal(pixels(canvas, (35, 23)).reshape(320, 320, 4), preview)
     assert canvas.chapter.masks[mask.mask_id].to_dict() == mask_state
+    assert {key: bytes(tile.constBits()) for key, tile in canvas.tiles.object_tiles(mask.mask_id).items()} == paint
+
+
+def test_exclusively_owned_painted_hsl_mask_moves_native_grid_with_page_and_history(page_scene):
+    canvas, _page, warp = page_scene
+    obj = child(canvas, warp)
+    mask = ToneMask()
+    canvas.chapter.masks[mask.mask_id] = mask
+    canvas.tiles.paint_dab(mask.mask_id, QPointF(110, 134), 80, QColor("white"))
+    effect = HueSaturationLightnessModifier(hue=80, parameter_masks={
+        "intensity": ParameterMaskBinding(mask.mask_id, 0., 100.)})
+    canvas.chapter.add_modifier(effect, [("object", obj.object_id)])
+    before = pixels(canvas).reshape(320, 320, 4)
+    mask_state = copy.deepcopy(mask.to_dict())
+    paint = {key: bytes(tile.constBits()) for key, tile in canvas.tiles.object_tiles(mask.mask_id).items()}
+    start_move(canvas, (35, 23))
+    preview = pixels(canvas, (35, 23)).reshape(320, 320, 4)
+    np.testing.assert_array_equal(preview, before)
+    assert canvas.chapter.masks[mask.mask_id].to_dict() == mask_state
+    canvas._commit_geometry_transform()
+    np.testing.assert_array_equal(pixels(canvas, (35, 23)).reshape(320, 320, 4), preview)
+    expected_mask = copy.deepcopy(mask_state)
+    expected_mask["paint_offset"] = [35., 23.]
+    assert canvas.chapter.masks[mask.mask_id].to_dict() == expected_mask
+    assert {key: bytes(tile.constBits()) for key, tile in canvas.tiles.object_tiles(mask.mask_id).items()} == paint
+    canvas.command_stack.undo()
+    assert canvas.chapter.masks[mask.mask_id].to_dict() == mask_state
+    np.testing.assert_array_equal(pixels(canvas).reshape(320, 320, 4), before)
+    canvas.command_stack.redo()
+    assert canvas.chapter.masks[mask.mask_id].to_dict() == expected_mask
+    np.testing.assert_array_equal(pixels(canvas, (35, 23)).reshape(320, 320, 4), preview)
     assert {key: bytes(tile.constBits()) for key, tile in canvas.tiles.object_tiles(mask.mask_id).items()} == paint

@@ -2,6 +2,7 @@
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 from contextvars import copy_context
+from dataclasses import dataclass, field
 from threading import Event
 
 from PySide6.QtCore import QObject, QTimer
@@ -10,6 +11,112 @@ from comic_editor.ui.radial_blur import RadialRenderCancelled
 
 
 _MISSING = object()
+
+
+def _navigator_job_relevant(scope, key=None):
+    """Only known channel-local artwork can be irrelevant to Navigator.
+
+    Original source decode/color handoffs are shared. Unknown scopes remain
+    conservative, while the existing canvas/navigator stage namespaces retain
+    their ordinary semantic pixel dependencies and cache keys.
+    """
+    if isinstance(scope, tuple) and scope and isinstance(scope[0], str):
+        if scope[0] == 'source-image-decode':
+            return True
+        if (scope[0] in {'object', 'layer'} and len(scope) >= 3
+                and isinstance(scope[2], str)):
+            return scope[2] not in {'canvas', 'overflow', 'posterize-statistics'}
+        if (scope[0] in {'tile-graph', 'tile-frame', 'mesh-region', 'pattern-frame'}
+                and len(scope) > 1 and isinstance(scope[1], tuple)):
+            return _navigator_job_relevant(scope[1], key)
+    return True
+
+
+@dataclass
+class _RegionAssembly:
+    image: object
+    metadata_bytes: int
+    covered: set = field(default_factory=set)
+    complete: bool = False
+    bounds: object = None
+    tile_size: int | None = None
+
+
+class _RegionStore:
+    """Owning-thread, context-checked access to private exact frame progress."""
+    def __init__(self, jobs, context, current):
+        self.jobs, self.context, self.current_context = jobs, context, current
+        self.generation = jobs._region_generation
+
+    def _check(self):
+        if (self.generation != self.jobs._region_generation
+                or self.context != self.jobs._region_context
+                or self.context != self.current_context()):
+            from comic_editor.ui.async_projection import ProjectionPending
+            raise ProjectionPending('stale-frame-assembly', self.context)
+
+    def validate(self):
+        self._check()
+
+    def get(self, key):
+        self._check()
+        entry = self.jobs._regions.get(key)
+        if entry is not None:
+            self.jobs._regions.move_to_end(key)
+        return entry
+
+    def current(self, key, entry):
+        self._check()
+        return self.jobs._regions.get(key) is entry
+
+    def begin(self, key, requested, image_format, tile_count, *, tile_size=None):
+        self._check()
+        return self.jobs._region_begin(key, requested, image_format, tile_count, tile_size=tile_size)
+
+    def crop(self, key, entry, requested):
+        """Detach only a fully covered native rectangle from private progress.
+
+        The producer declares its canonical grid when it begins the frame. A
+        crop proves coverage itself; a caller cannot supply an incomplete set
+        of addresses or promote the unfinished full image to an exact result.
+        """
+        import math
+        from PySide6.QtCore import QRectF
+        from comic_editor.ui.async_projection import ProjectionPending
+        self._check()
+        if self.jobs._regions.get(key) is not entry:
+            raise ProjectionPending('displaced-frame-assembly', key)
+        rect = QRectF(requested)
+        if (entry.tile_size is None or entry.tile_size <= 0 or rect.isEmpty()
+                or rect != QRectF(rect.toAlignedRect()) or not entry.bounds.contains(rect)):
+            raise ValueError('Private crops require a declared native grid and an aligned in-frame rectangle')
+        step = entry.tile_size
+        for y in range(math.floor(rect.top() / step), math.ceil(rect.bottom() / step)):
+            for x in range(math.floor(rect.left() / step), math.ceil(rect.right() / step)):
+                if (x, y) not in entry.covered:
+                    raise ProjectionPending('incomplete-frame-crop', key)
+        # QImage.copy detaches pixels. The still-incomplete parent stays private
+        # and budgeted; only this independently proven exact rectangle escapes.
+        relative = rect.translated(-entry.bounds.topLeft()).toAlignedRect()
+        result = entry.image.copy(relative)
+        if result.isNull():
+            raise MemoryError('Could not allocate exact frame crop')
+        return result
+
+    def finish(self, key, entry):
+        from PySide6.QtGui import QImage
+        self._check()
+        if self.jobs._regions.get(key) is not entry:
+            from comic_editor.ui.async_projection import ProjectionPending
+            raise ProjectionPending('displaced-frame-assembly', key)
+        if not entry.complete:
+            # Until complete, the mutable image is private and accounted as a
+            # working buffer. Only now may a COW handle reach a stage worker.
+            entry.complete = True
+            size, storage = int(entry.image.sizeInBytes()), int(entry.image.cacheKey())
+            self.jobs.retained_bytes -= size
+            self.jobs._retain_storage(storage, size)
+        return QImage(entry.image)
 
 
 class EffectJobs(QObject):
@@ -24,6 +131,10 @@ class EffectJobs(QObject):
         self._running = OrderedDict()
         self._job_serial = 0
         self.retry_on_release = False
+        self._navigator_retry_relevance = None
+        self._navigator_derived_relevance = None
+        self._navigator_derived_dependency = None
+        self._navigator_derived_retry = False
         self.exact_failures = OrderedDict()
         # The ordinary scene LRU also contains previews and source images.
         # Exact worker results and the latest completed stage need a separate
@@ -33,6 +144,12 @@ class EffectJobs(QObject):
         self.retained_budget = retained_budget
         self.retained_limit = max(1, int(retained_limit))
         self._retained_images = {}
+        # Partial and completed native frame assemblies share the retained
+        # pool's byte and record limits. Partials have no semantic cache entry
+        # and are never sent to disk, signals, or detached stage workers.
+        self._regions = OrderedDict()
+        self._region_context = None
+        self._region_generation = 0
         # Shared stage prefixes have many regional consumers. Protect a bounded
         # portion of the existing pool from one-use viewport captures, rather
         # than growing the pool or pinning a whole frame without a byte limit.
@@ -98,6 +215,94 @@ class EffectJobs(QObject):
             if not self._retained_shared_images[storage][1]:
                 self.retained_shared_bytes -= self._retained_shared_images.pop(storage)[0]
 
+    def _retain_storage(self, storage, size):
+        if storage in self._retained_images:
+            self._retained_images[storage][1] += 1
+        else:
+            self._retained_images[storage] = [size, 1]
+            self.retained_bytes += size
+
+    def _release_storage(self, storage):
+        self._retained_images[storage][1] -= 1
+        if not self._retained_images[storage][1]:
+            self.retained_bytes -= self._retained_images.pop(storage)[0]
+
+    def private_regions(self, context, current):
+        if context != self._region_context:
+            self._regions_clear()
+            self._region_context = context
+        return _RegionStore(self, context, current)
+
+    def _region_remove(self, key):
+        entry = self._regions.pop(key)
+        self.retained_bytes -= entry.metadata_bytes
+        if entry.complete:
+            self._release_storage(int(entry.image.cacheKey()))
+        else:
+            self.retained_bytes -= int(entry.image.sizeInBytes())
+
+    def _regions_clear(self):
+        for key in tuple(self._regions):
+            self._region_remove(key)
+        self._region_context = None
+        self._region_generation += 1
+
+    def _evict_retained(self, *, force=False):
+        # Keep unfinished demanded work ahead of one-use output aliases. A
+        # complete predecessor can leave this pool once its caller owns a COW
+        # handle; detached workers charge that source in snapshot admission.
+        oldest = next((scope for scope in self.retained
+                       if scope not in self._retained_shared), _MISSING)
+        if oldest is not _MISSING:
+            self.retained_remove(oldest)
+            return True
+        complete = next((key for key, entry in self._regions.items()
+                         if entry.complete), _MISSING)
+        if complete is not _MISSING:
+            self._region_remove(complete)
+            return True
+        if force and self._retained_shared:
+            self.retained_remove(next(iter(self._retained_shared)))
+            return True
+        if force and self._regions:
+            self._region_remove(next(iter(self._regions)))
+            return True
+        return False
+
+    def _region_begin(self, key, requested, image_format, tile_count, *, tile_size=None):
+        from PySide6.QtCore import Qt, QRectF
+        from PySide6.QtGui import QImage
+        previous = self._regions.get(key)
+        if previous is not None:
+            return previous
+        width, height = max(1, int(requested.width())), max(1, int(requested.height()))
+        depth = QImage(1, 1, image_format).depth()
+        # Address tuples, set slots, and Python integers also consume memory.
+        # Reserve conservatively up front so coverage growth is byte bounded.
+        metadata = 256 + 192 * tile_count
+        size = ((width * depth + 31) // 32) * 4 * height + metadata
+        budget = max(self.retained_budget, size)  # Existing exclusive oversized rule.
+        while (self.retained_bytes + size > budget
+               or len(self.retained) + len(self._regions) >= self.retained_limit):
+            if not self._evict_retained(force=True):
+                break
+        image = QImage(width, height, image_format)
+        if image.isNull():
+            raise MemoryError('Could not allocate exact frame assembly')
+        image.fill(Qt.transparent)
+        entry = _RegionAssembly(image, metadata, bounds=QRectF(requested), tile_size=tile_size)
+        self._regions[key] = entry
+        self.retained_bytes += int(image.sizeInBytes()) + metadata
+        return entry
+
+    def retained_consume(self, image):
+        """Retire raw result aliases only after an exact checkpoint owns them."""
+        storage = int(image.cacheKey())
+        for scope, entry in tuple(self.retained.items()):
+            if (isinstance(scope, tuple) and scope[:1] == ('result',)
+                    and int(entry[1].cacheKey()) == storage):
+                self.retained_remove(scope)
+
     def retained_put(self, scope, key, image, state=None, *, shared=False, force=False):
         from PySide6.QtGui import QImage
         from comic_editor.ui.cache_dependencies import cache_put
@@ -125,24 +330,15 @@ class EffectJobs(QObject):
         # often becomes a pipeline checkpoint before its result scope is
         # removed; counting that handoff twice evicts unrelated exact artwork.
         # Bound both unique pixel storage and the number of scope records.
-        while self.retained and (
+        while (self.retained or self._regions) and (
             self.retained_bytes + (0 if storage in self._retained_images else size)
                 > budget
-            or len(self.retained) >= self.retained_limit
+            or len(self.retained) + len(self._regions) >= self.retained_limit
         ):
-            oldest = next((item for item in self.retained if item not in self._retained_shared), _MISSING)
-            if oldest is _MISSING:
-                if not force:
-                    return False
-                oldest = next(iter(self._retained_shared))
-                self._retained_unprotect(oldest)
-            self.retained_remove(oldest)
+            if not self._evict_retained(force=force):
+                return False
         self.retained[scope] = (key, QImage(image), state, size)
-        if storage in self._retained_images:
-            self._retained_images[storage][1] += 1
-        else:
-            self._retained_images[storage] = [size, 1]
-            self.retained_bytes += size
+        self._retain_storage(storage, size)
         if shared:
             self._retained_shared[scope] = storage
             if storage in self._retained_shared_images:
@@ -158,9 +354,7 @@ class EffectJobs(QObject):
             self.retained.pop(scope)
             self._retained_unprotect(scope)
             storage = int(entry[1].cacheKey())
-            self._retained_images[storage][1] -= 1
-            if not self._retained_images[storage][1]:
-                self.retained_bytes -= self._retained_images.pop(storage)[0]
+            self._release_storage(storage)
 
     def result(self, scope, key):
         if any(job[:2] == (scope, key) and job[3].done() for job in self._running.values()):
@@ -206,6 +400,11 @@ class EffectJobs(QObject):
             # This request cannot start until the running snapshot releases.
             # Keep unrelated queued work instead of evicting it for a snapshot
             # we cannot retain yet. A repaint asks for the latest state later.
+            relevance = _navigator_job_relevant(scope, key)
+            if not self.retry_on_release:
+                self._navigator_retry_relevance = relevance
+            elif relevance:
+                self._navigator_retry_relevance = True
             self.retry_on_release = True
             if require_exact:
                 self.waiting[scope] = key
@@ -249,6 +448,32 @@ class EffectJobs(QObject):
                 self.executor.submit(compute, cancelled), size, require_exact)
             self.submitted += 1
 
+    def _emit_derived_ready(self, scope=None, key=None, *, retry=False, retry_relevance=None):
+        """Keep the global signal; expose Navigator relevance only while it emits.
+
+        Direct standalone emissions have no metadata and retain conservative
+        refresh. Restoring the previous value also preserves nested emissions.
+        Scope/key metadata is borrowed only for this synchronous emission;
+        it never retains pixels or creates a cache.
+        """
+        signal = getattr(self.canvas, 'derivedResultReady', None)
+        previous = self._navigator_derived_relevance
+        previous_dependency = self._navigator_derived_dependency
+        previous_retry = self._navigator_derived_retry
+        self._navigator_derived_retry = retry
+        self._navigator_derived_dependency = None if retry else (scope, key)
+        self._navigator_derived_relevance = (retry_relevance if retry
+            else _navigator_job_relevant(scope, key))
+        try:
+            if signal is not None:
+                signal.emit()
+            else:
+                self.canvas.visualChanged.emit(None)
+        finally:
+            self._navigator_derived_relevance = previous
+            self._navigator_derived_dependency = previous_dependency
+            self._navigator_derived_retry = previous_retry
+
     def poll(self):
         for identifier, job in tuple(self._running.items()):
             if not job[3].done():
@@ -275,13 +500,23 @@ class EffectJobs(QObject):
                 # their newly completed result takes priority over an older
                 # retained prefix, including the existing oversized-image case.
                 self.retained_put(("result", job[0]), job[1], result, force=job[5])
-                self.canvas._modifier_cache_put(job[1], result)
+                source_decode = (isinstance(job[0], tuple)
+                    and job[0][:1] == ('source-image-decode',)
+                    and isinstance(job[1], tuple)
+                    and job[1][:1] == ('source-image-decode-preview',))
+                # Original decodes use the retained source handoff and guarded
+                # ImageStore adoption. They are not derived effect pixels: a
+                # large source alias would flush current compact stage prefixes.
+                if not source_decode:
+                    self.canvas._modifier_cache_put(job[1], result)
                 ready = getattr(self.canvas, "_effect_result_ready", None)
                 if ready is not None:
                     ready(job[0], job[1])
                 else:
                     self.canvas._invalidate_scene_cache()
-                self.canvas.visualChanged.emit(None)
+                # Ready pixels improve the same document; they are not a new
+                # edit that should abandon a Navigator's completed bands.
+                self._emit_derived_ready(job[0], job[1])
                 self.canvas.update()
                 self.completed += 1
             else:
@@ -305,22 +540,61 @@ class EffectJobs(QObject):
                         ready(None, None)
                     self.canvas.update()
             if self.retry_on_release:
+                retry_relevance = self._navigator_retry_relevance
                 self.retry_on_release = False
+                self._navigator_retry_relevance = None
                 ready = getattr(self.canvas, "_effect_result_ready", None)
                 if ready is not None:
                     ready(None, None)
                 else:
                     self.canvas._invalidate_scene_cache()
-                self.canvas.visualChanged.emit(None)
+                self._emit_derived_ready(retry=True, retry_relevance=retry_relevance)
                 self.canvas.update()
         self._start()
         if not self._running and not self.pending:
             self.timer.stop()
 
+    def cancel_exact(self):
+        """Retire obsolete projection work without abandoning live previews.
+
+        Running snapshots release their own memory cooperatively. Mark even
+        finished futures before polling so they cannot publish obsolete pixels.
+        Completed semantic checkpoints remain available to the current scene.
+        Original image decodes depend only on immutable source bytes, so live
+        poses can share them; full document cancellation still retires them.
+        """
+        def source_decode(scope):
+            return isinstance(scope, tuple) and scope[:1] == ('source-image-decode',)
+
+        changed = False
+        self._regions_clear()
+        for table in (self.waiting, self.exact_failures):
+            for scope in tuple(table):
+                if not source_decode(scope):
+                    table.pop(scope)
+                    changed = True
+        for scope, job in tuple(self.pending.items()):
+            if job[5] and not source_decode(scope):
+                self.pending.pop(scope)
+                changed = True
+        for job in self._running.values():
+            if job[5] and not source_decode(job[0]) and not job[2].is_set():
+                job[2].set()
+                changed = True
+        if (not self.waiting and not any(not job[5] or source_decode(job[0])
+                for job in (*self._running.values(), *self.pending.values()))):
+            self.retry_on_release = False
+            self._navigator_retry_relevance = None
+        if not self._running and not self.pending:
+            self.timer.stop()
+        return changed
+
     def cancel(self, *, clear_retained=True):
+        self._regions_clear()
         self.pending.clear()
         self.waiting.clear()
         self.retry_on_release = False
+        self._navigator_retry_relevance = None
         self.exact_failures.clear()
         if clear_retained:
             self.retained.clear()

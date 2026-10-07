@@ -13,6 +13,7 @@ from comic_editor.ui.preview import ChapterPreview
 class PreviewCanvas(QWidget):
     documentChanged = Signal(object)
     visualChanged = Signal(object)
+    derivedResultReady = Signal()
     hierarchyChanged = Signal()
     cameraChanged = Signal()
     interactionFinished = Signal()
@@ -93,6 +94,8 @@ def test_paint_does_not_render_dirty_chapter_and_idle_timer_catches_up(navigator
     ("_active_gradient_control", ("point", "end")),
     ("_text_editing", True), ("_text_dragging", True),
     ("_free_text_drag", {"mode": "handle"}), ("_text_placement", {"new": True}),
+    ("_modifier_parameter_drag_id", "keyboard-parameter"),
+    ("_overlay_color_preview", {"color": "#FF123456"}),
 ])
 def test_held_gesture_defers_even_without_further_packets(navigator, field, value):
     canvas, preview = navigator
@@ -113,6 +116,18 @@ def test_wheel_zoom_waits_for_settle(navigator):
     preview._refresh_cache()
     assert not canvas.calls
     canvas._wheel_zoom_timer.stop()
+    preview._refresh_cache()
+    assert canvas.calls == [None]
+
+
+def test_all_canvas_live_previews_defer_navigator_work_without_mouse_contact(navigator):
+    canvas, preview = navigator
+    canvas._projection_has_live_preview = lambda: True
+    preview._refresh_cache()
+    assert not canvas.calls and preview._dirty_full
+    canvas._projection_has_live_preview = lambda: False
+    canvas.interactionFinished.emit()
+    assert not canvas.calls
     preview._refresh_cache()
     assert canvas.calls == [None]
 

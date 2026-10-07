@@ -304,18 +304,24 @@ def test_changed_view_configuration_has_no_compatible_fallback(scene):
     frame(canvas)
     assert canvas._projection_can_defer_effects()
     canvas.chapter.background = "#ff555555"
-    assert not canvas._projection_can_defer_effects()
+    assert canvas._projection_can_defer_effects()
+    assert canvas._projection_completed_view is None
 
 
-def test_committed_edit_does_not_wait_for_background_publication(scene):
+def test_committed_edit_can_defer_without_relabelling_previous_pixels(scene):
     canvas, _, _ = scene
     frame(canvas)
+    completed = canvas._projection_completed_view
     assert canvas._projection_can_defer_effects()
     canvas._invalidate_scene_cache()
     assert not canvas._drawing
-    assert not canvas._projection_can_defer_effects()
+    assert canvas._projection_can_defer_effects()
+    assert canvas._projection_completed_view is completed
+    assert canvas._projection_presented_revision == completed[2]
+    assert completed[2] != canvas._document_projection.revision
     frame(canvas)
     assert canvas._projection_can_defer_effects()
+    assert canvas._projection_presented_revision == canvas._document_projection.revision
 
 
 def test_retained_fallback_is_bounded_and_configuration_specific(scene):

@@ -22,18 +22,20 @@ class ProjectionFailed(RenderFailed):
 
 def projection_deferred(canvas):
     """Opt in only ordinary interactive, exact document captures."""
+    statistics = bool(getattr(canvas, "_posterize_statistics_capture", False)
+                      and getattr(canvas, "_effect_preview_channel", "canvas") == "posterize-statistics")
     return bool(getattr(canvas, "_projection_exact", False)
                 and getattr(canvas, "_projection_defer_effects", False)
                 and canvas._interactive_render
                 and not canvas._render_base_alpha
                 and canvas._rendering_mask_contributor <= 0
                 and not getattr(canvas, "_rendering_halftone_source", False)
-                and not getattr(canvas, "_render_modifier_sources", ())
+                and (statistics or not getattr(canvas, "_render_modifier_sources", ()))
                 and not getattr(canvas, "_render_cage_source", False)
                 and getattr(canvas, "_tiling_capture_geometry", None) is None
-                and not getattr(canvas, "_rendering_compound_references", False)
-                and not getattr(canvas, "_rendering_outward_gradient", False)
-                and getattr(canvas, "_effect_preview_channel", "canvas") in {"canvas", "overflow"})
+                and (statistics or not getattr(canvas, "_rendering_compound_references", False))
+                and (statistics or not getattr(canvas, "_rendering_outward_gradient", False))
+                and (statistics or getattr(canvas, "_effect_preview_channel", "canvas") in {"canvas", "overflow"}))
 
 
 def projection_result_or_pending(canvas, scope, key):

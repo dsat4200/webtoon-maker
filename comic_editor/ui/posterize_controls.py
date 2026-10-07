@@ -3,8 +3,9 @@ from __future__ import annotations
 
 import copy
 import math
+from contextlib import contextmanager
 
-from PySide6.QtCore import QPointF, QRectF, QSize, Qt, Signal, QTimer
+from PySide6.QtCore import QObject, QPointF, QRectF, QSize, Qt, Signal, QTimer
 from PySide6.QtGui import QColor, QImage, QPainter, QPen, QTransform
 from PySide6.QtWidgets import (
     QCheckBox, QHBoxLayout, QLabel, QPushButton, QSizePolicy, QSlider,
@@ -19,6 +20,35 @@ from comic_editor.core.posterize import HueStatistics, ValueStatistics, grayscal
 from comic_editor.ui.modifier_rendering import _qimage_premultiplied, _straight
 
 
+@contextmanager
+def _statistics_capture(canvas, deferred):
+    """Keep the established full native source capture, optionally yielding effects."""
+    values = {
+        "_interactive_render": bool(deferred),
+        "_rendering_compound_references": True,
+        "_posterize_statistics_capture": True,
+        "_effect_preview_channel": "posterize-statistics",
+    }
+    if deferred:
+        values.update(_projection_exact=True, _projection_defer_effects=True,
+                      _effect_region_requests=False, _effect_viewport_world=None,
+                      _bounded_effect_preview=False, _bounded_live_effect_preview=False)
+    missing = object()
+    previous = {name: getattr(canvas, name, missing) for name in values}
+    from comic_editor.ui.render_signatures import signature_scope
+    try:
+        for name, value in values.items():
+            setattr(canvas, name, value)
+        with signature_scope(canvas):
+            yield
+    finally:
+        for name, value in previous.items():
+            if value is missing:
+                delattr(canvas, name)
+            else:
+                setattr(canvas, name, value)
+
+
 class PosterizeSampler:
     def __init__(self, value_mode=False):
         self.statistics_type = ValueStatistics if value_mode else HueStatistics
@@ -27,9 +57,9 @@ class PosterizeSampler:
         self._samples = []
         self.statistics = self.statistics_type()
 
-    def sample(self, canvas, targets, before_id=None, simplify=None):
-        """Sample isolated artwork just before this stage, never its own output."""
+    def _describe(self, canvas, targets, before_id=None, simplify=None):
         from comic_editor.ui.baking import visual_bounds
+        from comic_editor.ui.render_signatures import signature_scope
         chapter = canvas.chapter
         if simplify is None and before_id:
             simplify = chapter.modifiers.get(before_id)
@@ -42,20 +72,37 @@ class PosterizeSampler:
                 continue
             original = target.modifier_ids
             prefix = original[:original.index(before_id)] if before_id in original else original[:]
-            try:
-                target.modifier_ids = prefix
-                signature = (canvas._modifier_layer_signature(identifier) if kind == "layer"
-                             else canvas._modifier_object_signature(target))
-                bounds = visual_bounds(canvas, kind, identifier)
-                parent = target.parent_id if kind == "layer" else target.parent_layer_id
-                mapping = canvas.layer_world_transform(parent) if parent else QTransform()
-                key.append((kind, identifier, signature, canvas._rect_signature(bounds),
-                            tuple(getattr(mapping, f"m{i}{j}")() for i in range(1, 4) for j in range(1, 4))))
-                sources.append((kind, target, prefix, bounds, mapping))
-            finally:
-                target.modifier_ids = original
-        source_key = (id(chapter), tuple(key))
-        key = (source_key, settings_key)
+            # A caller can already be inside a scene capture memo. Each target
+            # temporarily presents a different prefix model, so it needs its
+            # own memo; after restoring, discard the outer memo's stale tuples.
+            with signature_scope(canvas):
+                try:
+                    target.modifier_ids = prefix
+                    signature = (canvas._modifier_layer_signature(identifier) if kind == "layer"
+                                 else canvas._modifier_object_signature(target))
+                    bounds = visual_bounds(canvas, kind, identifier)
+                    parent = target.parent_id if kind == "layer" else target.parent_layer_id
+                    mapping = canvas.layer_world_transform(parent) if parent else QTransform()
+                    key.append((kind, identifier, signature, canvas._rect_signature(bounds),
+                                tuple(getattr(mapping, f"m{i}{j}")() for i in range(1, 4) for j in range(1, 4))))
+                    sources.append((kind, target, prefix, bounds, mapping))
+                finally:
+                    target.modifier_ids = original
+        source_key = (id(chapter), id(canvas.tiles), id(canvas.images),
+                      getattr(canvas, "_history_generation", 0), chapter.pixel_contract, tuple(key))
+        return (source_key, settings_key), sources, simplify
+
+    def context_key(self, canvas, targets, before_id=None, simplify=None):
+        return self._describe(canvas, targets, before_id, simplify)[0]
+
+    def sample(self, canvas, targets, before_id=None, simplify=None, *, defer_effects=False):
+        """Sample just before this stage; deferred effects use the same exact kernels.
+
+        A pending capture never changes the retained samples/statistics. The
+        default remains the synchronous oracle for baking and pixel comparisons.
+        """
+        key, sources, simplify = self._describe(canvas, targets, before_id, simplify)
+        source_key = key[0]
         if key == self._key:
             return self.statistics
         samples = self._samples if source_key == self._source_key else []
@@ -80,22 +127,21 @@ class PosterizeSampler:
                         canvas._rendering_outward_gradient)
             try:
                 target.modifier_ids, target.visible, target.mask_only = prefix, True, False
-                canvas._interactive_render = False
-                canvas._rendering_compound_references = True
                 canvas._rendering_outward_gradient = bool(
                     kind == "object" and isinstance(target, ColorFillGradientObject)
                     and canvas._is_outward_gradient(target))
-                if kind == "layer":
-                    canvas._render_layer(painter, target, 1., bounds)
-                else:
-                    if (isinstance(target, ColorFillGradientObject)
-                            and not canvas._rendering_outward_gradient
-                            and not target.ignore_parent_mask):
-                        painter.setClipPath(canvas.layer_effective_path(target.parent_layer_id),
-                                            Qt.IntersectClip)
-                    from comic_editor.ui.object_blending import suspend_object_blend
-                    with suspend_object_blend(canvas, target.object_id):
-                        canvas._render_object(painter, target, 1., inverse.mapRect(bounds))
+                with _statistics_capture(canvas, defer_effects):
+                    if kind == "layer":
+                        canvas._render_layer(painter, target, 1., bounds)
+                    else:
+                        if (isinstance(target, ColorFillGradientObject)
+                                and not canvas._rendering_outward_gradient
+                                and not target.ignore_parent_mask):
+                            painter.setClipPath(canvas.layer_effective_path(target.parent_layer_id),
+                                                Qt.IntersectClip)
+                        from comic_editor.ui.object_blending import suspend_object_blend
+                        with suspend_object_blend(canvas, target.object_id):
+                            canvas._render_object(painter, target, 1., inverse.mapRect(bounds))
             finally:
                 (target.modifier_ids, target.visible, target.mask_only,
                  canvas._interactive_render, canvas._rendering_compound_references,
@@ -115,6 +161,115 @@ class PosterizeSampler:
             self._source_key, self._samples = None, []
         self._key, self.statistics = key, statistics
         return statistics
+
+
+class PosterizeSampleRequest(QObject):
+    """Retry an isolated exact capture only after its detached effects can advance."""
+
+    finished = Signal(object)
+    failed = Signal(str)
+    cancelled = Signal()
+
+    def __init__(self, canvas, targets, *, before_id=None, sampler=None, parent=None):
+        super().__init__(parent)
+        self.canvas, self.targets, self.before_id = canvas, tuple(targets), before_id
+        self.sampler = sampler or PosterizeSampler()
+        self.active, self._sampling, self._pending = True, False, None
+        self._context = self._current_context()
+        self._timer = QTimer(self)
+        self._timer.setSingleShot(True)
+        self._timer.setInterval(50)
+        self._timer.timeout.connect(self._retry)
+        canvas.visualChanged.connect(self._ready)
+        canvas.derivedResultReady.connect(self._ready)
+        canvas.interactionFinished.connect(self._ready)
+        for signal in (canvas.documentChanged, canvas.chapterReplaced,
+                       canvas.selectionChanged, canvas.selectionSetChanged):
+            signal.connect(self.cancel)
+
+    def _current_context(self):
+        canvas = self.canvas
+        if canvas.chapter is None:
+            return None
+        return (tuple(canvas.selected_entities), canvas._document_projection.revision,
+                self.sampler.context_key(canvas, self.targets, self.before_id))
+
+    def _live(self):
+        canvas = self.canvas
+        return bool(canvas._drawing or getattr(canvas, '_pen_contact_active', False)
+                    or canvas._projection_has_live_preview())
+
+    def _disconnect(self):
+        self._timer.stop()
+        for signal, slot in ((self.canvas.visualChanged, self._ready),
+                             (self.canvas.derivedResultReady, self._ready),
+                             (self.canvas.interactionFinished, self._ready),
+                             (self.canvas.documentChanged, self.cancel),
+                             (self.canvas.chapterReplaced, self.cancel),
+                             (self.canvas.selectionChanged, self.cancel),
+                             (self.canvas.selectionSetChanged, self.cancel)):
+            signal.disconnect(slot)
+
+    def cancel(self, *_):
+        if self.active:
+            self.active = False
+            self._disconnect()
+            self.cancelled.emit()
+
+    def _ready(self, *_):
+        if self.active and not self._sampling:
+            self._timer.start(0)
+
+    def _retry(self):
+        if not self.active or self._sampling:
+            return
+        if self._live():
+            # Release or the next document notification will restart sampling.
+            return
+        if self._pending is not None:
+            jobs = self.canvas._effect_jobs
+            scope, key = getattr(self._pending, 'scope', None), getattr(self._pending, 'key', None)
+            queued = jobs.pending.get(scope)
+            if (jobs.has_running(scope, key) or queued is not None and queued[1] == key
+                    or jobs.waiting.get(scope) == key and jobs.has_running()):
+                self._timer.start(50)
+                return
+        # Ordinary model/history/selection signals cancel immediately. While
+        # the same immutable job is blocked, recomputing the entire prefix
+        # metadata cannot advance it. start() still validates all dependencies
+        # before capture and again before publication, including unsignaled
+        # changes that occurred while this result was computing.
+        self.start()
+
+    def start(self):
+        from comic_editor.render.service import RenderPending, RenderFailed
+        if not self.active or self._sampling:
+            return
+        if self._context != self._current_context():
+            self.cancel()
+            return
+        if self._live():
+            return
+        self._sampling = True
+        try:
+            statistics = self.sampler.sample(self.canvas, self.targets, self.before_id,
+                                             defer_effects=True)
+        except RenderPending as pending:
+            self._pending = pending
+            self._timer.start(50)
+        except (RenderFailed, ValueError, MemoryError) as error:
+            self.active = False
+            self._disconnect()
+            self.failed.emit(str(error))
+        else:
+            if self._context != self._current_context():
+                self.cancel()
+                return
+            self.active = False
+            self._disconnect()
+            self.finished.emit(statistics)
+        finally:
+            self._sampling = False
 
 
 class SimplifyColorsControls(QWidget):
@@ -383,6 +538,8 @@ class PosterizeControls(QWidget):
         self.extent = 256. if self.value_mode else 360.
         self.min_span = POSTERIZE_VALUE_MIN_SPAN if self.value_mode else POSTERIZE_MIN_SPAN
         self.sampler = PosterizeSampler(value_mode=self.value_mode)
+        self._statistics_ready = False
+        self._sample_request = None
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(4)
@@ -427,22 +584,57 @@ class PosterizeControls(QWidget):
         self._sample_timer.setInterval(180)
         self._sample_timer.timeout.connect(self.refresh_statistics)
         owner.canvas.documentChanged.connect(self.schedule_sample)
+        owner.canvas.interactionFinished.connect(self._interaction_finished)
         self.refresh_statistics()
         self.update_selection()
 
     def schedule_sample(self, *_):
-        self._sample_timer.start()
+        if self._sample_request is not None:
+            self._sample_request.cancel()
+        canvas = self.owner.canvas
+        self._statistics_ready = bool(canvas.chapter is not None
+            and self.modifier_id in canvas.chapter.modifiers
+            and self.sampler._key is not None
+            and self.sampler.context_key(canvas, self.owner.targets(), self.modifier_id) == self.sampler._key)
+        self.update_selection()
+        if self._statistics_ready:
+            self._sample_timer.stop()
+        else:
+            self.wheel.statistics = self.sampler.statistics_type()
+            self.wheel.update()
+            self._sample_timer.start()
+
+    def _interaction_finished(self):
+        if not self._statistics_ready:
+            self._sample_timer.start(0)
 
     def refresh_statistics(self):
         if self.owner.canvas.chapter is None or self.modifier_id not in self.owner.canvas.chapter.modifiers:
-            return
-        try:
-            self.wheel.statistics = self.sampler.sample(self.owner.canvas, self.owner.targets(), self.modifier_id)
-        except (ValueError, MemoryError) as error:
-            self.range_label.setText(f"Sample unavailable: {error}")
-            return
+            return False
+        if self._sample_request is not None and self._sample_request.active:
+            self._sample_request._retry()
+            return self._statistics_ready
+        if self._sample_request is not None:
+            self._sample_request.deleteLater()
+        self._statistics_ready = False
+        request = self._sample_request = PosterizeSampleRequest(
+            self.owner.canvas, self.owner.targets(), before_id=self.modifier_id,
+            sampler=self.sampler, parent=self)
+        request.finished.connect(self._statistics_finished)
+        request.failed.connect(self._statistics_failed)
+        self.update_selection()
+        request.start()
+        return self._statistics_ready
+
+    def _statistics_finished(self, statistics):
+        self.wheel.statistics = statistics
+        self._statistics_ready = True
         self.wheel.update()
         self.update_selection()
+
+    def _statistics_failed(self, message):
+        self.range_label.setText(f"Sample unavailable: {message}")
+        self.add_button.setEnabled(False)
 
     def update_selection(self, *_):
         index = next((i for i, item in enumerate(self.wheel.ranges) if item.range_id == self.wheel.selected_id), 0)
@@ -453,8 +645,9 @@ class PosterizeControls(QWidget):
         percent = coverage * 100. / counts.sum() if counts.sum() else 0.
         interval = (f"Value {item.start:.1f} → {min(255., item.start + span):.1f}" if self.value_mode
                     else f"{item.start:.1f}° → {(item.start + span) % 360.:.1f}°")
-        self.range_label.setText(f"{interval}\n{percent:.1f}% of visible color")
-        self.add_button.setEnabled(len(self.wheel.ranges) < POSTERIZE_MAX_COLORS and span >= 2. * self.min_span)
+        detail = f"{percent:.1f}% of visible color" if self._statistics_ready else "Preparing colors…"
+        self.range_label.setText(f"{interval}\n{detail}")
+        self.add_button.setEnabled(self._statistics_ready and len(self.wheel.ranges) < POSTERIZE_MAX_COLORS and span >= 2. * self.min_span)
         self.remove_button.setEnabled(len(self.wheel.ranges) > 1)
 
     def commit(self, ranges, selected_id):
@@ -465,7 +658,8 @@ class PosterizeControls(QWidget):
     def add_range(self):
         if not self.add_button.isEnabled():
             return
-        self.refresh_statistics()
+        if not self.refresh_statistics():
+            return
         ranges = copy.deepcopy(self.wheel.ranges)
         index = next(i for i, item in enumerate(ranges) if item.range_id == self.wheel.selected_id)
         span = self.wheel.span(index) / 2.

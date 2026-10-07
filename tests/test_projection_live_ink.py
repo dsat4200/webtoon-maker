@@ -80,6 +80,9 @@ def test_prediction_reuses_both_phases_without_legacy_or_effect_work(scene, monk
     canvas, _, top = scene
     canvas.chapter.add_modifier(OutlineModifier(thickness=5), [("object", top.object_id)])
     canvas._predictive = (QPointF(80, 240), QPointF(160, 240), 24, QColor("green"))
+    # Establish both exact hierarchy phases before checking warm prediction.
+    # A widget's first cold paint may yield at its presentation deadline.
+    render(canvas)
     canvas.grab()
     calls, requests, _ = watch_effect_work(canvas, monkeypatch)
     def forbidden(*args, **kwargs):

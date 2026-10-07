@@ -7,6 +7,7 @@ from PySide6.QtCore import QPointF, QRectF, Qt
 from PySide6.QtGui import QColor, QImage, QPainter, QPainterPath, QPen, QTransform
 
 from comic_editor.core.commands import CallbackCommand
+from comic_editor.render.pixels import pixel_scope, export_image
 
 
 class ViewFeatures:
@@ -29,16 +30,21 @@ class ViewFeatures:
         source = self.export_source_rect()
         if source.isEmpty():
             raise ValueError("There is no document to export")
-        image = QImage(int(source.width()), int(source.height()),
-                       QImage.Format.Format_ARGB32_Premultiplied)
+        contract = self.chapter.pixel_contract
+        image = QImage(int(source.width()), int(source.height()), contract.image_format)
         if image.isNull():
             raise MemoryError("Could not allocate the export image")
-        with self.without_solo():
-            if self.chapter.export_rect_enabled and self.chapter.export_rect is not None:
-                self.render_preview(image, source_rect=source)
-            else:
-                self.render_preview(image)
-        return image
+        previous = self._interactive_render
+        try:
+            self._interactive_render = False
+            with self.without_solo(), pixel_scope(contract):
+                if self.chapter.export_rect_enabled and self.chapter.export_rect is not None:
+                    self.render_preview(image, source_rect=source)
+                else:
+                    self.render_preview(image)
+        finally:
+            self._interactive_render = previous
+        return export_image(image, contract)
 
     def _view_settings_changed(self) -> None:
         if self.export_rect_editing and self.chapter.export_rect is None:

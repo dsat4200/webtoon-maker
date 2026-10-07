@@ -67,6 +67,46 @@ def test_straight_source_alpha_is_multiplied_after_entering_float_storage(format
     np.testing.assert_array_equal(np.frombuffer(source.constBits(), dtype=dtype)[:4], channels)
 
 
+@pytest.mark.parametrize('format,dtype,maximum', [
+    (QImage.Format_RGBA8888, np.uint8, 255),
+    (QImage.Format_RGBA64, np.uint16, 65535),
+])
+@pytest.mark.parametrize('profile', [QColorSpace.SRgb, QColorSpace.SRgbLinear, QColorSpace.DisplayP3])
+@pytest.mark.parametrize('precision', ['float16', 'float32'])
+def test_straight_native_rows_keep_coverage_profile_conversion_and_source_bytes(format, dtype, maximum, profile, precision):
+    # The float reference starts with the mathematical native samples. It
+    # therefore does not share Qt's lossy integer-to-float import conversion.
+    channels = np.array([
+        [[maximum//2, maximum//4, maximum//8, 1],
+         [maximum, 0, maximum//3, 0],
+         [0, maximum, maximum//5, maximum]],
+        [[maximum//3, maximum//5, maximum//7, 2],
+         [maximum//2, maximum//3, maximum//4, maximum//2],
+         [maximum//4, maximum//2, maximum//3, maximum//3]],
+    ], dtype=dtype)
+    source = QImage(3, 2, format)
+    rows = np.frombuffer(source.bits(), dtype).reshape(2, source.bytesPerLine()//np.dtype(dtype).itemsize)
+    rows[:, :12].reshape(2, 3, 4)[:] = channels
+    source.setColorSpace(QColorSpace(profile))
+    original, original_profile = bytes(source.constBits()), bytes(source.colorSpace().iccProfile())
+    reference = QImage(3, 2, QImage.Format_RGBA32FPx4)
+    np.frombuffer(reference.bits(), np.float32).reshape(2, 3, 4)[:] = channels.astype(np.float32)/np.float32(maximum)
+    reference.setColorSpace(source.colorSpace())
+    contract = replace(FLOAT_PIXELS, precision=precision, working_space='linear_srgb')
+    expected = premultiplied_pixels(import_image(reference, contract))
+    actual = premultiplied_pixels(import_image(source, contract))
+    np.testing.assert_array_equal(actual, expected)
+    assert bytes(source.constBits()) == original
+    assert bytes(source.colorSpace().iccProfile()) == original_profile
+    # Color transforms must preserve the original coverage independently of
+    # low-alpha RGB and of transparent hidden source color.
+    alpha = channels[..., 3].astype(np.float32)/np.float32(maximum)
+    if precision == 'float16':
+        alpha = alpha.astype(np.float16).astype(np.float32)
+    np.testing.assert_array_equal(actual[..., 3], alpha)
+    np.testing.assert_array_equal(actual[0, 1], np.zeros(4, np.float32))
+
+
 def test_known_linear_profile_keeps_hdr_samples_without_a_gamma_round_trip():
     contract = replace(FLOAT_PIXELS, working_space='linear_srgb')
     values = np.array([[[1.12345, -.07321, .00071, .31739]]], np.float32)

@@ -391,3 +391,111 @@ def test_generic_zero_strength_mask_retains_reference_identity_mode(scene):
     assert tile_output(scene, image(), QRectF(0, 0, 530, 403), [modifier], QTransform(),
         required=QRectF(0, 0, 256, 256), request_scope=("object", "zero", "canvas"),
         source_identity=("pixels",), float_pipeline=True) is None
+
+
+def test_spatial_stage_preflight_survives_source_eviction_and_pending_retries(scene, monkeypatch):
+    from comic_editor.core.models import DistortModifier
+    from comic_editor.ui import distort_rendering
+    from comic_editor.ui.async_projection import ProjectionPending
+    warp = DistortModifier(modifier_type='distort_twirl', frame=(0, 0, 300, 280),
+                           center=(150, 140), radius=90, parameters={'angle': 85})
+    warp.validate()
+    modifiers = [warp, OutlineModifier(thickness=3)]
+    register(scene, modifiers)
+    source, bounds = image(300, 280), QRectF(0, 0, 300, 280)
+    full, frame = render_stages(scene, source, bounds, modifiers, QTransform(), tile_evaluation=False)
+    scene._modifier_render_cache.clear()
+    scene._modifier_render_cache_bytes = 0
+    enable(scene)
+    scene._projection_defer_effects = True
+    args = dict(required=QRectF(10, 10, 100, 100), source_identity=('preflight-source',),
+                request_scope=('object', 'preflight', 'canvas'))
+    started, release = Event(), Event()
+    original = distort_rendering.render_distort
+    def blocked(*a, **kw):
+        started.set()
+        assert release.wait(5)
+        return original(*a, **kw)
+    monkeypatch.setattr(distort_rendering, 'render_distort', blocked)
+    captures = []
+    def capture(rect):
+        captures.append(QRectF(rect))
+        return crop(source, bounds, rect)[0]
+    try:
+        with pytest.raises(ProjectionPending):
+            tile_output(scene, None, bounds, modifiers, QTransform(), capture=capture, **args)
+        assert started.wait(2)
+        submitted = scene._effect_jobs.submitted
+        assert submitted > 0
+        scene._modifier_render_cache.clear()
+        scene._modifier_render_cache_bytes = 0
+        for scope in tuple(scene._effect_jobs.retained):
+            if scope[0] in {'tile-graph', 'pipeline'}:
+                scene._effect_jobs.retained_remove(scope)
+        before = len(captures)
+        with pytest.raises(ProjectionPending):
+            tile_output(scene, None, bounds, modifiers, QTransform(), capture=capture, **args)
+        assert len(captures) == before and scene._effect_jobs.submitted == submitted
+    finally:
+        release.set()
+    # Completed worker scopes can be adopted before their graph tile/pipeline
+    # checkpoint exists. Neither polling nor resumption needs the raw source.
+    for job in scene._effect_jobs.running_jobs:
+        job[3].result(timeout=5)
+    scene._effect_jobs.poll()
+    def forbidden(_rect):
+        pytest.fail('completed warp output recaptured evicted source')
+    for _ in range(12):
+        try:
+            result = tile_output(scene, None, bounds, modifiers, QTransform(), capture=forbidden, **args)
+            break
+        except ProjectionPending:
+            for job in scene._effect_jobs.running_jobs:
+                job[3].result(timeout=5)
+            scene._effect_jobs.poll()
+    else:
+        pytest.fail('spatial stages did not converge')
+    assert result == crop(full, frame, args['required'])
+
+
+def test_single_stage_preflight_keeps_mask_dependency_validation(scene):
+    from comic_editor.core.models import DistortModifier
+    warp = DistortModifier(modifier_type='distort_twirl', frame=(0, 0, 300, 280),
+                           center=(150, 140), radius=90, parameters={'angle': 85})
+    warp.validate()
+    mask = ToneMask()
+    scene.chapter.masks[mask.mask_id] = mask
+    warp.parameter_masks['intensity'] = ParameterMaskBinding(mask.mask_id, 20, 90)
+    register(scene, [warp])
+    enable(scene)
+    source, bounds = image(300, 280), QRectF(0, 0, 300, 280)
+    args = dict(required=QRectF(10, 10, 100, 100), source_key=('masked-preflight-source',),
+                request_scope=('object', 'masked-preflight', 'canvas'), tile_evaluation=False)
+    expected = render_stages(scene, source, bounds, [warp], QTransform(), **args)
+    for scope in tuple(scene._effect_jobs.retained):
+        if scope[0] == 'pipeline':
+            scene._effect_jobs.retained_remove(scope)
+    assert cached_stage_output(scene, bounds, [warp], QTransform(), **args) == expected
+    mask.revision += 1
+    assert cached_stage_output(scene, bounds, [warp], QTransform(), **args) is None
+
+
+def test_shared_stage_key_preserves_unrounded_mapped_sampling_origin(scene):
+    from comic_editor.ui.effect_pipeline import _stage_plan, _stage_key
+    modifier = BrightnessContrastModifier(brightness=12)
+    register(scene, [modifier])
+    mapping = QTransform().translate(.00321, .00987).rotate(19).scale(100000, 300000)
+    source_key, keys, plans = ('fractional-source',), [], []
+    for x in (1e-6, 2e-6):
+        bounds = QRectF(x, 3e-6, 300, 280)
+        plan = _stage_plan(scene, bounds, [modifier], mapping, source_key, False, None)
+        expected_upstream = ('stage-input', source_key, (), plan.placement, ())
+        expected = ('stage', expected_upstream, scene._rect_signature(bounds),
+            scene._rect_signature(plan.targets[0]), plan.signatures[0][0], plan.signatures[0][1],
+            tuple(mapping.map(bounds.topLeft()).toTuple()), False, plan.signatures[0][2], plan.transform_signature)
+        key = _stage_key(scene, plan, source_key, 0, mapping, False)
+        assert key == expected
+        keys.append(key)
+        plans.append(plan)
+    assert plans[0].geometry == plans[1].geometry
+    assert keys[0] != keys[1]

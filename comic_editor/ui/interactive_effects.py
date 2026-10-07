@@ -43,7 +43,7 @@ def outline_capture_bounds(canvas, painter, bounds, visible, modifiers):
     return bounds.intersected(QRectF(left, top, right-left, bottom-top))
 
 
-def _draft(image, modifiers, origin, fields, mapping, nearest):
+def _draft(image, modifiers, origin, fields, mapping, nearest, *, outline_distance_cache=None):
     scale = min(1., 256 / max(image.width(), image.height()),
                 (32768 / (image.width() * image.height())) ** .5)
     width, height = max(1, round(image.width() * scale)), max(1, round(image.height() * scale))
@@ -87,7 +87,8 @@ def _draft(image, modifiers, origin, fields, mapping, nearest):
              if np.shape(value) == (image.height(), image.width())}
     transform = mapping * QTransform.fromScale(scale, scale) if mapping is not None else None
     result = apply_modifier_stack(small, effects, tuple(value * scale for value in origin),
-                                  masks, world_to_image=transform, nearest=nearest)
+                                  masks, world_to_image=transform, nearest=nearest,
+                                  outline_distance_cache=outline_distance_cache)
     return result
 
 
@@ -157,7 +158,10 @@ def render_interactive_stack(canvas, image, modifiers, world_origin, mask_fields
         draft_key = ("interactive-draft", cache_key, int(image.cacheKey()))
         result = canvas._modifier_cache_get(draft_key)
         if result is None:
-            result = _draft(image, modifiers, world_origin, fields, world_to_image, nearest)
+            # Reuse the existing bounded cache of current alpha silhouettes;
+            # compact drafts keep their own pixels and never become exact.
+            result = _draft(image, modifiers, world_origin, fields, world_to_image, nearest,
+                           outline_distance_cache=canvas._outline_distance_cache)
             canvas._modifier_cache_put(draft_key, result)
         canvas._effect_provisional_revision = getattr(canvas, "_effect_provisional_revision", 0) + 1
         return result.scaled(image.size(), Qt.IgnoreAspectRatio, Qt.FastTransformation), True

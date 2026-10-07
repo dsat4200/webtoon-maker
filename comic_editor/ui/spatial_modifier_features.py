@@ -32,9 +32,10 @@ class SpatialModifierFeatures:
             bounds = bounds.united(selection[3].map(selection[2]).boundingRect())
         bounds = aligned(bounds)
         modifiers = self._active_modifier_instances(obj.modifier_ids, suppress_outline=self._suppress_outline_for_mask)
-        from comic_editor.ui.thumbnail_effects import capture_scale, scaled_modifiers
+        from comic_editor.ui.thumbnail_effects import capture_scale, scaled_modifiers, live_effect_draft, compact_effects_supported
         thumbnail_scale = capture_scale(self, bounds, modifiers)
         navigator = self._interactive_render and getattr(self, "_effect_preview_channel", "canvas") == "navigator"
+        live_draft = live_effect_draft(self) and compact_effects_supported(modifiers)
         stage_mapping = mapping
         capture_bounds = bounds
         if thumbnail_scale < 1.:
@@ -46,6 +47,10 @@ class SpatialModifierFeatures:
         key = ("radial-raster-source", obj.object_id, signature[0], signature[3], signature[4], self._rect_signature(bounds))
         if navigator:
             key = ("navigator-source", thumbnail_scale, key)
+        elif live_draft:
+            key = ("live-effect-draft-source", thumbnail_scale, key)
+        from comic_editor.ui.scene_render_backend import source_capture_key
+        key = source_capture_key(self, key)
         def capture_region(region):
             image = empty_image(region)
             source = QPainter(image)
@@ -78,16 +83,17 @@ class SpatialModifierFeatures:
         from comic_editor.ui.effect_pipeline import _stage_plan
         move_key = None
         move_revision = getattr(self, "_effect_provisional_revision", 0)
-        if thumbnail_scale == 1. and not navigator:
+        if thumbnail_scale == 1. and not navigator and not live_draft:
             move_plan = _stage_plan(self, bounds, modifiers, stage_mapping, key, True, required)
             move_key = translation_cache.output_key(self, obj, bounds, stage_mapping, modifiers,
                 tile_space=True, geometry=move_plan.geometry)
+            move_key = source_capture_key(self, move_key)
         reused = translation_cache.get(self, move_key)
         from comic_editor.ui.tile_effects import tile_output
         tiled = ((reused, QRectF(move_plan.targets[-1] if move_plan.targets else bounds))
             if reused is not None else tile_output(self, None, bounds, modifiers, stage_mapping, nearest=True,
             required=required, source_identity=key, request_scope=request_scope, capture=capture_region)
-            if thumbnail_scale == 1. and not navigator else None)
+            if thumbnail_scale == 1. and not navigator and not live_draft else None)
         if tiled is not None:
             image, bounds = tiled
         else:
@@ -96,7 +102,7 @@ class SpatialModifierFeatures:
                 image = capture_region(bounds)
                 self._modifier_source_cache_put(key, image)
             image, bounds = render_stages(self, image, bounds, modifiers, stage_mapping, nearest=True,
-                required=required, source_key=key, provisional=navigator, request_scope=request_scope)
+                required=required, source_key=key, provisional=navigator or live_draft, request_scope=request_scope)
         if thumbnail_scale < 1.:
             bounds = QTransform.fromScale(1/thumbnail_scale, 1/thumbnail_scale).mapRect(bounds)
         if obj.opacity_mask is not None and reused is None:
@@ -104,7 +110,7 @@ class SpatialModifierFeatures:
             field = self.render_tone_mask_field(binding.mask_id, image.width(), image.height(),
                 self._world_to_image_transform(mapping, bounds, image.width(), image.height()), mapping.mapRect(bounds))
             image = apply_opacity_mask(image, field, binding.black_value, binding.white_value)
-        if not navigator:
+        if not navigator and not live_draft:
             translation_cache.put(self, move_key, image, move_revision)
         opacity = parent_opacity if self._render_base_alpha or obj.opacity_locked else parent_opacity*obj.opacity
         if obj.object_id == self._live_underlay_object_id:

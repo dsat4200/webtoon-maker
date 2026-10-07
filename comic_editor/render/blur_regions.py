@@ -58,6 +58,24 @@ def _coefficients(source, destination, start, count):
     return np.minimum(indexes, source - 1), np.floor(weights * (1 << 22) + .5).astype(np.int64)
 
 
+def _coefficient_extent(source, destination, start, count):
+    """The same index envelope without allocating unused bilinear weights.
+
+    The coefficient matrix pads each row to the widest support. Preserve its
+    extra zero-weight indexes too: detached capture must fetch precisely the
+    same source rectangles as the sampling kernel, including odd dimensions.
+    """
+    if source == destination:
+        return start, start + count
+    scale = source / destination
+    support = max(1., scale)
+    centers = (np.arange(start, start + count) + .5) * scale
+    low = np.maximum(0, (centers - support + .5).astype(np.int64))
+    high = np.minimum(source, (centers + support + .5).astype(np.int64))
+    width = int(np.max(high - low))
+    return int(low[0]), min(source, int(low[-1]) + width)
+
+
 def resize_region(fetch, source_size, destination_size, region, algorithm="normal"):
     x, y, width, height = region
     if source_size == destination_size:
@@ -120,9 +138,9 @@ class RegionalBlur:
                 require_level(index, rect)
                 return
             x, y, width, height = rect
-            ix, _ = _coefficients(source[0], destination[0], x, width)
-            iy, _ = _coefficients(source[1], destination[1], y, height)
-            needed = (int(ix.min()), int(iy.min()), int(ix.max()-ix.min())+1, int(iy.max()-iy.min())+1)
+            left, right = _coefficient_extent(source[0], destination[0], x, width)
+            top, bottom = _coefficient_extent(source[1], destination[1], y, height)
+            needed = (left, top, right-left, bottom-top)
             require_level(index, needed)
         radii = np.clip(np.asarray(strength, np.float32), 0., 100.)
         lower = np.clip(np.searchsorted(RADII, radii, side="right")-1, 0, len(RADII)-2)

@@ -7,8 +7,9 @@ from pathlib import Path
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 import pytest
-from PySide6.QtCore import QCoreApplication, QEvent
+from PySide6.QtCore import QCoreApplication, QEvent, QRectF
 from PySide6.QtGui import QFontDatabase
+from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication
 
 from comic_editor.core import settings
@@ -26,6 +27,26 @@ def isolated_app_settings(tmp_path_factory):
 @pytest.fixture(scope="session")
 def qapp():
     return QApplication.instance() or QApplication([])
+
+
+@pytest.fixture
+def await_completed_projection(qapp):
+    """Establish an exact resting baseline before testing immediate UI edits."""
+    def wait(canvas):
+        for _ in range(200):
+            qapp.processEvents()
+            completed = getattr(canvas, "_projection_completed_view", None)
+            if (completed is not None
+                    and completed[0] == canvas._projection_configuration()
+                    and completed[2] == canvas._document_projection.revision
+                    and not canvas._projection_frame_pending
+                    and canvas._completed_projection_covers(
+                        completed, canvas.visible_document_rect().intersected(
+                            QRectF(0, 0, canvas.chapter.width, canvas.chapter.height)))):
+                return
+            QTest.qWait(10)
+        pytest.fail("The initial artwork did not publish a complete current view")
+    return wait
 
 
 @pytest.fixture

@@ -5,6 +5,8 @@ from PySide6.QtCore import QPointF, QRect, QRectF, Qt, QTimer, Signal
 from PySide6.QtGui import QColor, QImage, QMouseEvent, QPainter, QPen, QPolygonF
 from PySide6.QtWidgets import QApplication, QWidget
 
+from comic_editor.ui.async_projection import ProjectionPending
+
 
 class ChapterPreview(QWidget):
     scrollRequested = Signal(float)
@@ -25,6 +27,9 @@ class ChapterPreview(QWidget):
         self._pending_region = QRect()
         self._pending_row = 0
         self._pending_full = False
+        self._pending_context = None
+        self._pending_derived_refresh = False
+        self._pending_source_dependency = None
         self._refresh_timer = QTimer(self)
         self._refresh_timer.setSingleShot(True)
         self._refresh_timer.timeout.connect(self._refresh_cache)
@@ -33,6 +38,7 @@ class ChapterPreview(QWidget):
         self.setCursor(Qt.PointingHandCursor)
         canvas.documentChanged.connect(self.invalidate)
         canvas.visualChanged.connect(self.invalidate)
+        canvas.derivedResultReady.connect(self._derived_ready)
         canvas.hierarchyChanged.connect(self.invalidate_all)
         canvas.cameraChanged.connect(self.update)
         canvas.interactionFinished.connect(self._schedule_refresh)
@@ -70,11 +76,70 @@ class ChapterPreview(QWidget):
         if self.isVisible() and (self._dirty_full or self._dirty_bands or not self._pending_image.isNull()):
             self._refresh_timer.start(self.REFRESH_DELAY_MS)
 
+    def _build_context(self):
+        """Use the canvas' existing document/view contracts between bands."""
+        chapter = self.canvas.chapter
+        if chapter is None:
+            return None
+        configuration = getattr(self.canvas, '_projection_configuration', None)
+        projection = getattr(self.canvas, '_document_projection', None)
+        history = getattr(self.canvas, 'command_stack', None)
+        contract = getattr(chapter, 'pixel_contract', None)
+        return (id(chapter), id(getattr(self.canvas, 'tiles', None)),
+                id(getattr(self.canvas, 'images', None)),
+                chapter.width, chapter.height, getattr(chapter, 'background', None),
+                getattr(contract, 'signature', None),
+                getattr(projection, 'revision', None),
+                getattr(self.canvas, '_history_generation', None),
+                getattr(history, 'revision', None),
+                configuration() if configuration is not None else (),
+                getattr(getattr(self.canvas, "images", None), "_decode_generation", None))
+
+    def _derived_ready(self) -> None:
+        # Channel-local native completions cannot improve this separate
+        # transient Navigator capture. Global readiness still reaches
+        # Posterize/Canvas; source handoffs and unknown signals refresh.
+        jobs = getattr(self.canvas, "_effect_jobs", None)
+        if getattr(jobs, "_navigator_derived_relevance", None) is False:
+            return
+        # Worker completion may improve any band, but cannot change the model.
+        # Finish this same-model provisional frame, then refresh once more.
+        # Never debounce its active continuation timer with another completion.
+        if not self._pending_image.isNull():
+            if self._pending_context != self._build_context():
+                self.invalidate_all()
+                return
+            dependency = self._pending_source_dependency
+            if (dependency is not None and (
+                    getattr(jobs, "_navigator_derived_retry", False) is True
+                    or getattr(jobs, "_navigator_derived_dependency", None) == dependency)):
+                from comic_editor.ui.source_images import navigator_source_handoff_current
+                if navigator_source_handoff_current(self.canvas, *dependency):
+                    # This band has never published or advanced past its
+                    # original source. Completing that exact native decode
+                    # or capacity-only release resumes its existing waiter.
+                    # Earlier bands cannot
+                    # improve from decoding the same immutable originals.
+                    # A released worker has capacity now. Resume on the
+                    # next Qt turn instead of letting another paint claim it
+                    # during the ordinary 120 ms source wait. A still-running
+                    # or rejected source returns to that bounded wait below.
+                    if (not self._refresh_timer.isActive()
+                            or self._refresh_timer.remainingTime() > 1):
+                        self._refresh_timer.start(1)
+                    return
+            self._pending_derived_refresh = True
+        else:
+            self._dirty_full = True
+            self._dirty_bands.clear()
+        if not self._refresh_timer.isActive():
+            self._schedule_refresh()
+
     def _abandon_build(self) -> None:
         """Keep the uncommitted region dirty if content changes between bands."""
         if self._pending_image.isNull():
             return
-        self._dirty_full |= self._pending_full
+        self._dirty_full |= self._pending_full or self._pending_derived_refresh
         if not self._dirty_full:
             dirty = self._pending_region
             if self._dirty_bands:
@@ -82,12 +147,18 @@ class ChapterPreview(QWidget):
             self._dirty_bands[:] = [dirty]
         self._pending_image = QImage()
         self._pending_chapter = None
+        self._pending_context = None
+        self._pending_derived_refresh = False
+        self._pending_source_dependency = None
 
     def _interaction_active(self) -> bool:
         # Mouse buttons also cover drags in property controls outside the
         # canvas. Tablet/touch contacts and direct canvas gestures use their
         # own state, so pausing the pointer while held does not start a render.
         if QApplication.mouseButtons() != Qt.NoButton:
+            return True
+        live_preview = getattr(self.canvas, '_projection_has_live_preview', None)
+        if live_preview is not None and live_preview():
             return True
         if any(getattr(self.canvas, field, None) for field in (
             "_drawing", "_pen_contact_active", "_nav_mode", "_touch_points",
@@ -96,6 +167,7 @@ class ChapterPreview(QWidget):
             "_modifier_handle_drag", "_mask_gradient_drag", "_text_property_drag",
             "_shape_property_drag", "_active_gradient_control",
             "_text_editing", "_text_dragging", "_free_text_drag", "_text_placement",
+            "_modifier_parameter_drag_id", "_overlay_color_preview",
         )):
             return True
         wheel = getattr(self.canvas, "_wheel_zoom_timer", None)
@@ -113,9 +185,23 @@ class ChapterPreview(QWidget):
             return
         size = self.content_rect().size()
         if (not self._pending_image.isNull() and
-                (self._pending_chapter is not self.canvas.chapter or self._pending_image.size() != size)):
+                (self._pending_chapter is not self.canvas.chapter or self._pending_image.size() != size
+                 or self._pending_context != self._build_context())):
             self._abandon_build()
             self._dirty_full = True
+        if self._pending_source_dependency is not None:
+            scope, key = self._pending_source_dependency
+            jobs = getattr(self.canvas, '_effect_jobs', None)
+            queued = jobs.pending.get(scope) if jobs is not None else None
+            if jobs is not None and (jobs.has_running(scope, key)
+                    or queued is not None and queued[1] == key
+                    or jobs.waiting.get(scope) == key):
+                # Wait only on existing job metadata. Failure, cancellation or
+                # eviction must release this private wait too, even when no
+                # successful derived-ready signal can arrive.
+                self._refresh_timer.start(self.REFRESH_DELAY_MS)
+                return
+            self._pending_source_dependency = None
         if self._pending_image.isNull():
             full = (self._dirty_full or self._cache.isNull() or self._cache.size() != size
                     or self._cache_chapter is not self.canvas.chapter)
@@ -130,6 +216,8 @@ class ChapterPreview(QWidget):
                                     else self._dirty_bands[0].intersected(self._pending_image.rect()))
             self._pending_row = self._pending_region.top()
             self._pending_chapter = self.canvas.chapter
+            self._pending_context = self._build_context()
+            self._pending_derived_refresh = False
             self._dirty_full = False
             self._dirty_bands.clear()
         image = self._pending_image
@@ -138,6 +226,17 @@ class ChapterPreview(QWidget):
                           self._pending_region.bottom() - self._pending_row + 1))
         try:
             self._render_live_preview(image, None if dirty == image.rect() else dirty)
+        except ProjectionPending as dependency:
+            # The current private band is unfinished. Retry its background and
+            # pixels when the existing source worker releases a dependency;
+            # keep the committed cache, context and row unchanged meanwhile.
+            # A bounded metadata wait also resumes terminal failed/canceled
+            # jobs without changing global readiness or rerendering at1ms.
+            if image is self._pending_image:
+                self._pending_source_dependency = (dependency.scope, dependency.key)
+                if not self._refresh_timer.isActive():
+                    self._refresh_timer.start(self.REFRESH_DELAY_MS)
+            return
         except Exception:
             self._abandon_build()
             self._dirty_full = True
@@ -146,7 +245,8 @@ class ChapterPreview(QWidget):
         # this build. Never publish pixels from an older document revision.
         if image is not self._pending_image:
             return
-        if self._pending_chapter is not self.canvas.chapter:
+        if (self._pending_chapter is not self.canvas.chapter
+                or self._pending_context != self._build_context()):
             self._abandon_build()
             self._dirty_full = True
             self._schedule_refresh()
@@ -156,10 +256,19 @@ class ChapterPreview(QWidget):
             # Return to Qt between bands so queued input precedes more work.
             self._refresh_timer.start(1)
         else:
+            refresh_again = self._pending_derived_refresh
             self._cache = image
             self._cache_chapter = self._pending_chapter
             self._pending_image = QImage()
             self._pending_chapter = None
+            self._pending_context = None
+            self._pending_derived_refresh = False
+            self._pending_source_dependency = None
+            if refresh_again:
+                self._dirty_full = True
+                self._dirty_bands.clear()
+                if not self._refresh_timer.isActive():
+                    self._schedule_refresh()
             self.update()
 
     def showEvent(self, event) -> None:  # noqa: N802
@@ -242,13 +351,20 @@ class ChapterPreview(QWidget):
     def _render_live_preview(self, image, clip=None):
         previous = self.canvas._interactive_render
         channel = getattr(self.canvas, "_effect_preview_channel", "canvas")
+        missing = object()
+        source_deferred = getattr(self.canvas, '_navigator_defer_sources', missing)
         self.canvas._interactive_render = True
         self.canvas._effect_preview_channel = "navigator"
+        self.canvas._navigator_defer_sources = True
         try:
             self.canvas.render_preview(image, clip)
         finally:
             self.canvas._interactive_render = previous
             self.canvas._effect_preview_channel = channel
+            if source_deferred is missing:
+                del self.canvas._navigator_defer_sources
+            else:
+                self.canvas._navigator_defer_sources = source_deferred
 
     def mousePressEvent(self, event: QMouseEvent) -> None:  # noqa: N802
         if event.button() == Qt.LeftButton:

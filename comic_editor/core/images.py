@@ -57,8 +57,11 @@ class ImageStore:
         self._saved_sources = {}
         self._pending_saves = {}
         self.dirty: set[str] = set()
+        self._decode_generation = 0
+        self._display_decode_provenance = OrderedDict()
 
     def _forget_decoded(self, object_id):
+        self._display_decode_provenance.pop(object_id, None)
         previous = self._decoded.pop(object_id, None)
         if previous is not None:
             self.decoded_bytes -= int(previous.sizeInBytes())
@@ -73,9 +76,40 @@ class ImageStore:
         self._decoded[object_id] = image
         self.decoded_bytes += size
 
+    @staticmethod
+    def _source_decode_stamp(encoded):
+        try:
+            stat = encoded.pin.path.stat()
+            return stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns
+        except OSError:
+            return None
+
+    def _record_display_decode(self, object_id, encoded, generation, image, stamp):
+        """Trust only an actual ordinary decode with unchanged source guards."""
+        source, resident = self.source(object_id), self._decoded.get(str(object_id))
+        if (stamp is None or source is None or source._encoded is not encoded
+                or generation != self._decode_generation or resident is None
+                or resident.cacheKey() != image.cacheKey()
+                or self._source_decode_stamp(encoded) != stamp):
+            return
+        self._display_decode_provenance[str(object_id)] = (
+            id(encoded), generation, int(image.cacheKey()), stamp)
+        self._display_decode_provenance.move_to_end(str(object_id))
+        while len(self._display_decode_provenance) > 64:
+            self._display_decode_provenance.popitem(last=False)
+
+    def display_decode_provenance(self, object_id):
+        """Metadata only; identify an ordinarily acquired resident display frame."""
+        return self._display_decode_provenance.get(str(object_id))
+
     def _forget_object_decoded(self, object_id):
+        self._decode_generation += 1
         self._forget_decoded(object_id)
         self._forget_decoded(('native', object_id))
+        for key in list(self._decoded):
+            if isinstance(key, tuple) and (key[:2] == ('working', object_id)
+                    or key[:1] == ('acquired-source-preview',) and key[2] == object_id):
+                self._forget_decoded(key)
 
     @staticmethod
     def safe_filename(filename: str) -> str:
@@ -208,9 +242,34 @@ class ImageStore:
         source = self._sources.get(object_id)
         if source is None:
             return QImage()
-        image, _detected = self._decode(source.data)
+        encoded, generation = source._encoded, self._decode_generation
+        stamp = self._source_decode_stamp(encoded)
+        image, _detected = self._decode(encoded.data)
         self._cache_decoded(object_id, image)
+        self._record_display_decode(object_id, encoded, generation, image, stamp)
         return QImage(image)
+
+    def cached_image(self, object_id: str) -> QImage | None:
+        """Borrow an already decoded display frame without reading source bytes."""
+        object_id = str(object_id)
+        cached = self._decoded.get(object_id)
+        if cached is None:
+            return None
+        self._decoded.move_to_end(object_id)
+        return QImage(cached)
+
+    def adopt_decoded(self, object_id, encoded, generation, image, *, source_stamp=None):
+        """Owner-thread handoff of the unchanged decoder's immutable result."""
+        source = self.source(object_id)
+        if (generation != self._decode_generation or source is None
+                or source._encoded is not encoded or image.isNull()):
+            return False
+        if source_stamp is not None and self._source_decode_stamp(encoded) != source_stamp:
+            return False
+        self._cache_decoded(str(object_id), QImage(image))
+        if source_stamp is not None:
+            self._record_display_decode(object_id, encoded, generation, image, source_stamp)
+        return True
 
     def native_image(self, object_id: str) -> QImage:
         """Decode the immutable original without reducing precision or its ICC profile.
@@ -230,6 +289,37 @@ class ImageStore:
         image, _detected = self._decode_native(source.data)
         self._cache_decoded(key, image)
         return QImage(image)
+
+    def cached_native_image(self, object_id: str) -> QImage | None:
+        """Read a resident original frame without decoding or reducing it."""
+        key = ('native', str(object_id))
+        image = self._decoded.get(key)
+        if image is None:
+            return None
+        self._decoded.move_to_end(key)
+        return QImage(image)
+
+    def cached_working_image(self, object_id: str, representation: tuple) -> QImage | None:
+        """Read a renderer-converted frame in the existing decoded byte budget."""
+        key = ('working', str(object_id), representation)
+        image = self._decoded.get(key)
+        if image is None:
+            return None
+        self._decoded.move_to_end(key)
+        return QImage(image)
+
+    def cache_working_image(self, object_id: str, representation: tuple, image: QImage) -> None:
+        """Retain renderer-owned conversion without changing original resources."""
+        self._cache_decoded(('working', str(object_id), representation), QImage(image))
+
+    def adopt_working_image(self, object_id, encoded, generation, representation, image):
+        """Validate a source-worker handoff before retaining its working frame."""
+        source = self.source(object_id)
+        if (generation != self._decode_generation or source is None
+                or source._encoded is not encoded or image.isNull()):
+            return False
+        self.cache_working_image(object_id, representation, image)
+        return True
 
     def relabel(
         self, object_id: str, filename: str,
@@ -291,11 +381,13 @@ class ImageStore:
         }
 
     def restore(self, values: dict[str, ImageSource]) -> None:
+        self._decode_generation += 1
         self._sources = {
             object_id: item
             for object_id, item in values.items()
         }
         self._decoded.clear()
+        self._display_decode_provenance.clear()
         self.decoded_bytes = 0
         self.dirty.update(values)
 
@@ -360,6 +452,7 @@ class ImageStore:
     ) -> None:
         self._sources.clear()
         self._decoded.clear()
+        self._display_decode_provenance.clear()
         self.decoded_bytes = 0
         self._saved_sources.clear()
         self._pending_saves.clear()

@@ -1,5 +1,6 @@
 """Thumbnail work stays bounded and cannot replace exact document pixels."""
 import copy
+from dataclasses import replace
 
 import numpy as np
 import pytest
@@ -23,7 +24,10 @@ from comic_editor.render.pixels import (
 )
 
 
-@pytest.fixture(params=[LEGACY_PIXELS, FLOAT_PIXELS], ids=["rgba8", "float"])
+@pytest.fixture(params=[LEGACY_PIXELS, FLOAT_PIXELS,
+                       replace(FLOAT_PIXELS, precision='float16', working_space='linear_srgb'),
+                       replace(FLOAT_PIXELS, working_space='linear_srgb')],
+                ids=["rgba8", "float", "float16-linear", "float32-linear"])
 def spatial_precision(request):
     with pixel_scope(request.param):
         yield request.param
@@ -41,9 +45,10 @@ def canvas(qapp):
     canvas.deleteLater()
 
 
-def preview(canvas, navigator=True):
-    canvas._interactive_render = navigator
+def preview(canvas, navigator=True, *, live=False):
+    canvas._interactive_render = navigator or live
     canvas._effect_preview_channel = "navigator" if navigator else "canvas"
+    canvas._bounded_effect_preview = live
     result = QImage(300, 225, QImage.Format_ARGB32_Premultiplied)
     canvas.render_preview(result)
     return result
@@ -222,10 +227,12 @@ def test_thumbnail_scaling_copies_bindings_and_preserves_world_axes(canvas):
 
 @pytest.mark.parametrize("kind,effect", [
     (kind, effect) for kind in ("image", "raster")
-    for effect in ("twirl", "mesh", "smudge", "radial", "generic")
+    for effect in ("twirl", "mesh", "smudge", "radial", "generic", "ancestor")
 ] + [("image", "cage")])
-def test_spatial_thumbnail_bounds_mask_work_and_preserves_native_output(canvas, monkeypatch, kind, effect, spatial_precision):
+@pytest.mark.parametrize('channel', ['navigator', 'live'])
+def test_spatial_thumbnail_bounds_mask_work_and_preserves_native_output(canvas, monkeypatch, kind, effect, spatial_precision, channel):
     chapter = canvas.chapter
+    chapter.pixel_contract = spatial_precision
     parent = chapter.add_layer(chapter.root_page_ids[0], "Parent", BoundGeometry.rectangle(0, 0, 1200, 900))
     parent.fill_color, parent.border_width = None, 0
     parent.translate_x, parent.translate_y = 25, 40
@@ -252,7 +259,7 @@ def test_spatial_thumbnail_bounds_mask_work_and_preserves_native_output(canvas, 
         modifier = OutlineModifier(thickness=8)
     else:
         parameters = {"interpolation": "bilinear", "edges": "transparent"}
-        if effect == "twirl":
+        if effect in {"twirl", "ancestor"}:
             parameters["angle"] = 30
         elif effect == "mesh":
             parameters.update(rows=2, columns=2, smoothness=0)
@@ -263,7 +270,7 @@ def test_spatial_thumbnail_bounds_mask_work_and_preserves_native_output(canvas, 
                  "radius": 25, "flow": 100, "strength": 100}
                 for point in [(250, 350), (650, 350)]
             ], "pressure_settings": default_tool_settings()}])
-        modifier = DistortModifier(modifier_type="distort_" + ("mesh_warp" if effect == "mesh" else effect),
+        modifier = DistortModifier(modifier_type="distort_" + ("mesh_warp" if effect == "mesh" else 'twirl' if effect == 'ancestor' else effect),
             frame=world_frame, center=(445, 360), radius=200, parameters=parameters)
     mask = ToneMask()
     chapter.masks[mask.mask_id] = mask
@@ -274,7 +281,11 @@ def test_spatial_thumbnail_bounds_mask_work_and_preserves_native_output(canvas, 
             canvas.tiles.set_tile(mask.mask_id, (x, y), tile)
     modifier.parameter_masks["intensity"] = ParameterMaskBinding(mask.mask_id, 0, 100)
     obj.opacity_mask = ParameterMaskBinding(mask.mask_id, 0, 1)
-    chapter.add_modifier(modifier, [("object", obj.object_id)])
+    if effect == 'ancestor':
+        chapter.add_modifier(OutlineModifier(thickness=5), [('layer', parent.layer_id)])
+        chapter.add_modifier(modifier, [('object', obj.object_id)])
+    else:
+        chapter.add_modifier(modifier, [("object", obj.object_id)])
     def exact():
         canvas._interactive_render = False
         canvas._effect_preview_channel = "canvas"
@@ -293,14 +304,22 @@ def test_spatial_thumbnail_bounds_mask_work_and_preserves_native_output(canvas, 
         fields.append(width*height)
         return original(mask_id, width, height, *args, **kwargs)
     monkeypatch.setattr(canvas, "render_tone_mask_field", field)
-    result = preview(canvas)
+    parameter_fields = []
+    original_parameters = canvas._modifier_mask_fields
+    def parameters(modifiers, width, height, *args, **kwargs):
+        parameter_fields.append(width * height)
+        return original_parameters(modifiers, width, height, *args, **kwargs)
+    monkeypatch.setattr(canvas, '_modifier_mask_fields', parameters)
+    result = preview(canvas, channel == 'navigator', live=channel == 'live')
     assert not result.isNull()
     assert fields and max(fields) < 100_000
-    compact = [image for key, image in canvas._modifier_source_cache.items() if key[0] == "navigator-source"]
+    assert parameter_fields and max(parameter_fields) < 100_000
+    source_prefix = 'navigator-source' if channel == 'navigator' else 'live-effect-draft-source'
+    compact = [image for key, image in canvas._modifier_source_cache.items() if key[0] == source_prefix]
     assert compact and all(max(image.width(), image.height()) <= 258 for image in compact)
     assert chapter.to_dict() == model, "Thumbnail scaling changed source rigs or mask bindings"
     assert canvas._effect_jobs.submitted == 0
-    assert exact() == expected, "Navigator drafts contaminated native output"
+    assert exact() == expected, "Transient drafts contaminated native output"
 
 
 @pytest.mark.parametrize("kind", ["image", "raster"])

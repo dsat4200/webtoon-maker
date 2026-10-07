@@ -205,6 +205,10 @@ class RenderDependencies:
         if config:
             path = Path(config)
             color = (self.file_digest("color-config", path),) if path.is_file() else ("missing-color-config", config)
+        from comic_editor.render.source_context import source_color_context
+        source_context = source_color_context(chapter.pixel_contract, chapter.pixel_contract)
+        if source_context:
+            color = (*color, source_context)
         return (chapter.chapter_id, request.address.level, request.address.x, request.address.y,
                 request.tile_size, request.gutter, digest((scene, context, chapter.pixel_contract.signature, color)))
 
@@ -242,7 +246,8 @@ def exact_cache_allowed(canvas, key):
 
 def cache_get(canvas, kind, key):
     backing = backing_for(canvas)
-    if backing is None or not exact_cache_allowed(canvas, key):
+    if (backing is None or not getattr(backing, "can_lookup", True)
+            or not exact_cache_allowed(canvas, key)):
         return None
     return backing.lookup(kind, key, wait=not getattr(canvas, "_projection_defer_effects", False))
 

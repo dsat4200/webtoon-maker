@@ -260,9 +260,9 @@ class GpuBlur:
         return output_key
 
     def apply(self, pixels, strength, *, source_key, algorithm='normal'):
-        # The fixed-point/pass-order contract is verified against this release.
+        # The fixed-point/pass-order contract is verified against these releases.
         # A future or different Pillow resampler keeps the CPU reference path.
-        if PILLOW_VERSION != '12.2.0':
+        if PILLOW_VERSION not in ('12.2.0', '12.3.0'):
             return None
         r = self.renderer
         pixels = np.asarray(pixels)
