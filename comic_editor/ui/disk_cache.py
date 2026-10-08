@@ -358,6 +358,11 @@ class DiskCacheController(QObject):
             return False
         if semantic_color_identity(self.canvas, self.canvas.chapter.pixel_contract) == ('color-resources-pending',):
             return False
+        # Use the ordinary backing's clear epoch before a definite index miss.
+        # An empty committed index cannot satisfy any exact projection tile.
+        self.backing._sync_epoch()
+        if not self.backing.entries:
+            return False
         with self.capture():
             configuration = (*self.canvas._projection_configuration(), None)
             try:

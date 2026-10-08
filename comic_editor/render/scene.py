@@ -8,6 +8,7 @@ The evaluator never reaches back into an editor or a mutable source store.
 from __future__ import annotations
 
 from collections import OrderedDict
+from collections.abc import MutableMapping
 from contextlib import contextmanager
 from dataclasses import dataclass, fields, is_dataclass
 import copy
@@ -24,6 +25,8 @@ from comic_editor.core.images import ImageStore
 from comic_editor.core.tile_backing import DiskTileMap, EditableTile, SnapshotBacking, prefetch_pins
 from comic_editor.core.tiles import TileStore
 from comic_editor.render.scene_kernels import SceneKernels
+from comic_editor.render.image_storage_cache import QImageStorageCache
+from comic_editor.render.image_residency_pool import QImageResidencyPool
 from comic_editor.render.pixels import capture_color_environment
 from comic_editor.render.service import CaptureState, RenderQuality
 from comic_editor.render.scene_culling import SceneRenderBounds
@@ -423,13 +426,81 @@ class SceneCapture:
         return tiles, jobs, active_resources
 
 
+class _RetainedAliases(MutableMapping):
+    """Compatible scope records; every exposed image/state is independently owned."""
+    def __init__(self, images):
+        self.images = images
+
+    def __len__(self):
+        return len(self.images)
+
+    def __iter__(self):
+        return iter(self.images)
+
+    def __getitem__(self, scope):
+        image = self.images.peek(scope)
+        key, state = self.images.metadata(scope)
+        return key, image, state, int(image.sizeInBytes())
+
+    def __setitem__(self, scope, value):
+        key, image, state, _size = value
+        self.images.store(scope, image, metadata=(key, state))
+
+    def __delitem__(self, scope):
+        del self.images[scope]
+
+    def move_to_end(self, scope, last=True):
+        self.images.move_to_end(scope, last=last)
+
+    def clear(self):
+        self.images.clear()
+
+
 class InlineResults:
     """Bounded retained checkpoints for kernels already running off the GUI."""
-    def __init__(self, owner, budget=64 * 1024 * 1024, limit=512):
+    def __init__(self, owner, budget=64 * 1024 * 1024, limit=512, *, pool=None):
         self.owner = owner
+        self._pooled_images = (QImageStorageCache(budget, limit, pool=pool,
+            reject_oversized=True, metadata_copy=detached_value, allow_null=True,
+            metadata_identity=lambda value: value[0])
+            if pool is not None else None)
         self.retained, self.pending, self.waiting = OrderedDict(), {}, {}
+        if self._pooled_images is not None:
+            self.retained = _RetainedAliases(self._pooled_images)
         self.budget, self.limit, self.bytes = budget, limit, 0
         self._retained_images = {}
+
+    @property
+    def budget(self):
+        return self._pooled_images.budget if self._pooled_images is not None else self._budget
+
+    @budget.setter
+    def budget(self, value):
+        self._budget = value
+        if self._pooled_images is not None:
+            self._pooled_images.budget = value
+
+    @property
+    def bytes(self):
+        return self._pooled_images.bytes if self._pooled_images is not None else self._bytes
+
+    @bytes.setter
+    def bytes(self, value):
+        self._bytes = value
+
+    @property
+    def limit(self):
+        return self._pooled_images.limit if self._pooled_images is not None else self._limit
+
+    @limit.setter
+    def limit(self, value):
+        if value < 1:
+            raise ValueError('Invalid checkpoint record limit')
+        self._limit = value
+        if self._pooled_images is not None:
+            self._pooled_images.limit = value
+            while len(self.retained) > value:
+                self.retained_remove(next(iter(self.retained)))
 
     def retained_get(self, scope, key):
         entry = self.retained.get(scope)
@@ -445,6 +516,8 @@ class InlineResults:
             self.retained_put(scope, key, image, state)
             return QImage(image), state
         self.retained.move_to_end(scope)
+        if self._pooled_images is not None:
+            self._pooled_images.reuse(scope)
         return QImage(entry[1]), detached_value(entry[2])
 
     def retained_put(self, scope, key, image, state=None, **_kwargs):
@@ -453,6 +526,8 @@ class InlineResults:
         return self._retained_store(scope, key, image, state)
 
     def _retained_store(self, scope, key, image, state):
+        if self._pooled_images is not None:
+            return self._pooled_images.store(scope, image, metadata=(key, state))
         self.retained_remove(scope)
         image = QImage(image)
         size = int(image.sizeInBytes())
@@ -477,6 +552,9 @@ class InlineResults:
     def retained_remove(self, scope, key=None):
         entry = self.retained.get(scope)
         if entry is not None and (key is None or entry[0] == key):
+            if self._pooled_images is not None:
+                del self.retained[scope]
+                return
             self.retained.pop(scope)
             storage = int(entry[1].cacheKey())
             self._retained_images[storage][1] -= 1
@@ -486,6 +564,11 @@ class InlineResults:
     def adopt_retained(self, values):
         """Rebuild this owner's bounded ledger from actual retained QImages."""
         entries = OrderedDict(values)
+        if self._pooled_images is not None:
+            self.retained.clear()
+            for scope, (key, image, state, _size) in entries.items():
+                self._retained_store(scope, key, image, state)
+            return
         self.retained = OrderedDict()
         self._retained_images = {}
         self.bytes = 0
@@ -514,10 +597,14 @@ class EvaluatedScene(SceneKernels):
         self._graphics_worker = snapshot.graphics_worker
         self.center_x = self.center_y = self.rotation = 0.
         self.scale = 1.
-        self._effect_jobs = InlineResults(self)
+        self._image_residency_pool = QImageResidencyPool(segmented=True)
+        self._effect_jobs = InlineResults(self, pool=self._image_residency_pool)
         self._render_bounds = SceneRenderBounds(self)
         for prefix in ("vector_render", "modifier_render", "modifier_source", "tone_mask_contributor"):
-            setattr(self, f"_{prefix}_cache", OrderedDict())
+            image_cache = (QImageStorageCache(pool=self._image_residency_pool)
+                           if prefix in ("modifier_render", "modifier_source")
+                           else OrderedDict())
+            setattr(self, f"_{prefix}_cache", image_cache)
             setattr(self, f"_{prefix}_cache_bytes", 0)
             setattr(self, f"_{prefix}_cache_budget", 64 * 1024 * 1024)
         for name in ("compound_path", "gradient_geometry", "gradient_scalar", "gradient_render",
@@ -542,6 +629,50 @@ class EvaluatedScene(SceneKernels):
         self._render_modifier_sources = set()
         self._blend_capture_objects = set()
         self._persistent_render_cache = None
+
+    # These compatibility metrics are role-local and can overlap. Reading the
+    # live map avoids stale values after another role evicts a shared node.
+    @property
+    def _modifier_render_cache_bytes(self):
+        cache = getattr(self, '_modifier_render_cache', None)
+        return cache.bytes if isinstance(cache, QImageStorageCache) else self.__dict__.get('_modifier_render_cache_bytes', 0)
+
+    @_modifier_render_cache_bytes.setter
+    def _modifier_render_cache_bytes(self, value):
+        self.__dict__['_modifier_render_cache_bytes'] = value
+
+    @property
+    def _modifier_source_cache_bytes(self):
+        cache = getattr(self, '_modifier_source_cache', None)
+        return cache.bytes if isinstance(cache, QImageStorageCache) else self.__dict__.get('_modifier_source_cache_bytes', 0)
+
+    @_modifier_source_cache_bytes.setter
+    def _modifier_source_cache_bytes(self, value):
+        self.__dict__['_modifier_source_cache_bytes'] = value
+
+    @property
+    def _modifier_render_cache_budget(self):
+        cache = getattr(self, '_modifier_render_cache', None)
+        return cache.budget if isinstance(cache, QImageStorageCache) else self.__dict__.get('_modifier_render_cache_budget', 64 * 1024 * 1024)
+
+    @_modifier_render_cache_budget.setter
+    def _modifier_render_cache_budget(self, value):
+        self.__dict__['_modifier_render_cache_budget'] = value
+        cache = getattr(self, '_modifier_render_cache', None)
+        if isinstance(cache, QImageStorageCache):
+            cache.budget = value
+
+    @property
+    def _modifier_source_cache_budget(self):
+        cache = getattr(self, '_modifier_source_cache', None)
+        return cache.budget if isinstance(cache, QImageStorageCache) else self.__dict__.get('_modifier_source_cache_budget', 64 * 1024 * 1024)
+
+    @_modifier_source_cache_budget.setter
+    def _modifier_source_cache_budget(self, value):
+        self.__dict__['_modifier_source_cache_budget'] = value
+        cache = getattr(self, '_modifier_source_cache', None)
+        if isinstance(cache, QImageStorageCache):
+            cache.budget = value
 
     @property
     def solo_entities(self):
@@ -574,32 +705,139 @@ class EvaluatedScene(SceneKernels):
     def cache_state(self):
         """Retain bounded semantic results, without retaining a scene owner."""
         values = {}
+        values['image_storage_order'] = self._image_residency_pool.storage_order()
+        # Prior read history uses owned handles, never persistent storage IDs
+        # or authoritative byte summaries. Export itself is not a new hit.
+        values['image_reuse_policy'] = ('probation-protected', 1, 'owned-history')
+        values['image_reuse_state'] = dict(
+            nodes=self._image_residency_pool.protected_storage(),
+            aliases={name: mapping.protected_aliases() for name, mapping in (
+                ('source', self._modifier_source_cache), ('effect', self._modifier_render_cache),
+                ('retained', self._effect_jobs._pooled_images))})
         for prefix in ("vector_render", "modifier_render", "modifier_source", "tone_mask_contributor"):
             name = f"_{prefix}_cache"
-            values[name] = OrderedDict(getattr(self, name))
-            values[f"{name}_bytes"] = getattr(self, f"{name}_bytes")
+            cache = getattr(self, name)
+            values[name] = cache.export() if isinstance(cache, QImageStorageCache) else OrderedDict(cache)
+            values[f"{name}_bytes"] = (cache.bytes if isinstance(cache, QImageStorageCache)
+                                       else getattr(self, f"{name}_bytes"))
         for prefix in ("gradient_geometry", "gradient_scalar", "gradient_render", "gradient_ramp"):
             name = f"_{prefix}_cache"
             values[name] = OrderedDict(getattr(self, name))
         # Checkpoints use the same semantic key checks as their live owner;
         # the replacement owner receives its own LRU bookkeeping.
         values["retained"] = OrderedDict(
-            (scope, (key, QImage(image), state, size))
+            (scope, (key, QImage(image), detached_value(state), size))
             for scope, (key, image, state, size) in self._effect_jobs.retained.items()
         )
         values["retained_bytes"] = self._effect_jobs.bytes
         return values
 
     def adopt_cache_state(self, values):
+        image_names = ("_modifier_render_cache", "_modifier_source_cache")
+        pooled = getattr(self, '_image_residency_pool', None) is not None
+        if pooled:
+            self._adopt_image_residency(values)
+        for name in image_names:
+            if name in values and not pooled:
+                cache = QImageStorageCache(budget=getattr(self, f"{name}_budget"))
+                cache.update(values[name])
+                setattr(self, name, cache)
+                setattr(self, f"{name}_bytes", cache.bytes)
         for name, value in values.items():
+            if (name in image_names or name in ('image_storage_order', 'image_reuse_policy', 'image_reuse_state')
+                    or name in tuple(f"{cache_name}_bytes" for cache_name in image_names)):
+                continue
             if name == "retained":
-                self._effect_jobs.adopt_retained(value)
+                if not pooled:
+                    self._effect_jobs.adopt_retained(value)
             elif name == "retained_bytes":
                 # Older snapshots charged every alias. The adopter derives
                 # storage and its byte charge from the current image handles.
                 continue
             else:
                 setattr(self, name, OrderedDict(value) if isinstance(value, dict) else value)
+
+    def _adopt_image_residency(self, values):
+        """Rebuild one bounded union from handles, preserving both LRU orders.
+
+        The transfer contains no pool/owner and no authoritative byte summary.
+        Old snapshots without storage order use their existing role order.
+        Prior protection restores only for admitted matching handles/aliases;
+        older snapshots without history start in probation. No rebuild is a hit.
+        """
+        policy = values.get('image_reuse_policy')
+        if policy is not None and (not isinstance(policy, tuple) or
+                policy != ('probation-protected', 1, 'owned-history')):
+            raise ValueError('Unsupported image reuse transfer policy')
+        reuse = values.get('image_reuse_state')
+        if policy is not None and reuse is None:
+            raise ValueError('Missing image reuse transfer history')
+        if reuse is not None:
+            if (policy is None or not isinstance(reuse, dict) or set(reuse) != {'nodes', 'aliases'}
+                    or not isinstance(reuse['nodes'], tuple) or len(reuse['nodes']) > 1536
+                    or not all(isinstance(image, QImage) for image in reuse['nodes'])
+                    or not isinstance(reuse['aliases'], dict) or set(reuse['aliases']) != {'source', 'effect', 'retained'}):
+                raise ValueError('Invalid image reuse transfer history')
+            if len({int(image.cacheKey()) for image in reuse['nodes']}) != len(reuse['nodes']):
+                raise ValueError('Duplicate image reuse storage history')
+            normalized = {}
+            for aliases in reuse['aliases'].values():
+                if (not isinstance(aliases, tuple) or len(aliases) > 512 or
+                        not all(isinstance(alias, tuple) and len(alias) == 3 and isinstance(alias[1], QImage)
+                                for alias in aliases)):
+                    raise ValueError('Invalid image reuse alias history')
+            for name, aliases in reuse['aliases'].items():
+                try:
+                    if len({key for key, _image, _identity in aliases}) != len(aliases):
+                        raise ValueError('Duplicate image reuse alias history')
+                    normalized[name] = tuple((key, QImage(image), detached_value(identity))
+                        for key, image, identity in aliases)
+                except TypeError as error:
+                    raise ValueError('Invalid image reuse alias identity') from error
+            reuse = dict(nodes=tuple(QImage(image) for image in reuse['nodes']), aliases=normalized)
+        pool = self._image_residency_pool
+        maps = (self._modifier_source_cache, self._modifier_render_cache,
+                self._effect_jobs._pooled_images)
+        histories = []
+        for name, mapping in zip(('_modifier_source_cache', '_modifier_render_cache'), maps):
+            entries = values[name] if name in values else mapping.export()
+            histories.append([(key, image, None) for key, image in entries.items()
+                              if int(image.sizeInBytes()) > 0][-mapping.limit:])
+        retained = values.get('retained', OrderedDict(self._effect_jobs.retained))
+        histories.append([(scope, image, (key, state))
+            for scope, (key, image, state, _size) in retained.items()
+            if 0 <= int(image.sizeInBytes()) <= self._effect_jobs.budget][-maps[2].limit:])
+        if reuse is not None:
+            # Validate identity comparisons before releasing any current
+            # ownership. Detached history is optional prior policy, never an
+            # authority to replace a semantic key or admit a missing image.
+            for name, history in zip(('source', 'effect', 'retained'), histories):
+                identities = {key: metadata[0] if name == 'retained' else None
+                              for key, _image, metadata in history}
+                for key, _image, identity in reuse['aliases'][name]:
+                    if key in identities:
+                        try:
+                            bool(identities[key] == identity)
+                        except (TypeError, ValueError) as error:
+                            raise ValueError('Invalid image reuse semantic comparison') from error
+        # Group all role aliases before admission so a late-loaded role cannot
+        # protect cold storage ahead of a more recently reused node.
+        groups = OrderedDict()
+        for image in values.get('image_storage_order', ()):
+            groups.setdefault(int(image.cacheKey()), [])
+        for mapping, history in zip(maps, histories):
+            for key, image, metadata in history:
+                groups.setdefault(int(image.cacheKey()), []).append((mapping, key, image, metadata))
+        pool.clear()
+        for aliases in groups.values():
+            for mapping, key, image, metadata in aliases:
+                mapping.store(key, image, metadata=metadata)
+        for mapping, history in zip(maps, histories):
+            mapping.reorder(key for key, _image, _metadata in history)
+        if reuse is not None:
+            pool.restore_protected(reuse['nodes'])
+            for name, mapping in zip(('source', 'effect', 'retained'), maps):
+                mapping.restore_aliases(reuse['aliases'][name])
 
 
 class DetachedSceneBackend:
@@ -645,8 +883,11 @@ class DetachedSceneBackend:
                 if texture is not None:
                     texture.close()
         finally:
-            if backing is not None:
-                backing.close()
+            try:
+                if backing is not None:
+                    backing.close()
+            finally:
+                self.scene._image_residency_pool.clear()
 
     def _record_allowed(self):
         document = self.snapshot.document

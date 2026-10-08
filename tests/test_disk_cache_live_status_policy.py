@@ -12,6 +12,7 @@ from types import SimpleNamespace
 import pytest
 from PySide6.QtCore import QPointF, Qt
 from PySide6.QtTest import QTest
+from PySide6.QtWidgets import QApplication
 
 from comic_editor.core.models import ParameterMaskBinding, ToneMask, RasterObject
 from comic_editor.core.tools import ToolKind
@@ -103,6 +104,9 @@ def test_real_contact_preserves_status_queue_then_current_semantic_retry(editor,
         QTest.keyClick(canvas, Qt.Key_Escape)
     wait(qapp, lambda: not canvas._drawing and not canvas._projection_has_live_preview())
     if outcome == "cancel":
+        QTest.mouseRelease(canvas, Qt.LeftButton, pos=last)
+    assert QApplication.mouseButtons() == Qt.NoButton
+    if outcome == "cancel":
         assert canvas.chapter.to_dict() == before and tuple(canvas.command_stack._undo) == history
     else:
         assert len(canvas.command_stack._undo) == len(history) + 1
@@ -140,6 +144,8 @@ def test_pending_native_contact_does_not_hide_completed_storage_ownership(editor
         assert cache._evaluation_done and 0 in cache._pending_rows
     QTest.keyClick(canvas, Qt.Key_Escape)
     wait(qapp, lambda: not canvas._drawing and not canvas._projection_has_live_preview())
+    QTest.mouseRelease(canvas, Qt.LeftButton, pos=_last)
+    assert QApplication.mouseButtons() == Qt.NoButton
     assert canvas.chapter.to_dict() == before and tuple(canvas.command_stack._undo) == history
     cache.tick()
     assert observed

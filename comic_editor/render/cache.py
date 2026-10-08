@@ -31,7 +31,7 @@ from .service import RenderPending
 
 CACHE_VERSION = 1
 # Shared native source/visibility semantics for the detached scene architecture.
-RENDERER_VERSION = "native-artwork-20261007-refactor-visibility-source-1"
+RENDERER_VERSION = "native-artwork-20261008-refactor-full-frame-translation-1"
 MAX_PAYLOAD = 512 * 1024 * 1024
 WRITE_BUDGET = 64 * 1024 * 1024
 READ_BUDGET = 64 * 1024 * 1024

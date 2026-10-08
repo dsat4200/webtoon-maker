@@ -58,7 +58,7 @@ def _percentile(values: list[float], fraction: float) -> float:
 
 
 class PerformanceRecorder:
-    """A recorder whose disabled hot path is a single boolean check.
+    """A bounded recorder with locked epoch validation for events and spans.
 
     ``start`` resumes existing data; ``clear`` resets it without changing whether
     capture is enabled. All storage is bounded, including distinct phase names
@@ -229,15 +229,26 @@ class PerformanceRecorder:
                 if detached != self._context:
                     self._context = detached
 
+    @property
+    def capture_epoch(self) -> int:
+        """Locked identity of the current capture, including clear boundaries."""
+        with self._lock:
+            return self._epoch
+
     def record_event(
         self,
         name: str,
         duration_ms: float | None = None,
         category: str = "event",
         details: dict[str, Any] | None = None,
+        *, capture_epoch: int | None = None,
     ) -> None:
-        if not self.enabled:
-            return
+        # Pin before detaching payloads. Stop/restart/clear during detachment
+        # cannot charge this call to a later capture.
+        with self._lock:
+            epoch = self._epoch if capture_epoch is None else capture_epoch
+            if not self.enabled or epoch != self._epoch:
+                return
         name, category = str(name)[:256], str(category)[:128]
         if duration_ms is not None:
             duration_ms = float(duration_ms)
@@ -247,7 +258,7 @@ class PerformanceRecorder:
                 duration_ms = max(0.0, duration_ms)
         detached = _json_value(details) if details is not None else {}
         with self._lock:
-            if self.enabled:
+            if self.enabled and epoch == self._epoch:
                 self._record_locked(name, duration_ms, category, detached)
 
     def _record_locked(
@@ -298,16 +309,19 @@ class PerformanceRecorder:
         phase["durations"].append(duration_ms)
 
     def measure(
-        self, name: str, category: str = "phase", details: dict[str, Any] | None = None
+        self, name: str, category: str = "phase", details: dict[str, Any] | None = None,
+        *, capture_epoch: int | None = None,
     ):
-        """Time an inclusive span without swallowing any application exception."""
-        if not self.enabled:
-            return nullcontext()
-        return self._measure_active(name, category, details)
+        """Time inclusive wall time; an optional epoch pins external ownership."""
+        with self._lock:
+            epoch = self._epoch if capture_epoch is None else capture_epoch
+            if not self.enabled or epoch != self._epoch:
+                return nullcontext()
+        return self._measure_active(name, category, details, epoch)
 
     @contextmanager
     def _measure_active(
-        self, name: str, category: str, details: dict[str, Any] | None
+        self, name: str, category: str, details: dict[str, Any] | None, epoch: int
     ) -> Iterator[None]:
         started = time.perf_counter()
         # Detach details at entry so mutations inside the operation cannot alter
@@ -316,8 +330,8 @@ class PerformanceRecorder:
         name, category = str(name)[:256], str(category)[:128]
         span_id = None
         with self._lock:
-            epoch = self._epoch
-            if self.enabled:
+            accepted = self.enabled and epoch == self._epoch
+            if accepted:
                 if len(self._active_spans) < self._bounds["max_active_spans"]:
                     self._next_span_id += 1
                     span_id = self._next_span_id
@@ -341,7 +355,7 @@ class PerformanceRecorder:
         finally:
             duration = (time.perf_counter() - started) * 1000.0
             with self._lock:
-                if self.enabled and epoch == self._epoch:
+                if accepted and self.enabled and epoch == self._epoch:
                     if span_id is not None:
                         self._active_spans.pop(span_id, None)
                     # Published active-span details remain immutable, allowing

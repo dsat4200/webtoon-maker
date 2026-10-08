@@ -12,6 +12,15 @@ Original image/raster grids, modifier source frames, float precision, and
 native sampling behavior remain intact. Grids, borders, and editing controls
 remain screen-resolution overlays. See the root `AGENTS.md` constraint.
 
+Translation-output aliases restore the complete bounds promised by their stage
+plan. Both mirror and radial raster paths therefore admit an alias only when
+the returned image bounds equal those full bounds. Cropped results retain
+their ordinary TileGraph keys and placement. The shared renderer version
+`native-artwork-20261008-refactor-full-frame-translation-1` rejects older
+derived entries through existing descriptor/index compatibility, including
+final projection tiles. Original pixels and native kernel sampling are unchanged;
+old in-memory owners require a fresh application process.
+
 `render/cache.py::PersistentRenderCache` is an optional backing for the ordinary
 projection, source, effect, tile-graph, and retained-stage cache access points.
 It never traverses the document or implements a second renderer. Only an

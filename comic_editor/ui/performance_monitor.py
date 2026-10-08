@@ -2,6 +2,9 @@
 from __future__ import annotations
 
 from collections import Counter
+from contextlib import contextmanager
+from dataclasses import dataclass
+from types import ModuleType
 from functools import wraps
 from pathlib import Path
 import threading
@@ -20,6 +23,19 @@ from comic_editor.core import settings as settings_module
 
 _active_controller = None
 _MISSING = object()
+_monitor_scope = threading.local()
+
+
+@dataclass(frozen=True)
+class _MonitorToken:
+    # No scheduler, snapshot, QWidget, scene or image references cross threads.
+    controller: object
+    generation: object
+    epoch: int
+    metadata: tuple
+
+    def details(self):
+        return dict(self.metadata)
 
 
 def _value(value):
@@ -48,6 +64,10 @@ class PerformanceMonitorController(QObject):
         self._writer_finalized = False
         self._resources = None
         self._patches = []
+        self._capture_generation = None
+        self._run_serial = 0
+        self._owned_schedulers = ()
+        self._owned_capture_adapters = ()
         self._connections = []
         self._counts = Counter()
         self._editor_metrics = {}
@@ -148,6 +168,7 @@ class PerformanceMonitorController(QObject):
                              "source_uploads": getattr(gpu, "uploads", 0),
                              "target_uploads": getattr(gpu, "color_uploads", 0)},
             "legacy_input": canvas.performance_snapshot(),
+            "cache_owner": "Legacy canvas pools; detached worker caches are not read by the GUI monitor.",
         }
         projection = getattr(canvas, "_document_projection", None)
         if projection is not None:
@@ -246,29 +267,209 @@ class PerformanceMonitorController(QObject):
         details["channel"] = getattr(self.canvas, "_effect_preview_channel", "canvas")
         return details
 
-    def _patch(self, owner, name, label, category="phase", *, transition=False, cache=False):
+    def _current_scope(self):
+        token = getattr(_monitor_scope, "value", None)
+        if (isinstance(token, _MonitorToken) and token.controller() is self
+                and token.generation is self._capture_generation and self.enabled
+                and token.epoch == self.recorder.capture_epoch):
+            return token
+        return None
+
+    @contextmanager
+    def _owned_scope(self, details, *, generation=None, capture_epoch=None):
+        previous = getattr(_monitor_scope, "value", _MISSING)
+        token = details if isinstance(details, _MonitorToken) else _MonitorToken(
+            weakref.ref(self), self._capture_generation if generation is None else generation,
+            self.recorder.capture_epoch if capture_epoch is None else capture_epoch,
+            tuple(details.items()))
+        _monitor_scope.value = token
+        try:
+            yield token
+        finally:
+            if previous is _MISSING:
+                del _monitor_scope.value
+            else:
+                _monitor_scope.value = previous
+
+    def _scheduler_scope(self, args, kwargs):
+        # This path runs on the worker: read only weak scheduler identity and
+        # the submitted immutable demand. Never read canvas/context/selection.
+        scheduler = args[0] if args else None
+        role = next((role for reference, role in self._owned_schedulers
+                     if reference() is scheduler), None)
+        if role is None:
+            return None
+        demand = args[1] if len(args) > 1 else kwargs.get("demand")
+        if demand is None:
+            return None
+        document = demand.snapshot.document
+        return {"ownership": "monitored_editor", "scope": "detached_worker",
+                "consumer": str(demand.consumer)[:32], "scheduler_role": role,
+                "demand_serial": demand.serial, "document_revision": document.revision,
+                "chapter_id": str(demand.snapshot.chapter.chapter_id)[:64],
+                "live_preview": bool(document.live_preview), "record": bool(demand.record),
+                "run_generation": self._run_serial}
+
+    def _capture_scope(self, args, _kwargs):
+        capture = args[0] if args else None
+        if (threading.get_ident() != self._ui_thread or capture is None
+                or capture.owner is not self.canvas):
+            return None
+        details = {"ownership": "monitored_editor", "scope": "gui_capture_slice",
+                   "document_revision": capture.document.revision,
+                   "run_generation": self._run_serial}
+        # Both adapters own captures from the same canvas. Infer the consumer
+        # only when its existing capture actually matches this slice.
+        for reference, role in self._owned_capture_adapters:
+            adapter = reference()
+            if adapter is not None and adapter.capture is capture:
+                details.update(consumer=role, scheduler_role=role, demand_serial=adapter.serial)
+                break
+        return details
+
+    @staticmethod
+    def _render_details(args, kwargs, name=""):
+        # No QWidget reads, image bits, semantic key repr or serialization.
+        details = {}
+        for value in args[:4]:
+            identifier = getattr(value, "object_id", None) or getattr(value, "layer_id", None)
+            if identifier:
+                details["entity"] = {"id": str(identifier)[:64], "type": type(value).__name__}
+                break
+        if name == "render_distort":
+            modifier = args[2] if len(args) > 2 else kwargs.get("modifier")
+            if modifier is not None:
+                details["modifier"] = {"id": str(modifier.modifier_id)[:64],
+                                       "type": str(modifier.modifier_type)[:64]}
+            details["pixel_scale"] = args[6] if len(args) > 6 else kwargs.get("pixel_scale", 1.)
+        return details
+
+    def _already_patched(self, owner, name):
+        return any(item[0] is owner and item[1] == name for item in self._patches)
+
+    def _patch_owned(self, owner, name, label, *, start_scope=None, cache=False, cpu=False,
+                     require_scope=False):
+        if self._already_patched(owner, name):
+            return
         original = getattr(owner, name, None)
         if not callable(original):
             return
         own = getattr(owner, "__dict__", {}).get(name, _MISSING)
+        reference, generation = weakref.ref(self), self._capture_generation
+        # A bound scope factory would retain the controller in a class wrapper.
+        scope_method = start_scope.__name__ if start_scope is not None else None
 
         @wraps(original)
         def measured(*args, **kwargs):
-            # The wrapper is removed at stop; tolerate an already-bound call.
-            if not self.enabled:
+            controller = reference()
+            if controller is None:
                 return original(*args, **kwargs)
-            details = self._details(name, args, kwargs)
-            if transition:
-                self.recorder.update_context(self.context())
-                self.recorder.record_event(label + ".begin", category="transition", details=details)
-            with self.recorder.measure(label, category=category, details=details):
+            # Read epoch before generation validation. A restart between these
+            # reads is rejected; after validation the old epoch pins recording.
+            epoch = controller.recorder.capture_epoch
+            if (not controller.enabled
+                    or generation is not controller._capture_generation):
+                return original(*args, **kwargs)
+            current = controller._current_scope()
+            # Old in-flight TLS must never be adopted by newly installed probes.
+            if getattr(_monitor_scope, "value", None) is not None and current is None:
+                return original(*args, **kwargs)
+            metadata = getattr(controller, scope_method)(args, kwargs) if scope_method else None
+            if scope_method and metadata is None:
+                return original(*args, **kwargs)
+            if require_scope:
+                if (current is None or current.details().get("scope") != "detached_worker"
+                        or any(current.details().get(key) != metadata.get(key) for key in
+                               ("scheduler_role", "consumer", "demand_serial", "document_revision"))):
+                    return original(*args, **kwargs)
+                token = current
+            else:
+                token = (_MonitorToken(reference, generation, epoch, tuple(metadata.items()))
+                         if metadata is not None else current)
+            if token is None:
+                return original(*args, **kwargs)
+            if token.details().get("ownership") != "monitored_editor":
+                return original(*args, **kwargs)
+            details = {**token.details(), **controller._render_details(args, kwargs),
+                       "capture_epoch": token.epoch, "thread_id": threading.get_ident(),
+                       "thread": "gui" if threading.get_ident() == controller._ui_thread else "worker"}
+            cpu_clock = getattr(time, "thread_time", None) if cpu else None
+            started_cpu = cpu_clock() if cpu_clock is not None else None
+            raised = None
+            try:
+                with controller._owned_scope(token), controller.recorder.measure(
+                        label, details=details, capture_epoch=token.epoch):
+                    result = original(*args, **kwargs)
+            except BaseException as error:
+                raised = type(error).__name__
+                raise
+            finally:
+                if started_cpu is not None:
+                    final = {**details, "clock": "thread_cpu"}
+                    if raised is not None:
+                        final["exception_type"] = raised
+                    controller.recorder.record_event(label + ".thread_cpu",
+                        (cpu_clock() - started_cpu) * 1000., category="worker_cpu",
+                        details=final, capture_epoch=token.epoch)
+            if cache:
+                # Worker cache hit counters use the recorder's existing lock.
+                controller.recorder.record_event(label + (".miss" if result is None else ".hit"),
+                    category="cache", details=details, capture_epoch=token.epoch)
+            return result
+
+        setattr(owner, name, measured)
+        self._patches.append((owner, name, own, measured))
+
+    def _patch(self, owner, name, label, category="phase", *, transition=False, cache=False,
+               owned_label=None):
+        if self._already_patched(owner, name):
+            return
+        original = getattr(owner, name, None)
+        if not callable(original):
+            return
+        own = getattr(owner, "__dict__", {}).get(name, _MISSING)
+        reference, generation = weakref.ref(self), self._capture_generation
+        global_probe = isinstance(owner, (type, ModuleType))
+
+        @wraps(original)
+        def measured(*args, **kwargs):
+            controller = reference()
+            if controller is None:
+                return original(*args, **kwargs)
+            epoch = controller.recorder.capture_epoch
+            if (not controller.enabled
+                    or generation is not controller._capture_generation):
+                return original(*args, **kwargs)
+            current = controller._current_scope()
+            if getattr(_monitor_scope, "value", None) is not None and current is None:
+                return original(*args, **kwargs)
+            gui = threading.get_ident() == controller._ui_thread
+            # Direct global effects remain backwards compatible, explicitly
+            # unattributed. Their details never query a live QWidget on workers.
+            scope = current.details() if current is not None else {
+                "ownership": "legacy_global_unattributed" if global_probe else "monitored_editor",
+                "scope": "legacy_global" if global_probe else "gui_adapter",
+                "run_generation": controller._run_serial}
+            token = current or _MonitorToken(reference, generation, epoch, tuple(scope.items()))
+            timed_label = owned_label if owned_label and scope.get("ownership") == "monitored_editor" else label
+            details = (controller._details(name, args, kwargs) if gui and not global_probe
+                       else {**controller._render_details(args, kwargs, name),
+                             "thread_id": threading.get_ident(), "thread": "gui" if gui else "worker"})
+            details.update(scope, capture_epoch=token.epoch)
+            if transition and gui:
+                controller.recorder.update_context(controller.context())
+                controller.recorder.record_event(label + ".begin", category="transition",
+                    details=details, capture_epoch=token.epoch)
+            with controller._owned_scope(token), controller.recorder.measure(
+                    timed_label, category=category, details=details, capture_epoch=token.epoch):
                 result = original(*args, **kwargs)
             if cache:
-                self._counts[label + (".miss" if result is None else ".hit")] += 1
-            if transition:
-                self.recorder.update_context(self.context())
-                self.recorder.record_event(label + ".end", category="transition",
-                                           details={**details, "accepted": result is not False})
+                controller.recorder.record_event(label + (".miss" if result is None else ".hit"),
+                    category="cache", details=details, capture_epoch=token.epoch)
+            if transition and gui:
+                controller.recorder.update_context(controller.context())
+                controller.recorder.record_event(label + ".end", category="transition",
+                    details={**details, "accepted": result is not False}, capture_epoch=token.epoch)
             return result
 
         setattr(owner, name, measured)
@@ -283,7 +484,7 @@ class PerformanceMonitorController(QObject):
         for name in ("set_tool", "set_selection", "set_solo_entities", "set_document"):
             self._patch(canvas, name, "canvas." + name, transition=True)
         phases = (
-            "paintEvent", "_ensure_scene_cache", "_render_scene_cache_rect", "render_preview",
+            "paintEvent", "_paint_canvas_frame", "_paint_ready_document_projection", "_ensure_scene_cache", "_render_scene_cache_rect", "render_preview",
             "_paint_document_projection", "_collect_document_projection",
             "_render_document_tiles", "_render_document_region", "_show_on_top_plan",
             "_draw_predictive_ink", "_draw_live_vector_gesture",
@@ -310,11 +511,60 @@ class PerformanceMonitorController(QObject):
             if navigator is not None:
                 self._patch(navigator, 'request', 'navigator.request')
                 self._patch(navigator.scheduler, 'poll', 'navigator.publish')
+                self._patch(navigator.scheduler, 'submit', 'navigator.submit')
         scene = getattr(canvas, '_scene_controller', None)
         if scene is not None:
             self._patch(scene, 'request', 'scene.request')
             self._patch(scene.scheduler, 'poll', 'scene.publish')
+            self._patch(scene.scheduler, 'submit', 'scene.submit')
             self._patch(canvas._scene_snapshot_compiler, 'capture', 'scene.capture_start')
+        # Late patches of timer-bound advance() do not replace the Qt slot.
+        # Its dynamic lazy-capture/poll callees remain observable without
+        # reconnecting timers or scheduling an extra render.
+        from comic_editor.render.scene import SceneCapture, DetachedSceneBackend
+        from comic_editor.render.scheduler import SceneScheduler
+        from comic_editor.render.service import DocumentRenderService
+        from comic_editor.render.scene_kernels import SceneKernels
+        from comic_editor.render import effect_pipeline, scene_kernels, tile_effects
+        from comic_editor.ui import interactive_effects
+        schedulers = []
+        if scene is not None:
+            schedulers.append((weakref.ref(scene.scheduler), "canvas"))
+        navigator = getattr(preview, "_navigator_jobs", None) if preview is not None else None
+        if navigator is not None:
+            schedulers.append((weakref.ref(navigator.scheduler), "navigator"))
+        self._owned_schedulers = tuple(schedulers)
+        self._owned_capture_adapters = tuple((weakref.ref(adapter), role)
+            for adapter, role in ((scene, "canvas"), (navigator, "navigator")) if adapter is not None)
+        self._patch_owned(SceneCapture, "advance", "scene.capture_slice", start_scope=self._capture_scope)
+        self._patch_owned(SceneScheduler, "_evaluate", "scene.worker_envelope", start_scope=self._scheduler_scope, cpu=True)
+        self._patch_owned(SceneScheduler, "_evaluate_admitted", "scene.worker_admitted",
+                          start_scope=self._scheduler_scope, cpu=True, require_scope=True)
+        for name in ("render_region", "render_tiles"):
+            self._patch_owned(DocumentRenderService, name, "scene." + name)
+        # capture() is a contextmanager constructor; ordinary paint spans
+        # measure its actual body instead of reporting generator creation.
+        self._patch_owned(DetachedSceneBackend, "paint", "scene.backend_paint")
+        for name in ("_render_modified_object", "_render_modified_layer"):
+            self._patch_owned(SceneKernels, name, "scene." + name.lstrip("_"))
+        for name in ("_modifier_cache_get", "_modifier_source_cache_get"):
+            self._patch_owned(SceneKernels, name, "scene.cache." + name.lstrip("_"), cache=True)
+        self._patch_owned(effect_pipeline, "render_stages", "scene.effects.stages")
+        # Scene kernels retained this separate import before monitor enable.
+        self._patch_owned(scene_kernels, "render_stages", "scene.effects.stages")
+        # These aliases were imported before monitor enable; patch the actual
+        # called attributes, while preserving the older global compatibility
+        # probes and explicitly marking their otherwise-unattributed scope.
+        self._patch_owned(effect_pipeline, "apply_modifier_stack", "scene.effects.stack")
+        # Ordinary scoped stages use this separately prebound CPU alias.
+        # Its owner-filtered wrapper inherits the current immutable worker token.
+        # Generic object/layer effects call this ordinary stage adapter
+        # directly; they need not enter the spatial render_stages pipeline.
+        self._patch_owned(interactive_effects, "render_interactive_stack", "scene.effects.stages")
+        self._patch_owned(interactive_effects, "apply_modifier_stack", "scene.effects.stack")
+        # Tile graphs retain their own module-bound alias.
+        self._patch_owned(tile_effects, "apply_modifier_stack", "scene.effects.stack")
+        self._patch_owned(scene_kernels, "apply_opacity_mask", "scene.effects.opacity_mask")
         for attribute in ("selection_settings", "selection_common", "layer_settings",
                           "modifier_controls", "text_object_controls"):
             control = getattr(self.window, attribute, None)
@@ -326,7 +576,12 @@ class PerformanceMonitorController(QObject):
         from comic_editor.ui import distort_rendering, modifier_rendering
         self._patch(GpuPatternRenderer, "render", "gpu.pattern_wall_time")
         for name in ("apply_modifier_stack", "apply_opacity_mask", "apply_pattern_modifier"):
-            self._patch(modifier_rendering, name, "effects." + name)
+            # The ui module is an alias of render.modifier_rendering.
+            # One source wrapper covers invocation-time pointwise/mask imports
+            # and preserves explicitly unattributed direct legacy calls.
+            owned_label = {"apply_modifier_stack": "scene.effects.stack",
+                           "apply_opacity_mask": "scene.effects.opacity_mask"}.get(name)
+            self._patch(modifier_rendering, name, "effects." + name, owned_label=owned_label)
         # Distort's worker closure imports this function when its stage is
         # requested. Patch the source module so both GUI and worker work is
         # observed without instrumenting per-strip or per-pixel inner loops.
@@ -361,6 +616,8 @@ class PerformanceMonitorController(QObject):
         if previous is not None and previous is not self:
             previous.stop()
         _active_controller = weakref.ref(self)
+        self._capture_generation = object()
+        self._run_serial += 1
         self.recorder.clear()
         self._counts.clear()
         self._last_refresh = 0.0
@@ -394,6 +651,9 @@ class PerformanceMonitorController(QObject):
     def _detach_instrumentation(self, *, qt_alive=True):
         """Restore Python patches even when Qt is already destroying widgets."""
         global _active_controller
+        self._capture_generation = None
+        self._owned_schedulers = ()
+        self._owned_capture_adapters = ()
         if _active_controller and _active_controller() is self:
             _active_controller = None
         if qt_alive:
@@ -494,7 +754,11 @@ class PerformanceMonitorController(QObject):
             "timings": "Inclusive wall time; nested spans overlap. Not GPU execution or presentation time.",
             "sampling": "GUI Python stack; native calls may hold the GIL and delay the sampler.",
             "content": "Entity IDs and structural metadata only; no artwork, text content or local variables.",
-            "already_connected_slots": "Included in enclosing operation spans and sampled stacks.",
+            "already_connected_slots": "Existing Qt-bound callbacks remain connected; dynamic capture/poll/frame callees are timed, not every outer slot.",
+            "detached_workers": "Owned scheduler spans use actual thread IDs and frozen demand metadata; inclusive wall time includes admission and waits; separate thread_cpu spans use time.thread_time. Worker stacks are not sampled.",
+            "ownership": "Detached scene worker/capture spans are filtered to the monitored editor, run generation and recorder epoch. Legacy global effect probes are labelled unattributed when outside an owned scope.",
+            "measurement_boundary": "Tasks submitted before enable may retain the original worker entry and are unobserved; no retroactive reconstruction.",
+            "cache_metrics": "Legacy canvas pools only; the GUI never traverses live detached-worker cache dictionaries.",
         }
         return data
 

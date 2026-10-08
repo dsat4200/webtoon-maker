@@ -6,6 +6,7 @@ not be a QWidget or refer to an editor.
 """
 from __future__ import annotations
 from collections import OrderedDict
+from comic_editor.render.image_storage_cache import QImageStorageCache
 from comic_editor.core.tools import ToolKind
 from comic_editor.core.models import ArrayModifier
 from comic_editor.core.models import BlurModifier
@@ -3212,15 +3213,17 @@ class SceneKernels:
 
     def _modifier_cache_get(self, key: tuple) -> QImage | None:
         from comic_editor.ui.cache_dependencies import cache_get, cache_put
-        image = self._modifier_render_cache.pop(key, None)
+        image = self._modifier_render_cache.get(key)
         if image is None:
             image = cache_get(self, "effect", key)
             if image is None:
                 return None
             self._modifier_cache_put(key, image)
             return QImage(image)
-        self._modifier_render_cache[key] = image
+        self._modifier_render_cache.move_to_end(key)
         cache_put(self, "effect", key, image)
+        if isinstance(self._modifier_render_cache, QImageStorageCache):
+            self._modifier_render_cache.reuse(key)
         return QImage(image)
 
     def _modifier_cache_put(self, key: tuple, image: QImage) -> None:
@@ -3228,6 +3231,11 @@ class SceneKernels:
         cache_put(self, "effect", key, image)
         size = int(image.sizeInBytes())
         if size <= 0:
+            return
+        if isinstance(self._modifier_render_cache, QImageStorageCache):
+            self._modifier_render_cache.budget = self._modifier_render_cache_budget
+            self._modifier_render_cache.store(key, image)
+            self._modifier_render_cache_bytes = self._modifier_render_cache.bytes
             return
         previous = self._modifier_render_cache.pop(key, None)
         if previous is not None:
@@ -3248,15 +3256,17 @@ class SceneKernels:
 
     def _modifier_source_cache_get(self, key: tuple) -> QImage | None:
         from comic_editor.ui.cache_dependencies import cache_get, cache_put
-        image = self._modifier_source_cache.pop(key, None)
+        image = self._modifier_source_cache.get(key)
         if image is None:
             image = cache_get(self, "source", key)
             if image is None:
                 return None
             self._modifier_source_cache_put(key, image)
             return QImage(image)
-        self._modifier_source_cache[key] = image
+        self._modifier_source_cache.move_to_end(key)
         cache_put(self, "source", key, image)
+        if isinstance(self._modifier_source_cache, QImageStorageCache):
+            self._modifier_source_cache.reuse(key)
         return QImage(image)
 
     def _modifier_source_cache_put(self, key: tuple, image: QImage) -> None:
@@ -3264,6 +3274,11 @@ class SceneKernels:
         cache_put(self, "source", key, image)
         size = int(image.sizeInBytes())
         if size <= 0:
+            return
+        if isinstance(self._modifier_source_cache, QImageStorageCache):
+            self._modifier_source_cache.budget = self._modifier_source_cache_budget
+            self._modifier_source_cache.store(key, image)
+            self._modifier_source_cache_bytes = self._modifier_source_cache.bytes
             return
         previous = self._modifier_source_cache.pop(key, None)
         if previous is not None:
@@ -5112,8 +5127,11 @@ class SceneKernels:
             field = self.render_tone_mask_field(binding.mask_id, image.width(), image.height(),
                 self._world_to_image_transform(mapping, bounds, image.width(), image.height()), mapping.mapRect(bounds))
             image = apply_opacity_mask(image, field, binding.black_value, binding.white_value)
-        if not navigator:
-            translation_cache.put(self, move_key, image, move_revision)
+        if not navigator and move_key is not None:
+            # Aliases restore the planned full frame; ordinary tile caches own crops.
+            move_bounds = move_plan.targets[-1] if move_plan.targets else capture_bounds
+            if bounds == move_bounds:
+                translation_cache.put(self, move_key, image, move_revision)
         opacity = parent_opacity if self._render_base_alpha or obj.opacity_locked else parent_opacity*obj.opacity
         if obj.object_id == self._live_underlay_object_id:
             opacity *= 1-self._live_underlay_amount
