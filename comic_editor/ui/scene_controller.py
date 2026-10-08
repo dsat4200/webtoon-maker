@@ -30,6 +30,7 @@ class SceneController(QObject):
         self.error = ""
         self.preview_mode = False
         self.feedback_target = ''
+        self._contact_reuse_gate = None
         self.feedback = None
         self.feedback_dirty = set()
         self.feedback_patches = RasterFeedbackPatchCache()
@@ -50,6 +51,7 @@ class SceneController(QObject):
         self.canvas._projection_error_revision = -1
         self._cpu_pending.clear()
         self.feedback_target = ''
+        self._contact_reuse_gate = None
         self.feedback = None
         self.feedback_dirty.clear()
         self.feedback_patches.clear()
@@ -76,6 +78,15 @@ class SceneController(QObject):
         self.preview_mode = (not visible.isEmpty() and
             (document.live_preview or view_bytes > self.canvas._document_projection.budget // 2))
         signature = document, tuple(request.address for request in requests), tuple(phases), tuple(visible.getRect())
+        gate = self._covered_contact_gate(document, signature[3])
+        if gate is not None:
+            self._hold_contact_feedback(signature, gate)
+            return
+        if self._contact_reuse_gate is not None:
+            # Release or any eligibility change resumes ordinary guarded work,
+            # including a transition with otherwise unchanged demand metadata.
+            self._contact_reuse_gate = None
+            self.desired = None
         if signature != self.desired:
             self.release_handoff.new_request(signature)
             self.serial += 1
@@ -102,6 +113,51 @@ class SceneController(QObject):
         if self.dispatched != signature and not self.timer.isActive():
             self.timer.start(0)
 
+    def _covered_contact_gate(self, document, visible):
+        """Positive ownership gate for already prepared current native ink."""
+        canvas = self.canvas
+        prepared = self.feedback
+        if (not document.live_preview or not getattr(canvas, '_drawing', False)
+                or document.identity != (id(canvas.chapter), id(canvas.tiles), id(canvas.images))
+                or document.revision != canvas._document_projection.revision
+                or not getattr(canvas, '_raster_contact_active', False)
+                or canvas.tool not in {ToolKind.RASTER_PENCIL, ToolKind.RASTER_ERASER, ToolKind.BRUSH}
+                or prepared is None or prepared.identifier != canvas.selected_id
+                or not self._feedback_covers(document, visible)
+                or canvas._projection_has_live_preview(include_ink=False)):
+            return None
+        gate = getattr(canvas, '_paint_brush_tile_input' if canvas.tool == ToolKind.BRUSH
+                       else '_raster_tile_input', None)
+        current = getattr(gate, 'current', None)
+        if (gate is None or getattr(gate, 'canvas', None) is not canvas
+                or getattr(gate, 'chapter', None) is not canvas.chapter
+                or getattr(gate, 'tiles', None) is not canvas.tiles
+                or getattr(gate, 'identifier', None) != prepared.identifier
+                or getattr(gate, 'closed', True) or getattr(gate, 'released', True)
+                or getattr(gate, 'error', None) is not None
+                or not callable(current) or not current()):
+            return None
+        return gate
+
+    def _hold_contact_feedback(self, signature, gate):
+        """Retain immutable planes while native source packets are presented."""
+        if self._contact_reuse_gate is not gate:
+            self.scheduler.cancel()
+            effects = getattr(self.canvas, '_effect_jobs', None)
+            if effects is not None:
+                effects.cancel(clear_retained=False)
+            self._cpu_pending.clear()
+        if signature != self.desired:
+            self.release_handoff.new_request(signature)
+            self.serial += 1
+            self.desired = signature
+            self.error = ''
+            self.canvas._projection_render_error = ''
+            self.canvas._projection_error_revision = -1
+        self._contact_reuse_gate = gate
+        self.capture = self.dispatched = None
+        self.timer.stop()
+
     def _capture_slice_seconds(self, document, visible):
         canvas = self.canvas
         gate = getattr(canvas, '_raster_tile_input', None)
@@ -122,6 +178,12 @@ class SceneController(QObject):
             self.reset()
             return
         document, addresses, phases, visible = self.desired
+        gate = self._covered_contact_gate(document, visible)
+        if gate is not None:
+            self._hold_contact_feedback(self.desired, gate)
+            return
+        resume_contact = self._contact_reuse_gate is not None
+        self._contact_reuse_gate = None
         if (document.identity != (id(canvas.chapter), id(canvas.tiles), id(canvas.images)) or
                 document.revision != canvas._document_projection.revision):
             self.capture = None
@@ -130,6 +192,10 @@ class SceneController(QObject):
             self.timer.stop()
             canvas.update()
             return
+        if resume_contact:
+            self.dispatched = None
+            if self.snapshot is None or self.snapshot.document != document:
+                self.capture = canvas._scene_snapshot_compiler.capture(canvas, document)
         for completion in self.scheduler.poll():
             if completion.demand.serial != self.serial or completion.demand.snapshot.document != document:
                 continue

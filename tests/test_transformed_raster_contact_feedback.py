@@ -13,7 +13,7 @@ from comic_editor.core.brushes import BrushDefinition
 from comic_editor.core.models import BoundGeometry, ChildRef
 from comic_editor.core.tools import ToolKind
 from comic_editor.render.raster_feedback import feedback_chain
-from test_raster_contact_feedback import scene, pixels, ready_paint, native_reference as native_artwork_reference
+from test_raster_contact_feedback import scene, pixels, ready_paint, native_reference as native_artwork_reference, _queue_blocked_native_scene
 
 
 def native_reference(canvas):
@@ -83,6 +83,7 @@ def test_transformed_contact_publishes_every_held_position_with_exact_ordered_na
         assert gate.wait(20), 'test barrier was not released'
         return original(demand, token)
     monkeypatch.setattr(scheduler, '_evaluate_admitted', blocked)
+    _queue_blocked_native_scene(canvas)
     before = ready_paint(canvas)
     try:
         if tool == ToolKind.BRUSH:

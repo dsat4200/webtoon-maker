@@ -191,6 +191,14 @@ native buffers. Pending cancellation discards worker publication; terminal
 errors restore source pixels and frames and report one operation error. A new
 gesture clears the prior error after rollback. Clear and Save drain accepted
 released gestures before capturing document truth.
+Tile and occupancy preparation opt into `render/input_sources.py` only for
+explicitly guarded native source jobs. It freezes the selected owner's requested
+native tile keys, retains immutable backing pins before yielding, and uses the
+ordinary `SceneSnapshot.finish_sources()` resolver off the GUI. It does not
+capture chapter records, unrelated raster/mask owners or embedded images.
+Source owner/key versions remain valid through every bounded publication slice;
+harmless projection revisions do not restart owned input. Other scene consumers
+retain their complete captures. No input snapshot enters an artwork/disk cache.
 Cross-tool native contacts use one FIFO activation queue before changing shared
 stroke fields. A released cold Brush, Pencil, mask or Lasso contact therefore
 finishes its captured transaction before the next contact begins, while each
@@ -245,10 +253,16 @@ tool retains its original native packet data and source owner.
   work, rejects stale document/configuration/revision results and adopts ready
   native tiles. Edited views retain their previous complete coverage until all
   replacement regions are ready. Live feedback is explicitly provisional.
-  Metadata slices use 2 ms during an active original Pencil/Eraser contact with
-  ready source input and valid prepared feedback coverage. Cold preparation,
-  release and other tools retain 4 ms; the timer cadence remains 8 ms. This
-  cooperative budget does not change captured inputs or native exact work.
+  A covered Pencil/Eraser/Brush contact with current owned native input and
+  prepared feedback skips scene capture and submission entirely. Entry cancels
+  the preceding scene demand and auxiliary effect jobs once, retaining exact
+  effect cache results; repeated packets only replace native source patches.
+  The positive gate checks document identity/revision, source owner, unreleased
+  input, viewport/configuration coverage and absence of other live previews.
+  Release, stale ownership, unrelated artwork or lost coverage resumes normal
+  guarded scene work. Cold/fallback preparation retains bounded capture slices
+  (4 ms normally, 2 ms for eligible native Pencil/Eraser feedback), with an 8 ms
+  timer cadence. This scheduling policy changes no native exact work.
   Lower-density preview evaluators have separate caches and cannot contaminate
   the retained native evaluator or durable entries.
   Ordinary Raster Pencil/Eraser contact instead captures `contact_only` demand
@@ -260,7 +274,7 @@ tool retains its original native packet data and source owner.
   stay disabled. Export clears both contact and live demand metadata.
 - `render/raster_feedback.py` prepares native prefix/source/suffix planes with
   the ordinary detached scene kernels for a selected simple raster leaf. The
-  source grid and two-pixel gutters retain their integer document placement;
+  source grid and two-pixel gutters retain their native document placement;
   ancestor clip paths, selected opacity, foreground borders and the ordinary
   promoted-artwork pass retain their scene order. `ui/raster_feedback.py`
   substitutes only resident edited native source tiles, including cleared or
@@ -293,10 +307,16 @@ tool retains its original native packet data and source owner.
   provisional overlay stops; its retained source substitutions remain available
   for the next contact against that basis.
   Prepared planes also have a 32 MiB limit and never enter artwork/disk caches.
-  The current eligibility policy requires legacy pixels, normal object blends,
-  no selected/ancestor effects or opacity masks, bounded untransformed ancestors
-  at unit opacity, integer accumulated source placement and no linked sampler
-  depending on the edited source. Unsupported graphs retain the previous ready
+  The current eligibility policy requires legacy document pixels, normal object
+  blends, no selected/ancestor effects or opacity masks, bounded ancestors at
+  unit opacity and no linked sampler depending on the edited source. Solo uses
+  the ordinary visibility rules. Positive axis-aligned saved object/ancestor
+  transforms use native world patches with bounded inverse source dependencies;
+  other untransformed placement remains integral. Resident transformed source
+  footprints clear transparently before native SourceOver drawing, preserving
+  the ordinary Qt sampling phase and unchanged adjacent source tiles. Rotated,
+  mirrored, perspective or collapsed transforms remain conservative fallbacks.
+  Unsupported graphs retain the previous ready
   scene until ordinary detached preview evaluation completes. A screen-space
   contact ring and "Updating drawing…" label identify received input whose
   current pixels are unavailable, including queued cold source packets or a
@@ -304,7 +324,10 @@ tool retains its original native packet data and source owner.
   artwork or exact scene readiness. Native reference
   tests cover first press/move/erase while that worker is blocked, curved clip
   boundaries and borders, object opacity, negative tile origins, source seams,
-  foreground promotion and complete eraser pruning.
+  foreground promotion and complete eraser pruning. Additional full-buffer
+  cases cover held Pencil/Brush/Eraser on 70,000-pixel canvases, nested unequal
+  fractional scales, object/layer/page solo, source/world tile seams, RGBA64
+  source precision, partial opacity, native pruning and exact release/undo.
   This is a provisional presentation composition: flattening transparent
   foreground planes may add byte-stage rounding. The saved occupied-scene
   proof measured nine unchanged background bytes differing by one, with the

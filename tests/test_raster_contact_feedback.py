@@ -31,6 +31,28 @@ def ready_paint(canvas):
     return image
 
 
+def _queue_blocked_native_scene(canvas):
+    """Hold a legitimate native scene demand before the live contact begins.
+
+    Warm feedback can now defer its own chapter capture. Busy-worker pixel
+    assertions therefore use an already admitted ordinary immutable demand,
+    rather than forcing the live contact to enqueue unnecessary scene work.
+    """
+    import time
+    from comic_editor.render.scheduler import SceneDemand
+    controller=canvas._scene_controller
+    snapshot=controller.snapshot
+    assert snapshot is not None and not snapshot.document.live_preview
+    visible=canvas.visible_document_rect().intersected(snapshot.document.bounds)
+    requests=tuple(canvas._document_projection.requests(visible,1.))
+    controller.scheduler.submit(SceneDemand(controller.serial,snapshot,requests,(None,),
+        (visible.center().x(),visible.center().y()),tuple(visible.getRect())))
+    deadline=time.monotonic()+3.
+    while controller.scheduler.future is not None and not controller.scheduler.future.running() and time.monotonic()<deadline:
+        time.sleep(.002)
+    assert controller.scheduler.future is not None and controller.scheduler.future.running()
+
+
 def native_reference(canvas):
     document = canvas._render_document_state()
     request = RenderRequest((0., 0., 128., 128.), 1., (128, 128), ('feedback-oracle',),
@@ -107,6 +129,7 @@ def test_press_move_and_release_show_current_native_pixels_under_foreground_whil
         assert gate.wait(20)
         return original(demand, token)
     monkeypatch.setattr(scheduler, '_evaluate_admitted', blocked)
+    _queue_blocked_native_scene(canvas)
     try:
         canvas._begin_stroke(QPointF(32, 64), 1.)
         first = ready_paint(canvas)
@@ -215,6 +238,7 @@ def test_prepared_contact_matches_fixed_origin_reference_at_native_edges(
         assert gate.wait(20)
         return original(demand, token)
     monkeypatch.setattr(scheduler, '_evaluate_admitted', blocked)
+    _queue_blocked_native_scene(canvas)
     try:
         canvas._begin_stroke(QPointF(16, 64), 1.)
         first = ready_paint(canvas)
@@ -253,6 +277,7 @@ def test_fully_pruned_eraser_tile_reveals_prepared_prefix_while_worker_busy(
         assert gate.wait(20)
         return original(demand, token)
     monkeypatch.setattr(scheduler, '_evaluate_admitted', blocked)
+    _queue_blocked_native_scene(canvas)
     try:
         canvas._begin_stroke(QPointF(28, 64), 1.)
         assert ready_paint(canvas).pixelColor(28, 64) == QColor('blue')
@@ -444,6 +469,7 @@ def test_unavailable_contact_pixels_show_received_gesture_as_pending(
         assert gate.wait(20)
         return original(demand, token)
     monkeypatch.setattr(scheduler, '_evaluate_admitted', blocked)
+    _queue_blocked_native_scene(canvas)
     try:
         canvas._begin_stroke(QPointF(32, 64), 1.)
         actual = ready_paint(canvas)
@@ -674,16 +700,13 @@ def test_scene_capture_contact_budget_preserves_cold_release_and_exact_pixels(
     assert canvas._raster_feedback_contact_covered
     assert current.pixelColor(32, 64) != before.pixelColor(32, 64)
     controller = canvas._scene_controller
-    if case == 'release':
-        canvas._end_stroke()
-        ready_paint(canvas)
-    assert controller.capture is not None
-    capture = controller.capture
+    # Covered current source packets are presented directly from native
+    # feedback. This positive path must create no chapter metadata capture.
+    assert controller.capture is None
     budgets = []
     with monkeypatch.context() as patch:
-        # Observe the budget actually passed by the scheduler without finishing
-        # its metadata iterator. The original iterator then converges normally.
-        patch.setattr(capture, 'advance', lambda seconds: (budgets.append(seconds), False)[1])
+        if case == 'release':
+            canvas._end_stroke()
         if case == 'cold':
             patch.setattr(canvas, '_raster_tile_input', SimpleNamespace(busy=True, released=False))
         elif case == 'released_source':
@@ -701,9 +724,23 @@ def test_scene_capture_contact_budget_preserves_cold_release_and_exact_pixels(
                 document=SimpleNamespace(configuration=('different-presentation',))))
         elif case == 'inactive_drawing':
             patch.setattr(canvas, '_drawing', False)
+        # Apply the fallback before requesting the next actual frame. Cold,
+        # released, missing, different-owner/configuration and off-coverage
+        # contacts must still dispatch ordinary exact source/model work.
+        ready_paint(canvas)
+        capture = controller.capture
+        if case in ('pencil', 'eraser'):
+            assert capture is None
+        else:
+            assert capture is not None
+            # Observe the real fallback allowance without completing the
+            # iterator; after restoring the observer it converges normally.
+            patch.setattr(capture, 'advance', lambda seconds: (budgets.append(seconds), False)[1])
         controller.advance()
-        assert budgets == [.002 if case in ('pencil', 'eraser') else .004]
+        assert budgets == ([] if case in ('pencil', 'eraser') else [.004])
         assert controller.timer.interval() == 8
+        if case in ('pencil', 'eraser'):
+            assert controller.capture is None and not controller.timer.isActive()
     if case != 'release':
         canvas._end_stroke()
     wait_scene(canvas)
