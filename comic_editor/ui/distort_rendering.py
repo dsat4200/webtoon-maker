@@ -14,15 +14,14 @@ import math
 from threading import RLock
 
 import numpy as np
-from PySide6.QtCore import QRectF, Qt
+from PySide6.QtCore import QRect, QRectF, Qt
 from PySide6.QtGui import QImage, QTransform
-from scipy.interpolate import PchipInterpolator
 from scipy.ndimage import map_coordinates, sobel, spline_filter
 
 from comic_editor.core.cage import CageGrid, homography, map_points, project, tessellate
 from comic_editor.ui.distort_equations import evaluate_equation
 from comic_editor.core.pixel_arrays import normalized_bytes
-from comic_editor.render.pixels import current_contract, premultiplied_pixels, working_image
+from comic_editor.render.pixels import LEGACY_PIXELS, current_contract, premultiplied_pixels, working_image
 
 
 _MAX_PIXELS = 64 * 1024 * 1024
@@ -163,6 +162,23 @@ def _mesh(modifier, frame, parameters):
     return source, destination, faces
 
 
+def _mesh_bounds_destinations(modifier, frame, parameters):
+    """The identical destination tessellation, without unused source mapping."""
+    rows, columns = int(parameters.get("rows", 4)), int(parameters.get("columns", 4))
+    xx, yy = np.meshgrid(np.linspace(0., 1., columns), np.linspace(0., 1., rows))
+    rest = np.stack((xx, yy), axis=-1).reshape(-1, 2)
+    destinations = np.asarray(getattr(modifier, "points", None) or rest, np.float64)
+    sources = np.asarray(getattr(modifier, "source_points", None) or rest, np.float64)
+    if sources.shape != rest.shape or destinations.shape != rest.shape:
+        raise ValueError("Mesh point count does not match its rows and columns")
+    smoothness = float(parameters.get("smoothness", 50.))
+    # Source shape validation remains above. CageGrid construction itself
+    # performs no validation; only the destination grid is evaluated here.
+    destination_grid = CageGrid(frame=tuple(frame), columns=columns, rows=rows,
+        points=[tuple(point) for point in destinations * frame[2:] + frame[:2]], smoothness=smoothness)
+    return tessellate(destination_grid, subdivisions=6 if smoothness > 0 else 1)[1]
+
+
 _MLS_WEIGHT_CACHE_LIMIT = 64 * 1024 * 1024
 
 
@@ -233,6 +249,9 @@ def _curve(points, values):
     unique, indices = np.unique(points[:, 0], return_index=True)
     if len(unique) < 2:
         return np.full_like(values, points[0, 1])
+    # Bounds for other distortions do not need the interpolation package.
+    # Keep first-use curve preparation with the existing curve operation.
+    from scipy.interpolate import PchipInterpolator
     return PchipInterpolator(unique, points[indices, 1], extrapolate=False)(np.clip(values, unique[0], unique[-1]))
 
 
@@ -333,7 +352,7 @@ def distort_bounds(bounds: QRectF, modifier, local_to_world: QTransform | None =
         matrix, _ = _perspective(source, destination, corners)
         destination = project(matrix, corners)
     elif effect == "mesh_warp":
-        _, destination, _ = _mesh(modifier, frame, parameters)
+        destination = _mesh_bounds_destinations(modifier, frame, parameters)
         # Include spline overshoot between tessellated vertices.
         rows, columns = int(parameters.get("rows", 4)), int(parameters.get("columns", 4))
         xx, yy = np.meshgrid(np.linspace(0., 1., columns), np.linspace(0., 1., rows))
@@ -464,6 +483,33 @@ class _Sampler:
         return result
 
 
+def _sample_lens_bilinear(sampler, coordinates):
+    """Skip only constant-only taps from an owned Legacy Lens source.
+
+    Maps and partial bilinear support retain their original SciPy values.
+    Floating/native-wide sources and oversized strip samplers do not enter.
+    """
+    if (sampler.order != 1 or sampler.mode != "grid-constant"
+            or sampler.padding or sampler.fill not in (0., 1.)
+            or sampler.pixels.dtype != np.float32 or not sampler.pixels.flags.owndata
+            or coordinates.dtype != np.float64 or coordinates.shape[-1:] != (2,)
+            or coordinates.size // 2 > 262144
+            or not np.isfinite(coordinates).all()
+            or np.max(np.abs(coordinates), initial=0.) >= 1e15):
+        return sampler(coordinates)
+    height, width = sampler.pixels.shape[:2]
+    x, y = coordinates[..., 0], coordinates[..., 1]
+    # At -1 and N all real bilinear tap weights are zero. Any partial real
+    # support, including adjacent float64 values, stays on the original path.
+    supported = (x > -1.) & (x < width) & (y > -1.) & (y < height)
+    if supported.all():
+        return sampler(coordinates)
+    result = np.full((*coordinates.shape[:-1], 4), sampler.fill, np.float32)
+    if supported.any():
+        result[supported] = sampler(coordinates[supported])
+    return result
+
+
 def _array_storage_bytes(arrays):
     """Count retained NumPy allocations once, including shared channel views."""
     owners = {}
@@ -481,6 +527,9 @@ class PreparedDistort:
     sampler: _Sampler
 
 
+PREPARED_DISTORT_CACHE_BUDGET = 256 * 1024 * 1024
+
+
 class PreparedDistortCache:
     """Bounded immutable source/mesh setup reused by exact region requests.
 
@@ -492,7 +541,7 @@ class PreparedDistortCache:
 
     # A large smudge frame and its previous stroke checkpoint can coexist,
     # avoiding a full stroke replay when the last stroke changes.
-    def __init__(self, budget=256 * 1024 * 1024, *, entry_limit=64):
+    def __init__(self, budget=PREPARED_DISTORT_CACHE_BUDGET, *, entry_limit=64):
         self.budget = max(0, int(budget))
         self.entry_limit = max(1, int(entry_limit))
         self.bytes = self.hits = self.misses = self.evictions = 0
@@ -555,6 +604,165 @@ class PreparedDistortCache:
         with self._lock:
             self._entries.clear()
             self.bytes = 0
+
+
+def _oversized_bilinear_sampler(image, interpolation, edges, effect, pixel_scale,
+                                preparation_cache):
+    """Prepare only the original native taps needed by a large exact warp.
+
+    Other contracts, interpolation modes and kernels keep their complete
+    preparation. This changes working allocation, never the source grid.
+    """
+    contract = current_contract()
+    if (contract.floating or effect not in
+            {"twirl", "deform", "mesh_warp", "lens_distortion", "pinch_punch"}
+            or pixel_scale != 1. or interpolation != "bilinear"
+            or edges not in {"transparent", "white"} or image.isNull()
+            or image.format() != contract.image_format
+            or image.format() != QImage.Format_ARGB32_Premultiplied
+            or image.width() * image.height() * 16 <= PREPARED_DISTORT_CACHE_BUDGET):
+        return None
+    return _StripBilinearSampler(image, edges, preparation_cache)
+
+
+class _StripBilinearSampler:
+    """Job-local native input; numeric crops share the existing bounded cache."""
+
+    def __init__(self, image, edges, preparation_cache):
+        self.image = QImage(image)
+        self.edges = edges
+        self.cache = preparation_cache
+        self.contract = current_contract().signature
+        self.full = None
+
+    def _full(self, coordinates):
+        if self.full is None:
+            self.full = (_Sampler(_rgba(self.image), "bilinear", self.edges)
+                         if self.cache is None else
+                         self.cache.source(self.image, "bilinear", self.edges).sampler)
+        return self.full(coordinates)
+
+    @staticmethod
+    def _same_native_coefficients(global_coordinates, local_coordinates, origin):
+        # Compare the exact fraction bits SciPy receives after its padding
+        # addition. Reconstructing the global coordinates alone is insufficient
+        # near integer boundaries. Bilinear's padding is zero.
+        old, new = global_coordinates + 0., local_coordinates + 0.
+        old_floor, new_floor = np.floor(old), np.floor(new)
+        if not np.array_equal(old_floor - origin, new_floor):
+            return False
+        old_fraction = np.ascontiguousarray(old - old_floor)
+        new_fraction = np.ascontiguousarray(new - new_floor)
+        return np.array_equal(old_fraction.view(np.uint64), new_fraction.view(np.uint64))
+
+    def __call__(self, coordinates):
+        if self.full is not None:
+            return self.full(coordinates)
+        coordinates = np.asarray(coordinates)
+        if (not coordinates.size or coordinates.dtype != np.float64
+                or not np.isfinite(coordinates).all()
+                or np.max(np.abs(coordinates)) >= 1e15):
+            return self._full(coordinates)
+        width, height = self.image.width(), self.image.height()
+        axes = tuple(range(coordinates.ndim - 1))
+        low = np.floor(coordinates.min(axis=axes))
+        high = np.floor(coordinates.max(axis=axes)) + 2.
+        left, top = max(0, min(width, int(low[0]))), max(0, min(height, int(low[1])))
+        right, bottom = max(0, min(width, int(high[0]))), max(0, min(height, int(high[1])))
+        crop_width, crop_height = right - left, bottom - top
+        area = crop_width * crop_height
+        budget = self.cache.budget if self.cache is not None else PREPARED_DISTORT_CACHE_BUDGET
+        if (crop_width <= 0 or crop_height <= 0 or area == width * height
+                or area * 16 > budget):
+            return self._full(coordinates)
+        origin = np.asarray((left, top), np.float64)
+        local = coordinates - origin
+        if not self._same_native_coefficients(coordinates, local, origin):
+            return self._full(coordinates)
+        frame = left, top, crop_width, crop_height
+        key = ("source-bilinear-slice", int(self.image.cacheKey()), width, height,
+               self.image.format().value, "bilinear", self.edges, self.contract, frame)
+        prepared = self.cache._get(key) if self.cache is not None else None
+        if prepared is None:
+            crop = self.image.copy(QRect(*frame))
+            if crop.isNull() or crop.width() != crop_width or crop.height() != crop_height:
+                return self._full(coordinates)
+            pixels = _rgba(crop)
+            sampler = _Sampler(pixels, "bilinear", self.edges)
+            sampler.filtered = tuple(sampler.filtered)
+            prepared = PreparedDistort(pixels, sampler)
+            if self.cache is not None:
+                prepared = self.cache._put(key, prepared, (pixels, *sampler.filtered))
+        return prepared.sampler(local)
+
+
+def _pinch_mapped(center, delta, normalized, strength):
+    # Keep the original float64 operation order used by the native kernel.
+    target = normalized ** (2. ** strength)
+    ratio = np.divide(target, normalized, out=np.ones_like(target), where=normalized > 1e-8)
+    return center + delta * ratio[..., None]
+
+
+def native_pinch_input_region(bounds, output, modifier, transform, *, budget=PREPARED_DISTORT_CACHE_BUDGET):
+    """Conservative original-grid tap/base rectangle, or unchanged full input.
+
+    This planner does not inspect source pixels or reinterpret the source frame.
+    Unsupported contracts and any coefficient uncertainty retain full input.
+    """
+    parameters = getattr(modifier, 'parameters', {})
+    if (current_contract() != LEGACY_PIXELS
+            or modifier.modifier_type != 'distort_pinch_punch'
+            or getattr(modifier, 'parameter_masks', None)
+            or parameters.get('interpolation', 'bilinear') != 'bilinear'
+            or parameters.get('edges', 'transparent') not in {'transparent', 'white'}):
+        return None
+    values = (*bounds.getRect(), *output.getRect())
+    if (not all(math.isfinite(value) and value == int(value) for value in values)
+            or bounds.isEmpty() or output.isEmpty()
+            or output.width() * output.height() > 262144):
+        return None
+    inverse, valid = transform.inverted()
+    if not valid:
+        return None
+    width, height = int(bounds.width()), int(bounds.height())
+    frame, center, radius = _geometry(bounds, modifier, transform)
+    strength = float(parameters.get('amount', 25.)) / 100.
+    if (not np.isfinite(frame).all() or not np.isfinite(center).all()
+            or not math.isfinite(radius) or not math.isfinite(strength)):
+        return None
+    try:
+        xx, yy = np.meshgrid(output.x() + (np.arange(int(output.width())) + .5) * output.width() / int(output.width()),
+                             output.y() + (np.arange(int(output.height())) + .5) * output.height() / int(output.height()))
+        world = _transform(transform, np.stack((xx, yy), axis=-1))
+        delta = world - center
+        distance = np.linalg.norm(delta, axis=-1)
+        normalized = np.minimum(distance / radius, 1.)
+        mapped = _pinch_mapped(center, delta, normalized, strength)
+        # The eligible original semantic image has exactly width/height native
+        # pixels for this full frame; its native image_scale is exactly one.
+        coordinates = (_transform(inverse, mapped) - (bounds.x(), bounds.y())) * np.asarray((1., 1.)) - .5
+        if (not np.isfinite(coordinates).all() or np.max(np.abs(coordinates)) >= 1e15):
+            return None
+        floors = np.floor(coordinates)
+        low, high = floors.min(axis=(0, 1)), floors.max(axis=(0, 1)) + 2.
+        left, top = max(0, min(width, int(low[0]))), max(0, min(height, int(low[1])))
+        right, bottom = max(0, min(width, int(high[0]))), max(0, min(height, int(high[1])))
+        # Retain the unchanged base's exact pixel intersection even at100%.
+        # Partial intensity then uses the same native QPainter placement/mix.
+        base = output.intersected(bounds)
+        if not base.isEmpty():
+            left, top = min(left, int(base.x()-bounds.x())), min(top, int(base.y()-bounds.y()))
+            right, bottom = max(right, int(base.right()-bounds.x())), max(bottom, int(base.bottom()-bounds.y()))
+        crop_width, crop_height = right-left, bottom-top
+        if (crop_width <= 0 or crop_height <= 0 or crop_width*crop_height == width*height
+                or crop_width*crop_height*16 > budget):
+            return None
+        origin = np.asarray((left, top), np.float64)
+        if not _StripBilinearSampler._same_native_coefficients(coordinates, coordinates-origin, origin):
+            return None
+        return QRectF(bounds.x()+left, bounds.y()+top, crop_width, crop_height)
+    except (ArithmeticError, ValueError, OverflowError):
+        return None
 
 
 def _triangle_map(query, source, destination, faces):
@@ -780,7 +988,8 @@ def _glitch_map(world, frame, center, parameters, channel=1):
 
 def render_distort(image: QImage, bounds: QRectF, modifier, local_to_world: QTransform | None = None,
                    output_bounds: QRectF | None = None, cancelled=None, pixel_scale=1., *,
-                   displacement_image: QImage | None = None, preparation_cache=None):
+                   displacement_image: QImage | None = None, preparation_cache=None,
+                   native_input_bounds: QRectF | None = None):
     """Return a full-strength distortion, or ``None`` when cancelled.
 
     ``pixel_scale`` controls output resolution only. The source image always
@@ -812,20 +1021,66 @@ def render_distort(image: QImage, bounds: QRectF, modifier, local_to_world: QTra
     if pixel_scale < 1. and max(source_native_size) > 512:
         image = image.scaled(512, 512, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
     interpolation, edges = parameters.get("interpolation", "bilinear"), parameters.get("edges", "transparent")
-    if preparation_cache is None:
+    sampler = _oversized_bilinear_sampler(image, interpolation, edges, effect,
+                                          pixel_scale, preparation_cache)
+    if sampler is not None:
+        # Only the five admitted kernels use sample_world exclusively.
+        pixels = None
+    elif preparation_cache is None:
         pixels = _rgba(image)
         sampler = _Sampler(pixels, interpolation, edges)
     else:
         prepared = preparation_cache.source(image, interpolation, edges)
         pixels, sampler = prepared.pixels, prepared.sampler
-    floating = current_contract().floating
+    contract = current_contract()
+    floating = contract.floating
+    sparse_lens = (contract == LEGACY_PIXELS and effect == "lens_distortion"
+                   and pixel_scale == 1. and interpolation == "bilinear"
+                   and edges in {"transparent", "white"}
+                   and image.format() == QImage.Format_ARGB32_Premultiplied
+                   and type(sampler) is _Sampler and sampler.pixels.flags.owndata)
     encode = _float_pixels if floating else _byte_pixels
     output = np.zeros((height, width, 4), np.float32 if floating else np.uint8)
     image_scale = np.asarray((image.width() / bounds.width(), image.height() / bounds.height()))
+    input_origin = None
+    if native_input_bounds is not None:
+        supplied = QRectF(native_input_bounds)
+        values = (*bounds.getRect(), *supplied.getRect(), *output_bounds.getRect())
+        if (contract != LEGACY_PIXELS or effect != 'pinch_punch' or pixel_scale != 1.
+                or width * height > 262144
+                or interpolation != 'bilinear' or edges not in {'transparent', 'white'}
+                or image.format() != QImage.Format_ARGB32_Premultiplied
+                or getattr(modifier, 'parameter_masks', None)
+                or not all(math.isfinite(value) and value == int(value) for value in values)
+                or supplied.isEmpty() or not bounds.contains(supplied)
+                or image.width() != supplied.width() or image.height() != supplied.height()):
+            raise ValueError('Unsupported native Pinch input crop')
+        # All geometry/maps retain the ORIGINAL full semantic frame and grid.
+        # The cropped image only owns the already proven demanded native taps.
+        image_scale = np.asarray((1., 1.))
+        input_origin = np.asarray((supplied.x()-bounds.x(), supplied.y()-bounds.y()), np.float64)
 
     def sample_world(world):
         local = _transform(inverse, world)
-        return sampler((local - (bounds.x(), bounds.y())) * image_scale - .5)
+        coordinates = (local - (bounds.x(), bounds.y())) * image_scale - .5
+        if input_origin is not None:
+            if (not np.isfinite(coordinates).all()
+                    or np.max(np.abs(coordinates), initial=0.) >= 1e15):
+                raise ValueError('Unsupported native Pinch input coordinates')
+            floors = np.floor(coordinates)
+            full_size = np.asarray((bounds.width(), bounds.height()), np.float64)
+            low = np.clip(floors.min(axis=(0, 1)), 0., full_size)
+            high = np.clip(floors.max(axis=(0, 1)) + 2., 0., full_size)
+            required = high > low
+            owned_high = input_origin + (image.width(), image.height())
+            if np.any(required & ((low < input_origin) | (high > owned_high))):
+                raise ValueError('Native Pinch input crop omitted original native taps')
+            local_coordinates = coordinates - input_origin
+            if not _StripBilinearSampler._same_native_coefficients(coordinates, local_coordinates, input_origin):
+                raise ValueError('Native Pinch input crop changed bilinear coefficients')
+            coordinates = local_coordinates
+        return (_sample_lens_bilinear(sampler, coordinates) if sparse_lens
+                else sampler(coordinates))
 
     context = {}
     if effect == "perspective":
@@ -912,13 +1167,13 @@ def render_distort(image: QImage, bounds: QRectF, modifier, local_to_world: QTra
                 strength = float(parameters.get("amount", 25.)) / 100.
                 if effect == "pinch_punch":
                     # Positive punch expands the center, negative pinch contracts it.
-                    target = normalized ** (2. ** strength)
+                    mapped = _pinch_mapped(center, delta, normalized, strength)
                 else:
                     convex = 2. / np.pi * np.arcsin(np.clip(normalized, 0., 1.))
                     concave = np.sin(normalized * np.pi / 2.)
                     target = normalized + abs(strength) * ((convex if strength >= 0 else concave) - normalized)
-                ratio = np.divide(target, normalized, out=np.ones_like(target), where=normalized > 1e-8)
-                mapped = center + delta * ratio[..., None]
+                    ratio = np.divide(target, normalized, out=np.ones_like(target), where=normalized > 1e-8)
+                    mapped = center + delta * ratio[..., None]
         elif effect == "ripple":
             strength = float(parameters.get("amount", 10.))
             wavelength = max(1e-6, float(parameters.get("wavelength", 32.)))

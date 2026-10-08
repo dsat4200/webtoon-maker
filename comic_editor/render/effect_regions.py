@@ -28,6 +28,9 @@ def projection_requires_exact(canvas):
     windows and coordinate semantics still apply while reduced previews and
     deferred computations are suppressed for this capture.
     """
+    from comic_editor.render.live_canvas_preview import check_live_canvas_cancelled
+    if check_live_canvas_cancelled(canvas) is not None:
+        return False
     return bool(getattr(canvas, "_projection_exact", False))
 
 

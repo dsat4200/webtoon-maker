@@ -225,6 +225,11 @@ def test_copied_external_images_enter_history_and_decode_is_cached(qapp, monkeyp
         mime = QMimeData()
         mime.setImageData(QImage.fromData(_png()))
         qapp.clipboard().setMimeData(mime)
+        import time
+        deadline = time.monotonic() + 10.
+        while not window._clipboard_image_sources() and time.monotonic() < deadline:
+            qapp.processEvents()
+            time.sleep(.002)
         assert window._clipboard_image_sources()
         assert window.clipboard_image_history.entries[0].kind == "image"
         monkeypatch.setattr(window.canvas, "_external_image_entries", lambda mime: (_ for _ in ()).throw(AssertionError("Repeated MIME decode")))

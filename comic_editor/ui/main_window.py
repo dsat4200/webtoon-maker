@@ -66,6 +66,7 @@ from comic_editor.ui.clipboard_history import (
     cursor_world, drawing_at, paste_object,
 )
 from comic_editor.ui.settings_dialog import SettingsDialog
+from comic_editor.ui.canvas_resize import ResizeCanvasDialog, minimum_canvas_height, resize_canvas_height
 from comic_editor.ui.hotkeys import (
     MODIFIER_LABELS, chord_keys, chord_text,
 )
@@ -385,7 +386,10 @@ class MainWindow(QMainWindow):
     def _build_ui(self) -> None:
         style = Path(__file__).with_name("style.qss")
         if style.is_file():
-            QApplication.instance().setStyleSheet(style.read_text(encoding="utf-8"))
+            application = QApplication.instance()
+            stylesheet = style.read_text(encoding="utf-8")
+            if application.styleSheet() != stylesheet:
+                application.setStyleSheet(stylesheet)
 
         self.file_menu = QMenu("File", self)
         self.new_series_action = self.file_menu.addAction("New Series")
@@ -441,7 +445,7 @@ class MainWindow(QMainWindow):
         self.file_toolbar.addWidget(QLabel("Chapter"))
         self.file_toolbar.addWidget(self.chapter_combo)
         self.new_chapter_action = self.file_toolbar.addAction("New Chapter")
-        self.trim_action = self.file_toolbar.addAction("Trim Height")
+        self.trim_action = self.file_toolbar.addAction("Resize Canvas")
         self.export_png_toolbar_action = self.file_toolbar.addAction("Export PNG")
         export_menu = QMenu(self.file_toolbar)
         export_menu.addActions([
@@ -2238,6 +2242,13 @@ class MainWindow(QMainWindow):
         if (
             event_type == QEvent.KeyPress
             and event.key() == Qt.Key_Escape
+            and self.canvas._cancel_mask_stroke()
+        ):
+            event.accept()
+            return True
+        if (
+            event_type == QEvent.KeyPress
+            and event.key() == Qt.Key_Escape
             and self.canvas._cancel_mask_selection()
         ):
             event.accept()
@@ -3628,26 +3639,14 @@ class MainWindow(QMainWindow):
     def _trim_height(self) -> None:
         if self.chapter is None or self.chapter.document_kind == "image":
             return
-        minimum = self.chapter.minimum_safe_height()
-        for object_id in self.chapter.objects:
-            rect = self.canvas.object_world_rect(object_id)
-            if rect is not None:
-                minimum = max(minimum, int(rect.bottom() + 0.999))
-        value, accepted = QInputDialog.getInt(
-            self, "Trim chapter", f"New height (minimum {minimum}px)",
-            max(minimum, self.chapter.height), minimum, 10_000_000,
-        )
-        if not accepted or value == self.chapter.height:
+        minimum = minimum_canvas_height(self.canvas)
+        dialog = ResizeCanvasDialog(self.chapter.height, minimum, self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
             return
-        from comic_editor.core.document_patch import RecordSnapshot
-        before = RecordSnapshot.capture(self.chapter, scalars=('size',))
         try:
-            self.chapter.trim_height(value)
+            resize_canvas_height(self.canvas, dialog.height.value(), dialog.add_position.currentData())
         except ValueError as error:
-            QMessageBox.warning(self, "Cannot trim", str(error))
-            return
-        from comic_editor.ui.record_edits import commit_records
-        commit_records(self.canvas, before, "Trim chapter")
+            QMessageBox.warning(self, "Cannot resize canvas", str(error))
 
     def _activate_tool(self, tool: ToolKind) -> bool:
         if self.canvas.active_tone_mask_id and tool in {

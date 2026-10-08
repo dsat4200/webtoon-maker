@@ -2,10 +2,11 @@
 
 One scene evaluator owns model/source caches. GPU kernels use their own context
 owner. The GUI polls completed immutable blocks and never waits for this lane.
-Cancellation is observed between ordinary native capture blocks; a kernel
-already executing may finish, but cannot publish into another revision.
+Cancellation is observed between native capture blocks and cooperatively
+inside circular integration. Superseded work cannot publish into another revision.
 """
 from collections import deque
+from contextlib import contextmanager
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from dataclasses import replace
@@ -17,6 +18,22 @@ from comic_editor.render.service import DocumentRenderService, TileBatchPolicy, 
 from comic_editor.render.scene import DetachedSceneBackend
 from comic_editor.render.admission import RENDER_ADMISSION, WorkCancelled, snapshot_working_bytes
 from comic_editor.render.source_resources import ReadyOriginals
+
+
+@contextmanager
+def _scene_cancellation(scene, cancelled):
+    """Borrow the admitted worker token only for this native capture block."""
+    values = vars(scene)
+    absent = '_scene_cancelled' not in values
+    previous = values.get('_scene_cancelled')
+    values['_scene_cancelled'] = cancelled
+    try:
+        yield
+    finally:
+        if absent:
+            values.pop('_scene_cancelled', None)
+        else:
+            values['_scene_cancelled'] = previous
 
 
 @dataclass(frozen=True)
@@ -235,9 +252,23 @@ class SceneScheduler:
                 if demand.consumer == "canvas":
                     preview_backend.artwork_scale = 1.
                     preview_backend.native_preview = True
-                # Valid native results may be reused by a preview. Its private
-                # bookkeeping and new captures are discarded afterwards.
-                preview_backend.scene.adopt_cache_state(backend.scene.cache_state())
+                    if (snapshot.document.live_preview and not snapshot.document.contact_only
+                            and not demand.record
+                            and not snapshot.document.pixel_contract.floating
+                            and not snapshot.document.overflow
+                            and snapshot.document.underlay == ('', 0.)):
+                        from comic_editor.render.live_canvas_preview import LiveCanvasPreviewPolicy
+                        preview_backend.live_canvas_preview_policy = LiveCanvasPreviewPolicy(
+                            snapshot.document.identity, snapshot.document.revision, demand.serial,
+                            lambda: token.is_set() or self.stopped.is_set())
+                # A live draft uses one declared sampling policy even when the
+                # retained native evaluator is warm. Its effect/source-capture
+                # caches start empty, matching an independent cold reference.
+                # Snapshot-owned original pixels remain reusable; this private
+                # evaluator never transfers new captures/results back. Other
+                # preview contracts keep their existing native cache adoption.
+                if getattr(preview_backend, 'live_canvas_preview_policy', None) is None:
+                    preview_backend.scene.adopt_cache_state(backend.scene.cache_state())
                 preview_service = DocumentRenderService(preview_backend)
                 preview_service.projection.revision = snapshot.document.revision
                 try:
@@ -283,7 +314,8 @@ class SceneScheduler:
                             restored[tile.address] = image, True
                         else:
                             missing.append(tile)
-                    with backend.record_tiles(demand.record):
+                    with backend.record_tiles(demand.record), _scene_cancellation(
+                            backend.scene, lambda: token.is_set() or self.stopped.is_set()):
                         result = service.render_tiles(snapshot.document, missing,
                             TileBatchPolicy(demand.center), phase=phase, defer_effects=False)
                         if demand.record:
@@ -308,6 +340,8 @@ class SceneScheduler:
                 backend.finish_recording()
             self._prepare_feedback(demand, backend, token)
             self._publish(SceneCompletion(demand, done=True,recorded=demand.record), token)
+        except WorkCancelled:
+            return
         except Exception as error:
             self._publish(SceneCompletion(demand, done=True, error=f"{type(error).__name__}: {error}"), token)
         finally:

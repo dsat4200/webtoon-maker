@@ -51,6 +51,8 @@ class ImageStore:
                  encoded_budget: int = 64 * 1024 * 1024) -> None:
         self._sources: dict[str, ImageSource] = {}
         self._decoded: OrderedDict[object, QImage] = OrderedDict()
+        # Metadata only, bounded/retired by the existing decoded LRU.
+        self._owned_decodes = {}
         self.decoded_budget = max(0, int(decoded_budget))
         self.decoded_bytes = 0
         self._encoded_cache = EncodedImageCache(encoded_budget)
@@ -58,7 +60,24 @@ class ImageStore:
         self._pending_saves = {}
         self.dirty: set[str] = set()
 
+    def _remember_owned_decode(self, key, image, encoded):
+        """Only ordinary decoder acquisition may establish ownership."""
+        if self._decoded.get(key) is image:
+            self._owned_decodes[key] = (encoded, int(image.cacheKey()),
+                image.width(), image.height(), image.format().value)
+
+    def _adopt_owned_decode(self, key, image, witness):
+        """Transfer metadata for a proved COW alias; never infer it."""
+        identifier = key if isinstance(key, str) else key[1]
+        source = self._sources.get(identifier)
+        if (source is not None and witness is not None
+                and witness[0] is source._encoded
+                and witness[1:] == (int(image.cacheKey()), image.width(),
+                    image.height(), image.format().value)):
+            self._remember_owned_decode(key, image, source._encoded)
+
     def _forget_decoded(self, object_id):
+        self._owned_decodes.pop(object_id, None)
         previous = self._decoded.pop(object_id, None)
         if previous is not None:
             self.decoded_bytes -= int(previous.sizeInBytes())
@@ -178,6 +197,7 @@ class ImageStore:
         self._sources[str(object_id)] = source
         self._forget_object_decoded(str(object_id))
         self._cache_decoded(str(object_id), image)
+        self._remember_owned_decode(str(object_id), image, source._encoded)
         self.dirty.add(str(object_id))
         return source
 
@@ -245,6 +265,7 @@ class ImageStore:
             return QImage()
         image, _detected = self._decode(source.data)
         self._cache_decoded(object_id, image)
+        self._remember_owned_decode(object_id, image, source._encoded)
         return QImage(image)
 
     def native_image(self, object_id: str) -> QImage:
@@ -264,6 +285,7 @@ class ImageStore:
             return QImage()
         image, _detected = self._decode_native(source.data)
         self._cache_decoded(key, image)
+        self._remember_owned_decode(key, image, source._encoded)
         return QImage(image)
 
     def relabel(
@@ -331,6 +353,7 @@ class ImageStore:
             for object_id, item in values.items()
         }
         self._decoded.clear()
+        self._owned_decodes.clear()
         self.decoded_bytes = 0
         self.dirty.update(values)
 
@@ -405,6 +428,7 @@ class ImageStore:
     ) -> None:
         self._sources.clear()
         self._decoded.clear()
+        self._owned_decodes.clear()
         self.decoded_bytes = 0
         self._saved_sources.clear()
         self._pending_saves.clear()

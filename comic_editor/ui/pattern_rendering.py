@@ -505,8 +505,12 @@ def _cell_sample_table(prepared, color_source, cell_x, cell_y, spacing, angle,
 
 def _halftone(source: np.ndarray, modifier: HalftoneModifier,
               color_source: np.ndarray | None = None, cancelled=None, *,
-              frame_size=None, origin=(0, 0)) -> np.ndarray:
+              frame_size=None, origin=(0, 0), output_region=None) -> np.ndarray:
     height, width = source.shape[:2]
+    if (output_region is not None
+            and (modifier.grid_type not in {"square", "hexagonal"}
+                 or modifier.dot_style not in {"circle", "incircle"})):
+        raise ValueError("This dot style requires its complete evaluation frame")
     frame_width, frame_height = frame_size or (width, height)
     ox, oy = origin
     unit = halftone_unit(frame_width, frame_height, modifier)
@@ -575,6 +579,35 @@ def _halftone(source: np.ndarray, modifier: HalftoneModifier,
         largest_scale = math.sqrt(max(1., 1. - modifier.scale_factor))
         circle_reach = (spacing * .5 * modifier.size * largest_scale
                         * (math.sqrt(2.) if modifier.dot_style == "circle" else 1.))
+    output_crop = None
+    if output_region is not None:
+        # Keep the original full prepared source, global float32 coordinates,
+        # table eligibility and cell samples. Only the pointwise dot/output
+        # work is restricted. Circle/incircle AA has an analytic width, so it
+        # has no neighbor derivative or merged-mark dependency.
+        if grid not in {"square", "hexagonal"} or modifier.dot_style not in {"circle", "incircle"}:
+            raise ValueError("This dot style requires its complete evaluation frame")
+        left, top, crop_width, crop_height = output_region
+        if (not all(isinstance(v, int) for v in output_region)
+                or left < 0 or top < 0 or crop_width <= 0 or crop_height <= 0
+                or left + crop_width > width or top + crop_height > height):
+            raise ValueError("Invalid halftone output-work rectangle")
+        crop = (slice(top, top + crop_height), slice(left, left + crop_width))
+        output_crop = crop
+        # Fine/oversized table fallback uses shape-sensitive NumPy math.
+        # Preserve its whole original arithmetic and crop the final
+        # result below. Preparation and blur still execute only once.
+        if cell_samples is not None:
+            source, chosen, coverage = source[crop], chosen[crop], coverage[crop]
+            xx, yy, cell_x, cell_y = xx[crop], yy[crop], cell_x[crop], cell_y[crop]
+            if chosen_tone is not None:
+                chosen_tone = chosen_tone[crop]
+            if chosen_color is not None:
+                chosen_color = chosen_color[crop]
+            if cell_samples is not None:
+                xids, yids, *samples = cell_samples
+                cell_samples = (xids[crop], yids[crop], *samples)
+            height, width = crop_height, crop_width
     for iy in range(-half_span, half_span + 1):
         for ix in range(-half_span, half_span + 1):
             _check_cancelled(cancelled)
@@ -654,7 +687,8 @@ def _halftone(source: np.ndarray, modifier: HalftoneModifier,
     if modifier.dot_style in {"blob", "liquid"}:
         coverage = _edge_coverage(joined)
     ink = _ink(chosen, chosen_tone, modifier, chosen_color)
-    return _composite(source, ink, coverage, modifier)
+    result = _composite(source, ink, coverage, modifier)
+    return result[output_crop] if output_crop is not None and cell_samples is None else result
 
 
 def _halftone_strips(image, modifier, color_source, cancelled, *,
@@ -736,10 +770,15 @@ def halftone_region(image: QImage, modifier: HalftoneModifier, region: QRect,
                 source_rect = source_rect.adjusted(-padding, -padding, padding, padding)
                 source_rect = source_rect.intersected(QRect(0, 0, width, height))
                 crop = image.copy(source_rect)
+                local_top, local_left = top - source_rect.y(), left - source_rect.x()
+                output_region = ((local_left, local_top, right - left, bottom - top)
+                                 if modifier.dot_style in {"circle", "incircle"} else None)
                 rendered = _halftone(_rgba(crop), modifier, cancelled=cancelled,
                                      frame_size=(width, height),
-                                     origin=(source_rect.x(), source_rect.y()))
-                local_top, local_left = top - source_rect.y(), left - source_rect.x()
+                                     origin=(source_rect.x(), source_rect.y()),
+                                     output_region=output_region)
+                if output_region is not None:
+                    local_top = local_left = 0
                 tile = _image(rendered[local_top:local_top + bottom - top,
                                        local_left:local_left + right - left])
                 painter.drawImage(left - requested.x(), top - requested.y(), tile)

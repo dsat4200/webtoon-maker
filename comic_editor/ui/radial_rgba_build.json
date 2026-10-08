@@ -1,0 +1,60 @@
+{
+  "abi": "0x5247424142490001",
+  "platform": "win-amd64",
+  "build_contract": "scalar-double-separate-y-x-corners-00-01-10-11-channel-0-1-2-3-f32-unrolled-no-fastmath-v2",
+  "source_sha256": "877c58e04fd1b2976f4b77868158e06be136f16384807ae1292f58a80f7dcfa8",
+  "binary_sha256": "23fbff68f77290697f2f8df4a274a8b2249361d6e9c8cc1efcbef015bc783f5b",
+  "compiler_sha256": "e9cb3e89e20a9efead83cc9e6b100314275634c2f705056da71f424ea9b0cdf0",
+  "pe_inspection": {
+    "machine": "AMD64",
+    "magic": "PE32+",
+    "dll": true,
+    "bytes": 5632,
+    "exports": [
+      "radial_rgba_abi",
+      "radial_rgba_linear"
+    ],
+    "imports": [],
+    "sections": [
+      {
+        "name": ".text",
+        "virtual_size": 3840,
+        "rva": 4096,
+        "raw_size": 4096,
+        "raw_offset": 512
+      },
+      {
+        "name": ".data",
+        "virtual_size": 248,
+        "rva": 8192,
+        "raw_size": 512,
+        "raw_offset": 4608
+      },
+      {
+        "name": ".pdata",
+        "virtual_size": 60,
+        "rva": 12288,
+        "raw_size": 512,
+        "raw_offset": 5120
+      }
+    ]
+  },
+  "archive_sha256": "34a721949a2583fdff725312da092fa0f5f1f284b702e6f811c6954714faabb2",
+  "compiler": "TinyCC 0.9.27 x86_64 Windows (explicit developer build only)",
+  "recipe": [
+    "<explicit-tcc.exe>",
+    "-Wall",
+    "-shared",
+    "comic_editor/ui/radial_rgba_linear.c",
+    "-o",
+    "comic_editor/ui/radial_rgba_win64.dll"
+  ],
+  "native_validation": {
+    "sampler_cases": 83,
+    "whole_kernel_pairs": 3,
+    "output_bytes": 7291648,
+    "output_sha256": "f08cba5f4c54545b35d917d8845d0351ca1b6ba7926bf2bd8afbddbc106e5987",
+    "scope": "Actual isolated C2 native83 and initialized-worker control geometry; assembled live/initial gates remain separate."
+  },
+  "scope": "Optional owned scalar unrolled sampler; unsupported/missing/failed verification keeps ordinary SciPy. No runtime compiler/download or pixel cache."
+}

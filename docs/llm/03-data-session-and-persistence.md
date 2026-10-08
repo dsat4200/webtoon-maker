@@ -42,6 +42,14 @@ Ordinary folder copies/moves can reuse content identities. Save As excludes
 cache in the new location. Renderer/library/pixel-contract versions isolate
 incompatible entries without discarding source data.
 
+The bounded immutable descriptor memo returns the ordinary canonical identity;
+it is not a second disk key scheme. Every lookup still observes clear epochs and
+validates its ordinary dependencies, seals and blobs. The integration renderer
+epoch isolates incompatible visibility/source results while preserving artwork.
+Job-local distortion preparations and owned rig/mask preview copies are transient
+and never become durable exact entries. See the rendering guide's exact CPU
+distortion preparation section and `tests/test_render_cache_identity.py`.
+
 ## Saved document graph
 
 Chapter schema **27** adds `ToneMask.paint_offset`, a finite document-space
@@ -654,3 +662,7 @@ Undo history itself is never saved. Recovery autosave represents only the latest
 - Decide explicitly whether a new preference belongs to portable series data, chapter data, or per-user settings.
 - Treat render/gesture/camera state as transient unless a product requirement explicitly asks to persist it.
 - If you re-introduce geometric fill objects, integrate them with `fill_migration.py` and the save-block invariant.
+
+### Adding canvas space above artwork
+
+Top height growth is one focused record-history transaction: root layer placement, document-space modifier rigs and mask geometry/paint offsets move by the added height. Nested layer/object coordinates, original ImageStore bytes and sparse TileStore pixels/addresses remain unchanged. Saved masks also follow the document coordinate rebase. A retained explicit export rectangle follows the artwork, even while disabled; no explicit rectangle continues to mean the entire expanded canvas. Undo/redo restores the exact model records and size. Grid overlays and snapping origins remain canvas anchored. A singular saved root quad uses its existing renderer identity fallback before the translated frame is materialized; Undo restores the original record. This is geometry placement only, with no renderer, source/effect sampling, color/precision or durable cache policy change.

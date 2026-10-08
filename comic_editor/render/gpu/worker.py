@@ -15,6 +15,7 @@ from itertools import count
 import numpy as np
 from PySide6.QtCore import QObject, QThread, Slot
 from PySide6.QtGui import QGuiApplication, QOffscreenSurface, QOpenGLContext, QSurfaceFormat
+from shiboken6 import isValid
 
 from .point_chain import GpuPointChain
 from .residency import GRAPHICS_RESIDENCY
@@ -519,15 +520,21 @@ class GpuWorker(QObject):
     def _cleanup_surface(self):
         if QThread.currentThread() != QObject.thread(self):
             raise RuntimeError('Graphics surfaces must be destroyed on the application thread')
-        if self.surface is not None:
-            self.surface.destroy()
+        surface = self.surface
+        if surface is not None:
+            if isValid(surface):
+                surface.destroy()
             self.surface = None
-        if self.worker_thread is not None and not self.worker_thread.isRunning():
-            # A finished QThread must not keep its service and shared GUI
-            # context in a Python cycle. Retire that ownership explicitly on
-            # the application thread, before an unrelated garbage collection.
-            self.worker_thread.service = None
-            self.share_context = None
+        thread = self.worker_thread
+        if thread is not None:
+            valid = isValid(thread)
+            if not valid or not thread.isRunning():
+                # Finished owners can be closed again after Qt deletes their
+                # native wrappers. Keep valid finished threads inspectable.
+                thread.service = None
+                self.share_context = None
+                if not valid:
+                    self.worker_thread = None
 
     def close(self):
         if QThread.currentThread() != QObject.thread(self):
@@ -541,7 +548,8 @@ class GpuWorker(QObject):
                     request.copy_lease.release()
                 self.queued_bytes -= request.size
             self.condition.notify_all()
-        if self.worker_thread is None or self.worker_thread.wait(5000):
+        thread = self.worker_thread
+        if thread is None or not isValid(thread) or thread.wait(5000):
             self._cleanup_surface()
 
 

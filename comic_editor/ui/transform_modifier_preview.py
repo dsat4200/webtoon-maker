@@ -97,7 +97,7 @@ def effective_preview_modifier(canvas, modifier):
             and modifier is color_edit[1]
             and getattr(canvas, "_history_generation", 0) == color_edit[3]):
         return color_edit[2]
-    from comic_editor.ui.attached_translation import preview_attachment_context, translation
+    from comic_editor.ui.attached_translation import preview_attachment_context, preview_cache_context, translation
     if not isinstance(modifier, _RIG_TYPES):
         return modifier
     context = preview_attachment_context(canvas)
@@ -108,9 +108,10 @@ def effective_preview_modifier(canvas, modifier):
     references = owners.get(modifier.modifier_id, set())
     if not references or not references <= moving or (translation(transform) is None and len(references) != 1):
         return modifier
+    baseline, revision = preview_cache_context(canvas)
     key = (id(canvas.chapter), frozenset(moving),
            tuple(getattr(transform, f"m{i}{j}")() for i in range(1, 4) for j in range(1, 4)),
-           id(canvas._model_before), getattr(canvas._document_projection, "revision", None))
+           baseline, revision)
     cache = getattr(canvas, "_transform_modifier_preview_cache", None)
     if cache is None or cache[0] != key:
         cache = canvas._transform_modifier_preview_cache = (key, owners, transform, OrderedDict())

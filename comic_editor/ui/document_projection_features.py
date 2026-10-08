@@ -12,7 +12,9 @@ from comic_editor.ui.document_presentation import (
 from comic_editor.render.service import (
     RenderDocument, RenderRequest, RenderResult, RenderQuality, RenderStatus, TileBatchPolicy,
 )
-from comic_editor.core.models import RasterObject
+from comic_editor.core.models import RasterObject, TextObject
+from comic_editor.core.tools import ToolKind
+from comic_editor.core.document_patch import RecordSnapshot
 from comic_editor.render.sampling import artwork_density
 from comic_editor.ui.color_resources import projection_color_identity
 
@@ -59,6 +61,7 @@ class DocumentProjectionFeatures:
                 mask_entities, pixels)
 
     def _invalidate_selection_scene_cache(self):
+        self._scene_controller.release_handoff.clear("selection/cancel")
         # Selection/tool UI is drawn after document presentation. Underlay and
         # selected mask-only visibility have their own retained configuration.
         # A canceled live preview can change artwork without a model signal;
@@ -67,7 +70,32 @@ class DocumentProjectionFeatures:
         self._invalidate_scene_cache(projection=preview)
         self._projection_captured_live_preview = False
 
-    def _projection_has_live_preview(self, *, include_ink=True):
+    def _text_decoration_only_preview(self):
+        """Existing native glyphs can serve caret/selection-only editing.
+
+        This is presentation eligibility, not a new exact result. Any
+        glyph/geometry/other live change keeps ordinary fresh preview.
+        """
+        if (not self._text_editing or self.chapter is None
+                or self._projection_has_live_preview(include_text=False)):
+            return False
+        obj = self.chapter.objects.get(self.selected_object_id)
+        before = self._text_before_state
+        if (not isinstance(obj, TextObject) or not isinstance(before, RecordSnapshot)
+                or before.document_identity != id(self.chapter)
+                or before.scalars or set(before.records) != {"objects"}):
+            return False
+        records = before.records["objects"]
+        if tuple(records) != (obj.object_id,):
+            return False
+        values = records[obj.object_id]
+        if (not isinstance(values, dict) or set(values) != {"text", "color_runs", "margin"}
+                or max(len(obj.text), len(values["text"])) > 4096
+                or max(len(obj.color_runs), len(values["color_runs"])) > 256):
+            return False
+        return all(getattr(obj, name) == value for name, value in values.items())
+
+    def _projection_has_live_preview(self, *, include_ink=True, include_text=True):
         return (include_ink and bool(getattr(self, "_drawing", False))) or any(bool(getattr(self, name, None)) for name in (
             "_transform_preview_quad", "_multi_transform_preview_quads",
             "_selection_raster_states", "_selection_vector_preview", "_selection_shape_nodes",
@@ -76,7 +104,61 @@ class DocumentProjectionFeatures:
             "_fill_gesture_active", "_text_property_drag", "_shape_property_drag",
             "_raster_paste_overlay", "_overlay_color_preview",
             "_modifier_handle_drag", "_mesh_warp_parameter_drag_id", "_smudge_parameter_drag_id",
-        )) or getattr(self, "_selection_before_tiles", None) is not None
+        ) if include_text or name != "_text_editing") or getattr(self, "_selection_before_tiles", None) is not None
+
+    def _projection_contact_only(self):
+        """Capture an ordinary Raster pencil/eraser contact on the GUI thread.
+
+        This is demand metadata, never a semantic effect/cache key. A live
+        source contact remains provisional and cannot record exact disk tiles.
+        """
+        if (not getattr(self, "_drawing", False)
+                or not getattr(self, "_raster_contact_active", False)
+                or self.chapter is None or self.selected_kind != "object"
+                or self.tool not in {ToolKind.RASTER_PENCIL, ToolKind.RASTER_ERASER}):
+            return False
+        identifier = self.selected_id
+        if (self.selected_object_id != identifier
+                or not isinstance(self.chapter.objects.get(identifier), RasterObject)):
+            return False
+        entities = getattr(self, "selected_entities", ())
+        if len(entities) > 1 or (entities and ("object", identifier) not in entities):
+            return False
+        gate = getattr(self, "_raster_tile_input", None)
+        context = getattr(self, "_raster_native_context", None)
+        current = getattr(gate, "current", None)
+        if (gate is None or getattr(gate, "closed", True)
+                or getattr(gate, "error", None) is not None
+                or getattr(gate, "canvas", None) is not self
+                or getattr(gate, "identifier", None) != identifier
+                or getattr(gate, "chapter", None) is not self.chapter
+                or getattr(gate, "tiles", None) is not self.tiles
+                or not callable(current) or not current()
+                or not isinstance(context, dict)
+                or context.get("object") != identifier or context.get("tool") is not self.tool):
+            return False
+        # Includes transforms, Text, gradient, cage, fill, vector, property and
+        # handle edits, paste/color/page previews, and transient selections.
+        if self._projection_has_live_preview(include_ink=False):
+            return False
+        if any(bool(getattr(self, name, None)) for name in (
+                "active_tone_mask_id", "preview_tone_mask_id", "_mask_tile_input",
+                "_mask_gradient_drag", "_mask_selection_gesture",
+                "_geometry_transform_target", "_selection_transform_quad",
+                "_selection_transform_mode", "_vector_eraser_preview",
+                "_paint_brush_session", "_paint_brush_stroke", "_paint_brush_tile_input",
+                "_lasso_brush", "_lasso_brush_tile_input",
+                "_native_deferred_activations", "_raster_deferred_strokes",
+                "_mask_deferred_strokes", "_paint_brush_deferred", "_lasso_brush_deferred",
+                "_tiling_stroke_context", "_tiling_capture_geometry",
+                "_render_base_alpha", "_render_modifier_sources", "_render_cage_source",
+                "_render_exclude_text", "_rendering_mask_contributor",
+                "_rendering_halftone_source", "_rendering_compound_references",
+                "_rendering_outward_gradient", "_suppress_outline_for_mask",
+                "_live_underlay_object_id", "_live_underlay_amount")):
+            return False
+        selection = getattr(self, "_drawing_selection_path", None)
+        return selection is not None and selection.isEmpty()
 
     def _paint_ready_document_projection(self, painter, *, live_ink=False):
         """Paint is presentation only; capture/evaluation run on separate lanes."""
@@ -107,12 +189,21 @@ class DocumentProjectionFeatures:
         projection.configure((*configuration, phases[0]), document=configuration[:3])
         self._scene_controller.request(document, requests, phases, visible)
         batch, complete = self._scene_controller.ready_batch(document, requests, phases)
+        native_batch_complete = complete
         previous = getattr(self, "_projection_completed_view", None)
         if previous is not None and previous[0] != configuration:
             previous = None
         preview = self._scene_controller.preview
         self._projection_provisional_visible = False
-        if self._scene_controller.preview_mode:
+        if (document.live_preview and complete and any(tiles for _phase, tiles in batch)
+                and self._text_decoration_only_preview()):
+            # These are already-current exact native tiles. Reusing them
+            # for UI decorations avoids switching glyph sampling to a
+            # viewport capture. The active document remains provisional;
+            # no live result is admitted, persisted or marked exact.
+            self._projection_provisional_visible = True
+            complete = False
+        elif self._scene_controller.preview_mode:
             overview = self._scene_controller.overview
             complete = (overview is not None and overview[0] == document
                         and overview[1].world_rect == visible)
@@ -130,6 +221,10 @@ class DocumentProjectionFeatures:
             if sum(storage.values()) <= projection.budget:
                 self._projection_completed_view = configuration, batch, document.revision
             self._projection_presented_revision = document.revision
+        elif self._scene_controller.release_handoff.ticket is not None and preview is not None and preview[0] == document:
+            # Explicit checked pending commit presentation; never exact.
+            batch = [(None, [preview[1]])]
+            self._projection_provisional_visible = True
         elif previous is not None and previous[2] != document.revision:
             # An edited view stays coherent until every requested replacement is
             # ready. Unchanged artwork can be progressively exposed on a pan.
@@ -150,7 +245,10 @@ class DocumentProjectionFeatures:
         with self._show_on_top_scene() if draw_live else nullcontext():
             for phase, tiles in batch:
                 stats.append(draw_document_tiles(painter, tiles, self.camera_transform(), self.size(),
-                    owner=self, smooth=True))
+                    owner=self, smooth=True,
+                    native_context=(document, phase) if (native_batch_complete and not live_ink
+                        and (not document.live_preview or self._text_decoration_only_preview())) else None,
+                    native_bounds=document.bounds))
                 if phase is None:
                     feedback_tiles = self._scene_controller.present_feedback(painter, document)
                 if draw_live:
@@ -173,6 +271,12 @@ class DocumentProjectionFeatures:
             sum(item.uploads for item in stats), stats[-1].texture_bytes if stats else 0)
         if feedback_tiles:
             self._projection_provisional_visible = True
+        if complete:
+            self._scene_controller.release_handoff.clear("current exact presentation")
+        elif self._projection_provisional_visible and preview is not None and stats and sum(item.tiles for item in stats):
+            self._scene_controller.release_handoff.painted(document, preview[1],
+                self._scene_controller._preview_snapshot, self._scene_controller._preview_request,
+                owned=painter.device() is self, swapped_required=hasattr(self, "frameSwapped"))
         projection._trim({request.address for request in requests})
         self._paint_projection_grid(painter, self)
         draw_document_border(painter, document.bounds, self.camera_transform(), self.size(), owner=self)
@@ -244,7 +348,8 @@ class DocumentProjectionFeatures:
         return RenderDocument(configuration[:3], configuration,
             self._document_projection.revision, self.chapter.width, self.chapter.height,
             self.chapter.background, self.chapter.view_overflow, configuration[7],
-            self._projection_has_live_preview(), self.chapter.pixel_contract)
+            self._projection_has_live_preview(), self.chapter.pixel_contract,
+            contact_only=self._projection_contact_only())
 
     def _render_document_tiles(self, requests):
         document = self._render_document_state()

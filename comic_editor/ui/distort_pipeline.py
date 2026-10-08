@@ -47,6 +47,8 @@ def render_distort_stage(canvas, image, base, bounds, target, modifier,
                          local_to_world, fields, key, scope, provisional, navigator):
     from comic_editor.ui.distort_rendering import PreparedDistortCache, render_distort
 
+    from comic_editor.render.live_canvas_preview import check_live_canvas_cancelled
+    policy = check_live_canvas_cancelled(canvas)
     exact = projection_requires_exact(canvas)
     large = max(image.width() * image.height(), base.width() * base.height()) > 128 * 128
     interactive = (canvas._interactive_render and not canvas._render_base_alpha
@@ -74,7 +76,7 @@ def render_distort_stage(canvas, image, base, bounds, target, modifier,
                       dtype=np.float32, copy=True)
     amount /= 100.0
     preparation_cache = None
-    if (exact or mesh_preview) and not deferred:
+    if (exact or mesh_preview or policy is not None) and not deferred:
         preparation_cache = getattr(canvas, "_distort_preparation_cache", None)
         if preparation_cache is None:
             preparation_cache = canvas._distort_preparation_cache = PreparedDistortCache()
@@ -100,6 +102,20 @@ def render_distort_stage(canvas, image, base, bounds, target, modifier,
         return _premultiplied_qimage(_qimage_premultiplied(blend_base) * (1 - blend_amount)
                                      + _qimage_premultiplied(warped) * blend_amount)
 
+    if policy is not None and modifier.modifier_type in {
+            "distort_deform", "distort_mesh_warp", "distort_twirl",
+            "distort_lens_distortion", "distort_pinch_punch"}:
+        draft_key = ("live-canvas-distort-draft", policy.signature, key)
+        result = canvas._modifier_cache_get(draft_key)
+        if result is None:
+            result = compute(policy.cancelled, pixel_scale=policy.scale(base.width(), base.height()))
+            policy.check_cancelled()
+            if result is None:
+                from comic_editor.render.service import RenderFailed
+                raise RenderFailed("Current live distortion returned no artwork")
+            canvas._modifier_cache_put(draft_key, result)
+        policy.check_cancelled()
+        return result.scaled(base.size(), Qt.IgnoreAspectRatio, Qt.SmoothTransformation), True
     if mesh_preview:
         # Handle motion owns this temporary result. Do not enqueue a native
         # render for every intermediate mesh; release renders finished pixels.

@@ -122,7 +122,19 @@ def tile_output(canvas, image, bounds, modifiers, mapping, *, required, request_
         if isinstance(modifier, DitheringModifier) and not float_pipeline:
             # The compatibility stage renderer resets this lattice per stage.
             padding = None
-        def required_input(output, pad=padding, source_frame=incoming, effect=modifier, copies=transforms):
+        native_pinch = (not float_pipeline and projection_requires_exact(canvas)
+                        and not projection_deferred(canvas) and isinstance(modifier, DistortModifier)
+                        and modifier.modifier_type == 'distort_pinch_punch'
+                        and not modifier.parameter_masks)
+        def required_input(output, pad=padding, source_frame=incoming, effect=modifier, copies=transforms,
+                           pinch=native_pinch):
+            if pinch:
+                from comic_editor.ui.distort_rendering import native_pinch_input_region, PREPARED_DISTORT_CACHE_BUDGET
+                cache = getattr(canvas, '_distort_preparation_cache', None)
+                needed = native_pinch_input_region(source_frame, output, effect, mapping,
+                    budget=cache.budget if cache is not None else PREPARED_DISTORT_CACHE_BUDGET)
+                if needed is not None:
+                    return needed
             if copies is not None:
                 # The first image is the unchanged source at the output. Each
                 # transformed copy has its own inverse-mapped sampling region.
@@ -137,7 +149,8 @@ def tile_output(canvas, image, bounds, modifiers, mapping, *, required, request_
             return (needed if isinstance(effect, (OutlineModifier, BlurModifier)) and not float_pipeline
                     else needed.intersected(source_frame))
         def evaluate(output, source, source_bounds, effect=modifier, stage=index,
-                     source_frame=incoming, output_frame=frame, prefix=identity, halo=padding, copies=transforms):
+                     source_frame=incoming, output_frame=frame, prefix=identity, halo=padding, copies=transforms,
+                     pinch=native_pinch):
             if copies is not None:
                 from comic_editor.render.effect_pipeline import empty_image
                 result = empty_image(output)
@@ -168,6 +181,31 @@ def tile_output(canvas, image, bounds, modifiers, mapping, *, required, request_
                 painter.drawImage(0, 0, source[0])
                 painter.end()
                 return result
+            if pinch and source_bounds != source_frame:
+                from comic_editor.render.effect_pipeline import empty_image
+                from comic_editor.ui.distort_rendering import PreparedDistortCache, render_distort
+                # The demanded source crop is allocated by the original graph;
+                # source_frame remains the complete native effect reference.
+                cache = getattr(canvas, '_distort_preparation_cache', None)
+                if cache is None:
+                    cache = canvas._distort_preparation_cache = PreparedDistortCache()
+                warped = render_distort(source, source_frame, effect, mapping, output,
+                    preparation_cache=cache, native_input_bounds=source_bounds)
+                if warped is None:
+                    return None
+                amount = np.array(_parameter_field(effect, 'intensity', effect.intensity,
+                    (warped.height(), warped.width()), {}), dtype=np.float32, copy=True)
+                amount /= 100.
+                if amount.ndim == 0 and float(amount) == 1.:
+                    return warped
+                base = empty_image(output)
+                painter = QPainter(base)
+                try:
+                    painter.drawImage(source_bounds.topLeft()-output.topLeft(), source)
+                finally:
+                    painter.end()
+                return _premultiplied_qimage(_qimage_premultiplied(base)*(1.-amount)
+                                            + _qimage_premultiplied(warped)*amount)
             if halo is None:
                 return render_stages(canvas, source, source_bounds, [effect], mapping,
                     nearest=nearest, source_key=("tile-frame-input", source_identity, placement, signatures[:stage]),

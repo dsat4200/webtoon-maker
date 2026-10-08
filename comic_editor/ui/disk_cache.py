@@ -436,7 +436,11 @@ class DiskCacheController(QObject):
                 self._capture = None
         checked = 0
         status_changed = False
-        while self._status_queue and checked < 8 and time.perf_counter() < deadline:
+        # Queue validation walks committed scene dependencies. Leave its rows
+        # queued while the editor owns transient geometry or native ink.
+        # Completion/read/maintenance/build handling above still runs.
+        status_paused = bool(self.canvas._drawing or self.canvas._projection_has_live_preview())
+        while not status_paused and self._status_queue and checked < 8 and time.perf_counter() < deadline:
             row = self._status_queue.popleft()
             ready = self.row_ready(row)
             status_changed |= self.status.get(row) != ready

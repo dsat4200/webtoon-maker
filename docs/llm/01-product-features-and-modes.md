@@ -335,3 +335,7 @@ The grid uses the resolved user → document → nearest-layer size, divisions,
 color, and opacity for both canvas drawing and snapping. Box boundaries render
 at full configured opacity; subdivision lines render at 65% of that opacity.
 Alt+G persists the user-wide visibility gate without dirtying the document.
+
+### Resize Canvas height
+
+Resize Canvas changes chapter height. Additional height goes to Bottom by default; selecting Top when growing moves the existing comic down by the added height. Shrinking retains the existing safe bottom trim and never moves artwork. Image documents keep their protected fixed canvas.

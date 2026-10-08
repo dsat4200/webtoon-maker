@@ -9,7 +9,7 @@ import time
 import numpy as np
 import pytest
 from PySide6.QtCore import QPointF, QRect, QRectF, Qt
-from PySide6.QtGui import QColor, QGuiApplication, QImage, QPainter, QSurfaceFormat
+from PySide6.QtGui import QColor, QGuiApplication, QImage, QOpenGLContext, QPainter, QSurfaceFormat
 from shiboken6 import delete, isValid
 
 from comic_editor.core.images import ImageStore
@@ -38,6 +38,7 @@ class CapturedGpuCanvas(GpuCanvasWidget):
         self.frames = 0
         self.frame_pixels = None
         self.dirty_regions = []
+        self.frame_capture = None
 
     def _draw_tablet_hover(self, painter):
         # A deterministic UI overlay in the same post-presentation phase as the
@@ -55,9 +56,37 @@ class CapturedGpuCanvas(GpuCanvasWidget):
                           ctypes.c_int, ctypes.c_uint, ctypes.c_uint, ctypes.c_void_p)(
             self.context().getProcAddress(b"glReadPixels")
         )
+        context = QOpenGLContext.currentContext()
+        assert context is self.context(), 'Capture requires actual owning current GL context'
+        gl = context.functions()
+        assert int(gl.glGetIntegerv(0x8CAA)) == int(self.defaultFramebufferObject()), 'Capture requires owned read FBO'
+        assert int(gl.glGetIntegerv(0x0C02)) == 0x8CE0, 'Capture requires actual color attachment0'
         read(0, 0, width, height, 0x1908, 0x1401, output.ctypes.data)
         self.frame_pixels = output[::-1].copy()
         self.frames += 1
+        document = self._render_document_state()
+        controller = self._scene_controller
+        completed = self._projection_completed_view
+        keys = tuple((phase, tuple((tile.key, tuple(tile.world_rect.getRect()), int(tile.image.cacheKey()))
+                                   for tile in tiles)) for phase, tiles in completed[1]) if completed is not None else ()
+        assert sum(len(row[1]) for row in keys) <= 64, 'Fixture metadata bound exceeded'
+        camera = self.camera_transform()
+        presented_initialized = '_projection_presented_revision' in vars(self)
+        presented_revision = getattr(self, '_projection_presented_revision', None)
+        self.frame_capture = {
+            'frame': self.frames, 'document': document, 'source_keys': keys,
+            'completed_revision': completed[2] if completed is not None else None,
+            'presented_revision': presented_revision,
+            'presented_revision_initialized': presented_initialized,
+            'pending': self._projection_frame_pending,
+            'camera': tuple(getattr(camera, f'm{i}{j}')() for i in range(1, 4) for j in range(1, 4)),
+            'dpr': self.devicePixelRatioF(), 'size': (width, height),
+            'current': bool(completed is not None and completed[0] == document.configuration
+                and completed[2] == document.revision and presented_initialized
+                and presented_revision is not None and presented_revision == document.revision
+                and not self._projection_frame_pending and not controller.scheduler.busy
+                and controller.snapshot is not None and controller.snapshot.document == document),
+        }
 
 
 @pytest.fixture
@@ -90,6 +119,18 @@ def native_scene(qapp, monkeypatch, wait_scene):
         canvas.deleteLater()
         pytest.skip("No valid native OpenGL widget")
     wait_scene(canvas)
+    # wait_scene's QImage render can execute paintGL without this fixture's
+    # paintEvent reader. Require a subsequent actual owned current frame.
+    before_frame = canvas.frames
+    deadline = time.monotonic() + 10.
+    while time.monotonic() < deadline:
+        canvas.update()
+        qapp.processEvents()
+        if canvas.frames > before_frame and canvas.frame_capture and canvas.frame_capture['current']:
+            break
+        time.sleep(.002)
+    else:
+        pytest.fail(f'No current owned capture after ordinary settlement: {canvas.frame_capture!r}')
     yield canvas
     if isValid(canvas):
         canvas._scene_controller.reset()
@@ -161,10 +202,15 @@ def test_native_canvas_displays_retained_artwork_and_reuses_navigation(native_sc
 def test_small_native_update_preserves_overlay_outside_dirty_region(native_scene, qapp):
     canvas = native_scene
     initial = canvas.frame_pixels.copy()
+    initial_capture = canvas.frame_capture
+    assert initial_capture["current"]
     before = canvas.frames
     canvas.update(QRect(420, 420, 12, 12))
     qapp.processEvents()
     assert canvas.frames > before
+    assert canvas.frame_capture['current'], canvas.frame_capture
+    for name in ('document', 'source_keys', 'completed_revision', 'presented_revision', 'camera', 'dpr', 'size'):
+        assert canvas.frame_capture[name] == initial_capture[name], name
     assert_pixel(canvas, 12, 12, [0, 255, 0, 255])
     np.testing.assert_array_equal(canvas.frame_pixels, initial)
     assert canvas._document_presentation_stats.uploads == 0

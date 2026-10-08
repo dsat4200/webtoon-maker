@@ -3103,6 +3103,10 @@ class SceneKernels:
             pixels = self.tiles.object_signature(obj.object_id) if pixel_signature is None else pixel_signature
         elif isinstance(obj, ImageObject):
             pixels = self.images.pixel_signature(obj.object_id)
+            if obj.placement_mode == "fit_parent":
+                # Parent geometry can change the fitted destination within
+                # unchanged aligned bounds. Preserve its complete native quad.
+                pixels = (pixels, ("image-fit-quad", tuple(self._image_model_local_quad(obj))))
         elif isinstance(obj, ColorFillGradientObject):
             # Shape gradients and line-field coverage also depend on the
             # effective parent shape, including edits with unchanged bounds.
@@ -3468,6 +3472,20 @@ class SceneKernels:
         painter.drawImage(bounds.topLeft(), processed)
         painter.restore()
 
+    def _mirror_source_text_local_bounds(self, obj):
+        """Match current supported free-Text geometry to the source capture."""
+        if not isinstance(obj, TextObject) or obj.layout_mode != 'free':
+            return None
+        preview = self._multi_transform_preview_quads.get(obj.object_id)
+        if (preview is None and obj.object_id == self.selected_object_id
+                and self._geometry_transform_target is None
+                and self._transform_preview_quad is not None
+                and self._transform_start_quad is not None):
+            preview = self._transform_preview_quad
+        if preview is None:
+            return None
+        return QPolygonF([QPointF(*point) for point in self._text_quad(obj)]).boundingRect()
+
     def _render_mirror_target(self, painter, target, parent_opacity, visible):
         layer = isinstance(target, LayerNode)
         kind, identifier = ("layer", target.layer_id) if layer else ("object", target.object_id)
@@ -3477,16 +3495,25 @@ class SceneKernels:
         inverse, valid = mapping.inverted()
         if not valid:
             return
+        live_text_bounds = (self._mirror_source_text_local_bounds
+            if (self._geometry_transform_target is None
+                and self._transform_preview_quad is not None and self._transform_start_quad is not None
+                and isinstance(self.chapter.objects.get(self.selected_object_id), TextObject))
+                or any(isinstance(self.chapter.objects.get(key), TextObject)
+                       for key in self._multi_transform_preview_quads)
+            else None)
         world = entity_visual_bounds(self.chapter, self.tiles, kind, identifier,
-                                     layer_mapping=self.layer_world_transform)
+                                     layer_mapping=self.layer_world_transform,
+                                     object_local_bounds=live_text_bounds)
         if not layer:
             from comic_editor.ui.attached_translation import preview_object_bounds
-            world = preview_object_bounds(self, target, world)
+            world = preview_object_bounds(self, target, world, local_aabb=True)
         world = world.united(self._raster_selection_capture_bounds(kind, identifier))
         if layer:
             from comic_editor.ui.baking import visual_bounds
             for child in target.children:
-                world = world.united(visual_bounds(self, child.kind, child.entity_id))
+                world = world.united(visual_bounds(self, child.kind, child.entity_id,
+                    object_local_bounds=live_text_bounds))
             from comic_editor.ui.compound_strokes import scoped
             if scoped(self, target):
                 world = world.united(self.layer_world_transform(identifier).mapRect(self.layer_effective_path(identifier).controlPointRect()))

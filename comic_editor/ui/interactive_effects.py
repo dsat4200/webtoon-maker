@@ -6,7 +6,7 @@ import numpy as np
 from PySide6.QtCore import QRectF, Qt
 from PySide6.QtGui import QImage, QTransform
 
-from comic_editor.core.models import BlurModifier, OutlineModifier, KuwaharaModifier, SharpnessModifier, DitheringModifier
+from comic_editor.core.models import BlurModifier, OutlineModifier, KuwaharaModifier, SharpnessModifier, DitheringModifier, HueSaturationLightnessModifier
 from comic_editor.core.effect_geometry import outline_blur_padding
 from comic_editor.ui.modifier_rendering import (
     BlurPyramidCache, OutlineDistanceCache, apply_modifier_stack,
@@ -43,7 +43,7 @@ def outline_capture_bounds(canvas, painter, bounds, visible, modifiers):
     return bounds.intersected(QRectF(left, top, right-left, bottom-top))
 
 
-def _draft(image, modifiers, origin, fields, mapping, nearest):
+def _draft(image, modifiers, origin, fields, mapping, nearest, cancelled=None):
     scale = min(1., 256 / max(image.width(), image.height()),
                 (32768 / (image.width() * image.height())) ** .5)
     width, height = max(1, round(image.width() * scale)), max(1, round(image.height() * scale))
@@ -87,7 +87,8 @@ def _draft(image, modifiers, origin, fields, mapping, nearest):
              if np.shape(value) == (image.height(), image.width())}
     transform = mapping * QTransform.fromScale(scale, scale) if mapping is not None else None
     result = apply_modifier_stack(small, effects, tuple(value * scale for value in origin),
-                                  masks, world_to_image=transform, nearest=nearest)
+                                  masks, world_to_image=transform, nearest=nearest,
+                                  cancelled=cancelled)
     return result
 
 
@@ -130,6 +131,22 @@ def render_interactive_stack(canvas, image, modifiers, world_origin, mask_fields
         inexpensive = False
     asynchronous = (deferred and pixels > 16384 or
                     interactive and not exact and not inexpensive and not upstream_provisional and not preview_only)
+    from comic_editor.render.live_canvas_preview import check_live_canvas_cancelled
+    policy = check_live_canvas_cancelled(canvas)
+    supported = (BlurModifier, OutlineModifier, KuwaharaModifier, SharpnessModifier, DitheringModifier, HueSaturationLightnessModifier)
+    if (policy is not None and not inexpensive and active
+            and all(isinstance(modifier, supported) for modifier in active)):
+        draft_key = ("live-canvas-stack-draft", policy.signature, cache_key, int(image.cacheKey()))
+        result = canvas._modifier_cache_get(draft_key)
+        if result is None:
+            result = _draft(image, modifiers, world_origin, fields, world_to_image, nearest, policy.cancelled)
+            policy.check_cancelled()
+            if result is None:
+                from comic_editor.render.service import RenderFailed
+                raise RenderFailed("Current live stack returned no artwork")
+            canvas._modifier_cache_put(draft_key, result)
+        canvas._effect_provisional_revision = getattr(canvas, "_effect_provisional_revision", 0) + 1
+        return result.scaled(image.size(), Qt.IgnoreAspectRatio, Qt.FastTransformation), True
     if asynchronous:
         incoming, effects = QImage(image), deepcopy(modifiers)
         masks = {key: np.array(value, copy=True) for key, value in fields.items()}

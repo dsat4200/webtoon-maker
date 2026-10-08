@@ -1526,6 +1526,7 @@ class _CanvasLogic(SceneKernels, LassoBrushFeatures, BrushFeatures, DocumentProj
         from comic_editor.ui.tool_sessions import retire_input_sessions
         retire_input_sessions(self)
         self._scene_controller.reset()
+        self._native_raster_mosaic = None
         self._projection_completed_view = None
         self._projection_progress_view = None
         self._projection_stroke_preview = None
@@ -1619,7 +1620,8 @@ class _CanvasLogic(SceneKernels, LassoBrushFeatures, BrushFeatures, DocumentProj
         images: ImageStore | None = None, reset_view: bool = True,
     ) -> None:
         from comic_editor.ui.point_lut import prepare_point_worker
-        QTimer.singleShot(0, prepare_point_worker)
+        if not isinstance(self, QOpenGLWidget):
+            QTimer.singleShot(0, prepare_point_worker)
         self._solo_entities = set()
         self._cancel_mask_selection()
         self._mask_gradient_drag = None
@@ -1990,7 +1992,7 @@ class _CanvasLogic(SceneKernels, LassoBrushFeatures, BrushFeatures, DocumentProj
             return
         self._bind_change_index()
         self._scene_snapshot_compiler.invalidate(change)
-        self._scene_controller.changed(change)
+        self._scene_controller.changed(change, action=action)
         affected = self._change_index.publish(change, self.chapter)
         self._last_published_change = change
         if affected:
@@ -5651,11 +5653,12 @@ class _CanvasLogic(SceneKernels, LassoBrushFeatures, BrushFeatures, DocumentProj
             return
         painter.save()
         try:
-            clip = self._ancestor_mask_path("object", obj.object_id)
+            clip = self._text_presentation_clip(obj)
             if clip is not None:
                 if clip.isEmpty():
                     return
                 painter.setClipPath(clip, Qt.IntersectClip)
+            painter.setTransform(self._text_presentation_transform(obj), True)
             opacity = 1.0
             for layer in self.chapter.ancestor_layers(obj.parent_layer_id):
                 if not layer.visible or layer.opacity <= 0:
@@ -6003,6 +6006,7 @@ class _CanvasLogic(SceneKernels, LassoBrushFeatures, BrushFeatures, DocumentProj
                             self.tool == ToolKind.TEXT_EDIT
                             and isinstance(selected_object, TextObject)
                             and selected_object.layout_mode == "free"
+                            and self._text_presentation_transform(selected_object).isIdentity()
                         )
                     )
                 ):
@@ -6026,8 +6030,7 @@ class _CanvasLogic(SceneKernels, LassoBrushFeatures, BrushFeatures, DocumentProj
                 ):
                     radius = 5 / max(self.scale, 0.05)
                     painter.setBrush(QColor("#ffcc66"))
-                    rect = self.object_world_rect(obj.object_id)
-                    for point in self._edge_midpoints(self._rect_quad(rect)):
+                    for point in self._edge_midpoints(self._text_interaction_quad(obj)):
                         painter.drawRect(QRectF(
                             point[0] - radius, point[1] - radius,
                             radius * 2, radius * 2,
@@ -8549,6 +8552,9 @@ class _CanvasLogic(SceneKernels, LassoBrushFeatures, BrushFeatures, DocumentProj
                 transform.map(QPointF(x, y)).toTuple()
                 for x, y in self._transform_preview_quad
             ]
+        obj = self.chapter.objects.get(self.selected_id)
+        if self.tool == ToolKind.TEXT_EDIT and isinstance(obj, TextObject):
+            return self._text_interaction_quad(obj)
         return self.object_world_quad(self.selected_id)
 
     def selected_widget_rect(self) -> QRect:
@@ -8637,7 +8643,15 @@ class _CanvasLogic(SceneKernels, LassoBrushFeatures, BrushFeatures, DocumentProj
                 and layer.layer_id not in skipped_masks
             ):
                 path = self.layer_effective_path(layer.layer_id)
-                local = self._layer_world_to_local(layer.layer_id, point)
+                mask_point = point
+                if isinstance(obj, TextObject):
+                    inverse, valid = self._text_presentation_transform(
+                        obj, from_layer=layer.layer_id
+                    ).inverted()
+                    if not valid:
+                        return False
+                    mask_point = inverse.map(point)
+                local = self._layer_world_to_local(layer.layer_id, mask_point)
                 if not path.contains(local):
                     return False
         return True
@@ -8668,6 +8682,12 @@ class _CanvasLogic(SceneKernels, LassoBrushFeatures, BrushFeatures, DocumentProj
             return False
         if isinstance(obj, TextObject) and not obj.opacity_locked and obj.opacity <= 0:
             return False
+        if isinstance(obj, TextObject):
+            path = QPainterPath()
+            path.addPolygon(QPolygonF([
+                QPointF(*p) for p in self._text_interaction_quad(obj)
+            ]))
+            return path.contains(point)
         if isinstance(obj, SpeedLineCenterObject):
             return False
         if isinstance(obj, VectorDrawingObject):
@@ -9846,13 +9866,14 @@ class _CanvasLogic(SceneKernels, LassoBrushFeatures, BrushFeatures, DocumentProj
             text_path = QPainterPath()
             text_path.addPolygon(QPolygonF([
                 QPointF(*candidate)
-                for candidate in self.object_world_quad(
-                    selected_object.object_id
-                )
+                for candidate in self._text_interaction_quad(selected_object)
             ]))
             over_selected_text = text_path.contains(world)
 
         transform_hover = self._active_transform_hover_kind(world)
+        if (self.tool == ToolKind.TEXT_EDIT and isinstance(selected_object, TextObject)
+                and not self._text_presentation_transform(selected_object).isIdentity()):
+            transform_hover = ""
         translation_active = bool(
             self._transform_drag_mode == "translate"
             or self._selection_transform_mode == "translate"
@@ -16680,6 +16701,13 @@ class _CanvasLogic(SceneKernels, LassoBrushFeatures, BrushFeatures, DocumentProj
                 self._eyedropper_sampling = True
                 self.eyedropperGestureChanged.emit(True)
             return
+        if (self.tool == ToolKind.TRANSFORM and len(self.selected_entities) > 1
+                and any(kind == 'object'
+                    and isinstance(self.chapter.objects.get(identifier), TextObject)
+                    and self.chapter.objects[identifier].layout_mode != 'free'
+                    for kind, identifier in self.selected_entities)):
+            self._request_object_selection(point, widget_point)
+            return
         if self._begin_cage_handle(widget_point, modifiers):
             return
         if self._begin_modifier_handle(widget_point, pressure):
@@ -16718,6 +16746,12 @@ class _CanvasLogic(SceneKernels, LassoBrushFeatures, BrushFeatures, DocumentProj
         if self._begin_text_property_drag(widget_point):
             return
         if self._text_behavior_hit(widget_point):
+            return
+        text = self._editing_text_object()
+        if (text is not None and not self._text_presentation_transform(text).isIdentity()
+                and self._begin_text_pointer(point)):
+            # A displayed cage frame is an editor target. Do not start a
+            # source-frame transform capture or fall through to page selection.
             return
         if self._begin_free_text_transform(point):
             return
@@ -17502,6 +17536,7 @@ class _CanvasLogic(SceneKernels, LassoBrushFeatures, BrushFeatures, DocumentProj
         if (
             self._model_before is not None
             and self._transform_preview_quad is not None
+            and self._geometry_transform_target is None
             and self._is_transformable_object(
                 self.chapter.objects.get(self.selected_object_id)
             )
@@ -18085,6 +18120,8 @@ class _CanvasLogic(SceneKernels, LassoBrushFeatures, BrushFeatures, DocumentProj
             self.set_selection(
                 hit["kind"], hit["id"], activate_default_tool=True
             )
+            if self._editing_text_object() is not None:
+                self._begin_text_pointer(point)
             return
         page_id = self.active_page_id
         if page_id and page_id in self.chapter.layers:
@@ -18107,6 +18144,8 @@ class _CanvasLogic(SceneKernels, LassoBrushFeatures, BrushFeatures, DocumentProj
             )
             return True
         self.set_selection("object", hits[0]["id"], activate_default_tool=True)
+        if self._editing_text_object() is not None:
+            self._begin_text_pointer(point)
         return True
 
     def _selected_shape_node(self, bound: BoundGeometry) -> PathNode | None:
@@ -20364,6 +20403,9 @@ class _CanvasLogic(SceneKernels, LassoBrushFeatures, BrushFeatures, DocumentProj
         for kind, entity_id in self.selected_entities:
             if kind != "object":
                 return None
+            obj = self.chapter.objects.get(entity_id)
+            if isinstance(obj, TextObject) and obj.layout_mode != 'free':
+                return None
             candidate = self.object_world_rect(entity_id)
             if candidate is None:
                 continue
@@ -20385,8 +20427,11 @@ class _CanvasLogic(SceneKernels, LassoBrushFeatures, BrushFeatures, DocumentProj
         self._transform_handle_index = handle
         self._transform_drag_mode = mode
         from comic_editor.ui.attached_translation import record_snapshot
+        object_fields = (None if any(isinstance(self.chapter.objects.get(identifier), TextObject)
+            for kind, identifier in self.selected_entities if kind == 'object')
+            else ('x', 'y', 'transform_frame', 'transform_quad'))
         self._model_before = record_snapshot(self.chapter, self.selected_entities,
-            object_fields=('x', 'y', 'transform_frame', 'transform_quad'))
+            object_fields=object_fields)
         self._drag_start_doc = QPointF(point)
         self._transform_start_quad = list(cage)
         self._transform_preview_quad = list(cage)
@@ -20673,6 +20718,11 @@ class _CanvasLogic(SceneKernels, LassoBrushFeatures, BrushFeatures, DocumentProj
                 self._multi_transform_preview_quads.items()
             ):
                 obj = self.chapter.objects.get(object_id)
+                if isinstance(obj, TextObject):
+                    if obj.layout_mode == 'free':
+                        obj.transform_quad = list(destination_quad)
+                        obj.x = obj.y = 0
+                    continue
                 if not isinstance(obj, (RasterObject, VectorDrawingObject,
                                         ImageObject)):
                     continue
@@ -20792,6 +20842,9 @@ class _CanvasLogic(SceneKernels, LassoBrushFeatures, BrushFeatures, DocumentProj
     def _object_transform_cage_visible(
         self, obj: DocumentObject | None,
     ) -> bool:
+        if (self.tool == ToolKind.TEXT_EDIT and isinstance(obj, TextObject)
+                and not self._text_presentation_transform(obj).isIdentity()):
+            return False
         if not self._is_transformable_object(obj):
             return False
         if self.tool in {ToolKind.BRUSH, ToolKind.LASSO_BRUSH}:
@@ -21133,6 +21186,13 @@ class _CanvasLogic(SceneKernels, LassoBrushFeatures, BrushFeatures, DocumentProj
             self._invalidate_scene_cache()
 
     def _commit_object_transform(self) -> None:
+        ticket = self._scene_controller.release_handoff.begin()
+        try:
+            self._commit_object_transform_without_handoff()
+        finally:
+            self._scene_controller.release_handoff.finish(ticket)
+
+    def _commit_object_transform_without_handoff(self) -> None:
         object_id = self.selected_object_id
         obj = self.chapter.objects[object_id]
         before_model = self._model_before
@@ -21204,6 +21264,7 @@ class _CanvasLogic(SceneKernels, LassoBrushFeatures, BrushFeatures, DocumentProj
         self.update()
 
     def _clear_transform_preview(self) -> None:
+        self._scene_controller.release_handoff.clear("cancel/clear preview")
         self._attached_preview_context = None
         self._model_before = None
         self._transform_start_quad = None
@@ -21712,6 +21773,7 @@ class _CanvasLogic(SceneKernels, LassoBrushFeatures, BrushFeatures, DocumentProj
         self, obj: TextObject,
     ) -> tuple[QTextDocument, QPointF, QTransform]:
         layer_transform = self.layer_world_transform(obj.parent_layer_id)
+        presentation = self._text_presentation_transform(obj)
         if obj.layout_mode == "strict":
             rect = self._strict_text_rect(obj)
             document = self._text_document(obj, rect.width())
@@ -21719,14 +21781,14 @@ class _CanvasLogic(SceneKernels, LassoBrushFeatures, BrushFeatures, DocumentProj
             local = QTransform()
             local.translate(rect.left(), rect.top() + offset)
             return (
-                document, QPointF(), local * layer_transform,
+                document, QPointF(), local * layer_transform * presentation,
             )
         source = QRectF(0, 0, max(1.0, obj.width), max(1.0, obj.height))
         document = self._text_document(obj, source.width())
         offset = self._text_vertical_offset(obj, document, source.height())
         transform = self._quad_transform(source, self._text_quad(obj))
         transform.translate(0, offset)
-        return document, QPointF(), transform * layer_transform
+        return document, QPointF(), transform * layer_transform * presentation
 
     def _text_local_point(
         self, obj: TextObject, world: QPointF,
@@ -21748,7 +21810,7 @@ class _CanvasLogic(SceneKernels, LassoBrushFeatures, BrushFeatures, DocumentProj
             object_path = QPainterPath()
             object_path.addPolygon(QPolygonF([
                 QPointF(*candidate)
-                for candidate in self.object_world_quad(obj.object_id)
+                for candidate in self._text_interaction_quad(obj)
             ]))
             if not object_path.contains(point):
                 return None
@@ -21806,8 +21868,7 @@ class _CanvasLogic(SceneKernels, LassoBrushFeatures, BrushFeatures, DocumentProj
         if obj is None:
             return False
         if obj.layout_mode == "strict":
-            world_rect = self.object_world_rect(obj.object_id)
-            handles = self._edge_midpoints(self._rect_quad(world_rect))
+            handles = self._edge_midpoints(self._text_interaction_quad(obj))
             distances = [math.dist((point.x(), point.y()), item) for item in handles]
             if distances and min(distances) <= 12 / max(self.scale, 0.05):
                 self._begin_text_session(obj)
@@ -21835,6 +21896,10 @@ class _CanvasLogic(SceneKernels, LassoBrushFeatures, BrushFeatures, DocumentProj
         if self._strict_margin_edge is not None:
             dirty = self._text_visual_dirty(obj)
             parent = self.chapter.layers[obj.parent_layer_id]
+            inverse, valid = self._text_presentation_transform(obj).inverted()
+            if not valid:
+                return
+            point = inverse.map(point)
             local = self._layer_world_to_local(obj.parent_layer_id, point)
             left, top, width, height = parent.bound.bbox()
             local_x, local_y = local.x(), local.y()
@@ -22077,9 +22142,57 @@ class RasterCanvasWidget(_CanvasLogic, QWidget):
 
 
 class GpuCanvasWidget(_CanvasLogic, QOpenGLWidget):
+    def paintEvent(self, event):  # noqa: N802
+        # Qt owns the widget FBO lifecycle; paintGL draws the canvas frame.
+        QOpenGLWidget.paintEvent(self, event)
+    def paintGL(self):  # noqa: N802
+        import ctypes
+        context = QOpenGLContext.currentContext()
+        if context is None or context is not self.context():
+            raise RuntimeError('Canvas frame needs its owning current context')
+        gl, extra = context.functions(), context.extraFunctions()
+        framebuffer = int(self.defaultFramebufferObject())
+        if (not framebuffer or gl.glGetIntegerv(0x8CA6) != framebuffer
+                or gl.glGetIntegerv(0x8825) != 0x8CE0):
+            raise RuntimeError('Canvas clear needs its owned color attachment')
+        # Supply exact four-value storage; generated vector getters can
+        # allocate scalar storage in some PySide releases.
+        convention = getattr(ctypes, 'WINFUNCTYPE', ctypes.CFUNCTYPE)
+        query_address = context.getProcAddress(b'glGetBooleanv')
+        clear_address = context.getProcAddress(b'glClearBufferfv')
+        if not query_address or not clear_address:
+            raise RuntimeError('Canvas clear entry points unavailable')
+        query = convention(None, ctypes.c_uint, ctypes.POINTER(ctypes.c_ubyte))(query_address)
+        clear = convention(None, ctypes.c_uint, ctypes.c_int,
+                           ctypes.POINTER(ctypes.c_float))(clear_address)
+        mask = (ctypes.c_ubyte * 4)()
+        query(0x0C23, mask)  # GL_COLOR_WRITEMASK, draw buffer0
+        scissor = bool(gl.glIsEnabled(0x0C11))
+        try:
+            gl.glDisable(0x0C11)
+            extra.glColorMaski(0, True, True, True, True)
+            # Presentation only: reset transparent native tiles over the
+            # same background before any possibly clipped QPainter pass.
+            color = (ctypes.c_float * 4)(36 / 255., 36 / 255., 40 / 255., 1.)
+            clear(0x1800, 0, color)  # GL_COLOR, existing attachment0
+        finally:
+            extra.glColorMaski(0, *mask)
+            (gl.glEnable if scissor else gl.glDisable)(0x0C11)
+        _CanvasLogic.paintEvent(self, None)
+
     def initializeGL(self):  # noqa: N802
         from comic_editor.ui.point_lut import prepare_point_worker
-        prepare_point_worker(self)
+        context = self.context()
+        def prepare_owned_worker():
+            try:
+                valid = (context is not None and self.context() is context
+                         and context.isValid())
+            except RuntimeError:
+                return  # The queued owner/context was retired.
+            if valid:
+                prepare_point_worker(self)
+        # Construct the complete owner after Qt finishes initializeGL.
+        QTimer.singleShot(0, self, prepare_owned_worker)
 
     """OpenGL-backed presentation using the same sparse document renderer."""
 

@@ -185,6 +185,9 @@ def _stage_plan(canvas, bounds, modifiers, local_to_world, source_identity, near
 
 
 def _checkpoint_enabled(canvas, request_scope, provisional=False):
+    from comic_editor.render.live_canvas_preview import live_canvas_policy
+    if live_canvas_policy(canvas) is not None:
+        return False
     return (request_scope is not None and (canvas._interactive_render or exact_reference_sampling(canvas))
             and getattr(canvas, "_effect_preview_channel", "canvas") != "navigator"
             and not provisional and not canvas._render_base_alpha
@@ -269,6 +272,8 @@ def render_stages(canvas, image, bounds, modifiers, local_to_world, *, nearest=F
         else:
             canvas._effect_jobs.retained_put(checkpoint_scope, pipeline_key, image, (0, QRectF(bounds)))
     for index, modifier in enumerate(modifiers):
+        from comic_editor.render.live_canvas_preview import check_live_canvas_cancelled
+        check_live_canvas_cancelled(canvas)
         if index < start:
             continue
         if modifier.muted or modifier.intensity <= 0 and "intensity" not in modifier.parameter_masks:

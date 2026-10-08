@@ -30,8 +30,8 @@ from .service import RenderPending
 
 
 CACHE_VERSION = 1
-# Version four fixes native straight-source alpha and float source boundaries.
-RENDERER_VERSION = "native-artwork-4"
+# Shared native source/visibility semantics for the detached scene architecture.
+RENDERER_VERSION = "native-artwork-20261007-refactor-visibility-source-1"
 MAX_PAYLOAD = 512 * 1024 * 1024
 WRITE_BUDGET = 64 * 1024 * 1024
 READ_BUDGET = 64 * 1024 * 1024
@@ -58,6 +58,78 @@ def _root_state(root):
             state = _RootState()
             _ROOTS[key] = state
         return state
+
+
+IDENTITY_BUDGET = 16 * 1024 * 1024
+IDENTITY_LIMIT = 8192
+
+# Only descriptor hashes are reused here. Entries and their dependency/seal
+# validation remain live, including after recording, invalidation, and reopen.
+_identities = OrderedDict()
+_identity_bytes = 0
+_identity_lock = RLock()
+
+
+def _immutable_identity_token(value):
+    """An immutable, typed token plus a conservative retained-byte estimate.
+
+    Python tuple equality merges bool/int/float and the two signed zeroes;
+    canonical JSON does not. Mutable public semantic values must keep taking
+    the ordinary digest path, even when their containing descriptor is frozen.
+    """
+    value_type = type(value)
+    if value_type is tuple:
+        items, size = [], 112 + 8 * len(value)
+        for item in value:
+            result = _immutable_identity_token(item)
+            if result is None:
+                return None
+            token, retained = result
+            items.append(token)
+            size += retained
+        return (tuple, tuple(items)), size
+    if value_type is str:
+        return (str, value), 112 + 4 * len(value)
+    if value_type is bool:
+        return (bool, value), 84
+    if value_type is int:
+        return (int, value), 84 + 4 * ((value.bit_length() + 29) // 30)
+    if value_type is float:
+        representation = value.hex()
+        return (float, representation), 112 + len(representation)
+    if value is None:
+        return (type(None),), 64
+    if isinstance(value, np.generic):
+        # canonical() also converts a NumPy scalar to its Python scalar.
+        scalar = value.item()
+        return None if isinstance(scalar, np.generic) else _immutable_identity_token(scalar)
+    return None
+
+
+def _descriptor_identity(value):
+    global _identity_bytes
+    result = _immutable_identity_token(value)
+    if result is None:
+        return digest(value)
+    token, size = result
+    size += 256  # Digest string and bounded-LRU bookkeeping.
+    if size > IDENTITY_BUDGET or IDENTITY_LIMIT <= 0:
+        return digest(value)
+    with _identity_lock:
+        previous = _identities.get(token)
+        if previous is not None:
+            _identities.move_to_end(token)
+            return previous[0]
+    # Serialize/hash the original value, preserving the existing disk identity.
+    identity = digest(value)
+    with _identity_lock:
+        if token not in _identities:
+            _identities[token] = identity, size
+            _identity_bytes += size
+            while _identity_bytes > IDENTITY_BUDGET or len(_identities) > IDENTITY_LIMIT:
+                _, (_, retained) = _identities.popitem(last=False)
+                _identity_bytes -= retained
+    return identity
 
 
 def canonical(value):
@@ -96,8 +168,8 @@ class CacheDescriptor:
 
     @property
     def identity(self):
-        return digest((CACHE_VERSION, RENDERER_VERSION, self.kind, self.key,
-                       self.contract, self.environment, sys.byteorder))
+        return _descriptor_identity((CACHE_VERSION, RENDERER_VERSION, self.kind, self.key,
+                                     self.contract, self.environment, sys.byteorder))
 
 
 def _freeze(value):
@@ -301,6 +373,9 @@ class PersistentRenderCache:
         return identity, entry
 
     def has(self, kind, key, *, verify=True):
+        self._sync_epoch()
+        if not self.entries:
+            return False
         identity, entry = self._entry(kind, key)
         if entry is None:
             return False
@@ -321,6 +396,12 @@ class PersistentRenderCache:
 
     def lookup(self, kind, key, *, wait=False):
         if self.closed:
+            return None
+        self._sync_epoch()
+        if not self.entries and not self.ready:
+            # Unpublished entries cannot satisfy reads. Synchronize sibling
+            # clears first, then avoid hashing a definite empty-index miss.
+            self.misses += 1
             return None
         identity, entry = self._entry(kind, key)
         result = self.ready.pop(identity, None)

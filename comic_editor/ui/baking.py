@@ -64,15 +64,17 @@ def rasterize_reason(canvas, kind, identifier):
     return ""
 
 
-def visual_bounds(canvas, kind, identifier):
+def visual_bounds(canvas, kind, identifier, *, object_local_bounds=None):
     """Conservative document-space bounds including each subtree effect stage."""
     chapter = canvas.chapter
     target = chapter.layers[identifier] if kind == "layer" else chapter.objects[identifier]
     result = entity_visual_bounds(chapter, canvas.tiles, kind, identifier,
-                                  layer_mapping=canvas.layer_world_transform)
+                                  layer_mapping=canvas.layer_world_transform,
+                                  object_local_bounds=object_local_bounds)
     if kind == "layer":
         for ref in target.children:
-            result = result.united(visual_bounds(canvas, ref.kind, ref.entity_id))
+            result = result.united(visual_bounds(canvas, ref.kind, ref.entity_id,
+                object_local_bounds=object_local_bounds))
     if canvas._own_tiling(target):
         result = canvas._tiling_boundary(target).boundingRect()
     parent = target.parent_id if kind == "layer" else target.parent_layer_id

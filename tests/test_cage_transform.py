@@ -348,6 +348,7 @@ def test_cage_source_mapping_survives_moving_rotating_and_assets(qapp):
 def test_cage_worker_refines_and_discards_old_request(qapp):
     from comic_editor.ui.effect_pipeline import render_stages
     canvas, doc, page = scene(qapp, 320, 320)
+    canvas.settings.canvas_renderer = "raster"
     layer = doc.add_layer(page.layer_id, bound=BoundGeometry.rectangle(0, 0, 320, 320))
     grid = translated(CageTransformModifier(frame=(0, 0, 320, 320)), 0, 0)
     doc.add_modifier(grid, [("layer", layer.layer_id)])

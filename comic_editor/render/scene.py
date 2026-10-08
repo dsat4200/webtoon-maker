@@ -205,6 +205,14 @@ class SceneCapture:
 
     def advance(self, seconds=.004):
         deadline = time.perf_counter() + max(0., seconds)
+        # This GUI-thread slice does not process input events. Validate the
+        # full positive contact owner once per entry, then retain the cheap
+        # identity/revision checks at every incremental copy yield.
+        if (self.document.contact_only and
+                (not callable(getattr(self.owner, "_projection_contact_only", None))
+                 or not self.owner._projection_contact_only())):
+            self.stale = True
+            return True
         while True:
             if (self.owner.chapter is None or
                     (id(self.owner.chapter), id(self.owner.tiles), id(self.owner.images)) != self.document.identity or
@@ -308,7 +316,9 @@ class SceneCapture:
         # QImage handles. This also supports decoded publication sources whose
         # encoded resource is being adopted by the source owner.
         for key, image in owner.images._decoded.items():
-            images._cache_decoded(key, QImage(image))
+            alias = QImage(image)
+            images._cache_decoded(key, alias)
+            images._adopt_owned_decode(key, alias, owner.images._owned_decodes.get(key))
             yield
         tiles, pins, addresses = yield from self._capture_tiles(owner.tiles, 'document')
         jobs.extend(pins)
@@ -419,6 +429,7 @@ class InlineResults:
         self.owner = owner
         self.retained, self.pending, self.waiting = OrderedDict(), {}, {}
         self.budget, self.limit, self.bytes = budget, limit, 0
+        self._retained_images = {}
 
     def retained_get(self, scope, key):
         entry = self.retained.get(scope)
@@ -439,20 +450,47 @@ class InlineResults:
     def retained_put(self, scope, key, image, state=None, **_kwargs):
         from comic_editor.ui.cache_dependencies import cache_put
         cache_put(self.owner,'retained',('retained',scope,key),image,state=state)
+        return self._retained_store(scope, key, image, state)
+
+    def _retained_store(self, scope, key, image, state):
         self.retained_remove(scope)
+        image = QImage(image)
         size = int(image.sizeInBytes())
+        storage = int(image.cacheKey())
         if size > self.budget:
             return False
-        while self.retained and (self.bytes + size > self.budget or len(self.retained) >= self.limit):
+        # Stage, tile-graph and pipeline scopes can share one completed image.
+        # Bound its COW pixel storage once, and still bound every scope record.
+        while self.retained and (
+            self.bytes + (0 if storage in self._retained_images else size) > self.budget
+            or len(self.retained) >= self.limit
+        ):
             self.retained_remove(next(iter(self.retained)))
-        self.retained[scope] = key, QImage(image), detached_value(state), size
-        self.bytes += size
+        self.retained[scope] = key, image, detached_value(state), size
+        if storage in self._retained_images:
+            self._retained_images[storage][1] += 1
+        else:
+            self._retained_images[storage] = [size, 1]
+            self.bytes += size
         return True
 
     def retained_remove(self, scope, key=None):
         entry = self.retained.get(scope)
         if entry is not None and (key is None or entry[0] == key):
-            self.bytes -= self.retained.pop(scope)[3]
+            self.retained.pop(scope)
+            storage = int(entry[1].cacheKey())
+            self._retained_images[storage][1] -= 1
+            if not self._retained_images[storage][1]:
+                self.bytes -= self._retained_images.pop(storage)[0]
+
+    def adopt_retained(self, values):
+        """Rebuild this owner's bounded ledger from actual retained QImages."""
+        entries = OrderedDict(values)
+        self.retained = OrderedDict()
+        self._retained_images = {}
+        self.bytes = 0
+        for scope, (key, image, state, _size) in entries.items():
+            self._retained_store(scope, key, image, state)
 
     def result(self, scope, key):
         entry = self.retained_get(("result", scope), key)
@@ -483,8 +521,9 @@ class EvaluatedScene(SceneKernels):
             setattr(self, f"_{prefix}_cache_bytes", 0)
             setattr(self, f"_{prefix}_cache_budget", 64 * 1024 * 1024)
         for name in ("compound_path", "gradient_geometry", "gradient_scalar", "gradient_render",
-                     "gradient_ramp", "transform_modifier_preview"):
+                     "gradient_ramp"):
             setattr(self, f"_{name}_cache", OrderedDict())
+        self._transform_modifier_preview_cache = None
         self._outline_cache = OutlineCache()
         self._outline_distance_cache = OutlineDistanceCache()
         self._blur_pyramid_cache = BlurPyramidCache()
@@ -544,16 +583,21 @@ class EvaluatedScene(SceneKernels):
             values[name] = OrderedDict(getattr(self, name))
         # Checkpoints use the same semantic key checks as their live owner;
         # the replacement owner receives its own LRU bookkeeping.
-        values["retained"] = OrderedDict(self._effect_jobs.retained)
+        values["retained"] = OrderedDict(
+            (scope, (key, QImage(image), state, size))
+            for scope, (key, image, state, size) in self._effect_jobs.retained.items()
+        )
         values["retained_bytes"] = self._effect_jobs.bytes
         return values
 
     def adopt_cache_state(self, values):
         for name, value in values.items():
             if name == "retained":
-                self._effect_jobs.retained = OrderedDict(value)
+                self._effect_jobs.adopt_retained(value)
             elif name == "retained_bytes":
-                self._effect_jobs.bytes = value
+                # Older snapshots charged every alias. The adopter derives
+                # storage and its byte charge from the current image handles.
+                continue
             else:
                 setattr(self, name, OrderedDict(value) if isinstance(value, dict) else value)
 
@@ -588,8 +632,21 @@ class DetachedSceneBackend:
 
     def close(self):
         backing = self.scene._persistent_render_cache
-        if backing is not None:
-            backing.close()
+        # A synchronous detached consumer may create its own application-thread
+        # helper. EvaluatedScene has no QObject lifetime signal; retire only its
+        # local helper here, never the snapshot's borrowed graphics worker.
+        pattern = self.scene.__dict__.pop("_gpu_pattern_renderer", None)
+        texture = self.scene.__dict__.pop("_gpu_texture_renderer", None)
+        try:
+            try:
+                if pattern is not None:
+                    pattern.close()
+            finally:
+                if texture is not None:
+                    texture.close()
+        finally:
+            if backing is not None:
+                backing.close()
 
     def _record_allowed(self):
         document = self.snapshot.document
@@ -672,8 +729,15 @@ class DetachedSceneBackend:
         state = CaptureState()
         previous = scene._effect_provisional_revision
         from comic_editor.ui.point_lut import graphics_scope
-        with graphics_scope(scene._graphics_worker):
-            yield state
+        previous_policy = getattr(scene, '_live_canvas_preview_policy', None)
+        policy = getattr(self, 'live_canvas_preview_policy', None)
+        scene._live_canvas_preview_policy = (policy if policy is not None
+            and policy.matches(self.snapshot, document, request) else None)
+        try:
+            with graphics_scope(scene._graphics_worker):
+                yield state
+        finally:
+            scene._live_canvas_preview_policy = previous_policy
         state.provisional = (document.live_preview or scene._effect_provisional_revision != previous)
 
     def paint(self, painter, visible, *, phase=None, page_contents_only=False):

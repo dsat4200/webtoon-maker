@@ -78,7 +78,7 @@ def _render_snapshot(snapshot, region, *, scale=1., target=None):
     still apply, exactly as in the existing cropped export path; view overflow
     and editing decorations are excluded from the output.
     """
-    document = replace(snapshot.document, overflow=0., underlay=('', 0.), live_preview=False)
+    document = replace(snapshot.document, overflow=0., underlay=('', 0.), live_preview=False, contact_only=False)
     state = dict(snapshot.state, _solo_suspended=True, _render_base_alpha=False,
                  _show_on_top_phase=None, _text_editing=False)
     chapter = snapshot.chapter

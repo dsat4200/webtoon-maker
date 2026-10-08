@@ -486,6 +486,12 @@ def test_trim_and_grid_changes_capture_only_document_fields(owner, monkeypatch):
     monkeypatch.setattr(unrelated, 'to_dict', lambda: pytest.fail('Unrelated artwork serialized for chapter field'))
     monkeypatch.setattr(canvas, 'object_world_rect', lambda *_: None)
     monkeypatch.setattr('comic_editor.ui.main_window.QInputDialog.getInt', lambda *_a, **_k: (64, True))
+    resize_dialog = SimpleNamespace(
+        exec=lambda: QDialog.DialogCode.Accepted,
+        height=SimpleNamespace(value=lambda: 64),
+        add_position=SimpleNamespace(currentData=lambda: 'bottom'),
+    )
+    monkeypatch.setattr('comic_editor.ui.main_window.ResizeCanvasDialog', lambda *_a: resize_dialog)
     stable = QPersistentModelIndex(window.hierarchy_model.index_for_entity('object', unrelated.object_id))
     resets = QSignalSpy(window.hierarchy_model.modelReset)
     window._trim_height()

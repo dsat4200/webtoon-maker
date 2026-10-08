@@ -183,13 +183,21 @@ def test_large_grid_scroll_filter_selection_and_reopening_never_render(qapp, pre
     queue, calls = prepared_queue
     brushes = [BrushDefinition(id=str(i), name=f'Brush {i:02d}', size=12+i) for i in range(75)]
     settings = EditorSettings(brush_presets=[b.to_dict() for b in brushes], active_brush_id='0')
-    combo = BrushPresetCombo(settings)
+    # A real owner window restores native focus after the popup closes.
+    from PySide6.QtWidgets import QWidget
+    window = QWidget()
+    combo = BrushPresetCombo(settings, window)
     for b in brushes:
         combo.addItem(b.name, b.id)
     combo.refresh_thumbnails()
     finish(combo.thumbnails, queue)
     combo.resize(180, 30)
+    window.resize(combo.size())
+    window.show()
     combo.show()
+    if qapp.platformName() not in {"offscreen", "minimal"}:
+        window.activateWindow()
+        assert QTest.qWaitForWindowActive(window, 10000)
     assert combo.sizeHint().height() < thumbs.THUMBNAIL_HEIGHT
     count = len(calls)
     QTest.mouseClick(combo, Qt.LeftButton, pos=QPoint(combo.width()-12, combo.height()//2))
@@ -208,6 +216,9 @@ def test_large_grid_scroll_filter_selection_and_reopening_never_render(qapp, pre
     popup.search.setFocus()
     QTest.keyClick(popup.search, Qt.Key_Return)
     assert combo.currentData() == '74' and not popup.isVisible()
+    if qapp.platformName() not in {"offscreen", "minimal"}:
+        window.activateWindow()
+        assert QTest.qWaitForWindowActive(window, 10000)
     combo.setFocus()
     QTest.keyClick(combo, Qt.Key_Down, Qt.AltModifier)
     qapp.processEvents()
@@ -222,6 +233,8 @@ def test_large_grid_scroll_filter_selection_and_reopening_never_render(qapp, pre
     combo.thumbnails.stop()
     combo.close()
     combo.deleteLater()
+    window.close()
+    window.deleteLater()
 
 
 def test_hidden_cache_warming_pauses_during_live_drawing(qapp, prepared_queue):

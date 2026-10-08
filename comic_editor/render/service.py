@@ -61,8 +61,11 @@ class RenderDocument:
     underlay: tuple[str, float] = ("", 0.)
     live_preview: bool = False
     pixel_contract: PixelContract = LEGACY_PIXELS
+    contact_only: bool = False
 
     def __post_init__(self):
+        if type(self.contact_only) is not bool:
+            raise ValueError("Render contact metadata requires a boolean")
         if not isinstance(self.pixel_contract, PixelContract):
             raise ValueError("Render documents require a validated pixel contract")
         for name in ("identity", "configuration", "underlay"):

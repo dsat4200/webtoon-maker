@@ -19,6 +19,13 @@ explicit recording scope writes immutable results. QImage formats/raw bytes
 and numeric array bits are compressed losslessly, including float working
 pixels and retained checkpoint placement. Draft/live caches are excluded.
 
+Cache descriptor identity serialization has a locked, bounded memo for typed,
+immutable semantic keys (16 MiB and 8,192 entries). It returns the existing
+canonical digest, preserving bool/int/float distinctions and signed zero.
+Mutable keys and nonfinite values use the ordinary serialization path. This
+memo does not bypass dependency, clear-epoch, seal or blob validation and is
+shared by memory and disk access. See `tests/test_render_cache_identity.py`.
+
 `ui/cache_dependencies.py` supplies stable source content fingerprints and
 regional scene identities. Encoded source files are hashed asynchronously and
 their stat stamps/content hashes are remembered in the cache index. Known dirty
@@ -62,6 +69,55 @@ Canvas interaction lives in `comic_editor/ui/canvas.py` and its tool features.
 `render/scene_kernels.py::SceneKernels` contains the shared scene implementation;
 the canvas inherits it for explicit reference captures while detached consumers
 evaluate it without a widget. Ordinary widget paints present ready resources.
+
+### Exact CPU distortion preparation
+
+`ui/distort_rendering.py` retains the incoming native sampling grids and
+interpolation contracts. Two preparation shortcuts reduce work without changing
+samples; neither derives resolution from camera zoom or display density.
+
+Native legacy Pinch/Punch additionally plans the exact required input rectangle
+before source capture. Eligibility requires unmasked bilinear transparent/white
+edges, finite integer native frames and at most262,144 output pixels. The full
+semantic source/effect frame and inverse mapping remain unchanged. The crop
+includes every original bilinear tap and the unchanged base intersection,
+including at100% intensity. Global and crop-local floor indices and float64
+fraction bits must match; each kernel strip checks containment again. A crop's
+prepared float RGBA must fit the existing256 MiB preparation budget. Unsupported
+or uncertain cases use the original full-input path. This is source preparation,
+not a new sampling grid, cache identity or disk renderer. Independent original
+kernel and native-output checks are in `tests/test_native_pinch_input_roi.py`;
+the saved-stack whole-buffer and separate performance pair are documented in
+the integration performance ledger.
+
+- Oversized legacy premultiplied ARGB32 sources can retain a job-local COW
+  QImage and normalize only the required bilinear source crop. Eligibility is
+  restricted to native scale, bilinear transparent/white edges and Twirl,
+  Deform, Mesh Warp, Lens Distortion or Pinch/Punch. The full normalized source
+  must exceed the existing 256 MiB preparation budget; each admitted crop must
+  fit that budget. Global and crop-local floor indices and the float64 fraction
+  bits must be identical before using the crop. Nonfinite/large coordinates,
+  full or empty crops, floating contracts, other interpolation/edges, or any
+  fraction mismatch use the original full-source sampler.
+- Native legacy bilinear Lens Distortion can fill only taps whose entire
+  bilinear support is outside the source with its existing constant edge value.
+  Partially overlapping support still uses the original SciPy sampler. This
+  requires owned float32 input, float64 coordinates, zero padding,
+  `grid-constant` mode, constant fill zero/one, and at most 262,144 coordinates;
+  unsupported cases retain the original path.
+
+The mesh kernel also omits triangles whose destination bounds cannot cover the
+requested pixels. Its triangles, tessellation and inverse mapping stay intact.
+This kernel change is separate from the old regional-mesh scheduler, which has
+not been ported into the detached evaluator.
+
+Whole native-buffer, precision and fallback checks are recorded in
+`tests/test_oversized_bilinear_preparation.py`, `tests/test_sparse_lens_sampling.py`
+and the integration performance ledger. These shortcuts do not establish that
+the integrated editor is responsive: saved Blueprint measurements still show
+multi-second live artwork delays. See
+`../refactor-integration-performance-2026-10-07.md` for actual measured scope,
+failed probes and remaining acceptance work.
 
 `render/pixels.py` applies the persisted `PixelContract` at explicit source,
 working, display and export edges. Legacy documents retain encoded-sRGB byte
@@ -152,6 +208,16 @@ tool retains its original native packet data and source owner.
   editor callback. Snapshot-local mutable cache bookkeeping belongs to its
   evaluator. Bound semantic source/effect/vector/checkpoint LRUs survive a
   revision through validated keys, without retaining the old scene owner.
+  `InlineResults` retains independent COW handles and charges each distinct
+  QImage storage once across checkpoint scope aliases. Removing the last alias
+  releases its charge; mutation detaches the caller's handle. The existing
+  64 MiB/512-entry limits and oversized-result policy remain intact. Cache
+  adoption rebuilds this ledger from actual retained storage, rather than old
+  per-scope byte totals. This is memory ownership bookkeeping and does not
+  change semantic keys, dependency validation, disk entries or native output.
+  Native ownership/adoption cases are in `tests/test_inline_result_storage.py`;
+  measured heavy-stack performance is tracked separately in
+  `docs/refactor-integration-performance-2026-10-07.md`.
   `render/source_resources.py::ReadyOriginals` also transfers already decoded
   original QImage handles when the worker retires a snapshot, including after
   cancellation. Adoption requires the same document, pixel contract and color
@@ -176,6 +242,13 @@ tool retains its original native packet data and source owner.
   cooperative budget does not change captured inputs or native exact work.
   Lower-density preview evaluators have separate caches and cannot contaminate
   the retained native evaluator or durable entries.
+  Ordinary Raster Pencil/Eraser contact instead captures `contact_only` demand
+  metadata after validating its open native input gate and original object.
+  Capture slices revalidate that ownership. These contacts reuse unchanged
+  native-owner caches through the same semantic keys, sampling and dependency
+  checks; private transform/mask draft caches never flow back into that owner.
+  Contact results remain live and provisional, so durable reads and writes
+  stay disabled. Export clears both contact and live demand metadata.
 - `render/raster_feedback.py` prepares native prefix/source/suffix planes with
   the ordinary detached scene kernels for a selected simple raster leaf. The
   source grid and two-pixel gutters retain their integer document placement;
@@ -297,6 +370,15 @@ tool retains its original native packet data and source owner.
 - `_CanvasLogic` is a large mixin containing document binding, selection, camera math, rendering, hit testing, input dispatch, every drawing tool, text editing, tone-mask and modifier integration, and transform workflows.
 - `RasterCanvasWidget` combines that mixin with `QWidget`.
 - `GpuCanvasWidget` combines it with `QOpenGLWidget` and requests partial updates.
+- GPU paint events enter `QOpenGLWidget.paintEvent`; Qt prepares the widget's
+  framebuffer before `paintGL` draws the ordinary shared canvas frame.
+  `paintGL` verifies the current widget context, draw framebuffer and color
+  attachment, then clears that existing presentation attachment to the opaque
+  canvas background. It restores scissor and indexed color-mask state before
+  entering the explicitly bounded QPainter lifetime. Transparent native tiles
+  must not accumulate over preserved pixels from an earlier partial update.
+  This presentation clear does not bind another framebuffer, allocate derived
+  artwork, alter sampling density or change native/cache output.
 - `create_canvas(settings)` probes an offscreen OpenGL 3.3 context unless the renderer is forced to `raster`. If the probe fails, or Qt is using `offscreen`/`minimal`, it creates the raster widget.
 - Both backends present the shared scene pipeline. Eligible point/blur chains
   retain `render/device.py::DeviceImage` textures with producer fences and
@@ -456,6 +538,7 @@ format and pixels without re-reading the retired source store.
 - **HSL** performs a NumPy hue/saturation/lightness round-trip with per-parameter masks.
 - **Blur** evaluates a per-pixel radius from strength and the optional focal ramp. `BlurPyramidCache` (64 MiB) stores levels at radii `(0, 1, 3, 7, 15, 31, 63, 127)`, keyed by algorithm and a BLAKE2b source digest. Normal Blur keeps Pillow images in premultiplied `RGBa` through every reduction, enlargement, and blend. Legacy retains the old `RGBA` branch exactly: feeding it premultiplied data causes a second premultiplication/unpremultiplication during resizing and can produce RGB greater than alpha, explaining the colorful distortion on transparent composites.
 - **Radial Blur** uses `radial_blur.py`: symmetric midpoint angular integration with premultiplied bilinear sampling, transparent out-of-source samples, and adaptive sample counts based on pixel arc length. Integration uses 96×96 tiles; zero-angle mask regions are exact identities. The complete incoming stage remains available when rendering a cropped output, so displaced centers do not lose offscreen source pixels. `effect_geometry.radial_sweep_bounds` includes angular extrema and mask endpoint angles; the pipeline adds bilinear support and preserves ancestor clipping.
+- The optional Windows AMD64 RGBA sampler shares corner addresses across four channels on supported finite contiguous float32 inputs with SciPy 1.18.0. Its owned C source, binary, build contract and ABI are verified before loading. Unsupported or missing delivery retains the original SciPy path. It preserves double multiplication and corner order, float32 rounding per angular sample, native grids, sample counts, masks and cancellation cadence; it is not a sampling exception or another cache pipeline. The app never compiles or downloads code. `tools/build_radial_rgba_sampler.py` is an explicit developer build recipe. See [the integration measurements](../refactor-integration-performance-2026-10-07.md) for bit-level acceptance and matched whole-kernel timing.
 - `radial_pipeline.py` caches angular integration separately from the final intensity mix. Its key includes the semantic upstream source, center, angle/angle-mask signature, full mapping, output shape and origin, but excludes intensity and its mask. Integration is retained as a float-premultiplied QImage in the existing bounded caches, so the final blend still rounds to RGBA8 only once. An intensity-gradient edit also reuses in-flight integration and blends its latest mask after completion.
 - Document changes with an active Radial Blur mark their identity/revision for deferred exact projection. The previous complete view remains visible until all current tiles are ready. Radial handles and attached mask-gradient drags permit deferral during pen contact; painting and unrelated live previews retain their existing synchronous policy. Changed radial handles cancel obsolete snapshots without dropping retained outputs, no-op input avoids invalidation, Escape restores the drag snapshot, and radial cards synchronize controls without emitting parameter edits.
 - Raster stacks containing an active Radial Blur use the same tile-coordinate stage renderer as Raster Apply and transform the processed result once with nearest sampling. Prefix baking records its output frame (including transparent padding) for later stages, avoiding both a transform/resampling-order mismatch and a blur-pyramid alignment change after Apply. Legacy Raster stacks without radial baking are unchanged.
@@ -731,6 +814,7 @@ Text is laid out by `QTextDocument` with a pixel-size `QFont`, absolute letter s
 - Free text lays the document out in an axis-aligned local rectangle, maps it into a four-point destination quad, and clips before painting.
 - Selection highlighting uses `QAbstractTextDocumentLayout.PaintContext`. The caret comes from the active block layout's cursor position.
 - Canvas hit testing inversely maps a click into text layout coordinates and asks the document layout for a text position.
+- Full-strength affine Cage Transforms on a text's ancestors also map its editing frame, caret, selection, IME rectangle, and typography gizmos. Each lattice and the text frame are checked against the ordinary cage mapping; blended, intensity-masked, nonlinear, or singular cages retain the source editing frame. Parent-mask tests undo only that parent's cage and the outer cages, respecting clipping between stages. These are editor-only transforms: source bounds, native glyph/effect pixels, exact tiles, and durable cache identities are unchanged. A click on displayed text begins its typing session immediately and avoids capturing a source transform preview; free-box transform controls remain available in Transform mode.
 - Pointer drag updates the character range live; Qt word selection powers double-click, and a same-object third click within the platform interval selects the full text.
 - Keyboard, clipboard, and IME changes update the live object. A local text history handles in-session undo; the entire session becomes one chapter command on commit.
 - Text-only canvas controls are derived from the current selection and exist only in Text Edit. A floating overlay edits integer size and bold/italic; two screen-space right-edge handles scrub snapped size and kerning from their drag-start values and coalesce each drag into one chapter command.

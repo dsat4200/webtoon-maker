@@ -130,7 +130,7 @@ class SimplifyColorsControls(QWidget):
         self.enabled = QCheckBox("Simplify colors", self)
         self.enabled.setChecked(modifier.simplify_enabled)
         self.enabled.setToolTip("Smooth fine color variations before posterizing, while protecting stronger edges.")
-        layout.addWidget(self.enabled)
+        layout.addWidget(self.enabled, 0, Qt.AlignLeft)
         self.body = QWidget(self)
         body = QVBoxLayout(self.body)
         body.setContentsMargins(0, 2, 0, 4)

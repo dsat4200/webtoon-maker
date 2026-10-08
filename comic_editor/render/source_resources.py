@@ -42,6 +42,7 @@ class _ImageBuffer:
     key: object
     pin: object
     image: QImage
+    owned_decode: object = None
 
 
 @dataclass(frozen=True)
@@ -75,7 +76,8 @@ class ReadyOriginals:
             identifier = _image_identifier(key)
             source = snapshot.images._sources.get(identifier)
             if source is not None:
-                images.append(_ImageBuffer(key, source._encoded.pin, QImage(image)))
+                images.append(_ImageBuffer(key, source._encoded.pin, QImage(image),
+                    snapshot.images._owned_decodes.get(key)))
         self.images = tuple(images)
         tiles = []
         for (owner, key), (image, _content_key) in snapshot.tiles.residency.entries.items():
@@ -92,14 +94,18 @@ class ReadyOriginals:
         images, tiles = snapshot.images, snapshot.tiles
         # Imported/edited buffers already captured from the document remain
         # the most recent entries if incoming ready originals fill the budget.
-        current_images = tuple(images._decoded.items())
+        current_images = tuple((key, image, images._owned_decodes.get(key))
+            for key, image in images._decoded.items())
         current_tiles = tuple(tiles.residency.entries.items())
         for record in self.images:
             source = images._sources.get(_image_identifier(record.key))
             if source is not None and source._encoded.pin is record.pin:
-                images._cache_decoded(record.key, QImage(record.image))
-        for key, image in current_images:
+                alias = QImage(record.image)
+                images._cache_decoded(record.key, alias)
+                images._adopt_owned_decode(record.key, alias, record.owned_decode)
+        for key, image, witness in current_images:
             images._cache_decoded(key, image)
+            images._adopt_owned_decode(key, image, witness)
         for record in self.tiles:
             owner = tiles._tiles.get(record.identifier)
             if (owner is not None and record.key in owner

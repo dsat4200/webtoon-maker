@@ -114,6 +114,7 @@ def test_actual_controls_add_gradient_posterize_and_undo(gradient_editor, monkey
     visible = {action.text() for action in controls.add_button.menu().actions() if action.isVisible()}
     assert visible == {"Posterize…", "Posterize Value…", "Halftone", "Curves"}
     controls.add_modifier(kind)
+    _await_posterize_add(controls)
     modifier = canvas.chapter.modifiers[gradient.modifier_ids[-1]]
     assert modifier.modifier_type == kind
     if kind != "halftone":
@@ -132,6 +133,7 @@ def test_mixed_gradient_selection_add_and_link_are_undoable(gradient_editor, mon
     assert canvas.set_selection_set(refs)
     monkeypatch.setattr(QInputDialog, "getInt", lambda *_args: (3, True))
     controls.add_modifier(kind)
+    _await_posterize_add(controls)
     modifier = canvas.chapter.modifiers[gradient.modifier_ids[-1]]
     assert raster.modifier_ids == gradient.modifier_ids
     assert controls.common_ids() == [modifier.modifier_id]
@@ -147,3 +149,17 @@ def test_mixed_gradient_selection_add_and_link_are_undoable(gradient_editor, mon
     canvas.set_selection("object", raster.object_id)
     controls.refresh()
     assert any(action.text() == "Halftone" and action.isVisible() for action in controls.add_button.menu().actions())
+
+
+def _await_posterize_add(controls):
+    """Wait for the ordinary SceneConsumers owner callback, not a GUI sampler."""
+    import time
+    from PySide6.QtCore import QCoreApplication
+    deadline = time.monotonic() + 10.
+    while controls._posterize_add_token is not None and time.monotonic() < deadline:
+        QCoreApplication.processEvents()
+        time.sleep(.002)
+    assert controls._posterize_add_token is None, "Detached Posterize Add did not complete"
+    lane = controls._posterize_add_lane
+    consumers = vars(controls.canvas).get('_scene_consumers')
+    assert lane is None or consumers is not None and not consumers.contains(lane)

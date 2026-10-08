@@ -180,6 +180,7 @@ def test_add_dialog_cancel_initialization_and_undo(editor, monkeypatch):
     assert canvas.chapter.to_dict() == before
     monkeypatch.setattr(QInputDialog, "getInt", lambda *_args: (4, True))
     controls.add_modifier("posterize")
+    _await_posterize_add(controls)
     modifier = next(iter(canvas.chapter.modifiers.values()))
     assert len(modifier.ranges) == 4
     assert all(item.color == "#FFFF0000" for item in modifier.ranges)
@@ -273,6 +274,7 @@ def test_real_count_dialog_and_swatch_picker_apply_cancel(editor, qapp):
         dialog.accept()
     QTimer.singleShot(0, accept_count)
     controls.add_modifier("posterize")
+    _await_posterize_add(controls)
     assert observed == [True]
     modifier = next(iter(canvas.chapter.modifiers.values()))
     assert len(modifier.ranges) == 2
@@ -553,6 +555,7 @@ def test_value_add_dialog_linear_ui_picker_and_simplify_settings(editor, qapp):
         dialog.accept()
     QTimer.singleShot(0, accept_count)
     controls.add_modifier("posterize_value")
+    _await_posterize_add(controls)
     assert observed == ["Posterize Value"]
     modifier = next(iter(canvas.chapter.modifiers.values()))
     assert type(modifier) is PosterizeValueModifier
@@ -649,3 +652,17 @@ def test_value_sampler_simplification_assets_and_raster_baking(editor):
     assert result == expected
     canvas.command_stack.undo()
     assert type(canvas.chapter.modifiers[modifier.modifier_id]) is PosterizeValueModifier
+
+
+def _await_posterize_add(controls):
+    """Wait for the ordinary SceneConsumers owner callback, not a GUI sampler."""
+    import time
+    from PySide6.QtCore import QCoreApplication
+    deadline = time.monotonic() + 10.
+    while controls._posterize_add_token is not None and time.monotonic() < deadline:
+        QCoreApplication.processEvents()
+        time.sleep(.002)
+    assert controls._posterize_add_token is None, "Detached Posterize Add did not complete"
+    lane = controls._posterize_add_lane
+    consumers = vars(controls.canvas).get('_scene_consumers')
+    assert lane is None or consumers is not None and not consumers.contains(lane)

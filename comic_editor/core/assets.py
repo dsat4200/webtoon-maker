@@ -438,7 +438,8 @@ def _object_local_bounds(obj: DocumentObject, document: ChapterDocument,
 
 def entity_visual_bounds(document: ChapterDocument, tiles: TileStore,
                          kind: str, entity_id: str, *, include_effects=False,
-                         geometry_cache=None, layer_mapping=None) -> QRectF:
+                         geometry_cache=None, layer_mapping=None,
+                         object_local_bounds=None) -> QRectF:
     """Return a conservative world-space bound for an entity subtree.
 
     A renderer can supply its live layer mapping so a transform preview's
@@ -463,9 +464,10 @@ def entity_visual_bounds(document: ChapterDocument, tiles: TileStore,
         return mapping.mapRect(effect_bounds(inverse.mapRect(rect), [document.modifiers[mid] for mid in target.modifier_ids if mid in document.modifiers], mapping))
     if kind == "object":
         obj = document.objects[entity_id]
+        local = object_local_bounds(obj) if object_local_bounds is not None else None
         result = _mapped_rect(
             mapping_for_layer(obj.parent_layer_id),
-            _object_local_bounds(obj, document, tiles),
+            _object_local_bounds(obj, document, tiles) if local is None else local,
         )
         return expanded(result, obj, obj.parent_layer_id)
 
@@ -499,6 +501,7 @@ def entity_visual_bounds(document: ChapterDocument, tiles: TileStore,
         child_bounds = entity_visual_bounds(
             document, tiles, child.kind, child.entity_id, include_effects=include_effects,
             geometry_cache=geometry_cache, layer_mapping=layer_mapping,
+            object_local_bounds=object_local_bounds,
         )
         result = child_bounds if not found else result.united(child_bounds)
         found = True

@@ -21,6 +21,11 @@ class SceneController(QObject):
         self.serial = 0
         self.dispatched = None
         self.preview = None
+        self._preview_snapshot = self._preview_request = None
+        from comic_editor.ui.release_handoff import ReleaseHandoff
+        self.release_handoff = ReleaseHandoff(self)
+        if hasattr(canvas, "frameSwapped"):
+            canvas.frameSwapped.connect(self.release_handoff.swapped)
         self.overview = None
         self.error = ""
         self.preview_mode = False
@@ -36,6 +41,8 @@ class SceneController(QObject):
         self.destroyed.connect(lambda: scheduler.close())
 
     def reset(self):
+        self.release_handoff.clear("controller reset")
+        self._preview_snapshot = self._preview_request = None
         self.scheduler.cancel()
         self.capture = self.snapshot = self.desired = self.dispatched = self.preview = self.overview = None
         self.error = ""
@@ -70,6 +77,7 @@ class SceneController(QObject):
             (document.live_preview or view_bytes > self.canvas._document_projection.budget // 2))
         signature = document, tuple(request.address for request in requests), tuple(phases), tuple(visible.getRect())
         if signature != self.desired:
+            self.release_handoff.new_request(signature)
             self.serial += 1
             self.desired = signature
             self.dispatched = None
@@ -88,6 +96,9 @@ class SceneController(QObject):
             # Storage can expire without a document change (context loss or
             # cache eviction). Reevaluate the same guarded frozen request.
             self.dispatched = None
+        handoff = self.release_handoff.for_request(signature, self.serial)
+        if handoff is not None:
+            self.preview = handoff
         if self.dispatched != signature and not self.timer.isActive():
             self.timer.start(0)
 
@@ -130,7 +141,10 @@ class SceneController(QObject):
             if completion.materialized is not None:
                 self._accept_cpu_images(completion.materialized)
             if completion.preview is not None:
+                self.release_handoff.clear("new current preview")
                 result = completion.preview
+                self._preview_snapshot = completion.demand.snapshot
+                self._preview_request = result.request
                 self.preview = document, PresentedTile(("preview", self.serial), result.image,
                     result.request.bounds, pixel_contract=document.pixel_contract,
                     pixel_environment=completion.demand.snapshot.pixel_environment)
@@ -215,7 +229,8 @@ class SceneController(QObject):
                 tile.pixel_environment) for tile in tiles]))
         return batch, complete
 
-    def changed(self, change):
+    def changed(self, change, *, action="transient"):
+        self.release_handoff.changed(change, action)
         """Use the ordinary typed invalidation stream to guard prepared passes."""
         prepared = self.feedback
         if prepared is None:
@@ -276,6 +291,8 @@ class SceneController(QObject):
         self.timer.start(8)
 
     def _accept_cpu_images(self,images):
+        if self.release_handoff.ticket is not None:
+            self.release_handoff.clear("materialization/storage transition")
         projection = self.canvas._document_projection
         for tiles in projection._configurations.values():
             for tile in tiles.values():

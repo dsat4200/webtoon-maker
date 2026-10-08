@@ -1,2 +1,10 @@
 # Auto detect text files and perform LF normalization
 * text=auto
+
+# Preserve verified sampler build bytes and independent native references.
+comic_editor/ui/radial_rgba_linear.c -text
+comic_editor/ui/radial_rgba_win64.dll -text
+comic_editor/ui/radial_rgba_build.json -text
+tests/radial_blur_native_reference.py -text
+tests/references/*.py -text
+tests/test_live_radial_native_reference.py -text

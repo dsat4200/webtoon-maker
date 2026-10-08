@@ -586,6 +586,8 @@ class ModifierControls(QWidget):
         self._target_layer_pick_chapter = None
         self.preset_controller = None
         self._parameter_before = None
+        self._posterize_add_token = None
+        self._posterize_add_lane = None
         self._mesh_warp_parameter_chapter = None
         self._smudge_parameter_chapter = None
         self._reorder_before = None
@@ -645,6 +647,10 @@ class ModifierControls(QWidget):
         menu.addAction("Cage Transform").triggered.connect(lambda: self.add_modifier("cage_transform"))
         self.add_button.setMenu(menu)
         layout.addWidget(self.add_button)
+        self._posterize_add_status = QLabel(self)
+        self._posterize_add_status.setWordWrap(True)
+        self._posterize_add_status.hide()
+        layout.addWidget(self._posterize_add_status)
         self.stack = QWidget(self)
         self.stack_layout = QVBoxLayout(self.stack)
         self.stack_layout.setContentsMargins(0, 0, 0, 0)
@@ -664,8 +670,10 @@ class ModifierControls(QWidget):
     def _refresh_selection_style(self, _identifier=""):
         for identifier, card in self._cards.items():
             selected = self.canvas.modifier_mode and self.canvas.active_modifier_id == identifier
-            card.setStyleSheet("#modifierCard { border: 2px solid " +
-                ("#65bcff; background-color: #203f59" if selected else "transparent") + "; border-radius: 4px; }")
+            style = "#modifierCard { border: 2px solid " + (
+                "#65bcff; background-color: #203f59" if selected else "transparent") + "; border-radius: 4px; }"
+            if card.styleSheet() != style:
+                card.setStyleSheet(style)
 
     def targets(self) -> list[tuple[str, str]]:
         if self.canvas.chapter is None:
@@ -858,7 +866,8 @@ class ModifierControls(QWidget):
         targets = list(self.canvas.selected_entities)
         if chapter is None or not targets:
             return
-        before = self._graph_snapshot(targets, modifiers=None)
+        before = (None if modifier_type in {'posterize', 'posterize_value'}
+                  else self._graph_snapshot(targets, modifiers=None))
         if modifier_type in DISTORT_TYPES:
             bounds = self._default_bounds()
             frame = (self.canvas._rect_signature(bounds) if bounds is not None and not bounds.isEmpty()
@@ -889,12 +898,8 @@ class ModifierControls(QWidget):
             )
             if not accepted:
                 return
-            from comic_editor.ui.posterize_controls import PosterizeSampler
-            try:
-                modifier.ranges = PosterizeSampler(value_mode=value_mode).sample(self.canvas, targets).initialize(count)
-            except (ValueError, MemoryError) as error:
-                QMessageBox.warning(self, modifier.name, str(error))
-                return
+            self._start_posterize_add(modifier, targets, count, value_mode)
+            return
         elif modifier_type == "dithering":
             modifier = DitheringModifier()
         elif modifier_type == "sharpness":
@@ -942,6 +947,81 @@ class ModifierControls(QWidget):
             modifier = MirrorModifier(axis_start=(center.x(), center.y() - radius), axis_end=(center.x(), center.y() + radius))
         else:
             modifier = OutlineModifier()
+        self._install_modifier(modifier, targets, before)
+
+    def _posterize_input_signature(self, targets):
+        """Use the renderer's existing semantic inputs, without acquiring pixels."""
+        chapter = self.canvas.chapter
+        values = []
+        for kind, identifier in targets:
+            target = chapter.modifier_target(kind, identifier) if chapter is not None else None
+            if target is None:
+                return None
+            parent = target.parent_id if kind == 'layer' else target.parent_layer_id
+            mapping = self.canvas.layer_world_transform(parent)
+            signature = (self.canvas._modifier_layer_signature(identifier) if kind == 'layer'
+                         else self.canvas._modifier_object_signature(target))
+            values.append((kind, identifier, signature,
+                self.canvas._modifier_mapping_signature(mapping)))
+        return tuple(values)
+
+    def _start_posterize_add(self, modifier, targets, count, value_mode):
+        from comic_editor.render.source_sampling import posterize_statistics
+        from comic_editor.ui.scene_consumers import scene_consumers
+        from shiboken6 import isValid
+        import weakref
+        jobs = scene_consumers(self.canvas)
+        if self._posterize_add_lane is not None:
+            jobs.cancel(self._posterize_add_lane)
+        token = self._posterize_add_token = object()
+        self._posterize_add_lane = ('posterize-add', id(self), id(token))
+        reference = weakref.ref(self)
+        chapter = self.canvas.chapter
+        generation = getattr(self.canvas, '_history_generation', 0)
+        targets = tuple(targets)
+        signature = self._posterize_input_signature(targets)
+        self._posterize_add_status.setText(f'Preparing {modifier.name} colors… You can keep editing.')
+        self._posterize_add_status.show()
+
+        def current():
+            control = reference()
+            return (control is not None and isValid(control)
+                and control._posterize_add_token is token
+                and control.canvas.chapter is chapter
+                and getattr(control.canvas, '_history_generation', 0) == generation
+                and tuple(control.canvas.selected_entities) == targets
+                and control._posterize_input_signature(targets) == signature)
+
+        def discard():
+            control = reference()
+            if control is not None and isValid(control) and control._posterize_add_token is token:
+                control._posterize_add_token = None
+                control._posterize_add_status.setText('Posterize cancelled because the selection or artwork changed.')
+
+        def accept(statistics, error):
+            if not current():
+                discard()
+                return
+            control = reference()
+            control._posterize_add_token = None
+            if error is not None:
+                control._posterize_add_status.setText(f'Could not prepare Posterize colors: {error}')
+                return
+            # No state taken before the wait may enter this new command.
+            try:
+                modifier.ranges = statistics.initialize(count)
+            except (ValueError, MemoryError) as failure:
+                control._posterize_add_status.setText(f'Could not prepare Posterize colors: {failure}')
+                return
+            before = control._graph_snapshot(targets, modifiers=None)
+            control._posterize_add_status.hide()
+            control._install_modifier(modifier, list(targets), before)
+
+        jobs.request(self._posterize_add_lane, posterize_statistics,
+            (targets, None, value_mode), accept, valid=current, discard=discard)
+
+    def _install_modifier(self, modifier, targets, before):
+        chapter = self.canvas.chapter
         incompatible = chapter.incompatible_modifier_targets(modifier, targets)
         if incompatible:
             self.canvas.report_incompatible("Add modifier", chapter.modifier_compatibility_message(modifier, incompatible), incompatible)
@@ -953,7 +1033,6 @@ class ModifierControls(QWidget):
         self.canvas._remember_modifier(modifier.modifier_id)
         self.active_modifier_id = modifier.modifier_id
         self.canvas.active_modifier_id = modifier.modifier_id
-        self._changed()
         self._push(before, "Add modifier")
         self.refresh()
 

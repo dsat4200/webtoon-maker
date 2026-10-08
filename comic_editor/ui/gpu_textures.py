@@ -7,6 +7,7 @@ allocation is capped. Context ownership is restored before returning to Qt.
 import logging
 import math
 import numpy as np
+from shiboken6 import isValid
 from PySide6.QtCore import QSize
 from PySide6.QtGui import QGuiApplication, QImage, QOffscreenSurface, QOpenGLContext, QSurfaceFormat
 from PySide6.QtOpenGL import (QOpenGLBuffer, QOpenGLFramebufferObject, QOpenGLFunctions_3_3_Core,
@@ -177,29 +178,32 @@ class GpuTextureRenderer:
 
     def close(self):
         self.available = False
-        if self.context is None or self.surface is None:
-            return
+        context, surface = self.context, self.surface
         previous = QOpenGLContext.currentContext()
-        previous_surface = previous.surface() if previous else None
-        context = self.context
+        previous_surface = previous.surface() if previous is not None and isValid(previous) else None
         activated = False
         try:
-            activated = context.makeCurrent(self.surface)
-            if activated:
-                if self.texture:
-                    self.texture.destroy()
-                if self.buffer:
-                    self.buffer.destroy()
-                if self.vao:
-                    self.vao.destroy()
+            if (context is not None and surface is not None
+                    and isValid(context) and isValid(surface)):
+                activated = context.makeCurrent(surface)
+                if activated:
+                    if self.texture is not None and isValid(self.texture):
+                        self.texture.destroy()
+                    if self.buffer is not None and isValid(self.buffer):
+                        self.buffer.destroy()
+                    if self.vao is not None and isValid(self.vao):
+                        self.vao.destroy()
         finally:
             self.framebuffer = self.texture = self.program = self.buffer = self.vao = None
             self.functions = None
-            if activated:
-                context.doneCurrent()
-            if previous is not context and previous and previous_surface:
-                previous.makeCurrent(previous_surface)
             self.context = self.surface = None
+            try:
+                if activated and isValid(context):
+                    context.doneCurrent()
+            finally:
+                if (previous is not context and previous is not None and previous_surface is not None
+                        and isValid(previous) and isValid(previous_surface)):
+                    previous.makeCurrent(previous_surface)
 
 
 def renderer_for(canvas):
@@ -216,5 +220,7 @@ def renderer_for(canvas):
     if renderer is None:
         renderer = GpuTextureRenderer()
         canvas._gpu_texture_renderer = renderer
-        canvas.destroyed.connect(renderer.close)
+        destroyed = getattr(canvas, "destroyed", None)
+        if destroyed is not None:
+            destroyed.connect(renderer.close)
     return renderer if renderer.available else None

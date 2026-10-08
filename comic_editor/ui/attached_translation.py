@@ -81,6 +81,21 @@ def transform_attached(canvas, roots, transform):
                 translate_mask(mask, *delta)
 
 
+def preview_cache_context(canvas):
+    """Identify preview caches without transferring input-owned history.
+
+    Detached evaluators keep one immutable document for their lifetime. Their
+    attachment helpers are local to that evaluator; ordinary cache handoff
+    excludes these contexts and transformed modifier copies.
+    """
+    snapshot = getattr(canvas, "snapshot", None)
+    if snapshot is not None:
+        document = snapshot.document
+        return ("scene", document.identity, document.configuration), document.revision
+    projection = getattr(canvas, "_document_projection", None)
+    return id(canvas._model_before), getattr(projection, "revision", None)
+
+
 def preview_attachment_context(canvas):
     if canvas.chapter is None:
         return None
@@ -105,21 +120,20 @@ def preview_attachment_context(canvas):
         parent = canvas.layer_world_transform(obj.parent_layer_id)
     else:
         return None
-    projection = getattr(canvas, "_document_projection", None)
+    baseline, revision = preview_cache_context(canvas)
     key = (id(canvas.chapter), tuple(roots), tuple(source), tuple(destination),
            tuple(getattr(parent, f"m{i}{j}")() for i in range(1, 4) for j in range(1, 4)),
-           getattr(projection, "revision", None), id(canvas._model_before),
+           revision, baseline,
            len(canvas.chapter.layers), len(canvas.chapter.objects), len(canvas.chapter.modifiers))
     cached = getattr(canvas, "_attached_preview_context", None)
     if cached is not None and cached[0] == key:
         return cached[1]
     # A translation must stay exactly affine, including under an affine parent.
     changes = [(b[0] - a[0], b[1] - a[1]) for a, b in zip(source, destination)]
-    if all(abs(dx - changes[0][0]) < 1e-9 and abs(dy - changes[0][1]) < 1e-9
-           for dx, dy in changes):
+    if (parent.isAffine()
+            and all(abs(dx - changes[0][0]) < 1e-9 and abs(dy - changes[0][1]) < 1e-9
+                    for dx, dy in changes)):
         delta = parent.map(QPointF(*changes[0])) - parent.map(QPointF())
-        if not parent.isAffine():
-            return None
         transform = QTransform.fromTranslate(delta.x(), delta.y())
     else:
         transform = canvas._quad_to_quad_transform(
@@ -146,9 +160,9 @@ def effective_preview_mask(canvas, mask):
     return result
 
 
-def preview_object_bounds(canvas, obj, bounds):
+def preview_object_bounds(canvas, obj, bounds, *, local_aabb=False):
     """Use the live destination for source captures as well as presentation."""
-    from comic_editor.core.models import TextObject
+    from comic_editor.core.models import ImageObject, TextObject
     if isinstance(obj, TextObject) or bounds is None:
         return bounds
     destination = canvas._multi_transform_preview_quads.get(obj.object_id)
@@ -156,6 +170,17 @@ def preview_object_bounds(canvas, obj, bounds):
         destination = canvas._transform_preview_quad
     if destination is None:
         return bounds
+    if isinstance(obj, ImageObject) and obj.placement_mode == "free":
+        from PySide6.QtGui import QPolygonF
+        parent = canvas.layer_world_transform(obj.parent_layer_id)
+        polygon = QPolygonF([QPointF(*point) for point in destination])
+        if local_aabb:
+            # Mirror sources use the committed local AABB before the parent
+            # mapping. Reconstructing a projective old-to-new transform can
+            # move an exact integer edge across native floor/ceil boundaries.
+            rect = polygon.boundingRect()
+            polygon = QPolygonF([rect.topLeft(), rect.topRight(), rect.bottomRight(), rect.bottomLeft()])
+        return parent.map(polygon).boundingRect()
     source = canvas.object_world_quad(obj.object_id)
     if not source:
         return bounds

@@ -1,15 +1,86 @@
 """Free text placement and non-destructive layout/frame manipulation."""
 import copy
 import math
+import numpy as np
 from PySide6.QtCore import QPointF, QRectF, QTimer, Qt
 from PySide6.QtGui import QColor, QPen, QPolygonF, QTransform
-from comic_editor.core.models import TextObject, object_from_dict
+from comic_editor.core.models import CageTransformModifier, TextObject, object_from_dict
 from comic_editor.core.document_patch import RecordSnapshot, DocumentPatch
 from comic_editor.core.changes import ChangeSet, EntityChange, GROUP_KINDS
 from comic_editor.ui.tool_sessions import LatestValueInput, ToolSession
 
 
 class TextFeatures:
+    def _text_presentation_clip(self, obj):
+        """Each parent clips its input before its own cage, after child cages."""
+        layers = self.chapter.ancestor_layers(obj.parent_layer_id)
+        skipped = {obj.parent_layer_id} if obj.ignore_parent_mask else set()
+        for parent, child in zip(layers, layers[1:]):
+            if child.ignore_parent_mask:
+                skipped.add(parent.layer_id)
+        result = None
+        for layer in layers:
+            if layer.bound is None or layer.layer_id in skipped:
+                continue
+            mapping = (self.layer_world_transform(layer.layer_id)
+                       * self._text_presentation_transform(obj, from_layer=layer.layer_id))
+            path = mapping.map(self.layer_effective_path(layer.layer_id))
+            result = path if result is None else result.intersected(path)
+        return result
+
+    def _text_interaction_quad(self, obj):
+        mapping = self._text_presentation_transform(obj)
+        return [mapping.map(QPointF(*p)).toTuple()
+                for p in (self.object_world_quad(obj.object_id) or [])]
+
+    def _text_presentation_transform(self, obj, *, from_layer=None):
+        """Follow affine cages for editor geometry, never source artwork geometry.
+
+        A full-strength translated/affine cage has one invertible text layout.
+        Blended, masked and nonlinear cages retain the source editing frame.
+        Validate every lattice point so a curved cage cannot become a corner-only
+        approximation. Recheck live records rather than retaining editor state.
+        """
+        from comic_editor.core.cage import map_points
+        result = QTransform()
+        quad = self.object_world_quad(obj.object_id)
+        if not quad:
+            return result
+        owners = [obj, *reversed(self.chapter.ancestor_layers(obj.parent_layer_id))]
+        include = from_layer is None
+        for owner in owners:
+            if getattr(owner, "layer_id", None) == from_layer:
+                include = True
+            for cage in self._active_modifier_instances(owner.modifier_ids):
+                if not isinstance(cage, CageTransformModifier) or cage.intensity <= 0:
+                    continue
+                if cage.intensity != 100 or "intensity" in cage.parameter_masks:
+                    return QTransform()
+                rest = cage.rest_points()
+                points = np.asarray(cage.points or rest)
+                indexes = [0, cage.columns-1, len(rest)-1, len(rest)-cage.columns]
+                mapping = QTransform()
+                if not QTransform.quadToQuad(
+                    QPolygonF([QPointF(*rest[i]) for i in indexes]),
+                    QPolygonF([QPointF(*points[i]) for i in indexes]), mapping,
+                ) or not mapping.isAffine() or not mapping.isInvertible():
+                    return QTransform()
+                mapped = np.asarray([mapping.map(QPointF(*p)).toTuple() for p in rest])
+                if not np.allclose(mapped, points, rtol=0, atol=1e-5):
+                    return QTransform()
+                # Cage displacement clamps outside its source domain. Prove
+                # that this text frame obeys the same mapping, too.
+                probes = quad + self._edge_midpoints(quad) + [
+                    tuple(np.asarray(quad).mean(axis=0))
+                ]
+                mapped = np.asarray([mapping.map(QPointF(*p)).toTuple() for p in probes])
+                if not np.allclose(mapped, map_points(cage, probes), rtol=0, atol=1e-5):
+                    return QTransform()
+                quad = [mapping.map(QPointF(*p)).toTuple() for p in quad]
+                if include:
+                    result = result * mapping
+        return result
+
     def _text_record_snapshot(self, obj, fields):
         """Retain only the authored fields participating in this text edit."""
         return RecordSnapshot.capture(self.chapter, objects=(obj.object_id,),
@@ -218,6 +289,9 @@ class TextFeatures:
         return None
 
     def _text_behavior_rect(self):
+        obj = self._editing_text_object()
+        if obj is not None and not self._text_presentation_transform(obj).isIdentity():
+            return QRectF()
         target = self._text_frame_target()
         if target is None:
             return QRectF()

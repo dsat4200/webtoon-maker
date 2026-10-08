@@ -470,9 +470,141 @@ class GpuTilePresenter:
                     previous.makeCurrent(previous_surface)
 
 
+
+# Presentation-only native frames: never artwork/exact/durable cache entries.
+_NATIVE_RASTER_MOSAIC_BYTES = 4 * 1024 * 1024
+_NATIVE_RASTER_MOSAIC_SIDE = 2048
+_NATIVE_RASTER_MOSAIC_TILES = 32
+
+
+def _discard_native_raster_mosaic(owner):
+    if owner is not None:
+        owner._native_raster_mosaic = None
+
+
+def _native_raster_mosaic(owner, tiles, camera, viewport_size, native_bounds,
+                          context, *, smooth=True, presentation_dpr=1.):
+    """Join a small complete current native batch without changing any pixels.
+
+    The caller proves that the owned batch is already-current exact artwork.
+    Only Legacy ARGB32 native tiles are supported initially. All other formats,
+    missing coverage, large views and non-axis-aligned cameras keep their prior
+    presentation path. There is at most one4MiB surface, no retained tile handles
+    and no scene/source/effect evaluation or native/durable result admission.
+    """
+    import math
+
+    def reject():
+        _discard_native_raster_mosaic(owner)
+        return None
+    if (owner is None or context is None or native_bounds is None
+            or not math.isfinite(presentation_dpr) or presentation_dpr <= 0
+            or not 2 <= len(tiles) <= _NATIVE_RASTER_MOSAIC_TILES):
+        return reject()
+    matrix = (camera.m11(), camera.m12(), camera.m13(), camera.m21(), camera.m22(),
+              camera.m23(), camera.m31(), camera.m32(), camera.m33())
+    if (not all(math.isfinite(value) for value in matrix)
+            or not camera.isAffine() or camera.m11() <= 0 or camera.m22() <= 0
+            or camera.m12() != 0 or camera.m21() != 0 or camera.m33() != 1):
+        return reject()
+    inverse, valid = camera.inverted()
+    if not valid or viewport_size.width() <= 0 or viewport_size.height() <= 0:
+        return reject()
+    bounds_values = tuple(native_bounds.getRect())
+    if not all(math.isfinite(v) and v == round(v) for v in bounds_values):
+        return reject()
+    visible = inverse.mapRect(QRectF(0, 0, viewport_size.width(), viewport_size.height())).intersected(native_bounds)
+    # Initial native-frame equivalence is proven for integral capture frames.
+    # Fractional frames keep the original path; do not invent a sampling shift.
+    if not all(math.isfinite(v) and v == round(v) for v in visible.getRect()):
+        return reject()
+    region = visible.toAlignedRect().intersected(native_bounds.toAlignedRect())
+    width, height = region.width(), region.height()
+    if (region.isEmpty() or width > _NATIVE_RASTER_MOSAIC_SIDE
+            or height > _NATIVE_RASTER_MOSAIC_SIDE
+            or width * height * 4 > _NATIVE_RASTER_MOSAIC_BYTES):
+        return reject()
+    placements, signatures, areas = [], [], 0
+    space, environment, contract = None, None, None
+    for tile in tiles:
+        image = tile.image
+        if (not isinstance(image, QImage) or image.isNull()
+                or tile.pixel_contract != LEGACY_PIXELS
+                or image.format() != QImage.Format_ARGB32_Premultiplied
+                or image.devicePixelRatio() != 1.
+                or not isinstance(tile.key, tuple) or len(tile.key) != 2 or tile.key[0] is not None):
+            return reject()
+        world = QRectF(tile.world_rect)
+        source = QRectF(tile.source_rect) if tile.source_rect is not None else QRectF(image.rect())
+        values = tuple(world.getRect()) + tuple(source.getRect())
+        if (world.isEmpty() or source.isEmpty()
+                or not all(math.isfinite(v) and v == round(v) for v in values)
+                or source.width() != world.width() or source.height() != world.height()
+                or not QRectF(image.rect()).contains(source)):
+            return reject()
+        clipped = world.toAlignedRect().intersected(region)
+        if clipped.isEmpty():
+            continue
+        if any(clipped.intersects(other[1]) for other in placements):
+            return reject()
+        current_space = image.colorSpace()
+        current_environment = (getattr(tile.pixel_environment, 'signature', None)
+                               if tile.pixel_environment is not None else None)
+        if tile.pixel_environment is not None and not isinstance(current_environment, tuple):
+            return reject()
+        if not placements:
+            space, environment, contract = current_space, current_environment, tile.pixel_contract
+        elif current_space != space or current_environment != environment or tile.pixel_contract != contract:
+            return reject()
+        sx = round(source.x()) + clipped.x() - round(world.x())
+        sy = round(source.y()) + clipped.y() - round(world.y())
+        placements.append((image, clipped, sx, sy))
+        areas += clipped.width() * clipped.height()
+        signatures.append((tile.key, image.cacheKey(), image.width(), image.height(), image.format(),
+                           image.devicePixelRatio(), values, current_space, current_environment,
+                           tile.pixel_contract.signature))
+    if len(placements) < 2 or areas != width * height:
+        return reject()
+    key = (context, tuple(signatures), tuple(region.getRect()), matrix,
+           viewport_size.width(), viewport_size.height(), bool(smooth), presentation_dpr)
+    cached = getattr(owner, '_native_raster_mosaic', None)
+    if cached is not None and cached[0] == key:
+        return cached[1], QRectF(region)
+    # Retire before allocating the replacement; the private owner retains only
+    # one bounded surface. Source tiles remain owned by the ordinary tile graph.
+    _discard_native_raster_mosaic(owner)
+    image = QImage(width, height, QImage.Format_ARGB32_Premultiplied)
+    if image.isNull() or image.sizeInBytes() > _NATIVE_RASTER_MOSAIC_BYTES:
+        return None
+    image.setDevicePixelRatio(1.)
+    image.setColorSpace(space)
+    target = np.frombuffer(image.bits(), np.uint8).reshape(height, image.bytesPerLine())
+    for native, clipped, sx, sy in placements:
+        pixels = np.frombuffer(native.constBits(), np.uint8).reshape(native.height(), native.bytesPerLine())
+        x, y = clipped.x()-region.x(), clipped.y()-region.y()
+        target[y:y+clipped.height(), x*4:(x+clipped.width())*4] = pixels[sy:sy+clipped.height(), sx*4:(sx+clipped.width())*4]
+    del target, pixels
+    owner._native_raster_mosaic = key, image
+    return image, QRectF(region)
+
+
+def _draw_native_raster_mosaic(painter, mosaic, camera, contract, environment, *, smooth):
+    """Draw one ordinary native QImage, restoring every caller painter state."""
+    image, world = mosaic
+    painter.save()
+    try:
+        painter.setTransform(camera)
+        painter.setRenderHint(QPainter.SmoothPixmapTransform, bool(smooth))
+        with pixel_scope(contract, environment=environment):
+            painter.drawImage(world, display_image(image, contract), QRectF(image.rect()))
+    finally:
+        painter.restore()
+
+
 def draw_document_tiles(painter: QPainter, tiles: Iterable[PresentedTile],
                         camera: QTransform, viewport_size: QSizeF, *, owner=None,
-                        smooth=True, clip_world: QRectF | None = None) -> PresentationStats:
+                        smooth=True, clip_world: QRectF | None = None,
+                        native_context=None, native_bounds: QRectF | None = None) -> PresentationStats:
     """Present tiles, preserving the painter for subsequent tool/grid overlays.
 
     An arbitrary existing painter clip or nonstandard composition mode uses the
@@ -503,12 +635,39 @@ def draw_document_tiles(painter: QPainter, tiles: Iterable[PresentedTile],
             return PresentationStats("gpu", len(tiles), presenter.uploads - uploads_before,
                                      presenter.texture_bytes)
     if any(isinstance(tile.image,DeviceImage) for tile in tiles):
+        if owner is not None and getattr(owner, '_native_raster_mosaic', None) is not None:
+            _discard_native_raster_mosaic(owner)
         # A GUI fallback may not synchronously materialize a device image. Its
         # consumer must request the CPU edge through the background scheduler.
         controller = getattr(owner,'_scene_controller',None)
         if controller is not None:
             controller.ensure_cpu_tiles(tiles)
         return PresentationStats('pending',0)
+    # Only the ordinary owned Raster widget opts in. Arbitrary QImage/export
+    # painters, GPU widgets and caller-supplied clips retain their old path.
+    # Detached/nonopted callers do not even import the Canvas UI module.
+    if native_context is not None and owner is not None:
+        from comic_editor.ui.canvas import RasterCanvasWidget
+        eligible = (isinstance(owner, RasterCanvasWidget) and painter.device() is owner
+                    and not painter.hasClipping()
+                    and painter.compositionMode() == QPainter.CompositionMode_SourceOver
+                    and clip_world is None)
+        if eligible:
+            mosaic = _native_raster_mosaic(owner, tiles, camera, viewport_size,
+                native_bounds, native_context, smooth=smooth,
+                presentation_dpr=owner.devicePixelRatioF())
+            if mosaic is not None:
+                try:
+                    _draw_native_raster_mosaic(painter, mosaic, camera, tiles[0].pixel_contract,
+                                               tiles[0].pixel_environment, smooth=smooth)
+                except BaseException:
+                    _discard_native_raster_mosaic(owner)
+                    raise
+                return PresentationStats('raster', len(tiles))
+        elif getattr(owner, '_native_raster_mosaic', None) is not None:
+            _discard_native_raster_mosaic(owner)
+    elif owner is not None and getattr(owner, '_native_raster_mosaic', None) is not None:
+        _discard_native_raster_mosaic(owner)
     painter.save()
     painter.setTransform(camera)
     painter.setRenderHint(QPainter.SmoothPixmapTransform, bool(smooth))
