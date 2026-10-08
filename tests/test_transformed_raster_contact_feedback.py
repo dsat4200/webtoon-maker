@@ -13,7 +13,22 @@ from comic_editor.core.brushes import BrushDefinition
 from comic_editor.core.models import BoundGeometry, ChildRef
 from comic_editor.core.tools import ToolKind
 from comic_editor.render.raster_feedback import feedback_chain
-from test_raster_contact_feedback import scene, pixels, ready_paint, native_reference
+from test_raster_contact_feedback import scene, pixels, ready_paint, native_reference as native_artwork_reference
+
+
+def native_reference(canvas):
+    # Compare the complete presented buffer, including the document boundary
+    # that the ordinary presenter always draws after the native artwork.
+    from comic_editor.ui.document_presentation import draw_document_border
+    image = native_artwork_reference(canvas)
+    painter = QPainter(image)
+    painter.setRenderHint(QPainter.Antialiasing, True)
+    try:
+        draw_document_border(painter, canvas._render_document_state().bounds,
+                             canvas.camera_transform(), canvas.size(), owner=canvas)
+    finally:
+        painter.end()
+    return image
 
 
 def configure_transforms(canvas, selected):

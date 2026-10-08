@@ -126,6 +126,9 @@ def _compose_tile(canvas, prepared, tile, resident):
             else:
                 if mapped:
                     patch_source.fillRect(QRectF(left, top, side, side), Qt.transparent)
+                    # Qt's Source image path rounds transformed samples
+                    # differently. Clear first, then use the same SourceOver
+                    # image path as the ordinary native raster kernel.
                     patch_source.setCompositionMode(QPainter.CompositionMode_SourceOver)
                 patch_source.drawImage(left, top, image)
                 if mapped:
