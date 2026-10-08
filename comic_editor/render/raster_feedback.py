@@ -27,6 +27,7 @@ class RasterFeedbackTile:
     prefix: QImage
     source: QImage
     suffix: QImage
+    source_keys: tuple = ()
 
     @property
     def byte_count(self):
@@ -43,10 +44,42 @@ class RasterFeedback:
     opacity: float
     clips: tuple
     tiles: tuple
+    source_transform: tuple | None = None
 
     @property
     def byte_count(self):
         return sum(tile.byte_count for tile in self.tiles)
+
+
+def _feedback_mapping_supported(entity):
+    """Conservative native separability gate; never approximate a quad."""
+    frame, quad = entity.transform_frame, entity.transform_quad
+    if frame is None and quad is None:
+        return True
+    if frame is None or quad is None or len(frame) != 4 or len(quad) != 4:
+        return False
+    try:
+        if not all(math.isfinite(value) for value in frame) or frame[2] <= 0 or frame[3] <= 0:
+            return False
+        if not all(len(point) == 2 and all(math.isfinite(value) for value in point) for point in quad):
+            return False
+        a, b, c, d = quad
+        return (a[1] == b[1] and b[0] == c[0] and c[1] == d[1] and d[0] == a[0]
+                and b[0] > a[0] and d[1] > a[1])
+    except (TypeError, ValueError, OverflowError):
+        return False
+
+
+def _feedback_source_keys(bounds, inverse, side, limit=128):
+    """Bound source metadata work before constructing a source-key set."""
+    local = inverse.mapRect(QRectF(*bounds)).adjusted(-1., -1., 1., 1.)
+    coordinates = local.left(), local.top(), local.right(), local.bottom()
+    if not all(math.isfinite(value) for value in coordinates):
+        return None
+    left, top, right, bottom = (math.floor(value / side) for value in coordinates)
+    if (right - left + 1) * (bottom - top + 1) > limit:
+        return None
+    return tuple((x, y) for y in range(top, bottom + 1) for x in range(left, right + 1))
 
 
 def feedback_chain(snapshot, identifier):
@@ -55,9 +88,9 @@ def feedback_chain(snapshot, identifier):
     obj = chapter.objects.get(identifier)
     if (not isinstance(obj, RasterObject) or not obj.visible or obj.mask_only
             or document.pixel_contract != LEGACY_PIXELS or document.overflow
-            or document.underlay != ('', 0.) or snapshot.state.get('_solo_entities')
+            or document.underlay != ('', 0.)
             or obj.opacity_mask is not None or obj.modifier_ids
-            or obj.transform_frame is not None or obj.transform_quad is not None
+            or not _feedback_mapping_supported(obj)
             or obj.modifier_source_frame is not None or obj.ignore_parent_mask
             or obj.tile_size != snapshot.tiles.tile_size
             or obj.show_on_top
@@ -73,7 +106,7 @@ def feedback_chain(snapshot, identifier):
                 or layer.modifier_ids or layer.compound_enabled
                 or layer.show_on_top
                 or layer.layer_kind != 'bounded' or layer.ignore_parent_mask
-                or layer.transform_frame is not None or layer.transform_quad is not None
+                or not _feedback_mapping_supported(layer)
                 or layer.bound is None):
             return None
         # These children have an extra pass outside the ordinary child order.
@@ -95,9 +128,15 @@ def feedback_chain(snapshot, identifier):
                    for modifier in chapter.modifiers.values())):
         return None
     origin = obj.x + sum(layer.translate_x for layer in chain), obj.y + sum(layer.translate_y for layer in chain)
-    if not all(math.isfinite(value) and value == round(value) for value in origin):
+    if not all(math.isfinite(value) for value in
+               (obj.x, obj.y, *(value for layer in chain for value in (layer.translate_x, layer.translate_y)))):
         return None
-    return obj, chain, tuple(int(value) for value in origin)
+    mapped = obj.transform_quad is not None or any(layer.transform_quad is not None for layer in chain)
+    if not mapped and any(value != round(value) for value in origin):
+        return None
+    # Mapped sources use a native document grid. The source retains its original
+    # sampling grid, and resident edits are mapped into these prepared planes.
+    return obj, chain, (0, 0) if mapped else tuple(int(value) for value in origin)
 
 
 def _split_snapshot(snapshot, obj, chain, *, suffix):
@@ -155,9 +194,31 @@ def prepare_raster_feedback(snapshot, identifier, visible, *, caches=None,
     before = DetachedSceneBackend(_split_snapshot(snapshot, obj, chain, suffix=False))
     after = DetachedSceneBackend(_split_snapshot(snapshot, obj, chain, suffix=True))
     source_backend = DetachedSceneBackend(replace(snapshot, cache_spec=None, graphics_worker=None))
+    if not source_backend.scene._solo_content_visible('object', identifier):
+        before.close()
+        after.close()
+        source_backend.close()
+        return None
     raw_obj = copy.copy(obj)
     raw_obj.x = raw_obj.y = 0.
+    raw_obj.transform_frame = raw_obj.transform_quad = None
+    mapped = (obj.transform_quad is not None or any(layer.transform_quad is not None for layer in chain)
+              or any(value != round(value) for value in
+                     (obj.x + sum(layer.translate_x for layer in chain),
+                      obj.y + sum(layer.translate_y for layer in chain))))
+    source_transform = None
     try:
+        mapping = (QTransform.fromTranslate(obj.x, obj.y)
+                   * source_backend.scene._drawing_object_transform(obj)
+                   * source_backend.scene.layer_world_transform(obj.parent_layer_id))
+        inverse, valid = mapping.inverted()
+        if mapped:
+            coefficients = (mapping.m11(), mapping.m12(), mapping.m21(), mapping.m22(), mapping.dx(), mapping.dy())
+            if (not valid or not mapping.isAffine() or not all(math.isfinite(value) for value in coefficients)
+                    or coefficients[0] <= 0. or coefficients[3] <= 0.
+                    or coefficients[1] != 0. or coefficients[2] != 0.):
+                return None
+            source_transform = coefficients
         if caches:
             before.scene.adopt_cache_state(caches)
             after.scene.adopt_cache_state(caches)
@@ -178,6 +239,9 @@ def prepare_raster_feedback(snapshot, identifier, visible, *, caches=None,
                 return None
             bounds = (origin[0] + key[0] * side - gutter,
                       origin[1] + key[1] * side - gutter, side + 2 * gutter, side + 2 * gutter)
+            source_keys = _feedback_source_keys(bounds, inverse, side) if mapped else ()
+            if source_keys is None:
+                return None
             request = RenderRequest(bounds, 1., (side + 2 * gutter,) * 2,
                                     ('raster-feedback', identifier, *key), snapshot.document.revision)
             base_request = replace(request, phase='base') if has_top else request
@@ -203,18 +267,20 @@ def prepare_raster_feedback(snapshot, identifier, visible, *, caches=None,
             source.fill(Qt.transparent)
             painter = QPainter(source)
             try:
-                painter.setTransform(QTransform.fromTranslate(origin[0] - bounds[0], origin[1] - bounds[1]))
+                painter.setTransform(mapping * QTransform.fromTranslate(-bounds[0], -bounds[1]) if mapped
+                    else QTransform.fromTranslate(origin[0] - bounds[0], origin[1] - bounds[1]))
+                local_visible = (inverse.mapRect(QRectF(*bounds)).adjusted(-1., -1., 1., 1.) if mapped
+                    else QRectF(bounds[0] - origin[0], bounds[1] - origin[1], bounds[2], bounds[3]))
                 with pixel_scope(snapshot.document.pixel_contract, environment=snapshot.pixel_environment):
                     # The ordinary source kernel supplies unchanged neighboring
                     # pixels and gutters. No object clipping/effect is baked in.
                     source_backend.scene._render_raster_content(painter, raw_obj,
-                        QRectF(bounds[0] - origin[0], bounds[1] - origin[1], bounds[2], bounds[3]),
-                        use_transform_preview=False)
+                        local_visible, use_transform_preview=False)
             finally:
                 painter.end()
-            tiles.append(RasterFeedbackTile(key, bounds, planes[0].image, source, suffix))
+            tiles.append(RasterFeedbackTile(key, bounds, planes[0].image, source, suffix, source_keys))
         return RasterFeedback(snapshot.document, identifier, origin, side, gutter,
-                              snapshot.chapter.effective_object_opacity(identifier), tuple(clips), tuple(tiles))
+                              snapshot.chapter.effective_object_opacity(identifier), tuple(clips), tuple(tiles), source_transform)
     finally:
         before.close()
         after.close()

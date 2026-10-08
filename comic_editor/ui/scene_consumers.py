@@ -148,6 +148,14 @@ class SceneConsumers(QObject):
     def _document(self):
         return self.canvas._render_document_state() if self.canvas.chapter is not None else None
 
+    def _capture_job(self, job):
+        source_capture = getattr(job.compute, 'source_capture', None)
+        if job.owned_source and callable(source_capture):
+            # Only explicitly owned input evaluators opt in. Ordinary scene,
+            # mask sampling and render consumers keep their complete capture.
+            return source_capture(self.canvas, job.document, *job.arguments)
+        return self.canvas._scene_snapshot_compiler.capture(self.canvas, job.document)
+
     def advance(self):
         canvas = self.canvas
         if self.stopped.is_set():
@@ -198,7 +206,7 @@ class SceneConsumers(QObject):
                                 # source guard across harmless presentation or
                                 # unrelated edits. Retry only its staged view.
                                 job.document = self._document()
-                                job.capture = canvas._scene_snapshot_compiler.capture(canvas, job.document)
+                                job.capture = self._capture_job(job)
                             else:
                                 self._discard(job)
                                 self.active = None
@@ -218,7 +226,7 @@ class SceneConsumers(QObject):
                 elif canvas.chapter is not None:
                     if job.owned_source:
                         job.document = self._document()
-                    job.capture = canvas._scene_snapshot_compiler.capture(canvas, job.document)
+                    job.capture = self._capture_job(job)
                 else:
                     self._discard(job)
                     self.active = None

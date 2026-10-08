@@ -56,6 +56,11 @@ def footprint(modifier):
     return None
 
 
+def _sector_frame(modifier):
+    """Sector filters retain the original complete-frame numerical layout."""
+    return isinstance(modifier, KuwaharaModifier) and modifier.variant != "original"
+
+
 def eligible(canvas, required, request_scope, bounds, modifiers):
     stroke_regions = (getattr(canvas, '_stroke_projection_active', False)
                       and any(isinstance(m, (BrightnessContrastModifier, CurvesModifier,
@@ -69,7 +74,7 @@ def eligible(canvas, required, request_scope, bounds, modifiers):
             and (projection_requires_exact(canvas) or stroke_regions)
             and bounds == QRectF(bounds.toAlignedRect()) and not bounds.isEmpty()
             and bounds.width() * bounds.height() > 256 * 256
-            and any(footprint(m) is not None for m in modifiers if not m.muted))
+            and any(footprint(m) is not None or _sector_frame(m) for m in modifiers if not m.muted))
 
 
 def tile_output(canvas, image, bounds, modifiers, mapping, *, required, request_scope,
@@ -82,7 +87,7 @@ def tile_output(canvas, image, bounds, modifiers, mapping, *, required, request_
     active = [m for m in modifiers if not m.muted and (m.intensity > 0 or "intensity" in m.parameter_masks)]
     if not active:
         return None
-    if float_pipeline and (any(footprint(m) is None or isinstance(m, (ArrayModifier, MirrorModifier)) for m in active)
+    if float_pipeline and (any((footprint(m) is None and not _sector_frame(m)) or isinstance(m, (ArrayModifier, MirrorModifier)) for m in active)
                            or any(isinstance(m, BlurModifier) and "strength" in m.parameter_masks for m in active)
                            or all(isinstance(m, OutlineModifier) for m in active)):
         return None
@@ -206,7 +211,7 @@ def tile_output(canvas, image, bounds, modifiers, mapping, *, required, request_
                     painter.end()
                 return _premultiplied_qimage(_qimage_premultiplied(base)*(1.-amount)
                                             + _qimage_premultiplied(warped)*amount)
-            if halo is None:
+            if halo is None and not (float_pipeline and _sector_frame(effect)):
                 return render_stages(canvas, source, source_bounds, [effect], mapping,
                     nearest=nearest, source_key=("tile-frame-input", source_identity, placement, signatures[:stage]),
                     required=output, request_scope=("tile-frame", request_scope, effect.modifier_id), tile_evaluation=False)[0]
@@ -215,7 +220,10 @@ def tile_output(canvas, image, bounds, modifiers, mapping, *, required, request_
             fields = canvas._modifier_mask_fields([effect], source.width(), source.height(), work_mapping, mapping.mapRect(source_bounds))
             if revision != getattr(canvas, "_effect_provisional_revision", 0):
                 raise TileCacheMiss()
-            scope = ("tile-graph", request_scope, (stage + 1, (math.floor(output.x()/256), math.floor(output.y()/256))))
+            # Shared float sector frames use the same owner as graph lookup;
+            # keep float intermediates in the ordinary kernel path below.
+            owner = "frame" if halo is None else (math.floor(output.x()/256), math.floor(output.y()/256))
+            scope = ("tile-graph", request_scope, (stage + 1, owner))
             key = ("effect-tile", prefix, tuple(output.getRect()))
             if isinstance(effect, BlurModifier):
                 key_prefix = ("blur-level", source_identity, placement, signatures[:stage], tuple(output_frame.getRect()), effect.algorithm)
@@ -287,7 +295,7 @@ def tile_output(canvas, image, bounds, modifiers, mapping, *, required, request_
                 crop = QRectF(output)
                 crop.translate(-source_bounds.topLeft())
                 return None if result is None else result.copy(crop.toAlignedRect())
-            if projection_deferred(canvas) and halo > 0:
+            if projection_deferred(canvas) and (halo is None or halo > 0):
                 canvas._effect_jobs.request(scope, key, compute, 16*int(source.sizeInBytes()),
                     allow_oversized=True, require_exact=True)
                 raise ProjectionPending(scope, key)
@@ -388,7 +396,7 @@ def generic_target_output(canvas, target, bounds, modifiers, mapping, visible):
     scope = canvas._effect_request_scope(kind, identifier)
     if not eligible(canvas, required, scope, bounds, modifiers):
         return False
-    if (any(footprint(m) is None or isinstance(m, (ArrayModifier, MirrorModifier)) for m in modifiers if not m.muted)
+    if (any((footprint(m) is None and not _sector_frame(m)) or isinstance(m, (ArrayModifier, MirrorModifier)) for m in modifiers if not m.muted)
             or any(isinstance(m, BlurModifier) and "strength" in m.parameter_masks for m in modifiers if not m.muted)
             or all(isinstance(m, OutlineModifier) for m in modifiers)):
         return False

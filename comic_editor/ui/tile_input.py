@@ -7,6 +7,7 @@ from PySide6.QtCore import QTimer
 from PySide6.QtGui import QImage
 
 from comic_editor.ui.scene_consumers import SceneConsumers
+from comic_editor.render.input_sources import InputSourceCapture
 
 
 def prepare_input_tiles(snapshot, identifier, keys):
@@ -24,6 +25,7 @@ def prepare_input_tiles(snapshot, identifier, keys):
 prepare_input_tiles.admission_priority = 0
 prepare_input_tiles.working_bytes = lambda snapshot, _identifier, keys: len(keys) * snapshot.tiles.tile_size ** 2 * 32
 prepare_input_tiles.snapshot_working_bytes = lambda *_args: 0
+prepare_input_tiles.source_capture = InputSourceCapture
 
 
 def prepare_input_bounds(snapshot, identifier, keys):
@@ -37,6 +39,7 @@ def prepare_input_bounds(snapshot, identifier, keys):
 prepare_input_bounds.admission_priority = 0
 prepare_input_bounds.working_bytes = lambda snapshot, *_args: snapshot.tiles.tile_size ** 2 * 32
 prepare_input_bounds.snapshot_working_bytes = lambda *_args: 0
+prepare_input_bounds.source_capture = InputSourceCapture
 
 
 class TileInputGate:
@@ -143,11 +146,11 @@ class TileInputGate:
         self.cancel()
         self.canvas.operationError.emit('Drawing failed', str(error))
 
-    def publish(self, result, adopt):
+    def publish(self, result, adopt, *, valid=None):
         """Publish owned handles/metadata in bounded document-thread slices."""
         records = iter(result)
         def advance():
-            if not self.current():
+            if not self.current() or (valid is not None and not valid()):
                 self.pending = False
                 self.cancel()
                 return
@@ -224,7 +227,7 @@ class TileInputGate:
                         self.buffers[key] = image
                         self.tiles._alpha_bounds.setdefault(self.identifier, {})[key] = bounds
                         self.tiles._alpha_bounds_dirty.discard((self.identifier, *key))
-                    self.publish(result, adopt)
+                    self.publish(result, adopt, valid=valid)
                 def discard():
                     self.pending = False
                     self.cancel()

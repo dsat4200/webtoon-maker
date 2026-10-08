@@ -51,6 +51,11 @@ class RasterFeedbackPatchCache:
 
     def source_signature(self, prepared, tile, resident):
         """Compare every sampled gutter pixel without new invalidation rules."""
+        if getattr(prepared, 'source_transform', None) is not None:
+            # A world patch can sample arbitrary source tiles. Full owned image
+            # tokens avoid assuming a source-grid gutter around the world key.
+            return tuple((key, None if image is None else image.cacheKey())
+                         for key, image in sorted(resident.items()))
         entry = self.entries.get(tile.key)
         previous = (dict(entry[0][2]) if entry is not None
                     and entry[0][0] == id(prepared) else {})
@@ -107,12 +112,24 @@ def _compose_tile(canvas, prepared, tile, resident):
     patch_source = QPainter(source)
     try:
         patch_source.setCompositionMode(QPainter.CompositionMode_Source)
+        mapped = getattr(prepared, 'source_transform', None) is not None
+        if mapped:
+            patch_source.setRenderHint(QPainter.Antialiasing, False)
+            patch_source.setRenderHint(QPainter.SmoothPixmapTransform, False)
+            patch_source.setTransform(QTransform(*prepared.source_transform)
+                * QTransform.fromTranslate(-tile.bounds[0], -tile.bounds[1]))
         for key, image in resident.items():
-            left, top = (key[0] - x) * side + gutter, (key[1] - y) * side + gutter
+            left, top = (key[0] * side, key[1] * side) if mapped else (
+                (key[0] - x) * side + gutter, (key[1] - y) * side + gutter)
             if image is None:
-                patch_source.fillRect(left, top, side, side, Qt.transparent)
+                patch_source.fillRect(QRectF(left, top, side, side), Qt.transparent)
             else:
+                if mapped:
+                    patch_source.fillRect(QRectF(left, top, side, side), Qt.transparent)
+                    patch_source.setCompositionMode(QPainter.CompositionMode_SourceOver)
                 patch_source.drawImage(left, top, image)
+                if mapped:
+                    patch_source.setCompositionMode(QPainter.CompositionMode_Source)
     finally:
         patch_source.end()
     # The prepared prefix already uses the native composition format. Copying
@@ -199,7 +216,8 @@ def present_raster_feedback(canvas, painter, prepared, dirty_keys, cache):
             continue
         # Changed neighboring source pixels also replace a filtering gutter.
         x, y = tile.key
-        neighbors = {(x + dx, y + dy) for dy in (-1, 0, 1) for dx in (-1, 0, 1)}
+        neighbors = (set(tile.source_keys) if getattr(prepared, 'source_transform', None) is not None else
+            {(x + dx, y + dy) for dy in (-1, 0, 1) for dx in (-1, 0, 1)})
         if not dirty_keys.intersection(neighbors):
             continue
         resident = {}

@@ -26,6 +26,10 @@ REGIONAL_HALFTONE_MIN_PIXELS = 2_000_000
 
 
 def _kuwahara_region_padding(modifier):
+    # Sector moments use full-frame 48px matrix blocks. Cropping changes BLAS
+    # column shape/placement and native rounding even with identical samples.
+    if modifier.variant != "original":
+        return None
     # A native-scale, single-pass filter has finite support. Reduced-scale
     # filtering resamples against the complete source frame instead.
     if modifier.processing_scale != 100 or modifier.iterations != 1:
