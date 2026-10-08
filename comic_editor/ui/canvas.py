@@ -9484,11 +9484,12 @@ class _CanvasLogic(LassoBrushFeatures, BrushFeatures, DocumentProjectionFeatures
             return
         painter.save()
         try:
-            clip = self._ancestor_mask_path("object", obj.object_id)
+            clip = self._text_presentation_clip(obj)
             if clip is not None:
                 if clip.isEmpty():
                     return
                 painter.setClipPath(clip, Qt.IntersectClip)
+            painter.setTransform(self._text_presentation_transform(obj), True)
             opacity = 1.0
             for layer in self.chapter.ancestor_layers(obj.parent_layer_id):
                 if not layer.visible or layer.opacity <= 0:
@@ -10087,6 +10088,7 @@ class _CanvasLogic(LassoBrushFeatures, BrushFeatures, DocumentProjectionFeatures
                             self.tool == ToolKind.TEXT_EDIT
                             and isinstance(selected_object, TextObject)
                             and selected_object.layout_mode == "free"
+                            and self._text_presentation_transform(selected_object).isIdentity()
                         )
                     )
                 ):
@@ -10110,8 +10112,7 @@ class _CanvasLogic(LassoBrushFeatures, BrushFeatures, DocumentProjectionFeatures
                 ):
                     radius = 5 / max(self.scale, 0.05)
                     painter.setBrush(QColor("#ffcc66"))
-                    rect = self.object_world_rect(obj.object_id)
-                    for point in self._edge_midpoints(self._rect_quad(rect)):
+                    for point in self._edge_midpoints(self._text_interaction_quad(obj)):
                         painter.drawRect(QRectF(
                             point[0] - radius, point[1] - radius,
                             radius * 2, radius * 2,
@@ -12732,6 +12733,9 @@ class _CanvasLogic(LassoBrushFeatures, BrushFeatures, DocumentProjectionFeatures
                 transform.map(QPointF(x, y)).toTuple()
                 for x, y in self._transform_preview_quad
             ]
+        obj = self.chapter.objects.get(self.selected_id)
+        if self.tool == ToolKind.TEXT_EDIT and isinstance(obj, TextObject):
+            return self._text_interaction_quad(obj)
         return self.object_world_quad(self.selected_id)
 
     def selected_widget_rect(self) -> QRect:
@@ -12820,7 +12824,15 @@ class _CanvasLogic(LassoBrushFeatures, BrushFeatures, DocumentProjectionFeatures
                 and layer.layer_id not in skipped_masks
             ):
                 path = self.layer_effective_path(layer.layer_id)
-                local = self._layer_world_to_local(layer.layer_id, point)
+                mask_point = point
+                if isinstance(obj, TextObject):
+                    inverse, valid = self._text_presentation_transform(
+                        obj, from_layer=layer.layer_id
+                    ).inverted()
+                    if not valid:
+                        return False
+                    mask_point = inverse.map(point)
+                local = self._layer_world_to_local(layer.layer_id, mask_point)
                 if not path.contains(local):
                     return False
         return True
@@ -12851,6 +12863,12 @@ class _CanvasLogic(LassoBrushFeatures, BrushFeatures, DocumentProjectionFeatures
             return False
         if isinstance(obj, TextObject) and not obj.opacity_locked and obj.opacity <= 0:
             return False
+        if isinstance(obj, TextObject):
+            path = QPainterPath()
+            path.addPolygon(QPolygonF([
+                QPointF(*p) for p in self._text_interaction_quad(obj)
+            ]))
+            return path.contains(point)
         if isinstance(obj, SpeedLineCenterObject):
             return False
         if isinstance(obj, VectorDrawingObject):
@@ -14027,13 +14045,14 @@ class _CanvasLogic(LassoBrushFeatures, BrushFeatures, DocumentProjectionFeatures
             text_path = QPainterPath()
             text_path.addPolygon(QPolygonF([
                 QPointF(*candidate)
-                for candidate in self.object_world_quad(
-                    selected_object.object_id
-                )
+                for candidate in self._text_interaction_quad(selected_object)
             ]))
             over_selected_text = text_path.contains(world)
 
         transform_hover = self._active_transform_hover_kind(world)
+        if (self.tool == ToolKind.TEXT_EDIT and isinstance(selected_object, TextObject)
+                and not self._text_presentation_transform(selected_object).isIdentity()):
+            transform_hover = ""
         translation_active = bool(
             self._transform_drag_mode == "translate"
             or self._selection_transform_mode == "translate"
@@ -20743,6 +20762,12 @@ class _CanvasLogic(LassoBrushFeatures, BrushFeatures, DocumentProjectionFeatures
             return
         if self._text_behavior_hit(widget_point):
             return
+        text = self._editing_text_object()
+        if (text is not None and not self._text_presentation_transform(text).isIdentity()
+                and self._begin_text_pointer(point)):
+            # A displayed cage frame is an editor target. Do not start a
+            # source-frame transform capture or fall through to page selection.
+            return
         if self._begin_free_text_transform(point):
             return
         if self._begin_selected_text_transform(point):
@@ -22081,6 +22106,8 @@ class _CanvasLogic(LassoBrushFeatures, BrushFeatures, DocumentProjectionFeatures
             self.set_selection(
                 hit["kind"], hit["id"], activate_default_tool=True
             )
+            if self._editing_text_object() is not None:
+                self._begin_text_pointer(point)
             return
         page_id = self.active_page_id
         if page_id and page_id in self.chapter.layers:
@@ -22103,6 +22130,8 @@ class _CanvasLogic(LassoBrushFeatures, BrushFeatures, DocumentProjectionFeatures
             )
             return True
         self.set_selection("object", hits[0]["id"], activate_default_tool=True)
+        if self._editing_text_object() is not None:
+            self._begin_text_pointer(point)
         return True
 
     def _selected_shape_node(self, bound: BoundGeometry) -> PathNode | None:
@@ -24402,6 +24431,9 @@ class _CanvasLogic(LassoBrushFeatures, BrushFeatures, DocumentProjectionFeatures
     def _object_transform_cage_visible(
         self, obj: DocumentObject | None,
     ) -> bool:
+        if (self.tool == ToolKind.TEXT_EDIT and isinstance(obj, TextObject)
+                and not self._text_presentation_transform(obj).isIdentity()):
+            return False
         if not self._is_transformable_object(obj):
             return False
         if self.tool in {
@@ -25321,6 +25353,7 @@ class _CanvasLogic(LassoBrushFeatures, BrushFeatures, DocumentProjectionFeatures
         self, obj: TextObject,
     ) -> tuple[QTextDocument, QPointF, QTransform]:
         layer_transform = self.layer_world_transform(obj.parent_layer_id)
+        presentation = self._text_presentation_transform(obj)
         if obj.layout_mode == "strict":
             rect = self._strict_text_rect(obj)
             document = self._text_document(obj, rect.width())
@@ -25328,14 +25361,14 @@ class _CanvasLogic(LassoBrushFeatures, BrushFeatures, DocumentProjectionFeatures
             local = QTransform()
             local.translate(rect.left(), rect.top() + offset)
             return (
-                document, QPointF(), local * layer_transform,
+                document, QPointF(), local * layer_transform * presentation,
             )
         source = QRectF(0, 0, max(1.0, obj.width), max(1.0, obj.height))
         document = self._text_document(obj, source.width())
         offset = self._text_vertical_offset(obj, document, source.height())
         transform = self._quad_transform(source, self._text_quad(obj))
         transform.translate(0, offset)
-        return document, QPointF(), transform * layer_transform
+        return document, QPointF(), transform * layer_transform * presentation
 
     def _text_local_point(
         self, obj: TextObject, world: QPointF,
@@ -25357,7 +25390,7 @@ class _CanvasLogic(LassoBrushFeatures, BrushFeatures, DocumentProjectionFeatures
             object_path = QPainterPath()
             object_path.addPolygon(QPolygonF([
                 QPointF(*candidate)
-                for candidate in self.object_world_quad(obj.object_id)
+                for candidate in self._text_interaction_quad(obj)
             ]))
             if not object_path.contains(point):
                 return None
@@ -25415,8 +25448,7 @@ class _CanvasLogic(LassoBrushFeatures, BrushFeatures, DocumentProjectionFeatures
         if obj is None:
             return False
         if obj.layout_mode == "strict":
-            world_rect = self.object_world_rect(obj.object_id)
-            handles = self._edge_midpoints(self._rect_quad(world_rect))
+            handles = self._edge_midpoints(self._text_interaction_quad(obj))
             distances = [math.dist((point.x(), point.y()), item) for item in handles]
             if distances and min(distances) <= 12 / max(self.scale, 0.05):
                 self._begin_text_session(obj)
@@ -25444,6 +25476,10 @@ class _CanvasLogic(LassoBrushFeatures, BrushFeatures, DocumentProjectionFeatures
         if self._strict_margin_edge is not None:
             dirty = self._text_visual_dirty(obj)
             parent = self.chapter.layers[obj.parent_layer_id]
+            inverse, valid = self._text_presentation_transform(obj).inverted()
+            if not valid:
+                return
+            point = inverse.map(point)
             local = self._layer_world_to_local(obj.parent_layer_id, point)
             left, top, width, height = parent.bound.bbox()
             local_x, local_y = local.x(), local.y()

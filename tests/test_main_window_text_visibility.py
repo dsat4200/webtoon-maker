@@ -5,7 +5,7 @@ import pytest
 from PySide6.QtCore import QRectF, Qt
 from PySide6.QtTest import QTest
 
-from comic_editor.core.models import BoundGeometry, ChapterDocument, OutlineModifier, TextObject
+from comic_editor.core.models import BoundGeometry, CageTransformModifier, ChapterDocument, OutlineModifier, TextObject
 from comic_editor.core.tiles import TileStore
 from comic_editor.ui.main_window import MainWindow
 
@@ -146,3 +146,51 @@ def test_window_font_size_update_keeps_text_visible(text_window, qapp, effect):
     active = capture(canvas, qapp)
     canvas.commit_active_text_edit()
     assert capture(canvas, qapp) == active
+
+
+def test_translated_cage_text_edit_keeps_native_artwork_and_live_typing_visible(
+    text_window, qapp, await_completed_projection,
+):
+    canvas = text_window.canvas
+    obj = create_text(text_window, "object", ignore_parent_mask=True)
+    cage = CageTransformModifier(frame=(0, 0, 600, 400))
+    cage.validate_grid()
+    cage.points = [(x, y + 170) for x, y in cage.points]
+    canvas.chapter.add_modifier(cage, [("layer", obj.parent_layer_id)])
+    canvas._invalidate_scene_cache()
+    await_completed_projection(canvas)
+    resting = capture(canvas, qapp)
+    assert canvas.start_text_edit()
+    assert capture(canvas, qapp) == resting
+    QTest.keyClick(canvas, Qt.Key_A, Qt.ControlModifier)
+    QTest.keyClicks(canvas, "Cage edit")
+    live = capture(canvas, qapp)
+    assert obj.text == "Cage edit"
+    assert live != resting
+    canvas.commit_active_text_edit()
+    await_completed_projection(canvas)
+    assert capture(canvas, qapp) == live
+
+
+def test_clicking_displaced_text_from_parent_shape_reserves_first_tool_hotkey(
+    text_window, qapp,
+):
+    canvas = text_window.canvas
+    obj = create_text(text_window, "object", ignore_parent_mask=True)
+    cage = CageTransformModifier(frame=(0, 0, 600, 400))
+    cage.validate_grid()
+    cage.points = [(x, y + 170) for x, y in cage.points]
+    canvas.chapter.add_modifier(cage, [("layer", obj.parent_layer_id)])
+    document, origin, mapping = canvas._text_edit_layout(obj)
+    position = canvas.document_to_widget(
+        origin + mapping.map(canvas._text_caret_rect(document, 7).center())
+    ).toPoint()
+    canvas.set_selection("layer", obj.parent_layer_id)
+    QTest.mouseClick(canvas, Qt.LeftButton, pos=position)
+    assert canvas.selected_object_id == obj.object_id
+    assert canvas.has_active_text_edit()
+    cursor = canvas._text_cursor_position
+    before = obj.text
+    # T is also a tool shortcut; the initiating click must reserve typing.
+    QTest.keyClick(canvas, Qt.Key_T)
+    assert obj.text == before[:cursor] + "t" + before[cursor:]
