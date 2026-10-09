@@ -452,9 +452,9 @@ def test_unavailable_contact_pixels_show_received_gesture_as_pending(
         selected.x = .25
     elif case == 'transformed':
         selected.transform_frame = (0., 0., 128., 128.)
-        # Rotated/skewed maps retain ordinary evaluation. Positive axis-aligned
-        # transformed rasters now have separately verified native feedback.
-        selected.transform_quad = [(0., 0.), (128., 8.), (120., 128.), (-8., 120.)]
+        # Projective maps require ordinary scene evaluation; saved affine
+        # rotation/skew has separately verified native feedback.
+        selected.transform_quad = [(0., 0.), (128., 8.), (121., 128.), (-8., 120.)]
     canvas._invalidate_scene_cache()
     wait_scene(canvas)
     if case == 'missing':

@@ -163,7 +163,7 @@ def test_transformed_pruned_native_source_reveals_prefix_without_repainting_the_
     assert ready_paint(canvas).pixelColor(32, 64) == QColor('blue')
 
 
-@pytest.mark.parametrize('case', ['rotated', 'perspective', 'collapsed', 'mirror', 'nan'])
+@pytest.mark.parametrize('case', ['perspective', 'collapsed', 'folded', 'nan'])
 def test_unsupported_mapping_keeps_native_detached_evaluation_required(scene, case, wait_scene):
     canvas, selected, _front = scene
     wait_scene(canvas)
@@ -173,10 +173,9 @@ def test_unsupported_mapping_keeps_native_detached_evaluation_required(scene, ca
     obj = chapter.objects[selected.object_id] = copy.copy(chapter.objects[selected.object_id])
     obj.transform_frame = (0., 0., 128., 128.)
     obj.transform_quad = {
-        'rotated': [(0., 0.), (128., 1.), (127., 129.), (-1., 128.)],
         'perspective': [(0., 0.), (128., 0.), (127., 128.), (0., 128.)],
         'collapsed': [(0., 0.), (0., 0.), (0., 128.), (0., 128.)],
-        'mirror': [(128., 0.), (0., 0.), (0., 128.), (128., 128.)],
+        'folded': [(0., 0.), (128., 0.), (0., 128.), (128., 128.)],
         'nan': [(float('nan'), 0.), (128., 0.), (128., 128.), (0., 128.)],
     }[case]
     assert feedback_chain(replace(snapshot, chapter=chapter), selected.object_id) is None

@@ -108,33 +108,35 @@ class RasterFeedbackPatchCache:
 def _compose_tile(canvas, prepared, tile, resident):
     side, gutter = prepared.tile_size, prepared.gutter
     x, y = tile.key
-    source = tile.source.copy()
-    patch_source = QPainter(source)
-    try:
-        patch_source.setCompositionMode(QPainter.CompositionMode_Source)
-        mapped = getattr(prepared, 'source_transform', None) is not None
-        if mapped:
-            patch_source.setRenderHint(QPainter.Antialiasing, False)
-            patch_source.setRenderHint(QPainter.SmoothPixmapTransform, False)
-            patch_source.setTransform(QTransform(*prepared.source_transform)
-                * QTransform.fromTranslate(-tile.bounds[0], -tile.bounds[1]))
-        for key, image in resident.items():
-            left, top = (key[0] * side, key[1] * side) if mapped else (
-                (key[0] - x) * side + gutter, (key[1] - y) * side + gutter)
-            if image is None:
-                patch_source.fillRect(QRectF(left, top, side, side), Qt.transparent)
-            else:
-                if mapped:
+    rebuild = prepared.source_images is not None
+    if not rebuild:
+        source = tile.source.copy()
+        patch_source = QPainter(source)
+        try:
+            patch_source.setCompositionMode(QPainter.CompositionMode_Source)
+            mapped = getattr(prepared, 'source_transform', None) is not None
+            if mapped:
+                patch_source.setRenderHint(QPainter.Antialiasing, False)
+                patch_source.setRenderHint(QPainter.SmoothPixmapTransform, False)
+                patch_source.setTransform(QTransform(*prepared.source_transform)
+                    * QTransform.fromTranslate(-tile.bounds[0], -tile.bounds[1]))
+            for key, image in resident.items():
+                left, top = (key[0] * side, key[1] * side) if mapped else (
+                    (key[0] - x) * side + gutter, (key[1] - y) * side + gutter)
+                if image is None:
                     patch_source.fillRect(QRectF(left, top, side, side), Qt.transparent)
-                    # Qt's Source image path rounds transformed samples
-                    # differently. Clear first, then use the same SourceOver
-                    # image path as the ordinary native raster kernel.
-                    patch_source.setCompositionMode(QPainter.CompositionMode_SourceOver)
-                patch_source.drawImage(left, top, image)
-                if mapped:
-                    patch_source.setCompositionMode(QPainter.CompositionMode_Source)
-    finally:
-        patch_source.end()
+                else:
+                    if mapped:
+                        patch_source.fillRect(QRectF(left, top, side, side), Qt.transparent)
+                        # Qt's Source image path rounds transformed samples
+                        # differently. Clear first, then use the same SourceOver
+                        # image path as the ordinary native raster kernel.
+                        patch_source.setCompositionMode(QPainter.CompositionMode_SourceOver)
+                    patch_source.drawImage(left, top, image)
+                    if mapped:
+                        patch_source.setCompositionMode(QPainter.CompositionMode_Source)
+        finally:
+            patch_source.end()
     # The prepared prefix already uses the native composition format. Copying
     # its pixels is identical to SourceOver onto an empty transparent image,
     # without another allocation/fill/draw on every changed patch.
@@ -145,15 +147,33 @@ def _compose_tile(canvas, prepared, tile, resident):
         composed.save()
         composed.setTransform(QTransform.fromTranslate(-tile.bounds[0], -tile.bounds[1]))
         composed.setClipRect(prepared.document.bounds)
-        for clip in prepared.clips:
-            composed.setClipPath(clip, Qt.IntersectClip)
+        if rebuild:
+            for transform, clip in prepared.source_layers:
+                composed.setTransform(QTransform(*transform), True)
+                composed.setClipPath(clip, Qt.IntersectClip)
+        else:
+            for clip in prepared.clips:
+                composed.setClipPath(clip, Qt.IntersectClip)
         composed.setOpacity(prepared.opacity)
         # Match the shared raster kernel's native source sampling. In Qt the
         # raster hint also controls how an already installed curved clip is
         # applied to an image, so it must change after installing the clips.
         composed.setRenderHint(QPainter.Antialiasing, False)
         composed.setRenderHint(QPainter.SmoothPixmapTransform, False)
-        composed.drawImage(QRectF(*tile.bounds), source)
+        if rebuild:
+            transform, left, top = prepared.source_object
+            composed.setTransform(QTransform(*transform), True)
+            composed.translate(left, top)
+            # Draw onto the prefix with the ordinary native transform/opacity
+            # phase. An intermediate mapped image would round translucent
+            # samples before their native composition with the background.
+            for key in tile.source_keys:
+                native = resident.get(key, prepared.source_images.get(key))
+                if native is not None:
+                    composed.drawImage(key[0] * side, key[1] * side, native)
+            composed.setTransform(QTransform.fromTranslate(-tile.bounds[0], -tile.bounds[1]))
+        else:
+            composed.drawImage(QRectF(*tile.bounds), source)
         if (canvas.settings.predictive_ink and canvas._predictive is not None
                 and not canvas._stroke_erasing):
             composed.setRenderHint(QPainter.Antialiasing, True)
@@ -214,7 +234,8 @@ def present_raster_feedback(canvas, painter, prepared, dirty_keys, cache):
     visible = canvas.visible_document_rect().adjusted(-margin, -margin, margin, margin)
     presented_tiles = []
     for tile in prepared.tiles:
-        world = QRectF(tile.bounds[0] + gutter, tile.bounds[1] + gutter, side, side)
+        world_side = prepared.world_size
+        world = QRectF(tile.bounds[0] + gutter, tile.bounds[1] + gutter, world_side, world_side)
         if not world.intersects(visible):
             continue
         # Changed neighboring source pixels also replace a filtering gutter.
@@ -250,7 +271,7 @@ def present_raster_feedback(canvas, painter, prepared, dirty_keys, cache):
             presented = _compose_tile(canvas, prepared, tile, resident)
             cache.put(tile.key, signature, presented)
         presented_tiles.append(PresentedTile(('raster-feedback', id(prepared), tile.key),
-            presented, world, QRectF(gutter, gutter, side, side)))
+            presented, world, QRectF(gutter, gutter, world_side, world_side)))
         contact = getattr(canvas, '_raster_contact_point', None)
         gate = _contact_gate(canvas)
         if (contact is not None and world.contains(contact)

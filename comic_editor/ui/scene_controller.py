@@ -78,7 +78,7 @@ class SceneController(QObject):
         self.preview_mode = (not visible.isEmpty() and
             (document.live_preview or view_bytes > self.canvas._document_projection.budget // 2))
         signature = document, tuple(request.address for request in requests), tuple(phases), tuple(visible.getRect())
-        gate = self._covered_contact_gate(document, signature[3])
+        gate = self._pending_native_contact_gate(document) or self._covered_contact_gate(document, signature[3])
         if gate is not None:
             self._hold_contact_feedback(signature, gate)
             return
@@ -113,6 +113,28 @@ class SceneController(QObject):
         if self.dispatched != signature and not self.timer.isActive():
             self.timer.start(0)
 
+    def _pending_native_contact_gate(self, document):
+        """Give an owned cold input packet priority over obsolete scene work."""
+        canvas = self.canvas
+        if (not document.live_preview or not getattr(canvas, '_drawing', False)
+                or not getattr(canvas, '_raster_contact_active', False)
+                or document.identity != (id(canvas.chapter), id(canvas.tiles), id(canvas.images))
+                or canvas.tool not in {ToolKind.RASTER_PENCIL, ToolKind.RASTER_ERASER, ToolKind.BRUSH}):
+            return None
+        gate = getattr(canvas, '_paint_brush_tile_input' if canvas.tool == ToolKind.BRUSH
+                       else '_raster_tile_input', None)
+        current = getattr(gate, 'current', None)
+        if (gate is None or not getattr(gate, 'busy', False)
+                or getattr(gate, 'canvas', None) is not canvas
+                or getattr(gate, 'chapter', None) is not canvas.chapter
+                or getattr(gate, 'tiles', None) is not canvas.tiles
+                or getattr(gate, 'identifier', None) != canvas.selected_id
+                or getattr(gate, 'closed', True) or getattr(gate, 'released', True)
+                or getattr(gate, 'error', None) is not None
+                or not callable(current) or not current()):
+            return None
+        return gate
+
     def _covered_contact_gate(self, document, visible):
         """Positive ownership gate for already prepared current native ink."""
         canvas = self.canvas
@@ -140,7 +162,7 @@ class SceneController(QObject):
         return gate
 
     def _hold_contact_feedback(self, signature, gate):
-        """Retain immutable planes while native source packets are presented."""
+        """Retain ready artwork while native input owns the interaction lane."""
         if self._contact_reuse_gate is not gate:
             self.scheduler.cancel()
             effects = getattr(self.canvas, '_effect_jobs', None)
@@ -178,7 +200,7 @@ class SceneController(QObject):
             self.reset()
             return
         document, addresses, phases, visible = self.desired
-        gate = self._covered_contact_gate(document, visible)
+        gate = self._pending_native_contact_gate(document) or self._covered_contact_gate(document, visible)
         if gate is not None:
             self._hold_contact_feedback(self.desired, gate)
             return
@@ -328,8 +350,14 @@ class SceneController(QObject):
         # only replace source patches; rebuilding all three scene planes on
         # each such revision would delay exact convergence needlessly.
         from comic_editor.render.raster_feedback import feedback_keys
+        extent = QRectF(*visible).intersected(document.bounds)
+        side = prepared.world_size
+        columns = math.ceil((extent.right() - prepared.origin[0]) / side) - math.floor((extent.left() - prepared.origin[0]) / side)
+        rows = math.ceil((extent.bottom() - prepared.origin[1]) / side) - math.floor((extent.top() - prepared.origin[1]) / side)
+        if not extent.isEmpty() and columns * rows > len(prepared.tiles):
+            return False
         needed = feedback_keys(document, visible, prepared.origin,
-                               prepared.tile_size, prepared.gutter)
+                               side, prepared.gutter, budget=None)
         return set(needed).issubset(tile.key for tile in prepared.tiles)
 
     def present_feedback(self, painter, document):

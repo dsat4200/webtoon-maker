@@ -272,6 +272,14 @@ class BrushStroke:
                     updates["size"]=updates.get("size",dab.size)*factor("particle_size")
             if b.minimum_pixel:
                 updates["size"]=max(1.,updates.get("size",dab.size))
+            # Dense ordinary strokes calculate identity envelopes for every
+            # dab. Retain the original immutable dab when all resulting scalar
+            # bits are unchanged, avoiding a complete dataclass reconstruction.
+            # Signed zero is distinct, and NaN retains the ordinary update.
+            updates = {name: value for name, value in updates.items()
+                       if type(value) is not type(getattr(dab, name))
+                       or value != getattr(dab, name) or (value == 0 and
+                           math.copysign(1., value) != math.copysign(1., getattr(dab, name)))}
             result.append(replace(dab,**updates) if updates else dab)
         return result
 

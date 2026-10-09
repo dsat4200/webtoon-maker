@@ -36,15 +36,23 @@ CAMERAS = {
 }
 parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument("--label", required=True)
+parser.add_argument("--artifact-root", type=Path,
+                    help="Use a separate evidence/settings sandbox under this checkout's .artifacts.")
+parser.add_argument("--include-brush", action="store_true",
+                    help="Cycle Pencil, Eraser and the saved Brush preset instead of Pencil/Eraser.")
 parser.add_argument("--baseline", action="store_true")
 parser.add_argument("--source-code", type=Path,
                     help="Import an explicitly preserved source checkout for before/after comparisons.")
 parser.add_argument("--project-copy", type=Path, default=ARTIFACTS / "project-copy")
 parser.add_argument("--scenario", choices=(*CAMERAS, 'occupied'), default="rotated")
 parser.add_argument('--raster-id', default=RASTER_ID, help='Choose an existing raster in the isolated chapter.')
+parser.add_argument('--camera', type=float, nargs=4, metavar=('X', 'Y', 'SCALE', 'ROTATION'),
+                    help='Override the synthetic camera while retaining the chosen saved source and stacks.')
 parser.add_argument('--exercise-point-chain', action='store_true',
                     help='Prepend a compatible three-effect color chain in the benchmark copy only.')
 parser.add_argument('--profile', action='store_true', help='Capture GUI call costs; affects latency measurements.')
+parser.add_argument('--instrument-contact', action='store_true',
+                    help='Trace dirty publication and native pixel helpers; diagnostic timings only.')
 parser.add_argument('--profile-startup', action='store_true', help='Include initial rendering in the GUI profile; implies --profile.')
 parser.add_argument("--hz", type=float, default=120.)
 parser.add_argument("--stroke-seconds", type=float, default=2.)
@@ -69,6 +77,9 @@ parser.add_argument("--warm-from", choices=CAMERAS,
 parser.add_argument("--no-stroke-warmup", action="store_true",
                     help="Skip explicit initial repaint; Qt may already have painted its exposure.")
 args = parser.parse_args()
+if args.artifact_root is not None:
+    ARTIFACTS = args.artifact_root.resolve()
+    assert ARTIFACTS.is_relative_to((ROOT / '.artifacts').resolve())
 RASTER_ID = args.raster_id
 assert not (args.baseline and args.source_code)
 assert 1 <= args.hz <= 1000 and 0 < args.stroke_seconds <= 30 and 1 <= args.strokes <= 20
@@ -84,6 +95,8 @@ assert COPY.is_relative_to((ROOT / ".artifacts").resolve()) and (COPY / "series.
 assert not OUT.exists(), "Use a new label to preserve previous measurements"
 OUT.mkdir(parents=True)
 shutil.copyfile(ARTIFACTS / "user-settings-snapshot.json", OUT / "settings.json")
+if (ARTIFACTS / 'brush-assets').is_dir():
+    shutil.copytree(ARTIFACTS / 'brush-assets', OUT / 'brush-assets')
 sys.path.insert(0, str(args.source_code.resolve() if args.source_code else ARTIFACTS / "baseline-source" if args.baseline else ROOT))
 os.environ["QT_QPA_PLATFORM"] = "windows"
 os.environ["QT_TLS_BACKEND"] = "schannel"
@@ -317,6 +330,14 @@ probe.patch(GpuPatternRenderer, "render", "effects.pattern")
 probe.patch(modifier_rendering, "_outside_distance", "effects.outline_distance")
 probe.patch(modifier_rendering, "_outline_qimage", "effects.outline")
 probe.patch(modifier_rendering.OutlineDistanceCache, "field", "effects.outline_field")
+if args.instrument_contact:
+    from comic_editor.core.tiles import TileStore
+    for name in ('_emit_raster_dirty', '_publish_change_set', '_queue_visual_dirty',
+                 'modifier_expanded_dirty', '_invalidate_render_bounds'):
+        probe.patch(canvas_module._CanvasLogic, name, 'contact.' + name.lstrip('_'))
+    for name in ('paint_segment', '_paint_samples'):
+        probe.patch(TileStore, name, 'contact.tiles.' + name)
+    probe.patch(window_module.MainWindow, '_canvas_changes_published', 'contact.window_changes')
 try:
     from comic_editor.ui import tile_input
 except ImportError:
@@ -353,6 +374,9 @@ window = window_module.MainWindow()
 window.setAttribute(Qt.WA_DontShowOnScreen, True)
 window.setAttribute(Qt.WA_ShowWithoutActivating, True)
 canvas = window.canvas
+if args.instrument_contact:
+    probe.patch(window.selection_settings, 'refresh', 'contact.selection_properties')
+    probe.patch(window.hierarchy_model, 'apply_change', 'contact.hierarchy_rows')
 if getattr(canvas, '_scene_controller', None) is not None:
     probe.patch(type(canvas._scene_controller), 'present_feedback', 'canvas.raster_feedback')
 if args.effect_workers is not None:
@@ -369,12 +393,16 @@ if not args.no_autosave:
 window._set_chapter(chapter, tiles, images)
 canvas.set_selection("object", RASTER_ID)
 window._activate_tool(ToolKind.RASTER_PENCIL)
+input_history_revision = canvas.command_stack.revision
 if args.scenario == 'occupied':
     occupied = canvas.object_world_rect(RASTER_ID)
     assert occupied is not None and not occupied.isEmpty()
     center = occupied.center()
     density = min(.7, 955 / max(1, occupied.width()*1.1), 927 / max(1, occupied.height()*1.1))
     CAMERAS['occupied'] = (center.x(), center.y(), max(.05, density), 0.)
+if args.camera is not None:
+    assert .05 <= args.camera[2] <= 8. and all(math.isfinite(value) for value in args.camera)
+    CAMERAS[args.scenario] = tuple(args.camera)
 canvas.center_x, canvas.center_y, canvas.scale, canvas.rotation = CAMERAS[args.warm_from or args.scenario]
 if args.navigator != "saved":
     window.navigator_panel.setExpanded(args.navigator == "shown", emit=False)
@@ -453,7 +481,9 @@ def add_navigation(start, outward):
 for stroke in range(0 if args.cold_only else args.strokes):
     if stroke and args.navigate_between_strokes:
         offset = add_navigation(offset, outward=bool(stroke % 2))
-    tool = ToolKind.RASTER_PENCIL if stroke % 2 == 0 else ToolKind.RASTER_ERASER
+    tools = (ToolKind.RASTER_PENCIL, ToolKind.RASTER_ERASER, ToolKind.BRUSH) if args.include_brush else (
+        ToolKind.RASTER_PENCIL, ToolKind.RASTER_ERASER)
+    tool = tools[stroke % len(tools)]
     schedule.append({"kind": "tool", "offset": offset, "tool": tool,
                      "activity": f"stroke-{stroke}", "expected_camera": list(planned_camera)})
     anchor = QPointF(max(rect.left()+30, min(rect.right()-30, planned_camera[0])),
@@ -462,6 +492,9 @@ for stroke in range(0 if args.cold_only else args.strokes):
         # The center pivot handle owns a press within a fixed screen radius.
         # Use an interior ink position away from it and the corner handles.
         anchor = QPointF(rect.left() + rect.width()*.37, rect.top() + rect.height()*.43)
+        if args.camera is not None:
+            anchor = QPointF(max(rect.left()+30, min(rect.right()-30, planned_camera[0])),
+                             max(rect.top()+30, min(rect.bottom()-30, planned_camera[1])))
     transform = QTransform()
     transform.translate(canvas.width()/2, canvas.height()/2)
     transform.rotate(planned_camera[3])
@@ -573,6 +606,17 @@ def graphics_state():
         return {'available': worker.available, 'reason': worker.reason,
                 'ready': worker.ready.is_set(), 'closed': worker.closed,
                 'queued_bytes': worker.queued_bytes, **worker.stats}
+
+
+def native_graphics():
+    import ctypes
+    canvas.makeCurrent()
+    try:
+        gl = ctypes.WinDLL('opengl32')
+        gl.glGetString.restype = ctypes.c_char_p
+        return gl.glGetString(0x1F01).decode()
+    finally:
+        canvas.doneCurrent()
 
 
 graphics_before_shutdown = None
@@ -856,6 +900,7 @@ finally:
         depth += change
         max_depth = max(max_depth, depth)
     summary = {
+        "native_graphics": native_graphics(),
         "timed_out": timed_out, "posted_inputs": len(probe.input_rows),
         'input_start': probe.input_start,
         'first_native_display_ms': (probe.first_native_paint_at-probe.exposure_requested_at)*1000
@@ -901,6 +946,8 @@ finally:
                    for (phase, name), values in sorted(probe.samples.items())],
         "autosaves_submitted": window._autosave_jobs.submitted,
         "command_revision": canvas.command_stack.revision,
+        "input_history_revision": input_history_revision,
+        "history_labels": [command.label for command in canvas.command_stack._undo],
         "projection": measured_projection,
         "async_exact": exact_status,
     }
@@ -910,12 +957,13 @@ finally:
                             and (chapter.modifiers[identifier].intensity > 0
                                  or chapter.modifiers[identifier].parameter_masks)}
         evaluated = {effect['id'] for row in probe.rows
-                     if row['phase'] in ({'cold'} if args.cold_only else {'input'})
+                     if row['phase'] in ({'cold'} if args.cold_only else {'input', 'drain', 'validation'})
                      for effect in row.get('modifiers', [])}
+        evaluated_held = {effect['id'] for row in probe.rows if row['phase'] == 'input'
+                          for effect in row.get('modifiers', [])}
         summary['selected_effects_evaluated'] = sorted(selected_effects & evaluated)
+        summary['selected_effects_evaluated_during_input'] = sorted(selected_effects & evaluated_held)
         summary['selected_effects_expected'] = sorted(selected_effects)
-        if selected_effects:
-            assert selected_effects <= evaluated, 'Occupied drawing did not evaluate every active selected effect'
     window._dirty = False
     if graphics_before_shutdown is not None:
         summary['graphics_worker'] = graphics_before_shutdown
@@ -931,6 +979,24 @@ finally:
             pass
         gpu.close()
     window.close()
+    controller = getattr(canvas, '_scene_controller', None)
+    if controller is not None:
+        controller.reset()
+        controller.scheduler.close()
+        controller.scheduler.executor.shutdown(wait=True, cancel_futures=False)
+    graphics = getattr(canvas, '_graphics_worker', None)
+    if graphics is not None:
+        graphics.close()
+    presenter = getattr(canvas, '_document_tile_presenter', None)
+    if presenter is not None:
+        presenter.close()
+    window.deleteLater()
+    QCoreApplication.sendPostedEvents(None, QEvent.DeferredDelete)
+    app.processEvents()
+    import gc
+    gc.collect()
+    QCoreApplication.sendPostedEvents(None, QEvent.DeferredDelete)
+    app.processEvents()
     after_hashes = manifest()
     write_json("project-files-after.json", after_hashes)
     summary["project_files_unchanged"] = before_hashes == after_hashes
@@ -940,6 +1006,11 @@ finally:
         setattr(owner, name, original)
     assert before_hashes == after_hashes, "Source project copy was unexpectedly written"
     assert summary["camera_endpoint_max_error"] < 1e-6, "Scripted tablet path and actual camera diverged"
+    if args.scenario == 'occupied':
+        assert selected_effects <= evaluated, 'Occupied drawing did not evaluate every active selected effect'
+    if not args.cold_only:
+        assert summary['command_revision'] == input_history_revision + args.strokes, (
+            'Every scripted stroke must create exactly one history transaction', summary['history_labels'])
     if args.async_exact:
         assert not timed_out and exact_status["terminal_ready"], "Exact projection did not finish cleanly"
         assert not exact_status["unpresented_exact_inputs"], "Input never reached a finished exact frame"

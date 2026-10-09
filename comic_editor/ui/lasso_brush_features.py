@@ -73,7 +73,9 @@ class LassoBrushFeatures:
             return
         remaining = self._lasso_brush_deferred
         self._lasso_brush_deferred = []
+        active_mask = self.active_tone_mask_id
         try:
+            self.active_tone_mask_id = ''
             self._begin_lasso_brush(pending['point'], _context=pending['context'])
             state = self._lasso_brush
             if state is None:
@@ -85,6 +87,7 @@ class LassoBrushFeatures:
             if pending['released']:
                 self._finish_lasso_brush()
         finally:
+            self.active_tone_mask_id = active_mask
             self._lasso_brush_deferred = remaining
 
     def _continue_lasso_brush(self, point: QPointF) -> None:

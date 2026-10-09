@@ -41,6 +41,61 @@ def _has_authored_materials(definition):
     return False
 
 
+class _PreparedBrushMaterialCache:
+    """Bounded, document-independent owners prepared on the input worker.
+
+    Retained source strings keep the identity key alive without hashing large
+    PNGs on pen-down. The key includes the complete mip/grayscale request;
+    brush size, color and dynamics do not change those original material pixels.
+    """
+    def __init__(self, budget=64*1024*1024, limit=8):
+        self.budget, self.limit = budget, limit
+        self.values = OrderedDict()
+        self.bytes = 0
+
+    @staticmethod
+    def _identity(definition):
+        resources = {}
+        while definition is not None:
+            for tip in definition.tips:
+                if tip.shape != 'image' or not tip.png:
+                    continue
+                maximum = (max(0, int(math.floor(math.log2(max(1, min(tip.width, tip.height))))))
+                           if definition.antialiasing >= 2 else 0)
+                record = resources.setdefault(id(tip.png), [tip.png, -1, False])
+                record[1] = max(record[1], maximum)
+            texture = definition.texture
+            if texture is not None and texture.png and texture.density > 0:
+                resources.setdefault(id(texture.png), [texture.png, -1, False])[2] = True
+            definition = definition.dual
+        key = tuple(sorted((identifier, record[1], record[2])
+                           for identifier, record in resources.items()))
+        return key, tuple(record[0] for record in resources.values())
+
+    def get(self, definition):
+        key, _sources = self._identity(definition)
+        entry = self.values.get(key)
+        if entry is None:
+            return None
+        self.values.move_to_end(key)
+        return entry[0]
+
+    def put(self, definition, owner):
+        key, sources = self._identity(definition)
+        cost = sum(material.nbytes for material in owner._values.values())
+        cost += sum(len(source) for source in sources)
+        if not key or cost > self.budget or self.limit < 1:
+            return
+        previous = self.values.pop(key, None)
+        if previous is not None:
+            self.bytes -= previous[2]
+        while self.values and (self.bytes+cost > self.budget or len(self.values) >= self.limit):
+            _key, entry = self.values.popitem(last=False)
+            self.bytes -= entry[2]
+        self.values[key] = owner, sources, cost
+        self.bytes += cost
+
+
 class BrushFeatures:
     def _paint_brush_view_scale(self, obj, local: QPointF) -> float:
         """Equal-area local-to-screen scale at the pen-down position.
@@ -120,6 +175,7 @@ class BrushFeatures:
         self._paint_brush_session = None
         self._paint_brush_tile_input = None
         self._paint_brush_input_bounds = QRectF()
+        self._paint_brush_material_cache = _PreparedBrushMaterialCache()
         self._paint_brush_timer = QTimer(self)
         self._paint_brush_timer.setInterval(16)
         self._paint_brush_timer.timeout.connect(self._tick_paint_brush)
@@ -223,8 +279,15 @@ class BrushFeatures:
                 cancelled=self._cancel_paint_brush)
             self._raster_contact_point, self._raster_contact_active = QPointF(point), True
             if _has_authored_materials(definition):
-                gate.prepare_resources(prepare_material_resources, (definition,),
-                                       self._paint_brush_stroke.install_materials)
+                materials = self._paint_brush_material_cache.get(definition)
+                if materials is not None:
+                    self._paint_brush_stroke.install_materials(materials)
+                else:
+                    stroke = self._paint_brush_stroke
+                    def adopt_materials(materials):
+                        self._paint_brush_material_cache.put(definition, materials)
+                        stroke.install_materials(materials)
+                    gate.prepare_resources(prepare_material_resources, (definition,), adopt_materials)
             gate.submit(lambda: self._paint_brush_packet_keys(sample),
                         lambda: self._apply_paint_brush_sample(sample, begin=True))
             if not gate.closed and any(scheduler is not None and scheduler.continuous_enabled for scheduler in (
@@ -499,10 +562,12 @@ class BrushFeatures:
         self._paint_brush_deferred = []
         previous = (self.selected_kind, self.selected_id, self.selected_object_id,
                     self.primary_color, self.secondary_color, self.active_color_slot,
-                    self._drawing_selection_path)
+                    self._drawing_selection_path, self.selected_entities, self.active_tone_mask_id)
         try:
             self.selected_kind = 'object'
             self.selected_id = self.selected_object_id = next_stroke['object']
+            self.selected_entities = [('object', next_stroke['object'])]
+            self.active_tone_mask_id = ''
             self.primary_color, self.secondary_color = next_stroke['primary'], next_stroke['secondary']
             self.active_color_slot = next_stroke['slot']
             self._drawing_selection_path = next_stroke['selection']
@@ -517,5 +582,5 @@ class BrushFeatures:
         finally:
             (self.selected_kind, self.selected_id, self.selected_object_id,
              self.primary_color, self.secondary_color, self.active_color_slot,
-             self._drawing_selection_path) = previous
+             self._drawing_selection_path, self.selected_entities, self.active_tone_mask_id) = previous
             self._paint_brush_deferred = deferred

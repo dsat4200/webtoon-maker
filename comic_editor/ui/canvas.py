@@ -2922,7 +2922,8 @@ class _CanvasLogic(SceneKernels, LassoBrushFeatures, BrushFeatures, DocumentProj
             self._cancel_smudge_gesture()
             self._cancel_mask_selection()
             self._finish_mask_gradient()
-            if self.active_tone_mask_id and self._drawing:
+            if self.active_tone_mask_id and (getattr(self, '_mask_tile_input', None) is not None
+                    or getattr(self, '_mask_deferred_strokes', None)):
                 self._end_mask_stroke()
         if tool == ToolKind.CAGE_TRANSFORM:
             if not self.begin_cage_tool():
@@ -3477,7 +3478,8 @@ class _CanvasLogic(SceneKernels, LassoBrushFeatures, BrushFeatures, DocumentProj
         self._cancel_gradient_creation()
         if mask_id and not self.active_tone_mask_id:
             self._mask_return_tool = self.tool
-        if self._drawing and self.active_tone_mask_id:
+        if self.active_tone_mask_id and (getattr(self, '_mask_tile_input', None) is not None
+                or getattr(self, '_mask_deferred_strokes', None)):
             self._end_mask_stroke()
         self.active_tone_mask_id = str(mask_id)
         if not mask_id and self._mask_return_tool is not None:

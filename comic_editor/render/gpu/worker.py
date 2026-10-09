@@ -169,15 +169,19 @@ class _GraphicsThread(QThread):
                 with service.condition:
                     service.condition.wait_for(lambda: service.queue or service.releases or service.closed)
                     released, service.releases = service.releases, set()
-                    if released and renderer.available:
-                        from .sync import GlSync
-                        with renderer._current():
-                            sync = GlSync(renderer.context)
-                            for token in released:
-                                entry = leases.pop(token,None)
-                                renderer.leases.pop(token,None)
-                                if entry is not None:
-                                    sync.delete(entry[1])
+                # The driver may wait while making a context current or
+                # retiring a fence. GUI lease release and submissions only
+                # enqueue ownership, so neither may share that driver wait.
+                if released and renderer.available:
+                    from .sync import GlSync
+                    with renderer._current():
+                        sync = GlSync(renderer.context)
+                        for token in released:
+                            entry = leases.pop(token,None)
+                            renderer.leases.pop(token,None)
+                            if entry is not None:
+                                sync.delete(entry[1])
+                with service.condition:
                     if not service.queue:
                         if service.closed:
                             break

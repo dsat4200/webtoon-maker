@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from threading import Event
 import time
 
-from PySide6.QtCore import QObject, QTimer
+from PySide6.QtCore import QObject, QTimer, Qt, Signal
 
 from comic_editor.render.admission import RENDER_ADMISSION, snapshot_working_bytes
 
@@ -46,6 +46,7 @@ def compute_snapshot(compute, snapshot, arguments, cancelled, stopped):
 class SceneConsumers(QObject):
     """One auxiliary worker; queued consumers hold no frozen source buffers."""
     LIMIT = 40
+    workerFinished = Signal()
 
     def __init__(self, canvas):
         super().__init__(canvas)
@@ -58,6 +59,10 @@ class SceneConsumers(QObject):
         self.timer = QTimer(self)
         self.timer.setInterval(8)
         self.timer.timeout.connect(self.advance)
+        # Native source/material preparation often finishes within one frame.
+        # Polling alone would hold its ready packets for a full timer interval.
+        # A queued wakeup still publishes and validates on the document thread.
+        self.workerFinished.connect(self.advance, Qt.ConnectionType.QueuedConnection)
         executor, stopped = self.executor, self.stopped
         self.destroyed.connect(lambda: (stopped.set(), executor.shutdown(wait=False, cancel_futures=True)))
 
@@ -156,6 +161,19 @@ class SceneConsumers(QObject):
             return source_capture(self.canvas, job.document, *job.arguments)
         return self.canvas._scene_snapshot_compiler.capture(self.canvas, job.document)
 
+    def _submit(self, job, snapshot):
+        job.future = self.executor.submit(compute_snapshot, job.compute, snapshot,
+            job.captured_arguments or job.arguments, job.cancelled, self.stopped)
+        signal = self.workerFinished
+        def completed(_future):
+            try:
+                signal.emit()
+            except RuntimeError:
+                # A retired document may have deleted its QObject while a
+                # cancelled evaluator was finishing its current native block.
+                pass
+        job.future.add_done_callback(completed)
+
     def advance(self):
         canvas = self.canvas
         if self.stopped.is_set():
@@ -212,8 +230,7 @@ class SceneConsumers(QObject):
                                 self.active = None
                         else:
                             snapshot, job.capture = job.capture.result, None
-                            job.future = self.executor.submit(compute_snapshot, job.compute, snapshot,
-                                job.captured_arguments or job.arguments, job.cancelled, self.stopped)
+                            self._submit(job, snapshot)
                     self.timer.start(8)
                     return
         if self.pending:
@@ -221,8 +238,7 @@ class SceneConsumers(QObject):
             if self._valid(job, self._document()):
                 self.active = job
                 if job.detached:
-                    job.future = self.executor.submit(compute_snapshot, job.compute, None,
-                        job.arguments, job.cancelled, self.stopped)
+                    self._submit(job, None)
                 elif canvas.chapter is not None:
                     if job.owned_source:
                         job.document = self._document()

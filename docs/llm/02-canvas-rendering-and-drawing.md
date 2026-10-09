@@ -180,6 +180,19 @@ the complete resource there. Procedural brushes need no material preparation.
 The material equations, registered grids, RNG sequence and legacy byte policy
 are unchanged; `test_brush_material_ownership.py` compares exact final pixels
 for stamp, ribbon, spray and corrected replay with primary/dual materials.
+A per-canvas 64 MiB/eight-entry LRU retains these immutable prepared owners
+between contacts. Its keys retain the actual authored PNG objects and the
+complete mip/grayscale request; changing source ownership or mip requirements
+misses normally. Warm pen-down installs the existing owner before input,
+without PNG hashing, decode or resizing on the GUI. This material-resource
+reuse never enters the semantic artwork or disk cache.
+
+Dense Brush CPU work also reuses the original promoted unchanged foreground
+calculation and immutable dabs with bit-identical envelopes. Broadcast native
+coordinate axes retain the original integer-to-float32 conversion followed by
+the half-pixel phase, including large coordinates. Independent original
+primitives compare live/final buffers, RNG, scalar types and signed zero in
+`tests/test_brush_cpu_reuse.py`; no sampling or precision policy changes.
 
 `ui/tile_input.py::TileInputGate` also admits Brush and Lasso Brush native source
 footprints. Received Brush packets retain their original pressure, axes, time
@@ -203,6 +216,10 @@ Cross-tool native contacts use one FIFO activation queue before changing shared
 stroke fields. A released cold Brush, Pencil, mask or Lasso contact therefore
 finishes its captured transaction before the next contact begins, while each
 tool retains its original native packet data and source owner.
+Later mask-mode or multiple-selection changes do not replace an accepted
+contact's authoring context. Deferred Brush/Lasso activation restores captured
+context temporarily and then restores current UI state. Mask finalization
+checks actual pending mask ownership rather than the shared drawing flag.
 
 - `core/changes.py` carries typed entity fields, old/new damage, resource
   addresses, structural/order changes and draft status. `DependencyIndex`
@@ -259,6 +276,11 @@ tool retains its original native packet data and source owner.
   effect cache results; repeated packets only replace native source patches.
   The positive gate checks document identity/revision, source owner, unreleased
   input, viewport/configuration coverage and absence of other live previews.
+  While an owned cold native packet is pending, the same guarded contact lane
+  pauses obsolete scene/effect work before input is ready. Worker completion
+  wakes `SceneConsumers` through a queued Qt signal, with publication and
+  retirement checks still on the document thread, rather than waiting for the
+  eight-millisecond polling interval.
   Release, stale ownership, unrelated artwork or lost coverage resumes normal
   guarded scene work. Cold/fallback preparation retains bounded capture slices
   (4 ms normally, 2 ms for eligible native Pencil/Eraser feedback), with an 8 ms
@@ -306,7 +328,7 @@ tool retains its original native packet data and source owner.
   worker preparation. Once exact artwork is current and contact ends, the
   provisional overlay stops; its retained source substitutions remain available
   for the next contact against that basis.
-  Prepared planes also have a 32 MiB limit and never enter artwork/disk caches.
+  Prepared planes never enter artwork/disk caches.
   The current eligibility policy requires legacy document pixels, normal object
   blends, no selected/ancestor effects or opacity masks, bounded ancestors at
   unit opacity and no linked sampler depending on the edited source. Solo uses
@@ -314,8 +336,18 @@ tool retains its original native packet data and source owner.
   transforms use native world patches with bounded inverse source dependencies;
   other untransformed placement remains integral. Resident transformed source
   footprints clear transparently before native SourceOver drawing, preserving
-  the ordinary Qt sampling phase and unchanged adjacent source tiles. Rotated,
-  mirrored, perspective or collapsed transforms remain conservative fallbacks.
+  the ordinary Qt sampling phase and unchanged adjacent source tiles. Finite
+  invertible affine rotations, shears and reflections use the ordinary exact
+  4×4 native block origin: Qt nearest-image scanline phase can differ on a
+  separately clipped 256-pixel device. These provisional blocks retain only
+  prefix/suffix planes and bounded COW handles to original native source tiles.
+  They draw current resident replacements directly onto the prefix with the
+  original layer clip/transform and SourceOver opacity phase. No intermediate
+  mapped source plane introduces another byte rounding. Their combined prepared
+  payload is capped at 64 MiB; ordinary axis-aligned planes retain their 32 MiB
+  cap, and composed presentation retains its existing 32 MiB LRU. Coverage gates
+  require every visible native block, including those beyond a budget-truncated
+  preparation. Perspective or collapsed transforms remain conservative fallbacks.
   Unsupported graphs retain the previous ready
   scene until ordinary detached preview evaluation completes. A screen-space
   contact ring and "Updating drawing…" label identify received input whose
@@ -419,6 +451,11 @@ tool retains its original native packet data and source owner.
   raster surfaces materialize at their real CPU edge on a detached lane.
   Unsupported chains preserve exact CPU fallback. Context failure retires
   device results as cache misses; GL cleanup remains on its graphics owner.
+  The graphics owner removes released tokens under its queue condition, then
+  makes the context current and retires fences outside that condition. Driver
+  cleanup cannot hold the lock used by GUI lease disposal or new submissions.
+  Controlled completion/cancel/close regressions and native driver checks
+  cover this ownership boundary.
 - `paintEvent` always ends its widget painter in `finally`, including early returns and exceptions. Deferred capture tracebacks can retain Python frames and delay painter destruction. Relying on that destruction allows an old painter to end Qt's reused OpenGL engine during a later frame, crashing smear previews or native tile presentation. `_paint_canvas_frame` draws within this explicitly bounded lifetime.
 - `_CanvasPerformanceMonitor` records per-frame and per-input timing used by the latency smoke gate.
 

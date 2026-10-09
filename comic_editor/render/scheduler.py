@@ -71,7 +71,7 @@ class SceneCompletion:
 def demand_working_bytes(demand):
     size = snapshot_working_bytes(demand.snapshot)
     if demand.feedback_target:
-        size += 32 * 1024 * 1024
+        size += 64 * 1024 * 1024
     if demand.presentation_size is not None and demand.visible is not None:
         width,height = demand.presentation_size
         tile_size = max((request.tile_size for request in demand.requests),default=256)

@@ -9,7 +9,7 @@ from PySide6.QtTest import QTest
 from test_dirty_modifier_reuse import scene, pixels, exact_scene, watch_effect_work
 
 
-def settled_projection(canvas, qapp):
+def settled_projection(canvas, qapp, *, allow_native_contact=False):
     deadline = time.monotonic() + 8
     image = QImage(canvas.size(), QImage.Format_ARGB32_Premultiplied)
     while time.monotonic() < deadline:
@@ -26,8 +26,18 @@ def settled_projection(canvas, qapp):
         assert not controller.error, controller.error
         ready_preview = (document.live_preview and controller.preview is not None
                          and controller.preview[0] == document)
+        # A prepared owned contact presents current native patches over retained
+        # artwork while deliberately pausing detached preview work. Require the
+        # actual presentation coverage and current gate, rather than accepting
+        # an arbitrary pending frame or waiting for that paused preview.
+        ready_contact = (allow_native_contact
+                         and canvas._raster_feedback_contact_covered
+                         and controller._contact_reuse_gate is not None
+                         and controller._contact_reuse_gate is
+                         controller._covered_contact_gate(document,
+                             canvas.visible_document_rect().getRect()))
         if (controller.capture is None and not controller.scheduler.busy
-                and (ready_preview or not canvas._projection_frame_pending)):
+                and (ready_contact or ready_preview or not canvas._projection_frame_pending)):
             return pixels(image)
         time.sleep(.002)
     raise AssertionError("Document projection did not reach exact pixels")
@@ -95,15 +105,22 @@ def test_drawing_reuses_unchanged_effects_across_dirty_tile_subsets(scene, qapp,
     calls, requests, _ = watch_effect_work(canvas, monkeypatch)
     unaffected = np.ones(before.shape[:2], dtype=bool)
     unaffected[80:130, 155:335] = False
+    previous = before
     canvas._begin_stroke(QPointF(170, 100), 1.)
     for point in (QPointF(210, 102), QPointF(270, 105), QPointF(320, 108)):
         canvas._continue_stroke(point, 1.)
-        actual = settled_projection(canvas, qapp)
+        actual = settled_projection(canvas, qapp, allow_native_contact=True)
+        assert canvas._raster_feedback_contact_covered
         np.testing.assert_array_equal(actual[unaffected], before[unaffected])
+        assert np.any(actual[~unaffected] != previous[~unaffected]), "Every native segment must be visible"
+        previous = actual
     canvas._end_stroke()
     assert not calls, "An unchanged background effect was recomputed while drawing"
     assert not requests, "An unchanged background effect requested another worker"
     after = settled_projection(canvas, qapp)
+    assert not canvas._projection_frame_pending
+    assert not canvas._projection_provisional_visible
+    np.testing.assert_array_equal(after, actual)
     canvas._document_projection.clear()
     canvas._invalidate_scene_cache(projection=False)
     np.testing.assert_array_equal(settled_projection(canvas, qapp), after)

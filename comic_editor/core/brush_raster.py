@@ -583,6 +583,7 @@ class RasterBrushStroke:
         self._stroke_color=QColor(color)
         self.color = np.asarray(color.getRgbF(), dtype=np.float32)
         self.sub_color = np.asarray(definition.sub_color, dtype=np.float32)/255.
+        self._unchanged_foreground = None
         def needs_length(brush):
             percentage=brush.taper_mode == "percentage" and (brush.taper_start or brush.taper_end)
             spacing_end=("spacing" in brush.taper_parameters and brush.taper_end > 0
@@ -980,6 +981,9 @@ class RasterBrushStroke:
             self._deposit(plane, key, ys, xs, rgb, alpha, middle)
 
     def _tip_colors(self,dab,definition):
+        unchanged = not (dab.hue or dab.saturation or dab.luminosity or dab.sub_color_mix)
+        if unchanged and self._unchanged_foreground is not None:
+            return self._unchanged_foreground, self.sub_color
         main,sub=self.color,self.sub_color
         target=getattr(definition,"color_change_target","main")
         if dab.hue or dab.saturation or dab.luminosity:
@@ -999,6 +1003,10 @@ class RasterBrushStroke:
             # Keep the same declared linear-light approximation used by wet
             # mixing; CSP also applies its mixing space to color variation.
             result[:3]=(main[:3]**2.2*(1-mix)+sub[:3]**2.2*mix)**(1/2.2)
+        if unchanged:
+            # Retain the exact original scalar/array promotion. Returning
+            # self.color directly would change deposition precision.
+            self._unchanged_foreground = result
         return result,sub
 
     def _foreground(self,dab,definition=None):
@@ -1127,8 +1135,14 @@ class RasterBrushStroke:
                 x1, y1 = min(right, (kx+1)*n), min(bottom, (ky+1)*n)
                 if x0 >= x1 or y0 >= y1:
                     continue
-                yy, xx = np.mgrid[y0:y1, x0:x1].astype(np.float32)
-                yield (kx, ky), slice(y0-ky*n, y1-ky*n), slice(x0-kx*n, x1-kx*n), xx+.5, yy+.5
+                # Convert the same original integer coordinates before adding
+                # the half-pixel phase. Broadcast their independent axes rather
+                # than allocate/convert two complete meshes for every dab.
+                xx = np.arange(x0, x1, dtype=np.int64).astype(np.float32)+.5
+                yy = np.arange(y0, y1, dtype=np.int64).astype(np.float32)+.5
+                shape = y1-y0, x1-x0
+                yield ((kx, ky), slice(y0-ky*n, y1-ky*n), slice(x0-kx*n, x1-kx*n),
+                       np.broadcast_to(xx, shape), np.broadcast_to(yy[:, None], shape))
 
     def _deposit(self, plane, key, ys, xs, rgb, alpha, dab):
         coverage = np.clip(alpha*dab.density, 0, 1)

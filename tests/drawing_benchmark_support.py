@@ -76,21 +76,89 @@ def canvas_pending(canvas):
     }
 
 
+def _native_framebuffer_extent(context):
+    """Query the existing read attachment, independently of Qt's viewport."""
+    import ctypes
+    convention = getattr(ctypes, 'WINFUNCTYPE', ctypes.CFUNCTYPE)
+    def procedure(name, *arguments):
+        address = context.getProcAddress(name.encode())
+        if not address:
+            raise RuntimeError(f'Native framebuffer query unavailable: {name}')
+        return convention(None, *arguments)(address)
+    get_integer = procedure('glGetIntegerv', ctypes.c_uint, ctypes.c_void_p)
+    get_attachment = procedure('glGetFramebufferAttachmentParameteriv',
+        ctypes.c_uint, ctypes.c_uint, ctypes.c_uint, ctypes.c_void_p)
+    def integer(parameter):
+        value = ctypes.c_int()
+        get_integer(parameter, ctypes.byref(value))
+        return value.value
+    def attachment(parameter):
+        value = ctypes.c_int()
+        get_attachment(0x8CA8, 0x8CE0, parameter, ctypes.byref(value))
+        return value.value
+    kind, name = attachment(0x8CD0), attachment(0x8CD1)
+    dimensions = []
+    if kind == 0x1702:  # GL_TEXTURE: Qt's single-sample widget framebuffer.
+        level = attachment(0x8CD2)
+        previous = integer(0x8069)  # GL_TEXTURE_BINDING_2D
+        bind = procedure('glBindTexture', ctypes.c_uint, ctypes.c_uint)
+        query = procedure('glGetTexLevelParameteriv', ctypes.c_uint, ctypes.c_int,
+                          ctypes.c_uint, ctypes.c_void_p)
+        bind(0x0DE1, name)
+        try:
+            for parameter in (0x1000, 0x1001):  # GL_TEXTURE_WIDTH/HEIGHT
+                value = ctypes.c_int()
+                query(0x0DE1, level, parameter, ctypes.byref(value))
+                dimensions.append(value.value)
+        finally:
+            bind(0x0DE1, previous)
+    elif kind == 0x8D41:  # GL_RENDERBUFFER
+        previous = integer(0x8CA7)
+        bind = procedure('glBindRenderbuffer', ctypes.c_uint, ctypes.c_uint)
+        query = procedure('glGetRenderbufferParameteriv', ctypes.c_uint,
+                          ctypes.c_uint, ctypes.c_void_p)
+        bind(0x8D41, name)
+        try:
+            for parameter in (0x8D42, 0x8D43):  # GL_RENDERBUFFER_WIDTH/HEIGHT
+                value = ctypes.c_int()
+                query(0x8D41, parameter, ctypes.byref(value))
+                dimensions.append(value.value)
+        finally:
+            bind(0x8D41, previous)
+    if len(dimensions) != 2 or min(dimensions) <= 0:
+        raise RuntimeError(f'Native framebuffer has no readable color extent: {kind:#x}')
+    return tuple(dimensions)
+
+
 def read_native_frame(canvas):
-    """Read the existing native framebuffer without invoking another paint."""
+    """Read every existing native framebuffer pixel without another paint.
+
+    Odd widget extents at fractional DPR use Qt's attachment rounding. Both
+    Python round and GL_VIEWPORT can omit the final row/column, so neither
+    supplies the readback dimensions.
+    """
     import ctypes
     import numpy as np
     from PySide6.QtGui import QImage
     canvas.makeCurrent()
     try:
-        width = round(canvas.width() * canvas.devicePixelRatioF())
-        height = round(canvas.height() * canvas.devicePixelRatioF())
-        array = np.zeros((height, width, 4), np.uint8)
-        gl = ctypes.WinDLL("opengl32")
-        gl.glReadPixels.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_int,
-                                   ctypes.c_int, ctypes.c_uint, ctypes.c_uint, ctypes.c_void_p]
-        canvas.context().functions().glBindFramebuffer(0x8D40, canvas.defaultFramebufferObject())
-        gl.glReadPixels(0, 0, width, height, 0x1908, 0x1401, array.ctypes.data)
+        context = canvas.context()
+        convention = getattr(ctypes, 'WINFUNCTYPE', ctypes.CFUNCTYPE)
+        get_integer = convention(None, ctypes.c_uint, ctypes.c_void_p)(
+            context.getProcAddress(b'glGetIntegerv'))
+        previous = ctypes.c_int()
+        get_integer(0x8CAA, ctypes.byref(previous))  # GL_READ_FRAMEBUFFER_BINDING
+        functions = context.functions()
+        functions.glBindFramebuffer(0x8CA8, canvas.defaultFramebufferObject())
+        try:
+            width, height = _native_framebuffer_extent(context)
+            array = np.zeros((height, width, 4), np.uint8)
+            read = convention(None, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+                             ctypes.c_int, ctypes.c_uint, ctypes.c_uint, ctypes.c_void_p)(
+                context.getProcAddress(b'glReadPixels'))
+            read(0, 0, width, height, 0x1908, 0x1401, array.ctypes.data)
+        finally:
+            functions.glBindFramebuffer(0x8CA8, previous.value)
         array = np.ascontiguousarray(array[::-1])
         image = QImage(array.data, width, height, width * 4,
                        QImage.Format_RGBA8888_Premultiplied).copy()
