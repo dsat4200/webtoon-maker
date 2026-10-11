@@ -1,7 +1,7 @@
 """Saved affine rasters show current native ink without scene evaluation."""
 import numpy as np
 import pytest
-from PySide6.QtCore import QPointF, Qt
+from PySide6.QtCore import QPointF, QRectF, Qt
 from PySide6.QtGui import QColor, QImage, QPainter, QTransform
 
 from comic_editor.core.tools import ToolKind
@@ -87,11 +87,21 @@ def test_saved_affine_contacts_publish_every_native_buffer_and_release_exactly(
 
 def test_zoomed_out_affine_feedback_owns_four_native_blocks_with_bounded_resources(
         scene, wait_scene, monkeypatch):
+    from comic_editor.core.models import BoundGeometry
+    from test_fractional_raster_feedback_native import fixed_native_reference
+    from test_painting_input_cursor import wait_for
     canvas, selected, front = scene
     boundary_scene(canvas, selected, front, QImage.Format_RGBA64_Premultiplied, .43)
     canvas.chapter.width = 1080
     canvas.setFixedSize(378, 672)
     canvas.center_x, canvas.center_y, canvas.scale = 540., 960., .35
+    # The inherited boundary fixture clips artwork to its original 128px strip.
+    # Extend authored clip geometry, keeping all native transforms unchanged,
+    # so the budget-truncated block contains visible, editable native artwork.
+    layer = canvas.chapter.layers[selected.parent_layer_id]
+    page = canvas.chapter.layers[layer.parent_id]
+    layer.bound = BoundGeometry.rectangle(0., 0., 1080., 2500.)
+    page.bound = BoundGeometry.rectangle(0., 0., 1080., 2500.)
     map_saved_quad(selected, QTransform().rotate(-3.))
     canvas._invalidate_scene_cache()
     wait_scene(canvas)
@@ -110,14 +120,38 @@ def test_zoomed_out_affine_feedback_owns_four_native_blocks_with_bounded_resourc
     controller.feedback = partial
     assert not controller._feedback_covers(document, visible), 'Budget truncation is not complete coverage'
     missing = next(tile for tile in complete.tiles if tile.key not in {tile.key for tile in partial.tiles})
-    point = QPointF(missing.bounds[0] + 80., missing.bounds[1] + 80.)
+    point = QRectF(*missing.bounds).intersected(QRectF(*visible)).intersected(document.bounds).center()
+    assert document.bounds.contains(point)
+    before = {key: QImage(image) for key, image in canvas.tiles.object_tiles(selected.object_id).items()}
+    history = canvas.command_stack.revision
+    previous = ready_paint(canvas)
     try:
-        begin(canvas, ToolKind.RASTER_PENCIL, point)
-        ready_paint(canvas)
-        assert controller._contact_reuse_gate is None
-        assert controller.capture is not None and controller.timer.isActive()
+        with monkeypatch.context() as held:
+            held.setattr(controller.scheduler, 'submit',
+                         lambda *_a, **_k: pytest.fail('Missing native coverage submitted an ordinary held scene'))
+            begin(canvas, ToolKind.RASTER_PENCIL, point)
+            ready_paint(canvas)
+            assert controller._contact_reuse_gate is canvas._raster_tile_input
+            assert controller.capture is None and not controller.timer.isActive()
+            def current_native_ready():
+                ready_paint(canvas)
+                return canvas._raster_feedback_contact_covered and not canvas._raster_feedback_pending_visible
+            wait_for(current_native_ready)
+            assert controller.feedback is not partial
+            assert controller.feedback.byte_count <= 64 * 1024 * 1024
+            actual = ready_paint(canvas)
+            assert actual != previous, 'The held missing-block input must be visible before release'
+            np.testing.assert_array_equal(pixels(actual), pixels(fixed_native_reference(canvas)))
+            for key, original in before.items():
+                assert canvas.tiles.tile(selected.object_id, key).format() == original.format()
+            assert canvas.command_stack.revision == history
     finally:
         finish(canvas, ToolKind.RASTER_PENCIL)
+    assert canvas.command_stack.revision == history+1
+    wait_scene(canvas)
+    np.testing.assert_array_equal(pixels(ready_paint(canvas)), pixels(fixed_native_reference(canvas)))
+    canvas.command_stack.undo()
+    assert before == canvas.tiles.object_tiles(selected.object_id)
 
 
 def test_rotated_pruned_tile_reveals_prefix_and_preserves_original_feedback_handles(

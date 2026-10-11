@@ -21,6 +21,7 @@ class SettingsDialog(QDialog):
         settings: EditorSettings,
         document: ChapterDocument | None = None,
         parent=None,
+        *, theme_library=None,
     ) -> None:
         super().__init__(parent)
         self.setWindowTitle("Settings")
@@ -29,6 +30,12 @@ class SettingsDialog(QDialog):
         layout = QVBoxLayout(self)
         self.tabs = QTabWidget(self)
         layout.addWidget(self.tabs)
+        from comic_editor.core.ui_themes import load_theme_library
+        from comic_editor.ui.theme_editor import ThemeEditorWidget
+        self.theme_editor = ThemeEditorWidget(theme_library or load_theme_library(), self.tabs)
+        self.tabs.addTab(self.theme_editor, "Themes")
+        self.rejected.connect(self.theme_editor.restore_preview)
+        self.resize(720, 760)
         self.grid_tab = QWidget(self.tabs)
         self.tabs.addTab(self.grid_tab, "Grid")
         grid_layout = QVBoxLayout(self.grid_tab)
@@ -127,6 +134,9 @@ class SettingsDialog(QDialog):
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
+
+    def theme_library(self):
+        return self.theme_editor.result_library()
 
     @staticmethod
     def _size_spin(value: int, parent: QWidget) -> QSpinBox:

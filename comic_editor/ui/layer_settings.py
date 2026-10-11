@@ -33,7 +33,7 @@ class LayerSettingsPanel(QGroupBox):
         self.form.setSpacing(5)
 
         self.type_label = QLabel("No active layer")
-        self.type_label.setStyleSheet("font-weight: bold; color: #80c8ff")
+        self.type_label.setProperty("themeAccent", True)
         self.form.addRow(self.type_label)
 
         self.name = QLineEdit()

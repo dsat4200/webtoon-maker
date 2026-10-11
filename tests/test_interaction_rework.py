@@ -16,6 +16,7 @@ from comic_editor.core.settings import EditorSettings
 from comic_editor.core.tiles import TileStore
 from comic_editor.ui.canvas import CanvasWidget, ToolKind
 from comic_editor.ui.main_window import MainWindow
+from comic_editor.ui.themes import theme_color
 
 
 def _canvas_document(settings: EditorSettings | None = None):
@@ -928,9 +929,9 @@ def test_outliner_colors_collapsed_add_and_dynamic_tools(qapp):
     assert window.canvas._text_selection_range() == [0, 4]
     refreshed = window.hierarchy_model.index_for_entity("layer", layer.layer_id)
     assert window.tree.isExpanded(refreshed)
-    assert window.hierarchy_model.data(refreshed, Qt.BackgroundRole).name() == "#303238"
+    assert window.hierarchy_model.data(refreshed, Qt.BackgroundRole) == theme_color("surface", "#303238")
     object_index = window.hierarchy_model.index_for_entity("object", object_id)
-    assert window.hierarchy_model.data(object_index, Qt.BackgroundRole).name() == "#050505"
+    assert window.hierarchy_model.data(object_index, Qt.BackgroundRole) == theme_color("input", "#050505")
     assert window.tool_buttons[ToolKind.RASTER_PENCIL].isHidden()
     window.show()
     window.canvas.set_selection("object", object_id)

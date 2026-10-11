@@ -35,6 +35,180 @@ def no_full_serialization(monkeypatch, chapter):
     monkeypatch.setattr(chapter, 'to_dict', forbidden)
 
 
+def raster_bytes(canvas, identifier):
+    return {key: (image.format(), image.size(), bytes(image.constBits()))
+            for key, image in canvas.tiles.object_tiles(identifier).items()}
+
+
+@pytest.mark.parametrize('tool_name', ['RASTER_PENCIL', 'RASTER_ERASER', 'BRUSH'])
+def test_held_native_pixels_leave_property_controls_and_rows_alone(owner, monkeypatch, qapp, tool_name):
+    import time
+    from PySide6.QtCore import QPointF
+    from PySide6.QtGui import QColor, QImage, QPainter
+    from comic_editor.core.brushes import BrushDefinition
+    from comic_editor.ui.canvas import ToolKind
+
+    window, _shape, obj, unrelated, _modifier = owner
+    canvas = window.canvas
+    image = QImage(256, 256, QImage.Format_ARGB32_Premultiplied)
+    image.fill(Qt.transparent)
+    painter = QPainter(image)
+    painter.fillRect(2, 2, 20, 20, QColor('#ffffffff'))
+    painter.end()
+    canvas.tiles.set_tile(obj.object_id, (0, 0), image)
+    obj.interaction_rect = (0., 0., 24., 24.)
+    before = raster_bytes(canvas, obj.object_id)
+    before_record = obj.to_dict()
+    tool = getattr(ToolKind, tool_name)
+    canvas.set_tool(tool)
+    canvas.primary_color = '#ff995533'
+    canvas.settings.predictive_ink = False
+    canvas.settings.pencil_size_px = dict.fromkeys(('small', 'medium', 'large'), 4)
+    canvas.settings.eraser_size_px = dict.fromkeys(('small', 'medium', 'large'), 4)
+    no_full_serialization(monkeypatch, window.chapter)
+    notices, refreshes = [], []
+    canvas.changesPublished.connect(notices.append)
+    original_refresh = window.selection_settings.refresh
+    def refresh():
+        refreshes.append(True)
+        original_refresh()
+    monkeypatch.setattr(window.selection_settings, 'refresh', refresh)
+    controls = window.selection_settings.raster_controls
+    controls.name.setText('Uncommitted inspector text')
+    changed = QSignalSpy(window.hierarchy_model.dataChanged)
+    resets = QSignalSpy(window.hierarchy_model.modelReset)
+    finished = QSignalSpy(canvas.interactionFinished)
+    stable = QPersistentModelIndex(window.hierarchy_model.index_for_entity('object', unrelated.object_id))
+    history = canvas.command_stack.revision
+
+    if tool == ToolKind.BRUSH:
+        canvas._begin_paint_brush(QPointF(8., 8.), .4,
+            _definition=BrushDefinition(size=4., spacing=.08, antialiasing=0))
+        for point in (QPointF(14., 8.), QPointF(14., 14.)):
+            canvas._continue_paint_brush(point, .7)
+    else:
+        canvas._begin_stroke(QPointF(8., 8.), .4)
+        for point in (QPointF(14., 8.), QPointF(14., 14.)):
+            canvas._continue_stroke(point, .7)
+
+    assert canvas._drawing and canvas.command_stack.revision == history
+    held = raster_bytes(canvas, obj.object_id)
+    assert held != before
+    assert len(notices) >= 2 and all(change.transient for change in notices)
+    assert all(change.entities[0].fields == {'pixels', 'interaction_rect'} for change in notices)
+    assert not refreshes and changed.count() == resets.count() == 0
+    assert controls.name.text() == 'Uncommitted inspector text'
+    assert stable.isValid() and finished.count() == 0
+
+    canvas._finish_paint_brush() if tool == ToolKind.BRUSH else canvas._end_stroke()
+    deadline = time.monotonic()+10
+    while (canvas._drawing or any(gate.busy for gate in canvas._native_input_gates())) and time.monotonic() < deadline:
+        qapp.processEvents()
+        time.sleep(.001)
+    assert not canvas._drawing and not any(gate.busy for gate in canvas._native_input_gates())
+    assert canvas.command_stack.revision == history+1 and finished.count() == 1
+    assert raster_bytes(canvas, obj.object_id) == held
+    assert refreshes and changed.count() > 0 and resets.count() == 0
+    assert controls.name.text() == obj.name
+    canvas.command_stack.undo()
+    assert raster_bytes(canvas, obj.object_id) == before and obj.to_dict() == before_record
+    canvas.command_stack.redo()
+    assert raster_bytes(canvas, obj.object_id) == held
+    assert stable.isValid() and resets.count() == 0
+
+
+def pixel_notice(obj, **kwargs):
+    from comic_editor.core.changes import ChangeSet, EntityChange, ResourceChange
+    return ChangeSet((EntityChange(('object', obj.object_id),
+        frozenset({'pixels', 'interaction_rect'}), (0., 0., 24., 24.), (0., 0., 24., 24.)),),
+        (ResourceChange(('object', obj.object_id), 'raster', (0, 0)),), transient=True, **kwargs)
+
+
+def test_mixed_pixel_and_property_notice_refreshes_controls_and_each_changed_row(owner, monkeypatch):
+    from comic_editor.core.changes import ChangeSet, EntityChange
+    window, _shape, obj, unrelated, _modifier = owner
+    obj.opacity, obj.blend_mode, obj.show_on_top = .35, 'multiply', True
+    obj.ignore_parent_mask, obj.underlay_opacity = True, .42
+    unrelated.name = 'Updated sibling'
+    pixel = pixel_notice(obj)
+    selected = EntityChange(('object', obj.object_id), frozenset({'pixels', 'opacity',
+        'blend_mode', 'show_on_top', 'ignore_parent_mask', 'underlay_opacity'}))
+    other = EntityChange(('object', unrelated.object_id), frozenset({'*'}))
+    changed = QSignalSpy(window.hierarchy_model.dataChanged)
+    window._canvas_changes_published(ChangeSet((selected, other), pixel.resources, transient=True))
+    controls = window.selection_settings.raster_controls
+    assert controls.opacity.value() == 35 and controls.ignore_parent_mask.isChecked()
+    assert controls.underlay.value() == 42
+    assert window.selection_settings.blend_mode.currentData() == 'multiply'
+    assert window.selection_settings.object_show_on_top.isChecked()
+    refs = {window.hierarchy_model.item_for_index(changed.at(i)[0]).entity_id for i in range(changed.count())}
+    assert refs == {obj.object_id, unrelated.object_id}
+
+
+@pytest.mark.parametrize('fallback', ['committed', 'conservative', 'document', 'order', 'foreign_resource', 'mask_resource'])
+def test_unknown_or_nonpixel_notice_retains_normal_observers(owner, monkeypatch, fallback):
+    from dataclasses import replace
+    from comic_editor.core.changes import OrderChange, ResourceChange
+    window, _shape, obj, unrelated, _modifier = owner
+    change = pixel_notice(obj)
+    if fallback == 'committed':
+        change = replace(change, transient=False)
+    elif fallback == 'conservative':
+        change = replace(change, conservative=True)
+    elif fallback == 'document':
+        change = replace(change, document_fields=frozenset({'height'}))
+    elif fallback == 'order':
+        change = replace(change, orders=(OrderChange('objects', tuple(window.chapter.objects), tuple(window.chapter.objects)),))
+    elif fallback == 'foreign_resource':
+        change = replace(change, resources=(ResourceChange(('object', unrelated.object_id), 'raster', (0, 0)),))
+    else:
+        change = replace(change, resources=(ResourceChange(('object', obj.object_id), 'mask', (0, 0)),))
+    refreshes = []
+    monkeypatch.setattr(window.selection_settings, 'refresh', lambda: refreshes.append(True))
+    changed = QSignalSpy(window.hierarchy_model.dataChanged)
+    resets = QSignalSpy(window.hierarchy_model.modelReset)
+    window._canvas_changes_published(change)
+    assert refreshes and changed.count()+resets.count() > 0
+
+
+@pytest.mark.parametrize('selection_kind', ['layer', 'text'])
+def test_raster_source_dependencies_refresh_selected_context_and_saved_masks(owner, monkeypatch, selection_kind):
+    from comic_editor.core.models import ParameterMaskBinding, TextObject, ToneMask
+    window, shape, obj, unrelated, _modifier = owner
+    canvas, chapter = window.canvas, window.chapter
+    mask = ToneMask(saved=True, contributors=[('object', obj.object_id)])
+    chapter.masks[mask.mask_id] = mask
+    if selection_kind == 'text':
+        text = chapter.add_object(shape.layer_id, TextObject(text='Dependent text',
+            opacity_mask=ParameterMaskBinding(mask.mask_id, 0., 1.)))
+        window.hierarchy_model.set_chapter(chapter)
+        canvas.set_selection('object', text.object_id, activate_default_tool=False)
+    else:
+        canvas.set_selection('layer', shape.layer_id, activate_default_tool=False)
+    canvas._change_index.bind(chapter)
+    panels, masks, text_controls = [], [], []
+    monkeypatch.setattr(window.selection_settings, 'refresh', lambda: panels.append(True))
+    monkeypatch.setattr(window, '_refresh_masks_panel', lambda: masks.append(True))
+    monkeypatch.setattr(window.text_object_controls, 'refresh', lambda: text_controls.append(True))
+    window._canvas_changes_published(pixel_notice(obj))
+    assert panels and masks
+    assert bool(text_controls) == (selection_kind == 'text')
+
+
+def test_selected_raster_pixel_notice_keeps_mask_dependency_updates(owner, monkeypatch):
+    from comic_editor.core.models import ToneMask
+    window, _shape, obj, _unrelated, _modifier = owner
+    chapter = window.chapter
+    mask = ToneMask(saved=True, contributors=[('object', obj.object_id)])
+    chapter.masks[mask.mask_id] = mask
+    window.canvas._change_index.bind(chapter)
+    masks, panels = [], []
+    monkeypatch.setattr(window, '_refresh_masks_panel', lambda: masks.append(True))
+    monkeypatch.setattr(window.selection_settings, 'refresh', lambda: panels.append(True))
+    window._canvas_changes_published(pixel_notice(obj))
+    assert masks and not panels
+
+
 def test_mask_binding_and_contributors_keep_unrelated_records_and_rows(owner, monkeypatch):
     from comic_editor.core.models import ToneMask
     window, _shape, first, unrelated, _modifier = owner

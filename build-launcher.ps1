@@ -7,7 +7,9 @@ if (-not (Test-Path -LiteralPath $pythonWindowed)) { throw "pythonw.exe was not 
 $compiler = Join-Path $env:WINDIR "Microsoft.NET\Framework64\v4.0.30319\csc.exe"
 if (-not (Test-Path -LiteralPath $compiler)) { throw "The Windows .NET Framework C# compiler was not found." }
 $output = Join-Path $PSScriptRoot "WebtoonMaker.exe"
-& $compiler /nologo /target:winexe /reference:System.Windows.Forms.dll "/out:$output" (Join-Path $PSScriptRoot "launcher\WebtoonMaker.cs")
+$icon = Join-Path $PSScriptRoot "comic_editor\ui\assets\webtoon-maker.ico"
+if (-not (Test-Path -LiteralPath $icon)) { throw "The Webtoon Maker application icon is missing." }
+& $compiler /nologo /target:winexe /reference:System.Windows.Forms.dll "/win32icon:$icon" "/out:$output" (Join-Path $PSScriptRoot "launcher\WebtoonMaker.cs")
 if ($LASTEXITCODE -ne 0) { throw "Launcher compilation failed." }
 [System.IO.File]::WriteAllText((Join-Path $PSScriptRoot "WebtoonMaker.python.txt"), $pythonWindowed)
 Write-Output "Built $output"

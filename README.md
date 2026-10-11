@@ -9,6 +9,9 @@ workflow.
 
 ## Current foundation
 
+Appearance palettes, saved theme editing and the integrated window controls
+are described in [UI themes](docs/ui-themes.md).
+
 - Portable series folders and versioned chapter manifests
 - Toolbar File dropdown with New/Open/Recent/Save plus atomic whole-series
   Save As cloning

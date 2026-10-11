@@ -498,7 +498,9 @@ def test_prepared_native_contact_batch_matches_qpainter_images_and_reuses_textur
         # Original native Qt image presentation, using exactly the same patch
         # buffers/gutters. Filtering may differ by one display byte; artwork
         # bytes and the final exact document path are unchanged.
-        def qt_images(painter, tiles, camera, size, *, owner, smooth, clip_world):
+        def qt_images(painter, tiles, camera, size, *, owner, smooth, clip_world,
+                      replace_background=None):
+            assert replace_background is None, 'GPU feedback must not request raster replacement'
             painter.save()
             try:
                 painter.setTransform(camera)
@@ -508,11 +510,12 @@ def test_prepared_native_contact_batch_matches_qpainter_images_and_reuses_textur
                     painter.drawImage(tile.world_rect, tile.image, tile.source_rect)
             finally:
                 painter.restore()
-        monkeypatch.setattr(feedback_ui, 'draw_document_tiles', qt_images)
-        canvas.update()
-        qapp.processEvents()
-        np.testing.assert_allclose(canvas.frame_pixels, batch, atol=1)
-        assert canvas._raster_feedback_contact_covered
+        with monkeypatch.context() as reference:
+            reference.setattr(feedback_ui, 'draw_document_tiles', qt_images)
+            canvas.update()
+            qapp.processEvents()
+            np.testing.assert_allclose(canvas.frame_pixels, batch, atol=1)
+            assert canvas._raster_feedback_contact_covered
         canvas._end_stroke()
     finally:
         release.set()

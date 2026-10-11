@@ -50,6 +50,7 @@ def _moments(rgba):
 def _original(rgba, size, cancelled=None):
     height, width = rgba.shape[:2]
     radii = np.broadcast_to(np.asarray(size, dtype=np.float32), (height, width))
+    scalar_radius = np.ndim(size) == 0
     result = _straight_rgb(rgba)
     # Independent tiles bound the integral tables even on a whole chapter.
     for top in range(0, height, 192):
@@ -69,9 +70,15 @@ def _original(rgba, size, cancelled=None):
                        (max(0, halo-left), max(0, right+halo-width)), (0, 0))
             tile = np.pad(rgba[y0:y1, x0:x1], padding, mode="edge")
             summed = np.pad(_moments(tile).cumsum(0).cumsum(1), ((1, 0), (1, 0), (0, 0)))
-            yy, xx = np.mgrid[halo:halo+bottom-top, halo:halo+right-left]
+            if scalar_radius:
+                yy = np.arange(halo, halo+bottom-top)[:, None]
+                xx = np.arange(halo, halo+right-left)[None, :]
+            else:
+                yy, xx = np.mgrid[halo:halo+bottom-top, halo:halo+right-left]
 
             def at_radius(r):
+                if scalar_radius:
+                    r = r.flat[0]
                 best = np.full(radius.shape, np.inf)
                 colors = result[top:bottom, left:right].copy()
                 for sy, sx in ((-1, -1), (-1, 1), (1, -1), (1, 1)):
@@ -79,8 +86,9 @@ def _original(rgba, size, cancelled=None):
                     ya, yb = (yy-r, yy+1) if sy < 0 else (yy, yy+r+1)
                     moment = summed[yb, xb] - summed[ya, xb] - summed[yb, xa] + summed[ya, xa]
                     weight = moment[..., 6]
-                    mean = moment[..., :3] / np.maximum(weight[..., None], 1e-12)
-                    variance = np.maximum(0., moment[..., 3:6] / np.maximum(weight[..., None], 1e-12) - mean*mean).sum(2)
+                    normal = np.maximum(weight[..., None], 1e-12)
+                    mean = moment[..., :3] / normal
+                    variance = np.maximum(0., moment[..., 3:6] / normal - mean*mean).sum(2)
                     choose = (weight > 1e-8) & (variance < best)
                     colors[choose], best[choose] = mean[choose], variance[choose]
                 return colors

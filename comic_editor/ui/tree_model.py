@@ -15,6 +15,7 @@ from comic_editor.core.models import (
     RasterObject, TextObject, VectorDrawingObject,
 )
 from comic_editor.core.document_patch import RecordSnapshot
+from comic_editor.ui.themes import theme_color
 
 
 @dataclass
@@ -86,6 +87,10 @@ class HierarchyModel(QAbstractItemModel):
         if change.hierarchy_changed:
             self.rebuild()
             return
+        if self.transient_raster_pixels_ref(change) is not None:
+            # Native contact pixels/frame affect artwork and canvas gizmos,
+            # but none of the outliner's displayed roles.
+            return
         for item in change.entities:
             index = self.index_for_entity(*item.entity)
             if not index.isValid():
@@ -98,6 +103,20 @@ class HierarchyModel(QAbstractItemModel):
             else:
                 last = index.siblingAtColumn(2)
             self.dataChanged.emit(index, last, [])
+
+    def transient_raster_pixels_ref(self, change):
+        """Recognize a pure native pixel notice, never mixed/property edits."""
+        if (self.chapter is None or not change.transient or change.conservative
+                or change.document_fields or change.orders or len(change.entities) != 1):
+            return None
+        item = change.entities[0]
+        if (item.structural or item.entity[0] != 'object' or not item.fields
+                or not item.fields <= {'pixels', 'interaction_rect'}
+                or not isinstance(self.chapter.objects.get(item.entity[1]), RasterObject)
+                or any(resource.entity != item.entity or resource.resource != 'raster'
+                       for resource in change.resources)):
+            return None
+        return item.entity
 
     def _build(self) -> None:
         self.root = TreeItem("root", "")
@@ -255,13 +274,22 @@ class HierarchyModel(QAbstractItemModel):
                 return QColor("#5f9f72")
             if (item.kind, item.entity_id) in self.link_highlights:
                 return QColor("#b85b12")
-            return QColor("#303238") if item.kind == "layer" else QColor("#050505")
+            return (
+                theme_color("surface", "#303238") if item.kind == "layer"
+                else theme_color("input", "#050505")
+            )
         if role == Qt.ForegroundRole:
             if entity.show_on_top:
                 return QColor("#ffffff")
             if key in self.solo_entities and key != self.current_entity:
                 return QColor("#171717")
-            return QColor("#eeeeee")
+            if key in self.error_highlights:
+                return QColor("#ffffff")
+            if key in self.mask_highlights:
+                return QColor("#171717")
+            if key in self.link_highlights:
+                return QColor("#ffffff")
+            return theme_color("text", "#eeeeee")
         return None
 
     def setData(self, index: QModelIndex, value, role=Qt.EditRole) -> bool:

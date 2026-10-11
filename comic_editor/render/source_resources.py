@@ -72,7 +72,10 @@ class ReadyOriginals:
     def capture(self, snapshot):
         self.identity = _identity(snapshot)
         images = []
-        for key, image in snapshot.images._decoded.items():
+        # A retired filtered consumer can still touch the snapshot's source
+        # LRUs. Freeze their bounded entries before Qt aliases/version reads
+        # yield; original pins and versions still guard every adoption.
+        for key, image in tuple(snapshot.images._decoded.items()):
             identifier = _image_identifier(key)
             source = snapshot.images._sources.get(identifier)
             if source is not None:
@@ -80,7 +83,7 @@ class ReadyOriginals:
                     snapshot.images._owned_decodes.get(key)))
         self.images = tuple(images)
         tiles = []
-        for (owner, key), (image, _content_key) in snapshot.tiles.residency.entries.items():
+        for (owner, key), (image, _content_key) in tuple(snapshot.tiles.residency.entries.items()):
             version = owner.version(key)
             pin = _tile_pin(owner, key)
             if pin is not None:

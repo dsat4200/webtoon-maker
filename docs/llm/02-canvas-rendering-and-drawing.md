@@ -2,6 +2,17 @@
 
 ## Architectural center
 
+### Native filter allocation reuse
+
+Mesh face containment compares separate coordinate columns while preserving
+array-to-array NumPy precision promotion, the original tolerance and face
+order. Original Kuwahara shares its unchanged weight denominator and uses
+broadcast integer axes only for scalar radii; variable radius fields retain
+the dense path. These shortcuts change temporary allocations, not sampling,
+cache identities, native grids or pixel contracts. Independent original math
+and whole-buffer regressions are in `tests/test_native_filter_allocations.py`;
+desktop measurements are in `docs/desktop-gpu-optimization-2026-10-09.md`.
+
 ### Native artwork and manual disk backing
 
 Camera zoom and display density do not add artwork samples. Exact projection
@@ -252,6 +263,15 @@ checks actual pending mask ownership rather than the shared drawing flag.
   Native ownership/adoption cases are in `tests/test_inline_result_storage.py`;
   measured heavy-stack performance is tracked separately in
   `docs/refactor-integration-performance-2026-10-07.md`.
+  `detached_value` reuses exact built-in immutable scalars and scalar tuples
+  when detaching metadata. An iterative proof also permits whole nested exact
+  tuple trees containing only those built-in values; no global memo is added.
+  Mutable containers, Qt values and scalar subclasses retain their ordinary
+  independent ownership, and editor callbacks remain rejected. This avoids
+  repeated immutable metadata copies without changing semantic keys, storage
+  accounting or pixels. Ownership regressions are in
+  `tests/test_detached_value_ownership.py` and `tests/test_nested_scene_detachment.py`;
+  desktop evidence is in `docs/desktop-gpu-optimization-2026-10-09.md`.
   `render/source_resources.py::ReadyOriginals` also transfers already decoded
   original QImage handles when the worker retires a snapshot, including after
   cancellation. Adoption requires the same document, pixel contract and color
@@ -282,9 +302,50 @@ checks actual pending mask ownership rather than the shared drawing flag.
   retirement checks still on the document thread, rather than waiting for the
   eight-millisecond polling interval.
   Release, stale ownership, unrelated artwork or lost coverage resumes normal
-  guarded scene work. Cold/fallback preparation retains bounded capture slices
-  (4 ms normally, 2 ms for eligible native Pencil/Eraser feedback), with an 8 ms
-  timer cadence. This scheduling policy changes no native exact work.
+  guarded scene work. Ordinary cold/fallback preparation retains bounded
+  capture slices (4 ms normally, 2 ms for eligible native Pencil/Eraser
+  feedback), with an 8 ms timer cadence. The private contact preparation below
+  yields between zero-timer capture slices. Scheduling changes no native exact work.
+  A separable cold Raster contact also owns a private
+  `render/raster_feedback_bootstrap.py` capture and feedback-only scheduler.
+  Selected pixel/interaction-frame changes retain this owner while every other
+  typed scene dependency, selection, viewport or configuration change retires
+  it. The selected native map is frozen through ordinary COW handles and clean
+  file pins, with a bounded eager address count. Global native maps above 128
+  originals freeze only native source cells required by the saved-model inverse
+  of every aligned visible feedback patch, including native gutters. The 128
+  limit applies to retained existing originals; metadata probing is also bounded.
+  Complete global source alpha bounds and authored interaction/transform frames
+  survive this view culling, and a changed mapping retires the provisional owner.
+  No source pixels or sampling grids change. `tests/test_large_source_cold_feedback.py`
+  compares every held Pencil/Eraser/Brush buffer against complete-original-map
+  feedback and fresh ordinary native output at 0.3, 0.57 and 1.0 zoom, including
+  fractional, affine, perspective and 64-bit sources, new native cells, clipping,
+  foreground order and exact undo. Unsafe or over-budget footprints retain the
+  ordinary fallback. Chapter capture uses two-ms
+  zero-timer slices and yields first to pending native input. Worker polling
+  retains an eight-ms backup cadence, while a queued completion signal wakes
+  the controller immediately. Every selected address changed before adoption, including pruned
+  transparent tiles and the first contact packet, remains in the substitution
+  journal. Preparation cannot restart on each packet or clear that journal.
+  Its normalized nonlive descriptor serves only prefix/source/suffix
+  preparation: the snapshot has no disk cache or graphics worker, publishes no
+  ordinary exact scene tiles, and its resources remain provisional. Release or
+  invalid ownership cancels unfinished preparation and resumes ordinary work.
+  Completed ordinary source ownership can feed this preparation through a
+  nonblocking `ReadyOriginals` future. Only a completed future is adopted, and
+  ordinary native generation/path validation still rejects stale originals.
+  Native patches publish progressively, with the current contact prioritized
+  before budget truncation; the ready queue retains only the newest cumulative
+  handoff for each private serial. This lane has a 64-MiB native-plane budget;
+  ordinary preparation retains its 32-MiB default. These are retention limits,
+  not sampling exceptions: tile sides, gutters and native pixel contracts do
+  not depend on camera scale or display density.
+  `render/raster_feedback_coverage.py` can prove a retained subset covers the
+  complete visible dirty-source journal even when it does not cover the whole
+  viewport. The proof includes transformed source footprints, native gutters,
+  a physical display halo, current source ownership and the usual dependency
+  guards. It never substitutes a pointer-only test for earlier stroke damage.
   Lower-density preview evaluators have separate caches and cannot contaminate
   the retained native evaluator or durable entries.
   Ordinary Raster Pencil/Eraser contact instead captures `contact_only` demand
@@ -294,6 +355,56 @@ checks actual pending mask ownership rather than the shared drawing flag.
   checks; private transform/mask draft caches never flow back into that owner.
   Contact results remain live and provisional, so durable reads and writes
   stay disabled. Export clears both contact and live demand metadata.
+- `render/filtered_raster_feedback.py` extends provisional contact feedback to
+  separable raster leaves with finite point filters and solid outlines. The
+  ordinary scene kernels record the original complete native 4×4 projection
+  device, clipping, source placement and painter order. Source captures and
+  parameter-mask fields keep their original 256-pixel grids; finite point work
+  crops only already sampled fields. Masked spatial stages keep ordinary tiles.
+  `render/filtered_feedback_worker.py` prepares a private source owner off the
+  GUI, adopting existing immutable capture pins and unchanged ready originals
+  through the ordinary bounded source LRUs. Changed resident pixels and typed
+  generations cross as COW packets; one active and one merged pending packet
+  retain complete dirty coverage. Prepared images, metadata and source/scene
+  progress have a 128 MiB cap, allowing neighboring complete native regions
+  where their summed ownership fits. Both worker paths reserve actual
+  prepared bytes plus ordinary snapshot workspace; scene preparation reserves
+  the full cap through shared admission. Explicit smaller budgets still
+  reject excess ownership. Source packets and presentation crops each keep
+  their 32 MiB caps. Native boundary, memory-ticket and history regressions
+  are in `tests/test_neighbor_filtered_contact.py`.
+  Capture current typed source generations before collecting completed work.
+  Completion-only polls publish ready pixels but defer starting pending work
+  while uncaptured generations exist; the next capture merges newest values
+  and complete dirty coverage before launching. This avoids an extra stale
+  display job while preserving every original source-edit sample. The real
+  worker regression is in `tests/test_latest_filtered_packet.py`.
+  `ui/filtered_raster_feedback.py` replaces complete affected native scene tiles
+  in the normal batch, including erased transparency. Replacement first
+  validates native phases and ProjectionAddress keys: viewport-preview and
+  overview serials are never tile addresses. A positively owned contact may
+  use its complete validated native basis after an earlier viewport preview;
+  absent ready updates, presentation retains the supplied view. Unowned
+  non-native batches remain on ordinary rendering. Regression coverage is
+  in `tests/test_preview_native_feedback.py`. Every requested dirty
+  tile and gutter must fit the original prepared demand and a complete native
+  previous view. Missing coverage, changed source frame/owner/configuration,
+  unsupported dependencies or budget exhaustion resume ordinary rendering.
+  A queued worker completion wakes held input even when the scene timer is
+  stopped. Reset, consumer destruction, selection changes and unsupported or
+  unrelated typed artwork changes retire that owner. Eligible selected-source
+  pixel undo/redo retains it through the same native packet path; its presentation
+  floor rejects every pre-restore result. Metadata-only history does not advance
+  that floor. Filtered preparation receives the complete visible native demand,
+  including already-ready exact regions, while ordinary work still renders only
+  missing tiles. Missing coverage and source-frame/dependency guards remain.
+  History, reselection and visibly exposed held-worker races are covered by
+  `tests/test_visible_filtered_scope.py`. Live/contact results have no persistent
+  cache and never become
+  exact projection entries. Full-native references, lifecycle and production
+  fallback/history checks are in `tests/test_filtered_native_recipe.py` and
+  `tests/test_filtered_raster_contact_feedback.py`; desktop measurements and
+  saved-project stability evidence are in the optimization report.
 - `render/raster_feedback.py` prepares native prefix/source/suffix planes with
   the ordinary detached scene kernels for a selected simple raster leaf. The
   source grid and two-pixel gutters retain their native document placement;
@@ -333,11 +444,13 @@ checks actual pending mask ownership rather than the shared drawing flag.
   blends, no selected/ancestor effects or opacity masks, bounded ancestors at
   unit opacity and no linked sampler depending on the edited source. Solo uses
   the ordinary visibility rules. Positive axis-aligned saved object/ancestor
-  transforms use native world patches with bounded inverse source dependencies;
-  other untransformed placement remains integral. Resident transformed source
+  transforms and fractional object/ancestor translations use native world
+  patches with bounded inverse source dependencies. Integral unmapped placement
+  retains its original source-grid path. Resident transformed source
   footprints clear transparently before native SourceOver drawing, preserving
   the ordinary Qt sampling phase and unchanged adjacent source tiles. Finite
-  invertible affine rotations, shears and reflections use the ordinary exact
+  invertible affine rotations, shears and reflections, plus validated convex
+  perspective maps, use the ordinary exact
   4×4 native block origin: Qt nearest-image scanline phase can differ on a
   separately clipped 256-pixel device. These provisional blocks retain only
   prefix/suffix planes and bounded COW handles to original native source tiles.
@@ -347,7 +460,15 @@ checks actual pending mask ownership rather than the shared drawing flag.
   payload is capped at 64 MiB; ordinary axis-aligned planes retain their 32 MiB
   cap, and composed presentation retains its existing 32 MiB LRU. Coverage gates
   require every visible native block, including those beyond a budget-truncated
-  preparation. Perspective or collapsed transforms remain conservative fallbacks.
+  preparation. Perspective eligibility verifies the ordinary solver against
+  every authored corner and retains all nine transform coefficients. A horizon
+  crossing either an inverse query or a contributing native source-tile
+  rectangle declines preparation before source work. Folded, concave, collapsed,
+  nonfinite or unsupported source-frame transforms remain conservative fallbacks.
+  Native projective reference/undo/cancel tests are in
+  `tests/test_projective_raster_contact_feedback.py`; RTX 5060 measurements and
+  the complete saved-project checks are in
+  `docs/desktop-gpu-optimization-2026-10-09.md`.
   Unsupported graphs retain the previous ready
   scene until ordinary detached preview evaluation completes. A screen-space
   contact ring and "Updating drawing…" label identify received input whose
@@ -433,6 +554,90 @@ checks actual pending mask ownership rather than the shared drawing flag.
 
 - `_CanvasLogic` is a large mixin containing document binding, selection, camera math, rendering, hit testing, input dispatch, every drawing tool, text editing, tone-mask and modifier integration, and transform workflows.
 - `RasterCanvasWidget` combines that mixin with `QWidget`.
+- Its owned widget painter may join a complete coherent Legacy ARGB32 native
+  batch into one transient surface, capped at 4 MiB and 32 input tiles. Source
+  cores are copied byte for byte on their existing integer document grid; camera
+  zoom and display density do not increase that surface's sampling resolution.
+  A fractional visible frame retains one neighboring native pixel for display
+  filtering. Unsupported precision, missing coverage, non-axis-aligned cameras,
+  caller clips and oversized views keep ordinary tile presentation.
+  Filtered live batches use a separate provisional context keyed by configuration,
+  completed worker revision and actual input image identities. A pending newer
+  source packet can reuse the last coherent display surface. This surface never
+  enters exact projection or persistent caches; normal completed batches have
+  their own context. Detached image/export painters and GPU widgets retain their
+  existing presentation paths. Native cores, fractional-view display equivalence
+  and actual live widget use are checked in `tests/test_live_native_mosaic.py`.
+  Raster contact publication already invalidates its typed influence before
+  queuing visual notification, so that notification does not invalidate it again.
+  The first admitted native Pencil/Eraser/Brush dab queues one complete software
+  widget repaint to adopt the live presentation, including untouched document
+  edges outside its dirty band. A received press alone is insufficient: its
+  repaint may finish before a queued successor acquires the source. Subsequent
+  positively owned, unreleased packets with finite typed influence and unchanged
+  interaction geometry repaint only the affected horizontal display rows.
+  Qt's clipped fractional image interpolation
+  can otherwise differ by one display value from a complete widget repaint;
+  full-width rows retain the ordinary mosaic/tile sampling phase. This changes
+  presentation damage only, never native tiles, source grids or exact caches.
+  Old/new cursor paths, received pending rings and prediction footprints join
+  the coalesced QRegion, including Brush moves that produce no spaced dab.
+  After that initial complete contact frame, the software presentation lane
+  coalesces redraws against a six-ms frame deadline. It never delays native
+  packet admission or changes received samples, pressure, axes or timestamps.
+  The queued timer is not restarted by newer input, so a continuous stream
+  cannot postpone its display indefinitely. Release still publishes the final
+  ordinary guarded frame.
+  Source-readiness annotations, frame/document growth, rotated cameras,
+  unowned/general changes and GPU widgets retain complete repaint behavior.
+  Within a positively owned axis-aligned software contact paint, the actual
+  QWidget paint-event region may also reject tile destinations wholly outside
+  that region. The complete native-mosaic eligibility decision runs first;
+  tile order, source rectangles, ownership clips and sampling remain unchanged.
+  Damage is mapped through the actual widget device transform, rounded outward
+  with a one-physical-pixel margin. Unknown transforms or ownership, explicit
+  painter/world clips, nonstandard composition, detached/export painters and
+  GPU widgets keep the ordinary draw path. This is a transient draw-call
+  filter, not a source/derived cache or a second clipping/sampling operation.
+  `tests/test_owned_raster_paint_region.py` compares retained widget backing
+  against a complete unculled repaint, including fractional zoom, disconnected
+  regions, native RGBA64 precision, replacement and erasing.
+  While that native input owns the raster widget, unchanged selection gizmos
+  may retain their original QPainter primitives through `ui/painting_gizmos.py`,
+  capped at 512 commands and 8 MiB of geometry payload. Its keys
+  include document/selection, world quad, camera, tool, display density, handle
+  settings, transform mode, actual painter font/render hints, palette and solo
+  signature. Active Cage/Texture editing takes direct selection drawing, including
+  view-only modifier ribbon transitions. General typed changes invalidate it;
+  release or invalid ownership retires it. Replay uses the same primitive
+  overloads on the current painter, preserving original antialiasing and color
+  composition. It retains no pixels, paint device or native handle and never
+  enters rendering/persistence caches. Unsupported operations or excess command
+  payload use direct gizmo drawing with the caller painter state restored.
+  Retained backing pixels versus a fresh
+  complete widget repaint are checked in
+  `tests/test_native_contact_partial_repaint.py` at DPR 1 and 1.25. Idle-to-live
+  adoption at a fractional visible document edge and deferred first-dab damage
+  are covered by `tests/test_native_contact_presentation_adoption.py`; command
+  ownership, budgets, state failures and uncached widget equivalence are covered
+  in `tests/test_painting_gizmo_commands.py` and
+  `tests/test_painting_selection_cache.py`.
+  A newer unreleased received contact also owns the custom painting cursor while
+  an older transaction finishes. Its transient journal is checked against the
+  current chapter, TileStore, source model, tool and selected source identity;
+  `_drawing` alone cannot represent this received-versus-admitted interval.
+  `tests/test_native_pointer_received_owner.py` covers actual Qt successor moves
+  for Pencil, Eraser, Brush and Pencil/Eraser mask painting over modifier gizmos.
+  A strict transient notice for one Raster object's `pixels`/`interaction_rect`
+  fields does not refresh outliner roles, which have no pixel/frame dependency.
+  When that raster is the entire current selection, MainWindow also leaves its
+  unchanged selection property controls alone. The shared recognizer rejects
+  mixed entities, unknown/conservative edits, document/order changes, structural
+  fields and other-source/non-raster resources. Dependency publication and
+  affected mask-panel updates still run; committed strokes, undo/redo, selected
+  layers/text and real property edits retain ordinary control updates.
+  Actual held Pencil/Eraser/Brush source/history checks and the negative observer
+  matrix are in `tests/test_focused_property_observers.py`.
 - `GpuCanvasWidget` combines it with `QOpenGLWidget` and requests partial updates.
 - GPU paint events enter `QOpenGLWidget.paintEvent`; Qt prepares the widget's
   framebuffer before `paintGL` draws the ordinary shared canvas frame.
@@ -443,7 +648,18 @@ checks actual pending mask ownership rather than the shared drawing flag.
   must not accumulate over preserved pixels from an earlier partial update.
   This presentation clear does not bind another framebuffer, allocate derived
   artwork, alter sampling density or change native/cache output.
-- `create_canvas(settings)` probes an offscreen OpenGL 3.3 context unless the renderer is forced to `raster`. If the probe fails, or Qt is using `offscreen`/`minimal`, it creates the raster widget.
+- `create_canvas(settings)` probes an offscreen OpenGL 3.3 context unless the
+  renderer is forced to `raster`. Failed probes and `offscreen`/`minimal` use the
+  raster widget. A measured Windows auto-mode workaround also uses that existing
+  widget for RTX 5060 / NVIDIA 591.44 / Qt 6.11.1 rendering to a single available
+  direct HDMI AMD 164E output. Probe/widget/target screen names and source/target
+  adapters must agree. Read-only display queries and existing current-context
+  identity establish the route; unknown or other builds retain GPU selection.
+  Explicit renderer settings are preserved. GPU effects still use the ordinary
+  worker, with detached materialization at the real CPU presentation/source edge.
+  No native sampling, pixel contracts or exact/durable cache rules change. See
+  [the desktop measurements](../desktop-gpu-optimization-2026-10-09.md) and
+  `tests/test_canvas_presentation_policy.py` / `tests/test_auto_gpu_compute.py`.
 - Both backends present the shared scene pipeline. Eligible point/blur chains
   retain `render/device.py::DeviceImage` textures with producer fences and
   leases. Shared-context presentation consumes ready textures without a
@@ -451,6 +667,15 @@ checks actual pending mask ownership rather than the shared drawing flag.
   raster surfaces materialize at their real CPU edge on a detached lane.
   Unsupported chains preserve exact CPU fallback. Context failure retires
   device results as cache misses; GL cleanup remains on its graphics owner.
+  Shared graphics owners select the share context's screen for their native
+  offscreen surface before creation, then select that surface's screen for the
+  new context. Helpers with a supplied surface select its screen before
+  creating their context; owned surfaces follow the created context's screen.
+  This preserves display affinity on systems with multiple adapters without
+  choosing a GPU vendor or changing Windows preferences. Borrowed prepared
+  contexts retain their existing native identity. Distinct-screen regression
+  controls and native shared-context pixel checks cover initialization order
+  and ownership in `tests/test_gpu_screen_affinity.py`.
   The graphics owner removes released tokens under its queue condition, then
   makes the context current and retires fences outside that condition. Driver
   cleanup cannot hold the lock used by GUI lease disposal or new submissions.
@@ -933,6 +1158,33 @@ its requested native buffers and alpha workspace, without reserving an unrelated
 full-scene render workspace. Authored Brush materials enter as immutable worker
 resources before the first paint packet.
 
+Raster Pencil/Eraser, mask and Brush contacts retain the last positive received
+pressure for a release-only endpoint. Zero-pressure move samples still reach the native
+kernel unchanged. A queued contact takes its final position and pressure from
+its own received sample journal, rather than an older contact's replay state,
+and its received release seals that journal even if older painting has finished.
+Brush terminal samples retain the release packet's axes and timestamp. Deferred
+Brush moves use the owned journal before hover/gizmo handling. Mouse hover cannot
+extend a sealed contact, and focus/capture loss seals accepted Brush successors.
+Actual warm/cold tablet and queued-contact race regressions are in
+`tests/test_native_pointer_received_owner.py`.
+
+For an already active pen contact, a positive-pressure TabletPress or
+TabletRelease with remaining held buttons is admitted through the ordinary
+move path. Windows can replace the held tip's LeftButton with the barrel's
+RightButton; Qt derives press/release event kinds from that changing mask.
+The packet retains its pressure, axes and timestamp without restarting or
+committing the current tool owner. NoButton releases and zero-pressure releases
+keep the ordinary lift policy; inactive hover and navigation keep their existing
+dispatch. Warm/cold owner, packet and history checks are in
+`tests/test_tablet_button_transitions.py`.
+
+Synthetic brush thumbnails yield to all drawing and received native owners,
+including cold Pencil/Eraser/mask contacts and released-but-pending transactions.
+The preview iterator remains retained and resumes after input settles. Its
+33-ms pause checks perform no preview rendering; tests cover retained work and
+completion after release in `tests/test_brush_preview_queue.py`.
+
 Released contacts retain their original entity and source-generation guards
 when the user changes selection, tool or an unrelated property. A harmless
 presentation change may restart staging, but cannot silently cancel accepted
@@ -977,7 +1229,15 @@ The underlay is a live editing aid, not a separate object. While an object's und
 
 ## Tablet and touch interop (Windows)
 
-In tablet mode the canvas uses `comic_editor/ui/windows_input.py` to register the window for native touch with palm rejection (`TWF_WANTPALM`) and to set `MicrosoftTabletPenServiceProperty` with `TABLET_ENABLE_MULTITOUCHDATA` so touch navigation keeps working while the stylus hovers. `WM_TABLET_QUERYSYSTEMGESTURESTATUS` is answered to suppress system gesture handling.
+In tablet mode the canvas uses `comic_editor/ui/windows_input.py` to register
+native touch with `TWF_WANTPALM`, requesting immediate raw touch delivery even
+for contacts Windows might classify as palms, and sets
+`MicrosoftTabletPenServiceProperty` to `TABLET_ENABLE_MULTITOUCHDATA` so touch
+navigation can receive data while the stylus hovers. The exact
+`WM_TABLET_QUERYSYSTEMGESTURESTATUS` reply returns that same multitouch flag.
+It does not independently add the Windows flags that disable press-and-hold,
+tap feedback, barrel feedback or flicks. All other native messages continue
+through Qt.
 
 ## Rendering invariants and limitations
 

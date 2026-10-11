@@ -461,6 +461,109 @@ def test_detached_document_device_result_matches_scene_and_presents_without_tran
         surface.destroy()
 
 
+@pytest.mark.parametrize('point_stack',[False,True])
+def test_raster_blur_keeps_exact_regional_fallback_and_native_presentation(qapp,monkeypatch,point_stack):
+    from comic_editor.core.images import ImageStore
+    from comic_editor.core.models import BoundGeometry,ChapterDocument,ChildRef,RasterObject
+    from comic_editor.core.settings import EditorSettings
+    from comic_editor.core.tiles import TileStore
+    from comic_editor.render.scene import SceneSnapshotCompiler,DetachedSceneBackend
+    from comic_editor.render.service import DocumentRenderService,RenderRequest
+    from comic_editor.ui.canvas import CanvasWidget
+    from comic_editor.ui.document_presentation import GpuTilePresenter,PresentedTile
+    from PySide6.QtGui import QImage,QOffscreenSurface,QSurfaceFormat
+    from test_document_presentation import framebuffer,pixels
+
+    fmt = QSurfaceFormat()
+    fmt.setVersion(4,3)
+    fmt.setProfile(QSurfaceFormat.CoreProfile)
+    context = QOpenGLContext()
+    context.setFormat(fmt)
+    if not context.create():
+        pytest.skip('No native shared OpenGL context')
+    surface = QOffscreenSurface()
+    surface.setFormat(context.format())
+    surface.create()
+    assert context.makeCurrent(surface)
+    graphics = GpuWorker(share_context=context)
+    monkeypatch.setattr('comic_editor.ui.canvas.create_network_manager',lambda _:None)
+    owner = CanvasWidget(EditorSettings(canvas_renderer='auto'))
+    presenter,target = GpuTilePresenter(),None
+    try:
+        wait_until(qapp,graphics.ready.is_set)
+        if not graphics.available:
+            pytest.skip(graphics.reason)
+        chapter = ChapterDocument(width=128,height=128,document_kind='asset')
+        page = chapter.add_page('Page',BoundGeometry.rectangle(0,0,128,128))
+        page.shape_style.outline_thickness = 0
+        source = source_image(128,128)
+        tiles,images = TileStore(tile_size=128),ImageStore()
+        obj = RasterObject(parent_layer_id=page.layer_id,tile_size=128,interaction_rect=(0,0,128,128))
+        tiles.set_tile(obj.object_id,(0,0),source)
+        chapter.objects[obj.object_id] = obj
+        page.children.append(ChildRef('object',obj.object_id))
+        modifiers = [BlurModifier(strength=8.)]
+        if point_stack:
+            modifiers = [*effects(),*modifiers,*effects()]
+        for modifier in modifiers:
+            chapter.modifiers[modifier.modifier_id] = modifier
+            obj.modifier_ids.append(modifier.modifier_id)
+        owner.set_document(chapter,tiles,images)
+        owner._graphics_worker = graphics
+        original_pixels = pixels(tiles._tiles[obj.object_id][(0,0)]).copy()
+        original_model = chapter.to_dict()
+        capture = SceneSnapshotCompiler().capture(owner,owner._render_document_state())
+        while not capture.advance(.001):
+            pass
+        snapshot = capture.result
+        assert snapshot is not None
+        request = RenderRequest((8.,9.,44.,44.),1.,(44,44),('raster-blur-fallback',),snapshot.document.revision)
+        reference = owner._render_service.render_region(snapshot.document,request)
+        assert reference.exact and isinstance(reference.image,QImage)
+
+        def evaluate():
+            backend = DetachedSceneBackend(snapshot)
+            service = DocumentRenderService(backend)
+            service.projection.revision = snapshot.document.revision
+            try:
+                return service.render_region(snapshot.document,request)
+            finally:
+                backend.close()
+
+        with ThreadPoolExecutor(1) as pool:
+            job = pool.submit(evaluate)
+            wait_until(qapp,job.done)
+            result = job.result()
+        # Raster blur retains the regional source/effect sampling graph. An
+        # isolated point stack's DeviceImage final must not replace this edge.
+        assert result.exact and isinstance(result.image,QImage)
+        assert not isinstance(result.image,DeviceImage)
+        np.testing.assert_array_equal(pixels(result.image),pixels(reference.image))
+        assert graphics.stats.get('uploads',0) == 0 and graphics.stats.get('readbacks',0) == 0
+        context.makeCurrent(surface)
+        presenter._initialize()
+        target = framebuffer(presenter,44,44)
+        tile = PresentedTile(request.key,result.image,QRectF(0,0,44,44))
+        assert presenter.draw([tile],QTransform(),QSizeF(44,44),smooth=False)
+        np.testing.assert_array_equal(pixels(target.toImage()),pixels(reference.image))
+        assert presenter.uploads == 1 and graphics.stats.get('readbacks',0) == 0
+        np.testing.assert_array_equal(pixels(tiles._tiles[obj.object_id][(0,0)]),original_pixels)
+        assert chapter.to_dict() == original_model
+    finally:
+        if target is not None:
+            target.release()
+            del target
+        presenter.close()
+        graphics.close()
+        owner._scene_controller.reset()
+        owner._scene_controller.scheduler.close()
+        owner._effect_jobs.cancel()
+        owner._effect_jobs.executor.shutdown(wait=True,cancel_futures=True)
+        owner.deleteLater()
+        context.doneCurrent()
+        surface.destroy()
+
+
 @pytest.mark.parametrize('spatial',[False,True])
 def test_production_point_blur_point_cpu_consumer_materializes_once(qapp,monkeypatch,spatial):
     from comic_editor.core.models import BoundGeometry,ChapterDocument

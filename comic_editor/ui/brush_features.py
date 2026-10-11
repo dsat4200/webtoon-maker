@@ -165,6 +165,7 @@ class BrushFeatures:
         self._paint_brush_frame = None
         self._paint_brush_chapter_height = None
         self._paint_brush_sample = None
+        self._paint_brush_positive_pressure = 0.
         self._paint_brush_input_axes = (0.0, 0.0, 0.0)
         self._paint_brush_input_tablet = False
         self._paint_brush_packet_time = None
@@ -271,6 +272,7 @@ class BrushFeatures:
                 interruption=Interruption.COMMIT)
             sample = _sample or self._paint_brush_input(point, pressure)
             self._paint_brush_sample = sample
+            self._paint_brush_positive_pressure = sample.pressure
             self._paint_brush_input_bounds = QRectF(sample.x, sample.y, 0., 0.)
             from comic_editor.ui.tile_input import TileInputGate
             chapter = self.chapter
@@ -300,6 +302,8 @@ class BrushFeatures:
     def _continue_paint_brush(self, point: QPointF, pressure: float, *, _sample=None) -> None:
         deferred = getattr(self, '_paint_brush_deferred', None)
         if deferred:
+            if deferred[-1]['released']:
+                return
             deferred[-1]['samples'].append(self._paint_brush_deferred_packet(point, pressure))
             self._raster_contact_point = QPointF(point)
             return
@@ -308,6 +312,8 @@ class BrushFeatures:
         try:
             sample = _sample or self._paint_brush_input(point, pressure)
             self._paint_brush_sample = sample
+            if sample.pressure > 0.:
+                self._paint_brush_positive_pressure = sample.pressure
             self._raster_contact_point = QPointF(point)
             self._submit_paint_brush_sample(sample)
         except Exception:
@@ -326,9 +332,30 @@ class BrushFeatures:
             self._cancel_paint_brush()
             self.operationError.emit("Brush stroke", str(error))
 
+    def _finish_paint_brush_pointer_packet(self, point: QPointF, pressure=None) -> None:
+        """Seal the received Brush contact, independently of older painting."""
+        deferred = getattr(self, '_paint_brush_deferred', None)
+        if deferred:
+            contact = deferred[-1]
+            if contact['released']:
+                return
+            if pressure is None:
+                pressure = next((sample.pressure for _point, sample in reversed(contact['samples'])
+                    if sample.pressure > 0.), contact['samples'][0][1].pressure)
+            self._continue_paint_brush(point, pressure)
+            contact['released'] = True
+            return
+        gate = getattr(self, '_paint_brush_tile_input', None)
+        if (self._paint_brush_stroke is None or self._paint_brush_sample is None
+                or gate is not None and (gate.closed or gate.released)):
+            return
+        self._continue_paint_brush(point,
+            self._paint_brush_positive_pressure if pressure is None else pressure)
+
     def _interrupt_paint_brush(self) -> None:
         """Commit contact when focus or pointer capture is lost."""
-        if getattr(self, "_paint_brush_stroke", None) is None:
+        if (getattr(self, "_paint_brush_stroke", None) is None
+                and not getattr(self, '_paint_brush_deferred', None)):
             return
         try:
             self._finish_paint_brush()
@@ -422,6 +449,7 @@ class BrushFeatures:
         obj = getattr(self, "_paint_brush_object", None)
         if obj is None:
             return
+        self._pen_contact_active = self._tablet_tool_active = False
         dirty = QRectF(self._stroke_dirty_world)
         keys = tuple(self._stroke_before)
         for key, image in self._stroke_before.items():
@@ -463,6 +491,8 @@ class BrushFeatures:
                  else self._paint_brush_session.update(sample))
         if not dirty.isEmpty():
             self._emit_raster_dirty(self._paint_brush_object, dirty)
+        if begin:
+            self._queue_painting_contact_adoption()
 
     def _submit_paint_brush_sample(self, sample):
         gate = self._paint_brush_tile_input
@@ -544,6 +574,7 @@ class BrushFeatures:
         sample = QPointF(point), self._paint_brush_input(point, pressure, obj=obj)
         deferred.append({'samples': [sample],
             'released': False, 'object': self.selected_object_id,
+            'source': obj,
             'definition': definition, 'chapter': self.chapter, 'tiles': self.tiles,
             'selection': QPainterPath(self._drawing_selection_path),
             'primary': self.primary_color, 'secondary': self.secondary_color,

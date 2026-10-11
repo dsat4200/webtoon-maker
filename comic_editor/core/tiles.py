@@ -184,13 +184,15 @@ class TileStore:
         return image
 
     def set_tile(self, object_id: str, key: tuple[int, int], image: QImage | None,
-                 *, _known_alpha_bounds=_UNKNOWN_ALPHA_BOUNDS) -> None:
+                 *, _known_alpha_bounds=_UNKNOWN_ALPHA_BOUNDS,
+                 _preserve_empty: bool = False) -> None:
         object_tiles = self._object_tiles(object_id)
         bounds = _known_alpha_bounds if _known_alpha_bounds is not _UNKNOWN_ALPHA_BOUNDS else (
             None if image is None or image.isNull()
             else self._alpha_bbox(image)
         )
-        if bounds is None:
+        preserve_empty = _preserve_empty and image is not None and not image.isNull()
+        if bounds is None and not preserve_empty:
             if key in object_tiles:
                 del object_tiles[key]
             self._alpha_bounds.setdefault(object_id, {}).pop(key, None)

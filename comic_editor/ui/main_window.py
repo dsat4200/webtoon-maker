@@ -59,7 +59,7 @@ from comic_editor.ui.color_picker import (
 from comic_editor.ui.selection_settings import (
     SelectionCommonControls, SelectionSettingsPanel,
 )
-from comic_editor.ui.icons import iconoir
+from comic_editor.ui.icons import TOOLBAR_ICON_NAMES, iconoir
 from comic_editor.ui.hotkeys_dialog import HotkeysDialog
 from comic_editor.ui.clipboard_history import (
     ClipboardImageHistory, ClipboardHistoryPopup, ExternalClipboardReader, capture_object,
@@ -112,7 +112,7 @@ class ResponsiveToolButton(QToolButton):
         super().__init__(parent)
         self.command_label = label
         self.setText(label)
-        self.setIcon(iconoir(icon_name))
+        self.setIcon(iconoir(TOOLBAR_ICON_NAMES.get(label, icon_name)))
         self.setIconSize(QSize(20, 20))
         self.setToolTip(label)
         self.setMinimumWidth(36)
@@ -301,6 +301,10 @@ class MainWindow(QMainWindow):
         self.resize(1500, 950)
         self.setWindowTitle("Webtoon Maker")
         self.settings = load_settings()
+        from comic_editor.core.ui_themes import load_theme_library
+        self.theme_library = load_theme_library()
+        from PySide6.QtGui import QIcon
+        self.setWindowIcon(QIcon(str(Path(__file__).with_name("assets") / "webtoon-maker.ico")))
         self.settings.active_pencil_size = self.settings.pencil_default_size
         self.settings.active_eraser_size = self.settings.eraser_default_size
         self.repository: SeriesRepository | None = None
@@ -345,9 +349,16 @@ class MainWindow(QMainWindow):
         self.disk_cache = DiskCacheController(self)
         self._refresh_actions()
         self.statusBar().showMessage("Create or open a series")
+        from comic_editor.ui.window_chrome import install_window_chrome
+        self.window_chrome = install_window_chrome(self, self.file_toolbar)
 
     def nativeEvent(self, event_type, message):  # noqa: N802
         """Opt this window into finger input while a pen is hovering."""
+        chrome = getattr(self, "window_chrome", None)
+        if chrome is not None:
+            handled, result = chrome.native_event(event_type, message)
+            if handled:
+                return handled, result
         settings = getattr(self, "settings", None)
         result = tablet_multitouch_native_result(
             event_type, message,
@@ -384,12 +395,8 @@ class MainWindow(QMainWindow):
         self.file_notification.show_result(operation, destination)
 
     def _build_ui(self) -> None:
-        style = Path(__file__).with_name("style.qss")
-        if style.is_file():
-            application = QApplication.instance()
-            stylesheet = style.read_text(encoding="utf-8")
-            if application.styleSheet() != stylesheet:
-                application.setStyleSheet(stylesheet)
+        from comic_editor.ui.themes import apply_ui_theme
+        apply_ui_theme(self.theme_library.get(self.theme_library.active_id))
 
         self.file_menu = QMenu("File", self)
         self.new_series_action = self.file_menu.addAction("New Series")
@@ -948,10 +955,6 @@ class MainWindow(QMainWindow):
         self.remove_mask_button = QPushButton("Remove Mask", self.canvas)
         self.remove_mask_button.setObjectName("removeMaskButton")
         self.remove_mask_button.setToolTip("Remove the current mask binding")
-        self.remove_mask_button.setStyleSheet(
-            "#removeMaskButton { background: #8b1e1e; color: white; border-radius: 4px; padding: 4px 8px; }"
-            "#removeMaskButton:hover { background: #a52a2a; }"
-        )
         self.remove_mask_button.hide()
         self.remove_mask_button.clicked.connect(self._remove_current_mask)
 
@@ -960,10 +963,6 @@ class MainWindow(QMainWindow):
         self._restore_workspace_layout()
         self.page_gap_confirmation = QFrame(self.canvas)
         self.page_gap_confirmation.setObjectName("pageGapConfirmation")
-        self.page_gap_confirmation.setStyleSheet(
-            "#pageGapConfirmation { background: rgba(28,28,32,242); "
-            "border: 1px solid #f2a23a; border-radius: 7px; }"
-        )
         gap_layout = QHBoxLayout(self.page_gap_confirmation)
         gap_layout.setContentsMargins(8, 6, 8, 6)
         self.confirm_page_gap_button = QPushButton("Confirm Page Gap")
@@ -5924,6 +5923,7 @@ class MainWindow(QMainWindow):
         if change.hierarchy_changed or self.hierarchy_model.chapter is not self.chapter:
             self._hierarchy_changed(force=True)
             return
+        raster_pixels = self.hierarchy_model.transient_raster_pixels_ref(change)
         self.hierarchy_model.apply_change(change)
         affected = self.canvas._change_index.affected(change)
         selected = set(self.canvas.selected_entities or
@@ -5933,7 +5933,10 @@ class MainWindow(QMainWindow):
         if selected_changes:
             if fields & {'*', 'visible', 'opacity', 'opacity_locked', 'opacity_mask', 'mask_only'}:
                 self.selection_common.refresh()
-            if change.entities:
+            if change.entities and not (raster_pixels is not None and selected == {raster_pixels}):
+                # The selected raster controls show properties, not pixels or
+                # its changing interaction frame. Keep dependency/mask notices
+                # and every mixed or actual property edit on the normal path.
                 self.selection_settings.refresh()
             if any(isinstance(self.chapter.objects.get(identifier), TextObject)
                    for kind, identifier in selected_changes if kind == 'object'):
@@ -6961,9 +6964,22 @@ class MainWindow(QMainWindow):
         self.canvas.refresh_grid_settings()
 
     def _edit_settings(self) -> None:
-        dialog = SettingsDialog(self.settings, self.chapter, self)
+        from comic_editor.core.ui_themes import save_theme_library
+        from comic_editor.ui.themes import apply_ui_theme
+        dialog = SettingsDialog(self.settings, self.chapter, self, theme_library=self.theme_library)
         if dialog.exec() != QDialog.DialogCode.Accepted:
+            apply_ui_theme(self.theme_library.get(self.theme_library.active_id))
             return
+
+        theme_library = dialog.theme_library()
+        try:
+            save_theme_library(theme_library)
+        except OSError as error:
+            apply_ui_theme(self.theme_library.get(self.theme_library.active_id))
+            QMessageBox.warning(self, "Could not save themes", str(error))
+            return
+        self.theme_library = theme_library
+        apply_ui_theme(self.theme_library.get(self.theme_library.active_id))
 
         from comic_editor.core.document_patch import RecordSnapshot
         before = (RecordSnapshot.capture(self.chapter, scalars=('grid', 'grid_override_enabled'))

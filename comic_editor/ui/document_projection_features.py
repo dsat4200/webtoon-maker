@@ -187,6 +187,8 @@ class DocumentProjectionFeatures:
                 and self._show_on_top_plan().entries):
             phases = ('base', 'top')
         projection.configure((*configuration, phases[0]), document=configuration[:3])
+        if document.revision != projection.revision:
+            document = self._render_document_state()
         self._scene_controller.request(document, requests, phases, visible)
         batch, complete = self._scene_controller.ready_batch(document, requests, phases)
         native_batch_complete = complete
@@ -240,16 +242,29 @@ class DocumentProjectionFeatures:
         stats = []
         feedback_tiles = 0
         self._raster_feedback_contact_covered = False
+        batch,filtered_tiles = self._scene_controller.filtered_batch(document,requests,batch,complete=complete)
+        plain_context = None
+        if not filtered_tiles:
+            from comic_editor.ui.raster_feedback import replace_raster_feedback_batch
+            batch,feedback_tiles,plain_context = replace_raster_feedback_batch(self, painter, document, requests, batch)
+        if filtered_tiles:
+            self._projection_provisional_visible = True
+            native_batch_complete = False
+        if feedback_tiles:
+            self._projection_provisional_visible = True
+            native_batch_complete = False
         draw_live = (live_ink and not self._projection_provisional_visible
             and tuple(phase for phase, _ in batch) == phases)
         with self._show_on_top_scene() if draw_live else nullcontext():
             for phase, tiles in batch:
                 stats.append(draw_document_tiles(painter, tiles, self.camera_transform(), self.size(),
                     owner=self, smooth=True,
-                    native_context=(document, phase) if (native_batch_complete and not live_ink
-                        and (not document.live_preview or self._text_decoration_only_preview())) else None,
+                    native_context=(plain_context if plain_context is not None else ("filtered-contact", configuration,
+                        self._scene_controller._filtered_state.completed_revision, phase)
+                        if filtered_tiles else (document, phase) if (native_batch_complete and not live_ink
+                            and (not document.live_preview or self._text_decoration_only_preview())) else None),
                     native_bounds=document.bounds))
-                if phase is None:
+                if phase is None and not feedback_tiles:
                     feedback_tiles = self._scene_controller.present_feedback(painter, document)
                 if draw_live:
                     self._show_on_top_phase = phase
@@ -269,7 +284,7 @@ class DocumentProjectionFeatures:
         self._document_presentation_stats = PresentationStats(
             stats[-1].backend if stats else "pending", sum(item.tiles for item in stats),
             sum(item.uploads for item in stats), stats[-1].texture_bytes if stats else 0)
-        if feedback_tiles:
+        if feedback_tiles or filtered_tiles:
             self._projection_provisional_visible = True
         if complete:
             self._scene_controller.release_handoff.clear("current exact presentation")

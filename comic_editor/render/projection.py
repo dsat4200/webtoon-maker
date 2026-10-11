@@ -20,6 +20,17 @@ from PySide6.QtGui import QImage
 RESOLUTION_SCALES = (1.,)
 
 
+def _positive_finite_edges(coordinates):
+    """Prove ordinary positive QRectF edges, using Qt's stored x + width order."""
+    left, top, width, height = coordinates
+    right, bottom = left + width, top + height
+    if (width > 0. and height > 0. and right > left and bottom > top
+            and all(math.isfinite(value) for value in
+                    (left, top, width, height, right, bottom))):
+        return left, top, right, bottom
+    return None
+
+
 @dataclass(frozen=True)
 class ProjectionAddress:
     level: int
@@ -52,6 +63,17 @@ class ProjectionRequest:
         # Qt value; mutating a returned rectangle cannot alter another request.
         margin = self.gutter / self.scale
         return self.world_rect.adjusted(-margin, -margin, margin, margin).getRect()
+
+    @cached_property
+    def _capture_intersection_edges(self):
+        # Existing frozen requests own this bounded scalar metadata. The Qt
+        # fallback remains authoritative for custom metadata and unusual sizes.
+        address = self.address
+        if (type(address) is not ProjectionAddress
+                or any(type(value) is not int for value in
+                       (address.level, address.x, address.y, self.tile_size, self.gutter))):
+            return None
+        return _positive_finite_edges(self._capture_coordinates)
 
     @property
     def source_rect(self) -> QRectF:
@@ -123,9 +145,34 @@ class DocumentProjection:
     def invalidate(self, world: QRectF | None = None) -> None:
         """Keep old exact pixels available while their replacement is evaluated."""
         self.revision += 1
+        world_edges = (_positive_finite_edges(world.getRect())
+                       if type(world) is QRectF else None)
         for tiles in self._configurations.values():
             for tile in tiles.values():
-                if tile.valid and (world is None or tile.request.capture_rect.intersects(world)):
+                if type(tile) is not ProjectionTile:
+                    # An opaque getter may mutate the borrowed world rectangle.
+                    world_edges = None
+                if not tile.valid:
+                    continue
+                if world is None:
+                    tile.valid = False
+                    continue
+                request = tile.request
+                capture_edges = (request._capture_intersection_edges
+                                 if world_edges is not None and type(request) is ProjectionRequest
+                                 else None)
+                if capture_edges is not None:
+                    left, top, right, bottom = capture_edges
+                    world_left, world_top, world_right, world_bottom = world_edges
+                    intersects = (left < world_right and world_left < right
+                                  and top < world_bottom and world_top < bottom)
+                else:
+                    # Preserve Qt's normalization, invalid-number behavior and
+                    # original exceptions. Do not reuse pre-call world edges
+                    # after a foreign capture_rect getter has run.
+                    world_edges = None
+                    intersects = request.capture_rect.intersects(world)
+                if intersects:
                     tile.valid = False
 
     def requests(self, world: QRectF, pixels_per_unit: float) -> list[ProjectionRequest]:

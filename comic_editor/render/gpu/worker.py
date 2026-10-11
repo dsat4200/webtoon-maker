@@ -288,6 +288,8 @@ class GpuWorker(QObject):
         fmt.setVersion(4, 3)
         fmt.setProfile(QSurfaceFormat.CoreProfile)
         self.surface = QOffscreenSurface()
+        if share_context is not None:
+            self.surface.setScreen(share_context.screen())
         self.surface.setFormat(fmt)
         self.surface.create()
         if not self.surface.isValid():
@@ -304,6 +306,7 @@ class GpuWorker(QObject):
             # is populated. All resource creation/use/destruction remains on
             # the graphics owner after this affinity transfer.
             context = QOpenGLContext()
+            context.setScreen(self.surface.screen())
             context.setFormat(fmt)
             context.setShareContext(share_context)
             if not context.create():

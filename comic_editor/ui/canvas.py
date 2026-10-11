@@ -33,7 +33,7 @@ from PySide6.QtGui import (
     QLinearGradient,
     QMouseEvent, QOffscreenSurface, QOpenGLContext, QPainter, QPainterPath,
     QPainterPathStroker, QPalette,
-    QPen, QPolygonF, QRadialGradient, QSurfaceFormat, QTextBlockFormat, QTextCharFormat,
+    QPen, QPolygonF, QRadialGradient, QRegion, QSurfaceFormat, QTextBlockFormat, QTextCharFormat,
     QTextCursor, QTextDocument, QTransform, QValidator,
 )
 from PySide6.QtOpenGLWidgets import QOpenGLWidget
@@ -122,6 +122,7 @@ from comic_editor.ui.network import create_network_manager
 from comic_editor.ui.multi_raster_selection import MultiRasterSelectionFeatures
 from comic_editor.ui.brush_features import BrushFeatures
 from comic_editor.ui.lasso_brush_features import LassoBrushFeatures
+from comic_editor.ui.themes import theme_color
 
 
 
@@ -701,11 +702,16 @@ class _CanvasLogic(SceneKernels, LassoBrushFeatures, BrushFeatures, DocumentProj
         self._wheel_zoom_timer.setInterval(WHEEL_ZOOM_SETTLE_MS)
         self._wheel_zoom_timer.timeout.connect(self._settle_wheel_zoom)
         self._drawing = False
+        self._mask_tile_input = None
+        self._raster_deferred_strokes = None
+        self._mask_deferred_strokes = None
         self._eyedropper_sampling = False
         self._eyedropper_last_color = ""
         self._eyedropper_widget_point: QPointF | None = None
         self._last_draw_point = QPointF()
         self._last_pressure = 1.0
+        self._native_pointer_position: QPointF | None = None
+        self._native_pointer_pressure = 1.0
         self._stroke_before: dict[tuple[int, int], QImage | None] = {}
         self._stroke_frame_before: tuple[float, float, float, float] | None = None
         self._stroke_erasing = False
@@ -1040,6 +1046,7 @@ class _CanvasLogic(SceneKernels, LassoBrushFeatures, BrushFeatures, DocumentProj
         self._effect_viewport_world = None
         self._projection_tile_key = None
         self._projection_defer_effects = False
+        self._gpu_contact_pacing_token = self._gpu_contact_pacing_context = None
         self._render_service = DocumentRenderService(CanvasSceneBackend(self))
         from comic_editor.core.changes import DependencyIndex
         from comic_editor.render.scene import SceneSnapshotCompiler
@@ -1055,7 +1062,11 @@ class _CanvasLogic(SceneKernels, LassoBrushFeatures, BrushFeatures, DocumentProj
         self._scene_dirty_widget = QRect()
         self._preserve_scene_cache_once = False
         self._visual_pending_world = QRectF()
-        self._visual_pending_widget = QRect()
+        self._visual_pending_widget = QRegion()
+        self._painting_overlay_damage = QRegion()
+        self._painting_selection_cache = None
+        self._last_painting_frame_start = None
+        self._document_presentation_paint_region = None
         self._visual_frame_timer = QTimer(self)
         self._visual_frame_timer.setSingleShot(True)
         self._visual_frame_timer.timeout.connect(self._flush_visual_dirty)
@@ -1145,6 +1156,7 @@ class _CanvasLogic(SceneKernels, LassoBrushFeatures, BrushFeatures, DocumentProj
         self._restore_gc_after_stroke()
 
     def _invalidate_scene_cache(self, *args, projection=True) -> None:
+        self._retire_gpu_contact_pacing()
         self._scene_dirty_full = True
         self._scene_dirty_widget = QRect()
         self._scene_cache_key = None
@@ -1243,12 +1255,186 @@ class _CanvasLogic(SceneKernels, LassoBrushFeatures, BrushFeatures, DocumentProj
                 QRectF(world) if self._visual_pending_world.isEmpty()
                 else self._visual_pending_world.united(world)
             )
-        self._visual_pending_widget = (
-            QRect(widget) if self._visual_pending_widget.isEmpty()
-            else self._visual_pending_widget.united(widget)
-        )
+        self._queue_widget_dirty(widget)
+
+    def _gpu_contact_pacing_key(self, obj):
+        # Scalar checks only: no document capture, mask traversal or source read.
+        if (not self._drawing or not self._raster_contact_active or self._nav_mode is not None
+                or abs(self.rotation) >= 1e-9 or self.selected_kind != 'object'
+                or self.selected_id != self.selected_object_id or len(self.selected_entities) > 1
+                or self.tool not in {ToolKind.RASTER_PENCIL, ToolKind.RASTER_ERASER, ToolKind.BRUSH}
+                or self._projection_has_live_preview(include_ink=False) or self._solo_entities
+                or obj.mask_only or any(bool(getattr(self, name, None)) for name in (
+                    'active_tone_mask_id', 'preview_tone_mask_id', '_mask_tile_input',
+                    '_mask_gradient_drag', '_mask_selection_gesture', '_native_deferred_activations',
+                    '_raster_deferred_strokes', '_mask_deferred_strokes', '_paint_brush_deferred'))):
+            return None
+        return (self.tool, self.selected_id, self.center_x, self.center_y, self.scale,
+                self.rotation, self.width(), self.height(), self.devicePixelRatioF(),
+                self.chapter.width, self.chapter.height, self.chapter.background,
+                self.chapter.view_overflow, obj.interaction_rect, obj.underlay_opacity,
+                self.settings.predictive_ink)
+
+    def _gpu_contact_pacing_current(self):
+        token = getattr(self, '_gpu_contact_pacing_token', None)
+        if not isinstance(self, QOpenGLWidget) or token is None:
+            return False
+        owners, key = token
+        gate, chapter, tiles, images, obj, native, prepared, contract, context = owners
+        controller = self._scene_controller
+        selected_gate = getattr(self, '_paint_brush_tile_input' if self.tool == ToolKind.BRUSH
+                                else '_raster_tile_input', None)
+        return (self.chapter is chapter and self.tiles is tiles and self.images is images
+            and chapter.objects.get(self.selected_id) is obj
+            and tiles._tiles.get(self.selected_id) is native and chapter.pixel_contract is contract
+            and self._gpu_contact_pacing_context is context and context is not None
+            and selected_gate is gate and gate.canvas is self and gate.chapter is chapter
+            and gate.tiles is tiles and gate.identifier == self.selected_id
+            and not gate.closed and not gate.released and gate.error is None and not gate.busy
+            and gate.current() and controller.feedback is prepared
+            and controller._contact_reuse_gate is gate and controller._filtered_state is None
+            and not getattr(self, '_raster_feedback_pending_visible', False)
+            and key == self._gpu_contact_pacing_key(obj))
+
+    def _retire_gpu_contact_pacing(self):
+        if not isinstance(self, QOpenGLWidget):
+            return
+        self._gpu_contact_pacing_token = None
+        # Keep legitimate damage; a changed owner/view must not inherit a delay.
+        pending = getattr(self, '_visual_pending_widget', None)
+        timer = getattr(self, '_visual_frame_timer', None)
+        if pending is not None and not pending.isEmpty() and timer is not None and timer.isActive():
+            timer.start(0)
+
+    def _gpu_contact_context_retired(self, context):
+        # No Qt/GL calls during context destruction. Old A cannot retire new B.
+        if self._gpu_contact_pacing_context is context:
+            self._gpu_contact_pacing_context = self._gpu_contact_pacing_token = None
+
+    def _native_painting_contact_pending(self, gate):
+        selected_gate = getattr(self, '_paint_brush_tile_input' if self.tool == ToolKind.BRUSH
+                                else '_raster_tile_input', None)
+        if (isinstance(self, QOpenGLWidget) and gate is selected_gate and gate.canvas is self
+                and gate.chapter is self.chapter and gate.tiles is self.tiles and gate.current()):
+            # The cursor queued before submit; promote its warm timer on actual
+            # cold admission, not merely on the next successfully admitted dab.
+            self._retire_gpu_contact_pacing()
+            self._queue_widget_dirty(self.rect())
+
+    def _adopt_gpu_contact_pacing(self):
+        controller = self._scene_controller
+        signature = controller.desired
+        if (signature is None or self._gpu_contact_pacing_context is not self.context()
+                or not getattr(self, '_raster_feedback_contact_covered', False)
+                or getattr(self, '_raster_feedback_pending_visible', False)
+                or controller._filtered_state is not None):
+            return
+        document, _requests, _phases, visible = signature
+        gate = controller._owned_native_contact_gate(document)
+        obj = self.chapter.objects.get(self.selected_id)
+        if (gate is None or gate.busy or controller._contact_reuse_gate is not gate or obj is None
+                or not controller._feedback_covers(document, visible)):
+            return  # Edited-pixel-only coverage cannot establish this full-frame token.
+        native = self.tiles._tiles.get(self.selected_id)
+        key = self._gpu_contact_pacing_key(obj)
+        if native is not None and key is not None:
+            self._gpu_contact_pacing_token = ((gate, self.chapter, self.tiles, self.images, obj,
+                native, controller.feedback, self.chapter.pixel_contract, self.context()), key)
+
+    def _queue_widget_dirty(self, widget, *, stable_rows: bool = False) -> None:
+        """Coalesce presentation damage without joining distant overlays."""
+        gpu_paced = self._gpu_contact_pacing_current()
+        if isinstance(self, QOpenGLWidget) and not gpu_paced:
+            self._retire_gpu_contact_pacing()
+        # QRegion.contains(QRect) means overlap, not full coverage.
+        if (gpu_paced and self._visual_frame_timer.isActive()
+                and self._visual_pending_widget.rectCount() == 1
+                and self._visual_pending_widget.boundingRect() == self.rect()):
+            return
+        region = QRegion(self.rect() if gpu_paced else widget).intersected(QRegion(self.rect()))
+        if region.isEmpty():
+            return
+        if stable_rows and not isinstance(self, QOpenGLWidget):
+            rows = QRegion()
+            for rect in region:
+                rows = rows.united(QRegion(QRect(0, rect.y(), self.width(), rect.height())))
+            region = rows
+        self._visual_pending_widget = self._visual_pending_widget.united(region)
         if not self._visual_frame_timer.isActive():
-            self._visual_frame_timer.start(0)
+            delay = 0
+            last_frame = self._last_painting_frame_start
+            if (last_frame is not None and (gpu_paced or not isinstance(self, QOpenGLWidget))
+                    and self._drawing and self._raster_contact_active and self._nav_mode is None):
+                # Native samples run at their received rate. Coalesce only
+                # display work so a fast pen cannot consume the event loop with
+                # a complete presentation for every source packet.
+                delay = (max(0, math.ceil(0. - (time.perf_counter() - last_frame) * 1000))
+                         if gpu_paced else max(0, math.ceil((last_frame + .006 - time.perf_counter()) * 1000)))
+            self._visual_frame_timer.start(delay)
+
+    def _queue_painting_contact_adoption(self) -> None:
+        """Refresh untouched backing pixels when the first native dab is admitted."""
+        self._retire_gpu_contact_pacing()
+        if isinstance(self, QOpenGLWidget):
+            self._queue_widget_dirty(self.rect())
+        else:
+            # Idle and live composition may use different presentation paths.
+            # Adopt the live view once before restricting later packets to rows.
+            # This belongs to admission: a deferred contact's received press may
+            # have been repainted while its predecessor still owned the source.
+            self._queue_widget_dirty(self.rect())
+
+    def _painting_overlay_region(self) -> QRegion:
+        """Current custom cursor, forecast and pending-contact presentation."""
+        region = QRegion()
+        if (self.chapter is None or self._nav_mode is not None or self.tool not in {
+                ToolKind.RASTER_PENCIL, ToolKind.RASTER_ERASER, ToolKind.BRUSH}):
+            return region
+        center = (self._tablet_hover_widget if self._paint_brush_input_tablet
+                  else self._pointer_hover_widget)
+        if center is None:
+            center = self._pointer_hover_widget or self._tablet_hover_widget
+        size = (self.settings.active_eraser_pixels() if self.tool == ToolKind.RASTER_ERASER
+                else self.settings.brush_size_px if self.tool == ToolKind.BRUSH
+                else self.settings.pencil_size())
+        radius = max(6., size * abs(self.scale) / 2.)
+        if center is not None:
+            bounds = QRectF(center.x() - radius, center.y() - radius, radius * 2, radius * 2)
+            if self.tool == ToolKind.BRUSH:
+                bounds = bounds.united(self._paint_brush_cursor_path(center).boundingRect())
+            region = region.united(QRegion(bounds.adjusted(-4, -4, 4, 4).toAlignedRect()))
+        predictive = self._predictive if self.settings.predictive_ink else None
+        if predictive is not None:
+            radius = abs(predictive[2]) / 2. + 2.
+            bounds = QRectF(predictive[0], predictive[1]).normalized().adjusted(
+                -radius, -radius, radius, radius)
+            region = region.united(QRegion(self._world_dirty_to_widget(bounds)))
+        contact = getattr(self, '_raster_contact_point', None)
+        if contact is not None and self._raster_contact_active:
+            point = self.camera_transform().map(contact)
+            radius = max(4., min(72., size * abs(self.scale) / 2.)) + 4.
+            region = region.united(QRegion(QRectF(point.x() - radius, point.y() - radius,
+                radius * 2, radius * 2).toAlignedRect()))
+        return region.intersected(QRegion(self.rect()))
+
+    def _queue_painting_overlay_damage(self) -> None:
+        if self._gpu_contact_pacing_current():
+            self._queue_widget_dirty(self.rect())
+            return
+        region = self._painting_overlay_region()
+        self._queue_widget_dirty(self._painting_overlay_damage.united(region),
+            stable_rows=self._drawing and self._raster_contact_active and abs(self.rotation) < 1e-9)
+        self._painting_overlay_damage = region
+        gate = getattr(self, '_paint_brush_tile_input' if self.tool == ToolKind.BRUSH
+                       else '_raster_tile_input', None)
+        if (getattr(self, '_raster_feedback_pending_visible', False)
+                or (self._raster_contact_active and (getattr(gate, 'busy', False)
+                    or abs(self.rotation) >= 1e-9))):
+            # A rare source-readiness transition changes the bottom annotation.
+            # Repaint the full guides then: clipping a dashed guide at that
+            # annotation can change Qt's dash phase. Ready source packets remain
+            # bounded and never acquire a distant bottom-label damage region.
+            self.update()
 
 
 
@@ -1417,9 +1603,9 @@ class _CanvasLogic(SceneKernels, LassoBrushFeatures, BrushFeatures, DocumentProj
 
     def _flush_visual_dirty(self) -> None:
         world = QRectF(self._visual_pending_world)
-        widget = QRect(self._visual_pending_widget)
+        widget = QRegion(self._visual_pending_widget)
         self._visual_pending_world = QRectF()
-        self._visual_pending_widget = QRect()
+        self._visual_pending_widget = QRegion()
         if not world.isEmpty():
             self.visualChanged.emit(world)
         if not widget.isEmpty():
@@ -1482,7 +1668,7 @@ class _CanvasLogic(SceneKernels, LassoBrushFeatures, BrushFeatures, DocumentProj
             painter = QPainter(self._scene_cache if target is None else target)
             try:
                 painter.setClipRect(dirty)
-                painter.fillRect(dirty, QColor("#242428"))
+                painter.fillRect(dirty, theme_color("canvas", "#242428"))
                 self._paint_document_projection(painter)
             finally:
                 painter.end()
@@ -1492,7 +1678,7 @@ class _CanvasLogic(SceneKernels, LassoBrushFeatures, BrushFeatures, DocumentProj
         try:
             painter.setRenderHint(QPainter.Antialiasing, True)
             painter.setClipRect(dirty)
-            painter.fillRect(dirty, QColor("#242428"))
+            painter.fillRect(dirty, theme_color("canvas", "#242428"))
             inverse, valid = self.camera_transform().inverted()
             visible = inverse.mapRect(QRectF(dirty)) if valid else self.visible_document_rect()
             previous = getattr(self, "_capture_live_ink", False)
@@ -1504,7 +1690,7 @@ class _CanvasLogic(SceneKernels, LassoBrushFeatures, BrushFeatures, DocumentProj
             painter.setTransform(self.camera_transform())
             self._draw_grid(painter, visible)
             painter.resetTransform()
-            painter.setPen(QPen(QColor("#44444d"), 1))
+            painter.setPen(QPen(theme_color("border", "#44444d"), 1))
             painter.drawPolygon(self.camera_transform().map(QPolygonF(QRectF(0, 0, self.chapter.width, self.chapter.height))))
         finally:
             painter.end()
@@ -1613,6 +1799,13 @@ class _CanvasLogic(SceneKernels, LassoBrushFeatures, BrushFeatures, DocumentProj
         self._gradient_creation_type = ""
         self._gradient_creation_family = "color_fill"
         self._gradient_creation_before = None
+        if isinstance(self, QOpenGLWidget):
+            # Cancellation above may queue A damage. It cannot notify B.
+            self._gpu_contact_pacing_token = None
+            self._visual_frame_timer.stop()
+            self._visual_pending_world = QRectF()
+            self._visual_pending_widget = self._painting_overlay_damage = QRegion()
+            self._last_painting_frame_start = None
         self.unsetCursor()
 
     def set_document(
@@ -1990,6 +2183,10 @@ class _CanvasLogic(SceneKernels, LassoBrushFeatures, BrushFeatures, DocumentProj
         """Publish once after mutation; semantic cache keys remain authoritative."""
         if self.chapter is None or change.empty:
             return
+        local_repaint = self._live_raster_repaint(change, action)
+        if not local_repaint:
+            self._retire_gpu_contact_pacing()
+            self._painting_selection_cache = None
         self._bind_change_index()
         self._scene_snapshot_compiler.invalidate(change)
         self._scene_controller.changed(change, action=action)
@@ -2017,8 +2214,9 @@ class _CanvasLogic(SceneKernels, LassoBrushFeatures, BrushFeatures, DocumentProj
                         dirty = rect if dirty.isEmpty() else dirty.united(rect)
             if change.resources and not change.entities:
                 known = False
+            widget = QRect()
             if known and not dirty.isEmpty():
-                self._mark_scene_dirty_world(dirty)
+                widget = self._mark_scene_dirty_world(dirty)
             elif not known:
                 # Unknown influence is a full tile invalidation, not a
                 # request to discard unrelated model records or effect LRUs.
@@ -2026,8 +2224,42 @@ class _CanvasLogic(SceneKernels, LassoBrushFeatures, BrushFeatures, DocumentProj
                 self._scene_dirty_full = True
                 self._scene_dirty_widget = QRect()
                 self._scene_cache_key = None
-            self.update()
+            if known and local_repaint:
+                self._queue_widget_dirty(self.rect() if isinstance(self, QOpenGLWidget)
+                                         else widget, stable_rows=True)
+                self._queue_painting_overlay_damage()
+            else:
+                self.update()
         self.changesPublished.emit(change)
+
+    def _live_raster_repaint(self, change, action) -> bool:
+        """Only owned source packets with stable gizmo geometry use local damage."""
+        if (action != 'transient' or not change.transient
+                or not getattr(self, '_raster_repaint_frame_stable', False)
+                or (isinstance(self, QOpenGLWidget) and not self._gpu_contact_pacing_current())
+                or abs(self.rotation) >= 1e-9
+                or not self._drawing or not self._raster_contact_active
+                or self._nav_mode is not None or self.selected_kind != 'object'
+                or self.selected_id != self.selected_object_id
+                or len(self.selected_entities) > 1
+                or self.tool not in {ToolKind.RASTER_PENCIL, ToolKind.RASTER_ERASER, ToolKind.BRUSH}
+                or change.conservative or change.document_fields or change.orders
+                or self._projection_has_live_preview(include_ink=False)):
+            return False
+        selected = ('object', self.selected_id)
+        if (not change.entities or any(item.entity != selected or item.structural
+                or item.fields - {'pixels', 'interaction_rect'} for item in change.entities)
+                or any(item.entity != selected or item.resource != 'raster' for item in change.resources)):
+            return False
+        gate = getattr(self, '_paint_brush_tile_input' if self.tool == ToolKind.BRUSH
+                       else '_raster_tile_input', None)
+        current = getattr(gate, 'current', None)
+        return (gate is not None and getattr(gate, 'canvas', None) is self
+                and getattr(gate, 'chapter', None) is self.chapter
+                and getattr(gate, 'tiles', None) is self.tiles
+                and getattr(gate, 'identifier', None) == self.selected_id
+                and not getattr(gate, 'closed', True) and not getattr(gate, 'released', True)
+                and getattr(gate, 'error', None) is None and callable(current) and current())
 
     def _emit_typed_document_changed(self, world_rect, change) -> None:
         """Keep old UI observers while deferring their broad scene invalidation."""
@@ -3262,23 +3494,36 @@ class _CanvasLogic(SceneKernels, LassoBrushFeatures, BrushFeatures, DocumentProj
 
 
     def paintEvent(self, event) -> None:  # noqa: N802
+        self._last_painting_frame_start = (
+            time.perf_counter() if self._drawing and self._raster_contact_active else None)
         frame_started = time.perf_counter_ns() if self._performance.enabled else None
         self._update_text_gizmo_overlay()
         painter = QPainter(self)
+        previous_region = self._document_presentation_paint_region
         try:
+            owned_contact = (event is not None and not isinstance(self, QOpenGLWidget)
+                and self._drawing and self._raster_contact_active and self._nav_mode is None
+                and abs(self.rotation) < 1e-9
+                and self.tool in {ToolKind.RASTER_PENCIL, ToolKind.RASTER_ERASER, ToolKind.BRUSH})
+            # This is the widget's actual presentation damage, not an artwork
+            # request or cache key. Detached/GPU frames have no such ownership.
+            self._document_presentation_paint_region = QRegion(event.region()) if owned_contact else None
             self._paint_canvas_frame(painter, frame_started)
         finally:
             # Deferred effect exceptions can keep Python frames (and this
             # painter) alive until a later collection. End the native engine
             # before Qt reuses it for another frame; a delayed destructor must
             # never end the engine underneath the next canvas painter.
-            painter.end()
+            try:
+                painter.end()
+            finally:
+                self._document_presentation_paint_region = previous_region
 
     def _paint_canvas_frame(self, painter, frame_started) -> None:
-        painter.fillRect(self.rect(), QColor("#242428"))
+        painter.fillRect(self.rect(), theme_color("canvas", "#242428"))
         painter.setRenderHint(QPainter.Antialiasing, True)
         if self.chapter is None:
-            painter.setPen(QColor("#8e8e96"))
+            painter.setPen(theme_color("muted_text", "#8e8e96"))
             painter.drawText(self.rect(), Qt.AlignCenter, "Create or open a series to begin")
             if frame_started is not None:
                 self._performance.frame_ms.append(
@@ -3401,7 +3646,7 @@ class _CanvasLogic(SceneKernels, LassoBrushFeatures, BrushFeatures, DocumentProj
         if mask_gradient is not None and self.tool == ToolKind.GRADIENT:
             self._draw_gradient_edit_handles(painter, mask_gradient)
         if not (self.active_tone_mask_id or self.preview_tone_mask_id):
-            self._draw_selection(painter)
+            self._draw_painting_selection(painter)
             self._draw_focal_modifier_handles(painter)
             self._draw_creation_preview(painter)
             self._draw_asset_drag_preview(painter)
@@ -3473,6 +3718,7 @@ class _CanvasLogic(SceneKernels, LassoBrushFeatures, BrushFeatures, DocumentProj
         painter.restore()
 
     def set_tone_mask_mode(self, mask_id: str) -> None:
+        self._retire_gpu_contact_pacing()
         self._cancel_mask_selection()
         self._finish_mask_gradient()
         self._cancel_gradient_creation()
@@ -5802,12 +6048,12 @@ class _CanvasLogic(SceneKernels, LassoBrushFeatures, BrushFeatures, DocumentProj
         painter.restore()
 
     def _draw_tablet_hover(self, painter: QPainter) -> None:
-        center = self._tablet_hover_widget
-        if self.tool == ToolKind.BRUSH and center is None:
-            center = self._pointer_hover_widget
+        center = (self._tablet_hover_widget if self._paint_brush_input_tablet
+                  else self._pointer_hover_widget)
+        if center is None:
+            center = self._pointer_hover_widget or self._tablet_hover_widget
         if (
             center is None
-            or self._tablet_tool_active
             or self._nav_mode is not None
             or self.tool not in {
                 ToolKind.RASTER_PENCIL, ToolKind.RASTER_ERASER, ToolKind.BRUSH
@@ -5841,6 +6087,46 @@ class _CanvasLogic(SceneKernels, LassoBrushFeatures, BrushFeatures, DocumentProj
             QPointF(center.x(), center.y() + cross),
         )
         painter.restore()
+
+    def _draw_painting_selection(self, painter: QPainter) -> None:
+        """Replay stable editing primitives while native input owns the canvas."""
+        gate = getattr(self, '_paint_brush_tile_input' if self.tool == ToolKind.BRUSH
+                       else '_raster_tile_input', None)
+        current = getattr(gate, 'current', None)
+        if (painter.device() is not self or isinstance(self, QOpenGLWidget)
+                or self.chapter is None or not self._drawing or not self._raster_contact_active
+                or self.tool not in {ToolKind.RASTER_PENCIL, ToolKind.RASTER_ERASER, ToolKind.BRUSH}
+                or self._nav_mode is not None or self.selected_kind != 'object'
+                or self.selected_id != self.selected_object_id or len(self.selected_entities) > 1
+                or self._projection_has_live_preview(include_ink=False)
+                or self._active_cage() is not None or self._active_texture_modifier() is not None
+                or getattr(gate, 'canvas', None) is not self
+                or getattr(gate, 'chapter', None) is not self.chapter
+                or getattr(gate, 'tiles', None) is not self.tiles
+                or getattr(gate, 'identifier', None) != self.selected_id
+                or getattr(gate, 'closed', True) or getattr(gate, 'released', True)
+                or getattr(gate, 'error', None) is not None or not callable(current) or not current()):
+            self._painting_selection_cache = None
+            self._draw_selection(painter)
+            return
+        ratio = self.devicePixelRatioF()
+        key = (id(self.chapter), self.selected_id, self.active_layer_id, self.tool,
+            tuple(self._selected_world_quad() or ()), self.width(), self.height(), ratio,
+            self.center_x, self.center_y, self.scale, self.rotation,
+            self.settings.pencil_transform_handles_visible,
+            self.settings.eraser_transform_handles_visible, self.settings.transform_mode,
+            painter.font().key(), int(painter.renderHints().value), self.palette().cacheKey(),
+            self._solo_signature())
+        cached = self._painting_selection_cache
+        if cached is None or cached[0] != key:
+            self._painting_selection_cache = None
+            from comic_editor.ui.painting_gizmos import record_painting_gizmos
+            commands = record_painting_gizmos(painter, self._draw_selection)
+            if commands is None:
+                self._draw_selection(painter)
+                return
+            cached = self._painting_selection_cache = key, commands
+        cached[1].replay(painter)
 
     def _draw_selection(self, painter: QPainter) -> None:
         if self._active_cage() is not None or self._active_texture_modifier() is not None:
@@ -9788,6 +10074,37 @@ class _CanvasLogic(SceneKernels, LassoBrushFeatures, BrushFeatures, DocumentProj
             return "rotate"
         return None
 
+    def _has_received_painting_contact(self) -> bool:
+        """A queued physical contact owns its cursor independently of painting."""
+        if self.chapter is None:
+            return False
+        if self.tool == ToolKind.BRUSH and not self.active_tone_mask_id:
+            deferred = getattr(self, '_paint_brush_deferred', None)
+            identifier, sources = self.selected_object_id, self.chapter.objects
+            journal_tool = lambda contact: ToolKind.BRUSH
+            journal_identifier = lambda contact: contact.get('object')
+        elif self.tool in {ToolKind.RASTER_PENCIL, ToolKind.RASTER_ERASER}:
+            if self.active_tone_mask_id:
+                deferred = getattr(self, '_mask_deferred_strokes', None)
+                identifier, sources = self.active_tone_mask_id, self.chapter.masks
+                journal_tool = lambda contact: contact.get('tool')
+                journal_identifier = lambda contact: contact.get('mask')
+            else:
+                deferred = getattr(self, '_raster_deferred_strokes', None)
+                identifier, sources = self.selected_object_id, self.chapter.objects
+                journal_tool = lambda contact: contact.get('context', {}).get('tool')
+                journal_identifier = lambda contact: contact.get('context', {}).get('object')
+        else:
+            return False
+        if not deferred:
+            return False
+        contact = deferred[-1]
+        source = sources.get(identifier)
+        return (not contact.get('released', True)
+            and contact.get('chapter') is self.chapter and contact.get('tiles') is self.tiles
+            and source is not None and contact.get('source') is source
+            and journal_tool(contact) == self.tool and journal_identifier(contact) == identifier)
+
     def _update_interaction_cursor(self, widget_point: QPointF) -> None:
         """Resolve the canvas cursor identically for mouse and pen input."""
         if self._active_shape_control == "outline_width":
@@ -9796,6 +10113,17 @@ class _CanvasLogic(SceneKernels, LassoBrushFeatures, BrushFeatures, DocumentProj
         if self.chapter is None:
             self.unsetCursor()
             return
+        painting_tool = self.tool in {
+            ToolKind.RASTER_PENCIL, ToolKind.RASTER_ERASER, ToolKind.BRUSH,
+        }
+        if painting_tool:
+            self._pointer_hover_widget = QPointF(widget_point)
+            self._queue_painting_overlay_damage()
+            if (self._drawing or self._has_received_painting_contact()) and self._nav_mode is None:
+                # A received painting contact keeps its custom outline even
+                # while moving across a transform control or waiting for pixels.
+                self.setCursor(Qt.BlankCursor)
+                return
         if self.tool == ToolKind.LASSO_BRUSH:
             self.setCursor(Qt.CrossCursor)
             self.setToolTip("Drag to fill a shape; release to finish; Escape cancels")
@@ -9940,6 +10268,10 @@ class _CanvasLogic(SceneKernels, LassoBrushFeatures, BrushFeatures, DocumentProj
             self.setCursor(Qt.CrossCursor)
         elif over_selected_text:
             self.setCursor(Qt.CursorShape.IBeamCursor)
+        elif painting_tool and self._nav_mode is None and (
+                isinstance(selected_object, RasterObject)
+                or self.active_tone_mask_id and self.tool != ToolKind.BRUSH):
+            self.setCursor(Qt.BlankCursor)
         else:
             self.unsetCursor()
 
@@ -10024,8 +10356,7 @@ class _CanvasLogic(SceneKernels, LassoBrushFeatures, BrushFeatures, DocumentProj
             self._move_distort_handle(event.position())
             self._queue_radial_handle(event.position())
             world = self.widget_to_document(event.position())
-            if self._paint_brush_stroke is not None:
-                self._continue_paint_brush(world, 1.0)
+            self._finish_native_pointer_packet(world, 1.0)
             if self._lasso_brush is not None:
                 self._continue_lasso_brush(world)
             self._move_mask_selection(world)
@@ -10423,7 +10754,18 @@ class _CanvasLogic(SceneKernels, LassoBrushFeatures, BrushFeatures, DocumentProj
         elif self.tool == ToolKind.SHAPE_EDIT and self._active_shape_control is None:
             self._update_shape_hover(hover_world)
         nav = self._navigation_mode()
-        if event.type() == QEvent.TabletPress:
+        tablet_kind = event.type()
+        if (self._pen_contact_active and self._tablet_tool_active
+                and not nav and not self._nav_mode
+                and tablet_kind in {QEvent.TabletPress, QEvent.TabletRelease}
+                and event.pressure() > 0 and event.buttons() != Qt.NoButton):
+            # Qt can report a button press/release when Windows replaces the
+            # held tip's LeftButton with the barrel's RightButton, or releases
+            # a secondary button. This is still the same positive-pressure
+            # contact: preserve its owner and admit this exact packet as a move.
+            # NoButton and zero-pressure releases retain the ordinary lift path.
+            tablet_kind = QEvent.TabletMove
+        if tablet_kind == QEvent.TabletPress:
             # A real pen-down wins over any finger gesture already in flight.
             # Hover-only TabletMove events deliberately leave touch navigation
             # intact so fingers can pan, pinch, and rotate with the pen nearby.
@@ -10481,7 +10823,7 @@ class _CanvasLogic(SceneKernels, LassoBrushFeatures, BrushFeatures, DocumentProj
                 self._dispatch_tool_press(
                     event.position(), event.pressure(), event.modifiers()
                 )
-        elif event.type() == QEvent.TabletMove:
+        elif tablet_kind == QEvent.TabletMove:
             if (self._last_outline_tablet_tap is not None and math.dist(
                 event.position().toTuple(), self._last_outline_tablet_tap[1].toTuple()
             ) > 3):
@@ -10507,7 +10849,7 @@ class _CanvasLogic(SceneKernels, LassoBrushFeatures, BrushFeatures, DocumentProj
                     self.widget_to_document(event.position()),
                     event.position(),
                 )
-        elif event.type() == QEvent.TabletRelease:
+        elif tablet_kind == QEvent.TabletRelease:
             if self._nav_mode:
                 self._end_navigation(event.position())
             elif self._pen_contact_active:
@@ -10516,9 +10858,8 @@ class _CanvasLogic(SceneKernels, LassoBrushFeatures, BrushFeatures, DocumentProj
                 self._move_distort_handle(event.position())
                 self._queue_radial_handle(event.position())
                 world = self.widget_to_document(event.position())
+                self._finish_native_pointer_packet(world)
                 self._move_mask_selection(world)
-                if self._paint_brush_stroke is not None:
-                    self._continue_paint_brush(world, self._paint_brush_sample.pressure)
                 if self._lasso_brush is not None:
                     self._continue_lasso_brush(world)
                 self._queue_free_text_drag(world)
@@ -10535,11 +10876,21 @@ class _CanvasLogic(SceneKernels, LassoBrushFeatures, BrushFeatures, DocumentProj
         event.accept()
 
     def event(self, event) -> bool:
+        if event.type() == QEvent.Type.PaletteChange:
+            # Theme colors affect screen presentation only. Native artwork
+            # and the document projection retain their existing cache owners.
+            self._scene_dirty_full = True
+            self._transform_static_cache = QImage()
+            self._vector_eraser_background_cache = QImage()
+            self.update()
         if event.type() in {QEvent.UngrabMouse, QEvent.WindowDeactivate}:
             self._cancel_lasso_brush()
+            self._interrupt_native_pointer_contact()
             self._interrupt_paint_brush()
+            self._pen_contact_active = self._tablet_tool_active = False
         if event.type() == QEvent.Type.Leave:
             self._tablet_hover_widget = None
+            self._pointer_hover_widget = None
             self.update()
         if self.settings.tablet_mode and event.type() in {
             QEvent.TouchBegin, QEvent.TouchUpdate, QEvent.TouchEnd, QEvent.TouchCancel
@@ -17180,8 +17531,28 @@ class _CanvasLogic(SceneKernels, LassoBrushFeatures, BrushFeatures, DocumentProj
         if self._lasso_brush is not None:
             self._continue_lasso_brush(point)
             return
-        if self._paint_brush_stroke is not None:
+        if (self.tool == ToolKind.BRUSH and (self._paint_brush_stroke is not None
+                or getattr(self, '_paint_brush_deferred', None)
+                and not self._paint_brush_deferred[-1]['released'])):
             self._continue_paint_brush(point, pressure)
+            return
+        mask_gate = getattr(self, '_mask_tile_input', None)
+        mask_deferred = getattr(self, '_mask_deferred_strokes', None)
+        if (self.active_tone_mask_id and self.tool in {ToolKind.RASTER_PENCIL, ToolKind.RASTER_ERASER}
+                and (mask_gate is not None and not mask_gate.closed and not mask_gate.released
+                     or mask_deferred and not mask_deferred[-1]['released'])):
+            self._continue_mask_stroke(point, pressure)
+            return
+        native_gate = getattr(self, '_raster_tile_input', None)
+        if (self.tool in {ToolKind.RASTER_PENCIL, ToolKind.RASTER_ERASER}
+                and not self.active_tone_mask_id
+                and ((native_gate is not None and not native_gate.closed and not native_gate.released)
+                     or getattr(self, '_raster_deferred_strokes', None))):
+            # An owned paint contact cannot become a transform/text/gizmo
+            # hover halfway through a stroke. Submit its exact sample before
+            # visiting those unrelated hit tests, including while sources are
+            # being prepared for the first packet.
+            self._continue_stroke(point, pressure)
             return
         if self.active_tone_mask_id and self.tool == ToolKind.MASK_WAND:
             return
@@ -19490,11 +19861,15 @@ class _CanvasLogic(SceneKernels, LassoBrushFeatures, BrushFeatures, DocumentProj
                 'square': self.settings.eraser_square}
 
     def _begin_mask_stroke(self, point: QPointF, pressure: float, *, _context=None) -> None:
+        self._native_pointer_position = QPointF(point)
+        self._native_pointer_pressure = float(pressure)
         if self._native_input_predecessor() is not None:
             deferred = getattr(self, '_mask_deferred_strokes', None)
             if deferred is None:
                 deferred = self._mask_deferred_strokes = deque()
             deferred.append({'mask': self.active_tone_mask_id, 'tool': self.tool,
+                             'chapter': self.chapter, 'tiles': self.tiles,
+                             'source': self.chapter.masks.get(self.active_tone_mask_id),
                              'context': self._mask_input_context(),
                              'samples': [(QPointF(point), float(pressure))], 'released': False})
             self._defer_native_activation(self._start_deferred_mask_stroke)
@@ -19604,6 +19979,7 @@ class _CanvasLogic(SceneKernels, LassoBrushFeatures, BrushFeatures, DocumentProj
         gate = gate or getattr(self, '_mask_tile_input', None)
         if gate is None:
             return False
+        self._pen_contact_active = self._tablet_tool_active = False
         if not gate.closed:
             gate.cancel()
             return True
@@ -19670,8 +20046,13 @@ class _CanvasLogic(SceneKernels, LassoBrushFeatures, BrushFeatures, DocumentProj
         return self._stroke_base_size, max(0.0, min(1.0, amount))
 
     def _continue_mask_stroke(self, point: QPointF, pressure: float) -> None:
+        self._native_pointer_position = QPointF(point)
+        if pressure > 0.:
+            self._native_pointer_pressure = float(pressure)
         deferred = getattr(self, '_mask_deferred_strokes', None)
         if deferred:
+            if deferred[-1]['released']:
+                return
             deferred[-1]['samples'].append((QPointF(point), float(pressure)))
             return
         if (
@@ -19871,12 +20252,15 @@ class _CanvasLogic(SceneKernels, LassoBrushFeatures, BrushFeatures, DocumentProj
         obj = self.chapter.objects.get(self.selected_id)
         if not isinstance(obj, RasterObject):
             return
+        self._native_pointer_position = QPointF(point)
+        self._native_pointer_pressure = float(pressure)
         self._raster_contact_point, self._raster_contact_active = QPointF(point), True
         if self._native_input_predecessor() is not None:
             deferred = getattr(self, '_raster_deferred_strokes', None)
             if deferred is None:
                 deferred = self._raster_deferred_strokes = deque()
             deferred.append({'context': self._raster_input_context(),
+                             'chapter': self.chapter, 'tiles': self.tiles, 'source': obj,
                              'samples': [(QPointF(point), float(pressure))], 'released': False})
             self._defer_native_activation(self._start_deferred_raster_stroke)
             return
@@ -19895,9 +20279,14 @@ class _CanvasLogic(SceneKernels, LassoBrushFeatures, BrushFeatures, DocumentProj
 
     def _continue_stroke(self, point: QPointF, pressure: float) -> None:
         point = QPointF(point)
+        self._native_pointer_position = QPointF(point)
+        if pressure > 0.:
+            self._native_pointer_pressure = float(pressure)
         self._raster_contact_point = QPointF(point)
         deferred = getattr(self, '_raster_deferred_strokes', None)
         if deferred:
+            if deferred[-1]['released']:
+                return
             deferred[-1]['samples'].append((QPointF(point), float(pressure)))
             return
         gate = getattr(self, '_raster_tile_input', None)
@@ -19906,6 +20295,72 @@ class _CanvasLogic(SceneKernels, LassoBrushFeatures, BrushFeatures, DocumentProj
         keys = self._raster_packet_keys(self._raster_input_point, point)
         self._raster_input_point = QPointF(point)
         gate.submit(keys, lambda: self._with_raster_input_source(lambda: self._continue_stroke_admitted(point, pressure)))
+
+    def _finish_native_pointer_packet(self, world: QPointF, pressure: float | None = None) -> None:
+        """Keep a release-only endpoint without painting a duplicate dab.
+
+        Admission can lag behind received pen packets. The last positive received
+        pressure belongs to this contact; the last painted pressure may belong
+        to an older queued packet. A zero-pressure lift retains that received
+        pressure for the final segment. A deferred contact keeps its own received
+        samples even while an older contact is activated and painted.
+        """
+        if self.tool == ToolKind.BRUSH:
+            self._finish_paint_brush_pointer_packet(world, pressure)
+            return
+        if self.tool not in {ToolKind.RASTER_PENCIL, ToolKind.RASTER_ERASER}:
+            return
+        mask = bool(self.active_tone_mask_id)
+        if not mask and (self.chapter is None or not isinstance(
+                self.chapter.objects.get(self.selected_id), RasterObject)):
+            return
+        deferred = getattr(self, '_mask_deferred_strokes' if mask else '_raster_deferred_strokes', None)
+        gate = getattr(self, '_mask_tile_input' if mask else '_raster_tile_input', None)
+        if gate is None and not deferred:
+            return
+        if deferred:
+            contact = deferred[-1]
+            if contact['released']:
+                return
+            point = contact['samples'][-1][0]
+            if pressure is None:
+                pressure = next((value for _point, value in reversed(contact['samples'])
+                    if value > 0.), contact['samples'][0][1])
+            if point != world:
+                if mask:
+                    self._continue_mask_stroke(world, pressure)
+                else:
+                    self._continue_stroke(world, pressure)
+            # An older contact can finish before this received release, so its
+            # global _drawing flag cannot own the pending contact's terminal.
+            contact['released'] = True
+            return
+        elif not self._drawing or (gate is not None and (gate.closed or gate.released)):
+            return
+        if self._native_pointer_position == world:
+            return
+        pressure = self._native_pointer_pressure if pressure is None else pressure
+        if mask:
+            self._continue_mask_stroke(world, pressure)
+        else:
+            self._continue_stroke(world, pressure)
+
+    def _interrupt_native_pointer_contact(self) -> None:
+        """Commit accepted native packets when focus or pointer capture is lost."""
+        if self.tool not in {ToolKind.RASTER_PENCIL, ToolKind.RASTER_ERASER}:
+            return
+        mask = bool(self.active_tone_mask_id)
+        deferred = getattr(self, '_mask_deferred_strokes' if mask else '_raster_deferred_strokes', None)
+        gate = getattr(self, '_mask_tile_input' if mask else '_raster_tile_input', None)
+        if gate is None and not deferred:
+            return
+        if not self._drawing and not deferred:
+            return
+        try:
+            self._end_mask_stroke() if mask else self._end_stroke()
+        except Exception as error:
+            self._cancel_mask_stroke() if mask else self._cancel_native_raster_stroke()
+            self.operationError.emit('Drawing failed', str(error))
 
     def _end_stroke(self) -> None:
         deferred = getattr(self, '_raster_deferred_strokes', None)
@@ -19960,6 +20415,7 @@ class _CanvasLogic(SceneKernels, LassoBrushFeatures, BrushFeatures, DocumentProj
         gate = gate or getattr(self, '_raster_tile_input', None)
         if gate is None:
             return False
+        self._pen_contact_active = self._tablet_tool_active = False
         if not gate.closed:
             gate.cancel()
             return True
@@ -20033,6 +20489,7 @@ class _CanvasLogic(SceneKernels, LassoBrushFeatures, BrushFeatures, DocumentProj
             self._abort_raster_stroke_after_error()
             raise
         self._emit_raster_dirty(obj, dirty)
+        self._queue_painting_contact_adoption()
 
     def _continue_stroke_admitted(self, point: QPointF, pressure: float) -> None:
         session = getattr(self, "_raster_tool_session", None)
@@ -20128,6 +20585,12 @@ class _CanvasLogic(SceneKernels, LassoBrushFeatures, BrushFeatures, DocumentProj
         keys = set(self._stroke_before)
         if self._stroke_erasing:
             self.tiles.prune_empty(obj.object_id, keys)
+        else:
+            # A padded Pencil dab can create a new tile without writing alpha.
+            # Validate only those new touched tiles, preserving original sources.
+            new_keys = {key for key in keys if self._stroke_before[key] is None}
+            self.tiles._alpha_bounds_dirty.update((obj.object_id, *key) for key in new_keys)
+            self.tiles.prune_empty(obj.object_id, new_keys)
         frame_before = (
             self._stroke_frame_before
             if self._stroke_frame_before is not None
@@ -20213,6 +20676,8 @@ class _CanvasLogic(SceneKernels, LassoBrushFeatures, BrushFeatures, DocumentProj
         self.update()
 
     def _emit_raster_dirty(self, obj: RasterObject, local: QRectF) -> None:
+        old_frame = tuple(obj.interaction_rect)
+        old_height = self.chapter.height
         frame = QRectF(*obj.interaction_rect)
         if not self._stroke_erasing:
             frame = frame.united(local.adjusted(
@@ -20243,10 +20708,16 @@ class _CanvasLogic(SceneKernels, LassoBrushFeatures, BrushFeatures, DocumentProj
                 new_generation=owner.version(key) if owner is not None else None)
                 for key in self.tiles.keys_for_rect(local))
             bounds = world.getRect() if not world.isEmpty() else None
-            publish(ChangeSet((EntityChange(("object", obj.object_id),
-                frozenset({"pixels", "interaction_rect"}), bounds, bounds),), resources,
-                transient=True, conservative=bounds is None, label="Raster contact"), action="transient")
-        self._queue_visual_dirty(world)
+            previous = getattr(self, '_raster_repaint_frame_stable', False)
+            self._raster_repaint_frame_stable = (
+                old_frame == tuple(obj.interaction_rect) and old_height == self.chapter.height)
+            try:
+                publish(ChangeSet((EntityChange(("object", obj.object_id),
+                    frozenset({"pixels", "interaction_rect"}), bounds, bounds),), resources,
+                    transient=True, conservative=bounds is None, label="Raster contact"), action="transient")
+            finally:
+                self._raster_repaint_frame_stable = previous
+        self._queue_visual_dirty(world, scene=publish is None or local.isEmpty())
 
     def _restore_raster_frame(
         self, object_id: str, frame: object,
@@ -21324,7 +21795,7 @@ class _CanvasLogic(SceneKernels, LassoBrushFeatures, BrushFeatures, DocumentProj
             QImage.Format_ARGB32_Premultiplied,
         )
         image.setDevicePixelRatio(ratio)
-        image.fill(QColor("#242428"))
+        image.fill(theme_color("canvas", "#242428"))
         previous_excluded = self._render_excluded_object_id
         try:
             self._render_excluded_object_id = object_id
@@ -22144,10 +22615,15 @@ class RasterCanvasWidget(_CanvasLogic, QWidget):
 
 
 class GpuCanvasWidget(_CanvasLogic, QOpenGLWidget):
+    def resizeEvent(self, event):  # noqa: N802
+        self._retire_gpu_contact_pacing()
+        QOpenGLWidget.resizeEvent(self, event)
+
     def paintEvent(self, event):  # noqa: N802
         # Qt owns the widget FBO lifecycle; paintGL draws the canvas frame.
         QOpenGLWidget.paintEvent(self, event)
     def paintGL(self):  # noqa: N802
+        self._gpu_contact_pacing_token = None
         import ctypes
         context = QOpenGLContext.currentContext()
         if context is None or context is not self.context():
@@ -22175,16 +22651,25 @@ class GpuCanvasWidget(_CanvasLogic, QOpenGLWidget):
             extra.glColorMaski(0, True, True, True, True)
             # Presentation only: reset transparent native tiles over the
             # same background before any possibly clipped QPainter pass.
-            color = (ctypes.c_float * 4)(36 / 255., 36 / 255., 40 / 255., 1.)
+            background = theme_color("canvas", "#242428")
+            color = (ctypes.c_float * 4)(
+                background.redF(), background.greenF(), background.blueF(), 1.,
+            )
             clear(0x1800, 0, color)  # GL_COLOR, existing attachment0
         finally:
             extra.glColorMaski(0, *mask)
             (gl.glEnable if scissor else gl.glDisable)(0x0C11)
         _CanvasLogic.paintEvent(self, None)
+        self._adopt_gpu_contact_pacing()
 
     def initializeGL(self):  # noqa: N802
         from comic_editor.ui.point_lut import prepare_point_worker
         context = self.context()
+        self._retire_gpu_contact_pacing()
+        self._gpu_contact_pacing_context = context
+        if context is not None:
+            context.aboutToBeDestroyed.connect(
+                lambda owner=context: self._gpu_contact_context_retired(owner))
         def prepare_owned_worker():
             try:
                 valid = (context is not None and self.context() is context
@@ -22206,10 +22691,11 @@ class GpuCanvasWidget(_CanvasLogic, QOpenGLWidget):
 
 
 _GPU_AVAILABLE: bool | None = None
+_GPU_PRESENTATION_IDENTITY = None
 
 
 def gpu_available() -> bool:
-    global _GPU_AVAILABLE
+    global _GPU_AVAILABLE, _GPU_PRESENTATION_IDENTITY
     if _GPU_AVAILABLE is not None:
         return _GPU_AVAILABLE
     if QApplication.instance() is None:
@@ -22229,7 +22715,12 @@ def gpu_available() -> bool:
     if current:
         fmt = context.format()
         current = (fmt.majorVersion(), fmt.minorVersion()) >= (3, 3)
-        context.doneCurrent()
+        try:
+            if current:
+                from comic_editor.ui.canvas_presentation_policy import current_presentation_identity
+                _GPU_PRESENTATION_IDENTITY = current_presentation_identity(context)
+        finally:
+            context.doneCurrent()
     surface.destroy()
     _GPU_AVAILABLE = current
     return current
@@ -22238,6 +22729,12 @@ def gpu_available() -> bool:
 def create_canvas(settings: EditorSettings, parent=None):
     requested = settings.canvas_renderer
     use_gpu = requested != "raster" and gpu_available()
+    if use_gpu and requested == "auto":
+        from comic_editor.ui.canvas_presentation_policy import prefer_raster_presentation
+        screen = parent.screen() if parent is not None else QApplication.primaryScreen()
+        if prefer_raster_presentation(_GPU_PRESENTATION_IDENTITY,
+                                      screen.name() if screen is not None else ''):
+            use_gpu = False
     return (GpuCanvasWidget if use_gpu else RasterCanvasWidget)(settings, parent)
 
 

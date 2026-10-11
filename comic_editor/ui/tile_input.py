@@ -80,6 +80,10 @@ class TileInputGate:
             return
         self.queue.append((keys if callable(keys) else set(keys), apply))
         self.advance()
+        if self.busy:
+            pending = getattr(self.canvas, '_native_painting_contact_pending', None)
+            if pending is not None:
+                pending(self)
 
     def finish(self, apply, *, keys=()):
         self.released = True

@@ -1,0 +1,246 @@
+{
+  "themes": [
+    {
+      "id": "dark",
+      "name": "Dark",
+      "palette": {
+        "window": "#282a36",
+        "panel": "#282a36",
+        "surface": "#44475a",
+        "input": "#44475a",
+        "button": "#44475a",
+        "hover": "#4f5368",
+        "border": "#6272a4",
+        "text": "#f8f8f2",
+        "muted_text": "#b3b4b4",
+        "accent": "#50fa7b",
+        "accent_text": "#171717",
+        "selection": "#6272a4",
+        "selection_text": "#ffffff",
+        "canvas": "#232530",
+        "warning": "#e8bc68",
+        "danger": "#e68189"
+      }
+    },
+    {
+      "id": "light",
+      "name": "Light",
+      "palette": {
+        "window": "#f0f0f0",
+        "panel": "#f0f0f0",
+        "surface": "#e1e1e1",
+        "input": "#ffffff",
+        "button": "#e1e1e1",
+        "hover": "#cacaca",
+        "border": "#adadad",
+        "text": "#000000",
+        "muted_text": "#4f4f4f",
+        "accent": "#007acc",
+        "accent_text": "#ffffff",
+        "selection": "#d3d3d3",
+        "selection_text": "#171717",
+        "canvas": "#f2f2f2",
+        "warning": "#8a610c",
+        "danger": "#ad3544"
+      }
+    },
+    {
+      "id": "botanesque",
+      "name": "Botanesque",
+      "palette": {
+        "window": "#25221e",
+        "panel": "#4b4039",
+        "surface": "#39322c",
+        "input": "#39322c",
+        "button": "#817063",
+        "hover": "#9e897b",
+        "border": "#25221e",
+        "text": "#efdec4",
+        "muted_text": "#bdb09e",
+        "accent": "#b4b245",
+        "accent_text": "#2b2520",
+        "selection": "#5e845e",
+        "selection_text": "#fff9e6",
+        "canvas": "#211e1b",
+        "warning": "#d9b46b",
+        "danger": "#d48e80"
+      }
+    },
+    {
+      "id": "blender",
+      "name": "Blender",
+      "palette": {
+        "window": "#2e2e2e",
+        "panel": "#2e2e2e",
+        "surface": "#424242",
+        "input": "#424242",
+        "button": "#424242",
+        "hover": "#757575",
+        "border": "#616161",
+        "text": "#e0e0e0",
+        "muted_text": "#a5a5a5",
+        "accent": "#ff8f00",
+        "accent_text": "#171717",
+        "selection": "#757575",
+        "selection_text": "#ffffff",
+        "canvas": "#282828",
+        "warning": "#e8bc68",
+        "danger": "#e68189"
+      }
+    },
+    {
+      "id": "crona",
+      "name": "Crona",
+      "palette": {
+        "window": "#1c1c1c",
+        "panel": "#1c1c1c",
+        "surface": "#333333",
+        "input": "#333333",
+        "button": "#333333",
+        "hover": "#555555",
+        "border": "#4a4a4a",
+        "text": "#c0c0c0",
+        "muted_text": "#8a8a8a",
+        "accent": "#d6c8e0",
+        "accent_text": "#171717",
+        "selection": "#555555",
+        "selection_text": "#ffffff",
+        "canvas": "#191919",
+        "warning": "#e8bc68",
+        "danger": "#e68189"
+      }
+    },
+    {
+      "id": "kaito",
+      "name": "Kaito",
+      "palette": {
+        "window": "#1a1e26",
+        "panel": "#1a1e26",
+        "surface": "#2b3340",
+        "input": "#2b3340",
+        "button": "#2b3340",
+        "hover": "#3b4759",
+        "border": "#4a5d73",
+        "text": "#f0f0f0",
+        "muted_text": "#a9abad",
+        "accent": "#008cff",
+        "accent_text": "#ffffff",
+        "selection": "#3b4759",
+        "selection_text": "#ffffff",
+        "canvas": "#171a21",
+        "warning": "#e8bc68",
+        "danger": "#e68189"
+      }
+    },
+    {
+      "id": "len",
+      "name": "Len",
+      "palette": {
+        "window": "#202020",
+        "panel": "#202020",
+        "surface": "#333333",
+        "input": "#333333",
+        "button": "#333333",
+        "hover": "#444444",
+        "border": "#555555",
+        "text": "#e0e0e0",
+        "muted_text": "#a1a1a1",
+        "accent": "#fce400",
+        "accent_text": "#171717",
+        "selection": "#444444",
+        "selection_text": "#ffffff",
+        "canvas": "#1c1c1c",
+        "warning": "#e8bc68",
+        "danger": "#e68189"
+      }
+    },
+    {
+      "id": "miku_light",
+      "name": "Miku Light",
+      "palette": {
+        "window": "#e5efee",
+        "panel": "#b5e8eb",
+        "surface": "#e5efee",
+        "input": "#ffffff",
+        "button": "#e5efee",
+        "hover": "#ffffff",
+        "border": "#28afc2",
+        "text": "#000000",
+        "muted_text": "#4c4f4f",
+        "accent": "#28afc2",
+        "accent_text": "#ffffff",
+        "selection": "#b5e8eb",
+        "selection_text": "#171717",
+        "canvas": "#e8f1f0",
+        "warning": "#8a610c",
+        "danger": "#ad3544"
+      }
+    },
+    {
+      "id": "miku_dark",
+      "name": "Miku Dark",
+      "palette": {
+        "window": "#2c2f33",
+        "panel": "#3b3f45",
+        "surface": "#3b3f45",
+        "input": "#2c2f33",
+        "button": "#3b3f45",
+        "hover": "#4a4e54",
+        "border": "#5d646b",
+        "text": "#e0e0e0",
+        "muted_text": "#a5a6a7",
+        "accent": "#39c5bb",
+        "accent_text": "#171717",
+        "selection": "#4a4e54",
+        "selection_text": "#ffffff",
+        "canvas": "#27292d",
+        "warning": "#e8bc68",
+        "danger": "#e68189"
+      }
+    },
+    {
+      "id": "shadow",
+      "name": "Shadow",
+      "palette": {
+        "window": "#1d1d1d",
+        "panel": "#ac4044",
+        "surface": "#3a3e3b",
+        "input": "#3a3e3b",
+        "button": "#3a3e3b",
+        "hover": "#4b4f4d",
+        "border": "#ac4044",
+        "text": "#ffffff",
+        "muted_text": "#b4b4b4",
+        "accent": "#ff3c3f",
+        "accent_text": "#ffffff",
+        "selection": "#4b4f4d",
+        "selection_text": "#ffffff",
+        "canvas": "#1a1a1a",
+        "warning": "#e8bc68",
+        "danger": "#e68189"
+      }
+    },
+    {
+      "id": "unit01",
+      "name": "Unit 01",
+      "palette": {
+        "window": "#2e2e2e",
+        "panel": "#4a406b",
+        "surface": "#3f3f3f",
+        "input": "#2e2e2e",
+        "button": "#3f3f3f",
+        "hover": "#555555",
+        "border": "#7d40c0",
+        "text": "#e8e6f0",
+        "muted_text": "#aba9b0",
+        "accent": "#6fff00",
+        "accent_text": "#171717",
+        "selection": "#3b315c",
+        "selection_text": "#ffffff",
+        "canvas": "#282828",
+        "warning": "#e8bc68",
+        "danger": "#e68189"
+      }
+    }
+  ]
+}

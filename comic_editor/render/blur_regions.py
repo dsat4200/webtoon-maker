@@ -68,14 +68,47 @@ def resize_region(fetch, source_size, destination_size, region, algorithm="norma
     pixels = fetch((left, top, right - left, bottom - top))
     if algorithm == "legacy":
         pixels = np.asarray(Image.fromarray(pixels, "RGBA").convert("RGBa"))
-    horizontal = np.full((bottom - top, width, 4), 1 << 21, np.int64)
+    def accumulator_dtype(coefficients):
+        # The exact row reduction cannot overflow after this Python-int bound.
+        # Nonnegative samples make every ordered partial sum no larger than
+        # rounding bias + 255 * the complete coefficient row sum.
+        if (coefficients.dtype != np.dtype(np.int64) or coefficients.ndim != 2
+                or not coefficients.size):
+            return np.int64
+        minimum, maximum = int(coefficients.min()), int(coefficients.max())
+        if minimum < 0 or maximum * int(coefficients.shape[1]) > (1 << 63) - 1:
+            return np.int64
+        maximum_sum = int(np.sum(coefficients, axis=1, dtype=np.int64).max())
+        return (np.int32 if (1 << 21) + 255 * maximum_sum <= (1 << 31) - 1
+                else np.int64)
+
+    horizontal_dtype = (accumulator_dtype(cx) if isinstance(pixels, np.ndarray)
+                        and pixels.dtype == np.dtype(np.uint8) else np.int64)
+    if horizontal_dtype is np.int32:
+        cx = cx.astype(np.int32)
+    horizontal = np.full((bottom - top, width, 4), 1 << 21, horizontal_dtype)
+    scratch = np.empty_like(horizontal)
     for sample in range(ix.shape[1]):
-        horizontal += pixels[:, ix[:, sample] - left].astype(np.int64) * cx[None, :, sample, None]
-    horizontal = np.clip(horizontal >> 22, 0, 255).astype(np.uint8)
-    vertical = np.full((height, width, 4), 1 << 21, np.int64)
+        np.multiply(pixels[:, ix[:, sample] - left], cx[None, :, sample, None],
+                    dtype=horizontal_dtype, out=scratch)
+        horizontal += scratch
+    del scratch
+    np.right_shift(horizontal, 22, out=horizontal)
+    np.clip(horizontal, 0, 255, out=horizontal)
+    horizontal = horizontal.astype(np.uint8)
+    vertical_dtype = accumulator_dtype(cy)
+    if vertical_dtype is np.int32:
+        cy = cy.astype(np.int32)
+    vertical = np.full((height, width, 4), 1 << 21, vertical_dtype)
+    scratch = np.empty_like(vertical)
     for sample in range(iy.shape[1]):
-        vertical += horizontal[iy[:, sample] - top].astype(np.int64) * cy[:, sample, None, None]
-    result = np.clip(vertical >> 22, 0, 255).astype(np.uint8)
+        np.multiply(horizontal[iy[:, sample] - top], cy[:, sample, None, None],
+                    dtype=vertical_dtype, out=scratch)
+        vertical += scratch
+    del scratch
+    np.right_shift(vertical, 22, out=vertical)
+    np.clip(vertical, 0, 255, out=vertical)
+    result = vertical.astype(np.uint8)
     if algorithm == "legacy":
         result = np.asarray(Image.fromarray(result, "RGBa").convert("RGBA")).copy()
     return result

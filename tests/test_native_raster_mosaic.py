@@ -161,7 +161,7 @@ def test_presentation_metadata_changes_rebuild_without_increasing_native_density
     assert current[0].width()<=native.width() and current[0].height()<=native.height()
 
 
-@pytest.mark.parametrize('reason',['missing','overlap','preview','float16','float32','RGBA64','DPR','rotation','shear','projective','negative-scale','source-density','fractional-source','outside-source','no-context','unknown-environment','mixed-environment','null-image','single-preview','tile-count','fractional-view'])
+@pytest.mark.parametrize('reason',['missing','overlap','preview','float16','float32','RGBA64','DPR','rotation','shear','projective','negative-scale','source-density','fractional-source','outside-source','no-context','unknown-environment','mixed-environment','null-image','single-preview','tile-count'])
 def test_unsupported_or_missing_current_inputs_discard_and_preserve_native_pixels(qapp,reason):
     native=pattern();tiles=tiles_for(native);holder=owner()
     assert assemble(holder,tiles,native) is not None
@@ -178,7 +178,6 @@ def test_unsupported_or_missing_current_inputs_discard_and_preserve_native_pixel
     elif reason=='shear':transform.shear(.1,.2)
     elif reason=='projective':transform=QTransform(1.,0.,.0001,0.,1.,0.,0.,10.,1.)
     elif reason=='negative-scale':transform.scale(-1.,1.)
-    elif reason=='fractional-view':transform=camera(1.25,3.25,-2.75)
     elif reason=='source-density':tiles[0]=replace(tiles[0],source_rect=QRectF(2,2,128,256))
     elif reason=='fractional-source':tiles[0]=replace(tiles[0],source_rect=QRectF(2.5,2,256,256))
     elif reason=='outside-source':tiles[0]=replace(tiles[0],source_rect=QRectF(8,2,256,256))

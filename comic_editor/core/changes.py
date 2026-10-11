@@ -222,19 +222,25 @@ class DependencyIndex:
         return found
 
     def publish(self, change, chapter=None):
+        links_changed = False
         if chapter is not None and chapter is not self.chapter:
             self.bind(chapter)
+            links_changed = True
         if self.chapter is None:
             return set()
         # Preserve old dependencies for removals and remapped sources.
         affected = self.affected(change)
+        links_changed = links_changed or change.conservative or change.structural
         if change.conservative:
             self._rebuild_links()
         else:
             for item in change.entities:
                 if item.structural or item.fields & LINK_FIELDS:
                     self._refresh(item.entity)
-        affected.update(self.affected(change))
+                    links_changed = True
+        # Ordinary pixel/frame edits leave every dependency link unchanged.
+        if links_changed:
+            affected.update(self.affected(change))
         self.revision += 1
         for ref in affected:
             self.generations[ref] += 1

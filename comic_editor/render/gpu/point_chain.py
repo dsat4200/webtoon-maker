@@ -132,6 +132,9 @@ class GpuPointChain:
         if context is None:
             if share_context is not None:
                 self.context.setShareContext(share_context)
+                self.context.setScreen(share_context.screen())
+            elif surface is not None:
+                self.context.setScreen(surface.screen())
             self.context.setFormat(surface.format() if surface is not None else fmt)
         if context is None and not self.context.create():
             self.reason = 'OpenGL 4.3 context unavailable'
@@ -143,6 +146,7 @@ class GpuPointChain:
         self.surface = surface
         if self.surface is None:
             self.surface = QOffscreenSurface()
+            self.surface.setScreen(self.context.screen())
             self.surface.setFormat(actual)
             self.surface.create()
         try:

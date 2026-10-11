@@ -13,7 +13,7 @@ from comic_editor.core.models import (
 )
 from comic_editor.core.effect_geometry import (effect_bounds, outline_blur_padding,
     array_indices, array_transform, reflection_transform)
-from comic_editor.render.tile_graph import TileGraph, TileNode, TileCacheMiss
+from comic_editor.render.tile_graph import TileGraph, TileNode, TileCacheMiss, tiles
 from comic_editor.render.blur_regions import RegionalBlur, BlurTileCache
 from comic_editor.render.effect_regions import region_requests_enabled, projection_requires_exact
 from comic_editor.render.modifier_rendering import (
@@ -61,6 +61,28 @@ def _sector_frame(modifier):
     return isinstance(modifier, KuwaharaModifier) and modifier.variant != "original"
 
 
+def _native_contact_point_fields(canvas, modifier, source_bounds, source_frame, mapping):
+    """Crop fields sampled on the unchanged ordinary 256-pixel stage grid."""
+    result = {}
+    for _address, native in tiles(source_frame, source_bounds.intersected(source_frame), 256):
+        native = QRectF(native.toAlignedRect())
+        transform = canvas._world_to_image_transform(mapping, native, int(native.width()), int(native.height()))
+        fields = canvas._modifier_mask_fields([modifier], int(native.width()), int(native.height()),
+            transform, mapping.mapRect(native))
+        overlap = source_bounds.intersected(native)
+        if overlap.isEmpty():
+            continue
+        source_x, source_y = int(overlap.x()-native.x()), int(overlap.y()-native.y())
+        target_x, target_y = int(overlap.x()-source_bounds.x()), int(overlap.y()-source_bounds.y())
+        width, height = int(overlap.width()), int(overlap.height())
+        for key, values in fields.items():
+            if key not in result:
+                result[key] = np.zeros((int(source_bounds.height()), int(source_bounds.width())), dtype=values.dtype)
+            result[key][target_y:target_y+height, target_x:target_x+width] = values[
+                source_y:source_y+height, source_x:source_x+width]
+    return result
+
+
 def eligible(canvas, required, request_scope, bounds, modifiers):
     stroke_regions = (getattr(canvas, '_stroke_projection_active', False)
                       and any(isinstance(m, (BrightnessContrastModifier, CurvesModifier,
@@ -94,6 +116,15 @@ def tile_output(canvas, image, bounds, modifiers, mapping, *, required, request_
     transform = canvas._modifier_mapping_signature(mapping)
     tile_size = 64 if getattr(canvas, '_stroke_projection_active', False) and not projection_requires_exact(canvas) else 256
     placement = (tuple(bounds.getRect()), transform, nearest, float_pipeline, tile_size)
+    contact_region = bool(getattr(canvas, '_filtered_native_contact_patch', False))
+    if contact_region:
+        # Private proof only: finite point/solid-outline kernels share the
+        # unchanged source/effect grids; default exact tile keys stay intact.
+        assert all(isinstance(m, (BrightnessContrastModifier, CurvesModifier,
+            HueSaturationLightnessModifier)) or isinstance(m, OutlineModifier)
+            and m.style == 'solid' for m in active)
+        assert all(footprint(m) is not None for m in active)
+        placement = (*placement, 'native-contact-region')
     signatures = tuple((repr(modifier_render_settings(m)),
         canvas._modifier_parameter_signature([m.modifier_id]), _color_signature(canvas, m)) for m in active)
     storage = QImage.Format_RGBA32FPx4_Premultiplied if float_pipeline else QImage.Format_ARGB32_Premultiplied
@@ -217,7 +248,11 @@ def tile_output(canvas, image, bounds, modifiers, mapping, *, required, request_
                     required=output, request_scope=("tile-frame", request_scope, effect.modifier_id), tile_evaluation=False)[0]
             work_mapping = canvas._world_to_image_transform(mapping, source_bounds, source.width(), source.height())
             revision = getattr(canvas, "_effect_provisional_revision", 0)
-            fields = canvas._modifier_mask_fields([effect], source.width(), source.height(), work_mapping, mapping.mapRect(source_bounds))
+            if (contact_region and isinstance(effect, (BrightnessContrastModifier,
+                    CurvesModifier, HueSaturationLightnessModifier)) and effect.parameter_masks):
+                fields = _native_contact_point_fields(canvas, effect, source_bounds, source_frame, mapping)
+            else:
+                fields = canvas._modifier_mask_fields([effect], source.width(), source.height(), work_mapping, mapping.mapRect(source_bounds))
             if revision != getattr(canvas, "_effect_provisional_revision", 0):
                 raise TileCacheMiss()
             # Shared float sector frames use the same owner as graph lookup;
@@ -361,9 +396,17 @@ def tile_output(canvas, image, bounds, modifiers, mapping, *, required, request_
         count = len(jobs.running_jobs) + len(jobs.pending)
         return (count < jobs.worker_limit and jobs.bytes_in_flight < jobs.budget
                 and not any(job[4] > jobs.budget for job in jobs.running_jobs))
+    frame_guard = getattr(canvas, '_filtered_native_frame_guard', None)
+    if frame_guard is not None:
+        frame_guard(source_identity, nodes[-1].frame, required, transform, float_pipeline)
+    graph_deferred = projection_deferred(canvas)
     graph = TileGraph(nodes, source, get, put, cache_only=image is None and capture is None,
-                      tile_size=tile_size,
-                      continue_pending=continue_pending if projection_deferred(canvas) else None)
+                      tile_size=tile_size, region_evaluation=(frozenset(index + 1
+                          for index, modifier in enumerate(active) if not modifier.parameter_masks
+                          or isinstance(modifier, (BrightnessContrastModifier, CurvesModifier,
+                              HueSaturationLightnessModifier)))
+                          if contact_region else False),
+                      continue_pending=continue_pending if graph_deferred else None)
     try:
         output_bounds = QRectF(nodes[-1].frame.intersected(required).toAlignedRect())
         output_owner = ("output", tuple(output_bounds.getRect()))
@@ -378,6 +421,11 @@ def tile_output(canvas, image, bounds, modifiers, mapping, *, required, request_
         return result, region
     except TileCacheMiss:
         return None
+    finally:
+        if not graph_deferred:
+            # Nodes capture this cell while the graph owns their callbacks.
+            # Finished inline requests must not retain a private scene lease.
+            graph = None
 
 
 def generic_target_output(canvas, target, bounds, modifiers, mapping, visible):

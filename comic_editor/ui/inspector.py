@@ -34,17 +34,13 @@ class ContextInspector(QFrame):
         self._underlay_drag_object_id = ""
         self._alignment_buttons: dict[tuple[str, str], QToolButton] = {}
         self.setObjectName("contextInspector")
-        self.setStyleSheet(
-            "#contextInspector { background: rgba(28,28,32,238); "
-            "border: 1px solid #5d7d9c; border-radius: 8px; }"
-        )
         outer = QVBoxLayout(self)
         outer.setContentsMargins(8, 6, 8, 6)
         outer.setSpacing(4)
 
         header = QHBoxLayout()
         self.title = QLabel("Selection")
-        self.title.setStyleSheet("font-weight: bold; color: #80c8ff")
+        self.title.setProperty("themeAccent", True)
         header.addWidget(self.title, 1)
         self.preset_controls = QWidget()
         preset_row = QHBoxLayout(self.preset_controls)
@@ -196,9 +192,7 @@ class ContextInspector(QFrame):
         raster_layout.setContentsMargins(0, 4, 0, 0)
         raster_layout.setSpacing(4)
         self.raster_tool_title = QLabel("Raster Pencil")
-        self.raster_tool_title.setStyleSheet(
-            "font-weight: bold; color: #80c8ff"
-        )
+        self.raster_tool_title.setProperty("themeAccent", True)
         raster_layout.addWidget(self.raster_tool_title)
         self.pencil_tool_controls = QWidget()
         pencil_layout = QHBoxLayout(self.pencil_tool_controls)

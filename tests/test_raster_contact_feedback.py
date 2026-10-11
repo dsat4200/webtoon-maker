@@ -439,7 +439,7 @@ def test_native_pixel_changes_reuse_prepared_planes_and_exact_ready_stops_overla
     np.testing.assert_array_equal(pixels(image)[2:126, 8:504], pixels(native_reference(canvas))[2:126, 8:504])
 
 
-@pytest.mark.parametrize('case', ['effect', 'floating', 'noninteger', 'transformed', 'missing'])
+@pytest.mark.parametrize('case', ['effect', 'floating', 'source_frame', 'missing'])
 def test_unavailable_contact_pixels_show_received_gesture_as_pending(
         scene, case, wait_scene, monkeypatch, qapp):
     canvas, selected, _front = scene
@@ -448,12 +448,11 @@ def test_unavailable_contact_pixels_show_received_gesture_as_pending(
     elif case == 'floating':
         from comic_editor.core.pixel_contract import FLOAT_PIXELS
         canvas.chapter.pixel_contract = FLOAT_PIXELS
-    elif case == 'noninteger':
-        selected.x = .25
-    elif case == 'transformed':
+    elif case == 'source_frame':
         selected.transform_frame = (0., 0., 128., 128.)
-        # Projective maps require ordinary scene evaluation; saved affine
-        # rotation/skew has separately verified native feedback.
+        # A fixed modifier-source sampling frame still requires ordinary
+        # scene evaluation; valid saved perspective maps have native feedback.
+        selected.modifier_source_frame = (0., 0., 128., 128.)
         selected.transform_quad = [(0., 0.), (128., 8.), (121., 128.), (-8., 120.)]
     canvas._invalidate_scene_cache()
     wait_scene(canvas)
@@ -724,20 +723,27 @@ def test_scene_capture_contact_budget_preserves_cold_release_and_exact_pixels(
                 document=SimpleNamespace(configuration=('different-presentation',))))
         elif case == 'inactive_drawing':
             patch.setattr(canvas, '_drawing', False)
-        # Apply the fallback before requesting the next actual frame. Cold,
-        # released, missing, different-owner/configuration and off-coverage
-        # contacts must still dispatch ordinary exact source/model work.
+        # Missing/stale separable planes prepare on the stable contact lane.
+        # Invalid input ownership still dispatches ordinary guarded scene work.
         ready_paint(canvas)
         capture = controller.capture
         if case in ('pencil', 'eraser'):
             assert capture is None
+        elif case in ('missing', 'coverage', 'configuration'):
+            assert capture is None
+            assert controller._bootstrap is not None
+            patch.setattr(controller._bootstrap.capture, 'advance',
+                lambda seconds: (budgets.append(seconds), False)[1])
+            controller._advance_bootstrap()
         else:
             assert capture is not None
             # Observe the real fallback allowance without completing the
             # iterator; after restoring the observer it converges normally.
             patch.setattr(capture, 'advance', lambda seconds: (budgets.append(seconds), False)[1])
         controller.advance()
-        assert budgets == ([] if case in ('pencil', 'eraser') else [.004])
+        expected = ([] if case in ('pencil', 'eraser') else
+            [.002] if case in ('missing', 'coverage', 'configuration') else [.004])
+        assert budgets == expected
         assert controller.timer.interval() == 8
         if case in ('pencil', 'eraser'):
             assert controller.capture is None and not controller.timer.isActive()

@@ -1,5 +1,6 @@
 """Covered native feedback pauses scene work only while its owner stays valid."""
 import copy
+from dataclasses import replace
 
 import numpy as np
 import pytest
@@ -33,6 +34,27 @@ def trace_scene_work(canvas, monkeypatch):
     monkeypatch.setattr(controller.scheduler, 'submit', submit)
     monkeypatch.setattr(controller.scheduler, 'cancel', cancel)
     return calls
+
+
+def assert_current_native_reuse(canvas, controller, gate):
+    """The held owner must match a named production bootstrap/coverage lane."""
+    document = canvas._render_document_state()
+    visible = canvas.visible_document_rect()
+    if document.overflow <= 0:
+        visible = visible.intersected(document.bounds)
+    visible = tuple(visible.getRect())
+    assert canvas._drawing and canvas._raster_contact_active and document.live_preview
+    assert gate.current() and not gate.busy and not gate.closed and not gate.released and gate.error is None
+    assert not gate.pending and not gate.queue
+    assert gate.canvas is canvas and gate.chapter is canvas.chapter and gate.tiles is canvas.tiles
+    assert gate.identifier == canvas.selected_id
+    assert controller._pending_native_contact_gate(document) is None
+    bootstrap_gate = controller._bootstrap_contact_gate(document, visible)
+    covered_gate = controller._covered_contact_gate(document, visible)
+    assert bootstrap_gate is gate or covered_gate is gate
+    assert controller._contact_reuse_gate is gate
+    assert controller.capture is None and controller.dispatched is None and not controller.timer.isActive()
+    return document, visible, bootstrap_gate, covered_gate
 
 
 def move(canvas, tool, point):
@@ -114,10 +136,17 @@ def test_contact_eligibility_exit_immediately_resumes_ordinary_scene_capture(
     canvas._invalidate_scene_cache()
     wait_scene(canvas)
     controller = canvas._scene_controller
-    blocker = block_existing_scene_demand(canvas, monkeypatch)
-    calls = trace_scene_work(canvas, monkeypatch)
     original_object = selected
+    blocker = block_existing_scene_demand(canvas, monkeypatch)
     try:
+        calls = trace_scene_work(canvas, monkeypatch)
+        old_feedback = controller.feedback
+        blocked_future = controller.scheduler.future
+        blocked_demand = controller.scheduler.active_demand
+        blocked_token = controller.scheduler.cancelled
+        blocked_snapshot, blocked_preview = controller.snapshot, controller.preview
+        assert blocked_future is not None and not blocked_future.done()
+        assert blocked_demand.snapshot is blocked_snapshot and not blocked_snapshot.document.live_preview
         begin(canvas, ToolKind.RASTER_PENCIL, QPointF(32, 64))
         ready_paint(canvas)
         gate = canvas._raster_tile_input
@@ -142,10 +171,78 @@ def test_contact_eligibility_exit_immediately_resumes_ordinary_scene_capture(
             canvas._transform_preview_quad = [(1., 1.), (127., 1.), (127., 127.), (1., 127.)]
             assert canvas._projection_has_live_preview(include_ink=False)
         ready_paint(canvas)
-        assert controller._contact_reuse_gate is None
-        assert calls['capture'], 'The ordinary compiler must really be invoked after eligibility ends'
-        assert controller.capture is not None
-        assert controller.dispatched is None and controller.timer.isActive()
+        if transition in {'view', 'configuration', 'unrelated'}:
+            # These transitions retain the valid native source gate. A partial
+            # covered basis or a NEW current-dependency bootstrap replaces the
+            # obsolete assumption that every such transition queues scene work.
+            document, visible, bootstrap_gate, covered_gate = assert_current_native_reuse(canvas, controller, gate)
+            assert not calls['capture'] and not calls['submit']
+            if transition == 'view':
+                assert not controller._feedback_covers(document, visible)
+                assert controller._feedback_contact_covers(document, visible)
+                assert covered_gate is gate and bootstrap_gate is None
+                assert controller.feedback is old_feedback
+                assert old_feedback.document.identity == document.identity
+                assert old_feedback.document.configuration == document.configuration
+            else:
+                assert controller.feedback is None, 'Stale dependency feedback must be excluded'
+                bootstrap = controller._bootstrap
+                assert bootstrap is not None and bootstrap_gate is gate and covered_gate is None
+                assert bootstrap.valid(document, visible) and not bootstrap.retired
+                assert bootstrap.identifier == canvas.selected_id and bootstrap.visible == visible
+                assert replace(document, revision=bootstrap.document.revision,
+                    live_preview=False, contact_only=False) == bootstrap.document
+                if transition == 'unrelated':
+                    if bootstrap.seeded_records:
+                        assert ('object', front.object_id) in bootstrap.compiler.dirty
+                    else:
+                        assert bootstrap.compiler.identity is None
+            # The canceled ordinary job is blocked INSIDE its admission ticket.
+            # Prove it lost ownership, then let it unwind before awaiting the
+            # independent bootstrap's real admission/publication.
+            assert blocked_token.is_set() and calls['cancel'] == [True]
+            assert controller.scheduler.future is blocked_future
+            assert controller.scheduler.active_demand is blocked_demand
+            assert controller.snapshot is blocked_snapshot and controller.preview is blocked_preview
+            from test_native_input_admission import wait_for
+            blocker.set()
+            wait_for(blocked_future.done)
+            assert blocked_future.result() is None
+            with controller.scheduler.condition:
+                assert not any(completion.demand is blocked_demand
+                               for completion in controller.scheduler.ready), 'Canceled ordinary job published stale output'
+            assert controller.snapshot is blocked_snapshot and controller.preview is blocked_preview
+            assert not calls['capture'] and not calls['submit']
+            # Let the actual bootstrap scheduler publish; never fake readiness.
+            def current_feedback_ready():
+                ready_paint(canvas)
+                controller.advance()
+                current = canvas._render_document_state()
+                return controller._covered_contact_gate(current, visible) is gate
+            wait_for(current_feedback_ready)
+            prepared = controller.feedback
+            current = canvas._render_document_state()
+            assert prepared is not None and prepared.identifier == canvas.selected_id
+            assert prepared.document.identity == current.identity
+            assert prepared.document.configuration == current.configuration
+            assert prepared.document.pixel_contract == current.pixel_contract
+            assert prepared.tile_size == canvas.tiles.tile_size
+            assert controller.snapshot is blocked_snapshot and controller.preview is blocked_preview
+            assert not calls['capture'] and not calls['submit']
+            # Release really retires held reuse and resumes ordinary capture.
+            finish(canvas, ToolKind.RASTER_PENCIL)
+            blocker.set()
+            wait_scene(canvas)
+            assert not canvas._drawing and not canvas._render_document_state().live_preview
+            assert controller._contact_reuse_gate is None and controller._bootstrap is None
+            assert calls['capture'] and calls['submit']
+            assert controller.snapshot.document == canvas._render_document_state()
+            assert not controller.scheduler.busy and not canvas._projection_frame_pending
+        else:
+            assert controller._contact_reuse_gate is None
+            assert calls['capture'], 'The ordinary compiler must really be invoked after eligibility ends'
+            assert controller.capture is not None
+            assert controller.dispatched is None and controller.timer.isActive()
     finally:
         blocker.set()
         canvas.chapter.objects[selected.object_id] = original_object

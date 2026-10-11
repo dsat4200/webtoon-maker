@@ -11,7 +11,7 @@ from typing import Mapping
 import copy
 import math
 
-from PySide6.QtCore import QRectF, Qt
+from PySide6.QtCore import QPointF, QRectF, Qt
 from PySide6.QtGui import QImage, QPainter, QTransform
 
 from comic_editor.core.models import RasterObject, GradientObject
@@ -78,22 +78,63 @@ def _feedback_mapping_supported(entity):
         a, b, c, d = quad
         roundoff_x = max(math.ulp(float(point[0])) for point in quad) * 8
         roundoff_y = max(math.ulp(float(point[1])) for point in quad) * 8
-        # Use the shared kernel's exact affine admission tolerance. A failed
-        # projective solver can return its identity fallback; that is not
-        # evidence that the authored quad is an affine separable mapping.
+        # Preserve the shared kernel's affine admission. For perspective,
+        # accept only convex quads and verify that its ordinary solver really
+        # maps the authored corners, rather than returning an identity fallback.
         if (abs((b[0] - a[0]) - (c[0] - d[0])) > roundoff_x
                 or abs((d[1] - a[1]) - (c[1] - b[1])) > roundoff_y
                 or abs((d[0] - a[0]) - (c[0] - b[0])) > roundoff_x
                 or abs((b[1] - a[1]) - (c[1] - d[1])) > roundoff_y):
-            return False
+            edges = [(quad[(i + 1) % 4][0] - quad[i][0],
+                      quad[(i + 1) % 4][1] - quad[i][1]) for i in range(4)]
+            turns = [edges[i][0] * edges[(i + 1) % 4][1]
+                     - edges[i][1] * edges[(i + 1) % 4][0] for i in range(4)]
+            if (not all(math.isfinite(turn) for turn in turns)
+                    or not (all(turn > 0. for turn in turns) or all(turn < 0. for turn in turns))):
+                return False
+            mapping = SceneKernels._quad_transform(QRectF(*frame), list(quad))
+            if (not mapping.isInvertible()
+                    or not all(math.isfinite(value) for value in _feedback_transform_coefficients(mapping))
+                    or not _feedback_projective_rect_supported(mapping, QRectF(*frame))):
+                return False
+            bounds = QRectF(*frame)
+            corners = bounds.topLeft(), bounds.topRight(), bounds.bottomRight(), bounds.bottomLeft()
+            for corner, expected in zip(corners, quad):
+                actual = mapping.map(corner)
+                if (not math.isfinite(actual.x()) or not math.isfinite(actual.y())
+                        or abs(actual.x() - expected[0]) > max(1e-9, math.ulp(float(expected[0])) * 64)
+                        or abs(actual.y() - expected[1]) > max(1e-9, math.ulp(float(expected[1])) * 64)):
+                    return False
+            return True
         mapping = SceneKernels._quad_transform(QRectF(*frame), list(quad))
         return mapping.isAffine() and mapping.isInvertible()
     except (TypeError, ValueError, OverflowError):
         return False
 
 
+def _feedback_transform_coefficients(transform):
+    if transform.isAffine():
+        return (transform.m11(), transform.m12(), transform.m21(), transform.m22(),
+                transform.dx(), transform.dy())
+    return (transform.m11(), transform.m12(), transform.m13(),
+            transform.m21(), transform.m22(), transform.m23(),
+            transform.m31(), transform.m32(), transform.m33())
+
+
+def _feedback_projective_rect_supported(mapping, bounds):
+    """Decline a rectangle crossing the projective horizon before mapping it."""
+    if mapping.isAffine():
+        return True
+    values = [mapping.m13() * point.x() + mapping.m23() * point.y() + mapping.m33()
+        for point in (bounds.topLeft(), bounds.topRight(), bounds.bottomRight(), bounds.bottomLeft())]
+    return (all(math.isfinite(value) for value in values)
+            and (all(value > 1e-9 for value in values) or all(value < -1e-9 for value in values)))
+
+
 def _feedback_source_keys(bounds, inverse, side, limit=128):
     """Bound source metadata work before constructing a source-key set."""
+    if not _feedback_projective_rect_supported(inverse, QRectF(*bounds)):
+        return None
     local = inverse.mapRect(QRectF(*bounds)).adjusted(-1., -1., 1., 1.)
     coordinates = local.left(), local.top(), local.right(), local.bottom()
     if not all(math.isfinite(value) for value in coordinates):
@@ -153,9 +194,8 @@ def feedback_chain(snapshot, identifier):
     if not all(math.isfinite(value) for value in
                (obj.x, obj.y, *(value for layer in chain for value in (layer.translate_x, layer.translate_y)))):
         return None
-    mapped = obj.transform_quad is not None or any(layer.transform_quad is not None for layer in chain)
-    if not mapped and any(value != round(value) for value in origin):
-        return None
+    mapped = (obj.transform_quad is not None or any(layer.transform_quad is not None for layer in chain)
+              or any(value != round(value) for value in origin))
     # Mapped sources use a native document grid. The source retains its original
     # sampling grid, and resident edits are mapped into these prepared planes.
     return obj, chain, (0, 0) if mapped else tuple(int(value) for value in origin)
@@ -187,7 +227,7 @@ def _split_snapshot(snapshot, obj, chain, *, suffix):
     return replace(snapshot, chapter=chapter, document=document, cache_spec=None, graphics_worker=None)
 
 
-def feedback_keys(document, visible, origin, side, gutter=2, budget=32 * 1024 * 1024, *, planes=3):
+def feedback_keys(document, visible, origin, side, gutter=2, budget=32 * 1024 * 1024, *, planes=3, focus=None):
     """The bounded native resource coverage, shared by preparation and reuse."""
     extent = QRectF(*visible).intersected(document.bounds)
     if extent.isEmpty():
@@ -197,13 +237,16 @@ def feedback_keys(document, visible, origin, side, gutter=2, budget=32 * 1024 * 
                     for x in range(math.floor((extent.left() - origin[0]) / side),
                                    math.ceil((extent.right() - origin[0]) / side))]
     center = extent.center()
-    keys.sort(key=lambda key: (origin[0] + (key[0] + .5) * side - center.x()) ** 2
-                             + (origin[1] + (key[1] + .5) * side - center.y()) ** 2)
+    focus = (center.x(), center.y()) if focus is None else focus
+    if not all(math.isfinite(value) for value in focus):
+        focus = center.x(), center.y()
+    keys.sort(key=lambda key: (origin[0] + (key[0] + .5) * side - focus[0]) ** 2
+                             + (origin[1] + (key[1] + .5) * side - focus[1]) ** 2)
     return tuple(keys if budget is None else keys[:max(1, budget // ((side + 2 * gutter) ** 2 * 4 * planes))])
 
 
 def prepare_raster_feedback(snapshot, identifier, visible, *, caches=None,
-                            cancelled=lambda: False, budget=None):
+                            cancelled=lambda: False, budget=None, progress=None, focus=None):
     """Run on the admitted scene owner, before a pointer contact needs it."""
     eligible = feedback_chain(snapshot, identifier)
     if eligible is None or snapshot.document.live_preview or visible is None:
@@ -213,6 +256,10 @@ def prepare_raster_feedback(snapshot, identifier, visible, *, caches=None,
     before = DetachedSceneBackend(_split_snapshot(snapshot, obj, chain, suffix=False))
     after = DetachedSceneBackend(_split_snapshot(snapshot, obj, chain, suffix=True))
     source_backend = DetachedSceneBackend(replace(snapshot, cache_spec=None, graphics_worker=None))
+    # Input ownership may change inside a costly background effect, not only
+    # between prepared patches. Use the ordinary native cancellation checks.
+    for backend in (before, after, source_backend):
+        backend.scene._scene_cancelled = cancelled
     if not source_backend.scene._solo_content_visible('object', identifier):
         before.close()
         after.close()
@@ -232,24 +279,23 @@ def prepare_raster_feedback(snapshot, identifier, visible, *, caches=None,
                    * source_backend.scene.layer_world_transform(obj.parent_layer_id))
         inverse, valid = mapping.inverted()
         if mapped:
-            coefficients = (mapping.m11(), mapping.m12(), mapping.m21(), mapping.m22(), mapping.dx(), mapping.dy())
-            if (not valid or not mapping.isAffine() or not all(math.isfinite(value) for value in coefficients)):
+            coefficients = _feedback_transform_coefficients(mapping)
+            if (not valid or not all(math.isfinite(value) for value in coefficients)):
                 return None
             source_transform = coefficients
         rebuild_source = (source_transform is not None and
-            (coefficients[0] < 0. or coefficients[3] < 0. or coefficients[1] != 0. or coefficients[2] != 0.))
+            (not mapping.isAffine() or coefficients[0] < 0. or coefficients[3] < 0.
+             or coefficients[1] != 0. or coefficients[2] != 0.))
         source_images = {} if rebuild_source else None
-        def affine_coefficients(transform):
-            return (transform.m11(), transform.m12(), transform.m21(), transform.m22(), transform.dx(), transform.dy())
-        source_layers = tuple((affine_coefficients(source_backend.scene._layer_parent_transform(layer)),
+        source_layers = tuple((_feedback_transform_coefficients(source_backend.scene._layer_parent_transform(layer)),
             source_backend.scene._layer_operand_path(layer)) for layer in reversed(chain)) if rebuild_source else ()
-        source_object = (affine_coefficients(source_backend.scene._drawing_object_transform(obj)),
+        source_object = (_feedback_transform_coefficients(source_backend.scene._drawing_object_transform(obj)),
                          obj.x, obj.y) if rebuild_source else None
         patch_size = 4 * side if rebuild_source else side
         if budget is None:
             budget = (64 if rebuild_source else 32) * 1024 * 1024
         keys = feedback_keys(snapshot.document, visible, origin, patch_size, gutter, budget,
-                             planes=2 if rebuild_source else 3)
+                              planes=2 if rebuild_source else 3, focus=focus)
         if not keys:
             return None
         if caches:
@@ -274,7 +320,9 @@ def prepare_raster_feedback(snapshot, identifier, visible, *, caches=None,
             bounds = (origin[0] + key[0] * patch_size - gutter,
                       origin[1] + key[1] * patch_size - gutter, patch_size + 2 * gutter, patch_size + 2 * gutter)
             source_keys = _feedback_source_keys(bounds, inverse, side) if mapped else ()
-            if source_keys is None:
+            if source_keys is None or any(
+                    not _feedback_projective_rect_supported(mapping,
+                        QRectF(x * side, y * side, side, side)) for x, y in source_keys):
                 return None
             request = RenderRequest(bounds, 1., (patch_size + 2 * gutter,) * 2,
                                     ('raster-feedback', identifier, *key), snapshot.document.revision)
@@ -300,7 +348,7 @@ def prepare_raster_feedback(snapshot, identifier, visible, *, caches=None,
             local_visible = (inverse.mapRect(QRectF(*bounds)).adjusted(-1., -1., 1., 1.) if mapped
                 else QRectF(bounds[0] - origin[0], bounds[1] - origin[1], bounds[2], bounds[3]))
             if rebuild_source:
-                # Replacing a rotated/mirrored tile by clearing its transformed
+                # Clearing a rotated, mirrored or perspective source tile's
                 # rectangle rounds edge coverage differently from drawing its
                 # native pixels. Keep the bounded immutable original samples
                 # instead, and redraw the complete source patch in source order.
@@ -334,6 +382,15 @@ def prepare_raster_feedback(snapshot, identifier, visible, *, caches=None,
             if retained_bytes + source_bytes > budget:
                 return None
             tiles.append(tile)
+            if progress is not None and not rebuild_source:
+                # Contact-local patches can be presented as soon as they are
+                # exact. They remain private provisional resources; ordinary
+                # cache adoption still waits for the full document revision.
+                prepared = RasterFeedback(snapshot.document, identifier, origin, side, gutter,
+                    snapshot.chapter.effective_object_opacity(identifier), tuple(clips), tuple(tiles),
+                    source_transform, None, source_layers, source_object, patch_size)
+                if progress(prepared) is False:
+                    return None
         feedback = RasterFeedback(snapshot.document, identifier, origin, side, gutter,
             snapshot.chapter.effective_object_opacity(identifier), tuple(clips), tuple(tiles), source_transform,
             None if source_images is None else MappingProxyType(source_images), source_layers, source_object, patch_size)

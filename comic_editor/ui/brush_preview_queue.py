@@ -43,10 +43,24 @@ def cache_preview(key, pixmap):
 
 
 def live_brush_stroke(widget):
+    """Yield preview work to painting, including a cold native source owner.
+
+    This keeps the existing preview API used by controls. Pencil, Eraser and
+    mask contacts share the native-input lane with Brush; their source packets
+    need the same priority over synthetic preset strokes.
+    """
     while widget is not None:
         canvas=getattr(widget,'canvas',None)
-        if getattr(canvas,'_paint_brush_stroke',None) is not None:
-            return True
+        if canvas is not None:
+            if (getattr(canvas,'_paint_brush_stroke',None) is not None
+                    or getattr(canvas,'_drawing',False)
+                    or getattr(canvas,'_raster_contact_active',False)):
+                return True
+            predecessor=getattr(canvas,'_native_input_predecessor',None)
+            if callable(predecessor) and predecessor() is not None:
+                # A received pen-down or released-but-pending transaction may
+                # still be loading its source before `_drawing` becomes true.
+                return True
         widget=widget.parentWidget() if hasattr(widget,'parentWidget') else widget.parent()
     return False
 

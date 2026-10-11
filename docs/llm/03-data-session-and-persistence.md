@@ -529,6 +529,14 @@ capture. Derived render caches remain excluded from the clone.
 
 ## Editor settings data
 
+UI themes persist separately in per-user `themes.json` beside `settings.json`.
+`core/ui_themes.py` owns validated base palettes, bounded hue/saturation/
+brightness/contrast adjustments, the selected theme ID, collision-safe imports
+and custom theme records. The Settings Themes tab stages edits and restores
+the previous application palette on Cancel; OK writes through the existing
+atomic writer. Bundled `ui/themes.json` presets are immutable. Themes never
+enter series/chapter records, source pixels, or durable artwork cache entries.
+
 `EditorSettings` is version 23 and is written to the platform path returned by Qt's `QStandardPaths.AppConfigLocation`, in `settings.json`. It is not stored in the portable series folder.
 
 It contains:

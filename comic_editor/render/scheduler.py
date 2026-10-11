@@ -16,7 +16,8 @@ from threading import Condition, Event
 
 from comic_editor.render.service import DocumentRenderService, TileBatchPolicy, RenderRequest, RenderQuality
 from comic_editor.render.scene import DetachedSceneBackend
-from comic_editor.render.admission import RENDER_ADMISSION, WorkCancelled, snapshot_working_bytes
+from comic_editor.render.admission import CopyLease, RENDER_ADMISSION, WorkCancelled, snapshot_working_bytes
+from comic_editor.render.ordinary_contact_capture import ContactSceneSnapshot
 from comic_editor.render.source_resources import ReadyOriginals
 
 
@@ -49,6 +50,10 @@ class SceneDemand:
     record: bool = False
     presentation_size: tuple | None = None
     feedback_target: str = ''
+    feedback_requests: tuple | None = None
+    feedback_only: bool = False
+    feedback_originals: object = None
+    contact_preview_owner: tuple | None = None
 
 
 @dataclass(frozen=True)
@@ -70,8 +75,9 @@ class SceneCompletion:
 
 def demand_working_bytes(demand):
     size = snapshot_working_bytes(demand.snapshot)
-    if demand.feedback_target:
-        size += 64 * 1024 * 1024
+    if demand.feedback_target and not demand.snapshot.document.live_preview:
+        from comic_editor.render.filtered_raster_feedback import FILTERED_PREPARED_BUDGET
+        size += FILTERED_PREPARED_BUDGET
     if demand.presentation_size is not None and demand.visible is not None:
         width,height = demand.presentation_size
         tile_size = max((request.tile_size for request in demand.requests),default=256)
@@ -84,12 +90,13 @@ def demand_working_bytes(demand):
 
 
 class SceneScheduler:
-    def __init__(self, *, handoff_budget=64 * 1024 * 1024):
+    def __init__(self, *, handoff_budget=64 * 1024 * 1024, ready_callback=None):
         self.executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="scene-evaluate")
         self.condition = Condition()
         self.stopped = Event()
         self.cancelled = Event()
         self.future = None
+        self.active_demand = None
         self.pending = None
         self.ready = deque()
         self.ready_bytes = 0
@@ -100,13 +107,48 @@ class SceneScheduler:
         self._cache_identity = None
         self._originals = ReadyOriginals()
         self._transfers = set()
+        self.ready_callback = ready_callback
 
     @property
     def busy(self):
         return self.future is not None or self.pending is not None or bool(self._transfers)
 
-    def submit(self, demand):
-        self.cancel()
+    def _contact_preview_bounded(self, demand):
+        if demand.contact_preview_owner is None:
+            return False
+        document = demand.snapshot.document
+        size = demand.preview_size
+        return (demand.contact_preview_owner is not None and document.live_preview
+            and document.contact_only and demand.consumer == 'canvas' and not demand.record
+            and not demand.feedback_only and demand.presentation_size is None
+            and demand.phases in ((None,), ('base', 'top')) and demand.visible is not None
+            and size is not None and len(size) == 2
+            and all(type(value) is int and value > 0 for value in size)
+            and size[0] * size[1] * (16 if document.pixel_contract.floating else 4)
+                <= self.handoff_budget)
+
+    def _coalesces_contact_preview(self, demand):
+        active = self.active_demand
+        if (active is None or self.future is None or self.cancelled.is_set() or self._transfers
+                or not self._contact_preview_bounded(active) or not self._contact_preview_bounded(demand)):
+            return False
+        return (active.contact_preview_owner == demand.contact_preview_owner
+            and active.serial <= demand.serial
+            and active.snapshot.document.revision <= demand.snapshot.document.revision
+            and replace(active.snapshot.document, revision=0) == replace(demand.snapshot.document, revision=0)
+            and active.requests == demand.requests and active.phases == demand.phases
+            and active.visible == demand.visible and active.preview_size == demand.preview_size
+            and active.feedback_target == demand.feedback_target
+            and getattr(active.snapshot.pixel_environment, 'signature', None)
+                == getattr(demand.snapshot.pixel_environment, 'signature', None))
+
+    def submit(self, demand, *, coalesce_active=False):
+        # Only complete immutable native-contact snapshots take this exception.
+        # Existing exact/export/materialization/other consumers still cancel.
+        if demand.contact_preview_owner is not None and not self._contact_preview_bounded(demand):
+            demand = replace(demand, contact_preview_owner=None)
+        if not coalesce_active or not self._coalesces_contact_preview(demand):
+            self.cancel()
         self.pending = demand
         self._start()
 
@@ -121,10 +163,31 @@ class SceneScheduler:
             self.ready_bytes = 0
             self.condition.notify_all()
 
+    def ready_feedback_originals(self, identity):
+        """Queue a source-only handoff on this lane's owning thread.
+
+        Callers use it only if already ready; cold input never waits for another
+        scene evaluator. Adoption retains the existing pin/version validation.
+        """
+        return self.executor.submit(self._feedback_originals, identity)
+
+    def _feedback_originals(self, identity):
+        originals = ReadyOriginals()
+        backend = self._backend
+        if (backend is not None and backend.snapshot.document.identity == identity
+                and not backend.snapshot.document.live_preview):
+            originals.capture(backend.snapshot)
+        elif self._originals.identity is not None and self._originals.identity[0] == identity:
+            originals.identity = self._originals.identity
+            originals.images = self._originals.images
+            originals.tiles = self._originals.tiles
+        return originals
+
     def _start(self):
         if self.future is not None or self.pending is None or self.stopped.is_set():
             return
         demand, self.pending = self.pending, None
+        self.active_demand = demand
         token = self.cancelled = Event()
         self.future = self.executor.submit(self._evaluate, demand, token)
         self.submitted += 1
@@ -139,7 +202,47 @@ class SceneScheduler:
         if completion.feedback is not None:
             size += completion.feedback.byte_count
         with self.condition:
-            while self.ready and self.ready_bytes + size > self.handoff_budget:
+            if completion.demand.feedback_only and completion.feedback is not None:
+                # Each progressive value contains the preceding ready patches.
+                # Keep one latest handoff instead of retaining cumulative plane
+                # aliases for every patch while the GUI processes input.
+                retained = deque()
+                for previous in self.ready:
+                    if (previous.demand.feedback_only
+                            and previous.demand.serial == completion.demand.serial
+                            and previous.feedback is not None):
+                        self.ready_bytes -= previous.feedback.byte_count
+                    else:
+                        retained.append(previous)
+                self.ready = retained
+            contact_preview = (self._contact_preview_bounded(completion.demand)
+                and completion.preview is not None and completion.done and not completion.error
+                and not completion.tiles and completion.materialized is None
+                and completion.overview is None and completion.feedback is None
+                and not completion.recorded and not completion.recorded_rows and completion.cache_manifest is None)
+            if contact_preview:
+                # Do not hold render admission while waiting for the GUI. The
+                # owned preview size was bounded before submission; retain one
+                # latest provisional output for this owner, never exact tiles.
+                retained = deque()
+                for previous in self.ready:
+                    if (previous.preview is not None and previous.done and not previous.error
+                            and not previous.recorded and not previous.recorded_rows
+                            and previous.cache_manifest is None
+                            and previous.demand.serial <= completion.demand.serial
+                            and previous.demand.snapshot.document.revision <= completion.demand.snapshot.document.revision
+                            and previous.demand.contact_preview_owner
+                            == completion.demand.contact_preview_owner and not previous.tiles
+                            and previous.materialized is None and previous.overview is None
+                            and previous.feedback is None):
+                        self.ready_bytes -= int(previous.preview.image.sizeInBytes())
+                        self.discarded += 1
+                    else:
+                        retained.append(previous)
+                self.ready = retained
+                if self.ready_bytes + size > self.handoff_budget:
+                    return False
+            while not contact_preview and self.ready and self.ready_bytes + size > self.handoff_budget:
                 if token.is_set() or self.stopped.is_set():
                     return False
                 self.condition.wait(.05)
@@ -147,7 +250,14 @@ class SceneScheduler:
                 return False
             self.ready.append(completion)
             self.ready_bytes += size
-            return True
+        if self.ready_callback is not None:
+            try:
+                self.ready_callback()
+            except RuntimeError:
+                # A queued GUI receiver may retire immediately after publish.
+                # Its owner closes this lane; completed resources remain guarded.
+                pass
+        return True
 
     def materialize(self, demand, images):
         """Queue a real raster/display consumer on the existing detached lane."""
@@ -193,6 +303,26 @@ class SceneScheduler:
 
     def _evaluate(self, demand, token):
         try:
+            if isinstance(demand.snapshot, ContactSceneSnapshot):
+                if token.is_set() or self.stopped.is_set():
+                    return  # Retired work never inspects its released lease/context.
+                snapshot = demand.snapshot
+                holder = snapshot.capture_lease
+                copies = getattr(holder, 'lease', None)
+                if (not self._contact_preview_bounded(demand)
+                        or snapshot.contact_preview_owner != demand.contact_preview_owner
+                        or snapshot.cache_spec is not None or snapshot.graphics_worker is not None
+                            and getattr(snapshot.graphics_worker, 'closed', False)
+                        or not isinstance(copies, CopyLease)
+                        or copies.admission is not RENDER_ADMISSION or copies.released):
+                    raise ValueError('Private contact capture requires its live owned copy lease')
+                # Charge the complete unchanged worker estimate AND retained
+                # private copies; credit those exact already-reserved copies
+                # once through the existing admission implementation.
+                size = demand_working_bytes(demand) + copies.size
+                with RENDER_ADMISSION.reserve(demand.consumer, size, priority=0,
+                        cancelled=lambda: token.is_set() or self.stopped.is_set(), copies=copies):
+                    return self._evaluate_admitted(demand, token)
             with RENDER_ADMISSION.reserve(demand.consumer, demand_working_bytes(demand),
                     priority=1 if demand.record else 2 if demand.consumer == "navigator" else 0,
                     cancelled=lambda: token.is_set() or self.stopped.is_set()):
@@ -205,6 +335,22 @@ class SceneScheduler:
             if token.is_set() or self.stopped.is_set():
                 return
             snapshot = demand.snapshot
+            if demand.feedback_only:
+                # A contact's separable planes have a stable dependency owner.
+                # Selected pixels can advance while this private preparation
+                # finishes; it must neither render nor record ordinary tiles.
+                if demand.record or snapshot.cache_spec is not None or snapshot.document.live_preview:
+                    raise ValueError('Contact preparation requires a private nonrecording snapshot')
+                originals = demand.feedback_originals
+                if originals is not None and originals.done() and not originals.cancelled():
+                    originals.result().adopt(snapshot)
+                from comic_editor.render.raster_feedback import prepare_raster_feedback
+                feedback = prepare_raster_feedback(snapshot, demand.feedback_target, demand.visible,
+                    budget=64 * 1024 * 1024,
+                    cancelled=lambda: token.is_set() or self.stopped.is_set(), focus=demand.center,
+                    progress=lambda prepared: self._publish(SceneCompletion(demand, feedback=prepared), token))
+                self._publish(SceneCompletion(demand, done=True, feedback=feedback), token)
+                return
             if demand.consumer == "navigator":
                 chapter = copy.copy(snapshot.chapter)
                 chapter.objects = dict(chapter.objects)
@@ -358,6 +504,12 @@ class SceneScheduler:
             feedback = prepare_raster_feedback(demand.snapshot, demand.feedback_target, demand.visible,
                 caches=backend.scene.cache_state(),
                 cancelled=lambda: token.is_set() or self.stopped.is_set())
+            if feedback is None and demand.phases == (None,):
+                from comic_editor.render.filtered_raster_feedback import prepare_filtered_raster_feedback
+                feedback = prepare_filtered_raster_feedback(demand.snapshot,demand.feedback_target,
+                    demand.requests if demand.feedback_requests is None else demand.feedback_requests,
+                    demand.visible,caches=backend.scene.cache_state(),
+                    cancelled=lambda: token.is_set() or self.stopped.is_set())
             if feedback is not None:
                 self._publish(SceneCompletion(demand, feedback=feedback), token)
 
@@ -370,6 +522,7 @@ class SceneScheduler:
         if self.future is not None and self.future.done():
             self.future.result()
             self.future = None
+            self.active_demand = None
             self.completed += 1
             self._start()
         self._transfers = {future for future in self._transfers if not future.done()}

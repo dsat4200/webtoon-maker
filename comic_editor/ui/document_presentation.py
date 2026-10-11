@@ -8,9 +8,12 @@ same inputs. Neither path changes document data or reads pixels back from GL.
 from __future__ import annotations
 
 from collections import OrderedDict
+from comic_editor.ui.themes import theme_color
 import ctypes
 from dataclasses import dataclass
+from functools import lru_cache
 import logging
+import math
 from typing import Hashable, Iterable
 import weakref
 
@@ -18,7 +21,7 @@ import numpy as np
 from PySide6.QtCore import QPointF, QRect, QRectF, QSizeF, Qt
 from PySide6.QtGui import (
     QColor, QImage, QOpenGLContext, QPainter, QPainterPath,
-    QPainterPathStroker, QPen, QPolygonF, QTransform,
+    QPainterPathStroker, QPen, QPolygonF, QRegion, QTransform,
 )
 from PySide6.QtOpenGL import (
     QOpenGLBuffer, QOpenGLFunctions_3_3_Core, QOpenGLShader,
@@ -484,9 +487,11 @@ def _discard_native_raster_mosaic(owner):
 
 def _native_raster_mosaic(owner, tiles, camera, viewport_size, native_bounds,
                           context, *, smooth=True, presentation_dpr=1.):
-    """Join a small complete current native batch without changing any pixels.
+    """Join a small complete owned native batch without changing any pixels.
 
-    The caller proves that the owned batch is already-current exact artwork.
+    The caller proves complete native coverage of its coherent owned batch.
+    Filtered contact batches remain provisional, including their last
+    completed pixels while another source packet is pending.
     Only Legacy ARGB32 native tiles are supported initially. All other formats,
     missing coverage, large views and non-axis-aligned cameras keep their prior
     presentation path. There is at most one4MiB surface, no retained tile handles
@@ -514,11 +519,14 @@ def _native_raster_mosaic(owner, tiles, camera, viewport_size, native_bounds,
     if not all(math.isfinite(v) and v == round(v) for v in bounds_values):
         return reject()
     visible = inverse.mapRect(QRectF(0, 0, viewport_size.width(), viewport_size.height())).intersected(native_bounds)
-    # Initial native-frame equivalence is proven for integral capture frames.
-    # Fractional frames keep the original path; do not invent a sampling shift.
-    if not all(math.isfinite(v) and v == round(v) for v in visible.getRect()):
+    if not all(math.isfinite(v) for v in visible.getRect()):
         return reject()
-    region = visible.toAlignedRect().intersected(native_bounds.toAlignedRect())
+    region = visible.toAlignedRect()
+    if any(v != round(v) for v in visible.getRect()):
+        # Keep the original integer native grid and the neighboring samples
+        # needed for display filtering at a fractional viewport edge.
+        region = region.adjusted(-1, -1, 1, 1)
+    region = region.intersected(native_bounds.toAlignedRect())
     width, height = region.width(), region.height()
     if (region.isEmpty() or width > _NATIVE_RASTER_MOSAIC_SIDE
             or height > _NATIVE_RASTER_MOSAIC_SIDE
@@ -601,10 +609,128 @@ def _draw_native_raster_mosaic(painter, mosaic, camera, contract, environment, *
         painter.restore()
 
 
+def _raster_tile_ownership(painter, tile, world, source):
+    """Own disjoint physical pixels while retaining the tile's native gutters.
+
+    Antialiased destination rectangle edges would mix a ready frame with the
+    new image and then mix it again when a live patch replaces that tile. The
+    common axis-aligned native layout instead clips at shared physical pixel
+    boundaries and draws its existing neighboring samples beneath the clip.
+    This changes only presentation geometry, never native artwork sampling.
+    """
+    device = painter.deviceTransform()
+    return _raster_tile_ownership_geometry(
+        (device.m11(), device.m12(), device.m13(), device.m21(), device.m22(),
+         device.m23(), device.m31(), device.m32(), device.m33()),
+        tuple(world.getRect()), tuple(source.getRect()), tile.image.width(),
+        tile.image.height(), tile.image.devicePixelRatio())
+
+
+@lru_cache(maxsize=256)
+def _raster_tile_ownership_geometry(values, world_values, source_values,
+                                    image_width, image_height, image_ratio):
+    # Contact replaces pixels frequently under unchanged placement. This memo
+    # retains only bounded geometry; its keys contain no image, document,
+    # revision, widget or graphics handle. Camera, clipping and density changes
+    # select different geometry without extending native artwork resolution.
+    world, source = QRectF(*world_values), QRectF(*source_values)
+    if (image_ratio != 1.
+            or source.width() != world.width() or source.height() != world.height()
+            or not QRectF(0, 0, image_width, image_height).contains(source)
+            or source.left() < 1. or source.top() < 1.
+            or image_width - source.right() < 1.
+            or image_height - source.bottom() < 1.):
+        return None
+    if (not all(math.isfinite(value) for value in values)
+            or values[2] != 0 or values[5] != 0 or values[8] != 1.
+            or values[0] <= 0 or values[4] <= 0 or values[1] != 0 or values[3] != 0):
+        return None
+    device = QTransform(*values)
+    physical = device.mapRect(world)
+    if not all(math.isfinite(value) for value in physical.getRect()):
+        return None
+    left, top, right, bottom = (round(physical.left()), round(physical.top()),
+                              round(physical.right()), round(physical.bottom()))
+    return (QRectF(left, top, right - left, bottom - top),
+            QRectF(world.x() - source.x(), world.y() - source.y(),
+                   image_width, image_height))
+
+
+def _draw_owned_raster_tile(painter, tile, ownership, replace_background=None):
+    physical, expanded = ownership
+    if physical.isEmpty():
+        return
+    painter.save()
+    try:
+        camera = painter.transform()
+        painter.resetTransform()
+        inverse, valid = painter.deviceTransform().inverted()
+        if not valid:
+            return
+        painter.setRenderHint(QPainter.Antialiasing, False)
+        painter.setClipRect(inverse.mapRect(physical), Qt.IntersectClip)
+        if replace_background is not None:
+            painter.fillRect(inverse.mapRect(physical), replace_background)
+        painter.setTransform(camera)
+        with pixel_scope(tile.pixel_contract, environment=tile.pixel_environment):
+            painter.drawImage(expanded, display_image(tile.image, tile.pixel_contract),
+                              QRectF(tile.image.rect()))
+    finally:
+        painter.restore()
+
+
+def _owned_raster_paint_damage(painter, owner, camera, clip_world):
+    """Physical damage for this owned software paint, without adding a clip.
+
+    Qt owns the paint-event clip. Changing image/source rectangles or installing
+    a second clip can alter fractional sampling. This region only rejects
+    disjoint, already-owned tile destinations; remaining draws stay identical.
+    """
+    logical = getattr(owner, '_document_presentation_paint_region', None)
+    if (not isinstance(logical, QRegion) or logical.isEmpty()
+            or painter.device() is not owner or painter.hasClipping()
+            or painter.compositionMode() != QPainter.CompositionMode_SourceOver
+            or clip_world is not None):
+        return None
+    from comic_editor.ui.canvas import RasterCanvasWidget
+    if not isinstance(owner, RasterCanvasWidget):
+        return None
+
+    def axis_aligned(transform):
+        values = (transform.m11(), transform.m12(), transform.m13(),
+                  transform.m21(), transform.m22(), transform.m23(),
+                  transform.m31(), transform.m32(), transform.m33())
+        return (all(math.isfinite(value) for value in values)
+                and values[0] > 0. and values[4] > 0.
+                and values[1] == values[2] == values[3] == values[5] == 0.
+                and values[8] == 1.)
+
+    if not axis_aligned(camera):
+        return None
+    painter.save()
+    try:
+        painter.resetTransform()
+        device = painter.deviceTransform()
+    finally:
+        painter.restore()
+    if not axis_aligned(device):
+        return None
+    physical = []
+    for rectangle in logical:
+        mapped = device.mapRect(QRectF(rectangle))
+        if not all(math.isfinite(value) for value in mapped.getRect()):
+            return None
+        # Outward rounding plus one physical pixel deliberately overdraws at
+        # fractional DPR/system-clip boundaries. Ownership clips stay intact.
+        physical.append(QRectF(mapped.toAlignedRect().adjusted(-1, -1, 1, 1)))
+    return tuple(physical)
+
+
 def draw_document_tiles(painter: QPainter, tiles: Iterable[PresentedTile],
                         camera: QTransform, viewport_size: QSizeF, *, owner=None,
                         smooth=True, clip_world: QRectF | None = None,
-                        native_context=None, native_bounds: QRectF | None = None) -> PresentationStats:
+                        native_context=None, native_bounds: QRectF | None = None,
+                        replace_background=None) -> PresentationStats:
     """Present tiles, preserving the painter for subsequent tool/grid overlays.
 
     An arbitrary existing painter clip or nonstandard composition mode uses the
@@ -614,7 +740,7 @@ def draw_document_tiles(painter: QPainter, tiles: Iterable[PresentedTile],
     from PySide6.QtOpenGLWidgets import QOpenGLWidget
 
     tiles = tuple(tiles)
-    if (isinstance(owner, QOpenGLWidget) and painter.device() is owner
+    if (replace_background is None and isinstance(owner, QOpenGLWidget) and painter.device() is owner
             and not painter.hasClipping()
             and painter.compositionMode() == QPainter.CompositionMode_SourceOver):
         presenter = getattr(owner, "_document_tile_presenter", None)
@@ -668,6 +794,9 @@ def draw_document_tiles(painter: QPainter, tiles: Iterable[PresentedTile],
             _discard_native_raster_mosaic(owner)
     elif owner is not None and getattr(owner, '_native_raster_mosaic', None) is not None:
         _discard_native_raster_mosaic(owner)
+    # Decide the complete native presentation path before any draw rejection.
+    # Filtering the batch itself would change mosaic admission and its phase.
+    paint_damage = _owned_raster_paint_damage(painter, owner, camera, clip_world)
     painter.save()
     painter.setTransform(camera)
     painter.setRenderHint(QPainter.SmoothPixmapTransform, bool(smooth))
@@ -675,8 +804,15 @@ def draw_document_tiles(painter: QPainter, tiles: Iterable[PresentedTile],
         rectangles = _tile_rectangles(tile, clip_world)
         if rectangles is not None:
             world, source = rectangles
-            with pixel_scope(tile.pixel_contract,environment=tile.pixel_environment):
-                painter.drawImage(world, display_image(tile.image,tile.pixel_contract), source)
+            ownership = _raster_tile_ownership(painter, tile, world, source)
+            if ownership is not None:
+                if (paint_damage is not None
+                        and not any(ownership[0].intersects(damage) for damage in paint_damage)):
+                    continue
+                _draw_owned_raster_tile(painter, tile, ownership, replace_background)
+            else:
+                with pixel_scope(tile.pixel_contract,environment=tile.pixel_environment):
+                    painter.drawImage(world, display_image(tile.image,tile.pixel_contract), source)
     painter.restore()
     return PresentationStats("raster", len(tiles))
 
@@ -719,7 +855,7 @@ def _border_patches(polygon: QPolygonF, viewport: QSizeF, ratio: float):
             raster = QPainter(image)
             raster.setRenderHint(QPainter.Antialiasing, True)
             raster.translate(-cropped.x() / ratio, -cropped.y() / ratio)
-            raster.setPen(QPen(QColor("#44444d"), 1))
+            raster.setPen(QPen(theme_color("border", "#44444d"), 1))
             raster.setBrush(Qt.NoBrush)
             raster.drawPolygon(polygon)
             raster.end()
@@ -743,14 +879,14 @@ def draw_document_border(painter: QPainter, chapter_rect: QRectF, camera: QTrans
         painter.setTransform(QTransform())
         if not (isinstance(owner, QOpenGLWidget) and painter.device() is owner):
             painter.setRenderHint(QPainter.Antialiasing, True)
-            painter.setPen(QPen(QColor("#44444d"), 1))
+            painter.setPen(QPen(theme_color("border", "#44444d"), 1))
             painter.setBrush(Qt.NoBrush)
             painter.drawPolygon(polygon)
             return
         ratio = owner.devicePixelRatioF()
         viewport = QSizeF(viewport_size)
         key = (tuple((point.x(), point.y()) for point in polygon), ratio,
-               viewport.width(), viewport.height())
+               viewport.width(), viewport.height(), theme_color("border", "#44444d").name())
         cache = getattr(owner, "_document_border_cache", None)
         if cache is None or cache[0] != key:
             cache = key, _border_patches(polygon, viewport, ratio)

@@ -3,7 +3,7 @@ from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
-from PySide6.QtCore import QPointF, QTimer
+from PySide6.QtCore import QObject, QPointF, QTimer
 from PySide6.QtGui import QColor, QImage, QPainter
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QWidget
@@ -128,6 +128,58 @@ def test_running_preview_pauses_while_canvas_stroke_is_active(cooperative):
     owner.canvas._paint_brush_stroke=None;drain(queue)
     assert len(owner.results)==1
     owner.deleteLater()
+
+
+@pytest.mark.parametrize('contact_state', [
+    {'_drawing':True},  # Admitted Pencil, Eraser or mask packets.
+    {'_raster_contact_active':True},  # Received contact, before source loading.
+    {'_native_input_predecessor':lambda:object()},  # Released native owner still draining.
+])
+def test_synthetic_preview_does_no_work_during_other_painting_contacts(cooperative,contact_state):
+    queue,state=cooperative;owner=Owner()
+    owner.canvas=SimpleNamespace(_paint_brush_stroke=None,**contact_state)
+    queue.submit(owner,BrushDefinition(name='old'),100,44)
+    for _ in range(20):
+        queue.timer.stop();queue._tick()
+        assert queue.timer.isActive() and queue.timer.interval()==33
+    assert not state['started'] and not state['steps'] and not owner.results
+    assert queue.active is not None and queue.active['iterator'] is None
+    owner.canvas=SimpleNamespace(_paint_brush_stroke=None)
+    drain(queue)
+    assert len(owner.results)==1 and state['closed']==['old']
+    owner.deleteLater()
+
+
+def test_running_preview_keeps_its_iterator_and_resumes_after_native_release(cooperative):
+    queue,state=cooperative;owner=Owner()
+    owner.canvas=SimpleNamespace(_paint_brush_stroke=None,_native_input_predecessor=lambda:None)
+    queue.submit(owner,BrushDefinition(name='old'),100,44)
+    queue._tick();queue.timer.stop()
+    before=list(state['steps']);iterator=queue.active['iterator']
+    owner.canvas._native_input_predecessor=lambda:object()
+    for _ in range(20):
+        queue.timer.stop();queue._tick()
+    assert state['steps']==before and not state['closed'] and not owner.results
+    assert queue.active['iterator'] is iterator
+    owner.canvas._native_input_predecessor=lambda:None
+    drain(queue)
+    assert len(owner.results)==1 and state['started']==['old'] and state['closed']==['old']
+    owner.deleteLater()
+
+
+def test_thumbnail_qobject_parent_chain_observes_cold_canvas_contact(cooperative):
+    queue,state=cooperative;parent=Owner();parent.canvas=SimpleNamespace(_raster_contact_active=True)
+    owner=QObject(parent)
+    results=[]
+    owner._preview_is_visible=lambda:True
+    owner._preview_ready=lambda *args:results.append(args)
+    queue.submit(owner,BrushDefinition(name='old'),100,44)
+    queue._tick();queue.timer.stop()
+    assert not state['started'] and not results
+    parent.canvas._raster_contact_active=False
+    drain(queue)
+    assert len(results)==1 and state['started']==['old']
+    parent.deleteLater()
 
 
 def test_only_one_iterator_retains_raster_work_and_hiding_discards_it(cooperative):

@@ -6,7 +6,7 @@ import argparse
 from pathlib import Path
 
 from PySide6.QtCore import QCoreApplication, QTimer, Qt
-from PySide6.QtGui import QSurfaceFormat
+from PySide6.QtGui import QIcon, QSurfaceFormat
 from PySide6.QtWidgets import QApplication, QMessageBox
 
 from comic_editor.launch import FileLaunchBroker
@@ -37,6 +37,10 @@ def main() -> int:
     app = QApplication(sys.argv)
     app.setApplicationName("Vertical Comic Editor")
     app.setOrganizationName("VerticalComicEditor")
+    app.setWindowIcon(QIcon(str(Path(__file__).parent / "comic_editor/ui/assets/webtoon-maker.ico")))
+    if sys.platform == "win32":
+        import ctypes
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("WebtoonMaker.Desktop")
     broker = FileLaunchBroker(app)
     try:
         if not broker.start(paths):

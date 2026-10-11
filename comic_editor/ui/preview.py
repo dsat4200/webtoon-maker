@@ -5,6 +5,8 @@ from PySide6.QtCore import QPointF, QRect, QRectF, Qt, QTimer, Signal
 from PySide6.QtGui import QColor, QImage, QMouseEvent, QPainter, QPen, QPolygonF
 from PySide6.QtWidgets import QApplication, QWidget
 
+from comic_editor.ui.themes import theme_color
+
 
 class ChapterPreview(QWidget):
     scrollRequested = Signal(float)
@@ -219,7 +221,7 @@ class ChapterPreview(QWidget):
 
     def paintEvent(self, event) -> None:  # noqa: N802
         painter = QPainter(self)
-        painter.fillRect(self.rect(), QColor("#18181c"))
+        painter.fillRect(self.rect(), theme_color("panel", "#18181c"))
         if self.canvas.chapter is None:
             return
         preview_rect = self.content_rect()
@@ -239,8 +241,11 @@ class ChapterPreview(QWidget):
         handle = QRect(
             preview_rect.left(), handle_top, preview_rect.width(), handle_height
         ).intersected(preview_rect)
-        painter.setPen(QPen(QColor("#80c8ff"), 2))
-        painter.setBrush(QColor(128, 200, 255, 35))
+        accent = theme_color("accent", "#80c8ff")
+        painter.setPen(QPen(accent, 2))
+        handle_fill = QColor(accent)
+        handle_fill.setAlpha(35)
+        painter.setBrush(handle_fill)
         painter.drawRect(handle)
         cache = self.disk_cache
         if cache is not None and cache.backing is not None:
@@ -254,8 +259,8 @@ class ChapterPreview(QWidget):
                 if cache.building and row in cache.selected_rows and not cache.status.get(row, False):
                     color = "#eab345"
                 painter.fillRect(QRectF(x, top, 3, max(1., bottom - top)), QColor(color))
-            painter.setPen(QPen(QColor("#eeeeee"), 1))
-            painter.setBrush(QColor("#eeeeee"))
+            painter.setPen(QPen(theme_color("text", "#eeeeee"), 1))
+            painter.setBrush(theme_color("text", "#eeeeee"))
             start = preview_rect.top() + cache.start_y / height * preview_rect.height()
             end = preview_rect.top() + cache.end_y / height * preview_rect.height()
             painter.drawLine(QPointF(x + 5, start), QPointF(x + 5, end))

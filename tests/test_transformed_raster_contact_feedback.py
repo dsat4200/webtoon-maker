@@ -163,7 +163,7 @@ def test_transformed_pruned_native_source_reveals_prefix_without_repainting_the_
     assert ready_paint(canvas).pixelColor(32, 64) == QColor('blue')
 
 
-@pytest.mark.parametrize('case', ['perspective', 'collapsed', 'folded', 'nan'])
+@pytest.mark.parametrize('case', ['collapsed', 'folded', 'nan'])
 def test_unsupported_mapping_keeps_native_detached_evaluation_required(scene, case, wait_scene):
     canvas, selected, _front = scene
     wait_scene(canvas)

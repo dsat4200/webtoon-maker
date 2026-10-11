@@ -71,8 +71,30 @@ class SceneTileStore(TileStore):
         return self._tiles[identifier]
 
 
+def _immutable_tuple(value):
+    """Prove nested built-in key ownership without recursive copies."""
+    pending = [value]
+    while pending:
+        for item in pending.pop():
+            kind = type(item)
+            if kind is tuple:
+                pending.append(item)
+            elif item is not None and kind not in (bool, int, float, str, bytes):
+                return False
+    return True
+
+
 def detached_value(value):
     """Copy Qt values and plain records without copying editor/native owners."""
+    # Exact built-in scalar values already satisfy the detached ownership
+    # contract. Cache-key leaves need neither deepcopy nor Qt type imports.
+    if value is None or type(value) in (bool, int, float, str, bytes):
+        return value
+    if type(value) is tuple and all(item is None or type(item) in
+            (bool, int, float, str, bytes) for item in value):
+        return value
+    if type(value) is tuple and _immutable_tuple(value):
+        return value
     if isinstance(value, (QImage, QPainterPath, QPolygonF, QTransform, QRectF,
                           QRect, QSize, QPointF)):
         return type(value)(value)
@@ -368,7 +390,7 @@ class SceneCapture:
             (str(backing.root), tuple(backing.contract), tuple(backing.environment))
             if backing is not None and not backing.closed else None)
 
-    def _capture_tiles(self, source_store, namespace):
+    def _capture_tiles(self, source_store, namespace, *, source_keys=None):
         """Stage independent native handles and pins for artwork or live ink."""
         compiler = self.compiler
         tiles = SceneTileStore(source_store.tile_size, cache_budget=64 * 1024 * 1024)
@@ -387,7 +409,7 @@ class SceneCapture:
         # Register pin batches immediately so resource publication respects them.
         for identifier, source in source_store._tiles.items():
             target = tiles._object_tiles(identifier)
-            for key in source:
+            for key in source if source_keys is None else source_keys.get(identifier, ()):
                 source.version(key)
                 value = source.entries[key]
                 if isinstance(value, Path):
@@ -887,7 +909,16 @@ class DetachedSceneBackend:
                 if backing is not None:
                     backing.close()
             finally:
-                self.scene._image_residency_pool.clear()
+                try:
+                    self.scene._image_residency_pool.clear()
+                finally:
+                    # Closed renderer helpers must not keep native snapshots
+                    # alive through owner cycles while stroke GC is suspended.
+                    # Externally owned snapshots still retain their copy lease.
+                    if self.scene._effect_jobs.owner is self.scene:
+                        self.scene._effect_jobs.owner = None
+                    if self.scene._render_bounds.canvas is self.scene:
+                        self.scene._render_bounds.canvas = None
 
     def _record_allowed(self):
         document = self.snapshot.document

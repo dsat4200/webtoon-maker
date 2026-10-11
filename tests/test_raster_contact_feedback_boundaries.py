@@ -83,8 +83,9 @@ def boundary_scene(canvas,selected,front,format,opacity):
     painter.fillRect(24,20,16,90,QColor('green'))
     painter.end()
     # The foreground crosses the drawn line in world tile 1.
-    canvas.tiles.set_tile(front.object_id,(0,0),QImage(256,256,QImage.Format_ARGB32_Premultiplied))
-    canvas.tiles.tile(front.object_id,(0,0)).fill(Qt.transparent)
+    empty=QImage(256,256,QImage.Format_ARGB32_Premultiplied)
+    empty.fill(Qt.transparent)
+    canvas.tiles.set_tile(front.object_id,(0,0),empty)
     canvas.tiles.set_tile(front.object_id,(1,0),image)
     colors=(QColor.fromRgbF(.0713,.2817,.7891,.3527),
             QColor.fromRgbF(.7831,.3173,.0719,.7243),

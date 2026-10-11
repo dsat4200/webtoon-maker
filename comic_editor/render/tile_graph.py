@@ -39,7 +39,7 @@ class TileCacheMiss(Exception):
 
 class TileGraph:
     def __init__(self, nodes, source, get, put, *, cache_only=False, tile_size=TILE_SIZE,
-                 continue_pending=None):
+                 continue_pending=None, region_evaluation=False):
         if not isinstance(tile_size, int) or tile_size <= 0:
             raise ValueError('Tile size must be a positive integer')
         self.nodes = tuple(nodes)
@@ -48,6 +48,7 @@ class TileGraph:
         self.get, self.put = get, put
         self.cache_only = cache_only
         self.tile_size = tile_size
+        self.region_evaluation = region_evaluation
         self._request_cache = {}
         self._frames = {}
 
@@ -94,7 +95,13 @@ class TileGraph:
         frame_key = (index, tuple(requested.getRect()))
         if frame_key in self._frames:
             return self._frames[frame_key]
-        coverage = list(tiles(node.frame, requested.intersected(node.frame), self.tile_size))
+        regional = (self.region_evaluation is True or self.region_evaluation
+            and index in self.region_evaluation)
+        if regional and index > 0:
+            bounds = requested.intersected(node.frame)
+            coverage = [] if bounds.isEmpty() else [(tuple(bounds.getRect()), bounds)]
+        else:
+            coverage = list(tiles(node.frame, requested.intersected(node.frame), self.tile_size))
         if len(coverage) == 1 and coverage[0][1] == requested:
             address, bounds = coverage[0]
             image = self.tile(index, address, bounds)

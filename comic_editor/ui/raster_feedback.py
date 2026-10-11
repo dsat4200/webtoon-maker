@@ -1,9 +1,12 @@
 """Present native edited pixels using detached scene resources only."""
 from collections import OrderedDict
+from dataclasses import replace
+import math
 from PySide6.QtCore import QRect, QRectF, Qt
-from PySide6.QtGui import QColor, QImage, QPainter, QPen, QTransform
+from PySide6.QtGui import QColor, QImage, QPaintEngine, QPainter, QPen, QTransform
 from comic_editor.core.tools import ToolKind
-from comic_editor.ui.document_presentation import PresentedTile, draw_document_tiles
+from comic_editor.ui.document_presentation import (PresentedTile, draw_document_tiles,
+    _NATIVE_RASTER_MOSAIC_BYTES, _NATIVE_RASTER_MOSAIC_SIDE, _NATIVE_RASTER_MOSAIC_TILES)
 
 
 _GUTTER_FORMATS = frozenset((QImage.Format_ARGB32, QImage.Format_ARGB32_Premultiplied,
@@ -105,7 +108,7 @@ class RasterFeedbackPatchCache:
             self.byte_count -= self._entry_bytes(entry)
 
 
-def _compose_tile(canvas, prepared, tile, resident):
+def _compose_tile(canvas, prepared, tile, resident, flatten=True):
     side, gutter = prepared.tile_size, prepared.gutter
     x, y = tile.key
     rebuild = prepared.source_images is not None
@@ -182,6 +185,8 @@ def _compose_tile(canvas, prepared, tile, resident):
         composed.drawImage(0, 0, tile.suffix)
     finally:
         composed.end()
+    if not flatten:
+        return image
     # Flatten once at the presentation edge, after every scene component.
     presented = QImage(image.size(), QImage.Format_ARGB32_Premultiplied)
     presented.fill(QColor('#242428'))
@@ -211,11 +216,59 @@ def _contact_gate(canvas):
     return getattr(canvas, '_raster_tile_input', None)
 
 
-def present_raster_feedback(canvas, painter, prepared, dirty_keys, cache):
-    """No source decode, scene traversal, effects, color transform or waiting."""
+def _native_presentation_tiles(canvas, prepared, tile, image, visible, cache):
+    """Keep transformed native blocks on the ordinary display tile phase."""
+    side = canvas._document_projection.tile_size
+    gutter, world_side = prepared.gutter, prepared.world_size
+    left, top = tile.bounds[0] + gutter, tile.bounds[1] + gutter
+    if (world_side <= side or world_side % side != 0
+            or left % side != 0 or top % side != 0
+            or image.devicePixelRatio() != 1.
+            or image.width() != world_side + 2 * gutter
+            or image.height() != world_side + 2 * gutter):
+        return [PresentedTile(('raster-feedback', id(prepared), tile.key), image,
+            QRectF(left, top, world_side, world_side), QRectF(gutter, gutter, world_side, world_side))]
+    output = []
+    for y in range(0, world_side, side):
+        for x in range(0, world_side, side):
+            world = QRectF(left + x, top + y, side, side)
+            if not world.intersects(visible):
+                continue
+            key = ('native-presentation', tile.key, x, y)
+            signature = (id(prepared), image.cacheKey(), ())
+            crop = cache.get(key, signature)
+            if crop is None:
+                crop = image.copy(QRect(x, y, side + 2 * gutter, side + 2 * gutter))
+                if crop.isNull():
+                    continue
+                cache.put(key, signature, crop)
+            output.append(PresentedTile(('raster-feedback', id(prepared), key), crop, world,
+                QRectF(gutter, gutter, side, side)))
+    return output
+
+
+def _native_replacement_supported(painter, camera):
+    if (painter.paintEngine().type() != QPaintEngine.Raster
+            or painter.compositionMode() != QPainter.CompositionMode_SourceOver
+            or painter.opacity() != 1.):
+        return False
+    painter.save()
+    try:
+        painter.setTransform(camera)
+        device = painter.deviceTransform()
+        values = tuple(getattr(device, 'm' + str(row) + str(column))()
+            for row in range(1, 4) for column in range(1, 4))
+        return (all(math.isfinite(value) for value in values) and device.isAffine()
+            and device.m11() > 0. and device.m22() > 0.
+            and device.m12() == 0. and device.m21() == 0.)
+    finally:
+        painter.restore()
+
+
+def _raster_feedback_tiles(canvas, prepared, dirty_keys, cache, replace_native, *, complete=False):
     owner = canvas.tiles._tiles.get(prepared.identifier)
     if owner is None:
-        return 0
+        return []
     side, gutter = prepared.tile_size, prepared.gutter
     dirty_keys = set(dirty_keys)
     predictive = canvas._predictive if canvas.settings.predictive_ink and not canvas._stroke_erasing else None
@@ -227,7 +280,6 @@ def present_raster_feedback(canvas, painter, prepared, dirty_keys, cache):
         margin = predictive[2] / 2. + 2.
         prediction_bounds = QRectF(predictive[0], predictive[1]).normalized().adjusted(
             -margin, -margin, margin, margin)
-    camera = canvas.camera_transform()
     # Source gutters and one physical filtering pixel cover presentation at
     # fractional zoom/rotation, without composing obsolete off-screen patches.
     margin = max(gutter, 1. / max(.001, abs(canvas.scale) * canvas.devicePixelRatioF()))
@@ -242,7 +294,7 @@ def present_raster_feedback(canvas, painter, prepared, dirty_keys, cache):
         x, y = tile.key
         neighbors = (set(tile.source_keys) if getattr(prepared, 'source_transform', None) is not None else
             {(x + dx, y + dy) for dy in (-1, 0, 1) for dx in (-1, 0, 1)})
-        if not dirty_keys.intersection(neighbors):
+        if not complete and not dirty_keys.intersection(neighbors):
             continue
         resident = {}
         missing = False
@@ -264,25 +316,110 @@ def present_raster_feedback(canvas, painter, prepared, dirty_keys, cache):
         # removes the previous transient pen exactly once.
         local_prediction = (prediction_key if prediction_bounds is not None
             and QRectF(*tile.bounds).intersects(prediction_bounds) else None)
-        signature = (id(prepared), local_prediction,
+        signature = (id(prepared), (local_prediction, replace_native),
             cache.source_signature(prepared, tile, resident))
         presented = cache.get(tile.key, signature)
         if presented is None:
-            presented = _compose_tile(canvas, prepared, tile, resident)
+            presented = _compose_tile(canvas, prepared, tile, resident, not replace_native)
             cache.put(tile.key, signature, presented)
-        presented_tiles.append(PresentedTile(('raster-feedback', id(prepared), tile.key),
-            presented, world, QRectF(gutter, gutter, world_side, world_side)))
+        presented_tiles.extend(_native_presentation_tiles(canvas, prepared, tile,
+            presented, visible, cache))
         contact = getattr(canvas, '_raster_contact_point', None)
         gate = _contact_gate(canvas)
         if (contact is not None and world.contains(contact)
                 and not (gate is not None and gate.busy)):
             canvas._raster_feedback_contact_covered = True
+    return presented_tiles
+
+
+def replace_raster_feedback_batch(canvas, painter, document, requests, batch):
+    """A small complete contact basis shares ordinary native presentation.
+
+    Every visible image comes from the guarded prepared scene and current
+    resident source journal. The retained batch supplies only validated native
+    address/geometry metadata; stale source pixels never enter this live batch.
+    """
+    controller = canvas._scene_controller
+    prepared = controller.feedback
+    visible = canvas.visible_document_rect().intersected(document.bounds)
+    if (prepared is None or controller._filtered_state is not None or not controller.feedback_dirty
+            or prepared.identifier != canvas.selected_id
+            or prepared.document.configuration != document.configuration
+            or prepared.document.identity != document.identity
+            or not _native_replacement_supported(painter, canvas.camera_transform())
+            or not controller._feedback_covers(document, tuple(visible.getRect()))):
+        return batch, 0, None
+    gate = controller._covered_contact_gate(document, tuple(visible.getRect()))
+    if gate is None or gate.busy:
+        return batch, 0, None
+    owner = canvas.tiles._tiles.get(prepared.identifier)
+    if owner is None or any(key in owner.entries and (owner, key) not in owner.residency.entries
+                           for key in controller.feedback_dirty):
+        return batch, 0, None
+    # Match the existing one-native-pixel mosaic cap before any composition.
+    region = visible.toAlignedRect().adjusted(-1, -1, 1, 1).intersected(document.bounds.toAlignedRect())
+    requests = tuple(request for request in requests if request.world_rect.intersects(QRectF(region)))
+    if (region.isEmpty() or region.width() > _NATIVE_RASTER_MOSAIC_SIDE
+            or region.height() > _NATIVE_RASTER_MOSAIC_SIDE
+            or region.width() * region.height() * 4 > _NATIVE_RASTER_MOSAIC_BYTES
+            or not 2 <= len(requests) <= _NATIVE_RASTER_MOSAIC_TILES):
+        return batch, 0, None
+    from comic_editor.ui.filtered_raster_feedback import FilteredRasterFeedbackState
+    if not FilteredRasterFeedbackState.native_batch(batch):
+        return batch, 0, None
+    base = getattr(canvas, '_projection_completed_view', None)
+    metadata = FilteredRasterFeedbackState._native_base(document, requests, base, 0)
+    if metadata is None:
+        return batch, 0, None
+    # _native_base validates complete source rectangles, dimensions and phases.
+    # Also reject mismatched supplied tile metadata or a device-only basis.
+    supplied = {tile.key[1]: tile for tile in batch[0][1]}
+    if any(request.address not in supplied or not isinstance(supplied[request.address].image, QImage)
+            or supplied[request.address].world_rect != metadata[request.address].world_rect
+            or supplied[request.address].source_rect != metadata[request.address].source_rect
+            or supplied[request.address].image.width() != request.pixel_size
+            or supplied[request.address].image.height() != request.pixel_size
+            or supplied[request.address].image.devicePixelRatio() != 1.
+            or supplied[request.address].pixel_contract != document.pixel_contract
+            for request in requests):
+        return batch, 0, None
+    composed = _raster_feedback_tiles(canvas, prepared, controller.feedback_dirty,
+        controller.feedback_patches, True, complete=True)
+    current = {tuple(tile.world_rect.getRect()): tile for tile in composed}
+    output = []
+    for request in requests:
+        image = current.get(tuple(request.world_rect.getRect()))
+        if (image is None or image.source_rect != request.source_rect
+                or image.image.width() != request.pixel_size
+                or image.image.height() != request.pixel_size):
+            return batch, 0, None
+        output.append(replace(supplied[request.address], image=image.image))
+    source_signature = tuple((key, None if key not in owner.entries else
+        owner.residency.entries[(owner, key)][0].cacheKey()) for key in sorted(controller.feedback_dirty))
+    predictive = canvas._predictive if canvas.settings.predictive_ink and not canvas._stroke_erasing else None
+    prediction_key = None if predictive is None else (predictive[0].x(), predictive[0].y(),
+        predictive[1].x(), predictive[1].y(), predictive[2], predictive[3].rgba())
+    context = ('raster-contact', document.identity, document.configuration, document.revision,
+        prepared.identifier, id(prepared), source_signature, prediction_key)
+    return [(None, output)], len(output), context
+
+
+def present_raster_feedback(canvas, painter, prepared, dirty_keys, cache):
+    """No source decode, scene traversal, effects, color transform or waiting."""
+    camera = canvas.camera_transform()
+    # Preserve ordinary interpolation/alpha rounding on Raster widgets. The
+    # owned display clip first replaces the old scene with its background;
+    # the unchanged native alpha image is then sampled/composed exactly once.
+    # Other presentation backends retain the opaque provisional overlay.
+    replace_native = _native_replacement_supported(painter, camera)
+    presented_tiles = _raster_feedback_tiles(canvas, prepared, dirty_keys, cache, replace_native)
     if presented_tiles:
         # Use the same retained native presenter as exact document tiles. Only
         # display geometry/textures are cached; these live pixels are never
         # admitted to the document or disk artwork cache.
         draw_document_tiles(painter, presented_tiles, camera, canvas.size(), owner=canvas,
-            smooth=True, clip_world=prepared.document.bounds)
+            smooth=True, clip_world=None if replace_native else prepared.document.bounds,
+            replace_background=QColor('#242428') if replace_native else None)
     return len(presented_tiles)
 
 

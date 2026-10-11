@@ -765,6 +765,14 @@ def native_pinch_input_region(bounds, output, modifier, transform, *, budget=PRE
         return None
 
 
+def _mesh_face_contains(points, low, high):
+    lower, upper = low - 1e-8, high + 1e-8
+    # Keep the bound operands as arrays so float32 queries retain the original
+    # NumPy array-to-array promotion against float64 mesh coordinates.
+    return ((points[:, 0] >= lower[:1]) & (points[:, 1] >= lower[1:])
+            & (points[:, 0] <= upper[:1]) & (points[:, 1] <= upper[1:]))
+
+
 def _triangle_map(query, source, destination, faces):
     """Inverse mesh with stable overlapping-face order and transparent holes."""
     result = np.full_like(query, np.nan)
@@ -803,14 +811,14 @@ def _triangle_map(query, source, destination, faces):
         face, tri = faces[face_index], triangles[face_index]
         low, high = face_lows[face_index], face_highs[face_index]
         if blocks is None:
-            selected = np.flatnonzero(np.all((flat >= low - 1e-8) & (flat <= high + 1e-8), axis=1))
+            selected = np.flatnonzero(_mesh_face_contains(flat, low, high))
         else:
             intersecting = np.flatnonzero(np.all((highs >= low - 1e-8) & (lows <= high + 1e-8), axis=1))
             if not len(intersecting):
                 continue
             candidates = np.concatenate([blocks[index] for index in intersecting])
             points = flat[candidates]
-            selected = candidates[np.all((points >= low - 1e-8) & (points <= high + 1e-8), axis=1)]
+            selected = candidates[_mesh_face_contains(points, low, high)]
         if not len(selected):
             continue
         matrix = np.column_stack((tri[1] - tri[0], tri[2] - tri[0]))

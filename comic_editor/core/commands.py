@@ -60,7 +60,12 @@ class TilePatchCommand:
         self, values: dict[tuple[int, int], QImage | None], state: object,
     ) -> None:
         for key, image, bounds in values.items_with_bounds(self.tile_store._alpha_bbox):
-            self.tile_store.set_tile(self.object_id, key, image, _known_alpha_bounds=bounds)
+            if image is not None and not image.isNull() and bounds is None:
+                # A non-null history source is distinct from an absent tile.
+                self.tile_store.set_tile(self.object_id, key, image,
+                    _known_alpha_bounds=bounds, _preserve_empty=True)
+            else:
+                self.tile_store.set_tile(self.object_id, key, image, _known_alpha_bounds=bounds)
         if self.state_callback is not None:
             self.state_callback(state)
         if self.changed_callback:

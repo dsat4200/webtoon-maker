@@ -73,6 +73,8 @@ class GpuTextureRenderer:
             fmt.setVersion(3, 3)
             fmt.setProfile(QSurfaceFormat.CoreProfile)
             self.context = QOpenGLContext()
+            if surface is not None:
+                self.context.setScreen(surface.screen())
             self.context.setFormat(fmt)
             if not self.context.create():
                 raise RuntimeError("OpenGL context unavailable")
@@ -82,6 +84,7 @@ class GpuTextureRenderer:
                 if QThread.currentThread() != QGuiApplication.instance().thread():
                     raise RuntimeError("Graphics surfaces must be created on the application thread")
                 self.surface = QOffscreenSurface()
+                self.surface.setScreen(self.context.screen())
                 self.surface.setFormat(self.context.format())
                 self.surface.create()
             if not self.context.makeCurrent(self.surface):
