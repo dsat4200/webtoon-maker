@@ -323,6 +323,19 @@ def cage_initial(snapshot, targets, *, cancelled=None):
 cage_initial.accepts_cancelled = True
 
 
+def _cage_source_capture(owner, document, targets, *_arguments):
+    # Tiling boundaries can depend on arbitrary subtree contributors. Keep the
+    # complete ordinary snapshot for that uncommon geometry path.
+    if any(owner._own_tiling(owner.chapter.objects[identifier]) for _kind, identifier in targets):
+        return owner._scene_snapshot_compiler.capture(owner, document)
+    return owner._scene_snapshot_compiler.capture_drawing_sources(owner, document,
+        (identifier for _kind, identifier in targets))
+
+
+cage_initial.source_capture = _cage_source_capture
+cage_initial.scene_capture_scope = 'cage-originals'
+
+
 def cage_commit(snapshot, targets, grid, *, cancelled=None):
     """Prepare every selected original source before the owner publishes any."""
     import math
@@ -382,4 +395,6 @@ def cage_commit(snapshot, targets, grid, *, cancelled=None):
 
 
 cage_commit.accepts_cancelled = True
+cage_commit.source_capture = _cage_source_capture
+cage_commit.scene_capture_scope = 'cage-originals'
 cage_commit.working_bytes = lambda snapshot, *_a: snapshot.document.width*snapshot.document.height*64

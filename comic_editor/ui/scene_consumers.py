@@ -155,9 +155,13 @@ class SceneConsumers(QObject):
 
     def _capture_job(self, job):
         source_capture = getattr(job.compute, 'source_capture', None)
-        if job.owned_source and callable(source_capture):
-            # Only explicitly owned input evaluators opt in. Ordinary scene,
-            # mask sampling and render consumers keep their complete capture.
+        guarded_cage = (getattr(job.compute, 'scene_capture_scope', None) == 'cage-originals'
+                        and job.valid is not None and not job.detached)
+        if callable(source_capture) and (job.owned_source or guarded_cage):
+            # Owned contacts keep their positive source/version guard. Only
+            # explicitly declared, guarded cage work opts into a focused scene
+            # capture under ordinary full document/selection revision checks.
+            # An arbitrary source_capture attribute is not sufficient.
             return source_capture(self.canvas, job.document, *job.arguments)
         return self.canvas._scene_snapshot_compiler.capture(self.canvas, job.document)
 

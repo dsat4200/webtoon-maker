@@ -88,11 +88,14 @@ def mesh_for_image(grid, bounds, local_to_world, *, draft=False):
     return source, destination, faces
 
 
-def warp_image(image, bounds, grid, local_to_world=None, output_bounds=None, cancelled=None, *, pixel_scale=1.):
+def warp_image(image, bounds, grid, local_to_world=None, output_bounds=None, cancelled=None, *, pixel_scale=1., source_is_scaled=False):
     """Inverse rasterize triangles in bounded strips; folded faces use stable order.
 
     Work is proportional to covered destination pixels. Sampling uses compiled
     SciPy kernels and 128-row strips, avoiding a full-image float coordinate map.
+    ``source_is_scaled`` is reserved for an already bounded private source
+    capture: its complete bounds remain unchanged and it must not be reduced a
+    second time. Native/exact callers retain the default original-grid path.
     """
     local_to_world = local_to_world or QTransform()
     source, destination, faces = mesh_for_image(grid, bounds, local_to_world, draft=pixel_scale < 1.)
@@ -105,7 +108,7 @@ def warp_image(image, bounds, grid, local_to_world=None, output_bounds=None, can
     width, height = max(1, math.ceil(output_bounds.width()*pixel_scale)), max(1, math.ceil(output_bounds.height()*pixel_scale))
     if width*height > 64*1024*1024:
         raise ValueError("Cage result is too large. Reduce the deformation before applying it.")
-    if pixel_scale < 1.:
+    if pixel_scale < 1. and not source_is_scaled:
         from PySide6.QtCore import Qt
         image = image.scaled(max(1, math.ceil(image.width()*pixel_scale)), max(1, math.ceil(image.height()*pixel_scale)), Qt.IgnoreAspectRatio, Qt.SmoothTransformation)
     pixels = _qimage_premultiplied(image)

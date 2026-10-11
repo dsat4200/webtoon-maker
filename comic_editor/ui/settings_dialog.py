@@ -4,7 +4,7 @@ from __future__ import annotations
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (
-    QCheckBox, QDialog, QDialogButtonBox, QFormLayout,
+    QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFormLayout,
     QGroupBox, QHBoxLayout, QPushButton, QSlider, QSpinBox, QTabWidget,
     QVBoxLayout, QWidget, QLineEdit, QLabel, QFileDialog,
 )
@@ -36,6 +36,30 @@ class SettingsDialog(QDialog):
         self.tabs.addTab(self.theme_editor, "Themes")
         self.rejected.connect(self.theme_editor.restore_preview)
         self.resize(720, 760)
+        self.pencil_eraser_tab = QWidget(self.tabs)
+        self.tabs.addTab(self.pencil_eraser_tab, "Pencil/Eraser")
+        drawing_layout = QVBoxLayout(self.pencil_eraser_tab)
+        drawing_layout.addWidget(QLabel("Configure sizes", self.pencil_eraser_tab))
+        self.drawing_sizes = {}
+        self.drawing_defaults = {}
+        for kind, low, high in (("pencil", 1, 200), ("eraser", 2, 400)):
+            group = QGroupBox(kind.title(), self.pencil_eraser_tab)
+            form = QFormLayout(group)
+            for key in ("small", "medium", "large"):
+                control = QSpinBox(group)
+                control.setRange(low, high)
+                control.setSuffix(" px")
+                control.setValue(getattr(settings, f"{kind}_size_px")[key])
+                self.drawing_sizes[(kind, key)] = control
+                form.addRow(key.title(), control)
+            default = QComboBox(group)
+            for key in ("small", "medium", "large"):
+                default.addItem(key.title(), key)
+            default.setCurrentIndex(max(0, default.findData(getattr(settings, f"{kind}_default_size"))))
+            self.drawing_defaults[kind] = default
+            form.addRow("Default size", default)
+            drawing_layout.addWidget(group)
+        drawing_layout.addStretch(1)
         self.grid_tab = QWidget(self.tabs)
         self.tabs.addTab(self.grid_tab, "Grid")
         grid_layout = QVBoxLayout(self.grid_tab)
@@ -207,6 +231,12 @@ class SettingsDialog(QDialog):
             control.setEnabled(enabled)
 
     def apply_user_settings(self, settings: EditorSettings) -> None:
+        for kind in ("pencil", "eraser"):
+            setattr(settings, f"{kind}_size_px", {
+                key: self.drawing_sizes[(kind, key)].value()
+                for key in ("small", "medium", "large")
+            })
+            setattr(settings, f"{kind}_default_size", self.drawing_defaults[kind].currentData())
         settings.texture_directory = self.texture_directory.text().strip()
         settings.grid_overlay_visible = self.grid_visible.isChecked()
         settings.grid_size_px = self.grid_size.value()

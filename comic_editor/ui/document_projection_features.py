@@ -1,6 +1,7 @@
 """Bridge the editor's faithful document renderer to retained presentation."""
 import math
 import time
+from dataclasses import replace
 from contextlib import nullcontext
 
 from PySide6.QtCore import QRect, QRectF, QSize, Qt, QTimer
@@ -61,6 +62,8 @@ class DocumentProjectionFeatures:
                 mask_entities, pixels)
 
     def _invalidate_selection_scene_cache(self):
+        if self.chapter is not None:
+            self._scene_controller.checkpoint_raster_presentation(self._render_document_state())
         self._scene_controller.release_handoff.clear("selection/cancel")
         # Selection/tool UI is drawn after document presentation. Underlay and
         # selected mask-only visibility have their own retained configuration.
@@ -196,6 +199,12 @@ class DocumentProjectionFeatures:
         if previous is not None and previous[0] != configuration:
             previous = None
         preview = self._scene_controller.preview
+        continuity = self._scene_controller.raster_continuity
+        presentation_view = self._scene_controller.presentation_view()
+        if preview is not None and preview[0].contact_only and not continuity.accepts(preview[0]):
+            preview = None
+        displayed_revision = document.revision if complete else (previous[2] if previous is not None else -1)
+        retained_overlays = ()
         self._projection_provisional_visible = False
         if (document.live_preview and complete and any(tiles for _phase, tiles in batch)
                 and self._text_decoration_only_preview()):
@@ -215,6 +224,7 @@ class DocumentProjectionFeatures:
                 self._projection_presented_revision = document.revision
             elif preview is not None and preview[0].configuration == configuration:
                 batch = [(None, [preview[1]])]
+                displayed_revision = preview[0].revision
                 self._projection_provisional_visible = True
             else:
                 batch = previous[1] if previous is not None else []
@@ -227,10 +237,27 @@ class DocumentProjectionFeatures:
             # Explicit checked pending commit presentation; never exact.
             batch = [(None, [preview[1]])]
             self._projection_provisional_visible = True
+            displayed_revision = document.revision
         elif previous is not None and previous[2] != document.revision:
             # An edited view stays coherent until every requested replacement is
             # ready. Unchanged artwork can be progressively exposed on a pan.
             batch = previous[1]
+        if (self._projection_provisional_visible and preview is not None
+                and tuple((phase, tuple(tile.key for tile in tiles)) for phase, tiles in batch)
+                    == ((None, (preview[1].key,)),)
+                and (preview[0].contact_only or preview[0] == document
+                    and self._scene_controller._owned_native_contact_gate(document) is not None)):
+            # Only an actually presented native-input preview qualifies.
+            # Its immutable revision stays provisional after contact release;
+            # ordinary transforms and selection drafts never enter this owner.
+            continuity.remember(preview[0], batch, complete=True, view=presentation_view)
+        if complete and not document.live_preview:
+            continuity.clear()
+        elif not complete:
+            retained = continuity.fallback(document, revision=displayed_revision, view=presentation_view)
+            if retained is not None:
+                batch, retained_overlays = retained
+                self._projection_provisional_visible = True
         self._projection_frame_pending = not complete
         # Keep the tool's release/cancel bookkeeping aligned with the actual
         # ready preview, without invoking its old inline viewport renderer.
@@ -242,7 +269,13 @@ class DocumentProjectionFeatures:
         stats = []
         feedback_tiles = 0
         self._raster_feedback_contact_covered = False
+        filtered_basis = batch
         batch,filtered_tiles = self._scene_controller.filtered_batch(document,requests,batch,complete=complete)
+        filtered_replacements = ()
+        if filtered_tiles:
+            before = {tile.key: tile.image.cacheKey() for _phase, tiles in filtered_basis for tile in tiles}
+            filtered_replacements = tuple(tile for _phase, tiles in batch for tile in tiles
+                if before.get(tile.key) != tile.image.cacheKey())
         plain_context = None
         if not filtered_tiles:
             from comic_editor.ui.raster_feedback import replace_raster_feedback_batch
@@ -253,6 +286,20 @@ class DocumentProjectionFeatures:
         if feedback_tiles:
             self._projection_provisional_visible = True
             native_batch_complete = False
+        self._scene_controller._presentation_batch = document, filtered_basis if feedback_tiles else batch, presentation_view
+        if filtered_tiles:
+            state = self._scene_controller._filtered_state
+            if retained_overlays:
+                continuity.remember(replace(document, revision=state.completed_revision), filtered_basis,
+                    filtered_replacements, replace_background=True, view=presentation_view)
+            else:
+                continuity.remember(replace(document, revision=state.completed_revision), batch, complete=True,
+                    view=presentation_view)
+        elif feedback_tiles and self._predictive is None:
+            # A complete provisional batch replaces the old basis; its images
+            # remain separate from every exact projection/cache entry.
+            continuity.remember(document, batch, complete=True, view=presentation_view)
+            retained_overlays = ()
         draw_live = (live_ink and not self._projection_provisional_visible
             and tuple(phase for phase, _ in batch) == phases)
         with self._show_on_top_scene() if draw_live else nullcontext():
@@ -264,6 +311,18 @@ class DocumentProjectionFeatures:
                         if filtered_tiles else (document, phase) if (native_batch_complete and not live_ink
                             and (not document.live_preview or self._text_decoration_only_preview())) else None),
                     native_bounds=document.bounds))
+                if phase is None and retained_overlays:
+                    for tile, replace_background in retained_overlays:
+                        draw_document_tiles(painter, (tile,), self.camera_transform(), self.size(),
+                            owner=self, smooth=True,
+                            clip_world=None if replace_background else document.bounds,
+                            replace_background=QColor('#242428') if replace_background else None)
+                if phase is None and retained_overlays and filtered_replacements:
+                    # The filtered worker can replace only part of its scene.
+                    # Its new complete scene tiles own overlaps with retained
+                    # earlier contacts, including an earlier selected layer.
+                    draw_document_tiles(painter, filtered_replacements, self.camera_transform(), self.size(),
+                        owner=self, smooth=True, replace_background=QColor('#242428'))
                 if phase is None and not feedback_tiles:
                     feedback_tiles = self._scene_controller.present_feedback(painter, document)
                 if draw_live:

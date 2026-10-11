@@ -219,11 +219,21 @@ class SceneSnapshotCompiler:
     def capture(self, owner, document):
         return SceneCapture(self, owner, document)
 
+    def capture_drawing_sources(self, owner, document, identifiers):
+        """Native drawing operations retain only their original source owners.
+
+        Ancestor geometry, modifiers and masks retain ordinary immutable model
+        capture. This snapshot is private to the input operation and cannot
+        replace the complete renderer snapshot or record durable artwork.
+        """
+        return SceneCapture(self, owner, document, source_objects=frozenset(identifiers))
+
 
 class SceneCapture:
     """Owner-thread incremental capture. A revision change discards the slice."""
-    def __init__(self, compiler, owner, document):
+    def __init__(self, compiler, owner, document, *, source_objects=None):
         self.compiler, self.owner, self.document = compiler, owner, document
+        self.source_objects = source_objects
         self.result = None
         self.stale = False
         self.iterator = self._capture()
@@ -266,6 +276,8 @@ class SceneCapture:
                 group, kind = field.name, GROUP_KINDS[field.name]
                 detached = {}
                 for identifier, record in getattr(owner.chapter, group).items():
+                    if group == 'objects' and self.source_objects is not None and identifier not in self.source_objects:
+                        continue
                     ref = kind, identifier
                     saved = compiler.records.get(ref)
                     if fresh or ref in compiler.dirty or saved is None:
@@ -336,16 +348,18 @@ class SceneCapture:
         yield
         settings = SimpleNamespace(predictive_ink=bool(owner.settings.predictive_ink),
                                    canvas_renderer=owner.settings.canvas_renderer)
-        images = owner.images.clone()
+        images = owner.images.clone() if self.source_objects is None else ImageStore()
         # Retain already decoded original/working buffers through independent
         # QImage handles. This also supports decoded publication sources whose
         # encoded resource is being adopted by the source owner.
-        for key, image in owner.images._decoded.items():
+        for key, image in (owner.images._decoded.items() if self.source_objects is None else ()):
             alias = QImage(image)
             images._cache_decoded(key, alias)
             images._adopt_owned_decode(key, alias, owner.images._owned_decodes.get(key))
             yield
-        tiles, pins, addresses = yield from self._capture_tiles(owner.tiles, 'document')
+        source_keys = (None if self.source_objects is None else
+            {identifier: tuple(owner.tiles._tiles.get(identifier, ())) for identifier in self.source_objects})
+        tiles, pins, addresses = yield from self._capture_tiles(owner.tiles, 'document', source_keys=source_keys)
         jobs.extend(pins)
         active_resources.update(addresses)
         jobs = tuple(dict.fromkeys(jobs))
@@ -372,13 +386,15 @@ class SceneCapture:
                     and captured[2] != environment.signature):
                 self.stale = True
                 return
-        compiler.identity, compiler.records = identity, records
-        compiler.stroke_records = strokes
-        compiler.resource_pins = {address: value for address, value in compiler.resource_pins.items()
-            if address in active_resources}
-        compiler.dirty.clear()
-        compiler.conservative = False
-        backing = getattr(owner, '_persistent_render_cache', None)
+        if self.source_objects is None:
+            compiler.identity, compiler.records = identity, records
+            compiler.stroke_records = strokes
+            compiler.resource_pins = {address: value for address, value in compiler.resource_pins.items()
+                if address in active_resources}
+            compiler.dirty.clear()
+            compiler.conservative = False
+        # A scoped original-source capture is never a scene/artwork cache owner.
+        backing = getattr(owner, '_persistent_render_cache', None) if self.source_objects is None else None
         if backing is not None and not backing.closed:
             from comic_editor.ui.cache_dependencies import RenderDependencies
             backing.contract = chapter.pixel_contract.signature
@@ -407,7 +423,10 @@ class SceneCapture:
         backing = None
         # This loop reads addresses and edited resident buffers, not file pixels.
         # Register pin batches immediately so resource publication respects them.
-        for identifier, source in source_store._tiles.items():
+        owners = (source_store._tiles.items() if source_keys is None else
+            ((identifier, source_store._tiles[identifier]) for identifier in source_keys
+             if identifier in source_store._tiles))
+        for identifier, source in owners:
             target = tiles._object_tiles(identifier)
             for key in source if source_keys is None else source_keys.get(identifier, ()):
                 source.version(key)
@@ -443,8 +462,10 @@ class SceneCapture:
             tiles._alpha_bounds[identifier] = dict(source_store._alpha_bounds.get(identifier, {}))
         if pending:
             pin_batch()
-        tiles._alpha_bounds_dirty = set(source_store._alpha_bounds_dirty)
-        tiles.dirty = set(source_store.dirty)
+        tiles._alpha_bounds_dirty = {marker for marker in source_store._alpha_bounds_dirty
+            if source_keys is None or marker[0] in source_keys}
+        tiles.dirty = {marker for marker in source_store.dirty
+            if source_keys is None or marker[0] in source_keys}
         return tiles, jobs, active_resources
 
 

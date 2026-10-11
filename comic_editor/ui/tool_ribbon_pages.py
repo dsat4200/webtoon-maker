@@ -37,6 +37,7 @@ from comic_editor.core.settings import (
 )
 from comic_editor.ui.mask_controls import MaskAlphaSlider
 from comic_editor.ui.brush_controls import BrushControls
+from comic_editor.ui.drawing_preset_cards import DrawingPresetCards
 
 
 def _tool_value(tool: object) -> str:
@@ -194,6 +195,8 @@ class ToolSettingsControls(QWidget):
     settingsChanged = Signal()
     pencilPresetSelected = Signal(str)
     pencilSettingsRequested = Signal()
+    eraserSettingsRequested = Signal()
+    presetSettingsRequested = Signal(str, str)
     brushSizeSelected = Signal(str, str)
     brushSizesRequested = Signal()
     eraserShapeChanged = Signal(bool)
@@ -354,22 +357,32 @@ class ToolSettingsControls(QWidget):
 
     def _build_pencil_page(self) -> QWidget:
         page = QWidget(self)
-        row = WrappingLayout(page)
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(0, 0, 0, 0)
+        bar = QWidget(page)
+        row = WrappingLayout(bar)
+        layout.addWidget(bar)
+        # Compatibility controls stay off the strip; cards own preset selection.
         self.pencil_preset = QComboBox(page)
-        self.pencil_preset.setMinimumWidth(120)
-        row.addWidget(_labeled_control("Preset", self.pencil_preset, page))
+        self.pencil_preset.hide()
         self.pencil_size = QComboBox(page)
         for label, value in (("S", "small"), ("M", "medium"), ("L", "large")):
             self.pencil_size.addItem(label, value)
         row.addWidget(_labeled_control("Size", self.pencil_size, page))
-        self.pencil_presets_button = QPushButton("Pressure / Presets…", page)
+        self.pencil_presets_button = QPushButton("Manage presets…", page)
         row.addWidget(self.pencil_presets_button)
         self.pencil_sizes_button = QPushButton("Configure sizes…", page)
-        row.addWidget(self.pencil_sizes_button)
+        self.pencil_sizes_button.hide()
         self.pencil_transform_handles = QCheckBox(
             "Show transform handles", page
         )
-        row.addWidget(self.pencil_transform_handles)
+        self.pencil_transform_handles.hide()
+        self.pencil_cards = DrawingPresetCards(page)
+        self.pencil_cards.selected.connect(self._pencil_preset_changed)
+        self.pencil_cards.settingsRequested.connect(
+            lambda name: self.presetSettingsRequested.emit("pencil", name)
+        )
+        layout.addWidget(self.pencil_cards, 1)
 
         self.pencil_preset.currentTextChanged.connect(
             self._pencil_preset_changed
@@ -413,7 +426,11 @@ class ToolSettingsControls(QWidget):
 
     def _build_eraser_page(self) -> QWidget:
         page = QWidget(self)
-        row = WrappingLayout(page)
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(0, 0, 0, 0)
+        bar = QWidget(page)
+        row = WrappingLayout(bar)
+        layout.addWidget(bar)
         self.eraser_size = QComboBox(page)
         for label, value in (("S", "small"), ("M", "medium"), ("L", "large")):
             self.eraser_size.addItem(label, value)
@@ -421,7 +438,16 @@ class ToolSettingsControls(QWidget):
         self.eraser_shape = QComboBox(page)
         self.eraser_shape.addItem("Circle", False)
         self.eraser_shape.addItem("Square", True)
-        row.addWidget(_labeled_control("Shape", self.eraser_shape, page))
+        self.eraser_shape.hide()
+        self.eraser_presets_button = QPushButton("Manage presets…", page)
+        row.addWidget(self.eraser_presets_button)
+        self.eraser_presets_button.clicked.connect(self.eraserSettingsRequested)
+        self.eraser_cards = DrawingPresetCards(page)
+        self.eraser_cards.selected.connect(self._eraser_preset_changed)
+        self.eraser_cards.settingsRequested.connect(
+            lambda name: self.presetSettingsRequested.emit("eraser", name)
+        )
+        layout.addWidget(self.eraser_cards, 1)
         self.vector_eraser_label = QLabel("Vector mode", page)
         self.vector_eraser_mode = QComboBox(page)
         self.vector_eraser_mode.addItem("Stroke", "stroke")
@@ -430,13 +456,13 @@ class ToolSettingsControls(QWidget):
         self.vector_eraser_group = _labeled_control(
             "Vector mode", self.vector_eraser_mode, page
         )
-        row.addWidget(self.vector_eraser_group)
+        layout.insertWidget(1, self.vector_eraser_group)
         self.eraser_sizes_button = QPushButton("Configure sizes…", page)
-        row.addWidget(self.eraser_sizes_button)
+        self.eraser_sizes_button.hide()
         self.eraser_transform_handles = QCheckBox(
             "Show transform handles", page
         )
-        row.addWidget(self.eraser_transform_handles)
+        self.eraser_transform_handles.hide()
 
         self.eraser_size.currentIndexChanged.connect(
             self._eraser_size_changed
@@ -715,7 +741,7 @@ class ToolSettingsControls(QWidget):
         self.close_shape_button.setEnabled(value == "shape_edit" and can_close_shape)
         # Inactive pages have wide controls; compact pages use the sidebar width.
         self.stack.setSizePolicy(
-            QSizePolicy.Ignored if value in {"shape_edit", "brush"} or (value == "mask_wand" and mask_active)
+            QSizePolicy.Ignored if value in {"shape_edit", "brush", "raster_pencil", "raster_eraser"} or (value == "mask_wand" and mask_active)
             else QSizePolicy.Preferred,
             QSizePolicy.Preferred,
         )
@@ -737,6 +763,8 @@ class ToolSettingsControls(QWidget):
         self.pencil_preset.setCurrentText(
             self.settings.active_pencil_preset
         )
+        self.pencil_cards.refresh(self.settings.pencil_presets, self.settings.active_pencil_preset)
+        self.eraser_cards.refresh(self.settings.eraser_presets, self.settings.active_eraser_preset)
         self.pencil_size.setCurrentIndex(
             max(0, self.pencil_size.findData(
                 self.settings.active_pencil_size
@@ -855,6 +883,13 @@ class ToolSettingsControls(QWidget):
                 "raster_pencil", str(self.pencil_size.currentData())
             )
 
+    def _eraser_preset_changed(self, name: str) -> None:
+        if self._loading or not name:
+            return
+        self.settings.active_eraser_preset = name
+        self.settings.eraser_square = self.settings.active_eraser_preset_settings().shape == "square"
+        self.settingsChanged.emit()
+
     def _mask_pencil_size_changed(self) -> None:
         if not self._loading:
             self.brushSizeSelected.emit(
@@ -887,6 +922,9 @@ class ToolSettingsControls(QWidget):
 
     def _eraser_shape_changed(self) -> None:
         if not self._loading:
+            for item in self.settings.eraser_presets:
+                if item["name"] == self.settings.active_eraser_preset:
+                    item["shape"] = "square" if self.eraser_shape.currentData() else "circle"
             self.eraserShapeChanged.emit(
                 bool(self.eraser_shape.currentData())
             )

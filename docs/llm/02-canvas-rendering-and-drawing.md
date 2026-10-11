@@ -90,6 +90,31 @@ Canvas interaction lives in `comic_editor/ui/canvas.py` and its tool features.
 the canvas inherits it for explicit reference captures while detached consumers
 evaluate it without a widget. Ordinary widget paints present ready resources.
 
+### Raster presentation continuity
+
+`ui/raster_presentation_continuity.py` retains at most 64 MiB of already
+composed provisional native presentation while exact scene replacement is
+pending. Source pixels remain in the ordinary TileStore. Selection handoffs
+checkpoint resident source composition without prediction before retiring the
+contact owner, preserving earlier chunks when a later contact covers a
+different region. Checkpoints retain the existing backend/camera-dependent
+native or flattened presentation format and document clip, avoiding duplicate
+alpha on rotated translucent strokes. Erasure patches replace previous scene
+pixels, including
+transparent pruned tiles; they do not alpha-over old ink. Filtered replacements
+own their overlaps with earlier retained contacts.
+
+The retained images are guarded by document identity, configuration, bounds,
+pixel contract, revision and visible coverage. Undo/redo and unrelated artwork
+changes retire them; stale preview completion cannot rearm pre-history
+presentation. Routine idle worker retirement preserves this bounded display
+handoff, while explicit document/controller resets clear it. Ordinary exact
+completion retires it. This owner is never an exact projection, source/effect
+cache or persistent entry and introduces no renderer or invalidation scheme
+for disk. Delayed-worker regressions and untouched saved Pocket Boyfriend
+probes are in `tests/test_raster_presentation_continuity.py` and
+[the October 11 repair record](../pocket-raster-cage-presets-2026-10-11.md).
+
 ### Exact CPU distortion preparation
 
 `ui/distort_rendering.py` retains the incoming native sampling grids and
@@ -793,6 +818,25 @@ targets before mutation; `cage_vectors.py` adaptively transports and refits
 editable vector curves, adding anchors where necessary. Shape cages also warp
 compound contributor geometry. See [limits and measured timings](../cage-transform.md).
 
+Drawing-cage preparation and commit use a focused immutable capture of the
+selected original raster/vector owners, retaining ordinary ancestor models,
+modifiers, masks, revision validation and source pins. This private input
+snapshot cannot replace the full scene compiler state or record disk artwork.
+Tiling-dependent source geometry keeps the full ordinary capture.
+
+The positively owned legacy live-canvas cage demand bounds its temporary
+source and warp devices using `LiveCanvasPreviewPolicy` (224-pixel edge and
+32,768-pixel budget), independently of camera zoom and display density. The
+complete source/output document frames and original source pixels remain
+unchanged. Supported cage-affected modifier sources use the existing scaled
+stage mapping within that same private draft owner. Separate draft keys and
+provisional status prevent these images from becoming native exact or durable
+cache entries. Exact output, commit, floating contracts, masks, overflow,
+underlay and unsupported special captures retain their native sampling rules.
+Frozen original CPU source/warp comparisons, cancellation and whole-demand
+regressions are in `tests/test_cage_source_capture.py`; saved Pocket Boyfriend
+measurements are in [the October 11 repair record](../pocket-raster-cage-presets-2026-10-11.md).
+
 ## Tone masks
 
 Object/group translations carry wholly owned modifier rigs and private mask
@@ -966,7 +1010,7 @@ Images use `QImage.Format_ARGB32_Premultiplied`. Tile coordinates may be negativ
 
 `paint_line()` spaces interpolated dabs along each input segment. Spacing derives from brush size and preset density; opacity interpolates between the endpoints.
 
-The canvas converts active pointer/stylus pressure through the selected preset's cached size/opacity curves. The eraser ignores pressure curves for opacity and uses its configured size. The raster pencil also applies preset density, antialiasing, and start/end taper. The vector pencil reuses the size/opacity pressure channels but does not apply those raster-only preset fields. Mask pencil uses the mask-specific From/To mapping instead of normal pencil curves.
+The canvas converts active pointer/stylus pressure through the selected tool's preset and cached size/opacity curves. Raster pencil and eraser share circle/square shape, density, antialiasing, and start/end taper options. Eraser opacity controls erasing strength independently of the foreground color: full strength keeps the existing Clear composition, partial strength uses DestinationOut on the native source format, and zero-strength samples do not mutate tiles. Tiled erasing also preserves native source precision. The vector pencil reuses the size/opacity pressure channels but does not apply those raster-only preset fields. Mask pencil uses the mask-specific From/To mapping instead of normal pencil curves. Circle-only predictive ink is suppressed for square and erase strokes.
 
 ### Stroke transaction
 

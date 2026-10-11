@@ -9,10 +9,12 @@ from comic_editor.core.models import (
 )
 
 
-def capture_scale(canvas, bounds, modifiers):
+def capture_scale(canvas, bounds, modifiers, *, cage_policy=None):
     if (not canvas._interactive_render
-            or getattr(canvas, "_effect_preview_channel", "canvas") != "navigator"
             or canvas._render_base_alpha or canvas._rendering_mask_contributor > 0):
+        return 1.
+    navigator = getattr(canvas, "_effect_preview_channel", "canvas") == "navigator"
+    if not navigator and cage_policy is None:
         return 1.
     supported = (ArrayModifier, BlurModifier, BrightnessContrastModifier, CurvesModifier, HalftoneModifier,
                  HueSaturationLightnessModifier, MirrorModifier, OutlineModifier,
@@ -23,6 +25,8 @@ def capture_scale(canvas, bounds, modifiers):
            for modifier in modifiers):
         return 1.
     width, height = max(1., bounds.width()), max(1., bounds.height())
+    if cage_policy is not None and not navigator:
+        return cage_policy.scale(width, height)
     # Spatial rigs retain document coordinates. The caller's inverse-scale
     # stage mapping places these smaller captures on that same frame, so mask
     # fields and deformation preparation are small too. Exact/source/mask

@@ -25,6 +25,8 @@ def paint_samples(store, object_id, samples, color, context, *, erase, square, a
     size = store.tile_size
     dirty = QRectF()
     for point, diameter, opacity in samples:
+        if erase and opacity <= 0:
+            continue
         path = QPainterPath()
         rect = QRectF(point.x()-diameter/2, point.y()-diameter/2, diameter, diameter)
         if square:
@@ -51,10 +53,16 @@ def paint_samples(store, object_id, samples, color, context, *, erase, square, a
             if before is not None and key not in before:
                 before[key] = QImage(previous) if previous is not None else None
             image = QImage(previous) if previous is not None else store._empty(size)
-            rgba = np.empty((size, size, 4), dtype=np.uint8)
-            rgba[..., :3] = (color.red(), color.green(), color.blue())
-            rgba[..., 3] = np.rint(coverage*(1. if erase else min(1., max(0., opacity)))).astype(np.uint8)
-            source = QImage(rgba.data, size, size, size*4, QImage.Format_RGBA8888).copy()
+            strength = min(1., max(0., opacity))
+            if erase and image.depth() > 32:
+                rgba = np.zeros((size, size, 4), dtype=np.uint16)
+                rgba[..., 3] = np.rint(coverage.astype(np.float64)*257*strength).astype(np.uint16)
+                source = QImage(rgba.data, size, size, size*8, QImage.Format_RGBA64_Premultiplied).copy()
+            else:
+                rgba = np.empty((size, size, 4), dtype=np.uint8)
+                rgba[..., :3] = (color.red(), color.green(), color.blue())
+                rgba[..., 3] = np.rint(coverage*strength).astype(np.uint8)
+                source = QImage(rgba.data, size, size, size*4, QImage.Format_RGBA8888).copy()
             painter = QPainter(image)
             if erase:
                 painter.setCompositionMode(QPainter.CompositionMode_DestinationOut)

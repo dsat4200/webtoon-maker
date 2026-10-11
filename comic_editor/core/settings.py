@@ -9,7 +9,9 @@ from pathlib import Path
 
 from PySide6.QtCore import QStandardPaths
 from PySide6.QtGui import QColor
-from comic_editor.core.pressure import BrushPreset, default_pencil_presets
+from comic_editor.core.pressure import (
+    BrushPreset, default_eraser_presets, default_pencil_presets,
+)
 from comic_editor.core.brushes import BrushDefinition, default_brushes
 
 
@@ -188,7 +190,7 @@ def default_fill_profiles() -> dict[str, dict[str, object]]:
 class EditorSettings:
     texture_directory: str = r"C:\Users\hopper\Documents\Assets\Texturelabs_AllTextures"
     export_destinations: dict[str, str] = field(default_factory=dict)
-    settings_version: int = 23
+    settings_version: int = 24
     tablet_mode: bool = False
     brush_size: int = 12
     eraser_size: int = 28
@@ -215,6 +217,8 @@ class EditorSettings:
     preview_font_names: bool = False
     pencil_presets: list[dict] = field(default_factory=default_pencil_presets)
     active_pencil_preset: str = "Linear"
+    eraser_presets: list[dict] | None = None
+    active_eraser_preset: str = "Linear"
     brush_presets: list[dict] = field(default_factory=default_paint_brush_presets)
     active_brush_id: str = ""
     brush_size_px: float = 24.0
@@ -270,13 +274,15 @@ class EditorSettings:
     blender_bridge_token: str = ""
 
     def __post_init__(self) -> None:
+        if self.eraser_presets is None:
+            self.eraser_presets = default_eraser_presets(self.eraser_square)
         # Settings are also constructed directly by tests and UI helpers, so
         # keep the invariants on the value object instead of relying on every
         # caller to remember a separate normalization step.
         self.clamp()
 
     def clamp(self) -> None:
-        self.settings_version = 23
+        self.settings_version = 24
         from .texture_library import DEFAULT_TEXTURE_DIRECTORY
         self.texture_directory = (str(self.texture_directory).strip()
                                   if self.texture_directory is not None else DEFAULT_TEXTURE_DIRECTORY)
@@ -383,29 +389,20 @@ class EditorSettings:
                 continue
             if sum(normalized) > 0:
                 self.ui_splitter_sizes[key] = normalized
-        pencil_presets: list[dict] = []
-        pencil_names: set[str] = set()
-        for item in self.pencil_presets or []:
-            preset = BrushPreset.from_dict(item if isinstance(item, dict) else None)
-            if preset.name.casefold() == "linear":
-                preset.name = "Linear"
-            if preset.name.casefold() in pencil_names:
-                continue
-            pencil_names.add(preset.name.casefold())
-            pencil_presets.append(preset.to_dict())
-        linear_index = next((
-            index for index, item in enumerate(pencil_presets)
-            if item["name"] == "Linear"
-        ), -1)
-        if linear_index < 0:
-            pencil_presets.insert(0, BrushPreset().to_dict())
-        elif linear_index > 0:
-            pencil_presets.insert(0, pencil_presets.pop(linear_index))
-        self.pencil_presets = pencil_presets
-        if self.active_pencil_preset not in {
-            item["name"] for item in pencil_presets
-        }:
-            self.active_pencil_preset = "Linear"
+        for kind, defaults in (("pencil", default_pencil_presets),
+                               ("eraser", default_eraser_presets)):
+            presets, names = [], set()
+            for item in getattr(self, f"{kind}_presets") or []:
+                preset = BrushPreset.from_dict(item if isinstance(item, dict) else None)
+                if preset.name.casefold() in names:
+                    continue
+                names.add(preset.name.casefold())
+                presets.append(preset.to_dict())
+            presets = presets or defaults()
+            setattr(self, f"{kind}_presets", presets)
+            if getattr(self, f"active_{kind}_preset") not in {item["name"] for item in presets}:
+                setattr(self, f"active_{kind}_preset", presets[0]["name"])
+        self.eraser_square = self.active_eraser_preset_settings().shape == "square"
         if self.canvas_renderer not in {"auto", "gpu", "raster"}:
             self.canvas_renderer = "auto"
         if self.transform_mode not in {"free", "uniform"}:
@@ -633,6 +630,14 @@ class EditorSettings:
             self.pencil_presets[0],
         ))
 
+    def active_eraser_preset_settings(self) -> BrushPreset:
+        preset = BrushPreset.from_dict(next(
+            (item for item in self.eraser_presets
+             if item.get("name") == self.active_eraser_preset),
+            self.eraser_presets[0],
+        ))
+        return preset
+
     def active_paint_brush(self) -> BrushDefinition:
         """Snapshot the separate raster Brush preset and current size/opacity."""
         data = next(
@@ -801,7 +806,9 @@ def load_settings() -> EditorSettings:
                 for preset in stored_presets:
                     if isinstance(preset, dict):
                         preset.pop("transform_snap", None)
-            raw["settings_version"] = 23
+            if "eraser_presets" not in raw:
+                raw["eraser_presets"] = default_eraser_presets(bool(raw.get("eraser_square", False)))
+            raw["settings_version"] = 24
             valid = {item.name for item in dataclasses.fields(EditorSettings)}
             result = EditorSettings(**{
                 key: value for key, value in raw.items() if key in valid

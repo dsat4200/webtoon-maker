@@ -73,7 +73,7 @@ from comic_editor.ui.hotkeys import (
 from comic_editor.ui.gradient_tools import (
     BUILTIN_PRIMARY_SECONDARY_ID, GradientToolsControls,
 )
-from comic_editor.ui.pencil_settings_dialog import PencilSettingsDialog
+from comic_editor.ui.pencil_settings_dialog import PencilSettingsDialog, DrawingPresetSettingsDialog
 from comic_editor.ui.preview import ChapterPreview
 from comic_editor.ui.ribbon import RibbonWidget, VerticalTabWidget
 from comic_editor.ui.view_settings import ViewSettingsPanel
@@ -256,8 +256,8 @@ class NavigatorPanel(QWidget):
         column.setSpacing(2)
         self.preview = ChapterPreview(canvas, self.contents)
         column.addWidget(self.preview, 1)
-        self.cache_button = QPushButton("Cache to disk", self.contents)
-        self.cache_button.setObjectName("cacheToDisk")
+        self.cache_button = QPushButton("Cache to memory", self.contents)
+        self.cache_button.setObjectName("cacheToMemory")
         column.addWidget(self.cache_button)
         self.cache_progress = QLabel("", self.contents)
         self.cache_progress.setAlignment(Qt.AlignCenter)
@@ -268,8 +268,8 @@ class NavigatorPanel(QWidget):
         self.cache_status.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         column.addWidget(self.cache_status)
         menu = QMenu(self.cache_status)
-        self.clear_selected_action = menu.addAction("Clear selected cache")
-        self.clear_all_action = menu.addAction("Clear all disk cache")
+        self.clear_selected_action = menu.addAction("Clear selected memory cache")
+        self.clear_all_action = menu.addAction("Clear all memory cache")
         self.cache_status.setMenu(menu)
         layout.addWidget(rail)
         layout.addWidget(self.contents)
@@ -583,8 +583,10 @@ class MainWindow(QMainWindow):
             "tool_settings", "Tool Settings"
         )
         self.tool_settings_group = self.tool_settings_page.add_group(
-            "Current tool", minimum_width=720
+            "", minimum_width=720
         )
+        self.tool_settings_group.title_label.hide()
+        self.tool_settings_group.collapse_button.hide()
         self.tool_settings_controls = ToolSettingsControls(
             self.settings, self.ribbon
         )
@@ -1296,6 +1298,8 @@ class MainWindow(QMainWindow):
         self.tool_settings_controls.pencilSettingsRequested.connect(
             self._edit_pencil_settings
         )
+        self.tool_settings_controls.eraserSettingsRequested.connect(self._edit_eraser_settings)
+        self.tool_settings_controls.presetSettingsRequested.connect(self._edit_drawing_preset)
         self.tool_settings_controls.brushSizeSelected.connect(
             self._brush_size_selected
         )
@@ -6856,6 +6860,37 @@ class MainWindow(QMainWindow):
         dialog.committedPresets.connect(self._commit_pencil_presets)
         dialog.exec()
 
+    def _edit_eraser_settings(self) -> None:
+        dialog = PencilSettingsDialog(
+            self.settings.eraser_presets, self.settings.active_eraser_preset,
+            self, tool="Eraser",
+        )
+        dialog.committedPresets.connect(self._commit_eraser_presets)
+        dialog.exec()
+
+    def _commit_eraser_presets(self, presets, active_name: str) -> None:
+        self.settings.eraser_presets = presets
+        self.settings.active_eraser_preset = active_name
+        self.settings.eraser_square = self.settings.active_eraser_preset_settings().shape == "square"
+        self._ribbon_settings_changed()
+
+    def _edit_drawing_preset(self, kind: str, name: str) -> None:
+        presets = getattr(self.settings, f"{kind}_presets")
+        index = next((i for i, item in enumerate(presets) if item["name"] == name), -1)
+        if index < 0:
+            return
+        dialog = DrawingPresetSettingsDialog(
+            presets[index], self, tool=kind.title(),
+            show_handles=getattr(self.settings, f"{kind}_transform_handles_visible"),
+        )
+        if dialog.exec() != QDialog.Accepted:
+            return
+        presets[index] = dialog.result_preset()
+        setattr(self.settings, f"{kind}_transform_handles_visible", dialog.show_handles.isChecked())
+        if kind == "eraser":
+            self.settings.eraser_square = self.settings.active_eraser_preset_settings().shape == "square"
+        self._ribbon_settings_changed()
+
     def _commit_pencil_presets(self, presets, active_name: str) -> None:
         self.settings.pencil_presets = presets
         self.settings.active_pencil_preset = active_name
@@ -7004,6 +7039,8 @@ class MainWindow(QMainWindow):
                 self.canvas._emit_typed_document_changed(None, self.canvas._last_published_change)
 
         self.canvas.refresh_grid_settings()
+        self.canvas.refresh_brush_settings()
+        self.tool_settings_controls.refresh()
         self.selection_settings.refresh()
         if document_changed:
             self._refresh_actions()

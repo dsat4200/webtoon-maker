@@ -96,6 +96,7 @@ class BrushPreset:
     stroke_end_ratio: float = 1.0
     density: float = 1.0
     antialiasing: bool = True
+    shape: str = "circle"
 
     @property
     def use_pressure_size(self) -> bool:
@@ -112,6 +113,8 @@ class BrushPreset:
         self.stroke_start_ratio = max(0.1, min(1.0, float(self.stroke_start_ratio)))
         self.stroke_end_ratio = max(0.1, min(1.0, float(self.stroke_end_ratio)))
         self.density = max(0.1, min(3.0, float(self.density)))
+        if self.shape not in {"circle", "square"}:
+            self.shape = "circle"
 
     def to_dict(self) -> dict:
         self.clamp()
@@ -125,6 +128,7 @@ class BrushPreset:
             "stroke_end_ratio": self.stroke_end_ratio,
             "density": self.density,
             "antialiasing": self.antialiasing,
+            "shape": self.shape,
         }
 
     @classmethod
@@ -144,6 +148,7 @@ class BrushPreset:
             stroke_end_ratio=float(data.get("stroke_end_ratio", 1.0)),
             density=float(data.get("density", 1.0)),
             antialiasing=bool(data.get("antialiasing", True)),
+            shape=str(data.get("shape", "circle")),
         )
         preset.clamp()
         return preset
@@ -151,3 +156,11 @@ class BrushPreset:
 
 def default_pencil_presets() -> list[dict]:
     return [BrushPreset().to_dict()]
+
+
+def default_eraser_presets(square: bool = False) -> list[dict]:
+    """Keep the historical constant, hard-edged eraser until configured."""
+    return [BrushPreset(
+        pressure_size=False, pressure_opacity=False, antialiasing=False,
+        shape="square" if square else "circle",
+    ).to_dict()]

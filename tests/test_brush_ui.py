@@ -173,7 +173,7 @@ def test_brush_library_migrates_persists_and_is_separate_from_pencil(monkeypatch
     monkeypatch.setattr(settings_module, "settings_path", lambda: path)
     path.write_text(json.dumps({"settings_version": 22, "active_pencil_preset": "Linear"}), encoding="utf-8")
     settings = load_settings()
-    assert settings.settings_version == 23
+    assert settings.settings_version == 24
     assert settings.hotkeys["brush"] == "Shift+B"
     custom = replace(default_brushes()[5], id="custom", name="Imported chain")
     settings.brush_presets.append(custom.to_dict())

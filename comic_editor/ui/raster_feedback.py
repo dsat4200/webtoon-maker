@@ -108,7 +108,7 @@ class RasterFeedbackPatchCache:
             self.byte_count -= self._entry_bytes(entry)
 
 
-def _compose_tile(canvas, prepared, tile, resident, flatten=True):
+def _compose_tile(canvas, prepared, tile, resident, flatten=True, prediction=True):
     side, gutter = prepared.tile_size, prepared.gutter
     x, y = tile.key
     rebuild = prepared.source_images is not None
@@ -177,7 +177,7 @@ def _compose_tile(canvas, prepared, tile, resident, flatten=True):
             composed.setTransform(QTransform.fromTranslate(-tile.bounds[0], -tile.bounds[1]))
         else:
             composed.drawImage(QRectF(*tile.bounds), source)
-        if (canvas.settings.predictive_ink and canvas._predictive is not None
+        if (prediction and canvas.settings.predictive_ink and canvas._predictive is not None
                 and not canvas._stroke_erasing):
             composed.setRenderHint(QPainter.Antialiasing, True)
             paint_prediction(composed, canvas._predictive)
@@ -265,13 +265,13 @@ def _native_replacement_supported(painter, camera):
         painter.restore()
 
 
-def _raster_feedback_tiles(canvas, prepared, dirty_keys, cache, replace_native, *, complete=False):
+def _raster_feedback_tiles(canvas, prepared, dirty_keys, cache, replace_native, *, complete=False, prediction=True):
     owner = canvas.tiles._tiles.get(prepared.identifier)
     if owner is None:
         return []
     side, gutter = prepared.tile_size, prepared.gutter
     dirty_keys = set(dirty_keys)
-    predictive = canvas._predictive if canvas.settings.predictive_ink and not canvas._stroke_erasing else None
+    predictive = canvas._predictive if prediction and canvas.settings.predictive_ink and not canvas._stroke_erasing else None
     prediction_key = None if predictive is None else (
         predictive[0].x(), predictive[0].y(), predictive[1].x(), predictive[1].y(),
         predictive[2], predictive[3].rgba())
@@ -320,7 +320,8 @@ def _raster_feedback_tiles(canvas, prepared, dirty_keys, cache, replace_native, 
             cache.source_signature(prepared, tile, resident))
         presented = cache.get(tile.key, signature)
         if presented is None:
-            presented = _compose_tile(canvas, prepared, tile, resident, not replace_native)
+            presented = (_compose_tile(canvas, prepared, tile, resident, not replace_native)
+                if prediction else _compose_tile(canvas, prepared, tile, resident, not replace_native, False))
             cache.put(tile.key, signature, presented)
         presented_tiles.extend(_native_presentation_tiles(canvas, prepared, tile,
             presented, visible, cache))
@@ -420,6 +421,12 @@ def present_raster_feedback(canvas, painter, prepared, dirty_keys, cache):
         draw_document_tiles(painter, presented_tiles, camera, canvas.size(), owner=canvas,
             smooth=True, clip_world=None if replace_native else prepared.document.bounds,
             replace_background=QColor('#242428') if replace_native else None)
+        controller = canvas._scene_controller
+        basis = controller._presentation_batch
+        if basis is not None and canvas._predictive is None:
+            document, batch, view = basis
+            controller.raster_continuity.remember(document, batch, presented_tiles,
+                replace_background=replace_native, view=view)
     return len(presented_tiles)
 
 

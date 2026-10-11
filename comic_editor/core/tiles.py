@@ -1104,6 +1104,8 @@ class TileStore:
         ] = {}
         dirty = QRectF()
         for point, size, opacity in samples:
+            if erase and float(opacity) <= 0.0:
+                continue
             size = max(1.0, float(size))
             half = max(0.5, size / 2)
             dab_rect = QRectF(
@@ -1141,8 +1143,6 @@ class TileStore:
                 if replace_alpha else QPainter.CompositionMode_SourceOver
             )
             painter.setPen(Qt.NoPen)
-            if erase:
-                painter.setBrush(Qt.black)
             approximate = bounds_cache.get(key)
             cache_known = (
                 key in bounds_cache
@@ -1155,10 +1155,15 @@ class TileStore:
                     point.x() - key[0] * self.tile_size,
                     point.y() - key[1] * self.tile_size,
                 )
-                if not erase:
-                    actual = QColor(color)
-                    actual.setAlphaF(max(0.0, min(1.0, opacity)))
-                    painter.setBrush(actual)
+                actual = QColor(Qt.black) if erase else QColor(color)
+                strength = max(0.0, min(1.0, opacity))
+                actual.setAlphaF(strength)
+                painter.setBrush(actual)
+                if erase:
+                    # Full strength retains the established exact hard eraser;
+                    # partial strength removes alpha in the source's native format.
+                    painter.setCompositionMode(QPainter.CompositionMode_Clear if strength >= 1.0
+                                               else QPainter.CompositionMode_DestinationOut)
                 if square:
                     painter.drawRect(QRectF(
                         local.x() - half, local.y() - half, size, size

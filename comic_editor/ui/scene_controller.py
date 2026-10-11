@@ -43,6 +43,9 @@ class SceneController(QObject):
         self.feedback = None
         self.feedback_dirty = set()
         self.feedback_patches = RasterFeedbackPatchCache()
+        from comic_editor.ui.raster_presentation_continuity import RasterPresentationContinuity
+        self.raster_continuity = RasterPresentationContinuity()
+        self._presentation_batch = None
         self._bootstrap = None
         self._bootstrap_serial = 0
         self._bootstrap_dispatched = False
@@ -67,7 +70,10 @@ class SceneController(QObject):
         bootstrap_scheduler = self.bootstrap_scheduler
         self.destroyed.connect(lambda: bootstrap_scheduler.close())
 
-    def reset(self):
+    def reset(self, *, retain_presentation=False):
+        if not retain_presentation:
+            self.raster_continuity.reset()
+            self._presentation_batch = None
         self._retire_contact_preview()
         self._retire_bootstrap()
         self._bootstrap_failed = None
@@ -92,6 +98,7 @@ class SceneController(QObject):
         target = self.canvas.selected_id if (self.canvas.selected_kind == 'object' and
             isinstance(self.canvas.chapter.objects.get(self.canvas.selected_id), RasterObject)) else ''
         if target != self.feedback_target:
+            self.checkpoint_raster_presentation(document)
             self._retire_bootstrap()
             self._bootstrap_failed = None
             self._retire_filtered()
@@ -646,7 +653,10 @@ class SceneController(QObject):
     def advance(self):
         canvas = self.canvas
         if self.desired is None or canvas.chapter is None:
-            self.reset()
+            # A queued timer can arrive after contact release retires its
+            # demand. This is idle scheduling, not a document replacement:
+            # newest displayed source pixels still await an exact scene.
+            self.reset(retain_presentation=canvas.chapter is not None)
             return
         document, addresses, phases, visible = self.desired
         if self._filtered_state is not None and not self._filtered_state.advance(document,capture=False):
@@ -837,6 +847,7 @@ class SceneController(QObject):
         return batch, complete
 
     def changed(self, change, *, action="transient"):
+        self.raster_continuity.changed(change, action, self.canvas._render_document_state())
         self.release_handoff.changed(change, action)
         if self._contact_preview_owner is not None:
             from comic_editor.render.raster_feedback_bootstrap import selected_source_change
@@ -946,6 +957,33 @@ class SceneController(QObject):
             return 0
         from comic_editor.ui.raster_feedback import present_raster_feedback
         return present_raster_feedback(self.canvas, painter, prepared, self.feedback_dirty, self.feedback_patches)
+
+    def checkpoint_raster_presentation(self, document):
+        """Keep committed native ink before a selection retires its source owner."""
+        if (self._presentation_batch is None or self.feedback is None
+                or self._filtered_state is not None or not self.feedback_dirty
+                or self.feedback.document.identity != document.identity
+                or self.feedback.document.configuration != document.configuration):
+            return
+        old_document, batch, view = self._presentation_batch
+        if (old_document.configuration != document.configuration or old_document.identity != document.identity
+                or view != self.presentation_view()):
+            return
+        from comic_editor.ui.raster_feedback import _raster_feedback_tiles
+        from comic_editor.ui.canvas import RasterCanvasWidget
+        camera = self.canvas.camera_transform()
+        replace_native = (isinstance(self.canvas, RasterCanvasWidget) and camera.isAffine()
+            and camera.m11() > 0. and camera.m22() > 0. and camera.m12() == 0. and camera.m21() == 0.)
+        tiles = _raster_feedback_tiles(self.canvas, self.feedback, self.feedback_dirty,
+            self.feedback_patches, replace_native, complete=True, prediction=False)
+        if tiles:
+            self.raster_continuity.remember(document, batch, tiles, replace_background=replace_native, view=view)
+
+    def presentation_view(self):
+        camera = self.canvas.camera_transform()
+        return ((camera.m11(), camera.m12(), camera.m13(), camera.m21(), camera.m22(), camera.m23(),
+            camera.m31(), camera.m32(), camera.m33()), self.canvas.width(), self.canvas.height(),
+            self.canvas.devicePixelRatioF())
 
     def filtered_batch(self,document,requests,batch,*,complete=False):
         state = self._filtered_state

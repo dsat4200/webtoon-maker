@@ -537,15 +537,15 @@ the previous application palette on Cancel; OK writes through the existing
 atomic writer. Bundled `ui/themes.json` presets are immutable. Themes never
 enter series/chapter records, source pixels, or durable artwork cache entries.
 
-`EditorSettings` is version 23 and is written to the platform path returned by Qt's `QStandardPaths.AppConfigLocation`, in `settings.json`. It is not stored in the portable series folder.
+`EditorSettings` is version 24 and is written to the platform path returned by Qt's `QStandardPaths.AppConfigLocation`, in `settings.json`. It is not stored in the portable series folder.
 
 It contains:
 
 - tablet navigation, snap-to-grid, predictive ink, renderer choice, and global grid visibility/size/divisions/color/opacity defaults;
 - pencil/eraser S/M/L sizes and defaults;
-- pencil presets and active preset;
+- independent pencil and eraser preset libraries and active names, including each preset's shape, size/opacity pressure curves and enable flags, density, antialiasing, and taper;
 - separate raster Brush library with embedded PNG tip/texture resources, active Brush ID, size and opacity overrides (settings version 23);
-- eraser shape;
+- the compatibility eraser shape flag used by vector/mask erasing;
 - transform and rectangle edit modes;
 - transform-handle visibility, vector point icon visibility/size/opacity;
 - text formatting presets, active preset, and whether font-list entries preview their own families;
@@ -557,7 +557,7 @@ It contains:
 - the Blender loopback bridge endpoint and token (host clamped to loopback); and
 - up to 12 recent series paths.
 
-Loading progressively backfills/migrates settings from earlier versions, filters unknown fields, clamps values, protects the default Linear pencil and Default text presets, adds the default Delete Selected and Alt+G bindings, migrates Paste Image to unified Paste, and always emits version 23 on save. Text-preset sizes normalize to integers from 6 through 250. Settings save through a temporary file followed by replace.
+Loading progressively backfills/migrates settings from earlier versions, filters unknown fields, clamps values, protects the Default text preset, adds the default Delete Selected and Alt+G bindings, migrates Paste Image to unified Paste, and always emits version 24 on save. Each pencil/eraser library retains at least one preset; every preset may be renamed or deleted while another remains. Missing eraser libraries migrate from the old shape flag to a constant-size, full-strength, hard-edged preset, preserving historical default output. Text-preset sizes normalize to integers from 6 through 250. Settings save through a temporary file followed by replace.
 
 Primary/secondary colors, palettes, color history, and gradient presets are **series** preferences, not editor settings. `brush_color` remains as a compatibility/current-primary bridge for drawing behavior.
 

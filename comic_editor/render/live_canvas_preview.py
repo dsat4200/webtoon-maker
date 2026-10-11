@@ -1,9 +1,12 @@
 """Private live-canvas draft policy; exact/native callers retain their policy.
 
 This policy belongs to one detached preview evaluation. Its cancellation event
-is the worker's demand token, not a document/editor callback. Source captures
-keep their complete native frame. Only existing transient kernel helpers reduce
-temporary input/output samples; those values never leave the preview owner.
+is the worker's demand token, not a document/editor callback. Source frames
+retain their complete document-space bounds. Guarded cage target/ancestor
+sources may draw into a bounded private draft device before the deformation;
+exact, mask, floating and other special captures retain native samples. These
+temporary input/output samples never leave the preview owner or enter durable
+exact caches.
 """
 from dataclasses import dataclass, field
 from typing import Callable
@@ -70,4 +73,27 @@ def check_live_canvas_cancelled(scene):
     policy = live_canvas_policy(scene)
     if policy is not None:
         policy.check_cancelled()
+    return policy
+
+
+def live_cage_source_policy(scene):
+    """Only an explicitly bounded live ancestor may pass its policy inward."""
+    policy = live_canvas_policy(scene)
+    if policy is not None:
+        return policy
+    policy = getattr(scene, '_cage_preview_source_policy', None)
+    snapshot = getattr(scene, 'snapshot', None)
+    if (not isinstance(policy, LiveCanvasPreviewPolicy) or snapshot is None
+            or not snapshot.document.live_preview or snapshot.document.contact_only
+            or snapshot.document.identity != policy.document_identity
+            or snapshot.document.revision != policy.revision
+            or snapshot.document.pixel_contract.floating
+            or snapshot.document.overflow or snapshot.document.underlay != ('', 0.)
+            or getattr(scene, '_effect_preview_channel', 'canvas') != 'canvas'):
+        return None
+    for name in ('_render_base_alpha', '_rendering_mask_contributor', '_render_cage_source',
+                 '_rendering_halftone_source', '_rendering_compound_references',
+                 '_rendering_outward_gradient', '_tiling_capture_geometry'):
+        if getattr(scene, name, None):
+            return None
     return policy

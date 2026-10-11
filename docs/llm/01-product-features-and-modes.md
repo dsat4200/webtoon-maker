@@ -120,9 +120,9 @@ The application intentionally does not implement scheduling, reference libraries
 - **Add Raster** enters a drag-to-create frame mode. The interaction frame stays visible while painting and is not a clipping rectangle.
 - Pencil and eraser work beyond the frame. Pencil strokes expand it to the union of its old area and alpha bounds plus a 24-document-pixel margin. Eraser strokes recalculate it from the remaining alpha plus that margin.
 - Erasing prunes empty tiles. Erasing all pixels retains the previous interaction frame.
-- Circular and square erasers are supported.
-- Pencil presets independently map stylus pressure to size and opacity, with min/max/control points and pressure enable flags. Density, antialiasing, and start/end taper are applied by the raster pencil; the vector pencil reuses the pressure size/opacity channels.
-- Small/medium/large pencil and eraser sizes are configurable, including which size becomes active at launch.
+- Pencil and eraser presets support circular and square shapes and independently map stylus pressure to size and opacity, with the same min/max/control points and pressure enable flags. Density, antialiasing, and start/end taper apply to both raster tools; the vector pencil reuses the pressure size/opacity channels.
+- Each tool's size and Manage presets button sit above its preset cards. Each card opens its own shape and pressure settings. Manage presets creates, renames, and deletes presets while retaining at least one per tool. The redundant Current tool heading is hidden.
+- Small/medium/large pencil and eraser sizes and startup defaults are configurable in Settings → Pencil/Eraser.
 - Predictive ink shows the extrapolated end of an active raster stroke without committing it.
 - Stylus hover shows the active brush/eraser radius and a center crosshair.
 - Raster opacity may be locked to its parent layer or independently set. The object can ignore its direct parent mask, reference a compound mask, show an editing underlay, and carry modifiers.

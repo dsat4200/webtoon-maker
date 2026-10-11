@@ -6066,6 +6066,13 @@ class _CanvasLogic(SceneKernels, LassoBrushFeatures, BrushFeatures, DocumentProj
             else self.settings.brush_size_px if self.tool == ToolKind.BRUSH
             else self.settings.pencil_size()
         )
+        preset = (self.settings.active_eraser_preset_settings()
+                  if self.tool == ToolKind.RASTER_ERASER else self._preset)
+        raster_tip = not self.active_tone_mask_id and self._selected_vector_drawing() is None
+        if self.tool != ToolKind.BRUSH and raster_tip and preset.pressure_size:
+            pressure = (self._effective_pressure(self._native_pointer_pressure)
+                        if self._raster_contact_active else 1.0)
+            size *= preset.size_curve.evaluate_fast(pressure)
         radius = max(2.0, size * self.scale / 2)
         painter.save()
         painter.setTransform(QTransform())
@@ -6075,6 +6082,9 @@ class _CanvasLogic(SceneKernels, LassoBrushFeatures, BrushFeatures, DocumentProj
             path = self._paint_brush_cursor_path(center)
             painter.drawPath(path)
             radius = max(2.0, min(path.boundingRect().width(), path.boundingRect().height()) / 2)
+        elif (preset.shape == "square" if raster_tip else
+              self.tool == ToolKind.RASTER_ERASER and self.settings.eraser_square):
+            painter.drawRect(QRectF(center.x()-radius, center.y()-radius, radius*2, radius*2))
         else:
             painter.drawEllipse(center, radius, radius)
         cross = min(6.0, max(3.0, radius * 0.35))
@@ -20183,7 +20193,9 @@ class _CanvasLogic(SceneKernels, LassoBrushFeatures, BrushFeatures, DocumentProj
 
     def _raster_input_context(self):
         return {'object': self.selected_id, 'tool': self.tool, 'color': self.primary_color,
-                'preset': BrushPreset.from_dict(self._preset.to_dict()),
+                'preset': (self.settings.active_eraser_preset_settings()
+                           if self.tool == ToolKind.RASTER_ERASER
+                           else BrushPreset.from_dict(self._preset.to_dict())),
                 'base': float(self.settings.active_eraser_pixels() if self.tool == ToolKind.RASTER_ERASER
                               else self.settings.pencil_size()),
                 'square': self.settings.eraser_square, 'prediction': self.settings.predictive_ink}
@@ -20468,20 +20480,13 @@ class _CanvasLogic(SceneKernels, LassoBrushFeatures, BrushFeatures, DocumentProj
         self._stroke_erasing = self.tool == ToolKind.RASTER_ERASER
         self._predictive = None
         size, opacity = self._brush_values(self._last_pressure)
-        if self.tool == ToolKind.RASTER_PENCIL:
-            size *= self._stroke_preset.stroke_start_ratio
+        size *= self._stroke_preset.stroke_start_ratio
         try:
             dirty = self.tiles.paint_dab(
                 obj.object_id, local, size, QColor(self.primary_color), opacity,
                 erase=self.tool == ToolKind.RASTER_ERASER,
-                square=(
-                    self.settings.eraser_square
-                    and self.tool == ToolKind.RASTER_ERASER
-                ),
-                antialias=(
-                    self._stroke_preset.antialiasing
-                    if self.tool == ToolKind.RASTER_PENCIL else False
-                ),
+                square=self._stroke_preset.shape == "square",
+                antialias=self._stroke_preset.antialiasing,
                 before=self._stroke_before,
                 tiling=self._tiling_stroke_context,
             )
@@ -20516,18 +20521,9 @@ class _CanvasLogic(SceneKernels, LassoBrushFeatures, BrushFeatures, DocumentProj
                 size_start, size_end,
                 QColor(self.primary_color), opacity_start, opacity_end,
                 erase=self.tool == ToolKind.RASTER_ERASER,
-                square=(
-                    self.settings.eraser_square
-                    and self.tool == ToolKind.RASTER_ERASER
-                ),
-                antialias=(
-                    self._stroke_preset.antialiasing
-                    if self.tool == ToolKind.RASTER_PENCIL else False
-                ),
-                density=(
-                    self._stroke_preset.density
-                    if self.tool == ToolKind.RASTER_PENCIL else 1.0
-                ),
+                square=self._stroke_preset.shape == "square",
+                antialias=self._stroke_preset.antialiasing,
+                density=self._stroke_preset.density,
                 before=self._stroke_before,
                 tiling=getattr(self, "_tiling_stroke_context", None),
             )
@@ -20537,7 +20533,9 @@ class _CanvasLogic(SceneKernels, LassoBrushFeatures, BrushFeatures, DocumentProj
         previous_local = QPointF(self._last_draw_point)
         self._last_draw_point = local
         self._last_pressure = actual_pressure
-        if self.settings.predictive_ink and not getattr(self, "_tiling_stroke_context", None):
+        if (self.settings.predictive_ink and not self._stroke_erasing
+                and self._stroke_preset.shape == "circle"
+                and not getattr(self, "_tiling_stroke_context", None)):
             world_current = self._raster_world_point(obj, local)
             delta = local - previous_local
             # Prediction is intentionally short and transient; it never enters
@@ -20569,20 +20567,31 @@ class _CanvasLogic(SceneKernels, LassoBrushFeatures, BrushFeatures, DocumentProj
 
     def _end_stroke_impl(self) -> None:
         obj = self.chapter.objects[self.selected_id]
-        if (
-            not self._stroke_erasing
-            and self._stroke_preset.stroke_end_ratio < 0.999
-        ):
+        if self._stroke_preset.stroke_end_ratio < 0.999:
             size, opacity = self._brush_values(self._last_pressure)
             dirty = self.tiles.paint_dab(
                 obj.object_id, self._last_draw_point,
                 size * self._stroke_preset.stroke_end_ratio,
                 QColor(self.primary_color), opacity,
+                erase=self._stroke_erasing,
+                square=self._stroke_preset.shape == "square",
                 antialias=self._stroke_preset.antialiasing,
                 before=self._stroke_before,
+                tiling=getattr(self, "_tiling_stroke_context", None),
             )
             self._emit_raster_dirty(obj, dirty)
         keys = set(self._stroke_before)
+        if self._stroke_erasing and not keys:
+            # Zero-strength pressure and empty eraser footprints have no
+            # source transaction, frame adjustment or history entry.
+            self._stroke_before = {}
+            self._stroke_frame_before = None
+            self._stroke_erasing = self._drawing = False
+            self._stroke_dirty_world = QRectF()
+            self._stroke_preset = self._predictive = None
+            self._restore_gc_after_stroke()
+            self.interactionFinished.emit()
+            return
         if self._stroke_erasing:
             self.tiles.prune_empty(obj.object_id, keys)
         else:
@@ -20650,16 +20659,17 @@ class _CanvasLogic(SceneKernels, LassoBrushFeatures, BrushFeatures, DocumentProj
             self.settings.active_eraser_pixels()
             if erasing else self.settings.pencil_size()
         )
-        if erasing:
-            return float(base), 1.0
         size = float(base)
         opacity = 1.0
-        preset = self._stroke_preset or self._preset
+        preset = self._stroke_preset or (
+            self.settings.active_eraser_preset_settings() if erasing else self._preset
+        )
         if preset.pressure_size:
             size *= preset.size_curve.evaluate_fast(pressure)
         if preset.pressure_opacity:
             opacity = preset.opacity_curve.evaluate_fast(pressure)
-        opacity *= QColor(self.primary_color).alphaF()
+        if not erasing:
+            opacity *= QColor(self.primary_color).alphaF()
         return max(0.5, size), opacity
 
     def _effective_pressure(self, pressure: float) -> float:
@@ -20676,6 +20686,8 @@ class _CanvasLogic(SceneKernels, LassoBrushFeatures, BrushFeatures, DocumentProj
         self.update()
 
     def _emit_raster_dirty(self, obj: RasterObject, local: QRectF) -> None:
+        if local.isEmpty():
+            return
         old_frame = tuple(obj.interaction_rect)
         old_height = self.chapter.height
         frame = QRectF(*obj.interaction_rect)

@@ -781,6 +781,12 @@ class SceneKernels:
             return
         if self._render_tiled_target(painter, layer, parent_opacity, visible_world):
             return
+        from comic_editor.render.live_canvas_preview import live_cage_source_policy
+        if self._cage_session is not None and live_cage_source_policy(self) is not None and any(
+                any(parent.layer_id == layer.layer_id for parent in self.chapter.ancestor_layers(
+                    self.chapter.objects[ref[1]].parent_layer_id)) for ref in self._cage_session['targets']):
+            self._render_mirror_target(painter, layer, parent_opacity, visible_world)
+            return
         if (self._interactive_render
                 and getattr(self, "_effect_preview_channel", "canvas") == "navigator"):
             self._render_mirror_target(painter, layer, parent_opacity, visible_world)
@@ -3532,11 +3538,13 @@ class SceneKernels:
             from comic_editor.ui.compound_strokes import scoped
             if scoped(self, target):
                 world = world.united(self.layer_world_transform(identifier).mapRect(self.layer_effective_path(identifier).controlPointRect()))
+        cage_affected = False
         if self._cage_session is not None:
             affected = (kind, identifier) in self._cage_session["targets"] or layer and any(
                 any(parent.layer_id == identifier for parent in self.chapter.ancestor_layers(self.chapter.objects[ref[1]].parent_layer_id))
                 for ref in self._cage_session["targets"])
             if affected:
+                cage_affected = True
                 from comic_editor.core.cage import deformed_bounds
                 world = world.united(QRectF(*deformed_bounds(self._cage_session["grid"])))
         drawing = self._active_vector_drawing()
@@ -3557,7 +3565,9 @@ class SceneKernels:
         if layer and scoped(self, target):
             modifiers = [modifier for modifier in modifiers if not isinstance(modifier, StrokeModifier)]
         from comic_editor.ui.thumbnail_effects import capture_scale, scaled_modifiers
-        thumbnail_scale = capture_scale(self, bounds, modifiers)
+        from comic_editor.render.live_canvas_preview import live_cage_source_policy
+        cage_policy = live_cage_source_policy(self) if cage_affected else None
+        thumbnail_scale = capture_scale(self, bounds, modifiers, cage_policy=cage_policy)
         navigator = self._interactive_render and getattr(self, "_effect_preview_channel", "canvas") == "navigator"
         stage_mapping = mapping
         capture_bounds = bounds
@@ -3578,6 +3588,8 @@ class SceneKernels:
             key = (*key, self._modifier_mapping_signature(mapping))
         if navigator:
             key = ("navigator-source", thumbnail_scale, key)
+        elif cage_policy is not None:
+            key = ('cage-preview-effect-source', cage_policy.signature, thumbnail_scale, key)
         if layer and scoped(self, target):
             key = (*key, self._modifier_parameter_signature([mid for mid in target.modifier_ids
                 if isinstance(self.chapter.modifiers.get(mid), StrokeModifier)]))
@@ -3634,6 +3646,9 @@ class SceneKernels:
             source.setTransform(QTransform.fromScale(thumbnail_scale, thumbnail_scale)
                                 * QTransform.fromTranslate(-region.left(), -region.top()))
             capture = QTransform.fromScale(1/thumbnail_scale, 1/thumbnail_scale).mapRect(region)
+            old_cage_policy = getattr(self, '_cage_preview_source_policy', None)
+            if cage_policy is not None:
+                self._cage_preview_source_policy = cage_policy
             self._render_modifier_sources.add((kind, identifier))
             try:
                 if layer:
@@ -3651,6 +3666,7 @@ class SceneKernels:
                         self._render_modified_vector_pencil_preview(source, parent_id or "")
             finally:
                 self._render_modifier_sources.discard((kind, identifier))
+                self._cage_preview_source_policy = old_cage_policy
                 source.end()
             return image, revision != getattr(self, "_effect_provisional_revision", 0)
         if completed is None and not has_stroke and not direct_mirror and not shape_overlay and thumbnail_scale == 1. and not navigator:
@@ -3669,7 +3685,7 @@ class SceneKernels:
             image, source_provisional = capture_region(bounds)
             if not source_provisional:
                 self._modifier_source_cache_put(key, image)
-        source_provisional |= navigator
+        source_provisional |= navigator or cage_policy is not None
         if direct_mirror and not shape_overlay:
             # Axis dragging reuses the source stages without allocating the gap.
             image, bounds = render_stages(self, image, bounds, modifiers[:-1], stage_mapping, nearest=isinstance(target, RasterObject), request_scope=request_scope, provisional=source_provisional, source_key=key)
@@ -4636,42 +4652,74 @@ class SceneKernels:
             return False
         key = obj.object_id
         mapping = self.layer_world_transform(obj.parent_layer_id)
-        source = session["sources"].get(key)
+        grid = session["grid"]
+        bounds = aligned(mapping.inverted()[0].mapRect(self.object_world_rect(obj.object_id)))
+        from comic_editor.ui.cage_rendering import mesh_for_image
+        _, destination, _ = mesh_for_image(grid, bounds, mapping)
+        low, high = destination.min(axis=0), destination.max(axis=0)
+        output_bounds = aligned(QRectF(*low, *(high-low)))
+        from comic_editor.render.live_canvas_preview import live_cage_source_policy
+        # A modified cage target/ancestor may explicitly capture a private,
+        # bounded live source above. Its nested cage remains a draft while
+        # ordinary native modifier-source and mask captures retain their grids.
+        policy = live_cage_source_policy(self)
+        draft_scale = (min(policy.scale(bounds.width(), bounds.height()),
+                           policy.scale(output_bounds.width(), output_bounds.height()))
+                       if policy is not None else 1.)
+        source_key = (key if policy is None else
+                      ('cage-tool-draft-source', key, policy.signature, draft_scale))
+        source = session["sources"].get(source_key)
         if source is None:
-            bounds = aligned(mapping.inverted()[0].mapRect(self.object_world_rect(obj.object_id)))
-            image = empty_image(bounds)
+            if policy is not None:
+                policy.check_cancelled()
+            capture = (bounds if draft_scale == 1. else QRectF(0, 0,
+                max(1, math.ceil(bounds.width()*draft_scale)),
+                max(1, math.ceil(bounds.height()*draft_scale))))
+            image = empty_image(capture)
             p = QPainter(image)
             p.setRenderHint(QPainter.Antialiasing, True)
+            if draft_scale < 1.:
+                p.setRenderHint(QPainter.SmoothPixmapTransform, True)
+                p.scale(image.width()/bounds.width(), image.height()/bounds.height())
             p.translate(-bounds.left(), -bounds.top())
+            vector_scale = getattr(self, '_vector_render_scale_override', None)
+            if draft_scale < 1.:
+                self._vector_render_scale_override = draft_scale
             self._render_cage_source = True
             try:
                 self._render_object_content(p, obj, bounds)
             finally:
                 self._render_cage_source = False
+                self._vector_render_scale_override = vector_scale
                 p.end()
+            if policy is not None:
+                policy.check_cancelled()
             source = image, bounds
-            session["sources"][key] = source
+            session["sources"][source_key] = source
         image, bounds = source
-        grid = session["grid"]
         cache_key = ("cage-tool", key, int(image.cacheKey()), repr(grid.grid_dict()))
+        if policy is not None:
+            cache_key = ('cage-tool-draft', policy.signature, draft_scale, cache_key)
         warped = self._modifier_cache_get(cache_key)
-        from comic_editor.ui.cage_rendering import mesh_for_image
-        _, destination, _ = mesh_for_image(grid, bounds, mapping)
-        low, high = destination.min(axis=0), destination.max(axis=0)
-        output_bounds = aligned(QRectF(*low, *(high-low)))
         if warped is None:
             incoming, cage = QImage(image), copy.deepcopy(grid)
             placement, source_bounds, destination_bounds = QTransform(mapping), QRectF(bounds), QRectF(output_bounds)
             def compute(cancelled=None, pixel_scale=1.):
-                result = warp_image(incoming, source_bounds, cage, placement, destination_bounds, cancelled, pixel_scale=pixel_scale)
+                result = warp_image(incoming, source_bounds, cage, placement, destination_bounds, cancelled,
+                    pixel_scale=pixel_scale, source_is_scaled=policy is not None)
                 if result is None:
                     return None
                 return result[0]
             asynchronous = self._interactive_render and not self._render_modifier_sources and output_bounds.width()*output_bounds.height() > 128*128
             from comic_editor.ui.gpu_textures import renderer_for
-            gpu = renderer_for(self)
-            warped = gpu.cage(incoming, source_bounds, cage, placement, destination_bounds) if gpu is not None else None
+            gpu = renderer_for(self) if policy is None else None
+            warped = (gpu.cage(incoming, source_bounds, cage, placement, destination_bounds)
+                      if gpu is not None and policy is None else None)
             if warped is not None:
+                self._modifier_cache_put(cache_key, warped)
+            elif policy is not None:
+                warped = compute(cancelled=policy.cancelled, pixel_scale=draft_scale)
+                policy.check_cancelled()
                 self._modifier_cache_put(cache_key, warped)
             elif asynchronous and self._effect_jobs.request(("cage-tool", key), cache_key, compute,
                     10*int(image.sizeInBytes())+16*math.ceil(output_bounds.width()*output_bounds.height())):
