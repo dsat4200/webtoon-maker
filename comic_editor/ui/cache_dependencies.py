@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import hashlib
+from contextvars import ContextVar
 from pathlib import Path
 
 from PySide6.QtCore import QRectF, qVersion
@@ -10,6 +11,9 @@ from PySide6.QtGui import QFont, QRawFont, QTextLayout
 from comic_editor.core.models import TextObject, RasterObject
 from comic_editor.render.cache import digest
 from comic_editor.render.service import RenderPending, RenderFailed
+
+
+_projection_batch = ContextVar("render_dependency_projection_batch", default=None)
 
 
 class RenderDependencies:
@@ -21,10 +25,19 @@ class RenderDependencies:
         self.hashes = {}
         self.deferred = False
 
+    def _file_stat(self, path):
+        batch = _projection_batch.get()
+        if batch is None or batch[0] is not self:
+            return path.stat()
+        stamps = batch[2]
+        if path not in stamps:
+            stamps[path] = path.stat()
+        return stamps[path]
+
     def file_digest(self, logical, path):
         path = Path(path)
         try:
-            stat = path.stat()
+            stat = self._file_stat(path)
         except OSError as error:
             raise RenderFailed(f"Cannot read artwork source: {path.name}") from error
         stamp = [stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns]
@@ -80,6 +93,9 @@ class RenderDependencies:
             pixels = previous.get("pixels")
         self.backing.source_digests[logical] = dict(stamp=stamp, digest=content, pixels=pixels,
                                                   seal=digest((logical, stamp, content, pixels)))
+        remember = getattr(self.backing, "remember_source", None)
+        if remember is not None:
+            remember(logical, self.backing.source_digests[logical])
 
     def tiles(self, store, object_id, region=None):
         owner = store._tiles.get(object_id)
@@ -94,6 +110,9 @@ class RenderDependencies:
             path = owner.backing(address) if hasattr(owner, "backing") else None
             marker = id(store), object_id, address
             previous = self.tile_memo.get(marker)
+            remembered = getattr(self.backing, "pixel_identity", None)
+            if remembered is not None and (previous is None or previous[0] != version):
+                previous = remembered(object_id, address, version, path)
             known = previous[2] if previous is not None and previous[:2] == (version, str(path)) else None
             if known is None:
                 if path is not None:
@@ -114,6 +133,9 @@ class RenderDependencies:
                     known = ("pixels", image.width(), image.height(), image.format().value,
                              hashlib.sha256(bytes(image.constBits())).hexdigest())
                 self.tile_memo[marker] = version, str(path), known
+            remember = getattr(self.backing, "remember_pixel_identity", None)
+            if remember is not None:
+                remember(object_id, address, version, str(path), known)
             result.append((address, known))
         return tuple(result)
 
@@ -123,7 +145,7 @@ class RenderDependencies:
             return ()
         path = source._encoded.pin.path
         try:
-            encoded_size = path.stat().st_size
+            encoded_size = self._file_stat(path).st_size
         except OSError as error:
             raise RenderFailed(f"Cannot read artwork source: {path.name}") from error
         if encoded_size:
@@ -162,6 +184,32 @@ class RenderDependencies:
             self.fonts[properties] = tuple(sorted(signatures))
         return self.fonts[properties]
 
+    def projection_keys(self, requests, configuration):
+        """Ordinary keys for one synchronous immutable-scene inspection.
+
+        Rows share modified subtrees and imported sources. Inspect each shared
+        signature and file stamp once within this call, rather than once per
+        native tile. The memo is never retained across calls, revisions, source
+        changes, or pending/error retries; every batch runs the same source,
+        seal, font, color and semantic dependency validation as a single key.
+        The caller owns the immutable scene for the entire synchronous batch.
+        """
+        token = _projection_batch.set((self, {}, {}))
+        try:
+            return tuple(self.projection_key(request, configuration) for request in requests)
+        finally:
+            _projection_batch.reset(token)
+
+    def _projection_signature(self, kind, identifier, pixels, calculate):
+        batch = _projection_batch.get()
+        if batch is None or batch[0] is not self:
+            return calculate()
+        signatures = batch[1]
+        marker = kind, identifier, pixels
+        if marker not in signatures:
+            signatures[marker] = calculate()
+        return signatures[marker]
+
     def projection_key(self, request, configuration):
         from comic_editor.ui.color_resources import metadata_color_environment
         from comic_editor.render.pixels import pixel_scope
@@ -188,7 +236,8 @@ class RenderDependencies:
                 return None
             if (canvas._has_active_modifiers(layer.modifier_ids) or layer.opacity_mask is not None
                     or layer.compound_enabled):
-                return canvas._modifier_layer_signature(layer_id)
+                return self._projection_signature("layer", layer_id, None,
+                    lambda: canvas._modifier_layer_signature(layer_id))
             children = []
             for ref in layer.children:
                 if ref.kind == "layer":
@@ -205,7 +254,8 @@ class RenderDependencies:
                             transform = canvas.layer_world_transform(obj.parent_layer_id)
                             local = transform.inverted()[0].mapRect(region).translated(-obj.x, -obj.y)
                             pixels = self.tiles(canvas.tiles, obj.object_id, local)
-                        signature = canvas._modifier_object_signature(obj, pixel_signature=pixels)
+                        signature = self._projection_signature("object", obj.object_id, pixels,
+                            lambda: canvas._modifier_object_signature(obj, pixel_signature=pixels))
                         value = obj.blend_mode, signature
                 if value is not None:
                     children.append((ref.kind, ref.entity_id, value))

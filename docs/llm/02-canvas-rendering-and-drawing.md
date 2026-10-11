@@ -13,7 +13,7 @@ cache identities, native grids or pixel contracts. Independent original math
 and whole-buffer regressions are in `tests/test_native_filter_allocations.py`;
 desktop measurements are in `docs/desktop-gpu-optimization-2026-10-09.md`.
 
-### Native artwork and manual disk backing
+### Native artwork, resident memory and optional disk backing
 
 Camera zoom and display density do not add artwork samples. Exact projection
 tiles use the native document grid (256px plus 2px gutters), vectors and text
@@ -58,32 +58,64 @@ their full upstream dependencies. Names/editor metadata are omitted; source
 pixels, geometry, order, masks, modifiers, resolved fonts, pixel contracts,
 external color configurations, renderer and library versions are dependencies.
 
-`ui/disk_cache.py::DiskCacheController` stages the ordinary immutable scene
-capture, then submits explicit recording demands to `render/scheduler.py`.
-The worker uses the same renderer, dependency keys, source/effect caches and
-native tile grid as viewing. Image compression, hashing and disk reads retain
-the bounded IO pool. A row becomes green only after all requested phases and
-the index commit, the GUI receives that committed manifest, and ordinary blob
-validation succeeds. Cancellation drains completed writes off the GUI. Cache
-clears also run on a detached owner. Sibling owners merge publication under a
-root-scoped lock; a clear epoch prevents queued pre-clear writes resurrecting
-removed entries. Reads restore values into existing memory LRUs.
+`render/resident_cache.py::ResidentRenderCache` owns the canonical exact RAM
+tier across open projects and detached workers, through the ordinary typed
+`CacheDescriptor` identities. Native QImages retain their format, color metadata
+and COW ownership; numeric arrays retain their original precision and read-only
+bits. Source/effect checkpoints retain their placement. The bounded LRU uses
+20% of physical system RAM, capped at 8 GiB with a 256 MiB floor. It neither
+renders nor defines a second dependency or invalidation scheme. Shared GPU
+memory is system RAM, not another independent cache budget. GPU presentation
+keeps its existing bounded textures for currently displayed resources; it is
+not the sole owner of a whole project's exact artwork.
+
+`ui/disk_cache.py::DiskCacheController` retains its historical class name but
+the navigator action is **Cache to memory**. It stages the ordinary immutable
+scene capture, calculates native projection dependencies on a detached metadata
+lane, and warms exact values through `render/scheduler.py` without saving source
+artwork or writing disk cache blobs. Background cache evaluation releases render
+admission between native blocks so visible canvas work can proceed before the
+user cancels. The navigator also continues to refresh during warming. A row
+becomes green only when all required native final projection tiles are resident
+in RAM; a valid disk index alone is not green readiness. Fully resident visible
+requests bypass new scene capture and effect evaluation, including views larger
+than the smaller local projection LRU. Native sampling and source/effect grids
+are unchanged.
+
+Opening a project restores compatible saved exact values into RAM asynchronously
+through the ordinary dependency and lossless blob validation. Missing, changed
+or corrupt entries remain ordinary misses. Closing a project with an explicitly
+warmed or restored cache offers an optional, cancellable disk save after source
+Save/Discard decisions. `ui/cache_close.py` defers tab/application close until
+accepted publication finishes; cancellation or failure keeps the project open.
+Publication captures immutable source aliases and records already resident
+exact entries through the existing `PersistentRenderCache.record/retain` path,
+without another render. Discarded unsaved changes are not exported. Closing the
+last series/asset tab for a project retires its RAM namespace after detaching the
+canvas; late workers cannot populate a reopened namespace. Image compression,
+hashing, cache clears and disk reads retain detached bounded IO. Sibling owners
+merge publication under a root-scoped lock; a clear epoch prevents queued
+pre-clear writes resurrecting removed entries.
 Completed reads displaced by IO admission enter a separate 64 MiB handoff LRU
 (one oversized completion may occupy it exclusively). This lets a restarted
 capture consume its finished effect after reloading an evicted source, rather
 than discarding that effect and repeating the same reads indefinitely. The
 handoff retains the ordinary validated values and checkpoint metadata; clearing
 or closing the backing releases it.
-Failure/cancellation retains committed rows. Disk writes occur only after the
-user clicks Cache to disk; normal viewing never automatically records results.
+Failure/cancellation retains committed disk values. Normal viewing and Cache to
+memory do not record disk results. The size menu clears selected/all memory
+cache separately from **Clear saved disk cache**. Regression and saved-project
+evidence is recorded in [the October 11 cache repair record](../cache-memory-and-visibility-2026-10-11.md).
 
 While a cache job runs the active document is read-only. Command history,
 outliner edits, keyboard/mouse/tablet drawing, drop input and property controls
 are locked, while camera/navigation, Cancel and chapter switching remain
 available. Blender publication imports, pending clipboard paste results and
 completed external image drops are deferred until unlocking. Active fill jobs
-and unfinished editing previews must finish before caching starts. Chapter switches/shutdown drain already submitted
-immutable disk writes and start no further rendering.
+and unfinished editing previews must finish before warming starts. Chapter
+switches cancel background warming while retaining reusable RAM entries.
+Optional close publication also guards source/history mutation and resumes
+deferred external updates if the close is canceled.
 
 Canvas interaction lives in `comic_editor/ui/canvas.py` and its tool features.
 `render/scene_kernels.py::SceneKernels` contains the shared scene implementation;
@@ -465,6 +497,23 @@ checks actual pending mask ownership rather than the shared drawing flag.
   provisional overlay stops; its retained source substitutions remain available
   for the next contact against that basis.
   Prepared planes never enter artwork/disk caches.
+  Native display crops from a changed 4x4 feedback block retain their QImage
+  and texture identity only after complete crop/gutter pixel equality within
+  the same prepared owner. This avoids replacing unchanged display tiles
+  without weakening source dependencies or the presentation cache byte cap.
+  Explicit unmasked siblings retain the bounded-layer kernel's foreground
+  pass in the prepared suffix, regardless of their child-list position; they
+  do not disable feedback for an unrelated simple selected branch. Outward
+  gradients and coupled source dependencies retain the conservative gate.
+  Authored object/ancestor quads, including positive axis mappings, retain
+  original source samples and the ordinary painter transform/clip hierarchy
+  in native 4x4 patches. This avoids Qt sampling-phase changes from flattening
+  fractional parent coordinates into an intermediate source image. Plain
+  translated sources keep their existing compact native patches and budgets.
+  Cold contact source capture uses the same patch policy. Full-buffer saved
+  Doodles references and source-byte undo checks are in
+  `tests/test_unmasked_sibling_raster_feedback.py`; contention measurements
+  are in `docs/drawing-eraser-performance-2026-10-11.md`.
   The current eligibility policy requires legacy document pixels, normal object
   blends, no selected/ancestor effects or opacity masks, bounded ancestors at
   unit opacity and no linked sampler depending on the edited source. Solo uses
@@ -760,7 +809,13 @@ preserves these visual rules while separating artwork evaluation from overlays.
 
 `ui/navigator_jobs.py` captures and evaluates the navigator separately, pauses
 during interaction, hides UV guides in its detached chapter view and publishes
-a complete preview. `render_preview()` remains the explicit reference helper
+a complete preview. Detached preview traversal checks its worker cancellation
+token between layers, objects, native source tiles and effect stages. A
+provisional navigator also unwinds when higher-priority visible/input work is
+waiting for shared admission. Its partial image is discarded, its workspace
+reservation is released through normal unwinding, and its dirty state retries
+after the ordinary idle delay. This does not change rendering, sampling,
+memory accounting or exact cache admission. `render_preview()` remains the explicit reference helper
 for the same recursive kernels and historical navigator pixel comparisons.
 
 ## Hierarchy order and recursive layer rendering

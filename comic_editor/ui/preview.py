@@ -127,9 +127,6 @@ class ChapterPreview(QWidget):
         self._refresh_timer.stop()
         if not self.isVisible() or self.canvas.chapter is None:
             return
-        if self.disk_cache is not None and self.disk_cache.building:
-            self._refresh_timer.start(self.REFRESH_DELAY_MS)
-            return
         if self._interaction_active():
             self._schedule_refresh()
             return

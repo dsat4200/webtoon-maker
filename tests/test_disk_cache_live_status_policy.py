@@ -1,4 +1,4 @@
-"""Prospective guards: ordinary live contacts defer only disk status validation.
+"""Prospective guards: ordinary live contacts defer memory status validation.
 
 Unrun artifact payload. Reuses the real disk-cache editor fixture, original
 semantic keys and production tool handlers; no renderer/provider replacement.
@@ -129,19 +129,19 @@ def test_pending_native_contact_does_not_hide_completed_storage_ownership(editor
     if completion == "maintenance":
         future = Future()
         future.set_result((entries, sources))
-        cache._maintenance = future, cache._serial, "clear"
+        cache._maintenance = future, cache._serial, "clear-saved"
     else:
         # Metadata handoff only: the original serial/current committed manifest
         # format, no scene/image substitution and no invented pixel result.
         monkeypatch.setattr(cache.scheduler, "poll", lambda: [SimpleNamespace(
-            demand=SimpleNamespace(serial=cache._serial), cache_manifest=(entries,sources),
-            recorded_rows=(0,), error="", done=True, recorded=True)])
+            demand=SimpleNamespace(serial=cache._serial, snapshot=SimpleNamespace(document=canvas._render_document_state())),
+            cache_keys=(), error="", done=True)])
     cache.tick()
     assert not observed and polls and cache._status_queue
     if completion == "maintenance":
-        assert cache._maintenance is None and cache.message == "Cache cleared"
+        assert cache._maintenance is None and cache.message == "Saved disk cache cleared"
     else:
-        assert cache._evaluation_done and 0 in cache._pending_rows
+        assert cache._evaluation_done
     QTest.keyClick(canvas, Qt.Key_Escape)
     wait(qapp, lambda: not canvas._drawing and not canvas._projection_has_live_preview())
     QTest.mouseRelease(canvas, Qt.LeftButton, pos=_last)

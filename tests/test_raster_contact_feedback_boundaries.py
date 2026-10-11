@@ -119,9 +119,10 @@ def test_transformed_adjacent_native_source_tiles_match_every_held_full_buffer(
     wait_scene(canvas)
     prepared=canvas._scene_controller.feedback
     assert prepared is not None and prepared.source_transform is not None
-    assert len(prepared.tiles)>=3
+    assert prepared.source_images is not None and prepared.world_size == 1024
+    assert {(0, 0), (1, 0), (2, 0)} <= set(prepared.source_images)
     seam=canvas._raster_world_point(selected,QPointF(256,80))
-    assert 256.<seam.x()<258.,'source seam must sample the world patch gutter'
+    assert 256.<seam.x()<258.,'source seam must sample the native presentation gutter'
     before=ready_paint(canvas)
     np.testing.assert_array_equal(pixels(before),pixels(native_decorated(canvas)))
     sources_before={key:QImage(image) for key,image in canvas.tiles.object_tiles(selected.object_id).items()}

@@ -172,10 +172,12 @@ def feedback_chain(snapshot, identifier):
                 or not _feedback_mapping_supported(layer)
                 or layer.bound is None):
             return None
-        # These children have an extra pass outside the ordinary child order.
+        # Outward gradients have a separate source pass. Explicit unmasked
+        # siblings have a known foreground pass and are retained in the
+        # prepared suffix, independent of their ordinary child position.
         for ref in layer.children:
             child = (chapter.layers if ref.kind == 'layer' else chapter.objects).get(ref.entity_id)
-            if (child is None or child.ignore_parent_mask or
+            if (child is None or
                     isinstance(child, GradientObject) and SceneKernels._is_outward_gradient(child)):
                 return None
         chain.append(layer)
@@ -210,7 +212,20 @@ def _split_snapshot(snapshot, obj, chain, *, suffix):
         layer.shape_style = copy.copy(original.shape_style)
         index = next(i for i, ref in enumerate(layer.children)
                      if (ref.kind, ref.entity_id) == (branch_kind, branch_id))
-        children = original.children[:index] if suffix else original.children[index + 1:]
+        children = []
+        for position, ref in enumerate(original.children):
+            if position == index:
+                continue
+            child = (snapshot.chapter.layers if ref.kind == 'layer' else snapshot.chapter.objects)[ref.entity_id]
+            # The ordinary bounded-layer kernel draws these siblings after
+            # its border and every clipped child. Keep their original order
+            # within that pass; the native renderer still owns their pixels.
+            if child.ignore_parent_mask:
+                include = suffix
+            else:
+                include = position < index if suffix else position > index
+            if include:
+                children.append(ref)
         layer.children = list(children)
         if branch_kind == 'layer':
             layer.children.insert(len(children) if suffix else 0, original.children[index])
@@ -283,9 +298,12 @@ def prepare_raster_feedback(snapshot, identifier, visible, *, caches=None,
             if (not valid or not all(math.isfinite(value) for value in coefficients)):
                 return None
             source_transform = coefficients
-        rebuild_source = (source_transform is not None and
-            (not mapping.isAffine() or coefficients[0] < 0. or coefficients[3] < 0.
-             or coefficients[1] != 0. or coefficients[2] != 0.))
+        # Authored quads keep their original samples and the ordinary painter
+        # hierarchy. Flattening even a positive axis mapping can move Qt's
+        # sampling phase for authored fractional parent coordinates. Plain
+        # translated sources retain their compact native patch policy.
+        rebuild_source = (source_transform is not None and (obj.transform_quad is not None
+            or any(layer.transform_quad is not None for layer in chain)))
         source_images = {} if rebuild_source else None
         source_layers = tuple((_feedback_transform_coefficients(source_backend.scene._layer_parent_transform(layer)),
             source_backend.scene._layer_operand_path(layer)) for layer in reversed(chain)) if rebuild_source else ()
@@ -348,9 +366,9 @@ def prepare_raster_feedback(snapshot, identifier, visible, *, caches=None,
             local_visible = (inverse.mapRect(QRectF(*bounds)).adjusted(-1., -1., 1., 1.) if mapped
                 else QRectF(bounds[0] - origin[0], bounds[1] - origin[1], bounds[2], bounds[3]))
             if rebuild_source:
-                # Clearing a rotated, mirrored or perspective source tile's
-                # rectangle rounds edge coverage differently from drawing its
-                # native pixels. Keep the bounded immutable original samples
+                # Clearing a mapped source tile's rectangle and flattening its
+                # painter hierarchy can round samples/coverage differently.
+                # Keep the bounded immutable original samples
                 # instead, and redraw the complete source patch in source order.
                 # These COW handles are provisional resources, not cache entries.
                 for source_key, image in source_backend.scene.tiles.iter_tiles(identifier, local_visible):

@@ -241,6 +241,13 @@ def _native_presentation_tiles(canvas, prepared, tile, image, visible, cache):
                 crop = image.copy(QRect(x, y, side + 2 * gutter, side + 2 * gutter))
                 if crop.isNull():
                     continue
+                previous = cache.entries.get(key)
+                if (previous is not None and previous[0][0] == id(prepared)
+                        and previous[1] == crop):
+                    # A native block revision need not replace every display
+                    # texture. Verify the complete crop, including gutters,
+                    # before keeping its owned pixel/texture identity.
+                    crop = previous[1]
                 cache.put(key, signature, crop)
             output.append(PresentedTile(('raster-feedback', id(prepared), key), crop, world,
                 QRectF(gutter, gutter, side, side)))

@@ -113,6 +113,7 @@ class SceneController(QObject):
             self.snapshot = self.capture = self.dispatched = None
             self.desired = None
             self._cpu_pending.clear()
+        resident_verified = self._adopt_resident_tiles(document, requests, phases)
         bytes_per_pixel = 16 if document.pixel_contract.floating else 4
         view_bytes = len(requests) * (self.canvas._document_projection.tile_size +
                      2 * self.canvas._document_projection.gutter) ** 2 * bytes_per_pixel * len(phases)
@@ -155,6 +156,15 @@ class SceneController(QObject):
             # including a transition with otherwise unchanged demand metadata.
             self._contact_reuse_gate = None
             self.desired = None
+        resident_complete = (resident_verified and not document.live_preview
+            and (not self.feedback_target or self._feedback_covers(document, signature[3]))
+            and all(len(self.canvas._document_projection.ready(requests,
+                configuration=(*document.configuration, phase))) == len(requests) for phase in phases))
+        if resident_complete:
+            # Shared exact pixels are already owned by the RAM cache. The
+            # display LRU's size heuristic must not replace a complete native
+            # view with an asynchronous overview while panning these hits.
+            self.preview_mode = False
         if signature != self.desired:
             self.release_handoff.new_request(signature)
             self.serial += 1
@@ -166,7 +176,7 @@ class SceneController(QObject):
             self.error = ""
             self.canvas._projection_render_error = ""
             self.canvas._projection_error_revision = -1
-            if self.snapshot is None or self.snapshot.document != document:
+            if not resident_complete and (self.snapshot is None or self.snapshot.document != document):
                 self.capture = self._new_scene_capture(document)
         elif (self.dispatched == signature and not self.preview_mode and not self.error
                 and not self.scheduler.busy and any(
@@ -179,8 +189,49 @@ class SceneController(QObject):
         handoff = self.release_handoff.for_request(signature, self.serial)
         if handoff is not None:
             self.preview = handoff
+        if resident_complete:
+            # Exact shared RAM is immediately presentable. A camera change
+            # need not recapture an entire scene only to rediscover these hits.
+            self.capture = None
+            self.dispatched = signature
+            if not self.scheduler.busy:
+                self.timer.stop()
+            return
         if self.dispatched != signature and not self.timer.isActive():
             self.timer.start(0)
+
+    def _adopt_resident_tiles(self, document, requests, phases):
+        """Restore RAM hits and count current hits without disk or rendering."""
+        canvas = self.canvas
+        controller = getattr(canvas, '_disk_cache_controller', None)
+        lookup = getattr(controller, 'lookup_memory_tile', None)
+        if not callable(lookup) or document.live_preview:
+            return 0
+        from comic_editor.render.service import RenderPending, RenderFailed
+        from comic_editor.ui.color_resources import metadata_color_environment
+        projection = canvas._document_projection
+        environment = metadata_color_environment(canvas, document.pixel_contract)
+        if environment is None:
+            return 0
+        verified = 0
+        for phase in phases:
+            configuration = (*document.configuration, phase)
+            for request in requests:
+                try:
+                    image = lookup(request, configuration)
+                except (RenderPending, RenderFailed):
+                    continue  # An unresolved/cold value keeps the ordinary worker.
+                if (document.identity != (id(canvas.chapter), id(canvas.tiles), id(canvas.images))
+                        or document.revision != projection.revision):
+                    return 0
+                if image is not None and not image.isNull():
+                    if projection.ready((request,), configuration=configuration):
+                        verified += 1
+                    else:
+                        verified += bool(projection.adopt(request, image, configuration=configuration,
+                            document=document.identity, revision=document.revision,
+                            pixel_environment=environment))
+        return verified
 
     def _new_scene_capture(self, document):
         previous = self.capture
@@ -705,6 +756,10 @@ class SceneController(QObject):
                     continue
             if completion.demand.serial != self.serial or completion.demand.snapshot.document != document:
                 continue
+            cache_controller = getattr(canvas, '_disk_cache_controller', None)
+            adopt_keys = getattr(cache_controller, 'adopt_memory_keys', None)
+            if completion.cache_keys and callable(adopt_keys):
+                adopt_keys(completion, document)
             if completion.error:
                 self.error = completion.error
                 canvas._projection_render_error = completion.error

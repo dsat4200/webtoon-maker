@@ -270,6 +270,8 @@ class NavigatorPanel(QWidget):
         menu = QMenu(self.cache_status)
         self.clear_selected_action = menu.addAction("Clear selected memory cache")
         self.clear_all_action = menu.addAction("Clear all memory cache")
+        menu.addSeparator()
+        self.clear_saved_action = menu.addAction("Clear saved disk cache")
         self.cache_status.setMenu(menu)
         layout.addWidget(rail)
         layout.addWidget(self.contents)
@@ -347,6 +349,9 @@ class MainWindow(QMainWindow):
         self._install_shortcuts()
         from comic_editor.ui.disk_cache import DiskCacheController
         self.disk_cache = DiskCacheController(self)
+        from comic_editor.ui.cache_close import ProjectCacheClose
+        self._cache_close = ProjectCacheClose(self)
+        self._cache_exit_approved = False
         self._refresh_actions()
         self.statusBar().showMessage("Create or open a series")
         from comic_editor.ui.window_chrome import install_window_chrome
@@ -2392,6 +2397,11 @@ class MainWindow(QMainWindow):
     def _project_tab_selected(self, index: int) -> None:
         if self._switching_session:
             return
+        if self._cache_close.busy:
+            if self.active_session is not None:
+                with QSignalBlocker(self.project_tabs):
+                    self.project_tabs.setCurrentIndex(self._tab_index_for_key(self.active_session.key))
+            return
         if self._page_gap_mode_locked:
             if self.active_session is not None:
                 current = self._tab_index_for_key(self.active_session.key)
@@ -2412,7 +2422,7 @@ class MainWindow(QMainWindow):
             self._activate_editor_session(session)
 
     def _activate_editor_session(self, session: EditorSession) -> None:
-        if session is self.active_session:
+        if self._cache_close.busy or session is self.active_session:
             return
         if not self._drain_accepted_input_actions():
             return
@@ -2693,6 +2703,8 @@ class MainWindow(QMainWindow):
         return request is None or self._autosave_jobs.wait(request)
 
     def _close_project_tab(self, index: int) -> None:
+        if self._cache_close.busy:
+            return
         if self._page_gap_mode_locked:
             self.statusBar().showMessage(
                 "Confirm or cancel the page gap before closing a project",
@@ -2708,6 +2720,7 @@ class MainWindow(QMainWindow):
             return
         if session is self.active_session:
             self._capture_active_session()
+        discarded = False
         if session.dirty:
             answer = QMessageBox.question(
                 self, "Unsaved changes",
@@ -2719,6 +2732,19 @@ class MainWindow(QMainWindow):
                 return
             if answer == QMessageBox.Save and not self._save_editor_session(session, wait=True):
                 return
+            discarded = answer == QMessageBox.Discard
+        if session is self.active_session:
+            self.disk_cache.cancel()
+        self._cache_close.request(
+            [] if discarded else [session],
+            lambda: self._finish_close_project_tab(session.key),
+        )
+
+    def _finish_close_project_tab(self, key: str) -> None:
+        session = self.sessions.get(key)
+        index = self._tab_index_for_key(key)
+        if session is None or index < 0:
+            return
         self._autosave_jobs.drain(self._autosave_scope(session))
         was_active = session is self.active_session
         self.layout_settings_timer.stop()
@@ -2734,6 +2760,9 @@ class MainWindow(QMainWindow):
             next_session = self.sessions.get(str(self.project_tabs.tabData(current)))
             if next_session is not None:
                 self._activate_editor_session(next_session)
+        project = session.context.repository.root.resolve()
+        if not any(other.context.repository.root.resolve() == project for other in self.sessions.values()):
+            self.disk_cache.release_project(session)
 
     # ---- series and chapters ------------------------------------------
     @staticmethod
@@ -7272,43 +7301,69 @@ class MainWindow(QMainWindow):
         self.showNormal() if self.isFullScreen() else self.showFullScreen()
 
     def closeEvent(self, event: QCloseEvent) -> None:  # noqa: N802
-        self.disk_cache.cancel()
-        if self.canvas.page_gap_mode_active():
-            self.canvas.cancel_page_gap_transaction()
-        assets = getattr(self, '_asset_copy_jobs', None)
-        if assets is not None:
-            assets.drain()
-        if not self._drain_accepted_input_actions():
+        if self._cache_close.busy:
             event.ignore()
             return
-        if self.sessions:
-            if not all(self._finish_pending_manual_save(session) for session in self.sessions.values()):
+        assets = getattr(self, '_asset_copy_jobs', None)
+        if not self._cache_exit_approved:
+            self.disk_cache.cancel()
+            if self.canvas.page_gap_mode_active():
+                self.canvas.cancel_page_gap_transaction()
+            if assets is not None:
+                assets.drain()
+            if not self._drain_accepted_input_actions():
                 event.ignore()
                 return
-            self._capture_active_session()
-            for session in list(self.sessions.values()):
-                if not session.dirty:
-                    continue
-                answer = QMessageBox.question(
-                    self, "Unsaved changes",
-                    f"Save {session.name} before exiting?",
-                    QMessageBox.Save | QMessageBox.Discard | QMessageBox.Cancel,
-                    QMessageBox.Save,
-                )
-                if answer == QMessageBox.Cancel:
+            discarded = set()
+            if self.sessions:
+                if not all(self._finish_pending_manual_save(session) for session in self.sessions.values()):
                     event.ignore()
                     return
-                if answer == QMessageBox.Save and not self._save_editor_session(session, wait=True):
-                    event.ignore()
-                    return
-        elif not self._confirm_discard_or_save():
-            event.ignore()
-            return
+                self._capture_active_session()
+                for session in list(self.sessions.values()):
+                    if not session.dirty:
+                        continue
+                    answer = QMessageBox.question(
+                        self, "Unsaved changes",
+                        f"Save {session.name} before exiting?",
+                        QMessageBox.Save | QMessageBox.Discard | QMessageBox.Cancel,
+                        QMessageBox.Save,
+                    )
+                    if answer == QMessageBox.Cancel:
+                        event.ignore()
+                        return
+                    if answer == QMessageBox.Save and not self._save_editor_session(session, wait=True):
+                        event.ignore()
+                        return
+                    if answer == QMessageBox.Discard:
+                        discarded.add(session.key)
+            elif not self._confirm_discard_or_save():
+                event.ignore()
+                return
+            waiting = [False]
+            def cache_saved():
+                self._cache_exit_approved = True
+                if waiting[0]:
+                    QTimer.singleShot(0, self.close)
+            self._cache_close.request(
+                [session for session in self.sessions.values() if session.key not in discarded],
+                cache_saved, exiting=True,
+            )
+            waiting[0] = True
+            if not self._cache_exit_approved:
+                event.ignore()
+                return
         monitor = getattr(self, "_performance_monitor_controller", None)
         if monitor is not None:
             monitor.stop()
         self.autosave_timer.stop()
         self.disk_cache.detach()
+        released = set()
+        for session in self.sessions.values():
+            project = session.context.repository.root.resolve()
+            if project not in released:
+                self.disk_cache.release_project(session)
+                released.add(project)
         self._flush_series_preferences(wait=True)
         self._autosave_jobs.shutdown()
         if assets is not None:

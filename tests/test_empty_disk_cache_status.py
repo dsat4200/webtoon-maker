@@ -1,4 +1,4 @@
-"""Empty committed disk indexes are misses before document dependency traversal.
+"""Unknown RAM keys are misses before document dependency traversal.
 
 Prospective additive lifecycle coverage. Tests use the production MainWindow,
 private repository, detached recording service and original native output path.
@@ -99,102 +99,63 @@ def test_empty_status_tick_keeps_storage_polling_before_misses(editor, monkeypat
     assert not cache._status_queue and not cache.backing.entries
 
 
-def test_sibling_full_clear_drops_stale_index_before_any_status_traversal(editor, qapp, monkeypatch):
-    window, _, _ = editor
-    cache = record_rows(window, qapp)
-    sibling = PersistentRenderCache(cache.backing.root,
-        contract=cache.backing.contract, environment=cache.backing.environment)
-    try:
-        sibling.clear()
-        assert cache.backing.entries  # GUI reader has not yet observed the epoch.
-        assert cache.backing._root_epoch != cache.backing._root_state.epoch
-        with monkeypatch.context() as patch:
-            forbid_status_traversal(cache, patch)
-            assert not cache.row_ready(0)
-        assert not cache.backing.entries and not cache.backing.verified
-        assert cache.backing._root_epoch == cache.backing._root_state.epoch
-        assert cache.backing._reload is not None
-    finally:
-        sibling.close()
+def publish(window, qapp):
+    assert window.save(wait=True)
+    result = []
+    assert window.disk_cache.persist_for_close(window.active_session, lambda *value: result.append(value))
+    wait_until(qapp, lambda: bool(result), advance=window.disk_cache.tick)
+    assert result == [(True, "")]
 
 
-def test_epoch_reload_from_empty_restores_ordinary_keys_and_blob_validation(editor, qapp, monkeypatch):
+def test_saved_disk_clear_keeps_independently_resident_exact_pixels(editor, qapp, monkeypatch):
     window, _, _ = editor
     cache = record_rows(window, qapp, count=2)
-    sibling = PersistentRenderCache(cache.backing.root,
-        contract=cache.backing.contract, environment=cache.backing.environment)
-    try:
-        # Match the ordinary selected-row clear: remove shared intermediates,
-        # keep the other row's exact projection tiles in the committed index.
-        sibling.clear(lambda entry: entry["kind"] != "projection" or entry["key"][3] == 0)
-        assert sibling.entries
-        with monkeypatch.context() as patch:
-            forbid_status_traversal(cache, patch)
-            assert not cache.row_ready(1)
-        assert not cache.backing.entries and not cache.backing.verified
-        cache.backing._reload.result(timeout=5)
-        keys, reads = [], []
-        original_key, original_read = cache.tile_key, cache.backing._read
-        def tile_key(request, configuration):
-            key = original_key(request, configuration)
-            keys.append(key)
-            return key
-        def read(entry, **kwargs):
-            reads.append((entry["kind"], kwargs.get("verify")))
-            return original_read(entry, **kwargs)
-        monkeypatch.setattr(cache, "tile_key", tile_key)
-        monkeypatch.setattr(cache.backing, "_read", read)
-        wait_until(qapp, lambda: cache.row_ready(1), advance=cache.tick)
-        assert keys and reads and any(kind == "projection" and verify for kind, verify in reads)
-        assert cache.backing.entries and cache.backing.verified
-        assert not cache.row_ready(0)
-    finally:
-        sibling.close()
+    publish(window, qapp)
+    before = cache.backing.resident.bytes
+    cache.clear_saved()
+    wait_until(qapp, lambda: cache._maintenance is None, advance=cache.tick)
+    assert cache.backing.resident.bytes == before
+    with monkeypatch.context() as patch:
+        patch.setattr(cache.dependencies, "projection_key", lambda *args: pytest.fail("RAM status rehashed dependencies"))
+        patch.setattr(cache.backing, "has", lambda *args: pytest.fail("RAM status read disk"))
+        assert cache.row_ready(0) and cache.row_ready(1)
+    assert not PersistentRenderCache._valid_entry("invalid", {})
 
 
 @pytest.mark.parametrize("damage", ["source", "seal", "missing_blob", "corrupt_blob"])
-def test_nonempty_index_retains_dependency_seal_and_blob_validation(editor, qapp, monkeypatch, damage):
-    window, _, identifier = editor
+def test_saved_corruption_or_changed_source_never_becomes_resident_green(editor, qapp, damage):
+    window, reopen, identifier = editor
     cache = record_rows(window, qapp)
     with cache.capture():
         configuration = (*cache.canvas._projection_configuration(), None)
         request = next(iter(cache.requests(0)))
         key = cache.tile_key(request, configuration)
-    identity = cache.backing.descriptor("projection", key).identity
-    entry = cache.backing.entries[identity]
-    path = cache.backing._path(entry)
-    if damage == "source":
-        cache.canvas.tiles.paint_dab(identifier, QPointF(90, 80), 16, QColor("red"))
-        cache.canvas._invalidate_scene_cache()
-    elif damage == "seal":
-        entry["seal"] = "invalid"
-    elif damage == "missing_blob":
-        path.unlink()
-    else:
-        payload = bytearray(path.read_bytes())
-        assert len(payload) == entry["size"] > 0
-        payload[len(payload) // 2] ^= 1
-        path.write_bytes(payload)
-        assert path.stat().st_size == entry["size"]
-        cache.backing.verified.discard(identity)
-    calls = []
-    original_has = cache.backing.has
-    def has(kind, semantic_key, **kwargs):
-        calls.append((kind, semantic_key))
-        return original_has(kind, semantic_key, **kwargs)
-    monkeypatch.setattr(cache.backing, "has", has)
-    assert not cache.row_ready(0)
-    assert calls and calls[0][0] == "projection"
-    if damage == "source":
-        assert calls[0][1] != key and identity in cache.backing.entries
-    elif damage == "corrupt_blob":
-        with pytest.raises(ValueError, match="checksum"):
-            cache.backing.verifications[identity].result(timeout=5)
-        cache.backing.poll()
-        assert identity not in cache.backing.entries
-        assert not cache.row_ready(0)
-    else:
-        assert identity not in cache.backing.entries
+    publish(window, qapp)
+    saved = PersistentRenderCache(cache.backing.root, contract=cache.backing.contract, environment=cache.backing.environment)
+    try:
+        descriptor = saved.descriptor("projection", key)
+        entry = saved.entries[descriptor.identity]
+        path = saved._path(entry)
+        if damage == "source":
+            cache.canvas.tiles.paint_dab(identifier, QPointF(90, 80), 16, QColor("red"))
+            cache.canvas._invalidate_scene_cache()
+            assert window.save(wait=True)
+        elif damage == "seal":
+            entry["seal"] = "invalid"
+            saved.flush()
+        elif damage == "missing_blob":
+            path.unlink()
+        else:
+            payload = bytearray(path.read_bytes())
+            payload[len(payload) // 2] ^= 1
+            path.write_bytes(payload)
+    finally:
+        saved.close()
+    second = reopen()
+    loading = second.disk_cache
+    wait_until(qapp, lambda: loading._capture is None and loading._metadata is None, advance=loading.tick)
+    assert not loading.row_ready(0)
+    assert loading.lookup_memory_tile(next(iter(loading.requests(0))), (*second.canvas._projection_configuration(), None)) is None
 
 
 @pytest.mark.parametrize("populated", [False, True])
@@ -213,57 +174,42 @@ def test_pending_color_remains_a_miss_before_epoch_or_dependency_work(editor, qa
     assert cache.backing.entries == before
 
 
-def test_clear_maintenance_remains_a_miss_with_a_populated_reader(editor, qapp, monkeypatch):
-    window, _, _ = editor
-    cache = record_rows(window, qapp)
-    entries = copy.deepcopy(cache.backing.entries)
-    with monkeypatch.context() as patch:
-        patch.setattr(cache, "_maintenance", (Future(), cache._serial, "clear"))
-        forbid_status_traversal(cache, patch)
-        def forbidden():
-            raise AssertionError("Clear maintenance bypassed its existing readiness guard")
-        patch.setattr(cache.backing, "_sync_epoch", forbidden)
-        assert not cache.row_ready(0)
-    assert cache.backing.entries == entries
-
-
-def test_unpublished_recording_stays_false_then_manifest_requeues_and_unlocks(editor, qapp, monkeypatch):
+def test_memory_warming_publishes_ready_rows_without_disk_writes(editor, qapp, monkeypatch):
     window, _, _ = editor
     cache = window.disk_cache
-    entered, release = Event(), Event()
-    original_publish = PersistentRenderCache._publish_index
-    original_adopt = cache._adopt_manifest
-    manifests = []
-    def publish(owner, *args):
-        entered.set()
-        assert release.wait(15), "Test did not release the detached publication"
-        return original_publish(owner, *args)
-    def adopt(manifest):
-        original_adopt(manifest)
-        if manifest is not None:
-            manifests.append((bool(cache.backing.entries), tuple(cache._status_queue)))
-    monkeypatch.setattr(PersistentRenderCache, "_publish_index", publish)
-    monkeypatch.setattr(cache, "_adopt_manifest", adopt)
+    def forbidden(*args):
+        pytest.fail("Memory warming published to disk")
+    monkeypatch.setattr(PersistentRenderCache, "_publish_index", forbidden)
+    monkeypatch.setattr(window, "save", lambda **kw: pytest.fail("Memory warming saved the document"))
     cache.set_range(0, 256)
-    cache.status[0] = False
-    cache._status_queue.clear()
-    try:
-        assert cache.start() and cache.canvas.document_read_only
-        wait_until(qapp, entered.is_set, advance=cache.tick)
-        assert cache.building and not cache.backing.entries
-        assert not manifests
-        with monkeypatch.context() as patch:
-            forbid_status_traversal(cache, patch)
-            assert not cache.row_ready(0)
-        release.set()
-        finish(window, qapp)
-        assert manifests and any(populated and 0 in queued for populated, queued in manifests)
-        assert cache.row_ready(0) and cache.status[0]
-        assert not cache.building and not cache._work and not cache._pending_rows
-        assert not cache.canvas.document_read_only and not cache.canvas.command_stack.read_only
-        assert cache.message == "Cached to disk"
-    finally:
-        release.set()
+    assert cache.start() and cache.canvas.document_read_only
+    finish(window, qapp)
+    assert cache.row_ready(0) and cache.status[0]
+    assert cache.backing.resident.bytes > 0 and not cache.backing.entries
+    assert not cache.canvas.document_read_only and not cache.canvas.command_stack.read_only
+    assert cache.message == "Cached to memory"
+
+
+def test_completed_native_work_waits_for_remaining_readiness_rows(editor, qapp, monkeypatch):
+    window, _, _ = editor
+    cache = record_rows(window, qapp, count=3)
+    cache.building = True
+    cache._lock(True)
+    cache._evaluation_done = True
+    cache._work = deque((0, 1, 2))
+    cache._status_queue = deque((0, 1, 2))
+    ready = cache.row_ready
+    def slow_status(row):
+        time.sleep(.009)
+        return ready(row)
+    monkeypatch.setattr(cache, 'row_ready', slow_status)
+    cache.tick()
+    assert cache.building and cache._status_queue
+    assert 'full' not in cache.message
+    for _ in range(3):
+        cache.tick()
+    assert not cache.building and not cache._work
+    assert cache.message == 'Cached to memory'
 
 
 @pytest.mark.parametrize("kind", ["mask", "transform"])

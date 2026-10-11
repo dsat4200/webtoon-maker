@@ -271,11 +271,12 @@ def _atomic_bytes(path, data):
 class PersistentRenderCache:
     """Non-blocking read-through backing; caller owns memory and dependencies."""
 
-    def __init__(self, root, *, contract=(), environment=()):
+    def __init__(self, root, *, contract=(), environment=(), resident=None):
         self.root = Path(root)
         self._root_state = _root_state(self.root)
         self._root_epoch = self._root_state.epoch
         self.contract, self.environment = tuple(contract), tuple(environment)
+        self.resident = resident
         self.entries = {}
         self.source_digests = {}
         try:
@@ -291,6 +292,8 @@ class PersistentRenderCache:
                                 if self._valid_entry(identity, entry)}
         except (OSError, ValueError, TypeError):
             pass
+        if resident is not None:
+            self.source_digests.update(resident.source_digests())
         self.executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="render-cache-io")
         self.values_lock = self._root_state.lock
         self.reads, self.writes, self.verifications = {}, {}, {}
@@ -398,6 +401,13 @@ class PersistentRenderCache:
         if self.closed:
             return None
         self._sync_epoch()
+        if self.resident is not None:
+            result = self.resident.lookup(self.descriptor(kind, key))
+            if result is not None:
+                self.hits += 1
+                # An explicit disk recording can reuse exact RAM values.
+                self.retain(kind, key, result, state=self.resident.state(self.descriptor(kind, key)))
+                return result
         if not self.entries and not self.ready:
             # Unpublished entries cannot satisfy reads. Synchronize sibling
             # clears first, then avoid hashing a definite empty-index miss.
@@ -409,7 +419,7 @@ class PersistentRenderCache:
             self.ready_bytes -= int(result.sizeInBytes() if isinstance(result, QImage) else result.nbytes)
             if entry is not None:
                 self.hits += 1
-                self.retain(kind, key, result)
+                self.retain(kind, key, result, state=entry.get('state'))
                 return result
         if entry is None:
             self.misses += 1
@@ -439,8 +449,26 @@ class PersistentRenderCache:
         self.reads.pop(identity, None)
         result = self._finish_read(identity, future)
         if result is not None:
-            self.retain(kind, key, result)
+            self.retain(kind, key, result, state=entry.get('state'))
         return result
+
+    def retained_state(self, kind, key):
+        descriptor = self.descriptor(kind, key)
+        if self.resident is not None and self.resident.has(descriptor):
+            return self.resident.state(descriptor)
+        return self.entries.get(descriptor.identity, {}).get('state')
+
+    def remember_pixel_identity(self, object_id, address, version, path, known):
+        if self.resident is not None:
+            self.resident.remember_pixel_identity(object_id, address, version, path, known)
+
+    def remember_source(self, logical, record):
+        if self.resident is not None:
+            self.resident.remember_source(logical, record)
+
+    def pixel_identity(self, object_id, address, version, path):
+        previous = self.resident.pixel_identity(object_id, address) if self.resident is not None else None
+        return previous if previous is not None and previous[0] == version else None
 
     def _finish_read(self, identity, future):
         try:
@@ -469,6 +497,8 @@ class PersistentRenderCache:
             self.ready_bytes -= int(old.sizeInBytes() if isinstance(old, QImage) else old.nbytes)
 
     def retain(self, kind, key, value, *, state=None):
+        if self.resident is not None and not self.closed:
+            self.resident.retain(self.descriptor(kind, key), value, state)
         if not self.recording or self.closed:
             return
         self._sync_epoch()

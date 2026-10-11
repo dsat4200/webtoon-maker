@@ -232,6 +232,8 @@ def cached_stage_output(canvas, bounds, modifiers, local_to_world, *, nearest=Fa
 def render_stages(canvas, image, bounds, modifiers, local_to_world, *, nearest=False,
                   required=None, request_scope=None, provisional=False, source_key=None,
                   tile_evaluation=True):
+    from comic_editor.render.admission import check_scene_cancelled
+    check_scene_cancelled(canvas)
     bounds = QRectF(bounds)
     exact = projection_requires_exact(canvas)
     reference = exact_reference_sampling(canvas)
@@ -276,6 +278,7 @@ def render_stages(canvas, image, bounds, modifiers, local_to_world, *, nearest=F
         else:
             canvas._effect_jobs.retained_put(checkpoint_scope, pipeline_key, image, (0, QRectF(bounds)))
     for index, modifier in enumerate(modifiers):
+        check_scene_cancelled(canvas)
         from comic_editor.render.live_canvas_preview import check_live_canvas_cancelled
         check_live_canvas_cancelled(canvas)
         if index < start:

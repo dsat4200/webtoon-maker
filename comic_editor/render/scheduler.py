@@ -6,7 +6,7 @@ Cancellation is observed between native capture blocks and cooperatively
 inside circular integration. Superseded work cannot publish into another revision.
 """
 from collections import deque
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from dataclasses import replace
@@ -19,6 +19,7 @@ from comic_editor.render.scene import DetachedSceneBackend
 from comic_editor.render.admission import CopyLease, RENDER_ADMISSION, WorkCancelled, snapshot_working_bytes
 from comic_editor.render.ordinary_contact_capture import ContactSceneSnapshot
 from comic_editor.render.source_resources import ReadyOriginals
+from comic_editor.render.projection import ProjectionRequest
 
 
 @contextmanager
@@ -71,6 +72,7 @@ class SceneCompletion:
     recorded_rows: tuple = ()
     cache_manifest: object = None
     feedback: object = None
+    cache_keys: tuple = ()
 
 
 def demand_working_bytes(demand):
@@ -323,6 +325,11 @@ class SceneScheduler:
                 with RENDER_ADMISSION.reserve(demand.consumer, size, priority=0,
                         cancelled=lambda: token.is_set() or self.stopped.is_set(), copies=copies):
                     return self._evaluate_admitted(demand, token)
+            if self._background_cache(demand):
+                # A chapter warm/record request may contain hundreds of rows.
+                # Reserve only each ordinary native block, so a newly visible
+                # view can acquire the same admission budget between rows.
+                return self._evaluate_admitted(demand, token)
             with RENDER_ADMISSION.reserve(demand.consumer, demand_working_bytes(demand),
                     priority=1 if demand.record else 2 if demand.consumer == "navigator" else 0,
                     cancelled=lambda: token.is_set() or self.stopped.is_set()):
@@ -330,11 +337,26 @@ class SceneScheduler:
         except WorkCancelled:
             return
 
+    @staticmethod
+    def _background_cache(demand):
+        return demand.record or demand.consumer in {'cache', 'cache-memory'}
+
+    def _cache_block_admission(self, demand, token):
+        if not self._background_cache(demand):
+            return nullcontext()
+        return RENDER_ADMISSION.reserve('cache', demand_working_bytes(demand), priority=2,
+            cancelled=lambda: token.is_set() or self.stopped.is_set())
+
     def _evaluate_admitted(self, demand, token):
         try:
             if token.is_set() or self.stopped.is_set():
                 return
             snapshot = demand.snapshot
+            if self._background_cache(demand) and (
+                    snapshot.document.live_preview or demand.preview_size is not None
+                    or demand.presentation_size is not None or demand.feedback_only
+                    or demand.feedback_target or demand.contact_preview_owner is not None):
+                raise ValueError('Background caching requires ordinary exact native tiles')
             if demand.feedback_only:
                 # A contact's separable planes have a stable dependency owner.
                 # Selected pixels can advance while this private preparation
@@ -359,23 +381,24 @@ class SceneScheduler:
                         chapter.objects[identifier] = copy.copy(obj)
                         chapter.objects[identifier].visible = False
                 snapshot = replace(snapshot, chapter=chapter)
-            if self._backend is None or self._backend.snapshot is not snapshot:
-                if self._backend is not None:
-                    self._cache_state = self._backend.scene.cache_state()
-                    self._originals.capture(self._backend.snapshot)
-                    self._backend.close()
-                identity = (snapshot.document.identity, snapshot.document.pixel_contract.signature,
-                    getattr(snapshot.pixel_environment, "signature", None), snapshot.graphics_worker)
-                if identity != self._cache_identity:
-                    self._cache_state = None
-                self._cache_identity = identity
-                self._backend = DetachedSceneBackend(snapshot)
-                self._originals.adopt(snapshot)
-                if self._cache_state is not None:
-                    self._backend.scene.adopt_cache_state(self._cache_state)
-                    self._cache_state = None
+            with self._cache_block_admission(demand, token):
+                if self._backend is None or self._backend.snapshot is not snapshot:
+                    if self._backend is not None:
+                        self._cache_state = self._backend.scene.cache_state()
+                        self._originals.capture(self._backend.snapshot)
+                        self._backend.close()
+                    identity = (snapshot.document.identity, snapshot.document.pixel_contract.signature,
+                        getattr(snapshot.pixel_environment, "signature", None), snapshot.graphics_worker)
+                    if identity != self._cache_identity:
+                        self._cache_state = None
+                    self._cache_identity = identity
+                    self._backend = DetachedSceneBackend(snapshot)
+                    self._originals.adopt(snapshot)
+                    if self._cache_state is not None:
+                        self._backend.scene.adopt_cache_state(self._cache_state)
+                        self._cache_state = None
             backend = self._backend
-            backend.scene._effect_preview_channel = 'canvas' if demand.record else demand.consumer
+            backend.scene._effect_preview_channel = 'canvas' if self._background_cache(demand) else demand.consumer
             if demand.record and not backend._record_allowed():
                 raise ValueError('This scene cannot record exact cache entries')
             service = DocumentRenderService(backend)
@@ -418,7 +441,15 @@ class SceneScheduler:
                 preview_service = DocumentRenderService(preview_backend)
                 preview_service.projection.revision = snapshot.document.revision
                 try:
-                    result = preview_service.render_region(snapshot.document, request)
+                    # A whole-chapter thumbnail must relinquish its native
+                    # reservation when a visible/input consumer arrives. Its
+                    # private partial image is discarded; idle retry captures
+                    # the latest revision through this same renderer.
+                    with _scene_cancellation(preview_backend.scene,
+                            lambda: token.is_set() or self.stopped.is_set()
+                                or demand.consumer == 'navigator'
+                                    and RENDER_ADMISSION.higher_priority_waiting(2)):
+                        result = preview_service.render_region(snapshot.document, request)
                 finally:
                     preview_backend.close()
                 if demand.consumer == "navigator" and not result.image.isNull():
@@ -442,51 +473,68 @@ class SceneScheduler:
             groups = {}
             for request in requests:
                 address = request.address
-                group = (address.level, 0, address.y) if demand.record else (address.level,address.x // 4,address.y // 4)
+                group = (address.level, 0, address.y) if self._background_cache(demand) else (address.level,address.x // 4,address.y // 4)
                 groups.setdefault(group, []).append(request)
             def distance(item):
                 request = groups[item][0]
-                side = (1 if demand.record else 4) * request.tile_size / request.scale
+                side = (1 if self._background_cache(demand) else 4) * request.tile_size / request.scale
                 return ((item[1] + .5) * side - demand.center[0]) ** 2 + ((item[2] + .5) * side - demand.center[1]) ** 2
             for group in sorted(groups, key=distance):
+                row_cache_keys = []
                 for phase in demand.phases:
                     if token.is_set() or self.stopped.is_set():
                         return
-                    restored = {}
-                    missing = []
-                    for tile in groups[group]:
-                        image = backend.lookup_tile(tile, phase)
-                        if image is not None and not image.isNull():
-                            restored[tile.address] = image, True
-                        else:
-                            missing.append(tile)
-                    with backend.record_tiles(demand.record), _scene_cancellation(
-                            backend.scene, lambda: token.is_set() or self.stopped.is_set()):
-                        result = service.render_tiles(snapshot.document, missing,
-                            TileBatchPolicy(demand.center), phase=phase, defer_effects=False)
-                        if demand.record:
-                            for tile in missing:
-                                image,exact = result.tiles[tile.address]
-                                if exact:
-                                    backend.retain_tile(tile,phase,image)
-                    result.tiles.update(restored)
+                    with self._cache_block_admission(demand, token):
+                        restored = {}
+                        missing = []
+                        for tile in groups[group]:
+                            image = backend.lookup_tile(tile, phase)
+                            if image is not None and not image.isNull():
+                                restored[tile.address] = image, True
+                            else:
+                                missing.append(tile)
+                        with backend.record_tiles(demand.record), _scene_cancellation(
+                                backend.scene, lambda: token.is_set() or self.stopped.is_set()):
+                            result = service.render_tiles(snapshot.document, missing,
+                                TileBatchPolicy(demand.center), phase=phase, defer_effects=False)
+                            if demand.record:
+                                for tile in missing:
+                                    image,exact = result.tiles[tile.address]
+                                    if exact:
+                                        backend.retain_tile(tile,phase,image)
+                        result.tiles.update(restored)
+                        cache_keys = []
+                        retain_memory = getattr(backend, 'retain_memory_tile', None)
+                        if (callable(retain_memory) and not result.error and not result.pending
+                                and all(exact for _, exact in result.tiles.values())):
+                            template = groups[group][0]
+                            for address, (image, exact) in result.tiles.items():
+                                tile = ProjectionRequest(address, template.tile_size, template.gutter)
+                                key = retain_memory(tile, phase, image)
+                                if key is not None:
+                                    cache_keys.append((address, phase, key))
+                        row_cache_keys.extend(cache_keys)
                     if result.error or result.pending or not all(exact for _, exact in result.tiles.values()):
                         self._publish(SceneCompletion(demand, done=True,
                             error=result.error or "Scene evaluation did not produce an exact block"), token)
                         return
-                    if not demand.record and not self._publish(SceneCompletion(demand,phase,result.tiles),token):
+                    if not demand.record and not self._publish(SceneCompletion(demand,phase,result.tiles,
+                            cache_keys=tuple(cache_keys)),token):
                         return
                 if demand.record:
                     backend.finish_recording()
                     manifest = backend.record_manifest()
                     if not self._publish(SceneCompletion(demand,recorded=True,
-                            recorded_rows=(group[2],),cache_manifest=manifest),token):
+                            recorded_rows=(group[2],),cache_manifest=manifest,
+                            cache_keys=tuple(row_cache_keys)),token):
                         return
             if demand.record:
                 backend.finish_recording()
             self._prepare_feedback(demand, backend, token)
             self._publish(SceneCompletion(demand, done=True,recorded=demand.record), token)
         except WorkCancelled:
+            if demand.consumer == 'navigator':
+                self._publish(SceneCompletion(demand, done=True), token)
             return
         except Exception as error:
             self._publish(SceneCompletion(demand, done=True, error=f"{type(error).__name__}: {error}"), token)

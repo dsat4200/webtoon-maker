@@ -61,7 +61,12 @@ Webtoon Maker is a native PySide6 desktop editor for fixed-width, vertically gro
 
 ## Important terminology
 
+Drawing/eraser contention, navigator preemption and full native saved-scene
+verification are documented in
+[drawing-eraser-performance-2026-10-11.md](../drawing-eraser-performance-2026-10-11.md).
+
 - **Series**: a portable project folder with preferences and a list of chapters.
+- **Preview cache**: ordinary native exact artwork retained in bounded system RAM, warmed by Cache to memory. GPU textures serve presentation. Optional close-time disk publication and validated reopen restoration share the same descriptors, dependencies and exact rendering pipeline; green navigator rows require resident final tiles.
 - **Chapter**: one 1080-pixel-wide, vertically growing canvas and its complete object graph.
 - **Page**: a root shape layer positioned within a chapter. Pages need not tile the chapter and may overlap.
 - **Layer**: a bounded shape container or an open stroked shape. Legacy fill layers no longer exist as a runtime kind; they are materialized into sparse raster tiles at load.

@@ -9,12 +9,14 @@ import pytest
 from PySide6.QtCore import QPointF, QRectF, Qt
 from PySide6.QtGui import QColor, QImage, QColorSpace
 from PySide6.QtTest import QTest
+from PySide6.QtWidgets import QMessageBox
 
 from comic_editor.core.models import RasterObject, CurvesModifier
 from comic_editor.core.persistence import SeriesRepository
 from comic_editor.render.cache import PersistentRenderCache, encode_value, decode_value
 from comic_editor.render.service import RenderPending
 from comic_editor.ui.main_window import MainWindow
+from comic_editor.ui.cache_dependencies import RenderDependencies
 
 
 @pytest.mark.parametrize("format", [QImage.Format_ARGB32_Premultiplied,
@@ -243,7 +245,8 @@ def test_handed_off_value_still_validates_its_entry(tmp_path, monkeypatch):
 
 
 @pytest.fixture
-def editor(qapp, tmp_path):
+def editor(qapp, tmp_path, monkeypatch):
+    monkeypatch.setattr(QMessageBox, 'question', lambda *args, **kwargs: QMessageBox.No)
     repository = SeriesRepository(tmp_path / "project")
     series = repository.create("Cache test")
     chapter, tiles = repository.create_chapter(series, "Chapter")
@@ -270,8 +273,11 @@ def editor(qapp, tmp_path):
 
 
 def finish(window, qapp, seconds=15):
+    window.disk_cache.tick()
     end = time.monotonic() + seconds
     while (window.disk_cache.building or window.disk_cache._maintenance is not None or
+            window.disk_cache._capture is not None or window.disk_cache._metadata is not None or
+            window.disk_cache._export is not None or window.disk_cache.scheduler.busy or
             window.disk_cache.backing.verifications or any(not future.done() for future in
                 window.disk_cache.dependencies.hashes.values())) and time.monotonic() < end:
         window.disk_cache.tick()
@@ -280,7 +286,21 @@ def finish(window, qapp, seconds=15):
         time.sleep(.001)
     assert not window.disk_cache.building, window.disk_cache.message
     assert window.disk_cache._maintenance is None, window.disk_cache.message
+    assert window.disk_cache._capture is None and window.disk_cache._metadata is None, window.disk_cache.message
+    assert window.disk_cache._export is None and not window.disk_cache.scheduler.busy, window.disk_cache.message
     assert not window.disk_cache.backing.error
+
+
+def persist_memory(window, qapp, *, success=True):
+    """Exercise the optional close publication after the ordinary source save."""
+    assert window.save(wait=True)
+    finish(window, qapp)
+    completed = []
+    assert window.disk_cache.persist_for_close(window.active_session,
+        lambda ok, error: completed.append((ok, error)))
+    finish(window, qapp)
+    assert completed and completed[0][0] is success, completed
+    return completed[0]
 
 
 def test_sibling_cache_writers_merge_committed_index(tmp_path):
@@ -367,7 +387,9 @@ def test_manual_range_reopens_without_scene_rendering(editor, qapp, monkeypatch)
     finish(window, qapp)
     assert cache.row_ready(0) and cache.row_ready(1)
     assert not cache.row_ready(2)
-    first = dict(cache.backing.entries)
+    assert not cache.backing.entries and not list(cache.backing.root.glob('**/*'))
+    persist_memory(window, qapp)
+    first = json.loads((cache.backing.root / 'index.json').read_text())['entries']
     window.disk_cache.detach()
     second = reopen()
     second.disk_cache.timer.stop()
@@ -378,6 +400,8 @@ def test_manual_range_reopens_without_scene_rendering(editor, qapp, monkeypatch)
     with second_cache.capture():
         configuration = second.canvas._projection_configuration()
         second.canvas._render_service.configure((*configuration, None), document=configuration[:3])
+    finish(second, qapp)
+    with second_cache.capture():
         document = second.canvas._render_document_state()
         for row in (0, 1):
             requests = second_cache.requests(row)
@@ -434,7 +458,11 @@ def test_effect_intermediates_are_saved_and_invalidated(editor, qapp):
     cache.set_range(0, 512)
     assert cache.start()
     finish(window, qapp)
-    assert {entry["kind"] for entry in cache.backing.entries.values()} >= {"projection", "source", "effect"}
+    assert {entry.descriptor.kind for entry in cache.backing.resident.snapshot()} >= {"projection", "source", "effect"}
+    assert not cache.backing.entries
+    persist_memory(window, qapp)
+    saved = json.loads((cache.backing.root / 'index.json').read_text())['entries']
+    assert {entry['kind'] for entry in saved.values()} >= {'projection', 'source', 'effect'}
     assert cache.row_ready(0)
     modifier.curves = {"rgb:master": [(0, 0), (.5, .2), (1, 1)]}
     window.canvas._invalidate_scene_cache()
@@ -447,16 +475,18 @@ def test_reopen_reuses_effect_sources_after_final_cache_is_cleared(editor, qapp,
     window.chapter.add_modifier(modifier, [("object", identifier)])
     window.canvas.tiles.paint_dab(identifier, QPointF(90, 80), 12, QColor("red"))
     window.canvas._invalidate_scene_cache()
-    # Warm memory from dirty pixels before Cache to disk saves the chapter.
-    window.canvas._ensure_scene_cache()
+    # Warm dirty native pixels in RAM, then publish their aliases after Save.
     window.disk_cache.set_range(0, 512)
     assert window.disk_cache.start()
     finish(window, qapp)
-    window.disk_cache.backing.clear(lambda entry: entry["kind"] == "projection")
+    persist_memory(window, qapp)
+    committed = PersistentRenderCache(window.disk_cache.backing.root,
+        contract=window.disk_cache.backing.contract, environment=window.disk_cache.backing.environment)
+    try:
+        committed.clear(lambda entry: entry['kind'] == 'projection')
+    finally:
+        committed.close()
     window.disk_cache.detach()
-    # Cache recording and Save are independent detached consumers. Await the
-    # encoded chapter publication before copying its source/cache resources.
-    assert window.save(wait=True)
     copied = window.repository.root.parent / "copied project"
     shutil.copytree(window.repository.root, copied)
     second = reopen(copied)
@@ -480,13 +510,16 @@ def test_small_raster_edit_preserves_remote_green_rows(editor, qapp):
     window.canvas.tiles.paint_dab(identifier, QPointF(100, 70), 16, QColor("red"))
     window.canvas._document_visual_changed(QRectF(85, 55, 30, 30))
     assert not cache.row_ready(0)
+    # Current dependency keys rebuild off the GUI. Untouched exact resident
+    # tiles survive and become green when that immutable metadata is ready.
+    finish(window, qapp)
     assert cache.row_ready(2)
 
 
-def test_failed_write_unlocks_and_preserves_committed_rows(editor, qapp, monkeypatch):
+def test_failed_optional_write_keeps_completed_memory_rows(editor, qapp, monkeypatch):
     window, _, _ = editor
     cache = window.disk_cache
-    cache.set_range(0, 256)
+    cache.set_range(0, 512)
     assert cache.start()
     finish(window, qapp)
     import comic_editor.render.cache as storage
@@ -496,17 +529,12 @@ def test_failed_write_unlocks_and_preserves_committed_rows(editor, qapp, monkeyp
             raise OSError("Disk full")
         return original(path, data)
     monkeypatch.setattr(storage, "_atomic_bytes", fail)
-    cache.set_range(256, 512)
-    assert cache.start()
-    end = time.monotonic() + 10
-    while cache.building and time.monotonic() < end:
-        cache.tick()
-        time.sleep(.001)
+    ok, error = persist_memory(window, qapp, success=False)
     assert not cache.building
     assert not window.canvas.document_read_only
-    assert "Disk full" in cache.message
+    assert not ok and 'Disk full' in error
     assert cache.row_ready(0)
-    assert not cache.row_ready(1)
+    assert cache.row_ready(1)
 
 
 def test_clear_selected_keeps_other_final_rows(editor, qapp):
@@ -523,6 +551,7 @@ def test_clear_selected_keeps_other_final_rows(editor, qapp):
     cache.clear(selected=False)
     finish(window,qapp)
     assert not cache.backing.entries
+    assert not cache.backing.resident.snapshot()
     assert not list((cache.backing.root / "values").glob("*.cache"))
 
 
@@ -551,6 +580,9 @@ def test_explicit_recording_never_evaluates_or_drains_on_gui(editor,qapp,monkeyp
     finish(window,qapp)
     assert traversals
     assert window.disk_cache.row_ready(0) and window.disk_cache.row_ready(1)
+    warm_traversals = len(traversals)
+    persist_memory(window, qapp)
+    assert len(traversals) == warm_traversals, 'Saving RAM cache re-rendered the chapter'
     window.disk_cache.detach()
 
 
@@ -596,3 +628,56 @@ def test_pending_image_drop_waits_for_cache_unlock(editor, monkeypatch):
     cache.cancel()
     assert len(applied) == 1
     assert canvas._pending_external_drop is None
+
+
+def test_whole_project_memory_exceeds_display_lru_and_pans_without_render_or_hash(editor, qapp, monkeypatch):
+    from PySide6.QtGui import QPainter
+    from comic_editor.render.scene import DetachedSceneBackend
+    window, _, _ = editor
+    canvas, cache = window.canvas, window.disk_cache
+    canvas.setFixedSize(256, 256)
+    canvas.center_x, canvas.center_y, canvas.scale = 128., 128., 1.
+    canvas.settings.grid_overlay_visible = False
+    canvas.set_selection('layer', canvas.chapter.root_page_ids[0])
+    configuration = canvas._projection_configuration()
+    canvas._render_service.configure((*configuration, None), document=configuration[:3])
+    # A viewport's retained tile budget is deliberately smaller than the whole
+    # project's independent RAM budget. Keep enough for its existing guard.
+    pixel_size = canvas._document_projection.tile_size + 2 * canvas._document_projection.gutter
+    canvas._document_projection.budget = 8 * pixel_size**2 * 4
+    cache.set_range(0, 768)
+    assert cache.start()
+    finish(window, qapp)
+    assert cache.backing.resident.bytes > canvas._document_projection.budget
+    assert cache.row_ready(0) and cache.row_ready(2)
+    assert not cache.backing.entries
+    before_entries = len(cache.backing.resident.snapshot())
+    assert cache.start()
+    cache.cancel()
+    finish(window, qapp)
+    assert cache.row_ready(0) and cache.row_ready(2)
+    assert len(cache.backing.resident.snapshot()) == before_entries
+
+    def forbidden(*args, **kwargs):
+        controller = canvas._scene_controller
+        pytest.fail(f'A green resident view rendered, recaptured or traversed source dependencies: '
+                    f'center={canvas.center_y}, preview={controller.preview_mode}, '
+                    f'requests={controller.desired[1]}, ready={list(canvas._document_projection.tiles)}')
+
+    monkeypatch.setattr(DetachedSceneBackend, 'paint', forbidden)
+    monkeypatch.setattr(canvas._scene_controller, '_new_scene_capture', forbidden)
+    monkeypatch.setattr(RenderDependencies, 'projection_key', forbidden)
+    monkeypatch.setattr(RenderDependencies, 'projection_keys', forbidden)
+    for center in (128., 650., 128.):
+        canvas.center_y = center
+        image = QImage(256, 256, QImage.Format_ARGB32_Premultiplied)
+        image.fill(QColor('black'))
+        painter = QPainter(image)
+        try:
+            canvas._paint_ready_document_projection(painter)
+        finally:
+            painter.end()
+        assert not canvas._projection_frame_pending
+        assert canvas._scene_controller.capture is None and not canvas._scene_controller.scheduler.busy
+        ink = canvas.document_to_widget(QPointF(90., 80. if center == 128. else 650.)).toPoint()
+        assert image.pixelColor(ink) != QColor('black')

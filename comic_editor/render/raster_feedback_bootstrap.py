@@ -43,8 +43,8 @@ def visible_source_keys(canvas, document, identifier, visible, *, limit=128):
     mapped = (obj.transform_quad is not None
         or any(layer.transform_quad is not None for layer in chain)
         or any(value != round(value) for value in origin))
-    rebuild = mapped and (not mapping.isAffine() or coefficients[0] < 0.
-        or coefficients[3] < 0. or coefficients[1] != 0. or coefficients[2] != 0.)
+    rebuild = mapped and (obj.transform_quad is not None
+        or any(layer.transform_quad is not None for layer in chain))
     origin = (0, 0) if mapped else origin
     side = canvas.tiles.tile_size
     patch_size = 4 * side if rebuild else side

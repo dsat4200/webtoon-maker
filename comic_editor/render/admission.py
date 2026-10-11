@@ -31,6 +31,13 @@ def current_ticket():
     return _active_ticket.get()
 
 
+def check_scene_cancelled(scene):
+    """Stop a detached capture before more source/scene work is started."""
+    cancelled = vars(scene).get('_scene_cancelled')
+    if cancelled is not None and cancelled():
+        raise WorkCancelled()
+
+
 class CopyLease:
     def __init__(self, admission, marker, size):
         self.admission,self.marker,self.size = admission,marker,size
@@ -111,6 +118,15 @@ class WorkAdmission:
     def copied_bytes(self):
         with self.condition:
             return sum(size for _,size in self.copies.values())
+
+    def higher_priority_waiting(self, priority):
+        """A provisional consumer may abandon its capture for visible work.
+
+        This does not release a live workspace or alter byte reservations.
+        Its owner must unwind normally before another ticket is admitted.
+        """
+        with self.condition:
+            return any(value[0] < priority for value in self.waiters.values())
 
     def reserve_copies(self, size):
         """Nonblocking ownership of queued arrays and output buffers.

@@ -80,9 +80,15 @@ class EffectJobs(QObject):
             if image is None:
                 return None
             backing = backing_for(self.canvas)
-            descriptor = backing.descriptor("retained", ("retained", scope, key))
             from comic_editor.render.cache import restore_state
-            state = restore_state(backing.entries.get(descriptor.identity, {}).get("state"))
+            semantic = ("retained", scope, key)
+            retained_state = getattr(backing, 'retained_state', None)
+            if callable(retained_state):
+                metadata = retained_state('retained', semantic)
+            else:
+                descriptor = backing.descriptor('retained', semantic)
+                metadata = backing.entries.get(descriptor.identity, {}).get('state')
+            state = restore_state(metadata)
             self.retained_put(scope, key, image, state)
             return QImage(image), state
         self.retained.move_to_end(scope)

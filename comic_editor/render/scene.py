@@ -399,12 +399,16 @@ class SceneCapture:
             from comic_editor.ui.cache_dependencies import RenderDependencies
             backing.contract = chapter.pixel_contract.signature
             backing.environment = (*RenderDependencies.environment(), environment.signature)
+        cache_spec = None
+        if backing is not None and not backing.closed:
+            cache_spec = str(backing.root), tuple(backing.contract), tuple(backing.environment)
+            resident = getattr(backing, 'resident', None)
+            if resident is not None:
+                cache_spec = (*cache_spec, resident)
         self.result = SceneSnapshot(self.document, chapter, tiles, images, state,
             (owner.width(), owner.height()), settings, jobs,
             getattr(owner, "_graphics_worker", None),
-            environment,
-            (str(backing.root), tuple(backing.contract), tuple(backing.environment))
-            if backing is not None and not backing.closed else None)
+            environment, cache_spec)
 
     def _capture_tiles(self, source_store, namespace, *, source_keys=None):
         """Stage independent native handles and pins for artwork or live ink."""
@@ -554,8 +558,14 @@ class InlineResults:
                 return None
             from comic_editor.render.cache import restore_state
             backing = self.owner._persistent_render_cache
-            descriptor = backing.descriptor("retained", ("retained", scope, key))
-            state = restore_state(backing.entries.get(descriptor.identity, {}).get("state"))
+            semantic = ("retained", scope, key)
+            retained_state = getattr(backing, 'retained_state', None)
+            if callable(retained_state):
+                metadata = retained_state('retained', semantic)
+            else:
+                descriptor = backing.descriptor('retained', semantic)
+                metadata = backing.entries.get(descriptor.identity, {}).get('state')
+            state = restore_state(metadata)
             self.retained_put(scope, key, image, state)
             return QImage(image), state
         self.retained.move_to_end(scope)
@@ -891,9 +901,10 @@ class DetachedSceneBackend:
         if snapshot.cache_spec is not None:
             from comic_editor.render.cache import PersistentRenderCache
             from comic_editor.ui.cache_dependencies import RenderDependencies
-            root, contract, environment = snapshot.cache_spec
+            root, contract, environment = snapshot.cache_spec[:3]
             self.scene._persistent_render_cache = PersistentRenderCache(root,
-                contract=contract, environment=environment)
+                contract=contract, environment=environment,
+                resident=snapshot.cache_spec[3] if len(snapshot.cache_spec) > 3 else None)
             self.scene._render_dependencies = RenderDependencies(self.scene, self.scene._persistent_render_cache)
             self.scene.tiles.render_fingerprint = self.scene._render_dependencies.tiles
             self.scene.images.render_fingerprint = self.scene._render_dependencies.image
@@ -979,6 +990,15 @@ class DetachedSceneBackend:
             if not backing.retain('projection',key,image):
                 raise RuntimeError(backing.error or 'Exact tile was not admitted to disk recording')
         return True
+
+    def retain_memory_tile(self, request, phase, image):
+        backing = self.scene._persistent_render_cache
+        if (not self._record_allowed() or backing.resident is None or image.isNull()):
+            return None
+        from comic_editor.render.device import cpu_image
+        key = self.scene._render_dependencies.projection_key(request, (*self.snapshot.document.configuration, phase))
+        backing.retain('projection', key, cpu_image(image))
+        return key
 
     def finish_recording(self):
         backing = self.scene._persistent_render_cache

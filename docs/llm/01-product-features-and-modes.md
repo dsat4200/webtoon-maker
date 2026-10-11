@@ -34,6 +34,7 @@ The application intentionally does not implement scheduling, reference libraries
 - **Insert Page Gap** can start anywhere inside the existing canvas. A drag defines an exact-height translucent orange band between two dotted line handles. The preview grows the canvas and, from an immutable baseline, moves the highest complete hierarchy branches whose modeled bounds start on or below the top line. Crossing leaves are not split. Either line can be adjusted before **Confirm Page Gap** commits one undoable edit; Cancel or Escape restores the exact baseline. Editing, persistence, and project/chapter switching are locked during the preview, while pan, zoom, and rotation remain available.
 - Page motion can grow the chapter and rebase content away from a negative top edge. **Trim Height** refuses to cut through visible page or object bounds.
 - The chapter navigator caches a small preview and offers a draggable viewport handle for scrolling long chapters.
+- **Cache to memory** warms the chosen full-width chapter range in ordinary native exact RAM cache while canvas/navigation remain available. Green means ready in memory; the size menu separates memory clears from Clear saved disk cache. Compatible saved caches restore into RAM when opening. A warmed/restored project offers optional cancellable disk saving when closing, after artwork Save/Discard decisions; declining closes immediately and discarding unsaved edits skips cache publication.
 
 ## Layer and shape features
 

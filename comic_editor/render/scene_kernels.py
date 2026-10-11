@@ -7,6 +7,7 @@ not be a QWidget or refer to an editor.
 from __future__ import annotations
 from collections import OrderedDict
 from comic_editor.render.image_storage_cache import QImageStorageCache
+from comic_editor.render.admission import check_scene_cancelled
 from comic_editor.core.tools import ToolKind
 from comic_editor.core.models import ArrayModifier
 from comic_editor.core.models import BlurModifier
@@ -564,6 +565,7 @@ class SceneKernels:
         self, painter: QPainter, layer: LayerNode, parent_opacity: float,
         visible_world: QRectF,
     ) -> None:
+        check_scene_cancelled(self)
         if not self._solo_branch_visible(layer.layer_id):
             return
         if layer.mask_only and not self._mask_only_render_visible("layer", layer.layer_id):
@@ -2493,6 +2495,7 @@ class SceneKernels:
         self, painter: QPainter, obj: DocumentObject, parent_opacity: float,
         local_visible: QRectF,
     ) -> None:
+        check_scene_cancelled(self)
         if not self._solo_content_visible("object", obj.object_id):
             return
         if self._render_exclude_text and isinstance(obj, TextObject):
@@ -3806,6 +3809,7 @@ class SceneKernels:
             for (tile_x, tile_y), image in self.tiles.iter_tiles(
                 obj.object_id, object_visible
             ):
+                check_scene_cancelled(self)
                 painter.drawImage(
                     tile_x * obj.tile_size,
                     tile_y * obj.tile_size,
@@ -3825,6 +3829,7 @@ class SceneKernels:
         for (tile_x, tile_y), image in self.tiles.iter_tiles(
             obj.object_id, object_visible
         ):
+            check_scene_cancelled(self)
             painter.drawImage(
                 tile_x * obj.tile_size, tile_y * obj.tile_size,
                 self._working_raster_tile(image)
@@ -4978,6 +4983,7 @@ class SceneKernels:
 
     def _render_scene_layers(self, painter, visible_world, *, underlay=False,
                              page_contents_only=False, live_ink=False, only_phase=None):
+        check_scene_cancelled(self)
         with self._show_on_top_scene() as phases:
             for phase in phases:
                 if only_phase is not None and phase != only_phase:
@@ -5011,6 +5017,7 @@ class SceneKernels:
                     # The phase filter places ordinary ink below promoted art.
                     self._draw_predictive_ink(painter)
                     self._draw_live_vector_gesture(painter)
+        check_scene_cancelled(self)
 
     def _solo_filter_suspended(self):
         return (getattr(self, "_solo_suspended", False)

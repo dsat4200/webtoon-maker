@@ -90,3 +90,8 @@ class NavigatorJobs(QObject):
             self.sent = True
         if self.sent and not self.scheduler.busy:
             self.timer.stop()
+            if not self.error and (preview._dirty_full or preview._dirty_bands):
+                # A preempted thumbnail produced no presentable frame. Keep
+                # all dirtiness and resume only after the normal idle delay.
+                self.cancel()
+                preview._schedule_refresh()

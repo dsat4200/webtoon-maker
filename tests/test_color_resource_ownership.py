@@ -266,7 +266,10 @@ def test_navigator_color_capture_error_is_terminal_and_corrected_resources_retry
 @pytest.mark.parametrize('invalid', [False, True])
 def test_cold_disk_binding_waits_for_environment_and_records_only_semantic_native_entries(canvas, qapp, tmp_path, monkeypatch, invalid):
     from comic_editor.core.persistence import SeriesRepository
+    from comic_editor.render.cache import PersistentRenderCache
     from comic_editor.ui.main_window import MainWindow
+    from PySide6.QtWidgets import QMessageBox
+    monkeypatch.setattr(QMessageBox, 'question', lambda *args, **kwargs: QMessageBox.No)
     contract, _, path = custom_contract(tmp_path)
     repository = SeriesRepository(tmp_path / 'project')
     series = repository.create('Color cache')
@@ -301,7 +304,7 @@ def test_cold_disk_binding_waits_for_environment_and_records_only_semantic_nativ
         wait_for(qapp, complete)
         if invalid:
             assert not cache.canvas.document_read_only and not cache.canvas.command_stack.read_only
-            assert 'Exception:' in cache.backing.error or 'ValueError:' in cache.backing.error
+            assert 'Loading the OCIO profile failed' in cache.backing.error
             assert cache.message.startswith('Cache failed: ')
             assert not cache.row_ready(0) and not cache.backing.entries
             return
@@ -309,6 +312,17 @@ def test_cold_disk_binding_waits_for_environment_and_records_only_semantic_nativ
         assert cache.row_ready(0)
         actual = window.canvas._color_resources.environment.signature
         assert cache.backing.environment[-1] == actual
+        assert cache.backing.resident.bytes and not cache.backing.entries
+        saved = []
+        assert cache.persist_for_close(window.active_session, lambda *result: saved.append(result))
+        wait_for(qapp, lambda: (cache.tick(), bool(saved))[1])
+        assert saved == [(True, '')]
+        committed = PersistentRenderCache(cache.backing.root,
+            contract=cache.backing.contract, environment=cache.backing.environment)
+        try:
+            cache.backing.entries = dict(committed.entries)
+        finally:
+            committed.close()
         assert cache.backing.entries
         assert 'async-color' not in repr(cache.backing.entries)
         assert 'color-resources-pending' not in repr(cache.backing.entries)
