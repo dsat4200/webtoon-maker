@@ -13,6 +13,29 @@ from comic_editor.ui.document_presentation import PresentationStats
 from test_performance_monitor_integration import editor, controller, _phases
 
 
+def test_gpu_presentation_spans_require_owned_paint_and_restore(editor, controller, monkeypatch):
+    from comic_editor.ui.document_presentation import GpuTilePresenter
+    canvas = editor[0].canvas
+    presenter = GpuTilePresenter()
+    original = lambda _self: {}
+    monkeypatch.setattr(GpuTilePresenter, '_save_state', original)
+    monkeypatch.setattr(canvas, '_draw_selection', lambda _painter: presenter._save_state())
+    controller.start()
+    presenter._save_state()
+    assert 'presentation.save_state' not in _phases(controller)
+    canvas._draw_selection(None)
+    assert _phases(controller)['presentation.save_state']['count'] == 1
+    rows = [row for row in controller.snapshot()['timeline']
+        if row['name'] == 'presentation.save_state']
+    assert rows and all(row['details']['ownership'] == 'monitored_editor'
+        and row['details']['thread'] == 'gui' for row in rows)
+    retained = presenter._save_state
+    controller.stop()
+    assert GpuTilePresenter._save_state is original
+    retained()
+    assert _phases(controller)['presentation.save_state']['count'] == 1
+
+
 @pytest.mark.parametrize("selected_promoted", [False, True])
 def test_real_promoted_projection_records_capture_and_prediction_phases(editor, controller, selected_promoted):
     window, _, raster = editor

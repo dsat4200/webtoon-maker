@@ -527,6 +527,12 @@ class PerformanceMonitorController(QObject):
         from comic_editor.render.scene_kernels import SceneKernels
         from comic_editor.render import effect_pipeline, scene_kernels, tile_effects
         from comic_editor.ui import interactive_effects
+        from comic_editor.ui.document_presentation import GpuTilePresenter
+        for name in ('draw_groups', '_save_state', '_upload', '_restore_state'):
+            # These probes inherit only an owned editor scope. They do
+            # not sample another window's presenter or inspect a live widget
+            # from detached rendering workers.
+            self._patch_owned(GpuTilePresenter, name, 'presentation.' + name.lstrip('_'))
         schedulers = []
         if scene is not None:
             schedulers.append((weakref.ref(scene.scheduler), "canvas"))

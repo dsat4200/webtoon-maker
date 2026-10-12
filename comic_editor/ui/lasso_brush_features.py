@@ -81,9 +81,11 @@ class LassoBrushFeatures:
             if state is None:
                 return
             gate = state['input_gate']
-            for path in pending['paths']:
-                gate.submit(lambda path=path: self._lasso_brush_source_keys(state, path),
-                            lambda path=path: self._preview_lasso_brush(path))
+            for path, coverage in pending['paths']:
+                gate.submit(lambda path=path, coverage=coverage:
+                                self._lasso_brush_source_keys(state, path, coverage),
+                            lambda path=path, coverage=coverage:
+                                self._preview_lasso_brush(path, coverage))
             if pending['released']:
                 self._finish_lasso_brush()
         finally:
@@ -98,10 +100,11 @@ class LassoBrushFeatures:
             state = pending['context']
             local = self._raster_local_point(state['object'], point)
             if local != state['last']:
+                coverage = self._lasso_brush_changed_coverage(state, local)
                 state['path'].lineTo(local)
                 state['last'] = local
                 pending['point'] = QPointF(point)
-                pending['paths'].append(self._lasso_brush_closed_path(state))
+                pending['paths'].append((self._lasso_brush_closed_path(state), coverage))
             self._raster_contact_point = QPointF(point)
             return
         state = self._lasso_brush
@@ -110,6 +113,7 @@ class LassoBrushFeatures:
         local = self._raster_local_point(state["object"], point)
         if local == state["last"]:
             return
+        coverage = self._lasso_brush_changed_coverage(state, local)
         state["path"].lineTo(local)
         state["last"] = local
         self._raster_contact_point = QPointF(point)
@@ -117,8 +121,8 @@ class LassoBrushFeatures:
             path = self._lasso_brush_closed_path(state)
             gate = state['input_gate']
             if not gate.released:
-                gate.submit(lambda: self._lasso_brush_source_keys(state, path),
-                            lambda: self._preview_lasso_brush(path))
+                gate.submit(lambda: self._lasso_brush_source_keys(state, path, coverage),
+                            lambda: self._preview_lasso_brush(path, coverage))
         except Exception:
             self._cancel_lasso_brush()
             raise
@@ -135,22 +139,51 @@ class LassoBrushFeatures:
             path = path.intersected(state["selection"])
         return path
 
-    def _lasso_brush_source_keys(self, state, path):
-        return set(self.tiles.keys_for_rect(path.boundingRect())) | state['preview_keys']
+    def _lasso_brush_changed_coverage(self, state, local):
+        if state['tiling'] or not state['selection'].isEmpty():
+            return None
+        # Appending one segment replaces last->first with last->new->first.
+        # Fill coverage can only change inside that triangle, even when the
+        # growing polygon crosses itself. The image stays on its native grid.
+        first = state['path'].elementAt(0)
+        coverage = QPainterPath(QPointF(first.x, first.y))
+        coverage.lineTo(state['last'])
+        coverage.lineTo(local)
+        coverage.closeSubpath()
+        return coverage
 
-    def _preview_lasso_brush(self, path=None) -> None:
+    def _lasso_brush_source_keys(self, state, path, coverage=None):
+        if coverage is None:
+            return set(self.tiles.keys_for_rect(path.boundingRect())) | state['preview_keys']
+        size = self.tiles.tile_size
+        # Native AA can cross a tile edge. Expand the tested tile rectangle by
+        # two native pixels; camera scale and display density never enter here.
+        return {key for key in self.tiles.keys_for_rect(coverage.boundingRect().adjusted(-2, -2, 2, 2))
+                if coverage.intersects(QRectF(key[0]*size, key[1]*size, size, size)
+                                       .adjusted(-2, -2, 2, 2))}
+
+    def _preview_lasso_brush(self, path=None, coverage=None) -> None:
         state = self._lasso_brush
         obj = state["object"]
         path = self._lasso_brush_closed_path(state) if path is None else path
         size = self.tiles.tile_size
-        keys = {
-            key for key in self.tiles.keys_for_rect(path.boundingRect())
-            if path.intersects(QRectF(key[0] * size, key[1] * size, size, size))
-        }
+        if coverage is None:
+            keys = {key for key in self.tiles.keys_for_rect(path.boundingRect())
+                    if path.intersects(QRectF(key[0]*size, key[1]*size, size, size))}
+            touched = keys | state['preview_keys']
+        else:
+            candidates = self._lasso_brush_source_keys(state, path, coverage)
+            keys = set(state['preview_keys'])
+            for key in candidates:
+                if path.intersects(QRectF(key[0]*size, key[1]*size, size, size)):
+                    keys.add(key)
+                else:
+                    keys.discard(key)
+            touched = candidates & (keys | state['preview_keys'])
         before = state["before"]
         dirty = QRectF()
         changed = set()
-        for key in keys | state["preview_keys"]:
+        for key in touched:
             if key not in before:
                 original = self.tiles.tile(obj.object_id, key)
                 before[key] = QImage(original) if original is not None else None
@@ -171,9 +204,15 @@ class LassoBrushFeatures:
             # Rebuild from pen-down pixels so changing the closing edge removes
             # the previous preview and translucent fills never accumulate.
             current = self.tiles.tile(obj.object_id, key)
-            if image == current or (current is None and self.tiles._alpha_bbox(image) is None):
+            if image == current:
                 continue
-            self.tiles.set_tile(obj.object_id, key, image)
+            if current is None:
+                bounds = self.tiles._alpha_bbox(image)
+                if bounds is None:
+                    continue
+                self.tiles.set_tile(obj.object_id, key, image, _known_alpha_bounds=bounds)
+            else:
+                self.tiles.set_tile(obj.object_id, key, image)
             changed.add(key)
             rect = QRectF(key[0] * size, key[1] * size, size, size)
             dirty = rect if dirty.isEmpty() else dirty.united(rect)

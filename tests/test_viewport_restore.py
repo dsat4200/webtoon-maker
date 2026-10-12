@@ -149,6 +149,7 @@ def test_navigation_debounces_settings_and_reset_view_replaces_saved_camera(edit
     assert editor.layout_settings_timer.isActive()
     QTest.qWait(650)
     qapp.processEvents()
+    editor._workspace_preferences.flush()
     assert load_settings().document_viewports[editor._document_view_key()] == expected
     assert not editor._dirty
     editor.canvas.reset_view()

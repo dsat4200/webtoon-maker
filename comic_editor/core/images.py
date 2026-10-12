@@ -44,6 +44,14 @@ class ImageSource:
         return hash((self.filename, self.mime_type, self.data))
 
 
+@dataclass(frozen=True)
+class PreparedDecodedImage:
+    """Owned original-file pin and already prepared native/display borrowers."""
+    encoded: EncodedImage
+    native: QImage
+    display: QImage
+
+
 class ImageStore:
     """Own immutable imported files while caching decoded display frames."""
 
@@ -206,18 +214,42 @@ class ImageStore:
         mime_type: str = "image/png",
     ) -> ImageSource:
         """Store already-validated bytes and their decoded display image."""
+        prepared = self.prepare_decoded(data, image, encoded_cache=self._encoded_cache)
+        return self.put_prepared_decoded(object_id, filename, prepared, mime_type)
+
+    @staticmethod
+    def prepare_decoded(
+        data: bytes, image: QImage, *, encoded_cache: EncodedImageCache,
+    ) -> PreparedDecodedImage:
+        """Prepare immutable source storage and display conversion on its caller.
+
+        Detached import workers may use this with a captured thread-safe encoded
+        cache, without reading or changing an ImageStore/document. Original
+        bytes, native precision and the ICC profile stay on the native edge.
+        """
         if image.isNull():
+            raise ValueError("Cannot store a null decoded image")
+        encoded = EncodedImage.from_bytes(bytes(data), encoded_cache)
+        return PreparedDecodedImage(encoded, QImage(image),
+            image.convertToFormat(QImage.Format_ARGB32_Premultiplied))
+
+    def put_prepared_decoded(
+        self, object_id: str, filename: str, prepared: PreparedDecodedImage,
+        mime_type: str = "image/png",
+    ) -> ImageSource:
+        """Adopt prepared borrowers without file I/O or pixel conversion."""
+        if prepared.native.isNull() or prepared.display.isNull():
             raise ValueError("Cannot store a null decoded image")
         object_id = str(object_id)
         source = ImageSource(
             self.safe_filename(filename), str(mime_type),
-            EncodedImage.from_bytes(bytes(data), self._encoded_cache)
+            prepared.encoded,
         )
         self._sources[object_id] = source
         self._forget_object_decoded(object_id)
-        frames = [(('native', object_id), QImage(image)),
-                  (object_id, image.convertToFormat(QImage.Format_ARGB32_Premultiplied))]
-        if image_has_high_precision(image):
+        frames = [(('native', object_id), QImage(prepared.native)),
+                  (object_id, QImage(prepared.display))]
+        if image_has_high_precision(prepared.native):
             frames.reverse()
         # A one-frame budget retains the immediately useful representation:
         # display pixels for byte sources, original precision for wide sources.

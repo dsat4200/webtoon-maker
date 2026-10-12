@@ -7,8 +7,9 @@ from collections import OrderedDict
 from collections.abc import MutableMapping
 from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
+from queue import SimpleQueue
 import os
-from threading import RLock
+from threading import RLock, Thread
 import tempfile
 import uuid
 
@@ -16,8 +17,43 @@ from PySide6.QtGui import QImage
 
 
 _snapshot_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix='tile-pins')
+_retirements = SimpleQueue()
 _reader_lock = RLock()
 _reader_jobs = {}
+
+
+def _run_retirements():
+    while True:
+        cleanup, arguments = _retirements.get()
+        try:
+            cleanup(*arguments)
+        except Exception:
+            # A failed private-file cleanup must not retire the IO worker or
+            # affect surviving originals and later queued directory owners.
+            pass
+        # Last-release directory cleanup can enqueue more work. Release these
+        # owners on this IO thread before waiting for the next queue item.
+        del cleanup, arguments
+
+
+def _queue_retirement(cleanup, *arguments):
+    # CPython SimpleQueue.put is reentrant, including when allocation invokes
+    # another finalizer. Never submit executor work or start a thread here:
+    # GC may already hold an executor's non-reentrant submission/shutdown lock.
+    _retirements.put((cleanup, arguments))
+
+
+# Start once during module initialization, before a snapshot can own pins.
+# Finalizers only enqueue; no caller performs private filesystem retirement.
+_retirement_thread = Thread(target=_run_retirements, name='tile-retirement', daemon=True)
+_retirement_thread.start()
+
+
+def _retire_pin(backing, path):
+    # Keep the directory owner alive until its retired file is removed. A
+    # surviving snapshot/input owner retains its own independent pin reference.
+    if path.parent == backing.root:
+        path.unlink(missing_ok=True)
 
 
 class PrefetchedPins:
@@ -98,17 +134,20 @@ class SnapshotBacking:
         link_or_copy(str(path), str(target))
         return PinnedTile(self, target)
 
+    def __del__(self):
+        workspace = getattr(self, 'workspace', None)
+        if workspace is not None:
+            _queue_retirement(workspace.cleanup)
+
 
 class PinnedTile:
     def __init__(self, backing, path):
         self.backing, self.path = backing, path
 
     def __del__(self):
-        try:
-            self.path.unlink(missing_ok=True)
-        except OSError:
-            # The directory owner also cleans up at final release.
-            pass
+        backing, path = getattr(self, 'backing', None), getattr(self, 'path', None)
+        if backing is not None and path is not None:
+            _queue_retirement(_retire_pin, backing, path)
 
 
 class TileResidency:

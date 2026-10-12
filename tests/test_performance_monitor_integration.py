@@ -62,7 +62,10 @@ def _phases(controller):
 def test_top_left_action_opens_a_lazy_disabled_monitor(editor, qapp):
     window, _layer, _raster = editor
     assert getattr(window, "_performance_monitor_controller", None) is None
-    assert window.file_toolbar.actions()[1] is window.performance_monitor_action
+    actions = window.file_toolbar.actions()
+    file_index = next(index for index, action in enumerate(actions)
+        if window.file_toolbar.widgetForAction(action) is window.file_button)
+    assert actions[file_index + 1] is window.performance_monitor_action
     button = window.file_toolbar.widgetForAction(window.performance_monitor_action)
     assert button.isVisible()
     QTest.mouseClick(button, Qt.MouseButton.LeftButton)

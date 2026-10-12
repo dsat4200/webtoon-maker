@@ -510,8 +510,22 @@ def test_prepared_native_contact_batch_matches_qpainter_images_and_reuses_textur
                     painter.drawImage(tile.world_rect, tile.image, tile.source_rect)
             finally:
                 painter.restore()
+        def qt_feedback_groups(painter, groups, camera, size, *, owner, smooth, pending_context=None):
+            from comic_editor.ui.document_presentation import PresentationStats, draw_document_tiles
+            for group in groups:
+                if group.tiles and all(isinstance(tile.key, tuple)
+                        and tile.key[0] == 'raster-feedback' for tile in group.tiles):
+                    qt_images(painter, group.tiles, camera, size, owner=owner, smooth=smooth,
+                        clip_world=group.clip_world, replace_background=group.replace_background)
+                else:
+                    draw_document_tiles(painter, group.tiles, camera, size, owner=owner,
+                        smooth=smooth, clip_world=group.clip_world,
+                        native_context=group.native_context, native_bounds=group.native_bounds,
+                        replace_background=group.replace_background)
+            return PresentationStats('reference', sum(len(group.tiles) for group in groups))
         with monkeypatch.context() as reference:
-            reference.setattr(feedback_ui, 'draw_document_tiles', qt_images)
+            reference.setattr('comic_editor.ui.document_projection_features.draw_document_tile_groups',
+                qt_feedback_groups)
             canvas.update()
             qapp.processEvents()
             np.testing.assert_allclose(canvas.frame_pixels, batch, atol=1)

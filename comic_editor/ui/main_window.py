@@ -45,7 +45,9 @@ from comic_editor.core.assets import (
 )
 from comic_editor.core.persistence import SeriesRepository
 from comic_editor.core.commands import CallbackCommand, CommandStack
+from comic_editor.core import settings as settings_module
 from comic_editor.core.settings import load_settings, save_settings
+from comic_editor.core.workspace_preferences import WorkspacePreferencesWriter
 from comic_editor.core.tiles import TileStore
 from comic_editor.core.images import ImageStore
 from comic_editor.core.external_images import EXPORT_FORMATS, import_uv_overlay, prepare_image_project
@@ -303,6 +305,11 @@ class MainWindow(QMainWindow):
         self.resize(1500, 950)
         self.setWindowTitle("Webtoon Maker")
         self.settings = load_settings()
+        # Establish complete ordinary defaults after a missing/invalid file.
+        # Detached merges preserve the last validated complete encoding.
+        if not hasattr(self.settings, '_brush_asset_path'):
+            save_settings(self.settings)
+        self._workspace_preferences = WorkspacePreferencesWriter()
         from comic_editor.core.ui_themes import load_theme_library
         self.theme_library = load_theme_library()
         from PySide6.QtGui import QIcon
@@ -1049,7 +1056,6 @@ class MainWindow(QMainWindow):
             "outliner_settings": self.outliner_splitter.sizes(),
         }
         self.settings.navigator_expanded = self.navigator_panel.isExpanded()
-        self.settings.clamp()
 
     def _schedule_workspace_layout_save(self, *args) -> None:
         del args
@@ -1057,8 +1063,10 @@ class MainWindow(QMainWindow):
         self.layout_settings_timer.start(250)
 
     def _save_workspace_layout(self) -> None:
+        if self._workspace_preferences.closed:
+            return
         self._capture_workspace_layout()
-        save_settings(self.settings)
+        self._workspace_preferences.submit(settings_module.settings_path(), self.settings)
 
     def _document_view_key(self) -> str | None:
         if self.repository is None or self.chapter is None:
@@ -7377,6 +7385,10 @@ class MainWindow(QMainWindow):
         self.blender_sources.shutdown()
         self.layout_settings_timer.stop()
         self._save_workspace_layout()
+        self._workspace_preferences.shutdown()
+        # Preserve the former final full-save checkpoint, including scalar
+        # tool/color preferences that were only changed in memory this session.
+        save_settings(self.settings)
         if getattr(self, "_application_event_filter_installed", False):
             application = QApplication.instance()
             if application is not None:

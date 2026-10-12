@@ -257,8 +257,14 @@ def test_gpu_budget_is_bounded_and_over_budget_frame_draws_nothing(gl_context):
     one = PresentedTile("a", solid("red"), QRectF(0, 0, 16, 16))
     two = PresentedTile("b", solid("blue"), QRectF(16, 0, 16, 16))
     assert presenter.draw([one], QTransform(), QSizeF(64, 64))
+    # This one-slot budget test completes its isolated GPU reader before
+    # demanding reuse. Busy storage has separate zero-wait fallback coverage.
+    pixels(target.toImage())
+    allocations = presenter.texture_allocations
     assert presenter.draw([two], QTransform(), QSizeF(64, 64))
+    assert presenter.texture_allocations == allocations and presenter.texture_reuses == 1
     assert presenter.texture_bytes == presenter.byte_limit
+    assert presenter.allocated_texture_bytes == presenter.byte_limit
     before = pixels(target.toImage())
     assert not presenter.draw([one, two], QTransform(), QSizeF(64, 64))
     np.testing.assert_array_equal(before, pixels(target.toImage()))

@@ -271,7 +271,7 @@ def _atomic_bytes(path, data):
 class PersistentRenderCache:
     """Non-blocking read-through backing; caller owns memory and dependencies."""
 
-    def __init__(self, root, *, contract=(), environment=(), resident=None):
+    def __init__(self, root, *, contract=(), environment=(), resident=None, defer_index=False):
         self.root = Path(root)
         self._root_state = _root_state(self.root)
         self._root_epoch = self._root_state.epoch
@@ -279,21 +279,6 @@ class PersistentRenderCache:
         self.resident = resident
         self.entries = {}
         self.source_digests = {}
-        try:
-            document = json.loads((self.root / "index.json").read_text(encoding="utf-8"))
-            if not isinstance(document, dict):
-                raise ValueError("Invalid render cache index")
-            if document.get("version") == CACHE_VERSION and document.get("renderer") == RENDERER_VERSION:
-                self.entries = document.get("entries", {})
-                self.source_digests = document.get("sources", {})
-                if not isinstance(self.entries, dict) or not isinstance(self.source_digests, dict):
-                    self.entries, self.source_digests = {}, {}
-                self.entries = {identity: entry for identity, entry in self.entries.items()
-                                if self._valid_entry(identity, entry)}
-        except (OSError, ValueError, TypeError):
-            pass
-        if resident is not None:
-            self.source_digests.update(resident.source_digests())
         self.executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="render-cache-io")
         self.values_lock = self._root_state.lock
         self.reads, self.writes, self.verifications = {}, {}, {}
@@ -310,6 +295,19 @@ class PersistentRenderCache:
         self.epoch = 0
         self.invalidated = False
         self.hits = self.misses = self.loads = self.saved = 0
+        if defer_index:
+            # GUI binding adopts the same validated manifest through poll().
+            # The owning backing and root generation guard late completions.
+            if (self.root / "index.json").is_file():
+                self._reload = self.executor.submit(self._reload_index)
+        else:
+            self.entries, self.source_digests = self._committed_index()
+        if resident is not None:
+            self.source_digests.update(resident.source_digests())
+
+    @property
+    def index_loading(self):
+        return self._reload is not None
 
     def descriptor(self, kind, key):
         return CacheDescriptor(kind, tuple(key), self.contract, self.environment)
@@ -408,6 +406,14 @@ class PersistentRenderCache:
                 # An explicit disk recording can reuse exact RAM values.
                 self.retain(kind, key, result, state=self.resident.state(self.descriptor(kind, key)))
                 return result
+        if self.index_loading:
+            if not wait and not self._reload.done():
+                raise RenderPending("Saved cache index is loading")
+            if wait:
+                self._reload.result()
+            self.poll()
+            if self.index_loading:
+                raise RenderPending("Saved cache index is loading")
         if not self.entries and not self.ready:
             # Unpublished entries cannot satisfy reads. Synchronize sibling
             # clears first, then avoid hashing a definite empty-index miss.
@@ -543,6 +549,10 @@ class PersistentRenderCache:
             try:
                 entries,sources,epoch,generation = future.result()
                 if epoch == self._root_state.epoch and generation == self._root_state.generation:
+                    # Source aliases captured since initialization are still
+                    # owned by the ordinary resident dependency metadata.
+                    if self.resident is not None:
+                        sources.update(self.resident.source_digests())
                     self.entries,self.source_digests = entries,sources
                     changed = True
                 else:

@@ -8,7 +8,8 @@ from PySide6.QtCore import QRect, QRectF, QSize, Qt, QTimer
 from PySide6.QtGui import QColor, QImage, QPainter, QPainterPath, QTransform
 
 from comic_editor.ui.document_presentation import (
-    PresentedTile, PresentationStats, draw_document_tiles, draw_document_border,
+    PresentedTile, PresentedTileGroup, PresentationStats, draw_document_tiles,
+    draw_document_tile_groups, draw_document_border,
 )
 from comic_editor.render.service import (
     RenderDocument, RenderRequest, RenderResult, RenderQuality, RenderStatus, TileBatchPolicy,
@@ -17,6 +18,7 @@ from comic_editor.core.models import RasterObject, TextObject
 from comic_editor.core.tools import ToolKind
 from comic_editor.core.document_patch import RecordSnapshot
 from comic_editor.render.sampling import artwork_density
+from comic_editor.render.projection import ProjectionRequest
 from comic_editor.ui.color_resources import projection_color_identity
 
 
@@ -163,12 +165,89 @@ class DocumentProjectionFeatures:
         selection = getattr(self, "_drawing_selection_path", None)
         return selection is not None and selection.isEmpty()
 
+    def _native_presentation_retry_context(self, document, visible, *, complete, draw_live, phases):
+        """Guard one complete native scene across selected live source packets."""
+        controller = self._scene_controller
+        obj = self.chapter.objects.get(self.selected_id)
+        if (draw_live or phases != (None,) or self.selected_kind != 'object'
+                or not isinstance(obj, RasterObject) or controller._filtered_state is not None
+                or self._projection_has_live_preview(include_ink=False)):
+            return None
+        key = (document.identity, document.configuration, tuple(document.bounds.getRect()),
+            self.selected_id, id(obj), id(self.tiles._tiles.get(self.selected_id)),
+            self.command_stack.revision, controller._presentation_dependency_generation)
+        if document.live_preview:
+            gate = controller._covered_contact_gate(document, tuple(visible.getRect()))
+            if gate is None or gate.busy:
+                # A replay already validated for this exact owner may survive
+                # its next source chunk. Keep it visibly pending rather than
+                # treating busy source admission as fresh covered pixels.
+                if (self._gpu_contact_pacing_current(pending=True)
+                        and getattr(self, '_gpu_presentation_retry_context_key', None) == key):
+                    return key
+                return None
+        elif not complete or self._projection_provisional_visible:
+            return None
+        return key
+
+    def _retry_pending_native_presentation(self):
+        if getattr(self, '_gpu_presentation_pending', False):
+            pending = getattr(self, '_visual_pending_widget', None)
+            if pending is not None and not pending.isEmpty():
+                self._visual_frame_timer.stop()
+                self._flush_visual_dirty()
+            else:
+                self.update()
+
+    def _adopt_native_presentation_retry(self, document, pending_context):
+        self._gpu_presentation_retry_token = None
+        self._gpu_presentation_retry_context_key = pending_context
+        if pending_context is None or getattr(self, '_gpu_contact_pacing_context', None) is None:
+            return
+        # The caller already validated this complete scene's coverage before
+        # replay. A scalar token guards subsequent display packets without
+        # recapturing artwork or polling the graphics driver from input code.
+        controller = self._scene_controller
+        gate = controller._owned_native_contact_gate(document)
+        obj = self.chapter.objects.get(self.selected_id)
+        if gate is None or obj is None:
+            return
+        key = self._gpu_contact_pacing_key(obj, pending=True)
+        if key is not None:
+            self._gpu_presentation_retry_token = ((gate, self.chapter, self.tiles, self.images,
+                obj, self.tiles._tiles.get(self.selected_id), controller.feedback,
+                self.chapter.pixel_contract, self._gpu_contact_pacing_context), key,
+                self.command_stack.revision, controller._presentation_dependency_generation)
+
+    def _schedule_native_presentation_retry(self, pending):
+        self._gpu_presentation_pending = pending
+        timer = getattr(self, '_gpu_presentation_retry_timer', None)
+        if not pending:
+            self._gpu_presentation_retry_token = None
+            self._gpu_presentation_retry_context_key = None
+            self._gpu_presentation_retry_delay = 16
+            if timer is not None:
+                timer.stop()
+            return
+        if timer is None:
+            timer = self._gpu_presentation_retry_timer = QTimer(self)
+            timer.setSingleShot(True)
+            timer.timeout.connect(self._retry_pending_native_presentation)
+        if not timer.isActive():
+            # Replaying faster than a saturated GPU finishes its readers can
+            # perpetually keep the only compatible allocation busy. Back off
+            # bounded retries while normal ready drawing retains 60 Hz cadence.
+            delay = getattr(self, '_gpu_presentation_retry_delay', 16)
+            timer.start(delay)
+            self._gpu_presentation_retry_delay = min(128, delay * 2)
+
     def _paint_ready_document_projection(self, painter, *, live_ink=False):
         """Paint is presentation only; capture/evaluation run on separate lanes."""
         configuration = self._projection_configuration()
         projection = self._document_projection
         document = self._render_document_state()
         visible = self.visible_document_rect()
+        presented_revision = getattr(self, '_projection_presented_revision', -1)
         if document.overflow <= 0:
             visible = visible.intersected(document.bounds)
         if getattr(self, '_projection_windows_configuration', None) != configuration:
@@ -181,7 +260,7 @@ class DocumentProjectionFeatures:
             self._projection_windows[0] = QRectF(coverage)
         if document.overflow <= 0:
             coverage = coverage.intersected(document.bounds)
-        requests = projection.requests(coverage, 1.)
+        requests = self._projection_requests_for_window(projection, coverage)
         if self._projection_cull_outside_view:
             requests = self._projection_visible_requests(requests, projection.tile_size)
         phases = (None,)
@@ -302,10 +381,25 @@ class DocumentProjectionFeatures:
             retained_overlays = ()
         draw_live = (live_ink and not self._projection_provisional_visible
             and tuple(phase for phase, _ in batch) == phases)
+        camera = self.camera_transform()
+        groups = []
+        pending_context = self._native_presentation_retry_context(document, visible,
+            complete=complete, draw_live=draw_live, phases=phases)
+
+        def collect_feedback(_painter, tiles, _camera, _size, *, owner, smooth,
+                             clip_world, replace_background=None):
+            groups.append(PresentedTileGroup(tuple(tiles), clip_world=clip_world,
+                replace_background=replace_background))
+
+        def present_groups():
+            if groups:
+                stats.append(draw_document_tile_groups(painter, tuple(groups), camera,
+                    self.size(), owner=self, smooth=True, pending_context=pending_context))
+                groups.clear()
+
         with self._show_on_top_scene() if draw_live else nullcontext():
             for phase, tiles in batch:
-                stats.append(draw_document_tiles(painter, tiles, self.camera_transform(), self.size(),
-                    owner=self, smooth=True,
+                groups.append(PresentedTileGroup(tuple(tiles),
                     native_context=(plain_context if plain_context is not None else ("filtered-contact", configuration,
                         self._scene_controller._filtered_state.completed_revision, phase)
                         if filtered_tiles else (document, phase) if (native_batch_complete and not live_ink
@@ -313,19 +407,20 @@ class DocumentProjectionFeatures:
                     native_bounds=document.bounds))
                 if phase is None and retained_overlays:
                     for tile, replace_background in retained_overlays:
-                        draw_document_tiles(painter, (tile,), self.camera_transform(), self.size(),
-                            owner=self, smooth=True,
+                        groups.append(PresentedTileGroup((tile,),
                             clip_world=None if replace_background else document.bounds,
-                            replace_background=QColor('#242428') if replace_background else None)
+                            replace_background=QColor('#242428') if replace_background else None))
                 if phase is None and retained_overlays and filtered_replacements:
                     # The filtered worker can replace only part of its scene.
                     # Its new complete scene tiles own overlaps with retained
                     # earlier contacts, including an earlier selected layer.
-                    draw_document_tiles(painter, filtered_replacements, self.camera_transform(), self.size(),
-                        owner=self, smooth=True, replace_background=QColor('#242428'))
+                    groups.append(PresentedTileGroup(tuple(filtered_replacements),
+                        replace_background=QColor('#242428')))
                 if phase is None and not feedback_tiles:
-                    feedback_tiles = self._scene_controller.present_feedback(painter, document)
+                    feedback_tiles = self._scene_controller.present_feedback(painter, document,
+                        draw_tiles=collect_feedback)
                 if draw_live:
+                    present_groups()
                     self._show_on_top_phase = phase
                     painter.save()
                     try:
@@ -339,13 +434,23 @@ class DocumentProjectionFeatures:
                         self._clear_live_underlay_context()
                         painter.restore()
         if not feedback_tiles:
-            feedback_tiles = self._scene_controller.present_feedback(painter, document)
+            feedback_tiles = self._scene_controller.present_feedback(painter, document,
+                draw_tiles=collect_feedback)
+        present_groups()
         self._document_presentation_stats = PresentationStats(
             stats[-1].backend if stats else "pending", sum(item.tiles for item in stats),
             sum(item.uploads for item in stats), stats[-1].texture_bytes if stats else 0)
+        gpu_pending = any(item.backend == 'gpu-pending' for item in stats)
+        self._schedule_native_presentation_retry(gpu_pending)
+        if gpu_pending:
+            self._projection_frame_pending = True
+            self._projection_provisional_visible = True
+            self._raster_feedback_contact_covered = False
+            self._projection_presented_revision = presented_revision
+            self._adopt_native_presentation_retry(document, pending_context)
         if feedback_tiles or filtered_tiles:
             self._projection_provisional_visible = True
-        if complete:
+        if complete and not gpu_pending:
             self._scene_controller.release_handoff.clear("current exact presentation")
         elif self._projection_provisional_visible and preview is not None and stats and sum(item.tiles for item in stats):
             self._scene_controller.release_handoff.painted(document, preview[1],
@@ -398,18 +503,46 @@ class DocumentProjectionFeatures:
                               tile.request.world_rect, tile.request.source_rect)
                 for tile in tiles if tile.valid]
 
+    def _projection_requests_for_window(self, projection, coverage):
+        key = (tuple(coverage.getRect()), projection.tile_size, projection.gutter)
+        cached = getattr(self, '_projection_request_window', None)
+        if cached is None or cached[0] != key:
+            cached = key, tuple(projection.requests(coverage, 1.))
+            self._projection_request_window = cached
+        return cached[1]
+
     def _projection_visible_requests(self, requests, margin):
         # A tilted viewport's bounding box can cover thousands of document
         # pixels which cannot contribute to the screen. Cull only final output
         # tiles; effect sources and the fixed capture devices stay unchanged.
-        inverse, valid = self.camera_transform().inverted()
+        camera = self.camera_transform()
+        # Ordinary ready presentation holds an immutable request tuple for
+        # its guard window. Reuse its camera-only cull result while neither
+        # moves; artwork revisions never change these native grid rectangles.
+        # Foreign/mutable request collections keep the original Qt path.
+        cached = getattr(self, '_projection_visible_request_window', None)
+        cacheable = (isinstance(requests, tuple)
+            and all(type(request) is ProjectionRequest for request in requests))
+        key = (tuple(getattr(camera, f'm{row}{column}')()
+            for row in range(1, 4) for column in range(1, 4)),
+            tuple(self.rect().getRect()), float(margin), float(self.scale),
+            float(self.devicePixelRatioF())) if cacheable else None
+        if (cacheable and cached is not None and cached[0] is requests
+                and cached[1] == key):
+            return cached[2]
+        inverse, valid = camera.inverted()
         if not valid:
             return requests
         padding = margin * abs(self.scale) + 2. / max(1., self.devicePixelRatioF())
         viewport = QPainterPath()
         viewport.addRect(QRectF(self.rect()).adjusted(-padding, -padding, padding, padding))
         coverage = inverse.map(viewport)
-        return [request for request in requests if coverage.intersects(request.capture_rect)]
+        visible = [request for request in requests if coverage.intersects(request.capture_rect)]
+        if cacheable:
+            result = tuple(visible)
+            self._projection_visible_request_window = requests, key, result
+            return result
+        return visible
 
     def _render_document_tile(self, request):
         return self._render_document_region(request.capture_rect, request.scale,

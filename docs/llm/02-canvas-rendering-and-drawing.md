@@ -124,6 +124,59 @@ evaluate it without a widget. Ordinary widget paints present ready resources.
 
 ### Raster presentation continuity
 
+Contiguous document, retained contact and current feedback passes use ordered
+`PresentedTileGroup` records. GPU presentation validates the union of their
+texture revisions before drawing, then shares one real GL state snapshot,
+restore and geometry upload. Each pass retains its native pixels, source
+rectangle, clip and composition order; simultaneous revisions of a logical
+tile remain distinct until the frame finishes. QPainter grid, border, vector
+and tool overlays resume after this native boundary. Raster replacement and
+fallback retain their existing per-pass behavior. The 256 MiB texture budget,
+native sampling grids and all cache identities are unchanged. Frame statistics
+include retained and live feedback draws; optional owned performance probes
+measure native state preservation and texture uploads separately.
+
+Owned CPU-image presentation textures reuse compatible immutable RGBA8 storage
+only after a zero-time GPU fence poll confirms that the previous reader has
+finished. Active textures and retired reusable storage share the existing
+256 MiB cap. Borrowed device images retain their existing leases and are not
+pooled. Busy storage is neither overwritten nor waited upon on the GUI thread;
+capacity is polled before retiring or uploading any requested revision. A
+complete ordinary native scene may retain its last successful ordered texture
+geometry across selected transient source packets. Matching document,
+configuration, bounds, selected object/source ownership, history, dependency
+epoch, camera, viewport, density and opacity permit coherent replay while
+storage is busy. A replay stays pending, retains release handoff, and never
+claims current ink coverage or exact completion. Stationary/released input
+also retries with a bounded 16–128 ms delay. Missing or stale owners keep
+ordinary fallback semantics; vector/live phases and replacement backgrounds
+cannot borrow this whole-scene replay. These are presentation allocations,
+never exact artwork or persistent cache values.
+
+An unchanged guard window reuses its immutable native projection-request tuple;
+unchanged camera geometry reuses that tuple's Qt viewport intersection result.
+Camera, viewport, margin, density or grid changes invalidate this bounded
+metadata reuse. Artwork revisions still use all ordinary dependency checks;
+source/effect samples, exact tile sizes, color contracts and disk keys remain
+unchanged. Mutable or foreign request collections retain the original Qt path.
+
+After an existing full or bounded covered GPU contact token validates current
+source, scene, view and context ownership, display damage coalesces to a 16 ms cadence
+from the last actual paint. Native input samples still run at their received
+rate. New damage retains its original deadline and latest full-frame union;
+release, cold admission and invalidated ownership promote the pending timer
+immediately. This pacing changes only presentation frequency and does not skip
+source packets, endpoint admission or undo data.
+
+Lasso brush continuation uses the changed closing-edge triangle plus its
+native antialias guard to identify tiles that need the original full-path
+paint. Tiles are still derived from the contact's original source buffers,
+including self-crossings and reversed edges. Unsupported changes retain the
+full-polygon fallback. The optimization changes preparation extent, not source
+samples, precision, alpha composition, selection geometry or cache identity.
+`tests/test_lasso_brush_changed_tiles.py` compares every intermediate buffer
+with the full-path implementation for all supported native pixel contracts.
+
 `ui/raster_presentation_continuity.py` retains at most 64 MiB of already
 composed provisional native presentation while exact scene replacement is
 pending. Source pixels remain in the ordinary TileStore. Selection handoffs

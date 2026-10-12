@@ -1,5 +1,6 @@
 """Linked Comic View targets use published image pixels without Blender running."""
 from dataclasses import replace
+import time
 import uuid
 
 import numpy as np
@@ -141,7 +142,7 @@ def test_replacing_cached_blender_pixels_recaptures_without_descriptor_edit(link
 
 
 def test_new_published_blender_render_refreshes_target_effect_and_dirty_region(
-        linked_target_scene, tmp_path, monkeypatch):
+        linked_target_scene, tmp_path, monkeypatch, qapp):
     canvas, chapter, target, _, _, _, _ = linked_target_scene
     before = effect(linked_target_scene)
     published = tmp_path / "revision-2.png"
@@ -152,6 +153,11 @@ def test_new_published_blender_render_refreshes_target_effect_and_dirty_region(
     try:
         controller._set_views([ComicViewInfo(PROJECT_UUID, VIEW_UUID, "Panel 12", 2,
             32, 24, False, QImage(), str(published))])
+        deadline = time.monotonic() + 3
+        while controller._active_frame is not None or controller._pending_frames:
+            qapp.processEvents()
+            assert time.monotonic() < deadline
+            time.sleep(.001)
         assert target.source.last_revision == 2
         assert canvas.images.image(target.object_id).pixelColor(3, 3) == QColor("blue")
         after = effect(linked_target_scene)

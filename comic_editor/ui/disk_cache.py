@@ -99,7 +99,7 @@ class DiskCacheController(QObject):
             contract=chapter.pixel_contract.signature,
             environment=(*RenderDependencies.environment(), semantic_color_identity(self.canvas, chapter.pixel_contract)))
         self.backing = PersistentRenderCache(root, contract=chapter.pixel_contract.signature,
-            environment=self.contexts[view.namespace]['environment'], resident=view)
+            environment=self.contexts[view.namespace]['environment'], resident=view, defer_index=True)
         self._teardown[0] = self.backing
         self.dependencies = RenderDependencies(self.canvas, self.backing)
         self.canvas._persistent_render_cache, self.canvas._render_dependencies = self.backing, self.dependencies
@@ -111,7 +111,7 @@ class DiskCacheController(QObject):
         self.start_y, self.end_y = saved or (0., float(chapter.height))
         self.set_range(self.start_y, self.end_y, save=False)
         self._reset_status()
-        if self.backing.entries or view.bytes:
+        if self.backing.index_loading or self.backing.entries or view.bytes:
             self._begin_capture('restore', range(math.ceil(chapter.height / projection.tile_size)))
             self.message = 'Loading saved preview into memory…' if self.backing.entries else ''
         self.timer.start()
@@ -375,7 +375,7 @@ class DiskCacheController(QObject):
             backend.close()
 
     def _advance_capture(self):
-        if self._capture is None:
+        if self._capture is None or self.backing.index_loading:
             return
         with self.capture():
             complete = self._capture.advance(.004)
@@ -430,7 +430,17 @@ class DiskCacheController(QObject):
                     raise RuntimeError(completion.error)
                 if completion.done:
                     self._evaluation_done = True
+            index_loading = self.backing.index_loading
             self.backing.poll()
+            if (index_loading and not self.backing.index_loading and not self.building
+                    and self._capture is not None and self._capture_mode == 'restore'):
+                # Restore only this binding's validated index through the
+                # existing detached capture and dependency pipeline.
+                if self.backing.entries or self.backing.resident.bytes:
+                    self._revision = -1
+                else:
+                    self._capture = None
+                    self.message = ''
             if self._maintenance is not None and self._maintenance[0].done():
                 future, serial, _ = self._maintenance
                 self._maintenance = None
@@ -462,7 +472,8 @@ class DiskCacheController(QObject):
             self.message = 'Cache failed: ' + str(error)
         self.refresh_ui()
         self.timer.setInterval(20 if self.building or self._capture is not None or self._metadata is not None
-            or self._maintenance is not None or self._export is not None or self._status_queue else 150)
+            or self._maintenance is not None or self._export is not None or self._status_queue
+            or self.backing.index_loading else 150)
 
     def clear(self, *, selected):
         if self.backing is None:

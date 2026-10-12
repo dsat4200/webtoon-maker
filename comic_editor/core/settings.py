@@ -661,9 +661,16 @@ def settings_path() -> Path:
 
 def load_settings() -> EditorSettings:
     path = settings_path()
+    from .workspace_preferences import settings_read
+    with settings_read(path):
+        return _load_settings(path)
+
+
+def _load_settings(path: Path) -> EditorSettings:
     if path.is_file():
         try:
-            raw = json.loads(path.read_text(encoding="utf-8"))
+            encoded = path.read_text(encoding="utf-8")
+            raw = json.loads(encoded)
             if not isinstance(raw, dict):
                 raise TypeError("Settings must be an object")
             from .brush_storage import decode_brush_assets
@@ -816,6 +823,8 @@ def load_settings() -> EditorSettings:
             result.clamp()
             result._brush_asset_cache = asset_cache
             result._brush_asset_path = path.resolve()
+            from .workspace_preferences import remember_settings_encoding
+            remember_settings_encoding(path, encoded)
             return result
         except (OSError, TypeError, ValueError, json.JSONDecodeError):
             pass
@@ -823,8 +832,14 @@ def load_settings() -> EditorSettings:
 
 
 def save_settings(settings: EditorSettings) -> None:
-    settings.clamp()
     path = settings_path()
+    from .workspace_preferences import full_settings_write
+    with full_settings_write(path):
+        _save_settings(settings, path)
+
+
+def _save_settings(settings: EditorSettings, path: Path) -> None:
+    settings.clamp()
     from .brush_storage import atomic_write, encode_brush_assets, preserve_inline_backup
     cache = (getattr(settings, "_brush_asset_cache", {})
              if getattr(settings, "_brush_asset_path", None) == path.resolve() else {})
@@ -837,9 +852,14 @@ def save_settings(settings: EditorSettings) -> None:
     raw["brush_presets"] = presets
     if cache:
         preserve_inline_backup(path)
+    encoded = bytearray()
     def write(stream):
         for chunk in json.JSONEncoder(indent=2).iterencode(raw):
-            stream.write(chunk.encode("utf-8"))
+            data = chunk.encode("utf-8")
+            stream.write(data)
+            encoded.extend(data)
     atomic_write(path, write)
+    from .workspace_preferences import remember_settings_encoding
+    remember_settings_encoding(path, bytes(encoded))
     settings._brush_asset_cache = cache
     settings._brush_asset_path = path.resolve()

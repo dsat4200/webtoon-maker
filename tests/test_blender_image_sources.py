@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import uuid
+import time
+import threading
+from dataclasses import FrozenInstanceError, replace
 from pathlib import Path
 from unittest.mock import PropertyMock, patch
 
 import pytest
-from PySide6.QtCore import QBuffer, QByteArray, QIODevice, QPointF, Qt
+from PySide6.QtCore import QBuffer, QByteArray, QIODevice, QPointF, QTimer, Qt
 from PySide6.QtGui import QColor, QImage
 
 from comic_editor.core.assets import extract_asset
@@ -84,6 +87,22 @@ def _view(path: Path | str = "", *, revision=3, width=300, height=200, dirty=Fal
         PROJECT_UUID, VIEW_UUID, "Panel 12", revision, width, height,
         dirty, QImage(), str(path),
     )
+
+
+def _drain_frames(qapp, controller, timeout=3):
+    deadline = time.monotonic() + timeout
+    while controller._active_frame is not None or controller._pending_frames:
+        qapp.processEvents()
+        assert time.monotonic() < deadline, 'Published frame worker did not finish'
+        time.sleep(.001)
+
+
+def _pump_until(qapp, predicate, timeout=3):
+    deadline = time.monotonic() + timeout
+    while not predicate():
+        qapp.processEvents()
+        assert time.monotonic() < deadline
+        time.sleep(.001)
 
 
 def test_schema_15_image_migrates_to_embedded_source_without_eager_rewrite():
@@ -165,6 +184,7 @@ def test_controller_imports_atomic_png_once_and_updates_matching_objects(qapp, t
     path = _published(tmp_path)
 
     controller._set_views([_view(path)])
+    _drain_frames(qapp, controller)
     assert imported == [True]
     for obj in objects:
         assert images.source(obj.object_id).data == path.read_bytes()
@@ -195,6 +215,7 @@ def test_invalid_or_outdated_publication_preserves_last_good_frame(qapp, tmp_pat
     before_bytes = images.source(obj.object_id).data
 
     controller._set_views([_view(tmp_path / "missing.png")])
+    _drain_frames(qapp, controller)
     assert errors
     assert obj.to_dict() == before_model
     assert images.source(obj.object_id).data == before_bytes
@@ -205,6 +226,329 @@ def test_invalid_or_outdated_publication_preserves_last_good_frame(qapp, tmp_pat
     assert images.source(obj.object_id).data == before_bytes
     controller.shutdown()
     controller.deleteLater()
+
+
+def test_publication_decode_runs_off_gui_and_keeps_gui_callbacks_live(qapp, tmp_path, monkeypatch):
+    chapter, _page, objects, images = _chapter_with_linked_images()
+    canvas = CanvasWidget(EditorSettings())
+    canvas.set_document(chapter, TileStore(), images)
+    controller = BlenderImageSourceController(canvas)
+    entered, release = threading.Event(), threading.Event()
+    loader = controller_module.load_published_png
+    worker_threads, imported_threads, ticks = [], [], []
+    preparation_threads, adoption_threads = [], []
+    prepare = ImageStore.prepare_decoded
+    adopt = ImageStore.put_prepared_decoded
+
+    def observed_prepare(*args, **kwargs):
+        preparation_threads.append(threading.get_ident())
+        return prepare(*args, **kwargs)
+
+    def observed_adopt(*args, **kwargs):
+        adoption_threads.append(threading.get_ident())
+        return adopt(*args, **kwargs)
+
+    monkeypatch.setattr(ImageStore, 'prepare_decoded', staticmethod(observed_prepare))
+    monkeypatch.setattr(ImageStore, 'put_prepared_decoded', observed_adopt)
+    def blocked(view):
+        worker_threads.append(threading.get_ident())
+        entered.set()
+        assert release.wait(3)
+        return loader(view)
+    monkeypatch.setattr(controller_module, 'load_published_png', blocked)
+    controller.frameImported.connect(lambda: imported_threads.append(threading.get_ident()))
+    path = _published(tmp_path)
+    try:
+        controller._set_views([_view(path)])
+        QTimer.singleShot(0, lambda: ticks.append(True))
+        _pump_until(qapp, lambda: entered.is_set() and ticks)
+        assert not imported_threads
+        assert objects[0].source.last_revision == 2
+        assert worker_threads == [worker_threads[0]] and worker_threads[0] != threading.get_ident()
+        release.set()
+        _drain_frames(qapp, controller)
+        assert imported_threads == [threading.get_ident()]
+        assert preparation_threads == worker_threads
+        assert adoption_threads == [threading.get_ident()]
+        assert images.source(objects[0].object_id).data == path.read_bytes()
+    finally:
+        release.set()
+        controller.shutdown()
+
+
+def test_publications_coalesce_to_latest_revision_before_gui_apply(qapp, tmp_path, monkeypatch):
+    chapter, _page, objects, images = _chapter_with_linked_images()
+    canvas = CanvasWidget(EditorSettings())
+    canvas.set_document(chapter, TileStore(), images)
+    controller = BlenderImageSourceController(canvas)
+    entered, release = threading.Event(), threading.Event()
+    loader = controller_module.load_published_png
+    calls, imported = [], []
+    def blocked(view):
+        calls.append(view.revision)
+        if view.revision == 3:
+            entered.set()
+            assert release.wait(3)
+        return loader(view)
+    monkeypatch.setattr(controller_module, 'load_published_png', blocked)
+    paths = []
+    for revision, color in [(3, 'red'), (4, 'blue'), (5, 'purple')]:
+        path = tmp_path / f'{revision}.png'
+        path.write_bytes(_png(300, 200, color))
+        paths.append(path)
+    controller.frameImported.connect(lambda: imported.append(objects[0].source.last_revision))
+    try:
+        controller._set_views([_view(paths[0])])
+        _pump_until(qapp, entered.is_set)
+        controller._set_views([_view(paths[1], revision=4)])
+        controller._set_views([_view(paths[2], revision=5)])
+        release.set()
+        _drain_frames(qapp, controller)
+        assert calls == [3, 5]
+        assert imported == [5]
+        assert images.source(objects[0].object_id).data == paths[2].read_bytes()
+        assert images.image(objects[0].object_id).pixelColor(3, 3) == QColor('purple')
+    finally:
+        release.set()
+        controller.shutdown()
+
+
+@pytest.mark.parametrize('changed_metadata', ['name', 'dimensions'])
+def test_publication_worker_owns_scalar_snapshot_and_rejects_late_metadata(qapp, tmp_path, monkeypatch, changed_metadata):
+    chapter, _page, objects, images = _chapter_with_linked_images()
+    canvas = CanvasWidget(EditorSettings())
+    canvas.set_document(chapter, TileStore(), images)
+    controller = BlenderImageSourceController(canvas)
+    entered, release = threading.Event(), threading.Event()
+    loader = controller_module.load_published_png
+    calls, imported, errors = [], [], []
+
+    def blocked(view):
+        assert not isinstance(view, ComicViewInfo)
+        assert not hasattr(view, 'thumbnail')
+        with pytest.raises(FrozenInstanceError):
+            view.revision = 99
+        calls.append(view)
+        result = loader(view)
+        if len(calls) == 1:
+            entered.set()
+            assert release.wait(3)
+        return result
+
+    monkeypatch.setattr(controller_module, 'load_published_png', blocked)
+    controller.frameImported.connect(lambda: imported.append(objects[0].source.display_name))
+    controller.errorOccurred.connect(errors.append)
+    path = _published(tmp_path)
+    initial = _view(path)
+    try:
+        controller._set_views([initial])
+        _pump_until(qapp, entered.is_set)
+        if changed_metadata == 'name':
+            newest = replace(initial, name='Renamed panel')
+        else:
+            path.write_bytes(_png(150, 100, 'purple'))
+            newest = replace(initial, width=150, height=100)
+        controller._set_views([newest])
+        release.set()
+        _drain_frames(qapp, controller)
+        assert len(calls) == 2 and not errors
+        assert calls[0] is not initial and calls[1] is not newest
+        assert imported == [newest.name]
+        assert (objects[0].pixel_width, objects[0].pixel_height) == (newest.width, newest.height)
+        assert images.source(objects[0].object_id).data == path.read_bytes()
+    finally:
+        release.set()
+        controller.shutdown()
+
+
+def test_reconciliation_retires_unlinked_pending_view_before_worker_finishes(qapp, tmp_path, monkeypatch):
+    chapter, _page, objects, images = _chapter_with_linked_images(2)
+    objects[1].source.view_uuid = OTHER_VIEW_UUID
+    canvas = CanvasWidget(EditorSettings())
+    canvas.set_document(chapter, TileStore(), images)
+    controller = BlenderImageSourceController(canvas)
+    entered, release = threading.Event(), threading.Event()
+    loader = controller_module.load_published_png
+    calls = []
+
+    def blocked(view):
+        calls.append(view.view_uuid)
+        entered.set()
+        assert release.wait(3)
+        return loader(view)
+
+    monkeypatch.setattr(controller_module, 'load_published_png', blocked)
+    first = _view(_published(tmp_path))
+    second = replace(first, view_uuid=OTHER_VIEW_UUID)
+    try:
+        controller._set_views([first])
+        _pump_until(qapp, entered.is_set)
+        controller._set_views([first, second])
+        assert len(controller._pending_frames) == 1
+        objects[1].source = EmbeddedImageSourceDescriptor()
+        controller._set_views([first, second])
+        assert not controller._pending_frames
+        assert not controller._active_frame.future.done()
+        release.set()
+        _drain_frames(qapp, controller)
+        assert calls == [VIEW_UUID]
+        assert objects[0].source.last_revision == 3
+    finally:
+        release.set()
+        controller.shutdown()
+
+
+@pytest.mark.parametrize('blocked_state', ['painting', 'received_contact', 'queued_contact', 'read_only'])
+def test_completed_publication_waits_for_safe_document_state(qapp, tmp_path, monkeypatch, blocked_state):
+    chapter, _page, objects, images = _chapter_with_linked_images()
+    canvas = CanvasWidget(EditorSettings())
+    canvas.set_document(chapter, TileStore(), images)
+    controller = BlenderImageSourceController(canvas)
+    entered, release = threading.Event(), threading.Event()
+    loader = controller_module.load_published_png
+    def blocked(view):
+        entered.set()
+        assert release.wait(3)
+        return loader(view)
+    monkeypatch.setattr(controller_module, 'load_published_png', blocked)
+    before = images.source(objects[0].object_id).data
+    busy = [False]
+    if blocked_state == 'queued_contact':
+        monkeypatch.setattr(canvas, '_native_input_predecessor', lambda: object() if busy[0] else None)
+    attribute = {'painting': '_drawing', 'received_contact': '_raster_contact_active',
+                 'read_only': 'document_read_only'}.get(blocked_state)
+    try:
+        controller._set_views([_view(_published(tmp_path))])
+        _pump_until(qapp, entered.is_set)
+        if attribute:
+            setattr(canvas, attribute, True)
+        else:
+            busy[0] = True
+        future = controller._active_frame.future
+        release.set()
+        _pump_until(qapp, future.done)
+        qapp.processEvents()
+        assert controller._active_frame is not None
+        assert images.source(objects[0].object_id).data == before
+        assert objects[0].source.last_revision == 2
+        if attribute:
+            setattr(canvas, attribute, False)
+        else:
+            busy[0] = False
+        controller._advance_frames()
+        _drain_frames(qapp, controller)
+        assert objects[0].source.last_revision == 3
+    finally:
+        release.set()
+        if attribute:
+            setattr(canvas, attribute, False)
+        controller.shutdown()
+
+
+def test_stale_context_worker_error_cannot_affect_current_document(qapp, tmp_path, monkeypatch):
+    chapter, _page, objects, images = _chapter_with_linked_images()
+    canvas = CanvasWidget(EditorSettings())
+    canvas.set_document(chapter, TileStore(), images)
+    controller = BlenderImageSourceController(canvas)
+    entered, release = threading.Event(), threading.Event()
+    loader = controller_module.load_published_png
+    calls, errors = [], []
+    def blocked(view):
+        calls.append(view.revision)
+        if len(calls) == 1:
+            entered.set()
+            assert release.wait(3)
+            raise ValueError('Retired publication failed')
+        return loader(view)
+    monkeypatch.setattr(controller_module, 'load_published_png', blocked)
+    controller.errorOccurred.connect(errors.append)
+    old_bytes = images.source(objects[0].object_id).data
+    try:
+        controller._set_views([_view(_published(tmp_path))])
+        _pump_until(qapp, entered.is_set)
+        controller.stop_for_context_change()
+        current, _page, current_objects, current_images = _chapter_with_linked_images()
+        canvas.set_document(current, TileStore(), current_images)
+        controller.resume_for_context()
+        release.set()
+        _drain_frames(qapp, controller)
+        assert not errors
+        assert objects[0].source.last_revision == 2
+        assert images.source(objects[0].object_id).data == old_bytes
+        assert current_objects[0].source.last_revision == 3
+    finally:
+        release.set()
+        controller.shutdown()
+
+
+@pytest.mark.parametrize('replacement', ['source', 'images', 'object'])
+def test_ready_publication_rejects_replaced_source_owners(qapp, tmp_path, monkeypatch, replacement):
+    chapter, _page, objects, images = _chapter_with_linked_images()
+    canvas = CanvasWidget(EditorSettings())
+    canvas.set_document(chapter, TileStore(), images)
+    controller = BlenderImageSourceController(canvas)
+    entered, release = threading.Event(), threading.Event()
+    loader = controller_module.load_published_png
+    def blocked(view):
+        entered.set()
+        assert release.wait(3)
+        return loader(view)
+    monkeypatch.setattr(controller_module, 'load_published_png', blocked)
+    imported, errors = [], []
+    controller.frameImported.connect(lambda: imported.append(True))
+    controller.errorOccurred.connect(errors.append)
+    before = images.source(objects[0].object_id).data
+    try:
+        controller._set_views([_view(_published(tmp_path))])
+        _pump_until(qapp, entered.is_set)
+        if replacement == 'source':
+            objects[0].source = BlenderComicViewSourceDescriptor(
+                project_uuid=PROJECT_UUID, view_uuid=VIEW_UUID, last_revision=2)
+        elif replacement == 'images':
+            canvas.images = ImageStore()
+        else:
+            chapter.objects[objects[0].object_id] = ChapterDocument.from_dict(chapter.to_dict()).objects[objects[0].object_id]
+        release.set()
+        _drain_frames(qapp, controller)
+        assert not imported and not errors
+        assert images.source(objects[0].object_id).data == before
+        assert objects[0].source.last_revision == 2
+    finally:
+        release.set()
+        controller.shutdown()
+
+
+def test_publication_shutdown_does_not_wait_for_worker_or_apply_late_frame(qapp, tmp_path, monkeypatch):
+    chapter, _page, objects, images = _chapter_with_linked_images()
+    canvas = CanvasWidget(EditorSettings())
+    canvas.set_document(chapter, TileStore(), images)
+    controller = BlenderImageSourceController(canvas)
+    entered, release = threading.Event(), threading.Event()
+    loader = controller_module.load_published_png
+    def blocked(view):
+        entered.set()
+        assert release.wait(3)
+        return loader(view)
+    monkeypatch.setattr(controller_module, 'load_published_png', blocked)
+    imported, errors = [], []
+    controller.frameImported.connect(lambda: imported.append(True))
+    controller.errorOccurred.connect(errors.append)
+    before = images.source(objects[0].object_id).data
+    try:
+        controller._set_views([_view(_published(tmp_path))])
+        _pump_until(qapp, entered.is_set)
+        objects[0].source = EmbeddedImageSourceDescriptor()
+        future = controller._active_frame.future
+        controller.shutdown()
+        assert not future.done()  # Shutdown returned while the worker is blocked.
+        release.set()
+        future.result(timeout=3)
+        qapp.processEvents()
+        assert not imported and not errors
+        assert images.source(objects[0].object_id).data == before
+    finally:
+        release.set()
+        controller.shutdown()
 
 
 def test_published_png_validation_rejects_unsafe_or_inconsistent_files(tmp_path, monkeypatch):
@@ -342,6 +686,7 @@ def test_switching_linked_images_preserves_blender_view_and_imports_frames(qapp,
         with patch.object(BlenderSourceClient, "connected", new_callable=PropertyMock,
                           return_value=True):
             window.blender_sources._set_views([first, second])
+            _drain_frames(qapp, window.blender_sources)
             for obj in (objects[0], objects[1], objects[0], objects[1]):
                 window.canvas.set_selection("object", obj.object_id)
             assert statuses[-1] == "unsaved"

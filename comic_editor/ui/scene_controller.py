@@ -39,6 +39,7 @@ class SceneController(QObject):
         self._contact_preview_key = self._contact_preview_owner = None
         self._contact_preview_generation = 0
         self._contact_preview_dependency_generation = 0
+        self._presentation_dependency_generation = 0
         self._contact_preview_presented_revision = -1
         self.feedback = None
         self.feedback_dirty = set()
@@ -72,6 +73,7 @@ class SceneController(QObject):
 
     def reset(self, *, retain_presentation=False):
         if not retain_presentation:
+            self._presentation_dependency_generation += 1
             self.raster_continuity.reset()
             self._presentation_batch = None
         self._retire_contact_preview()
@@ -902,10 +904,19 @@ class SceneController(QObject):
         return batch, complete
 
     def changed(self, change, *, action="transient"):
+        from comic_editor.render.raster_feedback_bootstrap import selected_source_change
+        selected = ('object', self.canvas.selected_id)
+        source_only = (action == 'transient' and change.transient
+            and selected_source_change(change, self.canvas.selected_id)
+            and all(item.entity == selected for item in change.entities)
+            and (any(item.entity == selected and 'pixels' in item.fields for item in change.entities)
+                or any(item.entity == selected and item.resource == 'raster'
+                    and item.address is not None for item in change.resources)))
+        if not source_only:
+            self._presentation_dependency_generation += 1
         self.raster_continuity.changed(change, action, self.canvas._render_document_state())
         self.release_handoff.changed(change, action)
         if self._contact_preview_owner is not None:
-            from comic_editor.render.raster_feedback_bootstrap import selected_source_change
             if action != 'transient' or not selected_source_change(change, self.canvas.selected_id):
                 self._contact_preview_dependency_generation += 1
                 self._retire_contact_preview()
@@ -953,6 +964,9 @@ class SceneController(QObject):
         self._filtered_requests = ()
 
     def retire_feedback(self):
+        # Legacy broad document signals also retire prepared scene dependencies;
+        # they need the same replay rejection as the typed change stream.
+        self._presentation_dependency_generation += 1
         self._retire_contact_preview()
         self._retire_bootstrap()
         self._bootstrap_failed = None
@@ -1000,7 +1014,7 @@ class SceneController(QObject):
             presentation_margin=max(prepared.gutter,
                 1. / max(.001, abs(canvas.scale) * canvas.devicePixelRatioF())))
 
-    def present_feedback(self, painter, document):
+    def present_feedback(self, painter, document, *, draw_tiles=None):
         if self._filtered_state is not None:
             return 0  # Complete native scenes replace the normal batch below.
         prepared = self.feedback
@@ -1011,7 +1025,8 @@ class SceneController(QObject):
                     and not getattr(self.canvas, '_raster_contact_active', False)):
             return 0
         from comic_editor.ui.raster_feedback import present_raster_feedback
-        return present_raster_feedback(self.canvas, painter, prepared, self.feedback_dirty, self.feedback_patches)
+        return present_raster_feedback(self.canvas, painter, prepared, self.feedback_dirty,
+            self.feedback_patches, draw_tiles=draw_tiles)
 
     def checkpoint_raster_presentation(self, document):
         """Keep committed native ink before a selection retires its source owner."""

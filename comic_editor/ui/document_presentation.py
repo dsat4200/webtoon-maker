@@ -53,6 +53,24 @@ class PresentedTile:
 
 
 @dataclass(frozen=True)
+class PresentedTileGroup:
+    """An ordered presentation pass with its existing clipping and ownership.
+
+    Groups share only a native presentation boundary. They retain their own
+    tile revisions, source rectangles and raster fallback requirements.
+    """
+
+    tiles: tuple[PresentedTile, ...]
+    clip_world: QRectF | None = None
+    native_context: object = None
+    native_bounds: QRectF | None = None
+    replace_background: object = None
+
+    def __post_init__(self):
+        object.__setattr__(self, "tiles", tuple(self.tiles))
+
+
+@dataclass(frozen=True)
 class PresentationStats:
     backend: str
     tiles: int
@@ -65,6 +83,15 @@ class _TextureEntry:
     texture: QOpenGLTexture
     byte_count: int
     sampling: object = None
+    storage_key: tuple | None = None
+    fence: object = None
+
+
+@dataclass
+class _PresentationFence:
+    value: int
+    references: int = 0
+    failed: bool = False
 
 
 class _BorrowedTexture:
@@ -165,6 +192,12 @@ class GpuTilePresenter:
         self._ready = False
         self.context = self.functions = self.program = self.buffer = self.vao = None
         self._textures: OrderedDict[tuple, _TextureEntry] = OrderedDict()
+        self._texture_pool: OrderedDict[int, _TextureEntry] = OrderedDict()
+        self._texture_pool_bytes = self._pool_serial = 0
+        self.texture_allocations = self.texture_reuses = 0
+        self._protected_texture_keys = frozenset()
+        self._fence_ready_cache = {}
+        self._sync = None
         self._geometry = OrderedDict()
         self._geometry_configuration = None
         self.geometry_limit = 4096
@@ -172,6 +205,9 @@ class GpuTilePresenter:
         self.geometry_uploads = 0
         self._uploaded_geometry = ()
         self._max_texture_size = None
+        self._integer_query = None
+        self._last_native_frame = None
+        self.pending_storage = False
         self._owner = weakref.ref(owner) if owner is not None else None
 
     def _prepare_geometry(self, tiles, camera, viewport, clip_world):
@@ -222,6 +258,8 @@ class GpuTilePresenter:
         if not self.functions.initializeOpenGLFunctions():
             raise RuntimeError("OpenGL 3.3 unavailable")
         self._max_texture_size = int(self.functions.glGetIntegerv(0x0D33))
+        from comic_editor.render.gpu.sync import GlSync
+        self._sync = GlSync(context)
         self.program = QOpenGLShaderProgram()
         if (not self.program.addShaderFromSourceCode(QOpenGLShader.Vertex, VERTEX)
                 or not self.program.addShaderFromSourceCode(QOpenGLShader.Fragment, FRAGMENT)
@@ -241,10 +279,179 @@ class GpuTilePresenter:
                 tile.pixel_environment.signature if tile.pixel_environment is not None
                 else color_environment(tile.pixel_contract))
 
-    def _remove(self, key):
+    @property
+    def allocated_texture_bytes(self):
+        """The presentation cap includes active and recyclable allocations."""
+        return self.texture_bytes + self._texture_pool_bytes
+
+    def _release_fence(self, entry):
+        fence, entry.fence = entry.fence, None
+        if fence is not None:
+            fence.references -= 1
+            if not fence.references and fence.value:
+                self._sync.delete(fence.value)
+
+    def _storage_ready(self, entry):
+        # A missing fence means storage has never been submitted. Zero denotes
+        # a failed fence: keep that allocation unavailable until context close.
+        fence = entry.fence
+        if fence is None:
+            return True
+        if not fence.value or fence.failed:
+            return False
+        if fence.value not in self._fence_ready_cache:
+            try:
+                self._fence_ready_cache[fence.value] = self._sync.ready(fence.value)
+            except Exception:
+                fence.failed = True
+                self._fence_ready_cache[fence.value] = False
+        return self._fence_ready_cache[fence.value]
+
+    def _remove(self, key, *, recycle=True):
+        if self._last_native_frame is not None and key in self._last_native_frame[2]:
+            self._last_native_frame = None
         entry = self._textures.pop(key)
-        entry.texture.destroy()
         self.texture_bytes -= entry.byte_count
+        if recycle and entry.storage_key is not None:
+            self._pool_serial += 1
+            self._texture_pool[self._pool_serial] = entry
+            self._texture_pool_bytes += entry.byte_count
+        else:
+            self._release_fence(entry)
+            entry.texture.destroy()
+
+    def _take_storage(self, storage_key):
+        for token, entry in tuple(self._texture_pool.items()):
+            if entry.storage_key == storage_key and self._storage_ready(entry):
+                self._texture_pool.pop(token)
+                self._texture_pool_bytes -= entry.byte_count
+                self._release_fence(entry)
+                self.texture_reuses += 1
+                return entry
+        return None
+
+    def _reserve_storage(self, byte_count):
+        while self.allocated_texture_bytes + byte_count > self.byte_limit:
+            reusable = next((token for token, entry in self._texture_pool.items()
+                             if self._storage_ready(entry)), None)
+            if reusable is not None:
+                entry = self._texture_pool.pop(reusable)
+                self._texture_pool_bytes -= entry.byte_count
+                self._release_fence(entry)
+                entry.texture.destroy()
+                continue
+            victim = next((key for key in self._textures
+                           if key not in self._protected_texture_keys), None)
+            if victim is None:
+                return False
+            self._remove(victim)
+        return True
+
+    def _acquire_storage(self, width, height):
+        storage_key = (width, height, QOpenGLTexture.RGBA8_UNorm)
+        entry = self._take_storage(storage_key)
+        if entry is not None:
+            return entry
+        # At a full budget, reuse compatible cold LRU storage before deleting
+        # an allocation to create the same-sized texture all over again.
+        if self.allocated_texture_bytes + width * height * 4 > self.byte_limit:
+            for key, cold in tuple(self._textures.items()):
+                if key not in self._protected_texture_keys and cold.storage_key == storage_key:
+                    self._remove(key)
+                    entry = self._take_storage(storage_key)
+                    if entry is not None:
+                        return entry
+        byte_count = width * height * 4
+        if not self._reserve_storage(byte_count):
+            raise RuntimeError("Presentation texture storage is still in use at its budget")
+        texture = QOpenGLTexture(QOpenGLTexture.Target2D)
+        texture.setFormat(QOpenGLTexture.RGBA8_UNorm)
+        texture.setSize(width, height)
+        texture.setMipLevels(1)
+        texture.allocateStorage(QOpenGLTexture.RGBA, QOpenGLTexture.UInt8)
+        if not texture.isCreated():
+            raise RuntimeError("Could not allocate a document tile texture")
+        texture.setWrapMode(QOpenGLTexture.ClampToEdge)
+        self.texture_allocations += 1
+        return _TextureEntry(texture, byte_count, storage_key=storage_key)
+
+    def _storage_can_fit(self, needed):
+        """Poll capacity before retiring any part of the last coherent frame."""
+        missing = sum(tile.image.width() * tile.image.height() * 4
+                      for key, tile in needed.items()
+                      if key not in self._textures and not isinstance(tile.image, DeviceImage))
+        available = self.byte_limit - self.allocated_texture_bytes
+        for entry in self._texture_pool.values():
+            if self._storage_ready(entry):
+                available += entry.byte_count
+        for key, entry in self._textures.items():
+            if key not in needed and entry.storage_key is not None and self._storage_ready(entry):
+                available += entry.byte_count
+        return missing <= available
+
+    def _frame_available(self, keys):
+        for key in keys:
+            entry = self._textures.get(key)
+            if entry is None:
+                return False
+            if isinstance(entry.texture, _BorrowedTexture):
+                image = entry.texture.image
+                if image is None or image.isNull():
+                    return False
+        return True
+
+    def _draw_geometry(self, prepared, viewport, *, device_pixel_ratio, smooth, opacity, submitted):
+        """Submit already resident pixels in their original ordered geometry."""
+        gl = self.functions
+        self.vao.bind()
+        self.buffer.bind()
+        geometry = tuple(vertices for _, vertices in prepared)
+        if (len(geometry) != len(self._uploaded_geometry)
+                or any(current is not previous for current, previous in zip(geometry, self._uploaded_geometry))):
+            vertices = np.concatenate(geometry).tobytes()
+            self.buffer.allocate(vertices, len(vertices))
+            self._uploaded_geometry = geometry
+            self.geometry_uploads += 1
+        if not self.program.bind():
+            raise RuntimeError("Could not bind tile presentation program")
+        self.program.enableAttributeArray(0)
+        self.program.enableAttributeArray(1)
+        self.program.setAttributeBuffer(0, 0x1406, 0, 2, 16)
+        self.program.setAttributeBuffer(1, 0x1406, 8, 2, 16)
+        gl.glViewport(0, 0, round(viewport.width() * device_pixel_ratio),
+                      round(viewport.height() * device_pixel_ratio))
+        gl.glDisable(0x0B44)
+        gl.glDisable(0x0B71)
+        gl.glDisable(0x0B90)
+        gl.glDisable(0x0C11)
+        gl.glEnable(0x0BE2)
+        gl.glBlendEquation(0x8006)
+        gl.glBlendFunc(1, 0x0303)
+        gl.glColorMask(True, True, True, True)
+        gl.glUniform1i(self.program.uniformLocation("source"), 0)
+        gl.glUniform1f(self.program.uniformLocation("opacity"), float(opacity))
+        sampling = QOpenGLTexture.Linear if smooth else QOpenGLTexture.Nearest
+        for index, (key, _) in enumerate(prepared):
+            entry = self._textures[key]
+            if entry.sampling != sampling:
+                entry.texture.setMinMagFilters(sampling, sampling)
+                entry.sampling = sampling
+            entry.texture.bind(0)
+            submitted(entry)
+            gl.glDrawArrays(0x0004, index * 6, 6)
+
+    def _protect_submitted(self, entries):
+        try:
+            value = self._sync.insert()
+        except Exception:
+            # Never reuse unfenced storage after submission, even when the
+            # driver cannot produce the completion marker for this frame.
+            value = 0
+        fence = _PresentationFence(value)
+        for entry in entries:
+            self._release_fence(entry)
+            entry.fence = fence
+            fence.references += 1
 
     def _upload(self, tile):
         if isinstance(tile.image,DeviceImage):
@@ -252,15 +459,18 @@ class GpuTilePresenter:
             return
         with pixel_scope(tile.pixel_contract,environment=tile.pixel_environment):
             rgba = display_image(tile.image,tile.pixel_contract).convertToFormat(QImage.Format_RGBA8888_Premultiplied)
-        # Preserve premultiplication: Qt's convenience texture constructor would
-        # otherwise convert premultiplied images to straight RGBA before upload.
-        raw = QImage(rgba.constBits(), rgba.width(), rgba.height(),
-                     rgba.bytesPerLine(), QImage.Format_RGBA8888)
-        texture = QOpenGLTexture(raw, QOpenGLTexture.DontGenerateMipMaps)
-        if not texture.isCreated():
-            raise RuntimeError("Could not allocate a document tile texture")
-        texture.setWrapMode(QOpenGLTexture.ClampToEdge)
-        entry = _TextureEntry(texture, tile.image.width() * tile.image.height() * 4)
+        # Upload the unchanged premultiplied display bytes explicitly. The
+        # convenience image constructor allocates storage for every revision
+        # and may convert associated alpha to straight channels.
+        values = np.frombuffer(rgba.constBits(), np.uint8).reshape(
+            rgba.height(), rgba.bytesPerLine())[:, :rgba.width() * 4]
+        values = np.ascontiguousarray(values.reshape(rgba.height(), rgba.width(), 4))
+        entry = self._acquire_storage(rgba.width(), rgba.height())
+        try:
+            entry.texture.setData(QOpenGLTexture.RGBA, QOpenGLTexture.UInt8, values)
+        except Exception:
+            entry.texture.destroy()
+            raise
         self._textures[self._key(tile)] = entry
         self.texture_bytes += entry.byte_count
         self.uploads += 1
@@ -288,12 +498,15 @@ class GpuTilePresenter:
         # PySide's generated glGetIntegerv wrapper allocates one integer even
         # for multi-value queries in some releases, causing memory corruption.
         # Resolve through Qt and supply correctly sized storage explicitly.
-        convention = getattr(ctypes, "WINFUNCTYPE", ctypes.CFUNCTYPE)
-        query = convention(None, ctypes.c_uint, ctypes.POINTER(ctypes.c_int))(
-            self.context.getProcAddress(b"glGetIntegerv")
-        )
+        if self._integer_query is None:
+            convention = getattr(ctypes, "WINFUNCTYPE", ctypes.CFUNCTYPE)
+            address = self.context.getProcAddress(b"glGetIntegerv")
+            if not address:
+                raise RuntimeError("OpenGL state query entry point unavailable")
+            self._integer_query = convention(
+                None, ctypes.c_uint, ctypes.POINTER(ctypes.c_int))(address)
         values = (ctypes.c_int * count)()
-        query(name, values)
+        self._integer_query(name, values)
         return list(values)
 
     def _restore_state(self, values):
@@ -315,14 +528,35 @@ class GpuTilePresenter:
     def draw(self, tiles: Iterable[PresentedTile], camera: QTransform,
              viewport: QSizeF, *, device_pixel_ratio=1.0, smooth=True,
              clip_world: QRectF | None = None, opacity=1.0) -> bool:
-        """Draw into the current framebuffer; False requests raster fallback.
+        """Draw one pass into the current framebuffer; False requests fallback."""
+        return self.draw_groups((PresentedTileGroup(tuple(tiles), clip_world),),
+            camera, viewport, device_pixel_ratio=device_pixel_ratio,
+            smooth=smooth, opacity=opacity)
+
+    def draw_groups(self, groups: Iterable[PresentedTileGroup], camera: QTransform,
+                    viewport: QSizeF, *, device_pixel_ratio=1.0, smooth=True,
+                    opacity=1.0, pending_context=None) -> bool:
+        """Draw ordered passes under one GL state snapshot and geometry upload.
 
         Memory and resource checks finish before the first draw, so a normal
         unavailable/over-budget fallback never composites translucent tiles twice.
+        Callers must end this native block before resuming QPainter operations.
         """
+        groups = tuple(groups)
+        self.pending_storage = False
+        frame_key = (pending_context, tuple(getattr(camera, f'm{row}{column}')()
+            for row in range(1, 4) for column in range(1, 4)),
+            viewport.width(), viewport.height(), device_pixel_ratio, bool(smooth), float(opacity))
+        if (pending_context is None or self._last_native_frame is not None
+                and self._last_native_frame[0] != frame_key):
+            self._last_native_frame = None
+        if any(group.replace_background is not None for group in groups):
+            self.reason = "Background replacement requires ordered raster presentation"
+            return False
         if viewport.width() <= 0 or viewport.height() <= 0:
             return True
-        prepared = self._prepare_geometry(tiles, camera, viewport, clip_world)
+        prepared = [item for group in groups for item in self._prepare_geometry(
+            group.tiles, camera, viewport, group.clip_world)]
         if not prepared:
             return True
         needed = {self._key(tile): tile for tile, _ in prepared}
@@ -331,10 +565,17 @@ class GpuTilePresenter:
             self.reason = "Visible tile textures exceed the presentation budget"
             return False
         state = None
+        draw_started = False
+        submitted = {}
+        def track_submission(entry):
+            nonlocal draw_started
+            draw_started = True
+            if entry.storage_key is not None:
+                submitted[id(entry)] = entry
         try:
             self._initialize()
-            state = self._save_state()
-            from comic_editor.render.gpu.sync import GlSync
+            self._protected_texture_keys = frozenset(needed)
+            self._fence_ready_cache.clear()
             for tile in needed.values():
                 if isinstance(tile.image,DeviceImage):
                     image = tile.image
@@ -344,73 +585,57 @@ class GpuTilePresenter:
                             or tile.pixel_contract != image.contract):
                         self.reason = 'A device image needs its owning shared context'
                         return False
-                    if not GlSync(self.context).ready(image.fence):
+                    if not self._sync.ready(image.fence):
                         self.reason = 'A device image is not ready for presentation'
                         return False
             if any(max(tile.image.width(), tile.image.height()) > self._max_texture_size
                    for tile in needed.values()):
                 self.reason = "A document tile exceeds the driver's texture limit"
                 return False
+            if not self._storage_can_fit(needed):
+                self.pending_storage = True
+                self.reason = "Presentation texture storage is still in use at its budget"
+                previous = self._last_native_frame
+                if (pending_context is not None and previous is not None
+                        and self._frame_available(previous[2])):
+                    state = self._save_state()
+                    self._draw_geometry(previous[1], viewport,
+                        device_pixel_ratio=device_pixel_ratio, smooth=smooth,
+                        opacity=opacity, submitted=track_submission)
+                    self.draws += 1
+                    return True
+                return False
+            state = self._save_state()
             logical_keys = {tile.key for tile in needed.values()}
             for key in list(self._textures):
                 if key[0] in logical_keys and key not in needed:
-                    self._remove(key)
-            missing = sum(tile.image.width() * tile.image.height() * 4
-                          for key, tile in needed.items() if key not in self._textures)
-            for key in list(self._textures):
-                if self.texture_bytes + missing <= self.byte_limit:
-                    break
-                if key not in needed:
                     self._remove(key)
             for key, tile in needed.items():
                 if key not in self._textures:
                     self._upload(tile)
                 self._textures.move_to_end(key)
-            gl = self.functions
-            self.vao.bind()
-            self.buffer.bind()
-            geometry = tuple(vertices for _, vertices in prepared)
-            if (len(geometry) != len(self._uploaded_geometry)
-                    or any(current is not previous for current, previous in zip(geometry, self._uploaded_geometry))):
-                vertices = np.concatenate(geometry).tobytes()
-                self.buffer.allocate(vertices, len(vertices))
-                self._uploaded_geometry = geometry
-                self.geometry_uploads += 1
-            if not self.program.bind():
-                raise RuntimeError("Could not bind tile presentation program")
-            self.program.enableAttributeArray(0)
-            self.program.enableAttributeArray(1)
-            self.program.setAttributeBuffer(0, 0x1406, 0, 2, 16)
-            self.program.setAttributeBuffer(1, 0x1406, 8, 2, 16)
-            gl.glViewport(0, 0, round(viewport.width() * device_pixel_ratio),
-                          round(viewport.height() * device_pixel_ratio))
-            gl.glDisable(0x0B44)  # GL_CULL_FACE
-            gl.glDisable(0x0B71)  # GL_DEPTH_TEST
-            gl.glDisable(0x0B90)  # GL_STENCIL_TEST
-            gl.glDisable(0x0C11)  # GL_SCISSOR_TEST; caller supplies document clipping
-            gl.glEnable(0x0BE2)   # GL_BLEND
-            gl.glBlendEquation(0x8006)  # GL_FUNC_ADD
-            gl.glBlendFunc(1, 0x0303)  # ONE, ONE_MINUS_SRC_ALPHA (premultiplied)
-            gl.glColorMask(True, True, True, True)
-            gl.glUniform1i(self.program.uniformLocation("source"), 0)
-            gl.glUniform1f(self.program.uniformLocation("opacity"), float(opacity))
-            sampling = QOpenGLTexture.Linear if smooth else QOpenGLTexture.Nearest
-            for index, (tile, _) in enumerate(prepared):
-                entry = self._textures[self._key(tile)]
-                texture = entry.texture
-                if entry.sampling != sampling:
-                    texture.setMinMagFilters(sampling, sampling)
-                    entry.sampling = sampling
-                texture.bind(0)
-                gl.glDrawArrays(0x0004, index * 6, 6)  # GL_TRIANGLES
+            cached = tuple((self._key(tile), vertices) for tile, vertices in prepared)
+            self._draw_geometry(cached, viewport, device_pixel_ratio=device_pixel_ratio,
+                smooth=smooth, opacity=opacity, submitted=track_submission)
+            if pending_context is not None:
+                self._last_native_frame = frame_key, cached, frozenset(key for key, _ in cached)
             self.draws += 1
             self.reason = ""
             return True
         except Exception as error:
             self.reason = str(error)
-            logging.getLogger(__name__).warning("Tile presentation fallback: %s", error)
+            logging.getLogger(__name__).warning("Tile presentation %s: %s",
+                "failed after submission" if draw_started else "fallback", error)
+            if draw_started:
+                # The driver may have submitted a translucent prefix already.
+                # Replaying this group set through QPainter would blend it twice.
+                raise
             return False
         finally:
+            if submitted:
+                self._protect_submitted(submitted.values())
+            self._protected_texture_keys = frozenset()
+            self._fence_ready_cache.clear()
             if self.buffer is not None:
                 self.buffer.release()
             if self.vao is not None:
@@ -448,7 +673,10 @@ class GpuTilePresenter:
                 if not activated:
                     return
             for key in list(self._textures):
-                self._remove(key)
+                self._remove(key, recycle=False)
+            for entry in self._texture_pool.values():
+                self._release_fence(entry)
+                entry.texture.destroy()
             if self.buffer is not None:
                 self.buffer.destroy()
             if self.vao is not None:
@@ -460,12 +688,20 @@ class GpuTilePresenter:
             except (RuntimeError, TypeError):
                 pass
             self._textures.clear()
+            self._texture_pool.clear()
             self.texture_bytes = 0
+            self._texture_pool_bytes = 0
+            self._protected_texture_keys = frozenset()
+            self._fence_ready_cache.clear()
+            self._sync = None
             self.program = self.buffer = self.vao = self.functions = None
             self.context = None
             self._ready = False
             self._uploaded_geometry = ()
             self._max_texture_size = None
+            self._integer_query = None
+            self._last_native_frame = None
+            self.pending_storage = False
             if switched and activated and isValid(context):
                 context.doneCurrent()
                 if (previous is not None and isValid(previous)
@@ -731,16 +967,29 @@ def draw_document_tiles(painter: QPainter, tiles: Iterable[PresentedTile],
                         smooth=True, clip_world: QRectF | None = None,
                         native_context=None, native_bounds: QRectF | None = None,
                         replace_background=None) -> PresentationStats:
-    """Present tiles, preserving the painter for subsequent tool/grid overlays.
+    """Present one pass, preserving the painter for subsequent tool overlays."""
+    group = PresentedTileGroup(tuple(tiles), clip_world, native_context,
+                               native_bounds, replace_background)
+    return draw_document_tile_groups(painter, (group,), camera, viewport_size,
+                                     owner=owner, smooth=smooth)
+
+
+def draw_document_tile_groups(painter: QPainter, groups: Iterable[PresentedTileGroup],
+                              camera: QTransform, viewport_size: QSizeF, *, owner=None,
+                              smooth=True, pending_context=None) -> PresentationStats:
+    """Present contiguous ordered passes with one native state boundary.
 
     An arbitrary existing painter clip or nonstandard composition mode uses the
     raster fallback. The native path supports axis-aligned document clipping via
-    ``clip_world`` and lets the viewport clip rotated camera geometry naturally.
+    each group's ``clip_world`` and lets the viewport clip rotated geometry.
+    Background replacement retains the complete ordered raster path. A group
+    never absorbs QPainter commands; finish this call before painting overlays.
     """
     from PySide6.QtOpenGLWidgets import QOpenGLWidget
 
-    tiles = tuple(tiles)
-    if (replace_background is None and isinstance(owner, QOpenGLWidget) and painter.device() is owner
+    groups = tuple(groups)
+    if (not any(group.replace_background is not None for group in groups)
+            and isinstance(owner, QOpenGLWidget) and painter.device() is owner
             and not painter.hasClipping()
             and painter.compositionMode() == QPainter.CompositionMode_SourceOver):
         presenter = getattr(owner, "_document_tile_presenter", None)
@@ -750,16 +999,31 @@ def draw_document_tiles(painter: QPainter, tiles: Iterable[PresentedTile],
         uploads_before = presenter.uploads
         painter.beginNativePainting()
         try:
-            rendered = presenter.draw(
-                tiles, camera, QSizeF(viewport_size), smooth=smooth,
+            rendered = presenter.draw_groups(
+                groups, camera, QSizeF(viewport_size), smooth=smooth,
                 device_pixel_ratio=owner.devicePixelRatioF(),
-                clip_world=clip_world, opacity=painter.opacity(),
+                opacity=painter.opacity(),
+                pending_context=pending_context,
             )
         finally:
             painter.endNativePainting()
         if rendered:
-            return PresentationStats("gpu", len(tiles), presenter.uploads - uploads_before,
-                                     presenter.texture_bytes)
+            return PresentationStats("gpu-pending" if presenter.pending_storage else "gpu",
+                                     0 if presenter.pending_storage else sum(len(group.tiles) for group in groups),
+                                     presenter.uploads - uploads_before,
+                                     presenter.allocated_texture_bytes)
+    stats = [_draw_document_tiles_raster(painter, group.tiles, camera, viewport_size,
+        owner=owner, smooth=smooth, clip_world=group.clip_world,
+        native_context=group.native_context, native_bounds=group.native_bounds,
+        replace_background=group.replace_background) for group in groups]
+    return PresentationStats("pending" if any(item.backend == "pending" for item in stats)
+                             else "raster", sum(item.tiles for item in stats))
+
+
+def _draw_document_tiles_raster(painter, tiles, camera, viewport_size, *, owner,
+                               smooth, clip_world, native_context, native_bounds,
+                               replace_background):
+    """The existing per-pass raster path, invoked in original group order."""
     if any(isinstance(tile.image,DeviceImage) for tile in tiles):
         if owner is not None and getattr(owner, '_native_raster_mosaic', None) is not None:
             _discard_native_raster_mosaic(owner)

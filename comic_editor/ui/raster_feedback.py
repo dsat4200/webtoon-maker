@@ -412,7 +412,7 @@ def replace_raster_feedback_batch(canvas, painter, document, requests, batch):
     return [(None, output)], len(output), context
 
 
-def present_raster_feedback(canvas, painter, prepared, dirty_keys, cache):
+def present_raster_feedback(canvas, painter, prepared, dirty_keys, cache, *, draw_tiles=None):
     """No source decode, scene traversal, effects, color transform or waiting."""
     camera = canvas.camera_transform()
     # Preserve ordinary interpolation/alpha rounding on Raster widgets. The
@@ -425,7 +425,8 @@ def present_raster_feedback(canvas, painter, prepared, dirty_keys, cache):
         # Use the same retained native presenter as exact document tiles. Only
         # display geometry/textures are cached; these live pixels are never
         # admitted to the document or disk artwork cache.
-        draw_document_tiles(painter, presented_tiles, camera, canvas.size(), owner=canvas,
+        (draw_document_tiles if draw_tiles is None else draw_tiles)(
+            painter, presented_tiles, camera, canvas.size(), owner=canvas,
             smooth=True, clip_world=None if replace_native else prepared.document.bounds,
             replace_background=QColor('#242428') if replace_native else None)
         controller = canvas._scene_controller
@@ -448,7 +449,7 @@ def present_pending_raster_gesture(canvas, painter, document):
     queued = gate is not None and gate.busy
     preview = canvas._scene_controller.preview
     current_preview = preview is not None and preview[0] == document
-    if not queued and (getattr(canvas, '_raster_feedback_contact_covered', False)
+    if not queued and not getattr(canvas, '_gpu_presentation_pending', False) and (getattr(canvas, '_raster_feedback_contact_covered', False)
                        or current_preview or not canvas._projection_frame_pending):
         if not getattr(canvas, '_raster_contact_active', False) and not canvas._projection_frame_pending:
             canvas._raster_contact_point = None

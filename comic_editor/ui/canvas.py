@@ -1257,10 +1257,10 @@ class _CanvasLogic(SceneKernels, LassoBrushFeatures, BrushFeatures, DocumentProj
             )
         self._queue_widget_dirty(widget)
 
-    def _gpu_contact_pacing_key(self, obj):
+    def _gpu_contact_pacing_key(self, obj, *, pending=False):
         # Scalar checks only: no document capture, mask traversal or source read.
         if (not self._drawing or not self._raster_contact_active or self._nav_mode is not None
-                or abs(self.rotation) >= 1e-9 or self.selected_kind != 'object'
+                or (not pending and abs(self.rotation) >= 1e-9) or self.selected_kind != 'object'
                 or self.selected_id != self.selected_object_id or len(self.selected_entities) > 1
                 or self.tool not in {ToolKind.RASTER_PENCIL, ToolKind.RASTER_ERASER, ToolKind.BRUSH}
                 or self._projection_has_live_preview(include_ink=False) or self._solo_entities
@@ -1275,11 +1275,18 @@ class _CanvasLogic(SceneKernels, LassoBrushFeatures, BrushFeatures, DocumentProj
                 self.chapter.view_overflow, obj.interaction_rect, obj.underlay_opacity,
                 self.settings.predictive_ink)
 
-    def _gpu_contact_pacing_current(self):
-        token = getattr(self, '_gpu_contact_pacing_token', None)
+    def _gpu_contact_pacing_current(self, *, pending=False):
+        token = getattr(self, '_gpu_presentation_retry_token' if pending else '_gpu_contact_pacing_token', None)
         if not isinstance(self, QOpenGLWidget) or token is None:
             return False
-        owners, key = token
+        if pending:
+            owners, key, history, dependency = token
+            if (not getattr(self, '_gpu_presentation_pending', False)
+                    or self.command_stack.revision != history
+                    or self._scene_controller._presentation_dependency_generation != dependency):
+                return False
+        else:
+            owners, key = token
         gate, chapter, tiles, images, obj, native, prepared, contract, context = owners
         controller = self._scene_controller
         selected_gate = getattr(self, '_paint_brush_tile_input' if self.tool == ToolKind.BRUSH
@@ -1290,11 +1297,11 @@ class _CanvasLogic(SceneKernels, LassoBrushFeatures, BrushFeatures, DocumentProj
             and self._gpu_contact_pacing_context is context and context is not None
             and selected_gate is gate and gate.canvas is self and gate.chapter is chapter
             and gate.tiles is tiles and gate.identifier == self.selected_id
-            and not gate.closed and not gate.released and gate.error is None and not gate.busy
+            and not gate.closed and not gate.released and gate.error is None and (pending or not gate.busy)
             and gate.current() and controller.feedback is prepared
             and controller._contact_reuse_gate is gate and controller._filtered_state is None
-            and not getattr(self, '_raster_feedback_pending_visible', False)
-            and key == self._gpu_contact_pacing_key(obj))
+            and (pending or not getattr(self, '_raster_feedback_pending_visible', False))
+            and key == self._gpu_contact_pacing_key(obj, pending=pending))
 
     def _retire_gpu_contact_pacing(self):
         if not isinstance(self, QOpenGLWidget):
@@ -1330,11 +1337,10 @@ class _CanvasLogic(SceneKernels, LassoBrushFeatures, BrushFeatures, DocumentProj
                 or controller._filtered_state is not None):
             return
         document, _requests, _phases, visible = signature
-        gate = controller._owned_native_contact_gate(document)
+        gate = controller._covered_contact_gate(document, visible)
         obj = self.chapter.objects.get(self.selected_id)
-        if (gate is None or gate.busy or controller._contact_reuse_gate is not gate or obj is None
-                or not controller._feedback_covers(document, visible)):
-            return  # Edited-pixel-only coverage cannot establish this full-frame token.
+        if gate is None or gate.busy or controller._contact_reuse_gate is not gate or obj is None:
+            return
         native = self.tiles._tiles.get(self.selected_id)
         key = self._gpu_contact_pacing_key(obj)
         if native is not None and key is not None:
@@ -1343,6 +1349,13 @@ class _CanvasLogic(SceneKernels, LassoBrushFeatures, BrushFeatures, DocumentProj
 
     def _queue_widget_dirty(self, widget, *, stable_rows: bool = False) -> None:
         """Coalesce presentation damage without joining distant overlays."""
+        if self._gpu_contact_pacing_current(pending=True):
+            # Source admission keeps running while compatible display storage
+            # is busy. Preserve its newest damage for the existing retry; pen
+            # packets must not repeatedly re-fence the retained scene.
+            self._visual_pending_widget = self._visual_pending_widget.united(QRegion(self.rect()))
+            self._visual_frame_timer.stop()
+            return
         gpu_paced = self._gpu_contact_pacing_current()
         if isinstance(self, QOpenGLWidget) and not gpu_paced:
             self._retire_gpu_contact_pacing()
@@ -1368,8 +1381,8 @@ class _CanvasLogic(SceneKernels, LassoBrushFeatures, BrushFeatures, DocumentProj
                 # Native samples run at their received rate. Coalesce only
                 # display work so a fast pen cannot consume the event loop with
                 # a complete presentation for every source packet.
-                delay = (max(0, math.ceil(0. - (time.perf_counter() - last_frame) * 1000))
-                         if gpu_paced else max(0, math.ceil((last_frame + .006 - time.perf_counter()) * 1000)))
+                interval = .016 if gpu_paced else .006
+                delay = max(0, math.ceil((interval - (time.perf_counter() - last_frame)) * 1000))
             self._visual_frame_timer.start(delay)
 
     def _queue_painting_contact_adoption(self) -> None:
@@ -10830,8 +10843,14 @@ class _CanvasLogic(SceneKernels, LassoBrushFeatures, BrushFeatures, DocumentProj
                     event.accept()
                     return
                 self._last_outline_tablet_tap = (now, QPointF(event.position()))
+                # Some tablet backends omit keyboard Ctrl from the packet.
+                # Capture it only for a real down; a held contact keeps its
+                # original tool even when keyboard or barrel buttons change.
+                modifiers = event.modifiers() | (
+                    QGuiApplication.keyboardModifiers() & Qt.ControlModifier
+                )
                 self._dispatch_tool_press(
-                    event.position(), event.pressure(), event.modifiers()
+                    event.position(), event.pressure(), modifiers
                 )
         elif tablet_kind == QEvent.TabletMove:
             if (self._last_outline_tablet_tap is not None and math.dist(
@@ -17000,8 +17019,12 @@ class _CanvasLogic(SceneKernels, LassoBrushFeatures, BrushFeatures, DocumentProj
         previous = getattr(self, "_pointer_tool_session", None)
         if previous is not None:
             previous.cancel()
+        modifiers = self._input_press_modifiers
+        if modifiers is None:
+            modifiers = QGuiApplication.keyboardModifiers()
         session = ToolSession(lambda sample: self._tool_press_impl(QPointF(*sample.position), sample.pressure),
-            lambda sample: self._tool_move_impl(QPointF(*sample.position), sample.pressure), self._tool_release_impl)
+            lambda sample: self._tool_move_impl(QPointF(*sample.position), sample.pressure),
+            lambda: self._tool_release_with_press_modifiers(modifiers))
         self._pointer_tool_session = session
         try:
             session.begin(PointerInput(widget_point.toTuple(), pressure, self._paint_brush_packet_time))
@@ -17057,6 +17080,12 @@ class _CanvasLogic(SceneKernels, LassoBrushFeatures, BrushFeatures, DocumentProj
             self._begin_mask_stroke(point, pressure)
             return
         if self.active_tone_mask_id and self.tool == ToolKind.FILL:
+            return
+        if (
+            self.tool in {ToolKind.RASTER_PENCIL, ToolKind.RASTER_ERASER}
+            and modifiers & Qt.ControlModifier
+        ):
+            self._request_object_selection(point, widget_point)
             return
         if self.tool == ToolKind.EYEDROPPER:
             self._eyedropper_widget_point = QPointF(widget_point)
@@ -17326,7 +17355,7 @@ class _CanvasLogic(SceneKernels, LassoBrushFeatures, BrushFeatures, DocumentProj
             ]
             if (
                 len(hits) > 1
-                and QGuiApplication.keyboardModifiers() & Qt.ControlModifier
+                and modifiers & Qt.ControlModifier
             ):
                 self.selectionCandidatesRequested.emit(
                     hits, self.mapToGlobal(widget_point.toPoint())
@@ -17865,6 +17894,16 @@ class _CanvasLogic(SceneKernels, LassoBrushFeatures, BrushFeatures, DocumentProj
                 self._tool_release_impl()
         finally:
             self._pointer_tool_session = None
+
+    def _tool_release_with_press_modifiers(self, modifiers) -> None:
+        # Outside drawing taps defer selection until release. The pen's down
+        # packet remains authoritative even after the keyboard Ctrl is lifted.
+        previous = self._input_press_modifiers
+        self._input_press_modifiers = modifiers
+        try:
+            self._tool_release_impl()
+        finally:
+            self._input_press_modifiers = previous
 
     def _tool_release_impl(self) -> None:
         if getattr(self, "document_read_only", False):
@@ -18521,7 +18560,10 @@ class _CanvasLogic(SceneKernels, LassoBrushFeatures, BrushFeatures, DocumentProj
         ]
         if not hits:
             return False
-        if len(hits) > 1 and QGuiApplication.keyboardModifiers() & Qt.ControlModifier:
+        modifiers = self._input_press_modifiers
+        if modifiers is None:
+            modifiers = QGuiApplication.keyboardModifiers()
+        if len(hits) > 1 and modifiers & Qt.ControlModifier:
             self.selectionCandidatesRequested.emit(
                 hits, self.mapToGlobal(widget_point.toPoint())
             )
