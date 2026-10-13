@@ -376,6 +376,15 @@ def apply_local_view(
     current = space.local_view is not None
     if enabled and not members:
         enabled = False
+    # Toggling an unchanged Local View rebuilds the scene and viewport resources.
+    # Use membership, not visibility: hidden members must remain in Local View.
+    if current == enabled and (
+        not enabled or {
+            identifier for identifier, obj in objects.items()
+            if obj.local_view_get(space)
+        } == members.intersection(objects)
+    ):
+        return None
     view_layer = getattr(bpy.context, "view_layer", None)
     active = getattr(getattr(view_layer, "objects", None), "active", None)
     selection = {

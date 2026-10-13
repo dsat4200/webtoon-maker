@@ -98,6 +98,36 @@ def test_reapplying_identical_transforms_avoids_rna_writes():
     assert observed.writes == []
 
 
+def test_repeated_snapshot_records_reuse_rna_work():
+    owner = make_owner("Repeated Record", {"pose": 1.0})
+    saved = snapshot(owner, {"pose": 1.0})
+    lookup = timeline._SnapshotLookup.from_scene(bpy.context.scene)
+    original = timeline._add_channel
+    calls = 0
+
+    def observe(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return original(*args, **kwargs)
+
+    timeline._add_channel = observe
+    try:
+        first = timeline.snapshot_channels(bpy.context.scene, saved, lookup=lookup)
+        initial_calls = calls
+        for _ in range(20):
+            repeated = timeline.snapshot_channels(bpy.context.scene, saved, lookup=lookup)
+            assert repeated == first
+        assert calls == initial_calls
+        changed = snapshot(owner, {"pose": 2.0})
+        changed_channels = timeline.snapshot_channels(bpy.context.scene, changed, lookup=lookup)
+        assert calls > initial_calls
+        assert next(iter(changed_channels.values())).value == 2.0
+        # A new operation observes the edited snapshot through fresh RNA lookups.
+        assert timeline.snapshot_channels(bpy.context.scene, changed) == changed_channels
+    finally:
+        timeline._add_channel = original
+
+
 def test_duplicate_repair_preserves_saved_name_and_skips_unneeded_parsing():
     scene = bpy.context.scene
     earlier = make_owner("Earlier Collision", {})
@@ -165,6 +195,32 @@ def test_promoted_channels_backfill_and_existing_frames_do_not_scan():
         original = action_contents(owner.animation_data.action)
         cached = save(views, second, changed)
         assert cached.cached and cached.keyed_channels == 0
+        assert action_contents(owner.animation_data.action) == original
+
+        # Native JSON uses the same canonical digest without reparsing every
+        # older view. Noncanonical snapshots above still exercise normalization.
+        first.state_json = state_module.state_json(timeline.parse_state(first.state_json))
+        second.state_json = state_module.state_json(changed)
+        original_parse = timeline.parse_state
+
+        def unexpected_parse(*_args, **_kwargs):
+            raise AssertionError("canonical unchanged Save parsed all older views")
+
+        timeline.parse_state = unexpected_parse
+        try:
+            native_cached = timeline.prepare_bake(bpy.context.scene, views, second, changed)
+            assert native_cached.cached
+            native_cached.commit()
+        finally:
+            timeline.parse_state = original_parse
+
+        # A changed snapshot must not rewrite already matching keys. A forced
+        # validation also leaves matching curves and their styles untouched.
+        untouched = timeline.prepare_bake(bpy.context.scene, views, second, changed, force=True)
+        assert untouched.keyed_channels == 0
+        assert untouched.point_mutations == []
+        assert untouched.preserved_styles == []
+        untouched.rollback()
         assert action_contents(owner.animation_data.action) == original
 
         # Forced repair still repairs an externally damaged owned key even when
@@ -265,8 +321,9 @@ def measure_rebake_rna_accesses(channel_count):
     profile = cProfile.Profile()
     start = time.perf_counter()
     profile.enable()
+    changed = snapshot(owner, {name: 9.0 for name in values})
     transaction = timeline.prepare_bake(
-        bpy.context.scene, views, views[-1], states[-1], force=True,
+        bpy.context.scene, views, views[-1], changed, force=True,
     )
     profile.disable()
     elapsed = time.perf_counter() - start
@@ -290,6 +347,7 @@ addon.register()
 try:
     addon._initialize_scenes()
     test_reapplying_identical_transforms_avoids_rna_writes()
+    test_repeated_snapshot_records_reuse_rna_work()
     test_duplicate_repair_preserves_saved_name_and_skips_unneeded_parsing()
     test_promoted_channels_backfill_and_existing_frames_do_not_scan()
     test_driver_lookup_is_fresh_on_each_bake()

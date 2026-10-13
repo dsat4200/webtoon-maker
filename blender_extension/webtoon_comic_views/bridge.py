@@ -476,12 +476,18 @@ class BridgeRuntime:
             bool(view.is_dirty), float(view.updated_at),
         )
         try:
-            scene.frame_set(transaction.target_frame)
+            if (
+                not transaction.cached or scene.frame_current != transaction.target_frame
+                or scene.frame_subframe != 0.0
+            ):
+                scene.frame_set(transaction.target_frame)
             selected_layer = view_layer_for_state(
                 scene, captured, getattr(bpy.context, "view_layer", None)
             )
             apply_warnings = apply_state(scene, captured, selected_layer)
-            failures = timeline.verify_snapshot(scene, captured)
+            failures = timeline.verify_snapshot(
+                scene, captured, channels=transaction.verification_channels,
+            )
             if failures and transaction.cached:
                 transaction.rollback()
                 transaction = timeline.prepare_bake(
@@ -489,7 +495,9 @@ class BridgeRuntime:
                 )
                 scene.frame_set(transaction.target_frame)
                 apply_warnings = apply_state(scene, captured, selected_layer)
-                failures = timeline.verify_snapshot(scene, captured)
+                failures = timeline.verify_snapshot(
+                    scene, captured, channels=transaction.verification_channels,
+                )
             if failures:
                 raise RuntimeError(
                     "Timeline bake did not restore: " + ", ".join(failures)
@@ -549,6 +557,7 @@ class BridgeRuntime:
 
     def _apply_stored_view(
         self, scene: bpy.types.Scene, view: object,
+        *, working: dict[str, Any] | None = None,
     ) -> tuple[dict[str, Any], list[str]]:
         stored = parse_state(view.state_json)
         original_frame = int(scene.frame_current)
@@ -556,11 +565,12 @@ class BridgeRuntime:
         working_bounds = viewport.frame_bounds(view)
         working_resolution = (int(view.width), int(view.height))
         old_state_json, old_state_hash = view.state_json, view.state_hash
-        working, _working_warnings = capture_state(
-            scene, bpy.context.view_layer, repair_ids=False,
-            stream_frame=working_bounds,
-            output_resolution=working_resolution,
-        )
+        if working is None:
+            working, _working_warnings = capture_state(
+                scene, bpy.context.view_layer, repair_ids=False,
+                stream_frame=working_bounds,
+                output_resolution=working_resolution,
+            )
         transaction = timeline.prepare_bake(
             scene, list(self._views(scene)), view, stored
         )
@@ -577,9 +587,15 @@ class BridgeRuntime:
             scene, stored, getattr(bpy.context, "view_layer", None)
         )
         try:
-            scene.frame_set(transaction.target_frame)
+            if (
+                not transaction.cached or scene.frame_current != transaction.target_frame
+                or scene.frame_subframe != 0.0
+            ):
+                scene.frame_set(transaction.target_frame)
             warnings = apply_state(scene, stored, view_layer)
-            failures = timeline.verify_snapshot(scene, stored)
+            failures = timeline.verify_snapshot(
+                scene, stored, channels=transaction.verification_channels,
+            )
             if failures and transaction.cached:
                 transaction.rollback()
                 transaction = timeline.prepare_bake(
@@ -587,7 +603,9 @@ class BridgeRuntime:
                 )
                 scene.frame_set(transaction.target_frame)
                 warnings = apply_state(scene, stored, view_layer)
-                failures = timeline.verify_snapshot(scene, stored)
+                failures = timeline.verify_snapshot(
+                    scene, stored, channels=transaction.verification_channels,
+                )
             if failures:
                 raise RuntimeError(
                     "Comic View frame did not restore: " + ", ".join(failures)
@@ -665,7 +683,9 @@ class BridgeRuntime:
                 scene, replacement, getattr(bpy.context, "view_layer", None)
             )
             warnings = apply_state(scene, replacement, view_layer)
-            failures = timeline.verify_snapshot(scene, replacement)
+            failures = timeline.verify_snapshot(
+                scene, replacement, channels=transaction.verification_channels,
+            )
             if failures:
                 raise RuntimeError(
                     "Reverted frame did not restore: " + ", ".join(failures)
@@ -715,7 +735,7 @@ class BridgeRuntime:
         )
         warnings: list[str] = []
         try:
-            stored, warnings = self._apply_stored_view(scene, view)
+            stored, warnings = self._apply_stored_view(scene, view, working=working)
             view_layer = view_layer_for_state(
                 scene, stored, getattr(bpy.context, "view_layer", None)
             )
@@ -728,7 +748,8 @@ class BridgeRuntime:
                 hide_overlays=self._hide_overlays(),
             )
         finally:
-            scene.frame_set(working_frame, subframe=working_subframe)
+            if scene.frame_current != working_frame or scene.frame_subframe != working_subframe:
+                scene.frame_set(working_frame, subframe=working_subframe)
             restore_layer = view_layer_for_state(
                 scene, working, getattr(bpy.context, "view_layer", None)
             )
@@ -742,18 +763,21 @@ class BridgeRuntime:
     def render_saved_view(
         self, scene: bpy.types.Scene, view: object,
     ) -> list[str]:
+        started = time.perf_counter()
         diagnostics.record(
             "INFO", "Render started", view=getattr(view, "name", ""),
             view_uuid=getattr(view, "view_uuid", ""),
             current_revision=int(getattr(view, "revision", 0)),
         )
         frame, warnings = self._render_saved_snapshot(scene, view)
+        rendered_at = time.perf_counter()
         next_revision = max(1, int(view.revision) + 1)
         project_uuid = self._settings(scene).project_uuid
         destination = published_frame_path(
             project_uuid, view.view_uuid, next_revision
         )
         encoded = renderer.png_bytes(frame)
+        encoded_at = time.perf_counter()
         _atomic_write(destination, encoded)
         renderer.update_thumbnail_image(view, renderer.thumbnail_from_frame(frame))
         view.revision = next_revision
@@ -768,6 +792,10 @@ class BridgeRuntime:
             "INFO", "Render published", view=getattr(view, "name", ""),
             revision=next_revision, width=frame.width, height=frame.height,
             path=destination, png_bytes=len(encoded),
+            elapsed_ms=round((time.perf_counter() - started) * 1000),
+            render_restore_ms=round((rendered_at - started) * 1000),
+            encode_ms=round((encoded_at - rendered_at) * 1000),
+            publish_ms=round((time.perf_counter() - encoded_at) * 1000),
         )
         return warnings
 

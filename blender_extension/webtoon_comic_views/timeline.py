@@ -1,7 +1,10 @@
 """Automatic timeline baking for persistent Comic View snapshots."""
 from __future__ import annotations
 
+from array import array
+from ctypes import c_float
 from dataclasses import dataclass, field
+import hashlib
 import math
 from typing import Any, Iterable
 
@@ -117,6 +120,14 @@ class SnapshotChannel:
     animatable: bool = True
 
 
+@dataclass
+class _ChannelSamples:
+    """One RNA descriptor per channel, with compact values for older views."""
+    channel: SnapshotChannel
+    frames: array = field(default_factory=lambda: array("i"))
+    values: array = field(default_factory=lambda: array("d"))
+
+
 def _add_channel(
     result: dict[ChannelKey, SnapshotChannel], owner: object | None,
     data_path: str, value: object, label: str, *, strict_driver: bool = False,
@@ -154,6 +165,8 @@ def _add_channel(
             strict_driver=strict_driver,
             animatable=animatable,
         )
+        if lookup is not None and lookup.record_sink is not None:
+            lookup.record_sink[key] = result[key]
 
 
 def _object_lookup(scene: bpy.types.Scene) -> dict[str, bpy.types.Object]:
@@ -187,6 +200,19 @@ class _SnapshotLookup:
     owner_uuids: dict[int, str] = field(default_factory=dict)
     animatable: dict[tuple[int, str], bool] = field(default_factory=dict)
     registered_owners: dict[str, object] | None = None
+    record_channels: dict[tuple[str, ...], tuple[dict, dict]] = field(default_factory=dict)
+    record_sink: dict[ChannelKey, SnapshotChannel] | None = None
+
+    def reuse_record(self, result: dict, key: tuple[str, ...], record: dict) -> bool:
+        """Reuse identical records only within this immutable bake operation."""
+        cached = self.record_channels.get(key)
+        if cached is not None and cached[0] == record:
+            self.record_sink = None
+            result.update(cached[1])
+            return True
+        self.record_sink = {}
+        self.record_channels[key] = (record, self.record_sink)
+        return False
 
     @classmethod
     def from_scene(cls, scene: bpy.types.Scene) -> _SnapshotLookup:
@@ -233,6 +259,8 @@ def snapshot_channels(
     objects = lookup.objects
     for record in snapshot.get("objects", []):
         identifier = str(record.get("uuid", ""))
+        if lookup.reuse_record(result, ("objects", identifier), record):
+            continue
         obj = objects.get(identifier)
         if obj is None:
             continue
@@ -262,6 +290,11 @@ def snapshot_channels(
             )
 
     for record in snapshot.get("poses", []):
+        if lookup.reuse_record(result, (
+            "poses", str(record.get("object_uuid", "")),
+            str(record.get("bone_uuid", "")), str(record.get("bone_name", "")),
+        ), record):
+            continue
         obj = objects.get(str(record.get("object_uuid", "")))
         bone_name = str(record.get("bone_name", ""))
         bone = None
@@ -288,6 +321,8 @@ def snapshot_channels(
 
     for group in ("cameras", "lights"):
         for record in snapshot.get(group, []):
+            if lookup.reuse_record(result, (group, str(record.get("object_uuid", ""))), record):
+                continue
             obj = objects.get(str(record.get("object_uuid", "")))
             owner = getattr(obj, "data", None)
             if owner is None:
@@ -301,6 +336,10 @@ def snapshot_channels(
                 )
 
     for record in snapshot.get("shape_keys", []):
+        if lookup.reuse_record(result, (
+            "shape_keys", str(record.get("object_uuid", "")), str(record.get("name", "")),
+        ), record):
+            continue
         obj = objects.get(str(record.get("object_uuid", "")))
         owner = getattr(getattr(obj, "data", None), "shape_keys", None)
         name = str(record.get("name", ""))
@@ -315,6 +354,11 @@ def snapshot_channels(
             )
 
     for record in snapshot.get("modifiers", []):
+        if lookup.reuse_record(result, (
+            "modifiers", str(record.get("object_uuid", "")),
+            str(record.get("uuid", "")), str(record.get("name", "")),
+        ), record):
+            continue
         obj = objects.get(str(record.get("object_uuid", "")))
         name = str(record.get("name", ""))
         modifier = None
@@ -334,6 +378,8 @@ def snapshot_channels(
 
     collections = lookup.collections
     for record in snapshot.get("collections", []):
+        if lookup.reuse_record(result, ("collections", str(record.get("uuid", ""))), record):
+            continue
         owner = collections.get(str(record.get("uuid", "")))
         if owner is None:
             continue
@@ -347,6 +393,11 @@ def snapshot_channels(
     registered = snapshot.get("registered", [])
     all_ids = lookup.registered() if registered else {}
     for record in registered:
+        if lookup.reuse_record(result, (
+            "registered", str(record.get("owner_uuid", "")),
+            str(record.get("rna_path", "")), str(record.get("property_id", "")),
+        ), record):
+            continue
         owner = all_ids.get(str(record.get("owner_uuid", "")))
         if owner is None:
             continue
@@ -441,6 +492,7 @@ class BakeTransaction:
     skipped_driver_channels: int = 0
     apply_only_channels: int = 0
     cached: bool = False
+    verification_channels: dict[ChannelKey, SnapshotChannel] | None = None
     _recorded_points: set[tuple[int, int]] = field(default_factory=set)
     _preserved_curves: set[int] = field(default_factory=set)
     _styles_by_curve: dict[int, list[_PointStyle]] = field(default_factory=dict)
@@ -659,10 +711,9 @@ def _preserve_point_styles(
     styles: list[_PointStyle] = []
     transaction._styles_by_curve[pointer] = styles
     for point in curve.keyframe_points:
-        owned = any(
-            abs(float(point.co.x) - frame) <= FRAME_EPSILON
-            for frame in owned_frames
-        )
+        frame = float(point.co.x)
+        nearest = int(round(frame)) if math.isfinite(frame) else 0
+        owned = nearest in owned_frames and abs(frame - nearest) <= FRAME_EPSILON
         style = _PointStyle(
             curve=curve,
             frame=float(point.co.x),
@@ -710,6 +761,12 @@ def _write_point(
     frame: int, value: float, *, discrete: bool,
 ) -> None:
     point = _point_at(curve, frame)
+    if (
+        point is not None and float(point.co.y) == c_float(value).value
+        and (not discrete and frame <= transaction.frame_end
+             or point.interpolation == "CONSTANT")
+    ):
+        return
     mutation_key = (int(curve.as_pointer()), int(round(frame / FRAME_EPSILON)))
     recorded = mutation_key in transaction._recorded_points
     if point is None:
@@ -847,7 +904,7 @@ def _bake_marker(snapshot: dict[str, Any]) -> str:
 
 def _cached_bake(
     usable_views: list[object], target: object, candidate: dict[str, Any],
-    *, prepared_states: dict[str, tuple[dict[str, Any], str]] | None = None,
+    *, prepared_states: dict[str, tuple[dict[str, Any] | None, str]] | None = None,
 ) -> bool:
     frames: set[int] = set()
     target_uuid = str(getattr(target, "view_uuid", ""))
@@ -860,14 +917,45 @@ def _cached_bake(
         if prepared_states is not None and identifier in prepared_states:
             _snapshot, marker = prepared_states[identifier]
         else:
-            snapshot = (
-                candidate if identifier == target_uuid
-                else parse_state(view.state_json)
-            )
-            marker = _bake_marker(snapshot)
+            snapshot = None
+            if identifier == target_uuid:
+                snapshot = candidate
+                marker = _bake_marker(snapshot)
+            else:
+                # Native Saves already store canonical state_json bytes. Check
+                # that same digest directly; legacy/noncanonical JSON still
+                # uses parse/migrate/normalize before calculating its identity.
+                raw = str(view.state_json)
+                marker = f"{BAKE_VERSION}:{hashlib.sha256(raw.encode('utf-8')).hexdigest()}"
+                if marker != str(getattr(view, "bake_hash", "")):
+                    snapshot = parse_state(raw)
+                    marker = _bake_marker(snapshot)
             if prepared_states is not None:
                 prepared_states[identifier] = (snapshot, marker)
         if str(getattr(view, "bake_hash", "")) != marker:
+            return False
+    return True
+
+
+def _baked_channels_match(transaction: BakeTransaction) -> bool:
+    """Validate owned keys before applying a snapshot can mask damaged animation."""
+    drivers: dict[int, set[tuple[str, int]]] = {}
+    for channel in (transaction.verification_channels or {}).values():
+        if not channel.animatable:
+            continue
+        curve = _indexed_curve(transaction, channel.owner, channel.key)
+        if curve is None:
+            continue
+        pointer = channel.key.owner_pointer
+        if pointer not in drivers:
+            drivers[pointer] = _active_drivers(channel.owner)
+        if (channel.key.data_path, channel.key.array_index) in drivers[pointer]:
+            if channel.strict_driver:
+                return False
+            continue
+        if abs(
+            float(curve.evaluate(transaction.target_frame)) - c_float(channel.value).value
+        ) > VALUE_EPSILON:
             return False
     return True
 
@@ -893,21 +981,25 @@ def prepare_bake(
         )),
     )
     try:
-        prepared_states: dict[str, tuple[dict[str, Any], str]] = {}
+        prepared_states: dict[str, tuple[dict[str, Any] | None, str]] = {}
         if not force and _cached_bake(
             usable_views, target, candidate, prepared_states=prepared_states,
         ):
             transaction.target_frame = int(target.timeline_frame)
-            transaction.cached = True
-            scene.frame_end = max(
-                int(scene.frame_end),
-                *(int(view.timeline_frame) for view in usable_views),
+            transaction.verification_channels = snapshot_channels(
+                scene, candidate,
             )
-            return transaction
+            if _baked_channels_match(transaction):
+                transaction.cached = True
+                scene.frame_end = max(
+                    int(scene.frame_end),
+                    *(int(view.timeline_frame) for view in usable_views),
+                )
+                return transaction
         frames = _allocate_frames(scene, usable_views, transaction)
         transaction.target_frame = frames[target_uuid]
         lookup = _SnapshotLookup.from_scene(scene)
-        channels_by_key: dict[ChannelKey, list[tuple[int, SnapshotChannel]]] = {}
+        channels_by_key: dict[ChannelKey, _ChannelSamples] = {}
         for view in usable_views:
             identifier = str(getattr(view, "view_uuid", ""))
             prepared = prepared_states.pop(identifier, None)
@@ -919,19 +1011,28 @@ def prepare_bake(
                 marker = _bake_marker(state)
             else:
                 state, marker = prepared
-            for key, channel in snapshot_channels(scene, state, lookup=lookup).items():
-                channels_by_key.setdefault(key, []).append((frames[identifier], channel))
+                if state is None:
+                    state = parse_state(view.state_json)
+            channels = snapshot_channels(scene, state, lookup=lookup)
+            if identifier == target_uuid:
+                transaction.verification_channels = channels
+            for key, channel in channels.items():
+                samples = channels_by_key.get(key)
+                if samples is None:
+                    samples = channels_by_key[key] = _ChannelSamples(channel)
+                samples.frames.append(frames[identifier])
+                samples.values.append(channel.value)
             transaction.bake_assignments.append((
                 view, str(getattr(view, "bake_hash", "")), marker,
             ))
 
         needed: set[ChannelKey] = set()
-        for key, entries in channels_by_key.items():
-            sample = entries[0][1]
+        for key, samples in channels_by_key.items():
+            sample = samples.channel
             if not sample.animatable:
                 transaction.apply_only_channels += 1
                 continue
-            if _values_differ(channel.value for _frame, channel in entries):
+            if _values_differ(samples.values):
                 needed.add(key)
                 continue
             if _indexed_curve(transaction, sample.owner, key) is not None:
@@ -945,8 +1046,8 @@ def prepare_bake(
             needed,
             key=lambda item: (item.owner_uuid, item.data_path, item.array_index),
         ):
-            entries = channels_by_key[key]
-            sample = entries[0][1]
+            samples = channels_by_key[key]
+            sample = samples.channel
             if key.owner_pointer not in driver_cache:
                 driver_cache[key.owner_pointer] = _active_drivers(sample.owner)
             if (key.data_path, key.array_index) in driver_cache[key.owner_pointer]:
@@ -961,9 +1062,8 @@ def prepare_bake(
                 transaction, sample.owner, action_cache, sample.label
             )
             curve = _ensure_curve(transaction, action, sample)
-            _preserve_point_styles(transaction, curve, owned_frames)
             curve_pointer = int(curve.as_pointer())
-            if (
+            needs_boundary = (
                 curve_pointer not in boundary_curves
                 and _point_at(curve, transaction.frame_end) is None
                 and (
@@ -971,7 +1071,27 @@ def prepare_bake(
                     or max(float(point.co.x) for point in curve.keyframe_points)
                         < transaction.target_frame
                 )
-            ):
+            )
+            # Blender stores key values as float32. Compare at that same edge,
+            # and preserve/modify styles only if this curve actually needs work.
+            points = {}
+            for point in curve.keyframe_points:
+                position = float(point.co.x)
+                if not math.isfinite(position):
+                    continue
+                nearest = int(round(position))
+                if abs(position - nearest) <= FRAME_EPSILON:
+                    points.setdefault(nearest, point)
+            changed_entries = [
+                (frame, value) for frame, value in zip(samples.frames, samples.values)
+                if frame not in points
+                or float(points[frame].co.y) != c_float(value).value
+                or points[frame].interpolation != "CONSTANT"
+            ]
+            if not needs_boundary and not changed_entries:
+                continue
+            _preserve_point_styles(transaction, curve, owned_frames)
+            if needs_boundary:
                 boundary_value = (
                     float(curve.evaluate(transaction.frame_end))
                     if curve.keyframe_points else _read_channel(sample)
@@ -983,10 +1103,10 @@ def prepare_bake(
                     boundary_value, discrete=True,
                 )
                 boundary_curves.add(curve_pointer)
-            for frame, channel in entries:
+            for frame, value in changed_entries:
                 _write_point(
                     transaction, curve, frame,
-                    channel.value, discrete=True,
+                    value, discrete=True,
                 )
             curve.update()
             _restore_point_styles(transaction, curve)
@@ -1029,10 +1149,13 @@ def _read_channel(channel: SnapshotChannel) -> float | None:
 
 def verify_snapshot(
     scene: bpy.types.Scene, snapshot: dict[str, Any], *, limit: int = 20,
+    channels: dict[ChannelKey, SnapshotChannel] | None = None,
 ) -> list[str]:
     failures: list[str] = []
     driver_cache: dict[int, set[tuple[str, int]]] = {}
-    for channel in snapshot_channels(scene, snapshot).values():
+    if channels is None:
+        channels = snapshot_channels(scene, snapshot)
+    for channel in channels.values():
         # Match prepare_bake: rig outputs are evaluated from saved controllers,
         # not keyed or required to reproduce a stale captured driver result.
         # Camera and explicitly registered properties retain strict checking.

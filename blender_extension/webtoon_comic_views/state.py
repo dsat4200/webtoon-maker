@@ -65,7 +65,12 @@ def _set_custom_properties(value: object, values: dict[str, Any]) -> None:
         if key in INTERNAL_KEYS:
             continue
         try:
-            value[key] = item
+            try:
+                unchanged = key in value and _json_value(value[key]) == item
+            except (KeyError, TypeError, ValueError):
+                unchanged = False
+            if not unchanged:
+                value[key] = item
         except (AttributeError, KeyError, TypeError, ValueError):
             continue
 
@@ -311,12 +316,24 @@ def _attrs(value: object, names: Iterable[str]) -> dict[str, Any]:
     return result
 
 
+def _assign_attr(value: object, name: str, item: Any) -> None:
+    """Avoid RNA updates (including dependency-graph rebuilds) for equal values."""
+    current = getattr(value, name)
+    if hasattr(current, "to_list"):
+        current = current.to_list()
+    elif isinstance(item, (list, tuple)):
+        current = list(current)
+        item = list(item)
+    if current != item:
+        setattr(value, name, item)
+
+
 def _apply_attrs(value: object, values: dict[str, Any]) -> None:
     for name, item in values.items():
         if not hasattr(value, name):
             continue
         try:
-            setattr(value, name, item)
+            _assign_attr(value, name, item)
         except (AttributeError, TypeError, ValueError):
             continue
 
@@ -372,7 +389,7 @@ def _apply_nested_attrs(value: object, values: dict[str, Any]) -> None:
         try:
             for part in parts[:-1]:
                 owner = getattr(owner, part)
-            setattr(owner, parts[-1], item)
+            _assign_attr(owner, parts[-1], item)
         except (AttributeError, TypeError, ValueError):
             continue
 
@@ -869,9 +886,10 @@ def apply_state(
         if identifier in stored_objects:
             continue
         try:
-            obj.hide_viewport = True
-            obj.hide_render = True
-            obj.hide_set(True, view_layer=view_layer)
+            _assign_attr(obj, "hide_viewport", True)
+            _assign_attr(obj, "hide_render", True)
+            if not obj.hide_get(view_layer=view_layer):
+                obj.hide_set(True, view_layer=view_layer)
         except (AttributeError, RuntimeError, TypeError):
             pass
         warnings.append(f"Hid uncaptured object {obj.name}")
@@ -881,12 +899,11 @@ def apply_state(
             warnings.append(f"Missing object {item.get('name', identifier)}")
             continue
         try:
-            obj.hide_viewport = bool(item.get("hide_viewport", False))
-            obj.hide_render = bool(item.get("hide_render", False))
-            obj.hide_set(
-                bool(item.get("hidden_in_view_layer", False)),
-                view_layer=view_layer,
-            )
+            _assign_attr(obj, "hide_viewport", bool(item.get("hide_viewport", False)))
+            _assign_attr(obj, "hide_render", bool(item.get("hide_render", False)))
+            hidden = bool(item.get("hidden_in_view_layer", False))
+            if obj.hide_get(view_layer=view_layer) != hidden:
+                obj.hide_set(hidden, view_layer=view_layer)
         except (AttributeError, RuntimeError, TypeError):
             pass
     collections = _collection_lookup(scene)
@@ -896,16 +913,16 @@ def apply_state(
     }
     for identifier, collection in collections.items():
         if identifier not in stored_collections and collection != scene.collection:
-            collection.hide_viewport = True
-            collection.hide_render = True
+            _assign_attr(collection, "hide_viewport", True)
+            _assign_attr(collection, "hide_render", True)
             warnings.append(f"Hid uncaptured collection {collection.name}")
     for identifier, item in stored_collections.items():
         collection = collections.get(identifier)
         if collection is None:
             warnings.append(f"Missing collection {item.get('name', identifier)}")
             continue
-        collection.hide_viewport = bool(item.get("hide_viewport", False))
-        collection.hide_render = bool(item.get("hide_render", False))
+        _assign_attr(collection, "hide_viewport", bool(item.get("hide_viewport", False)))
+        _assign_attr(collection, "hide_render", bool(item.get("hide_render", False)))
 
     layer_collections = _layer_collection_lookup(view_layer.layer_collection)
     for item in state.get("layer_collections", []):
@@ -914,7 +931,7 @@ def apply_state(
             continue
         for name in ("exclude", "hide_viewport", "holdout", "indirect_only"):
             try:
-                setattr(layer, name, bool(item.get(name, False)))
+                _assign_attr(layer, name, bool(item.get(name, False)))
             except (AttributeError, RuntimeError):
                 continue
     active_collection_uuid = str(
@@ -923,7 +940,7 @@ def apply_state(
     active_collection = layer_collections.get(active_collection_uuid)
     if active_collection is not None:
         try:
-            view_layer.active_layer_collection = active_collection
+            _assign_attr(view_layer, "active_layer_collection", active_collection)
         except (AttributeError, RuntimeError, TypeError):
             warnings.append("Could not restore the active collection")
 
@@ -943,7 +960,7 @@ def apply_state(
                 target = objects.get(target_uuid) if target_uuid else None
                 if target_uuid and target is None:
                     warnings.append(f"Missing linked portal for {obj.name}")
-                effect.portal_target = target
+                _assign_attr(effect, "portal_target", target)
         stored_custom = set(item.get("custom_properties", {}))
         for key in _custom_properties(obj):
             if key not in stored_custom:
@@ -984,8 +1001,8 @@ def apply_state(
         if key is None:
             warnings.append(f"Missing shape key {item.get('name', '')}")
             continue
-        key.value = _finite(item.get("value", 0.0))
-        key.mute = bool(item.get("mute", False))
+        _assign_attr(key, "value", _finite(item.get("value", 0.0)))
+        _assign_attr(key, "mute", bool(item.get("mute", False)))
     for object_uuid, obj in objects.items():
         if object_uuid not in stored_objects:
             continue
@@ -1036,7 +1053,7 @@ def apply_state(
         try:
             path = str(item.get("rna_path", ""))
             pointer = owner.path_resolve(path) if path else owner
-            setattr(pointer, str(item.get("property_id", "")), item.get("value"))
+            _assign_attr(pointer, str(item.get("property_id", "")), item.get("value"))
         except (AttributeError, TypeError, ValueError):
             warnings.append(f"Could not apply registered property {item.get('label', '')}")
 
@@ -1044,7 +1061,7 @@ def apply_state(
     if camera_uuid:
         camera = objects.get(camera_uuid)
         if camera is not None and camera.type == "CAMERA":
-            scene.camera = camera
+            _assign_attr(scene, "camera", camera)
         else:
             warnings.append("The active camera is missing")
     render_settings = state.get("render_settings", {})
@@ -1054,7 +1071,7 @@ def apply_state(
         if name not in render_settings:
             continue
         try:
-            setattr(scene.render, name, render_settings[name])
+            _assign_attr(scene.render, name, render_settings[name])
         except (AttributeError, TypeError, ValueError):
             warnings.append(f"Could not restore render setting {name}")
     _window, space, _region = find_view3d()

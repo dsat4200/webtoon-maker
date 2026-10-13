@@ -1,6 +1,6 @@
 schema_version = "1.0.0"
 id = "webtoon_comic_views"
-version = "0.8.1"
+version = "0.8.2"
 name = "Webtoon Comic Views"
 tagline = "Publish persistent viewport Comic Views to Webtoon Maker"
 maintainer = "Webtoon Maker"

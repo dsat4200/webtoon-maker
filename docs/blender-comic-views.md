@@ -81,6 +81,25 @@ not survive the operation, so edits and Undo cannot leave cached RNA pointers.
 Identical transform assignments are skipped, and duplicate-ID repair parses
 saved snapshots only when duplicate identities are actually present.
 
+Extension 0.8.2 also reuses equal snapshot records within one bake, keeps one
+RNA channel descriptor with compact float64 values and integer frames, and
+preserves matching float32 F-Curve keys without creating rollback/style records
+for them. Owned-frame membership uses an integer lookup with the original
+tolerance. Native canonical snapshot bytes use the existing SHA-256 bake marker
+without JSON round-trips; noncanonical and legacy snapshots retain normalization.
+Cached bakes validate existing channel curves before snapshot application can
+mask damaged keys. All RNA indexes and record reuse remain operation-local.
+
+Scene application avoids unchanged visibility, collection, custom, shape-key,
+optical, camera, light and registered-property assignments. Local View compares
+actual membership rather than visibility before deciding whether to toggle.
+Cached frames already selected at subframe zero avoid a redundant frame_set.
+Render reuses its original working snapshot for failure restoration. RGBA8 alpha
+conversion uses bounded strips with identical integer rounding, and PNG filter-0
+scanlines feed lossless level-1 zlib in bounded blocks. Output resolution, color,
+straight-alpha pixels, atomic publication and rollback remain unchanged.
+See [the October 13 performance record](blender-comic-views-performance-2026-10-13.md).
+
 A successful Render encodes the full frame as PNG and writes it beneath:
 
 ```text

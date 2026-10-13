@@ -60,18 +60,23 @@ def _to_top_down_straight_alpha(
     raw: bytes, width: int, height: int,
 ) -> bytes:
     """Flip OpenGL rows and convert transparent compositing to straight RGBA."""
-    pixels = np.frombuffer(raw, dtype=np.uint8).reshape(
-        height, width, 4
-    ).copy()
-    alpha = pixels[:, :, 3].astype(np.uint16)
-    rgb = pixels[:, :, :3].astype(np.uint16)
-    nonzero = alpha > 0
-    denominator = np.maximum(alpha, 1)[:, :, None]
-    straight = np.minimum(
-        255, (rgb * 255 + denominator // 2) // denominator
-    ).astype(np.uint8)
-    pixels[:, :, :3] = np.where(nonzero[:, :, None], straight, 0)
-    return np.flipud(pixels).tobytes()
+    source = np.frombuffer(raw, dtype=np.uint8).reshape(height, width, 4)
+    pixels = np.empty_like(source)
+    rows_per_strip = max(1, 65_536 // width)
+    # Keep the exact integer unpremultiplication, but bound its uint16 and
+    # broadcasting workspace instead of allocating several full-frame arrays.
+    for start in range(0, height, rows_per_strip):
+        end = min(height, start + rows_per_strip)
+        strip = source[height - end:height - start][::-1]
+        alpha = strip[:, :, 3].astype(np.uint16)
+        rgb = strip[:, :, :3].astype(np.uint16)
+        denominator = np.maximum(alpha, 1)[:, :, None]
+        straight = np.minimum(
+            255, (rgb * 255 + denominator // 2) // denominator
+        ).astype(np.uint8)
+        pixels[start:end, :, :3] = np.where(alpha[:, :, None] > 0, straight, 0)
+        pixels[start:end, :, 3] = strip[:, :, 3]
+    return pixels.tobytes()
 
 
 def render_active_camera(
@@ -147,14 +152,29 @@ def png_bytes(frame: RenderFrame) -> bytes:
         )
 
     stride = frame.width * 4
-    scanlines = b"".join(
-        b"\x00" + frame.rgba[offset:offset + stride]
-        for offset in range(0, len(frame.rgba), stride)
-    )
+    if frame.width <= 0 or frame.height <= 0 or len(frame.rgba) != stride * frame.height:
+        raise ValueError("PNG frame dimensions do not match its RGBA bytes")
+    compressor = zlib.compressobj(1)
+    compressed = []
+    source = memoryview(frame.rgba)
+    # PNG filter 0 and lossless RGBA8 stay unchanged. Feed bounded blocks to
+    # zlib without retaining a second uncompressed full frame of scanlines.
+    rows_per_block = max(1, 65_536 // (stride + 1))
+    for start in range(0, frame.height, rows_per_block):
+        rows = min(rows_per_block, frame.height - start)
+        scanlines = bytearray(rows * (stride + 1))
+        for row in range(rows):
+            offset = (start + row) * stride
+            destination = row * (stride + 1) + 1
+            scanlines[destination:destination + stride] = source[offset:offset + stride]
+        payload = compressor.compress(scanlines)
+        if payload:
+            compressed.append(payload)
+    compressed.append(compressor.flush())
     header = struct.pack(">IIBBBBB", frame.width, frame.height, 8, 6, 0, 0, 0)
     return (
         signature + chunk(b"IHDR", header)
-        + chunk(b"IDAT", zlib.compress(scanlines, 6))
+        + chunk(b"IDAT", b"".join(compressed))
         + chunk(b"IEND", b"")
     )
 

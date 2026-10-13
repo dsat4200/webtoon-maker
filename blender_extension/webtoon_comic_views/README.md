@@ -28,7 +28,7 @@ as revisioned PNGs below `%LOCALAPPDATA%\Webtoon Maker\Comic View Frames`.
 
 ### Textures, materials, and UV guides (0.8.0)
 
-Install `webtoon_comic_views-0.8.1.zip` using **Install from Disk**, then restart
+Install `webtoon_comic_views-0.8.2.zip` using **Install from Disk**, then restart
 Blender when you have saved your work. Existing Comic Views and the configured
 external image editor continue to work.
 
@@ -119,6 +119,15 @@ or `BLENDER_EXECUTABLE` to use a custom installation. Package validation must
 succeed before the ZIP is built.
 
 ### Saving and rendering
+
+Version 0.8.2 reduces Save's memory and repeated work across many views. A bake
+keeps one channel descriptor with compact saved values, reuses identical records
+only within the operation, and preserves matching animation keys. Unchanged
+visibility, optical settings and Local View membership no longer trigger scene
+rebuilds. Cached frames still validate animation and repair damaged keys. Render
+captures working state once, bounds the exact alpha conversion workspace, and
+encodes PNGs in small blocks using faster lossless compression. Resolution,
+straight-alpha pixels, scene restoration and atomic publication stay unchanged.
 
 Version 0.8.1 fixes Save/New failures caused by comparing rig-driven shape-key
 outputs against stale captured values. The saved controllers remain verified;
