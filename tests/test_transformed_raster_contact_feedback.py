@@ -9,6 +9,7 @@ import pytest
 from PySide6.QtCore import QPointF, Qt
 from PySide6.QtGui import QColor, QImage, QPainter
 
+from comic_editor.ui.themes import theme_color
 from comic_editor.core.brushes import BrushDefinition
 from comic_editor.core.models import BoundGeometry, ChildRef
 from comic_editor.core.tools import ToolKind
@@ -114,7 +115,7 @@ def test_transformed_contact_publishes_every_held_position_with_exact_ordered_na
             assert actual.pixelColor(x, 64) != previous.pixelColor(x, 64)
             assert actual.pixelColor(x, 64) == QColor('blue' if tool == ToolKind.RASTER_ERASER else 'red')
             assert actual.pixelColor(56, 64) == QColor('green'), 'foreground must retain its scene order'
-            assert actual.pixelColor(4, 64) == QColor('#242428'), 'page clipping must remain exact'
+            assert actual.pixelColor(4, 64) == theme_color('canvas', '#242428'), 'page clipping must remain exact'
             np.testing.assert_array_equal(pixels(actual), pixels(native_reference(canvas)))
             native_current = {key: bytes(image.constBits()) for key, image in
                 canvas.tiles.object_tiles(selected.object_id).items()}

@@ -7,6 +7,7 @@ import pytest
 from PySide6.QtCore import QPointF, QRectF, Qt
 from PySide6.QtGui import QColor, QColorSpace, QImage, QPainter
 
+from comic_editor.ui.themes import theme_color
 from comic_editor.core.changes import ChangeSet, EntityChange
 from comic_editor.core.models import BoundGeometry, ChapterDocument, RasterObject, BlurModifier
 from comic_editor.core.settings import EditorSettings
@@ -21,7 +22,7 @@ def pixels(image):
 
 def ready_paint(canvas):
     image = QImage(canvas.size(), QImage.Format_ARGB32_Premultiplied)
-    image.fill(QColor('#242428'))
+    image.fill(theme_color('canvas', '#242428'))
     painter = QPainter(image)
     painter.setRenderHint(QPainter.Antialiasing, True)
     try:
@@ -60,7 +61,7 @@ def native_reference(canvas):
     result = canvas._render_service.render_region(document, request)
     assert not result.image.isNull(), result
     image = QImage(128, 128, QImage.Format_ARGB32_Premultiplied)
-    image.fill(QColor('#242428'))
+    image.fill(theme_color('canvas', '#242428'))
     painter = QPainter(image)
     painter.drawImage(0, 0, result.image)
     painter.end()
@@ -141,7 +142,7 @@ def test_press_move_and_release_show_current_native_pixels_under_foreground_whil
         actual = ready_paint(canvas)
         assert actual.pixelColor(80, 64) == QColor('blue' if erasing else 'red')
         assert actual.pixelColor(56, 64) == QColor('green')
-        assert actual.pixelColor(4, 64) == QColor('#242428')
+        assert actual.pixelColor(4, 64) == theme_color('canvas', '#242428')
         expected = native_reference(canvas)
         np.testing.assert_array_equal(pixels(actual)[2:126, 8:504], pixels(expected)[2:126, 8:504])
         # Presentation reads only prepared resources and resident edited tiles.
@@ -341,7 +342,7 @@ def test_prediction_only_rebuilds_its_native_coverage_and_removes_leaving_pen(
     monkeypatch.setattr(feedback_ui, '_compose_tile', tracked)
     def feedback_frame(current_cache):
         image = QImage(canvas.size(), QImage.Format_ARGB32_Premultiplied)
-        image.fill(QColor('#242428'))
+        image.fill(theme_color('canvas', '#242428'))
         painter = QPainter(image)
         feedback_ui.present_raster_feedback(canvas, painter, prepared, {(1, 0)}, current_cache)
         painter.end()
@@ -636,7 +637,7 @@ def test_current_native_gutter_reuse_matches_fresh_composition_after_interior_an
     monkeypatch.setattr(feedback_ui, '_compose_tile', tracked)
     def frame(current_cache):
         image = QImage(canvas.size(), QImage.Format_ARGB32_Premultiplied)
-        image.fill(QColor('#242428'))
+        image.fill(theme_color('canvas', '#242428'))
         painter = QPainter(image)
         feedback_ui.present_raster_feedback(canvas, painter, prepared,
             canvas._scene_controller.feedback_dirty, current_cache)

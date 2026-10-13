@@ -59,6 +59,13 @@ def parse_args():
                         metavar=('LAYERS', 'OBJECTS', 'EFFECTS', 'MASKS'))
     parser.add_argument('--expected-size', type=int, nargs=2, default=(1080, 82000), metavar=('WIDTH', 'HEIGHT'))
     parser.add_argument('--expected-source-tiles', type=int, help='Assert initial selected native source tile cardinality')
+    parser.add_argument('--viewport', type=int, nargs=2, default=(1042, 937))
+    parser.add_argument('--solo-selected', action='store_true')
+    parser.add_argument('--canvas-color', default='#242428')
+    parser.add_argument('--monitor', action='store_true', help='Capture opt-in editor diagnostics alongside independent swap timings')
+    parser.add_argument('--main-window', action='store_true', help='Include the real outliner, navigator, window chrome and tablet event filters')
+    parser.add_argument('--hover-seconds', type=float, default=0., help='Replay native pen hover at the workload rate before the contacts')
+    parser.add_argument('--pencil-handles', action='store_true', help='Show the pencil transform controls as in the October13 captured view')
     parser.add_argument('--project-copy', type=Path, required=True)
     parser.add_argument('--out', type=Path, required=True, help='New result directory below .artifacts')
     parser.add_argument('--copy-from', type=Path, help='Create the private fixture before the run')
@@ -152,7 +159,10 @@ def prepare(args):
                 'document_id': args.chapter, 'asset_id': args.asset,
                 'source_files': len(file_manifest(args.project_copy)),
                 'source_bytes': sum(p.stat().st_size for p in args.project_copy.rglob('*') if p.is_file()),
-                'runtime': str(args.runtime_root), 'camera': args.camera, 'canvas': [1042, 937]}
+                'runtime': str(args.runtime_root), 'camera': args.camera, 'canvas': list(args.viewport),
+                'solo_selected': args.solo_selected, 'canvas_color': args.canvas_color,
+                'monitor': args.monitor, 'main_window': args.main_window,
+                'hover_seconds': args.hover_seconds, 'pencil_handles': args.pencil_handles}
     (args.out / 'fixture.json').write_text(json.dumps(metadata, indent=2), encoding='utf-8')
     print(json.dumps(metadata), flush=True)
     return metadata
@@ -202,6 +212,7 @@ def main():
     app = QApplication([])
     app.setApplicationName('Private Pocket GPU latency benchmark')
     app.setOrganizationName('Isolated benchmark')
+    app.setProperty('ui_theme_palette', {'canvas': args.canvas_color})
     canvas_module.create_network_manager = lambda *_: None
     pencil_preset = BrushPreset(name='Linear', pressure_size=True,
                                pressure_opacity=False, antialiasing=False).to_dict()
@@ -211,6 +222,7 @@ def main():
                                                    control_y=.6266094420600858)).to_dict()
     settings = EditorSettings(canvas_renderer='gpu', predictive_ink=True,
         grid_overlay_visible=False, snap_to_grid=False,
+        pencil_transform_handles_visible=args.pencil_handles,
         pencil_size_px={k: args.pencil_size for k in ('small', 'medium', 'large')},
         eraser_size_px={k: args.eraser_size for k in ('small', 'medium', 'large')},
         pencil_presets=[pencil_preset], eraser_presets=[eraser_preset],
@@ -501,9 +513,24 @@ def main():
         if hasattr(GpuTilePresenter, name):
             patch(GpuTilePresenter, name, 'presenter.batch' if name == batch_method else 'presenter.' + name.lstrip('_'))
 
-    canvas = create_canvas(settings)
+    main_window = None
+    if args.main_window:
+        from comic_editor.core import settings as settings_module
+        from comic_editor.ui import main_window as window_module
+        settings_module.settings_path = lambda: args.out / 'settings.json'
+        window_module.load_settings = lambda: settings
+        main_window = window_module.MainWindow()
+        main_window.setAttribute(Qt.WA_ShowWithoutActivating)
+        canvas = main_window.canvas
+        app.setProperty('ui_theme_palette', {'canvas': args.canvas_color})
+    else:
+        canvas = create_canvas(settings)
     assert type(canvas).__name__ == 'GpuCanvasWidget'
-    canvas.setFixedSize(1042, 937)
+    canvas.setFixedSize(*args.viewport)
+    patch(canvas, 'tabletEvent', 'canvas.tabletEvent')
+    patch(canvas, '_update_interaction_cursor', 'canvas.cursor')
+    if main_window is not None:
+        patch(main_window, '_forward_popup_tablet_event', 'window.popup_tablet')
     canvas.setAttribute(Qt.WA_ShowWithoutActivating)
     original_hover_painter = canvas._draw_tablet_hover
     if args.pixel_witness_no_cursor:
@@ -537,11 +564,24 @@ def main():
     assert (chapter.width, chapter.height) == tuple(args.expected_size)
     selected = chapter.objects[args.selected]
     assert selected.parent_layer_id == fixture['ancestors'][0]
-    canvas.set_document(chapter, tiles, images)
+    if main_window is None:
+        canvas.set_document(chapter, tiles, images)
+    else:
+        main_window._set_chapter(chapter, tiles, images)
     canvas.center_x, canvas.center_y, canvas.scale, canvas.rotation = args.camera
     canvas.set_selection('object', args.selected)
+    if args.solo_selected:
+        canvas.set_solo_entities({('object', args.selected)})
     canvas.set_tool(ToolKind.RASTER_PENCIL)
-    canvas.show()
+    (canvas if main_window is None else main_window).show()
+    monitor = monitor_owner = None
+    if args.monitor:
+        from PySide6.QtWidgets import QMainWindow
+        from comic_editor.ui.performance_monitor import PerformanceMonitorController
+        monitor_owner = main_window or QMainWindow()
+        monitor_owner.canvas = canvas
+        monitor = PerformanceMonitorController(monitor_owner, log_directory=args.out / 'performance-logs')
+        monitor.start()
 
     def pump(seconds):
         deadline = time.perf_counter() + max(0., seconds)
@@ -947,8 +987,12 @@ def main():
                 # A counterfactual near them cannot disambiguate actual ink
                 # from a decoration, even when the native source did change.
                 decorations = ([32,32,36], [36,36,40], [232,245,255])
+                # Solo erasure legitimately reveals the surround, already
+                # validated above with the ordinary native counterfactual.
+                # Keep that witness while still rejecting decorated pencil ink.
+                decorated_pixels = (painted_pixel,) if args.solo_selected else (painted_pixel, erased_pixel)
                 if any(max(abs(a-b) for a,b in zip(pixel[:3], decoration)) <= 24
-                       for pixel in (painted_pixel, erased_pixel) for decoration in decorations):
+                       for pixel in decorated_pixels for decoration in decorations):
                     continue
                 row.update(accepted=True, color=value, pencil_display=painted_pixel,
                     eraser_display=erased_pixel, visible_native_delta=delta,
@@ -1358,6 +1402,19 @@ def main():
         # Private ordinary witness work precedes pressure and all timed input;
         # give any ordinary scene worker publication its normal idle boundary.
         settle()
+        if args.hover_seconds > 0.:
+            phase = 'hover'
+            hover_started = time.perf_counter()
+            for index in range(round(args.hover_seconds * args.hz)):
+                pump(max(0., hover_started + index / args.hz - time.perf_counter()))
+                world = paths[0][index % len(paths[0])]
+                screen = canvas.camera_transform().map(QPointF(*world))
+                event = QTabletEvent(QEvent.TabletMove, pen, screen,
+                    QPointF(canvas.mapToGlobal(screen.toPoint())), 0., 0., 0., 0., 0., 0.,
+                    Qt.NoModifier, Qt.NoButton, Qt.NoButton)
+                QCoreApplication.sendEvent(canvas, event)
+            phase = 'setup'
+            settle()
         if args.busy_scene_first:
             from pocket_busy_scene_support import PocketBusySceneSupport
             busy_scene = PocketBusySceneSupport(canvas)
@@ -1671,6 +1728,10 @@ def main():
             busy_scene.undo_modifier_operation()
             settle()
         undo_source, undo_metadata = save_buffers('undo')
+        # Compare the same editor decorations as the initial frame. Pencil
+        # handles may be visible while the final eraser tool hides its cage.
+        canvas.set_tool(ToolKind.RASTER_PENCIL)
+        settle()
         undo_frame = read_native_frame(canvas)
         undo_frame.save(str(args.out / 'undo-native.png'))
         undo_identical = set(undo_source) == set(initial_source) and all(np.array_equal(undo_source[k], initial_source[k]) for k in initial_source)
@@ -1765,6 +1826,9 @@ def main():
             'private_files_unchanged': before_files == after_files, 'comparison': compare,
             'wall_seconds': time.perf_counter()-started}
         write_json('pressure-before.json', pressure)
+        if monitor is not None:
+            monitor.stop()
+            write_json('monitor.json', monitor.snapshot())
         write_json('summary.json', result)
         print(json.dumps(result, indent=2), flush=True)
         if compare is not None:
@@ -1778,6 +1842,9 @@ def main():
         raise
     finally:
         timer.stop()
+        if monitor is not None:
+            monitor.stop()
+            write_json('monitor.json', monitor.snapshot())
         canvas._draw_tablet_hover = original_hover_painter
         for name, value in (('frames.json', frame_rows), ('batches.json', batch_rows), ('timings.json', timing_rows),
                             ('inputs.json', input_rows), ('heartbeat.json', heartbeat_rows), ('contacts.json', contacts)):
@@ -1788,6 +1855,9 @@ def main():
             write_json('busy-scene.json', busy_scene.report())
             busy_scene.close()
         canvas._scene_controller.reset()
+        if main_window is not None:
+            main_window._dirty = False
+            main_window.close()
         canvas._scene_controller.scheduler.close()
         canvas._scene_controller.scheduler.executor.shutdown(wait=True, cancel_futures=True)
         canvas._effect_jobs.cancel()

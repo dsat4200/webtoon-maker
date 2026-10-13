@@ -5,6 +5,7 @@ import pytest
 from PySide6.QtCore import QPointF
 from PySide6.QtGui import QColor, QImage
 
+from comic_editor.ui.themes import theme_color
 from comic_editor.core.models import BoundGeometry
 from comic_editor.core.tools import ToolKind
 from test_raster_contact_feedback import scene, ready_paint
@@ -332,7 +333,7 @@ def test_saved_pocket_boyfriend_native_chunks_and_selection(qapp, monkeypatch, w
         # phase split only while an active drawing contact is held.
         from PySide6.QtGui import QPainter
         image = QImage(canvas.size(), QImage.Format_ARGB32_Premultiplied)
-        image.fill(QColor('#242428'))
+        image.fill(theme_color('canvas', '#242428'))
         painter = QPainter(image)
         painter.setRenderHint(QPainter.Antialiasing, True)
         try:

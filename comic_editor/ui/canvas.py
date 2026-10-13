@@ -1262,10 +1262,10 @@ class _CanvasLogic(SceneKernels, LassoBrushFeatures, BrushFeatures, DocumentProj
     def _gpu_contact_pacing_key(self, obj, *, pending=False):
         # Scalar checks only: no document capture, mask traversal or source read.
         if (not self._drawing or not self._raster_contact_active or self._nav_mode is not None
-                or (not pending and abs(self.rotation) >= 1e-9) or self.selected_kind != 'object'
+                or self.selected_kind != 'object'
                 or self.selected_id != self.selected_object_id or len(self.selected_entities) > 1
                 or self.tool not in {ToolKind.RASTER_PENCIL, ToolKind.RASTER_ERASER, ToolKind.BRUSH}
-                or self._projection_has_live_preview(include_ink=False) or self._solo_entities
+                or self._projection_has_live_preview(include_ink=False)
                 or obj.mask_only or any(bool(getattr(self, name, None)) for name in (
                     'active_tone_mask_id', 'preview_tone_mask_id', '_mask_tile_input',
                     '_mask_gradient_drag', '_mask_selection_gesture', '_native_deferred_activations',
@@ -1273,6 +1273,7 @@ class _CanvasLogic(SceneKernels, LassoBrushFeatures, BrushFeatures, DocumentProj
             return None
         return (self.tool, self.selected_id, self.center_x, self.center_y, self.scale,
                 self.rotation, self.width(), self.height(), self.devicePixelRatioF(),
+                self._solo_signature(),
                 self.chapter.width, self.chapter.height, self.chapter.background,
                 self.chapter.view_overflow, obj.interaction_rect, obj.underlay_opacity,
                 self.settings.predictive_ink)
@@ -1349,7 +1350,7 @@ class _CanvasLogic(SceneKernels, LassoBrushFeatures, BrushFeatures, DocumentProj
             self._gpu_contact_pacing_token = ((gate, self.chapter, self.tiles, self.images, obj,
                 native, controller.feedback, self.chapter.pixel_contract, self.context()), key)
 
-    def _queue_widget_dirty(self, widget, *, stable_rows: bool = False) -> None:
+    def _queue_widget_dirty(self, widget, *, stable_rows: bool = False, hover_only: bool = False) -> None:
         """Coalesce presentation damage without joining distant overlays."""
         if self._gpu_contact_pacing_current(pending=True):
             # Source admission keeps running while compatible display storage
@@ -1378,7 +1379,9 @@ class _CanvasLogic(SceneKernels, LassoBrushFeatures, BrushFeatures, DocumentProj
         if not self._visual_frame_timer.isActive():
             delay = 0
             last_frame = self._last_painting_frame_start
-            if (last_frame is not None and (gpu_paced or not isinstance(self, QOpenGLWidget))
+            if last_frame is not None and hover_only:
+                delay = max(0, math.ceil((.016 - (time.perf_counter() - last_frame)) * 1000))
+            elif (last_frame is not None and (gpu_paced or not isinstance(self, QOpenGLWidget))
                     and self._drawing and self._raster_contact_active and self._nav_mode is None):
                 # Native samples run at their received rate. Coalesce only
                 # display work so a fast pen cannot consume the event loop with
@@ -1390,14 +1393,12 @@ class _CanvasLogic(SceneKernels, LassoBrushFeatures, BrushFeatures, DocumentProj
     def _queue_painting_contact_adoption(self) -> None:
         """Refresh untouched backing pixels when the first native dab is admitted."""
         self._retire_gpu_contact_pacing()
-        if isinstance(self, QOpenGLWidget):
-            self._queue_widget_dirty(self.rect())
-        else:
-            # Idle and live composition may use different presentation paths.
-            # Adopt the live view once before restricting later packets to rows.
-            # This belongs to admission: a deferred contact's received press may
-            # have been repainted while its predecessor still owned the source.
-            self._queue_widget_dirty(self.rect())
+        # Adopt the live view before restricting later packets to rows. This
+        # belongs to admission: a deferred press may already have repainted
+        # while its predecessor still owned the source.
+        self._queue_widget_dirty(self.rect())
+        # A press must not inherit the remaining cursor-only frame delay.
+        self._visual_frame_timer.start(0)
 
     def _painting_overlay_region(self) -> QRegion:
         """Current custom cursor, forecast and pending-contact presentation."""
@@ -1439,18 +1440,20 @@ class _CanvasLogic(SceneKernels, LassoBrushFeatures, BrushFeatures, DocumentProj
             return
         region = self._painting_overlay_region()
         self._queue_widget_dirty(self._painting_overlay_damage.united(region),
-            stable_rows=self._drawing and self._raster_contact_active and abs(self.rotation) < 1e-9)
+            stable_rows=self._drawing and self._raster_contact_active and abs(self.rotation) < 1e-9,
+            hover_only=not self._drawing and not self._raster_contact_active
+                and not self._pen_contact_active and self._nav_mode is None)
         self._painting_overlay_damage = region
         gate = getattr(self, '_paint_brush_tile_input' if self.tool == ToolKind.BRUSH
                        else '_raster_tile_input', None)
-        if (getattr(self, '_raster_feedback_pending_visible', False)
-                or (self._raster_contact_active and (getattr(gate, 'busy', False)
-                    or abs(self.rotation) >= 1e-9))):
-            # A rare source-readiness transition changes the bottom annotation.
-            # Repaint the full guides then: clipping a dashed guide at that
-            # annotation can change Qt's dash phase. Ready source packets remain
-            # bounded and never acquire a distant bottom-label damage region.
-            self.update()
+        pending = bool(getattr(self, '_raster_feedback_pending_visible', False)
+            or (self._raster_contact_active and getattr(gate, 'busy', False)))
+        if pending != getattr(self, '_painting_annotation_pending', False):
+            # Redraw complete dashed guides when the bottom annotation changes.
+            # Rotation alone is not a readiness transition. Use the same damage
+            # scheduler as source/outline changes instead of bypassing pacing.
+            self._painting_annotation_pending = pending
+            self._queue_widget_dirty(self.rect())
 
 
 
@@ -2265,7 +2268,6 @@ class _CanvasLogic(SceneKernels, LassoBrushFeatures, BrushFeatures, DocumentProj
         if (action != 'transient' or not change.transient
                 or not getattr(self, '_raster_repaint_frame_stable', False)
                 or (isinstance(self, QOpenGLWidget) and not self._gpu_contact_pacing_current())
-                or abs(self.rotation) >= 1e-9
                 or not self._drawing or not self._raster_contact_active
                 or self._nav_mode is not None or self.selected_kind != 'object'
                 or self.selected_id != self.selected_object_id
@@ -3525,7 +3527,8 @@ class _CanvasLogic(SceneKernels, LassoBrushFeatures, BrushFeatures, DocumentProj
 
     def paintEvent(self, event) -> None:  # noqa: N802
         self._last_painting_frame_start = (
-            time.perf_counter() if self._drawing and self._raster_contact_active else None)
+            time.perf_counter() if (self._drawing and self._raster_contact_active
+                or self.tool in {ToolKind.RASTER_PENCIL, ToolKind.RASTER_ERASER, ToolKind.BRUSH}) else None)
         frame_started = time.perf_counter_ns() if self._performance.enabled else None
         self._update_text_gizmo_overlay()
         painter = QPainter(self)
@@ -10145,13 +10148,24 @@ class _CanvasLogic(SceneKernels, LassoBrushFeatures, BrushFeatures, DocumentProj
             and source is not None and contact.get('source') is source
             and journal_tool(contact) == self.tool and journal_identifier(contact) == identifier)
 
+    def _set_interaction_cursor(self, shape=None) -> None:
+        if shape is None:
+            if self.testAttribute(Qt.WA_SetCursor):
+                self.unsetCursor()
+        elif not self.testAttribute(Qt.WA_SetCursor) or self.cursor().shape() != shape:
+            self.setCursor(shape)
+
+    def _set_interaction_tooltip(self, text: str) -> None:
+        if self.toolTip() != text:
+            self.setToolTip(text)
+
     def _update_interaction_cursor(self, widget_point: QPointF) -> None:
         """Resolve the canvas cursor identically for mouse and pen input."""
         if self._active_shape_control == "outline_width":
-            self.setCursor(Qt.CrossCursor)
+            self._set_interaction_cursor(Qt.CrossCursor)
             return
         if self.chapter is None:
-            self.unsetCursor()
+            self._set_interaction_cursor()
             return
         painting_tool = self.tool in {
             ToolKind.RASTER_PENCIL, ToolKind.RASTER_ERASER, ToolKind.BRUSH,
@@ -10162,36 +10176,36 @@ class _CanvasLogic(SceneKernels, LassoBrushFeatures, BrushFeatures, DocumentProj
             if (self._drawing or self._has_received_painting_contact()) and self._nav_mode is None:
                 # A received painting contact keeps its custom outline even
                 # while moving across a transform control or waiting for pixels.
-                self.setCursor(Qt.BlankCursor)
+                self._set_interaction_cursor(Qt.BlankCursor)
                 return
         if self.tool == ToolKind.LASSO_BRUSH:
-            self.setCursor(Qt.CrossCursor)
-            self.setToolTip("Drag to fill a shape; release to finish; Escape cancels")
+            self._set_interaction_cursor(Qt.CrossCursor)
+            self._set_interaction_tooltip("Drag to fill a shape; release to finish; Escape cancels")
             return
         radial_hit = self._radial_handle_hit(widget_point)
         texture_hit = self._texture_handle_hit(widget_point)
         if texture_hit is not None:
-            self.setCursor(Qt.SizeAllCursor if texture_hit == "translate" else Qt.PointingHandCursor
+            self._set_interaction_cursor(Qt.SizeAllCursor if texture_hit == "translate" else Qt.PointingHandCursor
                            if texture_hit == "mode" else Qt.CrossCursor)
-            self.setToolTip("Texture: drag inside to move; outside a corner to rotate. Shift keeps proportions.")
+            self._set_interaction_tooltip("Texture: drag inside to move; outside a corner to rotate. Shift keeps proportions.")
             return
         if self._active_texture_modifier() is not None:
-            self.unsetCursor()
-            self.setToolTip("")
+            self._set_interaction_cursor()
+            self._set_interaction_tooltip("")
             return
         radial_drag = self._modifier_handle_drag
         if radial_drag and "radial" in radial_drag:
             radial_hit = radial_drag["handle"]
         if radial_hit is not None:
-            self.setCursor(Qt.CrossCursor)
-            self.setToolTip("Radial blur center: drag to move" if radial_hit == 0 else
+            self._set_interaction_cursor(Qt.CrossCursor)
+            self._set_interaction_tooltip("Radial blur center: drag to move" if radial_hit == 0 else
                             "Radial blur angle: drag around the center")
             return
         point = QPointF(widget_point)
         world = self.widget_to_document(point)
         if self.active_tone_mask_id and self.tool in {ToolKind.MASK_SELECT, ToolKind.MASK_WAND}:
-            self.setCursor(Qt.CrossCursor)
-            self.setToolTip(
+            self._set_interaction_cursor(Qt.CrossCursor)
+            self._set_interaction_tooltip(
                 "Click to add a color region; Control-click to remove"
                 if self.tool == ToolKind.MASK_WAND else
                 "Lasso to add an area; hold Control to remove"
@@ -10217,7 +10231,7 @@ class _CanvasLogic(SceneKernels, LassoBrushFeatures, BrushFeatures, DocumentProj
             "line_spacing": "Line spacing: drag left or right (0.5–3.0)",
         }.get(over_text_property, "")
         if self.toolTip() != property_tooltip:
-            self.setToolTip(property_tooltip)
+            self._set_interaction_tooltip(property_tooltip)
         selected_object = self.chapter.objects.get(self.selected_object_id)
         selected_gradient = (
             selected_object
@@ -10266,54 +10280,54 @@ class _CanvasLogic(SceneKernels, LassoBrushFeatures, BrushFeatures, DocumentProj
         )
 
         if translation_active:
-            self.setCursor(Qt.ClosedHandCursor)
+            self._set_interaction_cursor(Qt.ClosedHandCursor)
         elif (
             self._page_gap_draft is not None
             and self._page_gap_draft.drag_mode
         ):
-            self.setCursor(Qt.SizeVerCursor)
+            self._set_interaction_cursor(Qt.SizeVerCursor)
         elif page_gap_hit in {"top", "bottom"}:
-            self.setCursor(Qt.SizeVerCursor)
+            self._set_interaction_cursor(Qt.SizeVerCursor)
         elif self.tool == ToolKind.INSERT_PAGE_GAP:
-            self.setCursor(
+            self._set_interaction_cursor(
                 Qt.SizeVerCursor
                 if self._page_gap_hover_y is not None
                 else Qt.ForbiddenCursor
             )
         elif self._shape_property_drag is not None:
-            self.setCursor(Qt.CursorShape.SizeHorCursor)
+            self._set_interaction_cursor(Qt.CursorShape.SizeHorCursor)
         elif transform_precision_active or shape_precision_active:
-            self.setCursor(Qt.CrossCursor)
+            self._set_interaction_cursor(Qt.CrossCursor)
         elif self._transform_mode_gizmo_rect().contains(point):
-            self.setCursor(Qt.PointingHandCursor)
+            self._set_interaction_cursor(Qt.PointingHandCursor)
         elif shape_overlay_hit in {"base_thickness", "outline_thickness"}:
-            self.setCursor(Qt.CursorShape.SizeHorCursor)
+            self._set_interaction_cursor(Qt.CursorShape.SizeHorCursor)
         elif gradient_hit is not None:
-            self.setCursor(Qt.PointingHandCursor)
+            self._set_interaction_cursor(Qt.PointingHandCursor)
         elif shape_hover_kind not in {None, "interior"}:
-            self.setCursor(Qt.CrossCursor)
+            self._set_interaction_cursor(Qt.CrossCursor)
         elif shape_overlay_hit:
-            self.setCursor(Qt.PointingHandCursor)
+            self._set_interaction_cursor(Qt.PointingHandCursor)
         elif over_text_property:
-            self.setCursor(Qt.CursorShape.SizeHorCursor)
+            self._set_interaction_cursor(Qt.CursorShape.SizeHorCursor)
         elif transform_hover in {"handle", "rotate", "pivot"}:
-            self.setCursor(Qt.CrossCursor)
+            self._set_interaction_cursor(Qt.CrossCursor)
         elif transform_hover == "translate" or shape_hover_kind == "interior":
-            self.setCursor(Qt.OpenHandCursor)
+            self._set_interaction_cursor(Qt.OpenHandCursor)
         elif self.tool == ToolKind.DRAW_SELECT_STROKE:
-            self.setCursor(Qt.PointingHandCursor)
+            self._set_interaction_cursor(Qt.PointingHandCursor)
         elif self.tool in {
             ToolKind.DRAW_SELECT_RECT, ToolKind.DRAW_SELECT_LASSO,
         }:
-            self.setCursor(Qt.CrossCursor)
+            self._set_interaction_cursor(Qt.CrossCursor)
         elif over_selected_text:
-            self.setCursor(Qt.CursorShape.IBeamCursor)
+            self._set_interaction_cursor(Qt.CursorShape.IBeamCursor)
         elif painting_tool and self._nav_mode is None and (
                 isinstance(selected_object, RasterObject)
                 or self.active_tone_mask_id and self.tool != ToolKind.BRUSH):
-            self.setCursor(Qt.BlankCursor)
+            self._set_interaction_cursor(Qt.BlankCursor)
         else:
-            self.unsetCursor()
+            self._set_interaction_cursor()
 
     def mousePressEvent(self, event: QMouseEvent) -> None:  # noqa: N802
         if self.chapter is None:
@@ -10918,7 +10932,13 @@ class _CanvasLogic(SceneKernels, LassoBrushFeatures, BrushFeatures, DocumentProj
             self._drawing
             or self._vector_gesture_mode in {"pencil", "eraser"}
         ):
-            self.update()
+            if (tablet_kind == QEvent.TabletMove and self._nav_mode is None
+                    and self.tool in {ToolKind.RASTER_PENCIL, ToolKind.RASTER_ERASER, ToolKind.BRUSH}):
+                # Painting hover/pending-contact damage is already queued by
+                # cursor resolution. Preserve immediate press/release updates.
+                pass
+            else:
+                self.update()
         event.accept()
 
     def event(self, event) -> bool:
@@ -10928,6 +10948,10 @@ class _CanvasLogic(SceneKernels, LassoBrushFeatures, BrushFeatures, DocumentProj
             self._scene_dirty_full = True
             self._transform_static_cache = QImage()
             self._vector_eraser_background_cache = QImage()
+            controller = getattr(self, '_scene_controller', None)
+            if controller is not None:
+                controller.feedback_patches.clear()
+                controller.raster_continuity.clear()
             self.update()
         if event.type() in {QEvent.UngrabMouse, QEvent.WindowDeactivate}:
             self._cancel_lasso_brush()

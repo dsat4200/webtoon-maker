@@ -65,6 +65,18 @@ identify native-call entry locations, not native internals. Idle event-loop
 samples can appear among hot spots, so start with stalls and completed phase
 durations. This is not physical pen-to-display latency measurement.
 
+Complete tablet handlers, cursor resolution, popup forwarding and native window
+hit testing have separate opt-in spans. `canvas.contact_frame.first_covered`
+continues to measure the successful paint itself.
+`canvas.contact_frame.receipt_to_first_covered` measures elapsed time from the
+application receiving the press to completion of its first paint with current
+contact coverage. A deferred contact keeps its original receipt through source
+admission, including a release received before admission. This excludes driver
+delivery before receipt, GPU completion and scanout; coverage metadata is not a
+pixel readback. Pending/replayed frames cannot complete this latency outcome.
+Cancelled receipts have a bounded `canvas.contact_frame.cancelled` outcome;
+completed frame records include GPU pending and presentation replay flags.
+
 ## Disabled behavior and overhead
 
 The launcher creates the controller lazily. Until enabled, there is no sampling

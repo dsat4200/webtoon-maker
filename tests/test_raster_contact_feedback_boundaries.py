@@ -6,6 +6,7 @@ import pytest
 from PySide6.QtCore import QPointF, QRectF, Qt
 from PySide6.QtGui import QColor, QImage, QPainter, QTransform
 
+from comic_editor.ui.themes import theme_color
 from comic_editor.core.brushes import BrushDefinition
 from comic_editor.core.models import BoundGeometry, ChildRef
 from comic_editor.core.tools import ToolKind
@@ -25,7 +26,7 @@ def native_decorated(canvas):
     result = canvas._render_service.render_region(document,request)
     assert not result.image.isNull(),result
     image = QImage(width,height,QImage.Format_ARGB32_Premultiplied)
-    image.fill(QColor('#242428'))
+    image.fill(theme_color('canvas', '#242428'))
     painter=QPainter(image)
     painter.setRenderHint(QPainter.Antialiasing,True)
     try:

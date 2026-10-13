@@ -7,6 +7,7 @@ import pytest
 from PySide6.QtCore import QPointF, Qt
 from PySide6.QtGui import QColor, QImage, QPainter
 
+from comic_editor.ui.themes import theme_color
 from comic_editor.core.brushes import BrushDefinition
 from comic_editor.core.models import BoundGeometry, ChildRef
 from comic_editor.core.tools import ToolKind
@@ -101,7 +102,7 @@ def fixed_native_reference(canvas):
             request.world_rect, request.source_rect, snapshot.document.pixel_contract,
             snapshot.pixel_environment) for request in requests]
         image = QImage(canvas.size(), QImage.Format_ARGB32_Premultiplied)
-        image.fill(QColor('#242428'))
+        image.fill(theme_color('canvas', '#242428'))
         painter = QPainter(image)
         painter.setRenderHint(QPainter.Antialiasing, True)
         try:

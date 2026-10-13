@@ -6,6 +6,7 @@ import pytest
 from PySide6.QtCore import QRectF,Qt
 from PySide6.QtGui import QColor,QImage,QPainter
 
+from comic_editor.ui.themes import theme_color
 from comic_editor.core.models import BoundGeometry,BlurModifier,ParameterMaskBinding,ToneMask
 from comic_editor.render.raster_feedback import prepare_raster_feedback
 from comic_editor.render.scene import SceneSnapshotCompiler,DetachedSceneBackend
@@ -28,7 +29,7 @@ def freeze(canvas):
 
 def flat(image):
     result=QImage(image.size(),QImage.Format_ARGB32_Premultiplied)
-    result.fill(QColor('#242428'));painter=QPainter(result)
+    result.fill(theme_color('canvas', '#242428'));painter=QPainter(result)
     try:painter.drawImage(0,0,image)
     finally:painter.end()
     return result
@@ -67,7 +68,7 @@ def nested(canvas,selected):
 def compose(canvas,prepared):
     owner=canvas.tiles._tiles[prepared.identifier]
     resident={key:entry[0] for (source,key),entry in owner.residency.entries.items() if source is owner}
-    result=QImage(128,128,QImage.Format_ARGB32_Premultiplied);result.fill(QColor('#242428'))
+    result=QImage(128,128,QImage.Format_ARGB32_Premultiplied);result.fill(theme_color('canvas', '#242428'))
     painter=QPainter(result)
     try:
         for tile in prepared.tiles:
@@ -110,10 +111,10 @@ def test_solo_prepared_native_feedback_matches_cold_shared_scene_and_hides_exclu
         actual=compose(canvas,prepared)
     assert buffers(actual)==buffers(expected)
     assert actual.pixelColor(42,64)==QColor('yellow')
-    assert actual.pixelColor(4,64)==QColor('#242428')
+    assert actual.pixelColor(4,64)==theme_color('canvas', '#242428')
     if mode=='object':
         assert actual.pixelColor(58,64)==QColor('yellow')
-        assert actual.pixelColor(32,32)==QColor('#242428')
+        assert actual.pixelColor(32,32)==theme_color('canvas', '#242428')
     else:assert actual.pixelColor(58,64)==QColor('green')
     assert buffers(snapshot.tiles.tile(selected.object_id,(0,0)))==old_source
     assert canvas.chapter.to_dict()==before_model
@@ -130,7 +131,7 @@ def test_selected_raster_excluded_by_solo_never_draws_raw_feedback_source(scene,
         prepared=worker.submit(prepare_raster_feedback,snapshot,selected.object_id,(0.,0.,128.,128.)).result(timeout=20)
     assert prepared is None and not calls
     with ThreadPoolExecutor(max_workers=1) as worker:expected=worker.submit(native,snapshot).result(timeout=20)
-    assert expected.pixelColor(42,64)==QColor('#242428')
+    assert expected.pixelColor(42,64)==theme_color('canvas', '#242428')
     assert expected.pixelColor(58,64)==QColor('green')
 
 

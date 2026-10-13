@@ -20,6 +20,7 @@ from comic_editor.core.document_patch import RecordSnapshot
 from comic_editor.render.sampling import artwork_density
 from comic_editor.render.projection import ProjectionRequest
 from comic_editor.ui.color_resources import projection_color_identity
+from comic_editor.ui.themes import theme_color
 
 
 class DocumentProjectionFeatures:
@@ -427,13 +428,13 @@ class DocumentProjectionFeatures:
                     for tile, replace_background in retained_overlays:
                         groups.append(PresentedTileGroup((tile,),
                             clip_world=None if replace_background else document.bounds,
-                            replace_background=QColor('#242428') if replace_background else None))
+                            replace_background=theme_color('canvas', '#242428') if replace_background else None))
                 if phase is None and retained_overlays and filtered_replacements:
                     # The filtered worker can replace only part of its scene.
                     # Its new complete scene tiles own overlaps with retained
                     # earlier contacts, including an earlier selected layer.
                     groups.append(PresentedTileGroup(tuple(filtered_replacements),
-                        replace_background=QColor('#242428')))
+                        replace_background=theme_color('canvas', '#242428')))
                 if phase is None and not feedback_tiles:
                     feedback_tiles = self._scene_controller.present_feedback(painter, document,
                         draw_tiles=collect_feedback)

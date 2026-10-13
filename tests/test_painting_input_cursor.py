@@ -156,3 +156,61 @@ def test_mouse_hover_does_not_reuse_an_earlier_pen_position(painting_canvas, too
     image = overlay(canvas)
     assert image.pixelColor(90,40).alpha() > 0
     assert image.pixelColor(32,40).alpha() == 0
+
+
+def test_repeated_hover_does_not_repeat_cursor_or_tooltip_native_changes(painting_canvas, monkeypatch):
+    canvas, _raster = painting_canvas
+    canvas.set_tool(ToolKind.RASTER_PENCIL)
+    canvas._update_interaction_cursor(QPointF(32, 40))
+    calls = []
+    original_cursor, original_tooltip = canvas.setCursor, canvas.setToolTip
+    monkeypatch.setattr(canvas, 'setCursor', lambda value: (calls.append('cursor'), original_cursor(value)))
+    monkeypatch.setattr(canvas, 'setToolTip', lambda value: (calls.append('tooltip'), original_tooltip(value)))
+    for _ in range(20):
+        canvas._update_interaction_cursor(QPointF(32, 40))
+    assert calls == []
+    canvas.settings.pencil_transform_handles_visible = True
+    canvas._update_interaction_cursor(QPointF(0, 0))
+    assert calls == ['cursor']
+    assert canvas.cursor().shape() == Qt.CrossCursor
+
+
+def test_rotated_solo_overlay_only_schedules_full_guides_on_readiness_changes(painting_canvas, monkeypatch):
+    from types import SimpleNamespace
+    canvas, raster = painting_canvas
+    canvas.rotation = -.663008407605119
+    canvas.set_solo_entities({('object', raster.object_id)})
+    canvas._raster_contact_active = True
+    gate = SimpleNamespace(busy=False)
+    monkeypatch.setattr(canvas, '_raster_tile_input', gate, raising=False)
+    damage = []
+    monkeypatch.setattr(canvas, '_queue_widget_dirty', lambda value, **_kw: damage.append(value))
+    monkeypatch.setattr(canvas, 'update', lambda *_a: pytest.fail('Overlay bypassed damage scheduling'))
+    for _ in range(10):
+        canvas._queue_painting_overlay_damage()
+    assert canvas.rect() not in damage
+    gate.busy = True
+    for _ in range(10):
+        canvas._queue_painting_overlay_damage()
+    assert damage.count(canvas.rect()) == 1
+    gate.busy = False
+    canvas._queue_painting_overlay_damage()
+    assert damage.count(canvas.rect()) == 2
+    canvas._raster_tile_input = None
+    canvas._raster_contact_active = False
+
+
+def test_hover_repaint_deadline_is_retained_and_press_promotes_it(painting_canvas):
+    canvas, _raster = painting_canvas
+    canvas.set_tool(ToolKind.RASTER_PENCIL)
+    canvas._visual_frame_timer.stop()
+    canvas._pointer_hover_widget = QPointF(32, 40)
+    canvas.grab()
+    assert canvas._last_painting_frame_start is not None
+    canvas._queue_painting_overlay_damage()
+    remaining = canvas._visual_frame_timer.remainingTime()
+    assert 0 < remaining <= 16
+    canvas._queue_painting_overlay_damage()
+    assert 0 <= canvas._visual_frame_timer.remainingTime() <= remaining
+    canvas._queue_painting_contact_adoption()
+    assert canvas._visual_frame_timer.remainingTime() == 0

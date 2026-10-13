@@ -1776,11 +1776,16 @@ class MainWindow(QMainWindow):
         if isinstance(popup, SelectionCandidateMenu) and popup.parentWidget() is self:
             popup.tabletEvent(event)
             return True
+        pressed = getattr(self, "_tablet_popup_pressed", None)
+        # Ordinary canvas packets do not need a global native widget lookup.
+        # Keep the lookup for modal dialogs and a contact begun in a popup,
+        # including its release after the popup has closed.
+        if popup is None and QApplication.activeModalWidget() is None and pressed is None:
+            return False
         global_position = QPointF(event.globalPosition())
         target = QApplication.widgetAt(global_position.toPoint())
         if target is None and isinstance(watched, QWidget):
             target = watched
-        pressed = getattr(self, "_tablet_popup_pressed", None)
         if event.type() == QEvent.TabletRelease and pressed is not None:
             target = pressed
         if target is None:
@@ -2167,7 +2172,10 @@ class MainWindow(QMainWindow):
             event_type == QEvent.WindowDeactivate and watched is self
         ):
             self.canvas._cancel_lasso_brush()
+            self.canvas._interrupt_native_pointer_contact()
             self.canvas._interrupt_paint_brush()
+            self.canvas._pen_contact_active = False
+            self.canvas._tablet_tool_active = False
         if (event_type == QEvent.ApplicationDeactivate
                 or (event_type == QEvent.KeyPress and event.key() == Qt.Key_Escape)):
             self._solo_star_press = None

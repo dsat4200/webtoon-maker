@@ -1322,10 +1322,11 @@ class SceneController(QObject):
             self.raster_continuity.remember(document, batch, tiles, replace_background=replace_native, view=view)
 
     def presentation_view(self):
+        from comic_editor.ui.themes import theme_color
         camera = self.canvas.camera_transform()
         return ((camera.m11(), camera.m12(), camera.m13(), camera.m21(), camera.m22(), camera.m23(),
             camera.m31(), camera.m32(), camera.m33()), self.canvas.width(), self.canvas.height(),
-            self.canvas.devicePixelRatioF())
+            self.canvas.devicePixelRatioF(), theme_color('canvas', '#242428').rgba())
 
     def _remember_filtered_presented_basis(self):
         """A prepared recipe becomes reusable only after a native frame swap."""

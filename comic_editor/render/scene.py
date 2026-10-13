@@ -8,7 +8,7 @@ The evaluator never reaches back into an editor or a mutable source store.
 from __future__ import annotations
 
 from collections import OrderedDict
-from collections.abc import MutableMapping
+from collections.abc import MutableMapping, MutableSet
 from contextlib import contextmanager
 from dataclasses import dataclass, field, fields, is_dataclass
 import copy
@@ -74,6 +74,140 @@ class SceneTileStore(TileStore):
         return self._tiles[identifier]
 
 
+class _CowMap(MutableMapping):
+    """A per-consumer map that shares immutable headers until its first write."""
+
+    def __init__(self, base):
+        depth = base._depth + 1 if isinstance(base, _CowMap) else 1
+        if isinstance(base, _CowMap) and depth > 8:
+            base = dict(base.items())
+            depth = 1
+        self._base = base
+        self._depth = depth
+        self._values = {}
+        self._deleted = set()
+        self._length = len(base)
+
+    def __getitem__(self, key):
+        if key in self._values:
+            return self._values[key]
+        if key in self._deleted:
+            raise KeyError(key)
+        return self._base[key]
+
+    def __setitem__(self, key, value):
+        present = key in self._values or (key not in self._deleted and key in self._base)
+        if not present:
+            self._length += 1
+        self._deleted.discard(key)
+        self._values[key] = value
+
+    def __delitem__(self, key):
+        if key in self._values:
+            del self._values[key]
+            if key in self._base and key not in self._deleted:
+                self._deleted.add(key)
+            self._length -= 1
+            return
+        if key in self._deleted or key not in self._base:
+            raise KeyError(key)
+        self._deleted.add(key)
+        self._length -= 1
+
+    def __iter__(self):
+        for key in self._base:
+            if key not in self._deleted:
+                yield key
+        for key in self._values:
+            if key not in self._base:
+                yield key
+
+    def __len__(self):
+        return self._length
+
+    def copy(self):
+        return dict(self.items())
+
+
+class _CowSet(MutableSet):
+    """A set view that copies its source only when a snapshot mutates it."""
+
+    def __init__(self, base):
+        self._base = base
+        self._values = None
+
+    def _mutable(self):
+        if self._values is None:
+            self._values = set(self._base)
+        return self._values
+
+    def __contains__(self, value):
+        return value in (self._base if self._values is None else self._values)
+
+    def __iter__(self):
+        return iter(self._base if self._values is None else self._values)
+
+    def __len__(self):
+        return len(self._base if self._values is None else self._values)
+
+    def add(self, value):
+        self._mutable().add(value)
+
+    def discard(self, value):
+        self._mutable().discard(value)
+
+    def copy(self):
+        return set(self)
+
+
+class _OverlaySet(MutableSet):
+    """A small immutable-base set revision with per-edit deltas."""
+
+    def __init__(self, base, added=(), removed=()):
+        depth = base._depth + 1 if isinstance(base, _OverlaySet) else 1
+        if isinstance(base, _OverlaySet) and depth > 16:
+            base = set(base)
+            depth = 1
+        self._base = base
+        self._depth = depth
+        self._added = set()
+        self._removed = set()
+        for value in removed:
+            self.discard(value)
+        for value in added:
+            self.add(value)
+
+    def __contains__(self, value):
+        if value in self._added:
+            return True
+        if value in self._removed:
+            return False
+        return value in self._base
+
+    def __iter__(self):
+        for value in self._base:
+            if value not in self._removed and value not in self._added:
+                yield value
+        yield from self._added
+
+    def __len__(self):
+        return (len(self._base) - sum(value in self._base for value in self._removed)
+                + sum(value not in self._base for value in self._added))
+
+    def add(self, value):
+        self._removed.discard(value)
+        if value not in self._base:
+            self._added.add(value)
+
+    def discard(self, value):
+        self._added.discard(value)
+        if value in self._base:
+            self._removed.add(value)
+
+    def evolved(self, *, added=(), removed=()):
+        return _OverlaySet(self, added=added, removed=removed)
+
+
 def native_source_key(store, identity, generation):
     # Borrowed QImages can be edited in place before typed publication. Only
     # bounded resident borrowers need version adoption; cold originals require
@@ -93,33 +227,147 @@ class NativeSourceHeaders:
     every pointer packet. These are input owners, never rendered/cache entries.
     Worker decode/spill/pin adoption must not mutate the retained headers.
     """
-    def __init__(self, tiles, jobs, addresses):
+    def __init__(self, tiles, jobs):
         self.tiles = tiles
-        self.jobs, self.addresses = tuple(jobs), frozenset(addresses)
-        self.edited = {identifier: tuple(key for key, value in owner.entries.items()
-                       if isinstance(value, EditableTile))
-                       for identifier, owner in tiles._tiles.items()}
+        self.jobs = tuple(jobs)
+        self._jobs_by_address = {}
+        self._job_remaining = {}
+        self._job_objects = {}
+        for job in self.jobs:
+            job_id = id(job)
+            addresses_for_job = tuple(getattr(job, 'records', ()))
+            self._job_remaining[job_id] = len(addresses_for_job)
+            self._job_objects[job_id] = job
+            for address in addresses_for_job:
+                self._jobs_by_address.setdefault(address, []).append(job_id)
+
+    def apply_raster_changes(self, source_store, resources):
+        """Patch exact raster source addresses while older snapshots retain theirs."""
+        updates = {}
+        for resource in resources:
+            if (resource.entity[0] != 'object' or resource.resource != 'raster'
+                    or not isinstance(resource.address, tuple) or len(resource.address) != 2
+                    or any(type(value) is not int for value in resource.address)):
+                return False
+            updates[(resource.entity[1], resource.address)] = resource
+
+        prepared = []
+        for (identifier, key), resource in updates.items():
+            source = source_store._tiles.get(identifier)
+            if source is None or key not in source.entries:
+                prepared.append((identifier, key, resource, None, None, None))
+                continue
+            version = source.version(key)
+            value = source.entries.get(key)
+            # A pixel packet produces an editable tile or removes a tile. A
+            # file-backed replacement needs the normal pin/capture path.
+            if not isinstance(value, EditableTile):
+                return False
+            if value.frozen is not None:
+                prepared.append((identifier, key, resource, version,
+                                 EditableTile(value.frozen), None))
+                continue
+            resident = source_store.residency.entries.get((source, key))
+            if resident is None:
+                return False
+            prepared.append((identifier, key, resource, version,
+                             EditableTile(), QImage(resident[0])))
+
+        changed_bounds = {}
+        dirty_add, dirty_remove = set(), set()
+        alpha_dirty_add, alpha_dirty_remove = set(), set()
+        for identifier, key, resource, version, value, image in prepared:
+            header = self.tiles._tiles.get(identifier)
+            if header is None:
+                source = source_store._tiles.get(identifier)
+                if source is None:
+                    continue
+                header = self.tiles._object_tiles(identifier)
+            if identifier not in changed_bounds:
+                # Reassign COW maps instead of mutating shared dictionaries. A
+                # SceneSnapshot may still retain their earlier header revision.
+                header.entries = _CowMap(header.entries)
+                header.versions = _CowMap(header.versions)
+                header.content_keys = _CowMap(header.content_keys)
+                header.snapshot_pins = _CowMap(header.snapshot_pins)
+                header.pending_snapshot_pins = _CowMap(header.pending_snapshot_pins)
+                changed_bounds[identifier] = _CowMap(self.tiles._alpha_bounds.get(identifier, {}))
+            self.tiles.residency.remove(header, key)
+            header.snapshot_pins.pop(key, None)
+            header.pending_snapshot_pins.pop(key, None)
+            marker = (identifier, *key)
+            if value is None:
+                header.entries.pop(key, None)
+                header.versions.pop(key, None)
+                header.content_keys.pop(key, None)
+                changed_bounds[identifier].pop(key, None)
+            else:
+                header.entries[key] = value
+                header.versions[key] = version[0]
+                if key in source.content_keys:
+                    header.content_keys[key] = source.content_keys[key]
+                else:
+                    header.content_keys.pop(key, None)
+                source_bounds = source_store._alpha_bounds.get(identifier, {})
+                if key in source_bounds:
+                    changed_bounds[identifier][key] = source_bounds[key]
+                else:
+                    changed_bounds[identifier].pop(key, None)
+                if image is not None:
+                    self.tiles.residency.retain(header, key, image)
+            if marker in source_store._alpha_bounds_dirty:
+                alpha_dirty_add.add(marker)
+                alpha_dirty_remove.discard(marker)
+            else:
+                alpha_dirty_add.discard(marker)
+                alpha_dirty_remove.add(marker)
+            if marker in source_store.dirty:
+                dirty_add.add(marker)
+                dirty_remove.discard(marker)
+            else:
+                dirty_add.discard(marker)
+                dirty_remove.add(marker)
+            for job_id in self._jobs_by_address.pop((identifier, key), ()):
+                remaining = self._job_remaining.get(job_id, 0) - 1
+                if remaining <= 0:
+                    self._job_remaining.pop(job_id, None)
+                    self._job_objects.pop(job_id, None)
+                else:
+                    self._job_remaining[job_id] = remaining
+
+        for identifier, bounds in changed_bounds.items():
+            self.tiles._alpha_bounds[identifier] = bounds
+        self.tiles._alpha_bounds_dirty = _OverlaySet(
+            self.tiles._alpha_bounds_dirty).evolved(
+                added=alpha_dirty_add, removed=alpha_dirty_remove)
+        self.tiles.dirty = _OverlaySet(self.tiles.dirty).evolved(
+            added=dirty_add, removed=dirty_remove)
+        self.jobs = tuple(job for job in self.jobs if id(job) in self._job_remaining)
+        self.tiles._source_revision = source_store._source_revision
+        return True
 
     def fork(self):
         source = self.tiles
         result = SceneTileStore(source.tile_size, cache_budget=source.residency.budget)
         for identifier, owner in source._tiles.items():
             target = result._object_tiles(identifier)
-            target.entries = owner.entries.copy()
-            target.versions = owner.versions.copy()
-            target.content_keys = owner.content_keys.copy()
-            target.snapshot_pins = owner.snapshot_pins.copy()
-            for key in self.edited[identifier]:
-                target.entries[key] = EditableTile(owner.entries[key].frozen)
-            result._alpha_bounds[identifier] = dict(source._alpha_bounds.get(identifier, {}))
-        # Only edited borrowers need a COW alias. Clean decoded residency is a
-        # worker cache, already transferred through ordinary ReadyOriginals.
+            target.entries = _CowMap(owner.entries)
+            target.versions = _CowMap(owner.versions)
+            target.content_keys = _CowMap(owner.content_keys)
+            target.snapshot_pins = _CowMap(owner.snapshot_pins)
+            target.pending_snapshot_pins = _CowMap(owner.pending_snapshot_pins)
+            result._alpha_bounds[identifier] = _CowMap(source._alpha_bounds.get(identifier, {}))
+        result._alpha_bounds_dirty = _CowSet(source._alpha_bounds_dirty)
+        result.dirty = _CowSet(source.dirty)
+        result._source_revision = source._source_revision
+        # Edited borrowers are bounded by the source header residency budget.
+        # Immutable file paths and frozen tiles stay shared until a snapshot writes.
         for (owner, key), (image, _content) in source.residency.entries.items():
-            if isinstance(owner.entries.get(key), EditableTile):
-                target = result._tiles[owner.object_id]
+            target = result._tiles.get(owner.object_id)
+            value = target.entries.get(key) if target is not None else None
+            if isinstance(value, EditableTile):
+                target.entries[key] = EditableTile(value.frozen)
                 result.residency.retain(target, key, QImage(image))
-        result._alpha_bounds_dirty = set(source._alpha_bounds_dirty)
-        result.dirty = set(source.dirty)
         return result
 
 
@@ -280,22 +528,60 @@ class SceneSnapshotCompiler:
         self.native_sources = None
         self.source_generation = 0
         self.native_source_key = None
+        self.pending_raster_resources = {}
+
+    @staticmethod
+    def _raster_resource_delta(change):
+        """Return exact typed raster addresses suitable for source-header patching."""
+        if (change is None or change.conservative or change.document_fields or change.orders
+                or not change.resources):
+            return None
+        allowed_fields = {'pixels', 'interaction_rect'}
+        resource_entities = {item.entity for item in change.resources}
+        if any(item.entity[0] != 'object' or item.resource != 'raster'
+                or not isinstance(item.address, tuple) or len(item.address) != 2
+                or any(type(value) is not int for value in item.address)
+                for item in change.resources):
+            return None
+        if (not change.entities or {item.entity for item in change.entities} != resource_entities
+                or any(item.structural or item.fields - allowed_fields for item in change.entities)):
+            return None
+        return {(item.entity[1], item.address): item for item in change.resources}
+
+    @staticmethod
+    def _unaffected_native_owners_unchanged(previous, current, changed_objects):
+        if (previous is None or current is None or previous[:3] != current[:3]):
+            return False
+        before = {row[0]: row[1:] for row in previous[4]}
+        after = {row[0]: row[1:] for row in current[4]}
+        return all(before.get(identifier) == after.get(identifier)
+                   for identifier in (before.keys() | after.keys()) - changed_objects)
 
     def invalidate(self, change=None):
         # Only positively known metadata edits may reuse captured originals.
         # Unknown object fields include vector/raster/source replacement and
-        # therefore conservatively retire this owner, as do resource/history
-        # or document changes. This follows ordinary typed invalidation.
+        # therefore conservatively retire this owner. Exact typed raster tile
+        # edits can patch their addressed source headers during capture.
         metadata = {'name', 'expanded', 'saved', 'visible', 'opacity', 'x', 'y',
                     'translation', 'translate_x', 'translate_y', 'transform_frame',
                     'transform_quad', 'transform_preview', 'interaction_rect',
                     'modifier_ids', 'opacity_mask', 'ignore_parent_mask', 'mask_only'}
-        if (change is None or change.conservative or change.structural
-                or change.resources or change.document_fields or change.orders
-                or any(item.entity[0] == 'object' and item.fields - metadata
-                       for item in change.entities)):
+        raster_delta = self._raster_resource_delta(change)
+        invalidates_sources = (
+            change is None or change.conservative or change.structural
+            or change.document_fields or change.orders
+            or bool(change.resources and raster_delta is None)
+            or any(item.entity[0] == 'object' and item.fields - metadata
+                   for item in change.entities) and raster_delta is None
+        )
+        if invalidates_sources:
             self.source_generation += 1
             self.native_sources = self.native_source_key = None
+            self.pending_raster_resources.clear()
+        elif raster_delta is not None and self.native_sources is not None:
+            # Exact raster source changes preserve the retained header basis;
+            # addressed owners are patched at the next ordinary capture.
+            self.pending_raster_resources.update(raster_delta)
         if change is None or change.conservative:
             self.conservative = True
         else:
@@ -321,10 +607,15 @@ class SceneCapture:
         self.source_objects = source_objects
         self.result = None
         self.stale = False
+        self.stage = 'capture_start'
+        self.max_step_ms = 0.0
+        self.max_step_stage = ''
         self.iterator = self._capture()
 
     def advance(self, seconds=.004):
         deadline = time.perf_counter() + max(0., seconds)
+        self.max_step_ms = 0.0
+        self.max_step_stage = ''
         # This GUI-thread slice does not process input events. Validate the
         # full positive contact owner once per entry, then retain the cheap
         # identity/revision checks at every incremental copy yield.
@@ -339,15 +630,25 @@ class SceneCapture:
                     self.owner._document_projection.revision != self.document.revision):
                 self.stale = True
                 return True
+            step_started = time.perf_counter()
             try:
                 next(self.iterator)
             except StopIteration:
+                self._record_step(step_started, time.perf_counter())
                 return True
+            self._record_step(step_started, time.perf_counter())
             if time.perf_counter() >= deadline:
                 return False
 
+    def _record_step(self, started, ended):
+        duration_ms = max(0., (ended - started) * 1000.)
+        if duration_ms > self.max_step_ms:
+            self.max_step_ms = duration_ms
+            self.max_step_stage = self.stage
+
     def _capture(self):
         compiler, owner = self.compiler, self.owner
+        self.stage = 'chapter_copy'
         identity = self.document.identity
         if compiler.resource_identity != identity:
             compiler.resource_identity = identity
@@ -357,10 +658,12 @@ class SceneCapture:
         records = {}
         strokes = {}
         for field in fields(chapter):
+            self.stage = f'chapter_field:{field.name}'
             if field.name in GROUP_KINDS:
                 group, kind = field.name, GROUP_KINDS[field.name]
                 detached = {}
                 for identifier, record in getattr(owner.chapter, group).items():
+                    self.stage = f'record_group:{group}'
                     if group == 'objects' and self.source_objects is not None and identifier not in self.source_objects:
                         continue
                     ref = kind, identifier
@@ -368,6 +671,7 @@ class SceneCapture:
                     if fresh or ref in compiler.dirty or saved is None:
                         from comic_editor.core.models import VectorDrawingObject
                         if isinstance(record, VectorDrawingObject):
+                            self.stage = 'record_copy:vector'
                             saved = copy.copy(record)
                             for member in fields(record):
                                 if member.name != "strokes":
@@ -395,6 +699,7 @@ class SceneCapture:
                                 saved.strokes.append(frozen)
                                 yield
                         else:
+                            self.stage = f'record_copy:{group}'
                             saved = yield from detached_slices(record)
                         compiler.copied_records += 1
                     elif hasattr(record, "strokes"):
@@ -410,6 +715,7 @@ class SceneCapture:
                 setattr(chapter, field.name, (yield from detached_slices(getattr(owner.chapter, field.name))))
         state, jobs, active_resources = {}, [], set()
         for name in SCENE_FIELDS:
+            self.stage = f'scene_field:{name}'
             if hasattr(owner, name):
                 value = getattr(owner, name)
                 if name == '_cage_session' and value is not None:
@@ -433,34 +739,73 @@ class SceneCapture:
         yield
         settings = SimpleNamespace(predictive_ink=bool(owner.settings.predictive_ink),
                                    canvas_renderer=owner.settings.canvas_renderer)
+        self.stage = 'image_sources_clone'
         images = owner.images.clone() if self.source_objects is None else ImageStore()
         # Retain already decoded original/working buffers through independent
         # QImage handles. This also supports decoded publication sources whose
         # encoded resource is being adopted by the source owner.
         for key, image in (owner.images._decoded.items() if self.source_objects is None else ()):
+            self.stage = 'decoded_image_alias'
             alias = QImage(image)
             images._cache_decoded(key, alias)
             images._adopt_owned_decode(key, alias, owner.images._owned_decodes.get(key))
             yield
         source_keys = (None if self.source_objects is None else
             {identifier: tuple(owner.tiles._tiles.get(identifier, ())) for identifier in self.source_objects})
-        source_key = native_source_key(owner.tiles, identity, self.compiler.source_generation)
+        source_reused = False
+        pending_sources = (tuple(compiler.pending_raster_resources.values())
+                           if self.source_objects is None else ())
+        if pending_sources and compiler.native_sources is not None:
+            previous_key = compiler.native_source_key
+            if compiler.native_sources.apply_raster_changes(owner.tiles, pending_sources):
+                for resource in pending_sources:
+                    compiler.resource_pins.pop(
+                        ('document', resource.entity[1], resource.address), None)
+                expected_revision = owner.tiles._source_revision
+                self.stage = 'native_source_key'
+                source_key = native_source_key(owner.tiles, identity, compiler.source_generation)
+                untouched = {identifier for identifier, _key in compiler.pending_raster_resources}
+                if (owner.tiles._source_revision == expected_revision
+                        and compiler._unaffected_native_owners_unchanged(
+                            previous_key, source_key, untouched)):
+                    compiler.native_source_key = source_key
+                else:
+                    compiler.source_generation += 1
+                    compiler.native_sources = compiler.native_source_key = None
+                    self.stage = 'native_source_key_fallback'
+                    source_key = native_source_key(owner.tiles, identity, compiler.source_generation)
+                compiler.pending_raster_resources.clear()
+            else:
+                compiler.source_generation += 1
+                compiler.native_sources = compiler.native_source_key = None
+                compiler.pending_raster_resources.clear()
+                self.stage = 'native_source_key_fallback'
+                source_key = native_source_key(owner.tiles, identity, compiler.source_generation)
+        else:
+            self.stage = 'native_source_key'
+            source_key = native_source_key(owner.tiles, identity, compiler.source_generation)
         if (self.source_objects is None and compiler.native_sources is not None
                 and compiler.native_source_key == source_key):
             sources = compiler.native_sources
+            self.stage = 'native_source_fork'
             tiles = sources.fork()
-            pins, addresses = sources.jobs, sources.addresses
+            pins, addresses = sources.jobs, ()
+            source_reused = True
             yield
         else:
+            self.stage = 'native_source_capture'
             tiles, pins, addresses = yield from self._capture_tiles(owner.tiles, 'document', source_keys=source_keys)
             if self.source_objects is None:
                 # Keep the capture owner private; give the evaluator its own
                 # headers before it can prepare pins, decode or spill originals.
-                sources = NativeSourceHeaders(tiles, tuple(dict.fromkeys(pins)), addresses)
+                sources = NativeSourceHeaders(tiles, tuple(dict.fromkeys(pins)))
                 compiler.native_sources, compiler.native_source_key = sources, source_key
+                compiler.pending_raster_resources.clear()
+                self.stage = 'native_source_fork'
                 tiles = sources.fork()
         jobs.extend(pins)
-        active_resources.update(addresses)
+        if not source_reused:
+            active_resources.update(addresses)
         jobs = tuple(dict.fromkeys(jobs))
         captured = self.document.configuration[-1] if self.document.configuration else None
         if (isinstance(captured, tuple) and captured and captured[0] == 'pixel-environment'
@@ -480,6 +825,7 @@ class SceneCapture:
                     break
                 yield
         else:
+            self.stage = 'color_environment'
             environment = capture_color_environment(chapter.pixel_contract)
             if (isinstance(captured, tuple) and captured and captured[0] == 'pixel-environment'
                     and captured[2] != environment.signature):
@@ -488,8 +834,13 @@ class SceneCapture:
         if self.source_objects is None:
             compiler.identity, compiler.records = identity, records
             compiler.stroke_records = strokes
-            compiler.resource_pins = {address: value for address, value in compiler.resource_pins.items()
-                if address in active_resources}
+            if source_reused:
+                compiler.resource_pins = {address: value
+                    for address, value in compiler.resource_pins.items()
+                    if address[0] == 'document' or address in active_resources}
+            else:
+                compiler.resource_pins = {address: value for address, value in compiler.resource_pins.items()
+                    if address in active_resources}
             compiler.dirty.clear()
             compiler.conservative = False
         # A scoped original-source capture is never a scene/artwork cache owner.
@@ -504,6 +855,7 @@ class SceneCapture:
             resident = getattr(backing, 'resident', None)
             if resident is not None:
                 cache_spec = (*cache_spec, resident)
+        self.stage = 'snapshot_publish'
         self.result = SceneSnapshot(self.document, chapter, tiles, images, state,
             (owner.width(), owner.height()), settings, jobs,
             getattr(owner, "_graphics_worker", None),
@@ -512,6 +864,7 @@ class SceneCapture:
     def _capture_tiles(self, source_store, namespace, *, source_keys=None):
         """Stage independent native handles and pins for artwork or live ink."""
         compiler = self.compiler
+        self.stage = f'tile_header_capture:{namespace}'
         tiles = SceneTileStore(source_store.tile_size, cache_budget=64 * 1024 * 1024)
         jobs, pending = [], []
         active_resources = set()
@@ -530,8 +883,10 @@ class SceneCapture:
             ((identifier, source_store._tiles[identifier]) for identifier in source_keys
              if identifier in source_store._tiles))
         for identifier, source in owners:
+            self.stage = f'tile_owner_capture:{namespace}'
             target = tiles._object_tiles(identifier)
             for key in source if source_keys is None else source_keys.get(identifier, ()):
+                self.stage = f'tile_entry_capture:{namespace}'
                 source.version(key)
                 value = source.entries[key]
                 if isinstance(value, Path):

@@ -124,6 +124,14 @@ evaluate it without a widget. Ordinary widget paints present ready resources.
 
 ### Raster presentation continuity
 
+Live and retained raster feedback use the current UI canvas surround color at
+the presentation edge. Flattened feedback keys and retained presentation view
+ownership include that color; theme changes cannot replay a prior opaque
+surround. Native sources, working pixels and exact RAM/disk identities remain
+independent of the palette. Idle painting-tool hover damage coalesces to 16 ms
+from the last actual paint; first native admission promotes its pending timer
+immediately. Source samples and ordered contacts are never coalesced.
+
 Contiguous document, retained contact and current feedback passes use ordered
 `PresentedTileGroup` records. GPU presentation validates the union of their
 texture revisions before drawing, then shares one real GL state snapshot,

@@ -7,6 +7,7 @@ import pytest
 from PySide6.QtCore import QPointF, QRectF
 from PySide6.QtGui import QColor, QImage, QPainter
 
+from comic_editor.ui.themes import theme_color
 from comic_editor.ui.raster_feedback import replace_raster_feedback_batch
 from comic_editor.ui.document_presentation import draw_document_tiles, draw_document_border
 from test_raster_contact_feedback import scene, ready_paint, pixels
@@ -43,7 +44,7 @@ def test_owned_complete_native_batch_matches_fresh_source_and_refreshes_context(
     canvas, selected, document, requests, base = setup_contact(scene, wait_scene, qapp, tool)
     original = [(tile.image.cacheKey(), bytes(tile.image.constBits())) for _phase, tiles in base for tile in tiles]
     image = QImage(canvas.size(), QImage.Format_ARGB32_Premultiplied)
-    image.fill(QColor('#242428'))
+    image.fill(theme_color('canvas', '#242428'))
     painter = QPainter(image)
     try:
         painter.setRenderHint(QPainter.Antialiasing, True)

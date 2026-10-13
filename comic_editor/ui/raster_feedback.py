@@ -5,6 +5,7 @@ import math
 from PySide6.QtCore import QRect, QRectF, Qt
 from PySide6.QtGui import QColor, QImage, QPaintEngine, QPainter, QPen, QTransform
 from comic_editor.core.tools import ToolKind
+from comic_editor.ui.themes import theme_color
 from comic_editor.ui.document_presentation import (PresentedTile, draw_document_tiles,
     _NATIVE_RASTER_MOSAIC_BYTES, _NATIVE_RASTER_MOSAIC_SIDE, _NATIVE_RASTER_MOSAIC_TILES)
 
@@ -189,7 +190,7 @@ def _compose_tile(canvas, prepared, tile, resident, flatten=True, prediction=Tru
         return image
     # Flatten once at the presentation edge, after every scene component.
     presented = QImage(image.size(), QImage.Format_ARGB32_Premultiplied)
-    presented.fill(QColor('#242428'))
+    presented.fill(theme_color('canvas', '#242428'))
     display = QPainter(presented)
     try:
         display.drawImage(0, 0, image)
@@ -283,6 +284,7 @@ def _raster_feedback_tiles(canvas, prepared, dirty_keys, cache, replace_native, 
         predictive[0].x(), predictive[0].y(), predictive[1].x(), predictive[1].y(),
         predictive[2], predictive[3].rgba())
     prediction_bounds = None
+    background_key = None if replace_native else theme_color('canvas', '#242428').rgba()
     if predictive is not None:
         margin = predictive[2] / 2. + 2.
         prediction_bounds = QRectF(predictive[0], predictive[1]).normalized().adjusted(
@@ -323,7 +325,7 @@ def _raster_feedback_tiles(canvas, prepared, dirty_keys, cache, replace_native, 
         # removes the previous transient pen exactly once.
         local_prediction = (prediction_key if prediction_bounds is not None
             and QRectF(*tile.bounds).intersects(prediction_bounds) else None)
-        signature = (id(prepared), (local_prediction, replace_native),
+        signature = (id(prepared), (local_prediction, replace_native, background_key),
             cache.source_signature(prepared, tile, resident))
         presented = cache.get(tile.key, signature)
         if presented is None:
@@ -428,7 +430,7 @@ def present_raster_feedback(canvas, painter, prepared, dirty_keys, cache, *, dra
         (draw_document_tiles if draw_tiles is None else draw_tiles)(
             painter, presented_tiles, camera, canvas.size(), owner=canvas,
             smooth=True, clip_world=None if replace_native else prepared.document.bounds,
-            replace_background=QColor('#242428') if replace_native else None)
+            replace_background=theme_color('canvas', '#242428') if replace_native else None)
         controller = canvas._scene_controller
         basis = controller._presentation_batch
         if basis is not None and canvas._predictive is None:

@@ -12,7 +12,7 @@ import time
 import weakref
 
 from PySide6 import __version__ as pyside_version
-from PySide6.QtCore import QEvent, QObject, QTimer, Signal, qVersion
+from PySide6.QtCore import QEvent, QObject, QTimer, Signal, Qt, qVersion
 from PySide6.QtWidgets import QApplication
 
 from comic_editor.core.performance_monitor import PerformanceRecorder
@@ -90,6 +90,11 @@ class PerformanceMonitorController(QObject):
         self._feedback_contact_serial = 0
         self._feedback_contact_wait = None
         self._active_feedback_paint = None
+        self._input_receipt = None
+        self._current_input_receipt = None
+        self._input_receipt_serial = 0
+        self._gate_input_receipts = weakref.WeakKeyDictionary()
+        self._deferred_input_receipts = {}
         self._text_presentation_serial = 0
         self._text_presentation_wait = None
         self._editor_metrics = {}
@@ -257,6 +262,17 @@ class PerformanceMonitorController(QObject):
         if name in {"set_tool", "_activate_tool", "_activate_named_tool"}:
             details["requested_tool"] = _value(args[0]) if args else _value(kwargs.get("tool"))
             details["previous_tool"] = _value(self.canvas.tool)
+        elif name == "_apply":
+            command = args[0] if args else kwargs.get("command")
+            action = args[1] if len(args) > 1 else kwargs.get("action")
+            details["history_action"] = str(action)[:16] if action is not None else None
+            details["history_command_type"] = type(command).__name__ if command is not None else None
+        elif name == "_publish_change_set":
+            change = args[0] if args else kwargs.get("change")
+            details["change_action"] = str(kwargs.get("action", "transient"))[:16]
+            details["entity_changes"] = len(getattr(change, "entities", ()))
+            details["resource_changes"] = len(getattr(change, "resources", ()))
+            details["conservative"] = bool(getattr(change, "conservative", False))
         elif name == "set_selection":
             details["requested_selection"] = [_value(value) for value in args[:2]]
         elif name == "set_solo_entities":
@@ -762,12 +778,71 @@ class PerformanceMonitorController(QObject):
             self._critical_paint_epoch = epoch
         self._critical_paint_boundaries.add(boundary)
 
+    def _receipt_current(self, receipt, epoch):
+        return (receipt is not None and not receipt['finished']
+            and receipt['epoch'] == epoch and receipt['generation'] is self._capture_generation
+            and receipt['chapter'] == id(self.canvas.chapter)
+            and receipt['tiles'] == id(self.canvas.tiles))
+
+    def _cancel_receipt(self, receipt, reason):
+        if receipt is None or receipt['finished']:
+            return
+        receipt['finished'] = True
+        self.recorder.record_event('canvas.contact_frame.cancelled', category='diagnostic',
+            details={'receipt_serial': receipt['serial'], 'source_id': receipt['source_id'],
+                'reason': reason, 'tool': receipt['tool']},
+            capture_epoch=receipt['epoch'], critical=True)
+
+    def _clear_input_receipts(self, reason):
+        self._cancel_receipt(self._input_receipt, reason)
+        for receipt in self._gate_input_receipts.values():
+            self._cancel_receipt(receipt, reason)
+        for _journal, receipt in self._deferred_input_receipts.values():
+            self._cancel_receipt(receipt, reason)
+        self._input_receipt = self._current_input_receipt = None
+        self._gate_input_receipts.clear()
+        self._deferred_input_receipts.clear()
+
+    def _receipt_begin(self, name, epoch):
+        journal_name = ('_paint_brush_deferred' if 'paint_brush' in name else '_raster_deferred_strokes')
+        journal = getattr(self.canvas, journal_name, ()) or ()
+        if name.startswith('_start_deferred_'):
+            entry = self._deferred_input_receipts.pop(id(journal[0]), None) if journal else None
+            receipt = entry[1] if entry is not None and entry[0] is journal[0] else None
+        else:
+            receipt = self._current_input_receipt or self._input_receipt
+            if receipt is self._input_receipt:
+                self._input_receipt = None
+        return (receipt if self._receipt_current(receipt, epoch) else None,
+                journal_name, len(journal))
+
+    def _bind_input_receipt(self, receipt, journal_name, before):
+        if not self._receipt_current(receipt, self.recorder.capture_epoch):
+            return
+        journal = getattr(self.canvas, journal_name, ()) or ()
+        if len(journal) > before:
+            entry = journal[-1]
+            if len(self._deferred_input_receipts) >= 512:
+                _old_journal, old_receipt = self._deferred_input_receipts.pop(
+                    next(iter(self._deferred_input_receipts)))
+                self._cancel_receipt(old_receipt, 'diagnostic_capacity')
+            self._deferred_input_receipts[id(entry)] = entry, receipt
+            return
+        gate_name = '_paint_brush_tile_input' if journal_name == '_paint_brush_deferred' else '_raster_tile_input'
+        gate = getattr(self.canvas, gate_name, None)
+        if (gate is not None and not gate.closed and gate.identifier == receipt['source_id']
+                and gate.chapter is self.canvas.chapter and gate.tiles is self.canvas.tiles):
+            self._gate_input_receipts[gate] = receipt
+        else:
+            self._cancel_receipt(receipt, 'not_admitted')
+
     def _arm_feedback_contact(self, epoch):
         # Only an actual native begin can arm this diagnostic. A Ctrl-click's
         # input receipt in a drawing tool does not establish a new contact.
         canvas = self.canvas
         from comic_editor.ui.tile_input import TileInputGate
-        gate = getattr(canvas, '_raster_tile_input', None)
+        gate = getattr(canvas, '_paint_brush_tile_input' if _value(canvas.tool) == 'brush'
+                       else '_raster_tile_input', None)
         if (not isinstance(gate, TileInputGate) or gate.closed or gate.error is not None
                 or gate.canvas is not canvas or gate.chapter is not canvas.chapter
                 or gate.tiles is not canvas.tiles or gate.identifier != canvas.selected_id
@@ -780,7 +855,8 @@ class PerformanceMonitorController(QObject):
         self._feedback_contact_serial += 1
         self._feedback_contact_wait = {'gate': weakref.ref(gate), 'epoch': epoch,
             'generation': self._capture_generation, 'serial': self._feedback_contact_serial,
-            'source_id': gate.identifier, 'tool': _value(canvas.tool)}
+            'source_id': gate.identifier, 'tool': _value(canvas.tool),
+            'receipt': self._current_input_receipt or self._gate_input_receipts.get(gate)}
 
     def _observe_feedback_batch(self, owner, args, result):
         paint = self._active_feedback_paint
@@ -803,11 +879,13 @@ class PerformanceMonitorController(QObject):
             return
         canvas = self.canvas
         gate = waiting['gate']()
-        if (gate is None or gate is not getattr(canvas, '_raster_tile_input', None)
+        gate_name = '_paint_brush_tile_input' if waiting['tool'] == 'brush' else '_raster_tile_input'
+        if (gate is None or gate is not getattr(canvas, gate_name, None)
                 or gate.closed or gate.error is not None or gate.canvas is not canvas
                 or gate.chapter is not canvas.chapter or gate.tiles is not canvas.tiles
                 or canvas.selected_kind != 'object' or canvas.selected_id != waiting['source_id']
                 or _value(canvas.tool) != waiting['tool']):
+            self._cancel_receipt(waiting.get('receipt'), 'owner_changed')
             self._feedback_contact_wait = None
             return
         presentation = getattr(canvas, '_document_presentation_stats', None)
@@ -841,6 +919,15 @@ class PerformanceMonitorController(QObject):
         if cpu_duration is not None:
             self.recorder.record_event('canvas.contact_frame.first_covered.thread_cpu', cpu_duration,
                 category='gui_cpu', details={**outcome, 'clock': 'thread_cpu'},
+                capture_epoch=waiting['epoch'], critical=True)
+        receipt = waiting.get('receipt')
+        if self._receipt_current(receipt, waiting['epoch']):
+            receipt['finished'] = True
+            self.recorder.record_event('canvas.contact_frame.receipt_to_first_covered',
+                max(0., (time.perf_counter() - receipt['received']) * 1000.), category='latency',
+                details={**outcome, 'receipt_serial': receipt['serial'],
+                    'input_kind': receipt['input_kind'],
+                    'timing_boundary': 'application event receipt to completed covered paint; excludes driver/scanout'},
                 capture_epoch=waiting['epoch'], critical=True)
 
     def _patch_owned(self, owner, name, label, *, start_scope=None, cache=False, cpu=False,
@@ -917,6 +1004,7 @@ class PerformanceMonitorController(QObject):
             critical_duration = critical_cpu = critical_end = None
             critical_origin = controller.recorder._origin if critical_min_ms is not None else None
             raised = None
+            result = _MISSING
             retain_timeline = True
             text_serial = controller._text_draw_serial(token.epoch) if text_draw else None
             if scope in begin_scopes:
@@ -995,6 +1083,17 @@ class PerformanceMonitorController(QObject):
                                 category='gui_cpu' if details['thread'] == 'gui' else 'worker_cpu',
                                 details={**final, 'clock': 'thread_cpu'}, capture_epoch=token.epoch,
                                 retain_timeline=False, critical=True)
+                if selected_label in {'scene.capture_slice', 'cage.capture_slice'}:
+                    capture = args[0] if args else None
+                    step_ms = getattr(capture, 'max_step_ms', 0.)
+                    if step_ms >= 4.:
+                        controller.recorder.record_event('scene.capture_step.slow', step_ms,
+                            category='diagnostic', details={**details,
+                                'capture_stage': str(getattr(capture, 'max_step_stage', ''))[:96],
+                                'step_ms': round(step_ms, 3),
+                                'slice_complete': result if isinstance(result, bool) else None,
+                                'exception_type': raised}, capture_epoch=token.epoch,
+                            retain_timeline=False, critical=True)
             if cache:
                 # Worker cache hit counters use the recorder's existing lock.
                 controller.recorder.record_event(selected_label + (".miss" if result is None else ".hit"),
@@ -1328,6 +1427,8 @@ class PerformanceMonitorController(QObject):
             details.update(scope, capture_epoch=token.epoch)
             paint_boundaries = ()
             font_before = None
+            receipt_begin = None
+            previous_receipt = controller._current_input_receipt
             if gui and not global_probe:
                 if owner is controller.canvas:
                     if name in {'set_tool', 'set_selection', 'set_document'}:
@@ -1340,7 +1441,15 @@ class PerformanceMonitorController(QObject):
                 if owner is controller.canvas and name in {'set_tool', 'set_selection', 'set_document',
                         '_begin_stroke', '_cancel_native_raster_stroke', '_cancel_mask_stroke',
                         '_cancel_paint_brush', '_restore_history_state'}:
+                    if controller._feedback_contact_wait is not None:
+                        controller._cancel_receipt(controller._feedback_contact_wait.get('receipt'), name)
                     controller._feedback_contact_wait = None
+                    if name != '_begin_stroke' and previous_receipt is None:
+                        controller._clear_input_receipts(name)
+                if owner is controller.canvas and name in {'_begin_stroke', '_begin_paint_brush',
+                        '_start_deferred_raster_stroke', '_start_deferred_paint_brush'}:
+                    receipt_begin = controller._receipt_begin(name, token.epoch)
+                    controller._current_input_receipt = receipt_begin[0]
                 if name in {'_begin_stroke', '_end_stroke', '_begin_stroke_impl', '_end_stroke_impl'}:
                     controller._mark_contact_frame({
                         '_begin_stroke': 'after_begin', '_end_stroke': 'after_release',
@@ -1392,8 +1501,18 @@ class PerformanceMonitorController(QObject):
                                 (time.perf_counter()-started_wall)*1000., elapsed_cpu, details)
                     finally:
                         controller._active_feedback_paint = previous_feedback_paint
-            if gui and owner is controller.canvas and name == '_begin_stroke_impl':
-                controller._arm_feedback_contact(token.epoch)
+                if receipt_begin is not None:
+                    try:
+                        if raised is None and not name.startswith('_start_deferred_'):
+                            controller._bind_input_receipt(*receipt_begin)
+                            if name == '_begin_paint_brush':
+                                controller._arm_feedback_contact(token.epoch)
+                        elif raised is not None:
+                            controller._cancel_receipt(receipt_begin[0], raised)
+                    finally:
+                        controller._current_input_receipt = previous_receipt
+                if gui and owner is controller.canvas and name == '_begin_stroke_impl' and raised is None:
+                    controller._arm_feedback_contact(token.epoch)
             if gui and owner is controller.canvas:
                 controller._observe_text_action(name, args, kwargs, result, token.epoch, font_before)
             if gui and name == 'filtered_batch':
@@ -1406,6 +1525,8 @@ class PerformanceMonitorController(QObject):
                     details={**details,
                         'presentation_backend': str(getattr(presentation, 'backend', ''))[:32],
                         'frame_pending': bool(getattr(controller.canvas, '_projection_frame_pending', False)),
+                        'gpu_pending': bool(getattr(controller.canvas, '_gpu_presentation_pending', False)),
+                        'presentation_replayed': str(getattr(presentation, 'backend', '')) == 'gpu-pending',
                         'feedback_contact_covered': bool(getattr(controller.canvas, '_raster_feedback_contact_covered', False)),
                         'presented_revision': getattr(controller.canvas, '_projection_presented_revision', -1)},
                     capture_epoch=token.epoch, critical=True)
@@ -1427,9 +1548,18 @@ class PerformanceMonitorController(QObject):
                      "_sync_contextual_ribbon", "_refresh_hierarchy", "_refresh_masks_panel"):
             self._patch(self.window, name, "window." + name.lstrip("_"),
                         transition=name in {"_activate_tool", "_activate_named_tool"})
+        self._patch(self.window, "_undo", "window.undo", cpu=True, critical=True)
+        self._patch(canvas.command_stack, "undo", "history.undo", cpu=True, critical=True)
+        self._patch(canvas.command_stack, "_apply", "history.apply", cpu=True, critical=True)
+        self._patch(self.window, '_forward_popup_tablet_event', 'window.popup_tablet', cpu=True)
+        chrome = getattr(self.window, 'window_chrome', None)
+        if chrome is not None:
+            self._patch(chrome, 'native_event', 'window.native_hit_test', cpu=True)
         for name in ("set_tool", "set_selection", "set_solo_entities", "set_document"):
             self._patch(canvas, name, "canvas." + name, transition=True)
         phases = (
+            'tabletEvent', '_update_interaction_cursor',
+            '_begin_paint_brush', '_start_deferred_raster_stroke', '_start_deferred_paint_brush',
             "paintEvent", "_paint_canvas_frame", "_paint_ready_document_projection", "_ensure_scene_cache", "_render_scene_cache_rect", "render_preview",
             "_paint_document_projection", "_collect_document_projection",
             "_render_document_tiles", "_render_document_region", "_show_on_top_plan",
@@ -1453,7 +1583,8 @@ class PerformanceMonitorController(QObject):
         )
         for name in phases:
             self._patch(canvas, name, "canvas." + name.lstrip("_"),
-                cpu=name in {'paintEvent', '_begin_stroke_admitted', '_end_stroke_admitted',
+                cpu=name in {'paintEvent', 'tabletEvent', '_update_interaction_cursor',
+                            '_begin_stroke_admitted', '_end_stroke_admitted',
                             '_begin_stroke_impl', '_end_stroke_impl',
                             '_begin_drawing_selection_transform', '_prepare_multi_raster_selection'},
                 critical=name in {'_begin_stroke', '_end_stroke', '_begin_stroke_admitted',
@@ -1668,6 +1799,7 @@ class PerformanceMonitorController(QObject):
                     return
                 if signal_name in {'cameraChanged', 'hierarchyChanged', 'toolChanged',
                         'selectionChanged', 'soloChanged'}:
+                    self._clear_input_receipts(signal_name)
                     self._feedback_contact_wait = None
                 self._counts[signal_name] += 1
                 if signal_name in {"toolChanged", "selectionChanged", "soloChanged", "interactionFinished"}:
@@ -1735,6 +1867,7 @@ class PerformanceMonitorController(QObject):
     def _detach_instrumentation(self, *, qt_alive=True):
         """Restore Python patches even when Qt is already destroying widgets."""
         global _active_controller
+        self._clear_input_receipts('monitor_stopped')
         self._capture_generation = None
         self._owned_schedulers = ()
         self._owned_capture_adapters = ()
@@ -1913,6 +2046,23 @@ class PerformanceMonitorController(QObject):
                 self._counts[name] += 1
                 if event.type() in {QEvent.MouseButtonPress, QEvent.MouseButtonRelease,
                                     QEvent.TabletPress, QEvent.TabletRelease}:
+                    pen = event.type() in {QEvent.TabletPress, QEvent.TabletRelease}
+                    held_button_transition = (pen and getattr(self.canvas, '_pen_contact_active', False)
+                        and getattr(self.canvas, '_tablet_tool_active', False)
+                        and hasattr(event, 'pressure') and event.pressure() > 0.
+                        and event.buttons() != Qt.NoButton)
+                    if event.type() in {QEvent.MouseButtonPress, QEvent.TabletPress} and not held_button_transition:
+                        self._cancel_receipt(self._input_receipt, 'next_press')
+                        self._input_receipt_serial += 1
+                        self._input_receipt = {'received': time.perf_counter(),
+                            'epoch': self.recorder.capture_epoch, 'generation': self._capture_generation,
+                            'chapter': id(self.canvas.chapter), 'tiles': id(self.canvas.tiles),
+                            'source_id': self.canvas.selected_id, 'tool': _value(self.canvas.tool),
+                            'input_kind': 'tablet' if pen else 'mouse',
+                            'serial': self._input_receipt_serial, 'finished': False}
+                    elif not held_button_transition:
+                        self._cancel_receipt(self._input_receipt, 'released_without_admission')
+                        self._input_receipt = None
                     self._mark_contact_frame('after_press' if event.type() in {
                         QEvent.MouseButtonPress, QEvent.TabletPress} else 'after_release',
                         self.recorder.capture_epoch)
