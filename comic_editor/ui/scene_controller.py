@@ -8,6 +8,7 @@ from comic_editor.render.projection import ProjectionRequest
 from comic_editor.render.admission import CopyLease, RENDER_ADMISSION
 from comic_editor.render.scheduler import SceneDemand, SceneScheduler
 from comic_editor.render.ordinary_contact_capture import CaptureAdmissionUnavailable, CaptureUnavailable, ContactSceneSnapshot, OrdinaryContactCapture
+from comic_editor.render.geometry_capture import GeometryCapture, GeometrySceneSnapshot, gesture as geometry_gesture, owned_change as geometry_owned_change
 from comic_editor.ui.document_presentation import PresentedTile
 from comic_editor.ui.raster_feedback import RasterFeedbackPatchCache
 
@@ -27,10 +28,15 @@ class SceneController(QObject):
         self.dispatched = None
         self.preview = None
         self._preview_snapshot = self._preview_request = None
+        from comic_editor.ui.visibility_presentation import VisibilityPresentation
+        self.visibility_presentation = VisibilityPresentation(self)
         from comic_editor.ui.release_handoff import ReleaseHandoff
         self.release_handoff = ReleaseHandoff(self)
+        from comic_editor.ui.geometry_presentation_continuity import GeometryPresentationContinuity
+        self.geometry_continuity = GeometryPresentationContinuity(self)
         if hasattr(canvas, "frameSwapped"):
             canvas.frameSwapped.connect(self.release_handoff.swapped)
+            canvas.frameSwapped.connect(self.geometry_continuity.swapped)
         self.overview = None
         self.error = ""
         self.preview_mode = False
@@ -41,6 +47,10 @@ class SceneController(QObject):
         self._contact_preview_dependency_generation = 0
         self._presentation_dependency_generation = 0
         self._contact_preview_presented_revision = -1
+        self._geometry_preview_owner = self._geometry_preview_key = None
+        self._geometry_preview_before = None
+        self._geometry_preview_generation = self._geometry_preview_dependency_generation = 0
+        self._geometry_preview_presented_revision = -1
         self.feedback = None
         self.feedback_dirty = set()
         self.feedback_patches = RasterFeedbackPatchCache()
@@ -59,7 +69,12 @@ class SceneController(QObject):
         self._filtered_state = None
         self._filtered_requests = ()
         self._filtered_lifetime = {'state':None}
+        self._feedback_request_generation = 0
+        self._feedback_selection_generation = 0
         self.filteredFinished.connect(self.advance,Qt.QueuedConnection)
+        if hasattr(canvas, 'frameSwapped'):
+            canvas.frameSwapped.connect(self._remember_filtered_presented_basis)
+        canvas.selectionChanged.connect(self._filtered_selection_changed)
         lifetime = self._filtered_lifetime
         self.destroyed.connect(lambda: lifetime['state'].close() if lifetime['state'] is not None else None)
         self._cpu_pending = set()
@@ -72,15 +87,18 @@ class SceneController(QObject):
         self.destroyed.connect(lambda: bootstrap_scheduler.close())
 
     def reset(self, *, retain_presentation=False):
+        self.visibility_presentation.clear(native=True)
         if not retain_presentation:
             self._presentation_dependency_generation += 1
             self.raster_continuity.reset()
             self._presentation_batch = None
         self._retire_contact_preview()
+        self._retire_geometry_preview()
         self._retire_bootstrap()
         self._bootstrap_failed = None
         self._retire_filtered()
         self.release_handoff.clear("controller reset")
+        self.geometry_continuity.clear()
         self._preview_snapshot = self._preview_request = None
         self.scheduler.cancel()
         self.capture = self.snapshot = self.desired = self.dispatched = self.preview = self.overview = None
@@ -97,6 +115,11 @@ class SceneController(QObject):
 
     def request(self, document, requests, phases, visible):
         from comic_editor.core.models import RasterObject
+        self._feedback_request_generation += 1
+        if self._filtered_state is not None and self._filtered_state.selection_handoff is not None:
+            # The synchronous sibling transaction must return before any
+            # document draw. A selected-away paint cannot acquire this owner.
+            self.retire_feedback()
         target = self.canvas.selected_id if (self.canvas.selected_kind == 'object' and
             isinstance(self.canvas.chapter.objects.get(self.canvas.selected_id), RasterObject)) else ''
         if target != self.feedback_target:
@@ -122,13 +145,17 @@ class SceneController(QObject):
         self.preview_mode = (not visible.isEmpty() and
             (document.live_preview or view_bytes > self.canvas._document_projection.budget // 2))
         signature = document, tuple(request.address for request in requests), tuple(phases), tuple(visible.getRect())
+        self.visibility_presentation.request(*signature)
         self._ensure_bootstrap(document, requests, phases, signature[3])
         if self._filtered_state is not None and (
                 document.identity != self.feedback.document.identity or
                 document.configuration != self.feedback.document.configuration):
             self.retire_feedback()
         self._filtered_requests = tuple(requests)
-        if self._filtered_state is not None and not self._filtered_state.advance(document):
+        self._check_provisional_filtered()
+        if self._filtered_state is not None and not self._filtered_state.advance(document,
+                capture=not self._filtered_state.provisional
+                    or self._provisional_contact_gate(document) is not None):
             self.retire_feedback()
         gate = (self._pending_native_contact_gate(document)
             or self._bootstrap_contact_gate(document, signature[3])
@@ -153,6 +180,18 @@ class SceneController(QObject):
                 self._contact_preview_owner = (self._contact_preview_generation, contact_key)
         contact_continues = (self._contact_preview_owner is not None
             and self._contact_preview_owner == previous_owner)
+        geometry_key = self._geometry_preview_key_for(document, signature[1], signature[2], signature[3])
+        previous_geometry = self._geometry_preview_owner
+        if geometry_key != self._geometry_preview_key:
+            self._retire_geometry_preview()
+            self.desired = self.dispatched = None
+            if geometry_key is not None:
+                self._geometry_preview_generation += 1
+                self._geometry_preview_key = geometry_key
+                self._geometry_preview_owner = self._geometry_preview_generation, geometry_key
+                self._geometry_preview_before = geometry_gesture(self.canvas)[0]
+        geometry_continues = (self._geometry_preview_owner is not None
+            and self._geometry_preview_owner == previous_geometry)
         if self._contact_reuse_gate is not None:
             # Release or any eligibility change resumes ordinary guarded work,
             # including a transition with otherwise unchanged demand metadata.
@@ -172,7 +211,7 @@ class SceneController(QObject):
             self.serial += 1
             self.desired = signature
             self.dispatched = None
-            if not contact_continues:
+            if not contact_continues and not geometry_continues:
                 self.scheduler.cancel()
             self._cpu_pending.clear()
             self.error = ""
@@ -237,6 +276,24 @@ class SceneController(QObject):
 
     def _new_scene_capture(self, document):
         previous = self.capture
+        if isinstance(previous, GeometryCapture):
+            if (previous.token == self._geometry_preview_owner and not previous.stale
+                    and previous.document == document):
+                return previous
+            previous.retire()
+            if self.capture is previous:
+                self.capture = None
+        if self._geometry_preview_owner is not None:
+            try:
+                return GeometryCapture(self.canvas, document, self._geometry_preview_owner)
+            except CaptureAdmissionUnavailable:
+                active = self.scheduler.active_demand
+                if (self.capture is None and active is not None
+                        and active.interaction_preview_owner == self._geometry_preview_owner
+                        and self.scheduler._geometry_preview_bounded(active)):
+                    return None
+            except CaptureUnavailable:
+                self._retire_geometry_preview()
         if isinstance(previous, OrdinaryContactCapture):
             if previous.valid(document, self._contact_preview_owner):
                 return previous
@@ -252,6 +309,98 @@ class SceneController(QObject):
             except CaptureUnavailable:
                 pass  # Bounded nonblocking refusal retains ordinary exact capture.
         return self.canvas._scene_snapshot_compiler.capture(self.canvas, document)
+
+    def _retire_geometry_preview(self):
+        if isinstance(self._preview_snapshot, GeometrySceneSnapshot):
+            if self.preview is not None and self.preview[0] == self._preview_snapshot.document:
+                self.preview = None
+            self._preview_snapshot = self._preview_request = None
+        if isinstance(self.capture, GeometryCapture):
+            self.capture.retire()
+            self.capture = None
+        if isinstance(self.snapshot, GeometrySceneSnapshot):
+            self.snapshot = None
+        self._geometry_preview_owner = self._geometry_preview_key = self._geometry_preview_before = None
+        self._geometry_preview_presented_revision = -1
+
+    def _geometry_preview_key_for(self, document, addresses, phases, visible):
+        canvas = self.canvas
+        current = geometry_gesture(canvas)
+        if (current is None or not document.live_preview or document.contact_only
+                or phases not in ((None,), ('base', 'top')) or not addresses
+                or len(addresses) > 256 or any(address.level != 0 for address in addresses)
+                or document.identity != (id(canvas.chapter), id(canvas.tiles), id(canvas.images))
+                or document.revision != canvas._document_projection.revision
+                or any(bool(getattr(canvas, name, None)) for name in (
+                    '_drawing', '_cage_session', '_text_editing', '_text_placement',
+                    '_gradient_preview_active', '_page_gap_draft', '_fill_gesture_active',
+                    '_raster_paste_overlay', '_overlay_color_preview', '_modifier_handle_drag',
+                    '_selection_raster_states', '_selection_vector_preview', '_selection_shape_nodes'))):
+            return None
+        view = canvas.visible_document_rect()
+        if document.overflow <= 0:
+            view = view.intersected(document.bounds)
+        if tuple(view.getRect()) != visible:
+            return None
+        camera = canvas.camera_transform()
+        before, tag, refs = current
+        from comic_editor.render.scene import native_source_key
+        return (replace(document, revision=0), addresses, phases, visible,
+            tuple(getattr(camera, f'm{i}{j}')() for i in range(1, 4) for j in range(1, 4)),
+            canvas.width(), canvas.height(), canvas.devicePixelRatioF(),
+            canvas._document_projection.tile_size, canvas._document_projection.gutter,
+            id(before), tag, refs, canvas.selected_kind, canvas.selected_id,
+            tuple(canvas.selected_entities), canvas.tool, canvas.command_stack.revision,
+            getattr(canvas, '_history_generation', 0),
+            native_source_key(canvas.tiles, document.identity, canvas._scene_snapshot_compiler.source_generation),
+            self._geometry_preview_dependency_generation, id(getattr(canvas, '_graphics_worker', None)))
+
+    def _current_geometry_snapshot(self, snapshot, document, addresses, phases, visible):
+        owner = self._geometry_preview_owner
+        return (isinstance(snapshot, GeometrySceneSnapshot) and owner is not None
+            and snapshot.interaction_preview_owner == owner
+            and self._geometry_preview_key_for(document, addresses, phases, visible) == owner[1]
+            and replace(snapshot.document, revision=0) == replace(document, revision=0)
+            and snapshot.document.revision <= document.revision and snapshot.cache_spec is None
+            and snapshot.capture_lease is not None and not snapshot.capture_lease.lease.released
+            and snapshot.graphics_worker is getattr(self.canvas, '_graphics_worker', None))
+
+    def _accept_geometry_preview(self, completion, document, addresses, phases, visible):
+        demand, result = completion.demand, completion.preview
+        if (not self._current_geometry_snapshot(demand.snapshot, document, addresses, phases, visible)
+                or not self.scheduler._geometry_preview_bounded(demand)
+                or demand.interaction_preview_owner != self._geometry_preview_owner
+                or demand.serial > self.serial or not completion.done or completion.error
+                or completion.tiles or completion.materialized is not None or completion.overview is not None
+                or completion.feedback is not None or completion.recorded or completion.recorded_rows
+                or completion.cache_manifest is not None or result is None
+                or result.document != demand.snapshot.document or result.error or result.exact
+                or result.status.value != 'provisional' or result.request.quality.value != 'interactive'
+                or result.request.key != ('detached-preview', demand.serial)
+                or result.request.revision != result.document.revision
+                or tuple(result.request.bounds.getRect()) != visible
+                or result.request.pixel_size != demand.preview_size
+                or result.request.requested_region is not None or not result.request.clip_document
+                or result.request.scale != min(1., max(demand.preview_size[0] / visible[2], demand.preview_size[1] / visible[3]))
+                or result.request.output_transform != (demand.preview_size[0] / visible[2], 0., 0.,
+                    demand.preview_size[1] / visible[3], -visible[0] * (demand.preview_size[0] / visible[2]),
+                    -visible[1] * (demand.preview_size[1] / visible[3]))
+                or result.request.smooth_sources or result.request.defer_effects
+                or result.request.phase is not None or result.request.target is not None
+                or demand.visible != visible or demand.phases != phases
+                or tuple(request.address for request in demand.requests) != addresses
+                or result.document.revision <= self._geometry_preview_presented_revision
+                or result.image.isNull() or result.image.format() != document.pixel_contract.image_format
+                or result.image.devicePixelRatio() != 1.
+                or (result.image.width(), result.image.height()) != demand.preview_size):
+            return False
+        self.release_handoff.clear('new owned geometry preview')
+        self._preview_snapshot, self._preview_request = demand.snapshot, result.request
+        self.preview = result.document, PresentedTile(('preview', demand.serial), result.image,
+            result.request.bounds, pixel_contract=document.pixel_contract,
+            pixel_environment=demand.snapshot.pixel_environment)
+        self._geometry_preview_presented_revision = result.document.revision
+        return True
 
     def _current_contact_snapshot(self, snapshot, document, addresses, phases, visible):
         # Completion alone does not make R0 current. The actual stable owner and
@@ -310,7 +459,8 @@ class SceneController(QObject):
             owner = self._contact_preview_owner
             if (owner is None or owner != (self._contact_preview_generation, self._contact_preview_key)
                     or not self.preview_mode or self._contact_reuse_gate is not None or self._cpu_pending
-                    or self._filtered_state is not None or self._bootstrap is not None
+                    or self._filtered_state is not None and not self._filtered_state.provisional
+                    or self._bootstrap is not None
                     or scheduler.stopped.is_set() or scheduler.cancelled.is_set() or scheduler._transfers
                     or not 1 <= len(addresses) <= 256
                     or not all(math.isfinite(value) for value in visible)
@@ -318,6 +468,9 @@ class SceneController(QObject):
                 return False
             current = (document if document.revision == canvas._document_projection.revision
                        else canvas._render_document_state())
+            if (self._filtered_state is not None and not self._filtered_state.provisional_valid(
+                    current, self.presentation_view())):
+                return False
             current_signature = (current, addresses, phases, visible)
             if (document.identity != current.identity
                     or not 0 <= document.revision <= current.revision
@@ -706,12 +859,20 @@ class SceneController(QObject):
     def advance(self):
         canvas = self.canvas
         if self.desired is None or canvas.chapter is None:
+            if canvas.chapter is not None and self.visibility_presentation.waiting_for_first_request():
+                # An owned release may retire its live demand before its first
+                # committed paint. A queued timer must preserve that current
+                # commit witness until paint supplies ordinary coverage.
+                self.timer.stop()
+                canvas.update()
+                return
             # A queued timer can arrive after contact release retires its
             # demand. This is idle scheduling, not a document replacement:
             # newest displayed source pixels still await an exact scene.
             self.reset(retain_presentation=canvas.chapter is not None)
             return
         document, addresses, phases, visible = self.desired
+        self._check_provisional_filtered()
         if self._filtered_state is not None and not self._filtered_state.advance(document,capture=False):
             self.retire_feedback()
         gate = (self._pending_native_contact_gate(document)
@@ -730,15 +891,34 @@ class SceneController(QObject):
             # Retain a privately frozen capture until a real current paint
             # revalidates its owner. Do not advance/adopt it against stale desired
             # metadata. Existing active-job cancellation remains unchanged.
-            preserve = self._preserve_owned_contact_work(self.desired)
-            if not preserve:
+            current = canvas._render_document_state()
+            geometry_preserve = (self._geometry_preview_owner is not None
+                and self._geometry_preview_key_for(current, addresses, phases, visible) == self._geometry_preview_key)
+            preserve = geometry_preserve or self._preserve_owned_contact_work(self.desired)
+            if geometry_preserve:
+                # Input can advance the model before its queued paint. Waiting
+                # for that paint on every timer tick starves continuous drags.
+                # Revalidate the same complete owner/view and freeze its newest
+                # pose now; normal request bookkeeping and worker guards still
+                # apply. No unrelated revision takes this path.
+                requests = tuple(ProjectionRequest(address,
+                    canvas._document_projection.tile_size,
+                    canvas._document_projection.gutter) for address in addresses)
+                self.request(current, requests, phases, QRectF(*visible))
+                if self.desired != (current, addresses, phases, visible):
+                    self.timer.stop()
+                    canvas.update()
+                    return
+                document = current
+            elif not preserve:
                 if not isinstance(self.capture, OrdinaryContactCapture):
                     self.capture = None
                 self.dispatched = None
                 self.scheduler.cancel()
-            self.timer.stop()
-            canvas.update()
-            return
+            if not geometry_preserve:
+                self.timer.stop()
+                canvas.update()
+                return
         if resume_contact:
             self.dispatched = None
             if self.snapshot is None or self.snapshot.document != document:
@@ -748,6 +928,22 @@ class SceneController(QObject):
             self._retire_contact_preview()
             self.scheduler.cancel()
         for completion in self.scheduler.poll():
+            if completion.demand.visibility_preview_owner is not None:
+                state = self.visibility_presentation
+                if (completion.demand.visibility_preview_owner == state.owner
+                        and completion.demand.serial == self.serial
+                        and completion.demand.snapshot.document == document):
+                    if not state.accept(completion, document, addresses, phases, visible):
+                        state.clear()  # Optional presentation failure falls back to native.
+                    self.dispatched = None
+                    canvas.update()
+                continue  # No visibility draft enters exact tile/cache adoption.
+            if completion.demand.interaction_preview_owner is not None:
+                if self._accept_geometry_preview(completion, document, addresses, phases, visible):
+                    canvas.update()
+                    continue
+                if not completion.error:
+                    continue
             if completion.demand.contact_preview_owner is not None:
                 if self._accept_contact_preview(completion, document, addresses, phases, visible):
                     canvas.update()
@@ -771,6 +967,7 @@ class SceneController(QObject):
                 self._accept_cpu_images(completion.materialized)
             if completion.preview is not None:
                 self.release_handoff.clear("new current preview")
+                self.geometry_continuity.clear()
                 result = completion.preview
                 self._preview_snapshot = completion.demand.snapshot
                 self._preview_request = result.request
@@ -802,6 +999,13 @@ class SceneController(QObject):
                         document=document.identity, revision=document.revision,
                         pixel_environment=completion.demand.snapshot.pixel_environment)
             canvas.update()
+        if (self.capture is None and isinstance(self.snapshot, GeometrySceneSnapshot)
+                and self.snapshot.document != document and self._geometry_preview_owner is not None
+                and self.dispatched != self.desired):
+            self.capture = self._new_scene_capture(document)
+            if self.capture is None:
+                self.timer.start(8)
+                return
         if (self.capture is None and isinstance(self.snapshot, ContactSceneSnapshot)
                 and self.snapshot.document != document
                 and self._preserve_owned_contact_work(self.desired)):
@@ -836,9 +1040,34 @@ class SceneController(QObject):
             self.capture = None
             if isinstance(completed_capture, OrdinaryContactCapture):
                 completed_capture.retire()  # External snapshot keeps its copy lease.
+            if isinstance(completed_capture, GeometryCapture):
+                completed_capture.retire()
+            elif not isinstance(completed_capture, OrdinaryContactCapture):
+                # A gesture can begin before any ordinary snapshot/source
+                # header exists. After that first complete capture, apply the
+                # same bounded ownership checks as a warm gesture before its
+                # first evaluation; cold/warm state must not choose different
+                # draft source grids. Failure retains the ordinary snapshot.
+                key = self._geometry_preview_key_for(document, addresses, phases, visible)
+                if key is not None:
+                    if key != self._geometry_preview_key:
+                        self._retire_geometry_preview()
+                        self._geometry_preview_generation += 1
+                        self._geometry_preview_key = key
+                        self._geometry_preview_owner = self._geometry_preview_generation, key
+                        self._geometry_preview_before = geometry_gesture(canvas)[0]
+                    try:
+                        promoted = GeometryCapture(canvas, document, self._geometry_preview_owner)
+                    except (CaptureAdmissionUnavailable, CaptureUnavailable):
+                        self._retire_geometry_preview()
+                    else:
+                        self.snapshot = promoted.result
+                        promoted.retire()
         owned_snapshot = self._current_contact_snapshot(self.snapshot, document, addresses, phases, visible)
+        geometry_snapshot = self._current_geometry_snapshot(self.snapshot, document, addresses, phases, visible)
+        owned_snapshot = owned_snapshot or geometry_snapshot
         current_snapshot = (self.snapshot is not None and self.snapshot.document == document
-            and not isinstance(self.snapshot, ContactSceneSnapshot))
+            and not isinstance(self.snapshot, (ContactSceneSnapshot, GeometrySceneSnapshot)))
         if self.dispatched != self.desired and (current_snapshot or owned_snapshot):
             requests = tuple(ProjectionRequest(address, canvas._document_projection.tile_size,
                              canvas._document_projection.gutter) for address in addresses)
@@ -850,6 +1079,11 @@ class SceneController(QObject):
                     not canvas._document_projection.ready([request], configuration=(*document.configuration, phase))
                     for phase in phases))
             feedback_target = self.feedback_target if not self._feedback_covers(document, visible) else ''
+            if self._filtered_state is not None and self._filtered_state.provisional:
+                # Ordinary current tiles/previews still catch up, but the old
+                # prepared owner must retire before another 128MiB recipe can
+                # be requested. Exact presentation then re-arms preparation.
+                feedback_target = ''
             if requests or self.preview_mode or feedback_target:
                 preview_size = None
                 if self.preview_mode:
@@ -865,7 +1099,19 @@ class SceneController(QObject):
                     (visible[0] + visible[2] / 2, visible[1] + visible[3] / 2), visible, preview_size,
                     presentation_size=presentation_size, feedback_target=feedback_target,
                     feedback_requests=feedback_requests if feedback_target else None,
-                    contact_preview_owner=self._contact_preview_owner)
+                    contact_preview_owner=self._contact_preview_owner,
+                    interaction_preview_owner=self._geometry_preview_owner if geometry_snapshot else None)
+                if geometry_snapshot:
+                    demand = replace(demand, feedback_target='', feedback_requests=None)
+                visibility = self.visibility_presentation
+                if (current_snapshot and requests and not self.preview_mode
+                        and visibility.request(document, addresses, phases, visible)):
+                    scale = min(1., 1024. / max(1., visible[2], visible[3]))
+                    size = max(1, math.ceil(visible[2]*scale)), max(1, math.ceil(visible[3]*scale))
+                    demand = replace(demand, snapshot=replace(self.snapshot, cache_spec=None),
+                        preview_size=size, presentation_size=None, feedback_target='', feedback_requests=None,
+                        visibility_preview_owner=visibility.owner)
+                    visibility.submitted = True
                 copies = getattr(getattr(demand.snapshot, 'capture_lease', None), 'lease', None)
                 if (owned_snapshot and self.scheduler._contact_preview_bounded(demand)
                         and demand.contact_preview_owner == self._contact_preview_owner
@@ -876,7 +1122,7 @@ class SceneController(QObject):
                     # LIVE documents, so it needs no filtered-feedback reserve.
                     # Source/native workspace and retained lease charges remain.
                     demand = replace(demand, feedback_target='', feedback_requests=None)
-                if self._contact_preview_owner is not None:
+                if self._contact_preview_owner is not None or geometry_snapshot:
                     self.scheduler.submit(demand, coalesce_active=True)
                 else:
                     self.scheduler.submit(demand)
@@ -901,9 +1147,13 @@ class SceneController(QObject):
             batch.append((phase, [PresentedTile((phase, tile.request.address), tile.image,
                 tile.request.world_rect, tile.request.source_rect, document.pixel_contract,
                 tile.pixel_environment) for tile in tiles]))
+        if complete:
+            self.visibility_presentation.native_ready(document, requests, phases)
         return batch, complete
 
     def changed(self, change, *, action="transient"):
+        self.visibility_presentation.changed(change, action)
+        self.geometry_continuity.changed(change, action)
         from comic_editor.render.raster_feedback_bootstrap import selected_source_change
         selected = ('object', self.canvas.selected_id)
         source_only = (action == 'transient' and change.transient
@@ -914,6 +1164,12 @@ class SceneController(QObject):
                     and item.address is not None for item in change.resources)))
         if not source_only:
             self._presentation_dependency_generation += 1
+        if not geometry_owned_change(self.canvas, change, action):
+            self._geometry_preview_dependency_generation += 1
+            if self._geometry_preview_owner is not None:
+                self._retire_geometry_preview()
+                self.scheduler.cancel()
+                self.capture = self.dispatched = self.desired = None
         self.raster_continuity.changed(change, action, self.canvas._render_document_state())
         self.release_handoff.changed(change, action)
         if self._contact_preview_owner is not None:
@@ -931,14 +1187,30 @@ class SceneController(QObject):
         if prepared is None:
             return
         selected = ('object', prepared.identifier)
+        parked_foreign_change = (self._filtered_state is not None and self._filtered_state.provisional
+            and any(item.entity != selected or item.structural
+                or item.fields - {'pixels', 'interaction_rect'} for item in change.entities))
         if (change.conservative or change.document_fields or change.orders
+                or parked_foreign_change
                 or any(item.affects_artwork and (item.entity != selected
                     or item.structural or item.fields - {'pixels', 'interaction_rect'})
                     for item in change.entities)
                 or any(item.entity != selected or item.resource != 'raster' for item in change.resources)):
+            state = self._filtered_state
+            if state is not None and state.park_parameter_change(change, action, self.presentation_view()):
+                # Only this positively presented old scene survives the exact
+                # unrelated scalar transaction. It never covers current work.
+                self.canvas._raster_feedback_contact_covered = False
+                return
             self.retire_feedback()
             return
         if self._filtered_state is not None:
+            if self._filtered_state.provisional and action != 'transient':
+                # Release/history retire the old-background worker. The last
+                # displayed frame remains a dated presentation, not an exact
+                # projection or durable cache entry.
+                self.retire_feedback()
+                return
             # Eligible history restores use the same typed native source
             # packets as forward pixel edits. All dependency, geometry and
             # native-frame failures still retire through the guards below.
@@ -1055,10 +1327,91 @@ class SceneController(QObject):
             camera.m31(), camera.m32(), camera.m33()), self.canvas.width(), self.canvas.height(),
             self.canvas.devicePixelRatioF())
 
+    def _remember_filtered_presented_basis(self):
+        """A prepared recipe becomes reusable only after a native frame swap."""
+        state = self._filtered_state
+        if state is not None and state.selection_handoff is not None:
+            self.retire_feedback()
+            return
+        presented = self._presentation_batch
+        canvas = self.canvas
+        stats = getattr(canvas, '_document_presentation_stats', None)
+        if (state is None or presented is None
+                or getattr(canvas, '_projection_frame_pending', True)
+                or getattr(canvas, '_projection_provisional_visible', True)
+                or stats is None or stats.backend in {'pending', 'gpu-pending', 'none'}
+                or not stats.tiles):
+            return
+        document, batch, view = presented
+        if view == self.presentation_view():
+            state.remember_presented(document, self._filtered_requests,
+                getattr(canvas, '_projection_completed_view', None), batch, view)
+
+    def _filtered_selection_changed(self, kind, identifier):
+        """Observe one exact GUI sibling→original return, never a new owner."""
+        self._feedback_selection_generation += 1
+        state = self._filtered_state
+        if state is None:
+            return
+        canvas = self.canvas
+        if (kind, identifier) != (canvas.selected_kind, canvas.selected_id):
+            self.retire_feedback()
+        elif state.selection_handoff is not None:
+            if not state.finish_selection_handoff(self.presentation_view()):
+                self.retire_feedback()
+        elif (kind, identifier) != ('object', state.prepared.identifier):
+            if not state.begin_selection_handoff(self.presentation_view()):
+                self.retire_feedback()
+
+    def _check_provisional_filtered(self):
+        state = self._filtered_state
+        if state is None:
+            return
+        if state.selection_handoff is not None:
+            # Any event-loop source poll before the exact synchronous return
+            # abandons the handoff; no packet or old background is reused.
+            self.retire_feedback()
+            return
+        if not state.provisional:
+            return
+        canvas = self.canvas
+        active = getattr(canvas, '_raster_contact_active', False)
+        if (canvas.chapter is None
+                or not state.provisional_valid(canvas._render_document_state(), self.presentation_view())
+                or state.provisional_contact_started and not active):
+            self.retire_feedback()
+        elif active:
+            state.provisional_contact_started = True
+
+    def _provisional_contact_gate(self, document):
+        state = self._filtered_state
+        if (state is None or not state.provisional
+                or self.canvas.tool not in {ToolKind.RASTER_PENCIL, ToolKind.RASTER_ERASER}
+                or not state.provisional_valid(document, self.presentation_view())):
+            return None
+        return self._owned_native_contact_gate(document)
+
     def filtered_batch(self,document,requests,batch,*,complete=False):
         state = self._filtered_state
         if state is None:
             return batch,0
+        self._check_provisional_filtered()
+        if state is not self._filtered_state:
+            return batch,0
+        if state.provisional:
+            if (complete and not document.live_preview
+                    or self.preview is not None and self.preview[0] == document):
+                self.retire_feedback()
+                return batch,0
+            if self._provisional_contact_gate(document) is None:
+                return batch,0
+            replacement,count = state.provisional_batch(document, requests, self.presentation_view())
+            if not count:
+                return batch,0
+            self.canvas._projection_frame_pending = True
+            self.canvas._projection_provisional_visible = True
+            self.canvas._raster_feedback_contact_covered = False
+            return replacement,count
         if complete and not document.live_preview:
             state.checkpoint(document.revision)
             return batch,0

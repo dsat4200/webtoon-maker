@@ -461,8 +461,11 @@ class GpuWorker(QObject):
         return future.result()
 
     def _consumer_copies(self,size):
-        from comic_editor.render.admission import RENDER_ADMISSION
+        from comic_editor.render.admission import RENDER_ADMISSION, WorkCancelled, current_ticket
+        ticket = current_ticket()
         while not self.closed:
+            if ticket is not None and ticket.cancelled():
+                raise WorkCancelled()
             lease = RENDER_ADMISSION.reserve_copies(size)
             if lease is not None:
                 return lease

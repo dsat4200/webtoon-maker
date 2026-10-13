@@ -1,11 +1,5 @@
-"""UNRUN R4-policy handoff tests; original R2 native cases stay preserved.
-
-Ordinary primary actions and scheduler/paint are unchanged. The untimed oracle
-explicitly declares a transient render of independently committed stored values.
-That declaration never adds a committed transient evaluator to production.
-"""
+"""Actual owned live handoff compared with independently stored final geometry."""
 from copy import deepcopy
-from dataclasses import replace
 import time
 
 import numpy as np
@@ -14,9 +8,8 @@ from PySide6.QtCore import QPointF, QRectF
 from PySide6.QtGui import QColor, QImage
 
 from comic_editor.core.models import ParameterMaskBinding, ToneMask
-from comic_editor.render.live_canvas_preview import LiveCanvasPreviewPolicy, live_canvas_policy
-from comic_editor.render.scene import DetachedSceneBackend
-from comic_editor.render.service import DocumentRenderService, RenderQuality, RenderRequest, RenderStatus
+from comic_editor.render.service import RenderQuality
+from test_distort_pointer_events import escape
 from test_detached_owned_rig_preview import _start, _close, owned_rig_app, owned_rig_settings
 from test_live_canvas_preview_policy import _make_scene, _replica, _native, _original_pose_policy_reference
 
@@ -57,47 +50,38 @@ def wait(canvas, app, *, live):
     pytest.fail('Original current scene/presentation did not finish within existing25s')
 
 
-def stored_model_draft(reference):
-    """Cold originals + actual committed geometry under declared same policy.
+def stored_model_draft(reference, app, object_id):
+    """Enter the actual owned policy at the independently committed final pose.
 
-    The actual stored model has no live geometry or effective attachment state.
-    A RenderDocument declaration selects the same temporary operator sampling.
-    This is an independent test oracle only, never an admission/production path.
+    A zero-displacement ordinary gesture retains stored geometry and supplies
+    the real capture lease required by bounded geometry source frames. Neither
+    snapshots nor ownership are fabricated for the reference.
     """
     assert not reference._projection_has_live_preview()
     assert not reference.images._decoded
-    document = reference._render_document_state()
-    capture = reference._scene_snapshot_compiler.capture(reference, document)
-    while not capture.advance(.004):
-        pass
-    assert not capture.stale and capture.result.document == document
-    assert not capture.result.state['_transform_preview_quad']
-    assert not capture.result.state['_transform_start_quad']
-    declared = replace(document, live_preview=True)
-    snapshot = replace(capture.result, document=declared)
-    backend = DetachedSceneBackend(snapshot)
-    backend.native_preview, backend.artwork_scale = True, 1.
-    backend.scene._effect_preview_channel = 'canvas'
-    backend.live_canvas_preview_policy = LiveCanvasPreviewPolicy(declared.identity, declared.revision, 117, lambda: False)
-    service = DocumentRenderService(backend)
-    service.projection.revision = declared.revision
-    request = RenderRequest((0., 0., 800., 800.), 1., (800, 800), ('detached-preview', 117),
-        declared.revision, quality=RenderQuality.INTERACTIVE)
+    model = deepcopy(reference.chapter.to_dict())
+    quad = reference.object_world_quad(object_id)
+    # A real corner control works even when the image interior is transparent.
+    press = QPointF(*quad[2])
+    reference._tool_press(reference.document_to_widget(press), 1.)
+    reference._tool_move(reference.document_to_widget(press), 1.)
+    assert reference._transform_drag_mode == 'handle'
+    assert reference._transform_preview_quad == reference._transform_start_quad
     try:
-        assert not backend.scene._modifier_render_cache and not backend.scene._modifier_source_cache
-        assert not backend.scene.images._decoded
-        result = service.render_region(declared, request)
-        assert result.status is RenderStatus.PROVISIONAL and not result.exact and not result.image.isNull()
-        assert result.image.size().toTuple() == (800, 800)
-        assert result.image.format() == document.pixel_contract.image_format
-        assert backend.scene.images._decoded
-        assert backend.scene._live_canvas_preview_policy is None  # capture finally restores it
-        return QImage(result.image)
+        image = wait(reference, app, live=True)
+        from comic_editor.render.geometry_capture import GeometrySceneSnapshot
+        snapshot = reference._scene_controller.snapshot
+        assert isinstance(snapshot, GeometrySceneSnapshot)
+        assert snapshot.interaction_preview_owner is not None
+        assert not snapshot.capture_lease.lease.released
+        assert reference.chapter.to_dict() == model
+        return image
     finally:
-        backend.close()
+        escape(reference)
+        assert reference.chapter.to_dict() == model
 
 
-def cold_commit(primary, before, object_id, mode):
+def cold_commit(primary, before, object_id, mode, app):
     reference = _replica(primary, before, object_id)
     try:
         assert not reference.images._decoded
@@ -108,7 +92,7 @@ def cold_commit(primary, before, object_id, mode):
         assert not reference._projection_has_live_preview()
         model = deepcopy(reference.chapter.to_dict())
         assert model != before
-        draft = stored_model_draft(reference)
+        draft = stored_model_draft(reference, app, object_id)
         assert not reference.images._decoded  # detached oracle did not warm its owner
         native = _native(reference)
         return draft, native, model
@@ -130,7 +114,7 @@ def test_actual_r4_live_final_pose_handoff_equals_cold_stored_policy_then_exact(
         final_pose = deepcopy(canvas._transform_preview_quad)
         live = wait(canvas, owned_rig_app, live=True)
         assert np.count_nonzero(pixels(live) != pixels(initial_draft)) > 0
-        draft, native, committed = cold_commit(canvas, before, object_id, mode)
+        draft, native, committed = cold_commit(canvas, before, object_id, mode, owned_rig_app)
         np.testing.assert_array_equal(pixels(live), pixels(draft))
         assert np.count_nonzero(pixels(native) != pixels(initial_native)) > 0
         canvas._tool_release()
@@ -196,7 +180,7 @@ def test_r4_rapid_unpainted_final_pose_is_not_relabelled_current(owned_rig_app):
         committed = deepcopy(canvas.chapter.to_dict())
         assert committed != before
         reference = _replica(canvas, committed, object_id)
-        fresh_draft = stored_model_draft(reference)
+        fresh_draft = stored_model_draft(reference, owned_rig_app, object_id)
         assert np.count_nonzero(pixels(fresh_draft) != pixels(painted)) > 0
         np.testing.assert_array_equal(pixels(_native(canvas)), pixels(_native(reference)))
         canvas.command_stack.undo()

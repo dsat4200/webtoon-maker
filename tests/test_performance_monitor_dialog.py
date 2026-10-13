@@ -135,6 +135,7 @@ def test_export_stops_before_file_picker_and_writes_valid_json(monitor_dialog, m
         "comic_editor.ui.performance_monitor_dialog.QFileDialog.getSaveFileName", select_filename
     )
     dialog.export_button.click()
+    assert path.read_text(encoding="utf-8").startswith("{\n  ")
     result = json.loads(path.read_text(encoding="utf-8"))
     assert result["enabled"] is False
     assert result["context"]["solo"] is True
@@ -164,15 +165,15 @@ def test_display_can_use_a_limited_snapshot_but_export_preserves_full_trace(
     ]
     calls = []
 
-    def display_snapshot():
-        calls.append(True)
+    def display_snapshot(*, tab_index=None):
+        calls.append(tab_index)
         result = controller.snapshot()
         result["timeline"] = result["timeline"][-100:]
         return result
 
     monkeypatch.setattr(controller, "snapshot_for_display", display_snapshot, raising=False)
     controller.changed.emit()
-    assert calls
+    assert calls == [0]
     assert len(dialog._snapshot["timeline"]) == 100
     path = tmp_path / "full-capture.json"
     monkeypatch.setattr(

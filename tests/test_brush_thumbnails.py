@@ -254,6 +254,147 @@ def test_hidden_cache_warming_pauses_during_live_drawing(qapp, prepared_queue):
     owner.deleteLater()
 
 
+def test_unchanged_library_sync_reuses_detached_records_without_hashing_or_disk_reads(
+        qapp, prepared_queue, monkeypatch):
+    queue, calls = prepared_queue
+    presets = [BrushDefinition(id=str(i), size=12+i).to_dict() for i in range(75)]
+    store = BrushThumbnailStore()
+    store.sync(presets)
+    finish(store, queue)
+    original_keys = dict(store.keys)
+    original_records = dict(store._input_records)
+    before = deepcopy(presets)
+
+    def unexpected(*args, **kwargs):
+        pytest.fail('Unchanged presets must reuse their prepared thumbnails')
+    monkeypatch.setattr(BrushDefinition, 'from_dict', unexpected)
+    monkeypatch.setattr(thumbs, 'thumbnail_key', unexpected)
+    monkeypatch.setattr(thumbs, 'load_thumbnail', unexpected)
+    store.sync(deepcopy(presets))
+    store.sync(list(reversed(presets)))
+    assert store.keys == original_keys and not store.pending
+    assert all(store._input_records[key] is record for key, record in original_records.items())
+    assert presets == before and len(calls) == 75
+    store.sync(presets[:3])
+    assert set(store.keys) == {'0', '1', '2'}
+    assert set(store._input_records) == set(store._records) == set(store.keys)
+    assert len(store.pixmaps) == 3
+    store.stop()
+    store.deleteLater()
+
+
+def test_rebuilt_outline_picker_borrows_same_window_library_without_rehash_or_disk_reads(
+        qapp, prepared_queue, monkeypatch):
+    from comic_editor.core.models import OutlineModifier
+    from comic_editor.ui.outline_brush_controls import OutlineBrushCombo
+    queue, calls = prepared_queue
+    presets = [BrushDefinition(id=str(i), size=12+i).to_dict() for i in range(75)]
+    settings = EditorSettings(brush_presets=presets)
+    window = QWidget()
+    library = BrushPresetCombo(settings, window)
+    finish(library.thumbnails, queue)
+    before = deepcopy(presets)
+    modifier = OutlineModifier(brush=deepcopy(presets[5]))
+    original_key = thumbs.thumbnail_key
+    original_parse = BrushDefinition.from_dict
+    hashed, parsed = [], []
+    def fingerprint(definition):
+        hashed.append(definition.id)
+        return original_key(definition)
+    def parse(data):
+        parsed.append(data['id'])
+        return original_parse(data)
+    def unexpected_read(*args):
+        pytest.fail('Prepared library pixels should not be read again from disk')
+    monkeypatch.setattr(thumbs, 'thumbnail_key', fingerprint)
+    monkeypatch.setattr(BrushDefinition, 'from_dict', parse)
+    monkeypatch.setattr(thumbs, 'load_thumbnail', unexpected_read)
+    for _ in range(4):
+        combo = OutlineBrushCombo(modifier, settings, window)
+        combo.refresh_choices()
+        assert combo.thumbnails._source_store is library.thumbnails
+        assert combo.thumbnails.keys[combo.saved_id] == library.thumbnails.keys['5']
+        assert not combo.thumbnails.pending
+        assert not combo.itemIcon(combo.findData(combo.saved_id)).isNull()
+        for identifier, prepared in library.thumbnails._input_records.items():
+            assert combo.thumbnails._input_records[identifier] is prepared
+            key = library.thumbnails.keys[identifier]
+            assert combo.thumbnails.pixmaps[key].toImage() == library.thumbnails.pixmaps[key].toImage()
+        combo.thumbnails.stop()
+        combo.deleteLater()
+    assert hashed == parsed == [f'outline-saved-{modifier.modifier_id}'] * 4
+    assert presets == before and modifier.brush == before[5] and len(calls) == 75
+    library.thumbnails.stop()
+    window.deleteLater()
+
+
+@pytest.mark.parametrize('part', ['tip', 'texture', 'dynamics', 'dual', 'taper'])
+def test_borrowed_snapshots_detect_nested_in_place_material_and_response_edits(
+        qapp, prepared_queue, part):
+    from comic_editor.core.brushes import BrushDynamics, BrushTexture
+    queue, _ = prepared_queue
+    brush = BrushDefinition(id='nested', tips=(BrushTip(png='original-tip'),),
+                            texture=BrushTexture(png='original-texture'),
+                            dynamics={'size': BrushDynamics(pressure=True)},
+                            dual=BrushDefinition(angle=10), taper_minima={'size': .2})
+    presets = [brush.to_dict()]
+    source = BrushThumbnailStore()
+    source.sync(presets)
+    finish(source, queue)
+    borrowed = BrushThumbnailStore(source_store=source)
+    borrowed.sync(presets)
+    old_record = source._input_records[brush.id]
+    old_key = source.keys[brush.id]
+    if part == 'tip':
+        presets[0]['tips'][0]['png'] = 'edited-tip'
+    elif part == 'texture':
+        presets[0]['texture']['png'] = 'edited-texture'
+    elif part == 'dynamics':
+        presets[0]['dynamics']['size']['pressure_curve'] = [(0, 0), (.5, .25), (1, 1)]
+    elif part == 'dual':
+        presets[0]['dual']['angle'] = 45
+    else:
+        presets[0]['taper_minima']['size'] = .31
+    expected = thumbs.thumbnail_key(BrushDefinition.from_dict(presets[0]))
+    borrowed.sync(presets)
+    assert borrowed.keys[brush.id] == expected != old_key
+    assert borrowed._input_records[brush.id] is not old_record
+    assert old_record[0] == brush.to_dict()
+    assert source.keys[brush.id] == old_key
+    finish(borrowed, queue)
+    source.sync(presets)
+    finish(source, queue)
+    assert source.keys == borrowed.keys
+    assert source.pixmaps[expected].toImage() == borrowed.pixmaps[expected].toImage()
+    source.stop()
+    borrowed.stop()
+    source.deleteLater()
+    borrowed.deleteLater()
+
+
+def test_thumbnail_borrowing_does_not_cross_preferences_and_observes_renderer_version(
+        qapp, prepared_queue, monkeypatch, tmp_path):
+    queue, _ = prepared_queue
+    presets = [BrushDefinition(size=29).to_dict()]
+    source = BrushThumbnailStore(preferences=tmp_path/'first'/'settings.json')
+    source.sync(presets)
+    finish(source, queue)
+    old_key = source.keys[presets[0]['id']]
+    other = BrushThumbnailStore(preferences=tmp_path/'second'/'settings.json', source_store=source)
+    other.sync(presets)
+    assert other.pending and not other.pixmaps
+    assert other._input_records[presets[0]['id']] is not source._input_records[presets[0]['id']]
+    finish(other, queue)
+    monkeypatch.setattr(thumbs, 'THUMBNAIL_RENDER_VERSION', thumbs.THUMBNAIL_RENDER_VERSION + 1)
+    source.sync(presets)
+    assert source.keys[presets[0]['id']] != old_key
+    assert source.pending and not source.pixmaps
+    source.stop()
+    other.stop()
+    source.deleteLater()
+    other.deleteLater()
+
+
 def test_bundled_brush_set_is_prerendered_and_matches_current_renderer(qapp):
     for brush in default_brushes():
         path = thumbs.BUNDLED_THUMBNAILS / (thumbs.thumbnail_key(brush)+'.png')

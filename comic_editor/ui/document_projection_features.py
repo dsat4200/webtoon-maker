@@ -101,7 +101,10 @@ class DocumentProjectionFeatures:
         return all(getattr(obj, name) == value for name, value in values.items())
 
     def _projection_has_live_preview(self, *, include_ink=True, include_text=True):
-        return (include_ink and bool(getattr(self, "_drawing", False))) or any(bool(getattr(self, name, None)) for name in (
+        boundary = (self.tool == ToolKind.SHAPE_EDIT
+            and isinstance(getattr(self, '_model_before', None), RecordSnapshot)
+            and bool(getattr(self, '_active_shape_control', None)))
+        return boundary or (include_ink and bool(getattr(self, "_drawing", False))) or any(bool(getattr(self, name, None)) for name in (
             "_transform_preview_quad", "_multi_transform_preview_quads",
             "_selection_raster_states", "_selection_vector_preview", "_selection_shape_nodes",
             "_vector_gesture_mode", "_cage_session", "_text_editing", "_text_placement",
@@ -278,6 +281,12 @@ class DocumentProjectionFeatures:
         if previous is not None and previous[0] != configuration:
             previous = None
         preview = self._scene_controller.preview
+        geometry_continuity = self._scene_controller.geometry_continuity
+        visibility_presentation = self._scene_controller.visibility_presentation
+        current_visibility = visibility_presentation.for_request(self._scene_controller.desired)
+        dated_geometry = geometry_continuity.for_request(self._scene_controller.desired)
+        if dated_geometry is not None:
+            preview = dated_geometry
         continuity = self._scene_controller.raster_continuity
         presentation_view = self._scene_controller.presentation_view()
         if preview is not None and preview[0].contact_only and not continuity.accepts(preview[0]):
@@ -308,15 +317,24 @@ class DocumentProjectionFeatures:
             else:
                 batch = previous[1] if previous is not None else []
         elif complete:
+            visibility_presentation.clear()
             storage = {tile.image.cacheKey(): tile.image.sizeInBytes() for _, tiles in batch for tile in tiles}
             if sum(storage.values()) <= projection.budget:
                 self._projection_completed_view = configuration, batch, document.revision
             self._projection_presented_revision = document.revision
+        elif current_visibility is not None:
+            batch = [(None, [current_visibility[1]])]
+            self._projection_provisional_visible = True
+            displayed_revision = document.revision
         elif self._scene_controller.release_handoff.ticket is not None and preview is not None and preview[0] == document:
             # Explicit checked pending commit presentation; never exact.
             batch = [(None, [preview[1]])]
             self._projection_provisional_visible = True
             displayed_revision = document.revision
+        elif dated_geometry is not None:
+            batch = [(None, [dated_geometry[1]])]
+            self._projection_provisional_visible = True
+            displayed_revision = dated_geometry[0].revision
         elif previous is not None and previous[2] != document.revision:
             # An edited view stays coherent until every requested replacement is
             # ready. Unchanged artwork can be progressively exposed on a pan.
@@ -452,10 +470,14 @@ class DocumentProjectionFeatures:
             self._projection_provisional_visible = True
         if complete and not gpu_pending:
             self._scene_controller.release_handoff.clear("current exact presentation")
+            geometry_continuity.clear()
         elif self._projection_provisional_visible and preview is not None and stats and sum(item.tiles for item in stats):
             self._scene_controller.release_handoff.painted(document, preview[1],
                 self._scene_controller._preview_snapshot, self._scene_controller._preview_request,
                 owned=painter.device() is self, swapped_required=hasattr(self, "frameSwapped"))
+            if not gpu_pending:
+                geometry_continuity.painted(document, batch,
+                    owned=painter.device() is self, swapped_required=hasattr(self, "frameSwapped"))
         projection._trim({request.address for request in requests})
         self._paint_projection_grid(painter, self)
         draw_document_border(painter, document.bounds, self.camera_transform(), self.size(), owner=self)

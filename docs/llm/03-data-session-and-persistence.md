@@ -38,6 +38,29 @@ The shared memory budget is bounded; eviction changes readiness to a cache miss.
 Draft/live editing results remain transient and never become resident exact or
 durable cache entries.
 
+Continuous boundary/placement evaluation may present an older completed
+immutable geometry snapshot during the same input transaction. Its document
+revision remains attached to those pixels. One actually shown image may stay
+visible during its own command's pending native replacement; it is a dated
+presentation alias, not committed-pixel equivalence or cache readiness. View,
+selection, tool, history, source and subsequent edit changes retire it.
+Geometry snapshots, private draft caches, native-source header capsules and
+their copy-admission leases are process-only. They are absent from chapter,
+autosave, export and durable exact-cache publication.
+
+A typed committed reveal or complex-subtree hide may also show one current provisional scene frame
+while ordinary native tiles are pending. The document remains genuinely
+committed; this separate presentation owns a complete ordinary source snapshot
+with no cache specification. Its evaluator cannot import or export derived
+native cache entries, record a manifest, or populate durable storage. Native
+work follows immediately and replaces it. View, selection, tool, history,
+source, subsequent edits and unsupported pixel modes retire the presentation.
+Both the private evaluator and the presentation are process-only.
+The bounded recent-native visibility hint only chooses whether to skip that
+optional presentation. It retains no pixels or cache identities and is absent
+from persistence. Native memory/disk lookups and misses keep their ordinary
+semantic keys, validation and renderer regardless of that scheduling choice.
+
 Disk render caches are separate from source artwork, autosave and document
 transactions. Saving artwork does not populate or evict them. A project with
 explicitly warmed/restored exact memory entries offers optional disk publication
@@ -58,6 +81,32 @@ currently owned resident source aliases. Restore or manual warming capture
 waits for that index adoption so the ordinary dependency checks can reuse
 saved aliases. Clears and replaced bindings cannot adopt late results. There
 is no second disk renderer, identity scheme or invalidation path.
+
+Detached readers reuse one privately owned validated manifest per open root
+when the index file stat, clear epoch, publication generation and renderer
+versions match. Reader maps own their key order and copy each nested entry or
+source record on first public value access, preserving ordinary mutable
+metadata without rebuilding the whole index for every scene. Explicit JSON
+publication materializes ordinary dictionaries. Current resident source
+aliases merge through the existing owner path. Owner registration uses a
+separate short lock so deferred GUI binding cannot wait on a sibling index
+parse. Publication, flush, clear and
+external index replacement invalidate this metadata reuse; source seals and
+blob checks remain in their ordinary access paths. Closing the final reader
+releases the shared root snapshot, while returned manifest maps retain their
+own base until released. No live state or additional render result is cached.
+See `tests/test_committed_cache_manifest.py` for public-access isolation,
+retirement, external replacement, publication and native-value checks.
+
+Large committed indexes use one standard JSON decoder with a callback that
+returns each completed dictionary unchanged and periodically yields the worker.
+The scanner retains its shared field-name memo; parsing, validation and adoption
+still form one ordinary index load, with no partial metadata publication. Small
+indexes retain the normal load path. Cooperation happens between completed
+objects, so a large primitive value or Python collection pause can exceed the
+target slice duration. JSON errors, duplicate fields, numeric values and the
+recursion acceptance boundary retain the standard decoder's behavior. See
+`tests/test_cache_manifest_decoder.py` for parser and native-value parity.
 
 Cache index publication follows immutable blob writes and uses atomic replacement.
 There is no automatic disk eviction. The navigator size menu separates selected/
@@ -606,7 +655,7 @@ It contains:
 
 Loading progressively backfills/migrates settings from earlier versions, filters unknown fields, clamps values, protects the Default text preset, adds the default Delete Selected and Alt+G bindings, migrates Paste Image to unified Paste, and always emits version 24 on save. Each pencil/eraser library retains at least one preset; every preset may be renamed or deleted while another remains. Missing eraser libraries migrate from the old shape flag to a constant-size, full-strength, hard-edged preset, preserving historical default output. Text-preset sizes normalize to integers from 6 through 250. Settings save through a temporary file followed by replace.
 
-Workspace layout and document-camera updates copy only bounded scalar records
+Workspace layout, document-camera updates, and recent-series changes copy only bounded scalar records
 on the GUI and coalesce into one active and one latest detached preferences
 write. The worker merges the existing encoded JSON without traversing the live
 brush library or decoding its PNG assets. Settings reads, full saves and these
@@ -717,6 +766,12 @@ Undo history itself is never saved. Recovery autosave represents only the latest
 - Settings have their own independent version-1-to-20 migration pipeline, including hotkey renames and splitter keys.
 
 ## Safe modification rules for future agents
+
+The optional quick geometry-release presentation is process-local, just like
+the reveal presentation. Its new committed snapshot has no cache specification
+and cannot record, export/import derived caches, or adopt native projection
+tiles. Its focused release witness and provisional image are never persisted;
+ordinary exact evaluation retains the same semantic keys and invalidation.
 
 - Add new saved fields to both serialization and deserialization, then decide how older files default or migrate.
 - Keep graph IDs stable across ordinary edits; selection, outliner restoration, vector caches, and undo rely on them.

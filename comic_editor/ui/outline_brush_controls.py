@@ -18,7 +18,11 @@ class OutlineBrushCombo(BrushPresetCombo):
         self.modifier = modifier
         self.library_settings = settings
         self.saved_id = f"outline-saved-{modifier.modifier_id}"
-        super().__init__(SimpleNamespace(brush_presets=[]), parent)
+        source = None
+        if parent is not None:
+            source = next((combo.thumbnails for combo in parent.window().findChildren(BrushPresetCombo)
+                           if combo.settings is settings), None)
+        super().__init__(SimpleNamespace(brush_presets=[]), parent, thumbnail_source=source)
         self.setMinimumContentsLength(6)
         self.setMinimumWidth(0)
         self.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)

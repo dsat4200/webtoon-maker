@@ -1,5 +1,8 @@
-/* Owned experimental scalar RGBA linear sampler, ABI1.
- * No interpolation grid/weights/order changes, no SIMD/FMA/fast-math.
+/* Owned optional RGBA linear sampler, ABI1.
+ * No interpolation grid/weights/order changes, no FMA or fast-math.
+ * MSVC x64 evaluates independent double channel pairs with SSE2; other
+ * builds retain scalar volatile checkpoints. Each channel keeps its exact
+ * y-then-x products, sequential corner sums and float32 output rounding.
  * Inputs are finite native float32 premultiplied RGBA with row-major storage;
  * coordinates are finite native doubles on the unchanged global source grid.
  * Source/coordinate/output storage is exclusively caller-owned for the call.
@@ -69,6 +72,34 @@ static const float rgba_transparent[4] = {0.0f, 0.0f, 0.0f, 0.0f};
     out[CHANNEL] = (float)total; \
 } while (0)
 
+#if defined(_MSC_VER) && defined(_M_X64)
+#include <emmintrin.h>
+static __m128d rgba_pair(const float *corner, int high) {
+    __m128 values = _mm_loadu_ps(corner);
+    if (high) values = _mm_movehl_ps(values, values);
+    return _mm_cvtps_pd(values);
+}
+static __m128d rgba_pair_corner(__m128d total, const float *corner,
+                               double wy, double wx, int high) {
+    __m128d after_y = _mm_mul_pd(rgba_pair(corner, high), _mm_set1_pd(wy));
+    __m128d after_x = _mm_mul_pd(after_y, _mm_set1_pd(wx));
+    return _mm_add_pd(total, after_x);
+}
+static void rgba_pairs(const float *p00, const float *p01,
+                       const float *p10, const float *p11,
+                       double y0, double y1, double x0, double x1, float *out) {
+    int high;
+    for (high = 0; high < 2; ++high) {
+        __m128d total = _mm_setzero_pd();
+        total = rgba_pair_corner(total, p00, y0, x0, high);
+        total = rgba_pair_corner(total, p01, y0, x1, high);
+        total = rgba_pair_corner(total, p10, y1, x0, high);
+        total = rgba_pair_corner(total, p11, y1, x1, high);
+        _mm_storel_pi((__m64 *)(out + high * 2), _mm_cvtpd_ps(total));
+    }
+}
+#endif
+
 RGBA_API int RGBA_CALL radial_rgba_linear(
     const float *source, uint64_t height, uint64_t width,
     const double *y_coordinates, const double *x_coordinates,
@@ -121,10 +152,18 @@ RGBA_API int RGBA_CALL radial_rgba_linear(
         const float *p11 = valid_row1 && valid_column1
             ? source + ((uint64_t)row1 * width + (uint64_t)column1) * 4 : rgba_transparent;
         float *out = output + point * 4;
+#if defined(_MSC_VER) && defined(_M_X64)
+        /* Independent channel pairs use the same rounded double y/x products
+         * and sequential 00,01,10,11 sums. No FMA, grid or sample changes.
+         * Conversion rounds each channel to float32 before Python accumulation.
+         */
+        rgba_pairs(p00,p01,p10,p11,weight_y0,weight_y1,weight_x0,weight_x1,out);
+#else
         RGBA_CHANNEL(0);
         RGBA_CHANNEL(1);
         RGBA_CHANNEL(2);
         RGBA_CHANNEL(3);
+#endif
     }
     return 0;
 }

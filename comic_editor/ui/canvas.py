@@ -23,7 +23,7 @@ from typing import Iterable
 import numpy as np
 
 from PySide6.QtCore import (
-    QBuffer, QByteArray, QEvent, QIODevice, QPoint, QPointF, QRect, QRectF, Qt,
+    QBuffer, QByteArray, QEvent, QEventLoop, QIODevice, QPoint, QPointF, QRect, QRectF, Qt,
     QObject, QRunnable, QThreadPool, QTimer, QUrl, Signal,
 )
 from PySide6.QtGui import (
@@ -975,6 +975,8 @@ class _CanvasLogic(SceneKernels, LassoBrushFeatures, BrushFeatures, DocumentProj
         self._selection_vector_preview_revision = 0
         self._selection_shape_nodes: dict[str, dict] = {}
         self._selection_before_tiles: dict[tuple[int, int], QImage] | None = None
+        self._drawing_selection_input = None
+        self._drawing_selection_tile_input = None
         self._selection_raster_states: dict[str, dict] = {}
         self._selection_raster_snapshot: dict | None = None
         self._selection_overlay_tiles: (
@@ -1431,7 +1433,8 @@ class _CanvasLogic(SceneKernels, LassoBrushFeatures, BrushFeatures, DocumentProj
         return region.intersected(QRegion(self.rect()))
 
     def _queue_painting_overlay_damage(self) -> None:
-        if self._gpu_contact_pacing_current():
+        if (self._gpu_contact_pacing_current()
+                or self._gpu_contact_pacing_current(pending=True)):
             self._queue_widget_dirty(self.rect())
             return
         region = self._painting_overlay_region()
@@ -1552,9 +1555,19 @@ class _CanvasLogic(SceneKernels, LassoBrushFeatures, BrushFeatures, DocumentProj
         """Conservatively include effects and mask dependants for a subtree."""
         if self.chapter is None or world.isEmpty():
             return QRectF(world)
+        targets, modifier_ids, global_reason = self._entity_dirty_scope(kind, entity_id)
+        if global_reason:
+            chapter = QRectF(0, 0, self.chapter.width, self.chapter.height)
+            return chapter if global_reason == 'mask' else chapter.united(world)
+        if any(isinstance(self.chapter.modifiers.get(mid), (MirrorModifier, ArrayModifier, RadialBlurModifier, CageTransformModifier, StrokeModifier)) for mid in modifier_ids):
+            return effect_bounds(world, self._active_modifier_instances(modifier_ids))
+        return self._finite_effect_expanded_dirty(world, targets)
+
+    def _entity_dirty_scope(self, kind: str, entity_id: str):
+        """The existing damage rule, without first measuring every source."""
         from comic_editor.ui.halftone_source import references_entity
         if references_entity(self, kind, entity_id):
-            return QRectF(0, 0, self.chapter.width, self.chapter.height).united(world)
+            return [], [], 'reference'
         targets: list[LayerNode | DocumentObject] = []
 
         def collect_layer(layer_id: str) -> None:
@@ -1605,14 +1618,12 @@ class _CanvasLogic(SceneKernels, LassoBrushFeatures, BrushFeatures, DocumentProj
             target_keys.intersection(mask.contributors)
             for mask in self.chapter.masks.values()
         ):
-            return QRectF(0, 0, self.chapter.width, self.chapter.height)
+            return targets, modifier_ids, 'mask'
         if any(isinstance(m, (HalftoneModifier, PixelateModifier, DistortModifier,
                               KuwaharaModifier, DitheringModifier, SharpnessModifier))
                for m in self._active_modifier_instances(modifier_ids)):
-            return QRectF(0, 0, self.chapter.width, self.chapter.height).united(world)
-        if any(isinstance(self.chapter.modifiers.get(mid), (MirrorModifier, ArrayModifier, RadialBlurModifier, CageTransformModifier, StrokeModifier)) for mid in modifier_ids):
-            return effect_bounds(world, self._active_modifier_instances(modifier_ids))
-        return self._finite_effect_expanded_dirty(world, targets)
+            return targets, modifier_ids, 'spatial'
+        return targets, modifier_ids, None
 
     def _flush_visual_dirty(self) -> None:
         world = QRectF(self._visual_pending_world)
@@ -1711,6 +1722,7 @@ class _CanvasLogic(SceneKernels, LassoBrushFeatures, BrushFeatures, DocumentProj
 
     def _clear_detached_input_state(self) -> None:
         """Reset transient pointer state that cannot survive without a document."""
+        self._resolve_drawing_selection_input()
         self._native_deferred_activations = deque()
         self._cancel_lasso_brush()
         self._cancel_paint_brush()
@@ -1946,6 +1958,7 @@ class _CanvasLogic(SceneKernels, LassoBrushFeatures, BrushFeatures, DocumentProj
         )
 
     def _capture_drawing_selection_state(self) -> _DrawingSelectionSessionState:
+        self._resolve_drawing_selection_input()
         if self._selection_transform_mode is not None:
             # Discard a pointer preview before detaching the tab. Shape-node
             # previews edit their geometry in place; raster/vector previews do not.
@@ -2241,6 +2254,8 @@ class _CanvasLogic(SceneKernels, LassoBrushFeatures, BrushFeatures, DocumentProj
                 self._queue_widget_dirty(self.rect() if isinstance(self, QOpenGLWidget)
                                          else widget, stable_rows=True)
                 self._queue_painting_overlay_damage()
+            elif self._gpu_contact_pacing_current(pending=True):
+                self._queue_widget_dirty(self.rect())
             else:
                 self.update()
         self.changesPublished.emit(change)
@@ -3152,6 +3167,8 @@ class _CanvasLogic(SceneKernels, LassoBrushFeatures, BrushFeatures, DocumentProj
         ), already_done=True)
 
     def set_tool(self, tool: ToolKind) -> bool:
+        if tool != self.tool:
+            self._resolve_drawing_selection_input()
         if tool in {ToolKind.BRUSH, ToolKind.LASSO_BRUSH} and (
             self.chapter is None or self.active_tone_mask_id
             or len(self.selected_entities) > 1
@@ -11501,6 +11518,7 @@ class _CanvasLogic(SceneKernels, LassoBrushFeatures, BrushFeatures, DocumentProj
 
     # ---- drawing selections -------------------------------------------
     def _clear_drawing_selection(self, *, reset_pivot: bool = True) -> None:
+        self._resolve_drawing_selection_input()
         self._selection_raster_states.clear()
         self._selection_raster_snapshot = None
         self._selection_before_tiles = None
@@ -11642,10 +11660,128 @@ class _CanvasLogic(SceneKernels, LassoBrushFeatures, BrushFeatures, DocumentProj
                 result.add(stroke.stroke_id)
         return result
 
+    def _cancel_drawing_selection_input(self, pending=None) -> None:
+        pending = pending or self._drawing_selection_input
+        if pending is None or self._drawing_selection_input is not pending:
+            return
+        self._drawing_selection_input = None
+        gate = pending['gate']
+        owns_gate = self._drawing_selection_tile_input is gate
+        if owns_gate:
+            self._drawing_selection_tile_input = None
+        # A stale source/context can retire its own preview, never a replacement
+        # selection installed while its detached native preparation was running.
+        if (owns_gate and self.chapter is pending['chapter'] and self.tiles is pending['tiles']
+                and self.selected_object_id == pending['object'].object_id
+                and self._selection_transform_start_quad == pending['quad']):
+            self._selection_transform_quad = list(pending['quad'])
+            self._selection_pivot = (QPointF(pending['pivot'])
+                                     if pending['pivot'] is not None else None)
+            self._selection_pivot_custom = pending['pivot_custom']
+            self._selection_transform_mode = None
+            self._selection_transform_handle = None
+            self._selection_transform_start_quad = None
+            self._selection_before_tiles = self._selection_overlay_tiles = None
+            self._selection_before_model = None
+            self._invalidate_scene_cache()
+            self.update()
+        gate.cancel()
+        gate.retire()
+
+    def _resolve_drawing_selection_input(self) -> None:
+        pending = self._drawing_selection_input
+        if pending is None:
+            return
+        if pending['finishing']:
+            # The model transaction may synchronously notify tab/save controls.
+            # It already owns this release; never wait on or cancel that stack.
+            return
+        if not pending['released']:
+            self._cancel_drawing_selection_input(pending)
+            return
+        # Save/tab/tool retirement keeps an already accepted release ordered.
+        # Ordinary pointer callbacks only retain the latest absolute position.
+        while self._drawing_selection_input is pending:
+            gate = pending['gate']
+            if gate.closed or not gate.current():
+                self._cancel_drawing_selection_input(pending)
+                break
+            QApplication.processEvents(QEventLoop.ExcludeUserInputEvents)
+            time.sleep(.002)
+
+    def _prepare_drawing_selection_input(self, obj: RasterObject) -> None:
+        from comic_editor.ui.tile_input import TileInputGate
+        owner = self.tiles._tiles.get(obj.object_id)
+        keys = tuple(owner) if owner is not None else ()
+        pending = {
+            'object': obj, 'chapter': self.chapter, 'tiles': self.tiles,
+            'images': self.images, 'owner': owner, 'keys': keys,
+            'versions': {key: owner.version(key) for key in keys},
+            'selection': (self.selected_kind, self.selected_id,
+                          self.selected_object_id, tuple(self.selected_entities)),
+            'tool': self.tool, 'transform_mode': self.settings.transform_mode,
+            'history': self.command_stack.revision,
+            'document': self._render_document_state(),
+            'revision': self._document_projection.revision,
+            'dependency': getattr(self, '_presentation_dependency_generation', 0),
+            'mapping': self._drawing_local_to_world_transform(obj),
+            'tile_size': obj.tile_size,
+            'mode': self._selection_transform_mode,
+            'handle': self._selection_transform_handle,
+            'path': QPainterPath(self._drawing_selection_path),
+            'quad': list(self._selection_transform_start_quad),
+            'pivot': (QPointF(self._selection_pivot)
+                      if self._selection_pivot is not None else None),
+            'pivot_custom': self._selection_pivot_custom,
+            'latest': None, 'released': False, 'ready': False,
+            'finishing': False,
+        }
+        self._selection_before_tiles = self._selection_overlay_tiles = None
+        self._selection_raster_states.clear()
+        self._drawing_selection_input = pending
+
+        def valid():
+            current = self.tiles._tiles.get(obj.object_id)
+            return (self._drawing_selection_input is pending
+                and self._drawing_selection_tile_input is pending['gate']
+                and self.chapter is pending['chapter'] and self.tiles is pending['tiles']
+                and self.images is pending['images']
+                and self.chapter.objects.get(obj.object_id) is obj
+                and current is owner and tuple(current or ()) == keys
+                and all(current.version(key) == version
+                        for key, version in pending['versions'].items())
+                and (self.selected_kind, self.selected_id, self.selected_object_id,
+                     tuple(self.selected_entities)) == pending['selection']
+                and self.tool == pending['tool']
+                and self.settings.transform_mode == pending['transform_mode']
+                and self.command_stack.revision == pending['history']
+                and self._document_projection.revision == pending['revision']
+                and getattr(self, '_presentation_dependency_generation', 0) == pending['dependency']
+                and obj.tile_size == pending['tile_size']
+                and self._drawing_local_to_world_transform(obj) == pending['mapping']
+                and self._drawing_selection_path == pending['path']
+                and self._selection_transform_start_quad == pending['quad']
+                and self._selection_transform_mode == pending['mode']
+                and self._selection_transform_handle == pending['handle']
+                and (pending['ready'] or self._render_document_state() == pending['document']))
+
+        gate = TileInputGate(self, obj.object_id, valid=valid,
+                            cancelled=lambda: self._cancel_drawing_selection_input(pending))
+        pending['gate'] = self._drawing_selection_tile_input = gate
+
+        def prepared():
+            # Gate-owned native aliases make this read safe after LRU eviction.
+            self._selection_before_tiles = self.tiles.object_tiles(obj.object_id)
+            pending['ready'] = True
+            if pending['latest'] is not None:
+                self._update_drawing_selection_transform(obj, pending['latest'])
+        gate.submit(keys, prepared)
+
     def _begin_drawing_selection_transform(
         self, obj: RasterObject | VectorDrawingObject | LayerNode,
         world: QPointF,
     ) -> bool:
+        self._resolve_drawing_selection_input()
         quad = self._selection_transform_quad
         if not quad:
             return False
@@ -11707,6 +11843,9 @@ class _CanvasLogic(SceneKernels, LassoBrushFeatures, BrushFeatures, DocumentProj
         self._selection_shape_nodes = {}
         self._selection_vector_preview.clear()
         self._selection_vector_preview_revision += 1
+        self._selection_rotate_start = math.atan2(
+            world.y() - pivot.y(), world.x() - pivot.x()
+        )
         if isinstance(obj, VectorDrawingObject):
             self._selection_vector_points = {
                 point.point_id: {
@@ -11737,20 +11876,29 @@ class _CanvasLogic(SceneKernels, LassoBrushFeatures, BrushFeatures, DocumentProj
                     for key, image in pasted.overlay_tiles.items()
                 }
             else:
-                self._selection_before_tiles = self.tiles.object_tiles(
-                    obj.object_id
-                )
-                self._selection_overlay_tiles = None
-            self._prepare_multi_raster_selection(obj)
-        self._selection_rotate_start = math.atan2(
-            world.y() - pivot.y(), world.x() - pivot.x()
-        )
+                if len(self.selected_entities) <= 1:
+                    self._prepare_drawing_selection_input(obj)
+                else:
+                    self._selection_before_tiles = self.tiles.object_tiles(
+                        obj.object_id
+                    )
+                    self._selection_overlay_tiles = None
+            if self._drawing_selection_input is None:
+                self._prepare_multi_raster_selection(obj)
         return True
 
     def _update_drawing_selection_transform(
         self, obj: RasterObject | VectorDrawingObject | LayerNode,
         world: QPointF,
     ) -> None:
+        pending = self._drawing_selection_input
+        if pending is not None:
+            if not pending['gate'].current():
+                self._cancel_drawing_selection_input(pending)
+                return
+            if not pending['ready']:
+                pending['latest'] = QPointF(world)
+                return
         start = self._selection_transform_start_quad
         if not start:
             return
@@ -11897,6 +12045,8 @@ class _CanvasLogic(SceneKernels, LassoBrushFeatures, BrushFeatures, DocumentProj
             )
             self.documentChanged.emit(dirty)
         self._mark_scene_dirty_world(dirty)
+        if pending is not None:
+            pending['revision'] = self._document_projection.revision
         self.update()
 
     def _restore_drawing_transform_model(
@@ -11922,6 +12072,29 @@ class _CanvasLogic(SceneKernels, LassoBrushFeatures, BrushFeatures, DocumentProj
     def _finish_drawing_selection_transform(
         self, obj: RasterObject | VectorDrawingObject | LayerNode,
     ) -> bool:
+        pending = self._drawing_selection_input
+        if pending is not None and not pending['finishing']:
+            if obj is not pending['object']:
+                self._cancel_drawing_selection_input(pending)
+                return True
+            if pending['released']:
+                return True
+            pending['released'] = True
+            gate = pending['gate']
+            def complete():
+                pending['finishing'] = True
+                try:
+                    self._finish_drawing_selection_transform(obj)
+                    if pending['mode'] == 'pivot':
+                        self.interactionFinished.emit()
+                finally:
+                    if self._drawing_selection_input is pending:
+                        self._drawing_selection_input = None
+                    if self._drawing_selection_tile_input is gate:
+                        self._drawing_selection_tile_input = None
+                    gate.retire()
+            gate.finish(complete, keys=pending['keys'])
+            return True
         mode = self._selection_transform_mode
         self._selection_transform_mode = None
         self._selection_transform_handle = None
@@ -17887,6 +18060,8 @@ class _CanvasLogic(SceneKernels, LassoBrushFeatures, BrushFeatures, DocumentProj
 
     def _tool_release(self) -> None:
         session = getattr(self, "_pointer_tool_session", None)
+        continuity = self._scene_controller.geometry_continuity
+        ticket = continuity.begin()
         try:
             if session is not None:
                 session.commit()
@@ -17894,6 +18069,7 @@ class _CanvasLogic(SceneKernels, LassoBrushFeatures, BrushFeatures, DocumentProj
                 self._tool_release_impl()
         finally:
             self._pointer_tool_session = None
+            continuity.finish(ticket)
 
     def _tool_release_with_press_modifiers(self, modifiers) -> None:
         # Outside drawing taps defer selection until release. The pen's down
@@ -17982,8 +18158,10 @@ class _CanvasLogic(SceneKernels, LassoBrushFeatures, BrushFeatures, DocumentProj
                 return
             if self.tool == ToolKind.DRAW_SHAPE and self._pending_drawing_selection_press is not None:
                 self._pending_drawing_selection_press = None
+            pending_selection_input = self._drawing_selection_input
             self._finish_drawing_selection()
-            self.interactionFinished.emit()
+            if pending_selection_input is None and self._drawing_selection_input is None:
+                self.interactionFinished.emit()
             return
         if self._vector_gesture_mode is not None:
             self._end_vector_gesture()
@@ -19108,7 +19286,14 @@ class _CanvasLogic(SceneKernels, LassoBrushFeatures, BrushFeatures, DocumentProj
         if target is None:
             return
         self._shape_last_pointer_doc = QPointF(world_point)
-        dirty_before = entity_visual_bounds(
+        before = self._model_before
+        global_damage = (isinstance(before, RecordSnapshot)
+            and before.document_identity == id(self.chapter)
+            and self._entity_dirty_scope(self.selected_kind, self.selected_id)[2])
+        # These focused transactions already invalidate their complete typed
+        # influence. A chapter-wide damage rule makes two expensive subtree
+        # source-bound traversals redundant on every received pointer move.
+        dirty_before = None if global_damage else entity_visual_bounds(
             self.chapter, self.tiles, self.selected_kind, self.selected_id,
             geometry_cache=self._outline_cache,
         )
@@ -19348,6 +19533,9 @@ class _CanvasLogic(SceneKernels, LassoBrushFeatures, BrushFeatures, DocumentProj
                             )
         if control != "outline_width":
             bound.normalize_bezier_handles()
+        if global_damage:
+            self._geometry_preview_changed(QRectF(0, 0, self.chapter.width, self.chapter.height))
+            return
         dirty_after = entity_visual_bounds(
             self.chapter, self.tiles, self.selected_kind, self.selected_id,
             geometry_cache=self._outline_cache,
@@ -20245,6 +20433,7 @@ class _CanvasLogic(SceneKernels, LassoBrushFeatures, BrushFeatures, DocumentProj
     def _native_input_gates(self):
         lasso = getattr(self, '_lasso_brush', None)
         candidates = (getattr(self, '_mask_tile_input', None),
+                      getattr(self, '_drawing_selection_tile_input', None),
                       getattr(self, '_raster_tile_input', None),
                       getattr(self, '_paint_brush_tile_input', None),
                       getattr(self, '_lasso_brush_tile_input', None),
@@ -21187,7 +21376,12 @@ class _CanvasLogic(SceneKernels, LassoBrushFeatures, BrushFeatures, DocumentProj
             self._geometry_transform_target[0] == "layer_group"
         ):
             self._compound_path_cache.clear()
-            self._invalidate_scene_cache()
+            # Only the private placement preview changed. Original source
+            # ownership and unchanged model captures remain valid.
+            change = ChangeSet((EntityChange(('layer', self._geometry_transform_target[1]),
+                                frozenset({'transform_preview'})),),
+                               transient=True, label='Preview transform')
+            self._publish_change_set(change, action='transient')
 
     def _commit_geometry_transform(self) -> None:
         target = self._geometry_transform_target
@@ -21710,7 +21904,11 @@ class _CanvasLogic(SceneKernels, LassoBrushFeatures, BrushFeatures, DocumentProj
                            + self._multi_translation_dirty(new_dx, new_dy)):
                 self._queue_visual_dirty(region, notify_preview=False)
         else:
-            self._invalidate_scene_cache()
+            # Multi-object draft placement changes no original source pixels.
+            change = ChangeSet(tuple(EntityChange(('object', identifier), frozenset({'transform_preview'}))
+                                    for identifier in self._multi_transform_preview_quads),
+                               transient=True, label='Preview transform')
+            self._publish_change_set(change, action='transient')
 
     def _commit_object_transform(self) -> None:
         ticket = self._scene_controller.release_handoff.begin()

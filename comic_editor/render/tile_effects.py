@@ -15,6 +15,7 @@ from comic_editor.core.effect_geometry import (effect_bounds, outline_blur_paddi
     array_indices, array_transform, reflection_transform)
 from comic_editor.render.tile_graph import TileGraph, TileNode, TileCacheMiss, tiles
 from comic_editor.render.blur_regions import RegionalBlur, BlurTileCache
+from comic_editor.render.admission import check_scene_cancelled
 from comic_editor.render.effect_regions import region_requests_enabled, projection_requires_exact
 from comic_editor.render.modifier_rendering import (
     apply_modifier_stack, modifier_render_settings, _qimage_premultiplied,
@@ -187,6 +188,7 @@ def tile_output(canvas, image, bounds, modifiers, mapping, *, required, request_
         def evaluate(output, source, source_bounds, effect=modifier, stage=index,
                      source_frame=incoming, output_frame=frame, prefix=identity, halo=padding, copies=transforms,
                      pinch=native_pinch):
+            check_scene_cancelled(canvas)
             if copies is not None:
                 from comic_editor.render.effect_pipeline import empty_image
                 result = empty_image(output)
@@ -371,6 +373,7 @@ def tile_output(canvas, image, bounds, modifiers, mapping, *, required, request_
                               shared_frame=padding is None and not regional_spatial, format=storage,
                               input_index=input_index))
     def get(owner, key):
+        check_scene_cancelled(canvas)
         scope = ("tile-graph", request_scope, owner)
         retained = canvas._effect_jobs.retained_get(scope, key)
         result = retained[0] if retained is not None else canvas._modifier_cache_get(key)
@@ -378,15 +381,20 @@ def tile_output(canvas, image, bounds, modifiers, mapping, *, required, request_
             result = projection_result_or_pending(canvas, scope, key)
         return result
     def put(owner, key, result):
+        # Completed native neighbors remain valid under their existing keys.
+        # An abandoned region never starts a new publication or output tile.
+        check_scene_cancelled(canvas)
         canvas._modifier_cache_put(key, result)
         canvas._effect_jobs.retained_put(("tile-graph", request_scope, owner), key, result, shared=True)
     def source(region):
+        check_scene_cancelled(canvas)
         if capture is not None:
             result = capture(region)
         else:
             crop = QRectF(region)
             crop.translate(-bounds.topLeft())
             result = image.copy(crop.toAlignedRect())
+        check_scene_cancelled(canvas)
         return _float_image(_qimage_premultiplied(result)) if float_pipeline else result
     def continue_pending():
         jobs = canvas._effect_jobs

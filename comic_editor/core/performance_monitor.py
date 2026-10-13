@@ -80,6 +80,7 @@ class PerformanceRecorder:
         max_stack_depth: int = 48,
         max_active_spans: int = 128,
         max_transitions: int = 256,
+        max_critical_events: int = 512,
     ) -> None:
         self.enabled = False
         self._sample_interval = max(0.005, float(sample_interval_ms) / 1000.0)
@@ -93,6 +94,7 @@ class PerformanceRecorder:
             "max_stack_depth": max(1, int(max_stack_depth)),
             "max_active_spans": max(1, int(max_active_spans)),
             "max_transitions": max(1, int(max_transitions)),
+            "max_critical_events": max(1, min(512, int(max_critical_events))),
             "sample_interval_ms": self._sample_interval * 1000.0,
             "stall_threshold_ms": self._stall_threshold_ms,
             "metadata_max_keys": 32,
@@ -121,6 +123,7 @@ class PerformanceRecorder:
         self._active_stall: dict[str, Any] | None = None
         self._timeline: deque[dict[str, Any]] = deque(maxlen=self._bounds["max_events"])
         self._transitions: deque[dict[str, Any]] = deque(maxlen=self._bounds["max_transitions"])
+        self._critical_events: deque[dict[str, Any]] = deque(maxlen=self._bounds["max_critical_events"])
         self._stalls: deque[dict[str, Any]] = deque(maxlen=self._bounds["max_stalls"])
         self._phases: dict[tuple[str, str], dict[str, Any]] = {}
         self._active_spans: dict[int, dict[str, Any]] = {}
@@ -143,6 +146,7 @@ class PerformanceRecorder:
             "sampling_errors": 0,
             "active_spans": 0,
             "transition_events": 0,
+            "critical_events": 0,
         }
 
     def start(self, context: dict[str, Any] | None = None) -> None:
@@ -241,7 +245,8 @@ class PerformanceRecorder:
         duration_ms: float | None = None,
         category: str = "event",
         details: dict[str, Any] | None = None,
-        *, capture_epoch: int | None = None,
+        *, capture_epoch: int | None = None, retain_timeline: bool = True,
+        critical: bool = False,
     ) -> None:
         # Pin before detaching payloads. Stop/restart/clear during detachment
         # cannot charge this call to a later capture.
@@ -259,10 +264,12 @@ class PerformanceRecorder:
         detached = _json_value(details) if details is not None else {}
         with self._lock:
             if self.enabled and epoch == self._epoch:
-                self._record_locked(name, duration_ms, category, detached)
+                self._record_locked(name, duration_ms, category, detached,
+                    retain_timeline=retain_timeline, critical=critical)
 
     def _record_locked(
-        self, name: str, duration_ms: float | None, category: str, details: Any
+        self, name: str, duration_ms: float | None, category: str, details: Any,
+        *, retain_timeline: bool = True, critical: bool = False,
     ) -> None:
         event = {
             "t_ms": (time.perf_counter() - self._origin) * 1000.0,
@@ -275,9 +282,17 @@ class PerformanceRecorder:
         }
         if duration_ms is not None:
             event["duration_ms"] = duration_ms
-        if len(self._timeline) == self._timeline.maxlen:
-            self._dropped["timeline_events"] += 1
-        self._timeline.append(event)
+        if retain_timeline:
+            if len(self._timeline) == self._timeline.maxlen:
+                self._dropped["timeline_events"] += 1
+            self._timeline.append(event)
+        # Callers explicitly mark sparse boundaries and their outcomes. Ordinary
+        # phase traffic cannot evict them; metadata and capture epochs are shared
+        # with the normal event path rather than inferred from event names.
+        if critical:
+            if len(self._critical_events) == self._critical_events.maxlen:
+                self._dropped["critical_events"] += 1
+            self._critical_events.append(event)
         # Keep requested-tool/solo breadcrumbs after busy paint/cache phases
         # have displaced them from the general timeline between checkpoints.
         if category in {"transition", "marker", "stall"} or (
@@ -310,18 +325,19 @@ class PerformanceRecorder:
 
     def measure(
         self, name: str, category: str = "phase", details: dict[str, Any] | None = None,
-        *, capture_epoch: int | None = None,
+        *, capture_epoch: int | None = None, critical: bool = False,
     ):
         """Time inclusive wall time; an optional epoch pins external ownership."""
         with self._lock:
             epoch = self._epoch if capture_epoch is None else capture_epoch
             if not self.enabled or epoch != self._epoch:
                 return nullcontext()
-        return self._measure_active(name, category, details, epoch)
+        return self._measure_active(name, category, details, epoch, critical)
 
     @contextmanager
     def _measure_active(
-        self, name: str, category: str, details: dict[str, Any] | None, epoch: int
+        self, name: str, category: str, details: dict[str, Any] | None, epoch: int,
+        critical: bool,
     ) -> Iterator[None]:
         started = time.perf_counter()
         # Detach details at entry so mutations inside the operation cannot alter
@@ -361,7 +377,7 @@ class PerformanceRecorder:
                     # Published active-span details remain immutable, allowing
                     # snapshots to detach them after releasing the hot-path lock.
                     final_details = {**detached, "exception_type": raised} if raised is not None else detached
-                    self._record_locked(name, duration, category, final_details)
+                    self._record_locked(name, duration, category, final_details, critical=critical)
 
     def record_metrics(self, metrics: dict[str, Any]) -> None:
         """Record supplied process/rendering metrics without collecting them here."""
@@ -476,14 +492,37 @@ class PerformanceRecorder:
                     self._active_stall["latest_stack"] = stack
 
     def snapshot(self, *, timeline_limit: int | None = None,
-                 include_timeline: bool = True) -> dict[str, Any]:
+                 include_timeline: bool = True,
+                 sections: frozenset[str] | None = None) -> dict[str, Any]:
         """Return detached results without blocking input on sorting/deep copies.
 
-        Display refreshes can request a short recent timeline. Logs use the
-        default full bounded timeline. Internal published metadata/event/stack
-        containers are immutable; mutable counters and stall shells are copied
-        under the lock, then all expensive work happens after releasing it.
+        Display refreshes can request only the sections their current tab uses.
+        Unrequested containers keep their empty schema values and are not
+        traversed, detached or sorted. Common status, metadata, bounds and drop
+        counts remain fresh. Each included section retains its ordinary bounds
+        and nested detachment. The default includes the full bounded report for
+        logs and exports. Published metadata/event/stack containers are
+        immutable; mutable counters and stall shells are copied under the lock,
+        then all expensive work happens after releasing it.
         """
+        return self._snapshot(timeline_limit=timeline_limit, include_timeline=include_timeline,
+            sections=sections, detach_published=True)
+
+    def _snapshot_for_log(self) -> dict[str, Any]:
+        """Internal read-only writer view of immutable published metadata.
+
+        The checkpoint encoder only reads this view. Mutable counters, ring
+        containers and stall/active-span shells are still copied under lock;
+        published contexts/details/stacks are never mutated by the recorder.
+        Public/display/export snapshots retain full nested detachment.
+        """
+        return self._snapshot(detach_published=False)
+
+    def _snapshot(self, *, timeline_limit=None, include_timeline=True, sections=None,
+                  detach_published):
+        selected = None if sections is None else frozenset(sections)
+        def includes(name):
+            return selected is None or name in selected
         if self._environment is None:
             # Lazy once per recorder, never at construction or on input paths.
             self._environment = {
@@ -498,11 +537,13 @@ class PerformanceRecorder:
             phases = [
                 (category, name, phase["count"], phase["total_ms"], phase["max_ms"], list(phase["durations"]))
                 for (category, name), phase in self._phases.items()
-            ]
-            locations = [(key, counts[0], counts[1]) for key, counts in self._locations.items()]
+            ] if includes("summary") else []
+            locations = ([(key, counts[0], counts[1]) for key, counts in self._locations.items()]
+                         if includes("stack_hotspots") else [])
             now_ms = (time.perf_counter() - self._origin) * 1000.0
             limit = len(self._timeline) if timeline_limit is None else max(0, int(timeline_limit))
-            timeline = list(islice(self._timeline, max(0, len(self._timeline) - limit), None)) if include_timeline else []
+            timeline = (list(islice(self._timeline, max(0, len(self._timeline) - limit), None))
+                        if include_timeline and includes("timeline") else [])
             captured = {
                 "schema_version": 1,
                 "enabled": self.enabled,
@@ -521,18 +562,19 @@ class PerformanceRecorder:
                     "timing_semantics": "Inclusive spans; totals can overlap. Percentiles use recent bounded samples.",
                     "sampling_semantics": "Python stack locations only; native/GPU work appears at its Python caller. Sampling can be delayed by code holding the GIL.",
                 },
-                "context": self._context,
-                "active_spans": list(self._active_spans.values()),
+                "context": self._context if includes("context") else {},
+                "active_spans": [dict(span) for span in self._active_spans.values()] if includes("active_spans") else [],
                 "timeline": timeline,
-                "recent_transitions": list(self._transitions),
+                "recent_transitions": list(self._transitions) if includes("recent_transitions") else [],
+                "critical_events": list(self._critical_events) if includes("critical_events") else [],
                 # Only the shell changes (gap, completed, latest stack pointer).
                 # The stack arrays and contexts themselves are immutable.
-                "stalls": [dict(stall) for stall in self._stalls],
-                "metrics": self._metrics,
+                "stalls": [dict(stall) for stall in self._stalls] if includes("stalls") else [],
+                "metrics": self._metrics if includes("metrics") else {},
                 "bounds": dict(self._bounds),
                 "dropped": dict(self._dropped),
             }
-        report = copy.deepcopy(captured)
+        report = copy.deepcopy(captured) if detach_published else captured
         summary = []
         for category, name, count, total, maximum, values in phases:
             values.sort()

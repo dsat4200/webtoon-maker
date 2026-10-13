@@ -104,7 +104,7 @@ def render_distort_stage(canvas, image, base, bounds, target, modifier,
 
     if policy is not None and modifier.modifier_type in {
             "distort_deform", "distort_mesh_warp", "distort_twirl",
-            "distort_lens_distortion", "distort_pinch_punch"}:
+            "distort_lens_distortion", "distort_pinch_punch", "distort_smudge"}:
         draft_key = ("live-canvas-distort-draft", policy.signature, key)
         result = canvas._modifier_cache_get(draft_key)
         if result is None:

@@ -770,6 +770,10 @@ class SceneKernels:
         self, painter: QPainter, layer: LayerNode, parent_opacity: float,
         visible_world: QRectF,
     ) -> None:
+        from comic_editor.render.live_canvas_preview import live_geometry_source_policy
+        if live_geometry_source_policy(self, layer) is not None:
+            self._render_mirror_target(painter, layer, parent_opacity, visible_world)
+            return
         from comic_editor.ui.compound_strokes import scoped
         if scoped(self, layer) and layer.opacity_mask is None and all(
                 isinstance(m, StrokeModifier) for m in self._active_modifier_instances(layer.modifier_ids)):
@@ -2616,9 +2620,7 @@ class SceneKernels:
             if modifier is None or modifier.muted:
                 continue
             modifier = effective_preview_modifier(self, modifier)
-            result.append(json.dumps(
-                modifier_render_settings(modifier), sort_keys=True, separators=(",", ":"),
-            ))
+            result.append(self._modifier_settings_signature(modifier))
             if (isinstance(modifier, HalftoneModifier)
                     and modifier.color_mode == "target_layer" and not capturing_colors):
                 from comic_editor.ui.halftone_source import source_signature
@@ -2654,8 +2656,7 @@ class SceneKernels:
                     and modifier.color_mode == "target_layer" and not capturing_colors):
                 from comic_editor.ui.halftone_source import source_signature
                 source = source_signature(self, modifier.target_layer_id)
-            return (json.dumps(modifier_render_settings(modifier), sort_keys=True,
-                               separators=(",", ":")), source)
+            return (self._modifier_settings_signature(modifier), source)
 
         def entity_signature(kind: str, entity_id: str) -> tuple:
             entity = self.chapter.mask_contributor(kind, entity_id)
@@ -2700,7 +2701,7 @@ class SceneKernels:
                 )
             ancestors = tuple(
                 (
-                    json.dumps(self._modifier_entity_settings(layer), sort_keys=True),
+                    self._modifier_entity_signature(layer),
                     self._modifier_layer_preview_signature(layer.layer_id),
                     tuple(
                         modifier_signature(modifier)
@@ -2724,7 +2725,7 @@ class SceneKernels:
                 )
             return (
                 kind, entity_id,
-                json.dumps(self._modifier_entity_settings(entity), sort_keys=True),
+                self._modifier_entity_signature(entity),
                 tuple(
                     modifier_signature(modifier)
                     for modifier in entity_modifiers
@@ -2741,7 +2742,7 @@ class SceneKernels:
             if include_paint else ()
         )
         return (
-            json.dumps(copy.deepcopy(mask).to_dict(), sort_keys=True), paint,
+            self._tone_mask_settings_signature(mask), paint,
             tuple(entity_signature(*item) for item in mask.contributors),
             capturing_colors,
         )
@@ -3063,6 +3064,18 @@ class SceneKernels:
             settings.pop(name, None)
         return settings
 
+    def _modifier_entity_signature(self, entity, *, compact=False) -> str:
+        return json.dumps(self._modifier_entity_settings(entity), sort_keys=True,
+                          **({'separators': (',', ':')} if compact else {}))
+
+    def _modifier_settings_signature(self, modifier) -> str:
+        from comic_editor.render.modifier_rendering import modifier_render_settings
+        return json.dumps(modifier_render_settings(modifier), sort_keys=True,
+                          separators=(',', ':'))
+
+    def _tone_mask_settings_signature(self, mask) -> str:
+        return json.dumps(copy.deepcopy(mask).to_dict(), sort_keys=True)
+
     def _modifier_object_preview_signature(self, obj: DocumentObject) -> tuple:
         """Only a live preview that changes this object's pixels is a dependency."""
         live = ()
@@ -3137,9 +3150,7 @@ class SceneKernels:
         if obj.mask_only:
             live = (*live, ("mask-only-visible", self._mask_only_render_visible("object", obj.object_id)))
         return (
-            json.dumps(
-                self._modifier_entity_settings(obj), sort_keys=True, separators=(",", ":")
-            ),
+            self._modifier_entity_signature(obj, compact=True),
             self._modifier_parameter_signature(obj.modifier_ids),
             self._tone_mask_signature(obj.opacity_mask.mask_id)
             if obj.opacity_mask is not None else (),
@@ -3184,9 +3195,7 @@ class SceneKernels:
         if self._show_on_top_signature():
             preview = (*preview, ("show-on-top", self._show_on_top_signature()))
         return (
-            json.dumps(
-                self._modifier_entity_settings(layer), sort_keys=True, separators=(",", ":")
-            ),
+            self._modifier_entity_signature(layer, compact=True),
             self._modifier_parameter_signature(layer.modifier_ids),
             self._tone_mask_signature(layer.opacity_mask.mask_id)
             if layer.opacity_mask is not None else (),
@@ -3307,6 +3316,10 @@ class SceneKernels:
         self, painter: QPainter, obj: DocumentObject,
         parent_opacity: float, local_visible: QRectF,
     ) -> None:
+        from comic_editor.render.live_canvas_preview import live_geometry_source_policy
+        if live_geometry_source_policy(self, obj) is not None:
+            self._render_mirror_target(painter, obj, parent_opacity, local_visible)
+            return
         if self._render_tiled_target(painter, obj, parent_opacity, self.layer_world_transform(obj.parent_layer_id).mapRect(local_visible)):
             return
         if (isinstance(obj, VectorDrawingObject) and obj.blend_mode != "normal"
@@ -3380,10 +3393,19 @@ class SceneKernels:
             max(1, math.ceil(local.right()) - math.floor(local.left())),
             max(1, math.ceil(local.bottom()) - math.floor(local.top())),
         )
+        # A private detached feedback recorder can observe this ordinary
+        # outline source grid. Keep the complete frame before its existing
+        # viewport window is selected; neither the evaluator nor its rounding
+        # changes when the recorder is present.
+        outline_guard = getattr(self, '_filtered_native_outline_guard', None)
+        outline_frame = (QRectF(bounds) if callable(outline_guard)
+            and obj.object_id == getattr(self, '_filtered_native_outline_identifier', None)
+            else None)
         if not bounds.intersects(local_visible):
             return
         from comic_editor.render.tile_effects import generic_target_output
         tiled = generic_target_output(self, obj, bounds, modifiers, layer_transform, local_visible)
+        check_scene_cancelled(self)
         if tiled:
             processed, output_bounds = tiled
             opacity = parent_opacity if obj.opacity_locked else parent_opacity * obj.opacity
@@ -3491,6 +3513,8 @@ class SceneKernels:
         )
         if obj.object_id == self._live_underlay_object_id:
             opacity *= 1.0 - self._live_underlay_amount
+        if outline_frame is not None:
+            outline_guard(obj, outline_frame, bounds, layer_transform, modifiers, processed)
         painter.save()
         painter.setOpacity(opacity)
         painter.drawImage(bounds.topLeft(), processed)
@@ -3568,8 +3592,9 @@ class SceneKernels:
         if layer and scoped(self, target):
             modifiers = [modifier for modifier in modifiers if not isinstance(modifier, StrokeModifier)]
         from comic_editor.ui.thumbnail_effects import capture_scale, scaled_modifiers
-        from comic_editor.render.live_canvas_preview import live_cage_source_policy
-        cage_policy = live_cage_source_policy(self) if cage_affected else None
+        from comic_editor.render.live_canvas_preview import live_cage_source_policy, live_geometry_source_policy
+        cage_policy = (live_cage_source_policy(self) if cage_affected
+                       else live_geometry_source_policy(self, target))
         thumbnail_scale = capture_scale(self, bounds, modifiers, cage_policy=cage_policy)
         navigator = self._interactive_render and getattr(self, "_effect_preview_channel", "canvas") == "navigator"
         stage_mapping = mapping
@@ -4228,7 +4253,11 @@ class SceneKernels:
                 selection.format.setForeground(QColor(Qt.transparent))
             selections.append(selection)
         context.selections = selections
-        document.documentLayout().draw(painter, context)
+        native_text_draw = getattr(painter, '_draw_native_text_document', None)
+        if native_text_draw is None:
+            document.documentLayout().draw(painter, context)
+        else:
+            native_text_draw(document, context)
         if (
             editing and self.hasFocus() and self._text_caret_visible
             and self._text_cursor_position == self._text_selection_anchor

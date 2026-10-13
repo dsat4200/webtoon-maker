@@ -182,6 +182,10 @@ def drawing_selection(snapshot, identifier, path, selected_points, selected_stro
                         before[key], after[key] = QImage(original), replacement
             for key, image in after.items():
                 alpha_bounds[key] = None if image is None else scene.tiles._alpha_bbox(image)
+                # The installed cut drops an empty sparse tile. Record that
+                # absence too; generic history preserves non-null empty sources.
+                if alpha_bounds[key] is None:
+                    after[key] = None
                 scene.tiles.set_tile(identifier, key, image, _known_alpha_bounds=alpha_bounds[key])
             content = scene.tiles.content_bounds(identifier)
             frame = tuple(obj.interaction_rect)

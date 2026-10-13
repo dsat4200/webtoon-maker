@@ -190,7 +190,7 @@ class PerformanceMonitorDialog(QDialog):
         self.refresh_button.clicked.connect(self._refresh)
         self.log_folder_button.clicked.connect(self._open_log_folder)
         self.close_button.clicked.connect(self.close)
-        self.tabs.currentChanged.connect(self._render_visible_tab)
+        self.tabs.currentChanged.connect(self._refresh_tab)
         self.controller.changed.connect(self._capture_changed)
         self._refresh()
 
@@ -241,8 +241,9 @@ class PerformanceMonitorDialog(QDialog):
             self._refresh()
 
     def _refresh(self) -> None:
-        snapshot_for_display = getattr(self.controller, "snapshot_for_display", self.controller.snapshot)
-        self._snapshot = snapshot_for_display()
+        snapshot_for_display = getattr(self.controller, "snapshot_for_display", None)
+        self._snapshot = (snapshot_for_display(tab_index=self.tabs.currentIndex())
+                          if snapshot_for_display is not None else self.controller.snapshot())
         enabled = self.controller.enabled
         blocker = QSignalBlocker(self.enable_checkbox)
         self.enable_checkbox.setChecked(enabled)
@@ -261,6 +262,11 @@ class PerformanceMonitorDialog(QDialog):
         )
         self.log_folder_button.setEnabled(self._log_folder() is not None)
         self._render_visible_tab()
+
+    def _refresh_tab(self, _index: int) -> None:
+        # The previous tab's partial view cannot supply a newly selected tab.
+        # Fetch the current ordinary sections immediately; no per-tab cache.
+        self._refresh()
 
     def _log_folder(self) -> Path | None:
         directory = getattr(self.controller, "log_directory", None)

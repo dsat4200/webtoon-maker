@@ -64,6 +64,51 @@ def test_detached_worker_matches_live_native_scene(canvas):
     assert pixels(result.image) == pixels(reference.image)
 
 
+@pytest.mark.parametrize("closed_index", [0, 1])
+def test_shared_snapshot_cache_callbacks_belong_to_each_backend(canvas, tmp_path, closed_index):
+    from comic_editor.render.cache import PersistentRenderCache
+    from comic_editor.ui.cache_dependencies import RenderDependencies
+    from comic_editor.render.pixels import color_environment
+    page = canvas.chapter.layers[canvas.chapter.root_page_ids[0]]
+    obj = canvas.chapter.add_object(page.layer_id, RasterObject(interaction_rect=(0, 0, 64, 64)))
+    tile = QImage(256, 256, QImage.Format_ARGB32_Premultiplied)
+    tile.fill(QColor("red"))
+    canvas.tiles.set_tile(obj.object_id, (0, 0), tile)
+    canvas.tiles.save_directory(tmp_path / "source", {obj.object_id})
+    contract = canvas.chapter.pixel_contract
+    backing = PersistentRenderCache(tmp_path / "cache", contract=contract.signature,
+        environment=(*RenderDependencies.environment(), color_environment(contract)))
+    canvas._persistent_render_cache = backing
+    owners = []
+    try:
+        snapshot = freeze(canvas)
+        owners = [DetachedSceneBackend(snapshot), DetachedSceneBackend(snapshot)]
+        for owner in owners:
+            assert owner.scene.tiles is not snapshot.tiles
+            assert owner.scene.images is not snapshot.images
+            assert owner.scene.tiles._tiles is snapshot.tiles._tiles
+            assert owner.scene.images._sources is snapshot.images._sources
+            assert owner.scene.tiles.render_fingerprint.__self__ is owner.scene._render_dependencies
+            assert owner.scene.images.render_fingerprint.__self__ is owner.scene._render_dependencies
+        assert getattr(snapshot.tiles, "render_fingerprint", None) is None
+        assert getattr(snapshot.images, "render_fingerprint", None) is None
+        owners[closed_index].close()
+        remaining = owners[1-closed_index]
+        # A cold encoded source must use the remaining owner's live IO lane.
+        assert remaining.scene.tiles.object_signature(obj.object_id)
+        plain = DetachedSceneBackend(replace(snapshot, cache_spec=None))
+        try:
+            assert plain.scene.tiles.object_signature(obj.object_id)
+            assert plain.scene.tiles.tile(obj.object_id, (0, 0)).pixelColor(32, 32) == QColor("red")
+        finally:
+            plain.close()
+    finally:
+        for owner in owners:
+            owner.close()
+        canvas._persistent_render_cache = None
+        backing.close()
+
+
 def test_source_and_model_mutation_cannot_change_older_snapshot(canvas):
     page = canvas.chapter.layers[canvas.chapter.root_page_ids[0]]
     obj = RasterObject(parent_layer_id=page.layer_id, interaction_rect=(0, 0, 64, 64))

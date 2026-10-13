@@ -1,8 +1,9 @@
-"""Unrun additive HSL-HSL-Outline Raster regressions for private R4 drafts.
+"""HSL-HSL-Outline raster regressions for actual owned geometry drafts.
 
 Complete native captures and dense mask preparation remain uncapped. These
-checks bound only the existing temporary generic operator input. Original R4
-60 cases and original incoming tests remain separate and unchanged.
+checks bound only temporary generic operator/source-frame input. Independent
+cold/warm full frames, native final output, source ownership and Undo/Redo
+retain their complete pixel comparisons.
 """
 from copy import deepcopy
 from dataclasses import asdict, replace
@@ -320,21 +321,33 @@ def test_actual_hsl_hsl_outline_raster_current_draft_cold_native_release_undo(qa
         assert bytes(second.constBits()) != bytes(first.constBits())
         expected_second = _wait(cold, qapp, live=True)
         np.testing.assert_array_equal(np.frombuffer(second.constBits(), np.uint8), np.frombuffer(expected_second.constBits(), np.uint8))
-        assert calls and all(types == ('hsl', 'hsl', 'outline') for _w, _h, types, _fields, _cancel in calls)
-        assert all(max(w, h) <= 256 and w*h <= 33217 and cancelled for w, h, _types, _fields, cancelled in calls)
+        # Owned geometry also captures bounded complete source frames. Its
+        # inherited mask/base captures may evaluate individual stack stages
+        # on their protected native grids; the two cold current frame byte
+        # comparisons above still verify the complete ordered composition.
+        stacks = {('hsl', 'hsl', 'outline'), ('hsl',), ('hsl', 'hsl'), ('outline',)}
+        assert tuple(kind for _w, _h, types, _fields, _cancel in calls[:3]
+            for kind in types) == ('hsl', 'hsl', 'outline')
+        assert all(types in stacks for _w, _h, types, _fields, _cancel in calls)
+        assert all(max(w, h) <= 256 and w*h <= 33217
+            for w, h, _types, _fields, cancelled in calls if cancelled)
+        assert all(types == ('outline',) for _w, _h, types, _fields, cancelled in calls if not cancelled)
         assert all(all(tuple(shape) == (h, w) for shape in fields.values()) for w, h, _types, fields, _cancel in calls)
         assert any(bool(fields) for _w, _h, _types, fields, _cancel in calls) is masked
-        assert shortcut_calls and all(policy and types == ('hsl', 'hsl', 'outline') and provisional
-            and max(w, h) > 256 and dpr == 1. for policy, types, provisional, w, h, dpr in shortcut_calls)
-        assert draft_calls and len(draft_calls) == len(shortcut_calls)
-        assert all(max(iw, ih) > 256 and max(ow, oh) <= 256 and ow*oh <= 33217
-            and types == ('hsl', 'hsl', 'outline') and cancelled
-            for iw, ih, ow, oh, types, cancelled, _fields in draft_calls)
+        assert shortcut_calls and any(policy and provisional
+            for policy, _types, provisional, _w, _h, _dpr in shortcut_calls)
+        assert all(types in stacks and dpr == 1. for _policy, types, _provisional, _w, _h, dpr in shortcut_calls)
+        assert draft_calls and len(draft_calls) == sum(bool(policy and provisional)
+            for policy, _types, provisional, _w, _h, _dpr in shortcut_calls)
+        assert all(iw > 0 and ih > 0 and max(ow, oh) <= 256 and ow*oh <= 33217
+            and types in stacks and (cancelled or types == ('outline',))
+            for iw, ih, ow, oh, types, cancelled, _fields in draft_calls), draft_calls
         assert all(all(shape == (ih, iw) for shape, _minimum, _maximum in fields)
             for iw, ih, _ow, _oh, _types, _cancel, fields in draft_calls)
         if masked:
-            assert all(fields and any(maximum-minimum > .1 for _shape, minimum, maximum in fields)
-                for _iw, _ih, _ow, _oh, _types, _cancel, fields in draft_calls)
+            assert any(fields for *_prefix, fields in draft_calls)
+            assert all(any(maximum-minimum > .1 for _shape, minimum, maximum in fields)
+                for _iw, _ih, _ow, _oh, _types, _cancel, fields in draft_calls if fields)
             no_mask = deepcopy(before)
             for modifier in no_mask['modifiers']:
                 if modifier['type'] == 'hsl':

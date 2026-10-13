@@ -1,8 +1,9 @@
 """Opt-in, bounded-background performance checkpoints for later diagnosis.
 
-The provider must return a detached, thread-safe snapshot. It must never read
-QObjects, a canvas, or the mutable document: the controller supplies cached
-editor context together with the recorder's locked snapshot.
+The provider must return a thread-safe snapshot whose nested values remain
+immutable throughout encoding. It must never read QObjects, a canvas, or the
+mutable document: the controller supplies cached editor context together with
+the recorder's locked view of immutable published records.
 """
 from __future__ import annotations
 
@@ -282,7 +283,11 @@ class PerformanceLogWriter:
                 "previous_write_ms": round(self._previous_write_ms, 3),
                 "capture_file": "capture.json", "summary_file": "summary.md",
             }
-            serialized = json.dumps(snapshot, ensure_ascii=False, indent=2, default=str) + "\n"
+            # Recording checkpoints use the ordinary compact C encoder to
+            # reduce repeated diagnostic CPU work. Final/error reports retain
+            # readable indentation; content, options and publication are shared.
+            indent = None if status == "recording" else 2
+            serialized = json.dumps(snapshot, ensure_ascii=False, indent=indent, default=str) + "\n"
             summary = render_performance_summary(snapshot)
             self.directory.mkdir(parents=True, exist_ok=True)
             assert self.json_path is not None and self.summary_path is not None

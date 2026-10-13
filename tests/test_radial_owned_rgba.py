@@ -46,9 +46,9 @@ CONTRACTS=[LEGACY_PIXELS,replace(FLOAT_PIXELS,precision='float16'),FLOAT_PIXELS]
 @pytest.fixture
 def owned_component(candidate):
     from scipy import __version__
-    if candidate._sampler_library() is None or __version__ != '1.18.0':
+    if candidate._sampler_library() is None or __version__ not in candidate._C_SCIPY_VERSIONS:
         assert not candidate._shared_rgba_input(pixels())
-        pytest.skip('Optional verified Windows AMD64/SciPy1.18 component unavailable; ordinary SciPy lane remains tested')
+        pytest.skip('Optional verified Windows AMD64/supported SciPy component unavailable; ordinary SciPy lane remains tested')
 
 
 
@@ -86,7 +86,7 @@ def test_shared_sample_all_float_bits_and_native_input_unchanged(candidate,contr
         source=_qimage_premultiplied(native)
     before=source.tobytes();eligible=candidate._shared_rgba_input(source)
     from scipy import __version__
-    assert eligible == (candidate._sampler_library() is not None and __version__ == '1.18.0')
+    assert eligible == (candidate._sampler_library() is not None and __version__ in candidate._C_SCIPY_VERSIONS)
     if coordinates=='random':
         rng=np.random.default_rng(8391)
         coords=np.stack((rng.uniform(-3,height+3,(31,29)),rng.uniform(-3,width+3,(31,29))))

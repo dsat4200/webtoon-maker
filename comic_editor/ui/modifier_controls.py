@@ -411,6 +411,14 @@ class ModifierCard(QFrame):
             controls = self.findChild(OverlayControls)
             if controls is not None and fields & specialized:
                 controls.sync_from_modifier(self.modifier)
+        elif isinstance(self.modifier, DistortModifier) and self.modifier.modifier_type == 'distort_smudge':
+            from comic_editor.ui.smudge_controls import SmudgeControls
+            specialized = {'parameters'}
+            controls = self.findChild(SmudgeControls)
+            if controls is None:
+                return False
+            if fields & specialized:
+                controls.sync_from_modifier()
         if fields - (set(self._parameter_controls) | {'name', 'expanded', 'muted'} | specialized):
             return False
         for attribute in fields & self._parameter_controls.keys():

@@ -5,7 +5,7 @@ import pytest
 from PySide6.QtCore import QRect, QRectF
 from PySide6.QtGui import QRegion
 
-from comic_editor.core.changes import ChangeSet, EntityChange, ResourceChange
+from comic_editor.core.changes import ChangeSet, DependencyIndex, EntityChange, ResourceChange
 from comic_editor.core.models import RasterObject
 from comic_editor.ui.document_projection_features import DocumentProjectionFeatures
 from comic_editor.ui.scene_controller import SceneController
@@ -21,6 +21,10 @@ def retry_contact(warm_contact):
     canvas._document_projection = SimpleNamespace(revision=3)
     controller = canvas._scene_controller
     controller._presentation_dependency_generation = 0
+    controller._geometry_preview_dependency_generation = 0
+    controller._geometry_preview_owner = None
+    controller.visibility_presentation = SimpleNamespace(changed=lambda *_args: None)
+    controller.geometry_continuity = SimpleNamespace(changed=lambda *_args: None)
     controller.feedback = SimpleNamespace(identifier=canvas.selected_id)
     controller._feedback_covers = lambda *_args: False
     controller._feedback_contact_covers = lambda *_args: True
@@ -75,6 +79,9 @@ def test_replay_owner_and_dependency_transitions_reject_or_change_key(retry_cont
 def controller_stub():
     return SimpleNamespace(canvas=SimpleNamespace(selected_id='selected', _render_document_state=lambda: None),
         _presentation_dependency_generation=0, _contact_preview_owner=None, _bootstrap=None, feedback=None,
+        _geometry_preview_dependency_generation=0, _geometry_preview_owner=None,
+        visibility_presentation=SimpleNamespace(changed=lambda *_args: None),
+        geometry_continuity=SimpleNamespace(changed=lambda *_args: None),
         raster_continuity=SimpleNamespace(changed=lambda *_args: None),
         release_handoff=SimpleNamespace(changed=lambda *_args: None))
 
@@ -222,6 +229,98 @@ def test_already_validated_scene_survives_busy_chunk_without_claiming_fresh_cove
     assert not canvas._raster_feedback_contact_covered and canvas._raster_feedback_pending_visible
     document.configuration = ('new-native-configuration',)
     assert context(canvas, document) is None
+
+
+@pytest.mark.parametrize('known_bounds', [True, False])
+def test_typed_source_publication_keeps_one_pressure_retry_without_losing_invalidation(
+        retry_contact, monkeypatch, known_bounds):
+    canvas, document = retry_contact
+    chapter, controller = canvas.chapter, canvas._scene_controller
+    chapter.layers, chapter.modifiers, chapter.masks = {}, {}, {}
+    canvas._change_index = DependencyIndex(chapter)
+    invalidated, snapshots, continuity, published, updates = [], [], [], [], []
+    canvas._scene_snapshot_compiler = SimpleNamespace(invalidate=snapshots.append)
+    canvas._render_bounds = SimpleNamespace(invalidate_refs=lambda refs: invalidated.append(set(refs)))
+    canvas._render_service = SimpleNamespace(invalidate=lambda world=None: continuity.append(world))
+    canvas._scene_dirty_widget = QRect()
+    canvas._painting_overlay_damage = QRegion()
+    controller._contact_preview_owner = controller._bootstrap = None
+    controller.feedback_dirty = set()
+    controller.raster_continuity = SimpleNamespace(changed=lambda *_args: None)
+    controller.release_handoff = SimpleNamespace(changed=lambda *_args: None)
+    controller.changed = MethodType(SceneController.changed, controller)
+    monkeypatch.setattr(canvas, '_render_document_state', lambda: document)
+    monkeypatch.setattr(canvas, '_world_dirty_to_widget', lambda _world: canvas.rect())
+    overlay_reads = []
+    monkeypatch.setattr(canvas, '_painting_overlay_region',
+        lambda: overlay_reads.append(True) or QRegion(QRect(5, 6, 2, 3)))
+    monkeypatch.setattr(canvas, 'update', lambda region=None: updates.append(region))
+    canvas.changesPublished.connect(published.append)
+    adopt_pressure_retry(canvas, document)
+    canvas._raster_tile_input.busy = True
+    selected = ('object', canvas.selected_id)
+    changes = []
+    for index in range(200):
+        world = QRectF(index, index + 1, 2, 3)
+        bounds = tuple(world.getRect()) if known_bounds else None
+        change = ChangeSet(
+            entities=(EntityChange(selected, frozenset({'pixels'}), bounds, bounds),),
+            resources=(ResourceChange(selected, 'raster', (index, 0)),), transient=True)
+        assert not canvas._live_raster_repaint(change, 'transient')
+        canvas._publish_change_set(change)
+        # Native drawing publishes preview damage after its typed source packet.
+        canvas._queue_visual_dirty(world, scene=False)
+        canvas._queue_painting_overlay_damage()
+        changes.append(change)
+    assert published == snapshots == changes
+    assert canvas._change_index.revision == canvas._change_index.generation(*selected) == 200
+    assert invalidated == [{selected}] * 200 and len(continuity) == 200
+    assert controller.feedback_dirty == {(index, 0) for index in range(200)}
+    assert controller._presentation_dependency_generation == 0
+    assert updates == [] and canvas._visual_frame_timer.starts == []
+    assert overlay_reads == []
+    assert canvas._gpu_presentation_retry_timer.starts == [16]
+    assert canvas._visual_pending_widget == QRegion(canvas.rect())
+    assert canvas._visual_pending_world == QRectF(0, 1, 201, 202)
+    assert not canvas._raster_feedback_contact_covered and canvas._raster_feedback_pending_visible
+    # Committed history must wake immediately through this same publication path.
+    committed = ChangeSet(entities=changes[-1].entities, resources=changes[-1].resources)
+    canvas._publish_change_set(committed, action='commit')
+    assert updates == [None] and published[-1] is committed
+    assert canvas._change_index.revision == 201
+    assert not canvas._gpu_contact_pacing_current(pending=True)
+
+
+@pytest.mark.parametrize('transition', ['release', 'camera', 'dependency', 'context'])
+def test_pending_cursor_packets_coalesce_until_annotation_owner_changes(
+        retry_contact, monkeypatch, transition):
+    canvas, document = retry_contact
+    canvas.rotation = 17.
+    canvas._painting_overlay_damage = QRegion()
+    adopt_pressure_retry(canvas, document)
+    canvas._raster_tile_input.busy = True
+    updates = []
+    monkeypatch.setattr(canvas, 'update', lambda region=None: updates.append(region))
+    monkeypatch.setattr(canvas, '_painting_overlay_region', lambda: QRegion(QRect(5, 6, 2, 3)))
+    for _ in range(200):
+        canvas._queue_painting_overlay_damage()
+    assert updates == [] and canvas._visual_frame_timer.starts == []
+    assert canvas._gpu_presentation_retry_timer.starts == [16]
+    assert canvas._visual_pending_widget == QRegion(canvas.rect())
+    assert not canvas._raster_feedback_contact_covered and canvas._raster_feedback_pending_visible
+    if transition == 'release':
+        canvas._raster_tile_input.released = True
+        canvas._drawing = False
+    elif transition == 'camera':
+        canvas.center_x += 1.
+    elif transition == 'dependency':
+        canvas._scene_controller._presentation_dependency_generation += 1
+    else:
+        canvas._gpu_contact_pacing_context = object()
+    assert not canvas._gpu_contact_pacing_current(pending=True)
+    canvas._queue_painting_overlay_damage()
+    assert updates == [None]  # The changed pending annotation remains immediate.
+    assert canvas._visual_frame_timer.starts == [0]
 
 
 def test_all_borrowed_replay_leases_are_checked_before_the_first_draw():

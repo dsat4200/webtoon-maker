@@ -446,7 +446,17 @@ def entity_visual_bounds(document: ChapterDocument, tiles: TileStore,
     capture bounds use the same coordinates as the artwork being captured.
     Asset operations use the stored document transforms by default.
     """
-    mapping_for_layer = layer_mapping or (lambda identifier: _layer_world_transform(document, identifier))
+    if layer_mapping is None:
+        # Siblings repeatedly ask for the same ancestor mapping. Own these
+        # unchanged transforms only for this synchronous subtree traversal;
+        # the next query observes every model/preview change normally.
+        mappings = {}
+        def mapping_for_layer(identifier):
+            if identifier not in mappings:
+                mappings[identifier] = _layer_world_transform(document, identifier)
+            return mappings[identifier]
+    else:
+        mapping_for_layer = layer_mapping
     def expanded(rect, target, parent_id):
         if not include_effects:
             return rect
@@ -500,7 +510,7 @@ def entity_visual_bounds(document: ChapterDocument, tiles: TileStore,
     for child in layer.children:
         child_bounds = entity_visual_bounds(
             document, tiles, child.kind, child.entity_id, include_effects=include_effects,
-            geometry_cache=geometry_cache, layer_mapping=layer_mapping,
+            geometry_cache=geometry_cache, layer_mapping=mapping_for_layer,
             object_local_bounds=object_local_bounds,
         )
         result = child_bounds if not found else result.united(child_bounds)

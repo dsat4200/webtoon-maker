@@ -40,11 +40,13 @@ class TileStore:
         ] = {}
         self._alpha_bounds_dirty: set[tuple[str, int, int]] = set()
         self.dirty: set[tuple[str, int, int]] = set()
+        self._source_revision = 0
 
     def _object_tiles(self, object_id):
         result = self._tiles.get(object_id)
         if result is None:
-            result = self._tiles[object_id] = DiskTileMap(object_id, self.residency, self._tile_changed)
+            result = self._tiles[object_id] = DiskTileMap(object_id, self.residency, self._tile_changed,
+                                                         registered=self._source_registered)
         return result
 
     @staticmethod
@@ -52,8 +54,14 @@ class TileStore:
         return stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns
 
     def _tile_changed(self, marker):
+        self._source_revision += 1
         self.dirty.add(marker)
         self._alpha_bounds_dirty.add(marker)
+
+    def _source_registered(self):
+        # Loading/replacing a clean original is a source ownership change, but
+        # does not dirty the document or request an artwork render by itself.
+        self._source_revision += 1
 
     def preserve_backing(self, directory: Path) -> None:
         """Keep orphaned pixels available to undo when saved files are pruned."""

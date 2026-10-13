@@ -189,7 +189,7 @@ class OrdinaryContactCapture:
                 require(store_bytes <= 64 * 1024 * 1024, 'ordinary capture residency cap')
                 retained += store_bytes
             require(retained <= byte_budget, 'native contact capture retention cap')
-            lease = RENDER_ADMISSION.reserve_copies(retained)
+            lease = RENDER_ADMISSION.reserve_copies(retained, scope=owner_token)
             if lease is None:
                 raise CaptureAdmissionUnavailable('nonblocking native capture admission declined')
             self._lease = _LeaseOwner(lease)
@@ -306,7 +306,7 @@ class OrdinaryContactCapture:
         # Prototype subclass is only explicit provenance, not another renderer.
         # Older pixels stay R0; all source/effect grids remain ordinary.
         values = {field.name: getattr(self.capture.result, field.name)
-                  for field in fields(SceneSnapshot)}
+                  for field in fields(SceneSnapshot) if field.init}
         values.update(document=self.document, cache_spec=None,
             pin_jobs=tuple(dict.fromkeys((*self.capture.result.pin_jobs, *self._selected_jobs))),
             contact_preview_owner=self.owner_token, capture_lease=self._lease)

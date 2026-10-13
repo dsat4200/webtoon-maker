@@ -6,8 +6,10 @@ artwork depends on which source. Only explicit recording scopes write results.
 from __future__ import annotations
 
 from collections import OrderedDict
+from collections.abc import Mapping, MutableMapping
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
+import copy
 from dataclasses import dataclass
 import hashlib
 import base64
@@ -18,9 +20,10 @@ import os
 from pathlib import Path
 import struct
 import sys
+import time
 import uuid
 import zlib
-from weakref import WeakValueDictionary
+from weakref import WeakSet, WeakValueDictionary
 
 import numpy as np
 from PySide6.QtGui import QImage, QColorSpace
@@ -38,12 +41,141 @@ READ_BUDGET = 64 * 1024 * 1024
 READY_BUDGET = 64 * 1024 * 1024
 MAGIC = b"WTRCACHE1"
 
+_MANIFEST_COOPERATIVE_THRESHOLD = 1024 * 1024
+_MANIFEST_SLICE_SECONDS = .002
+_MANIFEST_SLICE_RECORDS = 128
+
+
+def _load_cache_manifest(text):
+    """Decode the ordinary JSON index, yielding between completed objects.
+
+    One stdlib scanner owns the grammar, values and shared field-name memo.
+    Its callback returns each dictionary unchanged; validation and atomic
+    adoption remain in _committed_index. Nothing is published during a yield.
+    """
+    if len(text) < _MANIFEST_COOPERATIVE_THRESHOLD or text.startswith('\ufeff'):
+        try:
+            return json.loads(text)
+        except RecursionError:
+            # This helper adds one call frame to loads(). Decode directly to
+            # retain loads -> decode -> raw_decode's original recursion budget.
+            return json.JSONDecoder().decode(text)
+    deadline = time.perf_counter() + _MANIFEST_SLICE_SECONDS
+    records = 0
+
+    def cooperate(value):
+        nonlocal deadline, records
+        records += 1
+        if (records >= _MANIFEST_SLICE_RECORDS
+                or time.perf_counter() >= deadline):
+            # Zero seconds relinquishes this worker's timeslice and Python GIL.
+            # No GUI objects, partial publication or cache identity is involved.
+            time.sleep(0)
+            deadline = time.perf_counter() + _MANIFEST_SLICE_SECONDS
+            records = 0
+        return value
+
+    try:
+        return json.JSONDecoder(object_hook=cooperate).decode(text)
+    except RecursionError:
+        # The callback can exhaust the stack at an otherwise valid deeply
+        # nested object. The rare retry uses the original scanner with the
+        # same Python call depth as loads -> decode -> raw_decode.
+        return json.JSONDecoder().decode(text)
+
+
+class _OwnedManifestRecords(MutableMapping):
+    """Independent mutable metadata, copying a private record on first read.
+
+    Keys and ordering belong to this owner. Every public value access uses
+    __getitem__, so nested records never escape the immutable committed base.
+    Explicit publication/inspection may materialize an ordinary dict.
+    """
+    def __init__(self, base):
+        self._base = base
+        self._keys = dict.fromkeys(base)
+        self._owned = {}
+
+    def __getitem__(self, key):
+        if key not in self._keys:
+            raise KeyError(key)
+        if key not in self._owned:
+            self._owned[key] = copy.deepcopy(self._base[key])
+        return self._owned[key]
+
+    def __setitem__(self, key, value):
+        self._keys[key] = None
+        self._owned[key] = value
+
+    def __delitem__(self, key):
+        del self._keys[key]
+        self._owned.pop(key, None)
+
+    def __iter__(self):
+        return iter(self._keys)
+
+    def __reversed__(self):
+        return reversed(self._keys)
+
+    def __len__(self):
+        return len(self._keys)
+
+    def __contains__(self, key):
+        return key in self._keys
+
+    def clear(self):
+        self._keys.clear()
+        self._owned.clear()
+        self._base = {}
+
+    def copy(self):
+        return dict(self.items())
+
+    def popitem(self):
+        if not self:
+            raise KeyError('popitem(): dictionary is empty')
+        key = next(reversed(self._keys))
+        return key, self.pop(key)
+
+    def __or__(self, other):
+        if not isinstance(other, Mapping):
+            return NotImplemented
+        result = self.copy()
+        result.update(other)
+        return result
+
+    def __ror__(self, other):
+        if not isinstance(other, Mapping):
+            return NotImplemented
+        result = dict(other)
+        result.update(self)
+        return result
+
+    def __ior__(self, other):
+        self.update(other)
+        return self
+
+
+@dataclass(frozen=True)
+class _CommittedManifest:
+    stamp: tuple
+    epoch: int
+    generation: int
+    versions: tuple
+    entries: dict
+    sources: dict
+
 
 class _RootState:
     def __init__(self):
         self.lock = RLock()
+        self.ownership_lock = RLock()
         self.epoch = 0
         self.generation = 0
+        self.owners = WeakSet()
+        # Privately owned records are never mutated or returned directly.
+        # A reader's lazy maps keep the base alive if this root is retired.
+        self.committed = None
 
 
 _ROOTS = WeakValueDictionary()
@@ -274,6 +406,8 @@ class PersistentRenderCache:
     def __init__(self, root, *, contract=(), environment=(), resident=None, defer_index=False):
         self.root = Path(root)
         self._root_state = _root_state(self.root)
+        with self._root_state.ownership_lock:
+            self._root_state.owners.add(self)
         self._root_epoch = self._root_state.epoch
         self.contract, self.environment = tuple(contract), tuple(environment)
         self.resident = resident
@@ -627,15 +761,42 @@ class PersistentRenderCache:
             return entries,sources,self._root_state.epoch,self._root_state.generation
 
     def _committed_index(self):
-        try:
-            document = json.loads((self.root/'index.json').read_text(encoding='utf-8'))
-            if document.get('version') == CACHE_VERSION and document.get('renderer') == RENDERER_VERSION:
-                entries,sources = document.get('entries',{}),document.get('sources',{})
-                if isinstance(entries,dict) and isinstance(sources,dict):
-                    return {key:value for key,value in entries.items() if self._valid_entry(key,value)},sources
-        except (OSError,ValueError,TypeError,AttributeError):
-            pass
-        return {},{}
+        path = self.root / 'index.json'
+        versions = CACHE_VERSION, RENDERER_VERSION
+        def stamp():
+            value = path.stat()
+            return (value.st_dev, value.st_ino, value.st_size,
+                    value.st_mtime_ns, value.st_ctime_ns)
+        with self.values_lock:
+            state = self._root_state
+            try:
+                before = stamp()
+            except OSError:
+                before = None
+            committed = state.committed
+            if (before is not None and committed is not None
+                    and (committed.stamp, committed.epoch, committed.generation, committed.versions)
+                    == (before, state.epoch, state.generation, versions)):
+                entries, sources = committed.entries, committed.sources
+            else:
+                state.committed = None
+                entries, sources = {}, {}
+                try:
+                    document = _load_cache_manifest(path.read_text(encoding='utf-8'))
+                    if document.get('version') == CACHE_VERSION and document.get('renderer') == RENDERER_VERSION:
+                        values, aliases = document.get('entries', {}), document.get('sources', {})
+                        if isinstance(values, dict) and isinstance(aliases, dict):
+                            entries = {key: value for key, value in values.items()
+                                       if self._valid_entry(key, value)}
+                            sources = aliases
+                            if before is not None and before == stamp():
+                                state.committed = _CommittedManifest(before, state.epoch,
+                                    state.generation, versions, entries, sources)
+                except (OSError, ValueError, TypeError, AttributeError):
+                    pass
+        # Readers own their mutable records and key order. Source aliases,
+        # bad-entry removal and nested state edits cannot mutate this base.
+        return _OwnedManifestRecords(entries), _OwnedManifestRecords(sources)
 
     def _publish_index(self,snapshot,sources,epoch):
         with self.values_lock:
@@ -645,20 +806,22 @@ class PersistentRenderCache:
             entries.update(snapshot)
             previous_sources.update(sources)
             data = json.dumps(dict(version=CACHE_VERSION,renderer=RENDERER_VERSION,
-                entries=entries,sources=previous_sources),sort_keys=True,separators=(',',':')).encode()
+                entries=dict(entries),sources=dict(previous_sources)),sort_keys=True,separators=(',',':')).encode()
             _atomic_bytes(self.root/'index.json',data)
             self._root_state.generation += 1
+            self._root_state.committed = None
             return entries,previous_sources
 
     def _index_bytes(self, entries):
         return json.dumps(dict(version=CACHE_VERSION, renderer=RENDERER_VERSION,
-            entries=entries, sources=self.source_digests), sort_keys=True,
+            entries=dict(entries), sources=dict(self.source_digests)), sort_keys=True,
             separators=(",", ":")).encode()
 
     def flush(self):
         with self.values_lock:
             _atomic_bytes(self.root / "index.json", self._index_bytes(self.entries))
             self._root_state.generation += 1
+            self._root_state.committed = None
 
     def drain(self):
         # Used only during shutdown/explicit clearing, never while painting.
@@ -680,6 +843,7 @@ class PersistentRenderCache:
         self.epoch += 1
         with self.values_lock:
             self._root_state.epoch += 1
+            self._root_state.committed = None
             self._root_epoch = self._root_state.epoch
             self.entries,self.source_digests = self._committed_index()
             for identity,entry in list(self.entries.items()):
@@ -711,6 +875,10 @@ class PersistentRenderCache:
         self.drain()
         self.executor.shutdown(wait=True, cancel_futures=True)
         self.closed = True
+        with self._root_state.ownership_lock:
+            self._root_state.owners.discard(self)
+            if not self._root_state.owners:
+                self._root_state.committed = None
         self.reads.clear()
         self.verifications.clear()
         self.ready.clear()

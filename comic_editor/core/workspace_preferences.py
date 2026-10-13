@@ -79,9 +79,16 @@ def workspace_snapshot(settings):
             views[key] = camera
             if len(views) > MAX_SAVED_VIEWPORTS:
                 views.pop(next(iter(views)))
+    recent = []
+    for value in settings.recent_series or []:
+        if isinstance(value, str) and value not in recent:
+            recent.append(value)
+            if len(recent) == 12:
+                break
     return {'ui_splitter_sizes': splitters,
             'navigator_expanded': bool(settings.navigator_expanded),
-            'document_viewports': views}
+            'document_viewports': views,
+            'recent_series': recent}
 
 
 def _write_workspace(path, packet, owner, generation):

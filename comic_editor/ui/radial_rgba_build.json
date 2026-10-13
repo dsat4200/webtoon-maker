@@ -1,15 +1,16 @@
 {
   "abi": "0x5247424142490001",
   "platform": "win-amd64",
-  "build_contract": "scalar-double-separate-y-x-corners-00-01-10-11-channel-0-1-2-3-f32-unrolled-no-fastmath-v2",
-  "source_sha256": "877c58e04fd1b2976f4b77868158e06be136f16384807ae1292f58a80f7dcfa8",
-  "binary_sha256": "23fbff68f77290697f2f8df4a274a8b2249361d6e9c8cc1efcbef015bc783f5b",
-  "compiler_sha256": "e9cb3e89e20a9efead83cc9e6b100314275634c2f705056da71f424ea9b0cdf0",
+  "build_contract": "double-separate-y-x-corners-00-01-10-11-channel-independent-f32-no-fastmath-v3",
+  "source_sha256": "a4115eadf1bf81b01ce5b40cd467b36cd8536bce76b43ad00eaf0584f8d240a8",
+  "binary_sha256": "e884d60c32ecb18f2cca30d7c3aa09bb2ca862780e9983df26449c06cb994dcc",
+  "compiler_version": "Microsoft (R) C/C++ Optimizing Compiler Version 19.44.35228 for x64",
+  "compiler_sha256": "88c8344236a27a6e727e0a8edc49aaa2690bdc7a9464b9d18cc7abe70a9f1c0d",
   "pe_inspection": {
     "machine": "AMD64",
     "magic": "PE32+",
     "dll": true,
-    "bytes": 5632,
+    "bytes": 4096,
     "exports": [
       "radial_rgba_abi",
       "radial_rgba_linear"
@@ -18,43 +19,140 @@
     "sections": [
       {
         "name": ".text",
-        "virtual_size": 3840,
+        "virtual_size": 1051,
         "rva": 4096,
-        "raw_size": 4096,
-        "raw_offset": 512
+        "raw_size": 1536,
+        "raw_offset": 1024
+      },
+      {
+        "name": ".rdata",
+        "virtual_size": 565,
+        "rva": 8192,
+        "raw_size": 1024,
+        "raw_offset": 2560
       },
       {
         "name": ".data",
-        "virtual_size": 248,
-        "rva": 8192,
-        "raw_size": 512,
-        "raw_offset": 4608
+        "virtual_size": 4,
+        "rva": 12288,
+        "raw_size": 0,
+        "raw_offset": 0
       },
       {
         "name": ".pdata",
-        "virtual_size": 60,
-        "rva": 12288,
+        "virtual_size": 36,
+        "rva": 16384,
         "raw_size": 512,
-        "raw_offset": 5120
+        "raw_offset": 3584
       }
     ]
   },
-  "archive_sha256": "34a721949a2583fdff725312da092fa0f5f1f284b702e6f811c6954714faabb2",
-  "compiler": "TinyCC 0.9.27 x86_64 Windows (explicit developer build only)",
-  "recipe": [
-    "<explicit-tcc.exe>",
-    "-Wall",
-    "-shared",
-    "comic_editor/ui/radial_rgba_linear.c",
-    "-o",
-    "comic_editor/ui/radial_rgba_win64.dll"
+  "command": [
+    [
+      "C:\\Program Files (x86)\\Microsoft Visual Studio\\2022\\BuildTools\\VC\\Tools\\MSVC\\14.44.35207\\bin\\Hostx64\\x64\\cl.exe",
+      "/nologo",
+      "/TC",
+      "/W4",
+      "/O2",
+      "/fp:strict",
+      "/GS-",
+      "/Zl",
+      "/Brepro",
+      "/c",
+      "/IC:\\Program Files (x86)\\Microsoft Visual Studio\\2022\\BuildTools\\VC\\Tools\\MSVC\\14.44.35207\\include",
+      "/IC:\\Program Files (x86)\\Windows Kits\\10\\Include\\10.0.26100.0\\ucrt",
+      "C:\\Users\\hopper\\Documents\\GitHub\\webtoon-maker\\comic_editor\\ui\\radial_rgba_linear.c",
+      "/FoC:\\Users\\hopper\\Documents\\GitHub\\webtoon-maker\\comic_editor\\ui\\radial_rgba_msvc_5x48oh8g\\sampler.obj"
+    ],
+    [
+      "C:\\Program Files (x86)\\Microsoft Visual Studio\\2022\\BuildTools\\VC\\Tools\\MSVC\\14.44.35207\\bin\\Hostx64\\x64\\cl.exe",
+      "/nologo",
+      "/TC",
+      "/W4",
+      "/O2",
+      "/fp:strict",
+      "/GS-",
+      "/Zl",
+      "/Brepro",
+      "/c",
+      "/IC:\\Program Files (x86)\\Microsoft Visual Studio\\2022\\BuildTools\\VC\\Tools\\MSVC\\14.44.35207\\include",
+      "/IC:\\Program Files (x86)\\Windows Kits\\10\\Include\\10.0.26100.0\\ucrt",
+      "C:\\Users\\hopper\\Documents\\GitHub\\webtoon-maker\\comic_editor\\ui\\radial_rgba_msvc_5x48oh8g\\float_marker.c",
+      "/FoC:\\Users\\hopper\\Documents\\GitHub\\webtoon-maker\\comic_editor\\ui\\radial_rgba_msvc_5x48oh8g\\float_marker.obj"
+    ],
+    [
+      "C:\\Program Files (x86)\\Microsoft Visual Studio\\2022\\BuildTools\\VC\\Tools\\MSVC\\14.44.35207\\bin\\Hostx64\\x64\\link.exe",
+      "/NOLOGO",
+      "/DLL",
+      "/NOENTRY",
+      "/NODEFAULTLIB",
+      "/MACHINE:X64",
+      "/OPT:REF",
+      "/OPT:ICF",
+      "/MANIFEST:NO",
+      "/Brepro",
+      "/OUT:C:\\Users\\hopper\\Documents\\GitHub\\webtoon-maker\\comic_editor\\ui\\radial_rgba_msvc_5x48oh8g\\radial_rgba_win64.dll",
+      "C:\\Users\\hopper\\Documents\\GitHub\\webtoon-maker\\comic_editor\\ui\\radial_rgba_msvc_5x48oh8g\\sampler.obj",
+      "C:\\Users\\hopper\\Documents\\GitHub\\webtoon-maker\\comic_editor\\ui\\radial_rgba_msvc_5x48oh8g\\float_marker.obj"
+    ]
   ],
+  "scope": "Explicit developer build; new binary requires native bit and performance validation before distribution.",
+  "linker_sha256": "ca11e6c45debd34bf652dfe984c5360a531a005ed78bf72852330c9c2590cf0d",
+  "support_source": "int _fltused = 0;\n",
+  "commands": [
+    [
+      "C:\\Program Files (x86)\\Microsoft Visual Studio\\2022\\BuildTools\\VC\\Tools\\MSVC\\14.44.35207\\bin\\Hostx64\\x64\\cl.exe",
+      "/nologo",
+      "/TC",
+      "/W4",
+      "/O2",
+      "/fp:strict",
+      "/GS-",
+      "/Zl",
+      "/Brepro",
+      "/c",
+      "/IC:\\Program Files (x86)\\Microsoft Visual Studio\\2022\\BuildTools\\VC\\Tools\\MSVC\\14.44.35207\\include",
+      "/IC:\\Program Files (x86)\\Windows Kits\\10\\Include\\10.0.26100.0\\ucrt",
+      "C:\\Users\\hopper\\Documents\\GitHub\\webtoon-maker\\comic_editor\\ui\\radial_rgba_linear.c",
+      "/FoC:\\Users\\hopper\\Documents\\GitHub\\webtoon-maker\\comic_editor\\ui\\radial_rgba_msvc_5x48oh8g\\sampler.obj"
+    ],
+    [
+      "C:\\Program Files (x86)\\Microsoft Visual Studio\\2022\\BuildTools\\VC\\Tools\\MSVC\\14.44.35207\\bin\\Hostx64\\x64\\cl.exe",
+      "/nologo",
+      "/TC",
+      "/W4",
+      "/O2",
+      "/fp:strict",
+      "/GS-",
+      "/Zl",
+      "/Brepro",
+      "/c",
+      "/IC:\\Program Files (x86)\\Microsoft Visual Studio\\2022\\BuildTools\\VC\\Tools\\MSVC\\14.44.35207\\include",
+      "/IC:\\Program Files (x86)\\Windows Kits\\10\\Include\\10.0.26100.0\\ucrt",
+      "C:\\Users\\hopper\\Documents\\GitHub\\webtoon-maker\\comic_editor\\ui\\radial_rgba_msvc_5x48oh8g\\float_marker.c",
+      "/FoC:\\Users\\hopper\\Documents\\GitHub\\webtoon-maker\\comic_editor\\ui\\radial_rgba_msvc_5x48oh8g\\float_marker.obj"
+    ],
+    [
+      "C:\\Program Files (x86)\\Microsoft Visual Studio\\2022\\BuildTools\\VC\\Tools\\MSVC\\14.44.35207\\bin\\Hostx64\\x64\\link.exe",
+      "/NOLOGO",
+      "/DLL",
+      "/NOENTRY",
+      "/NODEFAULTLIB",
+      "/MACHINE:X64",
+      "/OPT:REF",
+      "/OPT:ICF",
+      "/MANIFEST:NO",
+      "/Brepro",
+      "/OUT:C:\\Users\\hopper\\Documents\\GitHub\\webtoon-maker\\comic_editor\\ui\\radial_rgba_msvc_5x48oh8g\\radial_rgba_win64.dll",
+      "C:\\Users\\hopper\\Documents\\GitHub\\webtoon-maker\\comic_editor\\ui\\radial_rgba_msvc_5x48oh8g\\sampler.obj",
+      "C:\\Users\\hopper\\Documents\\GitHub\\webtoon-maker\\comic_editor\\ui\\radial_rgba_msvc_5x48oh8g\\float_marker.obj"
+    ]
+  ],
+  "build_options": "/O2 /fp:strict; volatile scalar rounding checkpoints; /Brepro; no CRT imports",
   "native_validation": {
-    "sampler_cases": 83,
-    "whole_kernel_pairs": 3,
-    "output_bytes": 7291648,
-    "output_sha256": "f08cba5f4c54545b35d917d8845d0351ca1b6ba7926bf2bd8afbddbc106e5987",
-    "scope": "Actual isolated C2 native83 and initialized-worker control geometry; assembled live/initial gates remain separate."
-  },
-  "scope": "Optional owned scalar unrolled sampler; unsupported/missing/failed verification keeps ordinary SciPy. No runtime compiler/download or pixel cache."
+    "pytest_cases": 102,
+    "exit_code": 0,
+    "scipy_version": "1.17.1",
+    "scope": "Verified loaded shipped SSE2 paired-channel MSVC binary; held native-image, whole-kernel, mask, float16/float32 and cancellation oracles. Geometry publication adds 16 passing cases."
+  }
 }

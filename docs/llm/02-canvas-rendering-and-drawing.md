@@ -333,6 +333,14 @@ capture chapter records, unrelated raster/mask owners or embedded images.
 Source owner/key versions remain valid through every bounded publication slice;
 harmless projection revisions do not restart owned input. Other scene consumers
 retain their complete captures. No input snapshot enters an artwork/disk cache.
+The exact registered native gate's ordered `InputSourceCapture` may advance
+one ordinary four-millisecond metadata quantum in the turn that starts its
+capture. Completion submits the ordinary worker without another timer hop;
+unfinished capture yields normally. Gate, job, chapter, store and source-version
+ownership are checked before and after this quantum. No native decode moves to
+the GUI, and generic, detached and argument captures retain their staged path.
+Cold pencil/eraser originals, held pixels, cancellation and release/undo/redo
+are covered by `tests/test_native_input_first_quantum.py`.
 Cross-tool native contacts use one FIFO activation queue before changing shared
 stroke fields. A released cold Brush, Pencil, mask or Lasso contact therefore
 finishes its captured transaction before the next contact begins, while each
@@ -394,7 +402,28 @@ checks actual pending mask ownership rather than the shared drawing flag.
   and bounds result handoff bytes. `render/admission.py` shares working-memory
   admission across scene, GPU, navigator, fill and output consumers; expensive
   jobs serialize, small independent work can coexist, and oversized work is
-  exclusive. Admission estimates do not replace the kernels' full-source
+  exclusive among ordinary consumers. One positively owned native input
+  source packet may coexist in an additional process-wide workspace of at
+  most 2 MiB, including during an oversized ordinary kernel. It receives a
+  distinct charged ticket; aggregate occupied/peak bytes include the complete
+  ordinary reservation, source packet and copy leases. Priority alone cannot
+  enter this lane. `SceneConsumers` authorizes only the current native gate's
+  `InputSourceSnapshot`/`prepare_input_tiles` job on the GUI, then the worker
+  inspects immutable PNG headers or resident/frozen metadata without decode,
+  then prepares exact one-key chunks under one ticket for the complete packet.
+  Its charge includes all retained native payloads plus the largest decode/
+  alpha-scan scratch. Complete handoff preflight/actual byte checks also retain
+  the ordinary source/gate budgets; unknown/noncanonical sources and packets
+  exceeding this proof keep the original full-job admission. The packet remains
+  unpublished until all keys are ready. Cancellation stops subsequent chunks
+  and still retires through ordinary owner/version checks. The source ticket
+  cannot borrow a foreign reservation or gain oversized-copy privilege.
+  Existing ordinary sole-parent copy borrowing ignores only that tagged small
+  ticket, while charging every copy and still rejecting unrelated owners.
+  This working-memory exception changes no samples, source/effect grids,
+  color/precision, cache keys or invalidation. It does not preempt an atomic
+  ordinary Qt/GPU kernel or accelerate filtered feedback's ordinary ticket.
+  Admission estimates do not replace the kernels' full-source
   requirements or their cache byte limits.
 - `ui/scene_controller.py` advances capture outside paint, dispatches detached
   work, rejects stale document/configuration/revision results and adopts ready
@@ -471,6 +500,27 @@ checks actual pending mask ownership rather than the shared drawing flag.
   device, clipping, source placement and painter order. Source captures and
   parameter-mask fields keep their original 256-pixel grids; finite point work
   crops only already sampled fields. Masked spatial stages keep ordinary tiles.
+  A single unmasked solid outline can also use the existing parent-local byte
+  outline route. Its recipe witnesses the complete aligned source frame, actual
+  effect window, object and parent mappings, stage settings and image contract,
+  including an ordinary cache hit. Updates evaluate that selected object through
+  the same kernel with the original complete window, then replay its complete
+  source plane on the unchanged native device. Reducing this outline window
+  changes fractional placement rounding and outer-halo pixels, so no smaller
+  per-dab outline window is admitted. Frame growth, mapping or stage changes,
+  blur, masks, unsupported placement and image-contract changes retain ordinary
+  rendering. Native byte equality, partial-demand crops, held pencil/eraser and
+  release/undo/redo checks are in `tests/test_outline_only_native_feedback.py`.
+  Text in the retained scene uses its ordinary Qt document layout. Prefix text
+  draws directly into the complete native device; suffix text records owned
+  `QPicture` commands through a real `QPainter` and replays them in the original
+  painter order. Mutable text documents and layouts never cross worker owners.
+  The command device must match the native device's logical DPI and unit DPR;
+  command/image ownership remains bounded by the existing recipe budget.
+  Placement, clipping, composition, render hints and the unchanged application
+  font environment retain their ordinary semantics. Complete native byte
+  comparisons, transformed/clipped text, cumulative pencil/eraser updates and
+  caller-state checks are in `tests/test_filtered_feedback_native_text.py`.
   `render/filtered_feedback_worker.py` prepares a private source owner off the
   GUI, adopting existing immutable capture pins and unchanged ready originals
   through the ordinary bounded source LRUs. Changed resident pixels and typed
@@ -810,6 +860,20 @@ checks actual pending mask ownership rather than the shared drawing flag.
   cover this ownership boundary.
 - `paintEvent` always ends its widget painter in `finally`, including early returns and exceptions. Deferred capture tracebacks can retain Python frames and delay painter destruction. Relying on that destruction allows an old painter to end Qt's reused OpenGL engine during a later frame, crashing smear previews or native tile presentation. `_paint_canvas_frame` draws within this explicitly bounded lifetime.
 - `_CanvasPerformanceMonitor` records per-frame and per-input timing used by the latency smoke gate.
+- The opt-in drawing performance monitor records bounded detached metadata and
+  owned wall/thread-CPU spans. Its display requests fresh sections for the active
+  tab; automatic logs and manual exports retain the complete report. Automatic
+  `recording` checkpoints use standard compact JSON (`indent=None`), while final
+  stopped/error checkpoints and manual Export JSON retain pretty indentation.
+  Unicode, `default=str`, schema, snapshot content, checkpoint cadence and atomic
+  publication are unchanged. A copied full-project capture comparison on
+  CPython 3.11 reduced median serialization CPU from 179.69 to 31.25 ms across
+  four alternating pairs, with complete parsed-content parity. The independent
+  5 ms observer's maximum stayed about 36 ms; this is CPU/size evidence, not a
+  live input or first-visible-pixel latency claim. Slow owned GUI capture bodies
+  of at least 20 ms retain sparse critical wall/CPU outcomes and explicit body
+  endpoints; these auxiliary inclusive spans must not be added to their parent
+  phase totals.
 
 The entry point asks Qt for a core-profile OpenGL 3.3 surface, no multisampling, and swap interval zero. QPainter antialiasing and explicit offscreen masks/images supply the actual 2D rendering.
 
@@ -854,6 +918,130 @@ Layer world translation is calculated by walking `parent_id` links and summing e
 The old widget scene/static-transform/vector-eraser image paths remain explicit
 reference helpers. A canvas with `SceneController` takes ready presentation;
 its scene previews are captured as tool/model state for detached evaluation.
+
+### Continuous geometry input and dated presentation
+
+Boundary edits whose existing mask/effect damage classification is already
+full-chapter use that scope directly, avoiding two otherwise redundant child
+source-bounds walks per pointer move. The typed influence invalidation remains
+unchanged; finite-effect cases keep their original bounds calculation. Native
+projection/cold-scene and full model/pixel Undo/Redo tests are in
+`test_shape_edit_damage_scope.py`.
+
+`GeometryCapture` recognizes an actual open `RecordSnapshot` owned by the
+boundary or placement tool. It freezes bounded changed records and render
+state, borrowing unchanged immutable records and complete native source
+headers from the ordinary compiler. Native original generations, typed
+dependencies, camera/coverage, selection, history, pixel/color configuration,
+and the graphics owner are part of the gesture guard. Other edits, resources,
+unsupported drafts and admission failures keep ordinary capture/retirement.
+
+If input starts before the first complete ordinary capture, completion may
+promote that same snapshot to an owned `GeometryCapture` before evaluation.
+The identical ownership, native-source, admission and context guards apply;
+failure keeps the ordinary snapshot. Cold and warmed gestures therefore use
+the same guarded draft source grids. Independent cold/warm full-frame tests
+cover HSL/HSL/Outline stacks, scalar masks and owned attached rigs, while
+release/Undo/final native comparisons retain their original pixel contract.
+
+The scheduler retains one actual immutable active evaluation and the latest
+pending request during that same owned gesture. Completed older artwork can
+be shown while newer input is pending, with its actual captured revision and
+provisional status. It is never relabeled current exact, adopted as an exact
+projection tile, exported, or recorded. Release starts ordinary native work.
+`GeometryPresentationContinuity` can hold one actually painted/swapped dated
+image through exactly its own command; view, tool, selection, history, source
+or subsequent typed changes retire it. This does not claim preview/native
+pixel equivalence. Current exact presentation clears that alias.
+
+A very short owned geometry release can precede any painted preview. The
+actual release records its focused transaction, context and prior history;
+only its single nonstructural `CallbackCommand` push may arm a fresh current
+committed presentation. It uses `VisibilityPresentation`'s same isolated
+ordinary-snapshot lane and bounded temporary source policy below. The real
+document is committed, and no unfinished live image is relabeled or adopted.
+The witness binds the actual command/change and context before the first
+request, so intervening source/view/history/selection/tool changes cannot
+first-admit the released edit. A painted gesture keeps its existing dated
+continuity path. Native exact rendering follows without cache transfer.
+`test_geometry_release_preview.py` verifies real unpainted boundary/translation
+releases, independent cold native tiles, full model Undo/Redo and retirement.
+A queued controller timer with no remaining live demand preserves a validated
+current release witness until the first committed paint supplies coverage; it
+does not reset that witness between release and paint.
+
+`VisibilityPresentation` recognizes a typed, nontransient visibility-only
+commit which reveals an existing layer/object or hides a complex layer subtree.
+A bounded metadata-only traversal recognizes more than 32 reachable records;
+small hides keep the ordinary fast native path. One complete ordinary snapshot
+may first produce a bounded current provisional frame through the same scene
+evaluator. Its real document/revision/live status stays unchanged. The private
+demand has no cache specification, recording, feedback or native tile adoption;
+its derived evaluator never transfers draft caches into the ordinary evaluator.
+The normal exact request follows that one frame, with its usual memory/disk
+keys, sampling and dependency checks.
+The last two fully ready native visibility states may supply a bounded
+scheduling hint (512 model records, 256 native addresses). A matching visibility change
+skips the optional provisional render and uses the ordinary exact path directly.
+The hint stores no pixels, source snapshots or semantic cache descriptors; it
+does not establish cache readiness. Every actual cache lookup still uses the
+ordinary keys and dependency validation, and a miss renders normally. Other
+typed edits/reset clear it, while view, source, configuration and history are
+part of its context. Repeated unchanged native repaints reuse its metadata.
+The guard binds the actual published change, unchanged record owners/values,
+source versions, view, selection, tool, history, configuration and graphics
+owner. Context changes retire the frame. Floating, overflow, underlay and
+native mask/base/coupled captures retain ordinary native sampling. The bounded
+224-edge/32,768-pixel presentation source devices are an explicit temporary
+sampling exception; exact tiles and output remain native. October 13 complete
+dense-project framebuffers/model records matched before/after this path while
+first visible reveal improved from 3,110 ms to 708–711 ms. Scope/publication
+tests are in `test_visibility_preview_publication.py`; further results are in
+[the investigation record](../pocket-geometry-responsiveness-2026-10-13.md).
+The first hide of the 41-descendant scene changed visible artwork at 330 ms
+instead of 5,620 ms; complete final native pixels and model records matched.
+Native completion remained about six seconds. Cold hide/view/reveal/source
+retirement and independent native-reference checks passed with the reveal,
+warm-state, geometry release/publication and handoff cases (76 total).
+
+The private geometry source/effect lane uses the existing live-canvas draft
+device limits (224-pixel edge, 32,768 pixels) and scaled stage mappings,
+including Smudge. Complete document-space source frames and original native
+pixels remain unchanged. Raster owners above 32 native cells and layer
+subtrees above 128 native cells retain their ordinary viewport source route,
+avoiding hundreds of unrelated offscreen decodes. Private semantic draft
+caches may carry between evaluations of one positively owned gesture; they
+never transfer their derived values back to an exact/disk evaluator. Floating,
+overflow, underlay, native mask/base/coupled captures and final output retain
+their native contracts. Zoom and display density never raise artwork density.
+
+Native-source header reuse is separate from derived artwork caching.
+`NativeSourceHeaders.fork()` copies address/version/pin/alpha metadata and
+wraps edited originals with independent COW headers. The retained capsule is
+never rendered or persisted. Native tile mutation, clean backing registration,
+resources, conservative/structural changes and unknown object fields invalidate
+it through the ordinary compiler. Resident Qt borrower changes are observed
+before reuse. Each worker snapshot resolves its immutable pin hooks once;
+input-source snapshots use that same resolver. No decode/pin wait runs on input
+or paint. Tests are in `test_native_source_header_reuse.py`,
+`test_geometry_preview_publication.py` and `test_render_gpu_admission.py`.
+
+Owned bounded capture leases are credited to their sole admitted scene
+workspace before nested graphics copies. Its active/pending copies share the
+same strong interaction-scope object; equality of values cannot adopt a foreign
+scope. Zero-byte metadata leases cannot block that workspace. Unrelated nonempty
+pending copies remain foreign; all retained and nested bytes stay in the
+aggregate admission ledger. A cancelled parent stops its graphics-copy wait.
+This prevents a graphics helper from waiting for its own caller's capture.
+
+Each evaluator may retain up to 8 MiB of encoded settings for its own immutable
+snapshot records. Complete semantic keys still revalidate source versions,
+preview poses, masks and render contexts on every use. Derived preview records
+are different owners; serialized metadata does not transfer to another snapshot
+or pixel/disk cache. Native mesh lookup preserves face order and arithmetic while
+using bounded candidate-block tables for small dense queries. Correctness and
+framebuffer measurements are recorded in
+[pocket-geometry-responsiveness-2026-10-13.md](../pocket-geometry-responsiveness-2026-10-13.md).
 
 `_ensure_scene_cache()` is the reference widget-image helper: dark gray outside
 the chapter, background, chapter clip, reversed root-page order, selected
@@ -984,7 +1172,7 @@ format and pixels without re-reading the retired source store.
 - **HSL** performs a NumPy hue/saturation/lightness round-trip with per-parameter masks.
 - **Blur** evaluates a per-pixel radius from strength and the optional focal ramp. `BlurPyramidCache` (64 MiB) stores levels at radii `(0, 1, 3, 7, 15, 31, 63, 127)`, keyed by algorithm and a BLAKE2b source digest. Normal Blur keeps Pillow images in premultiplied `RGBa` through every reduction, enlargement, and blend. Legacy retains the old `RGBA` branch exactly: feeding it premultiplied data causes a second premultiplication/unpremultiplication during resizing and can produce RGB greater than alpha, explaining the colorful distortion on transparent composites.
 - **Radial Blur** uses `radial_blur.py`: symmetric midpoint angular integration with premultiplied bilinear sampling, transparent out-of-source samples, and adaptive sample counts based on pixel arc length. Integration uses 96×96 tiles; zero-angle mask regions are exact identities. The complete incoming stage remains available when rendering a cropped output, so displaced centers do not lose offscreen source pixels. `effect_geometry.radial_sweep_bounds` includes angular extrema and mask endpoint angles; the pipeline adds bilinear support and preserves ancestor clipping.
-- The optional Windows AMD64 RGBA sampler shares corner addresses across four channels on supported finite contiguous float32 inputs with SciPy 1.18.0. Its owned C source, binary, build contract and ABI are verified before loading. Unsupported or missing delivery retains the original SciPy path. It preserves double multiplication and corner order, float32 rounding per angular sample, native grids, sample counts, masks and cancellation cadence; it is not a sampling exception or another cache pipeline. The app never compiles or downloads code. `tools/build_radial_rgba_sampler.py` is an explicit developer build recipe. See [the integration measurements](../refactor-integration-performance-2026-10-07.md) for bit-level acceptance and matched whole-kernel timing.
+- The optional Windows AMD64 RGBA sampler shares corner addresses across four channels on supported finite contiguous float32 inputs with SciPy 1.17.1 or 1.18.0. Its owned C source, binary, build contract and ABI are verified before loading. Unsupported or missing delivery retains the original SciPy path. It preserves double multiplication and corner order, float32 rounding per angular sample, native grids, sample counts, masks and cancellation cadence; it is not a sampling exception or another cache pipeline. The app never compiles or downloads code. `tools/build_radial_rgba_sampler.py` is an explicit developer build recipe supporting the scalar TinyCC route and an explicitly supplied offline MSVC x64 compiler with `/O2 /fp:strict /Brepro` and no CRT imports. MSVC x64 uses SSE2 independent double channel pairs; each channel retains the same y-then-x products, sequential 00/01/10/11 sums and float32 rounding before angular accumulation. Other builds retain the volatile scalar route. The shipped October 13 paired-channel build passed all 102 actual SciPy 1.17.1/native-image, float16/float32, mask and cancellation oracles with the verified component loaded; the complete dense-project framebuffer and model also matched. Every new compiler/binary requires that acceptance again. See [the original integration measurements](../refactor-integration-performance-2026-10-07.md) and [the October 13 whole-project investigation](../pocket-geometry-responsiveness-2026-10-13.md) for native output and timing evidence.
 - `radial_pipeline.py` caches angular integration separately from the final intensity mix. Its key includes the semantic upstream source, center, angle/angle-mask signature, full mapping, output shape and origin, but excludes intensity and its mask. Integration is retained as a float-premultiplied QImage in the existing bounded caches, so the final blend still rounds to RGBA8 only once. An intensity-gradient edit also reuses in-flight integration and blends its latest mask after completion.
 - Document changes with an active Radial Blur mark their identity/revision for deferred exact projection. The previous complete view remains visible until all current tiles are ready. Radial handles and attached mask-gradient drags permit deferral during pen contact; painting and unrelated live previews retain their existing synchronous policy. Changed radial handles cancel obsolete snapshots without dropping retained outputs, no-op input avoids invalidation, Escape restores the drag snapshot, and radial cards synchronize controls without emitting parameter edits.
 - Raster stacks containing an active Radial Blur use the same tile-coordinate stage renderer as Raster Apply and transform the processed result once with nearest sampling. Prefix baking records its output frame (including transparent padding) for later stages, avoiding both a transform/resampling-order mismatch and a blur-pyramid alignment change after Apply. Legacy Raster stacks without radial baking are unchanged.

@@ -18,6 +18,7 @@ from comic_editor.render.service import DocumentRenderService, TileBatchPolicy, 
 from comic_editor.render.scene import DetachedSceneBackend
 from comic_editor.render.admission import CopyLease, RENDER_ADMISSION, WorkCancelled, snapshot_working_bytes
 from comic_editor.render.ordinary_contact_capture import ContactSceneSnapshot
+from comic_editor.render.geometry_capture import GeometrySceneSnapshot
 from comic_editor.render.source_resources import ReadyOriginals
 from comic_editor.render.projection import ProjectionRequest
 
@@ -55,6 +56,8 @@ class SceneDemand:
     feedback_only: bool = False
     feedback_originals: object = None
     contact_preview_owner: tuple | None = None
+    interaction_preview_owner: tuple | None = None
+    visibility_preview_owner: tuple | None = None
 
 
 @dataclass(frozen=True)
@@ -107,6 +110,7 @@ class SceneScheduler:
         self._backend = None
         self._cache_state = None
         self._cache_identity = None
+        self._geometry_draft_cache = self._geometry_draft_owner = None
         self._originals = ReadyOriginals()
         self._transfers = set()
         self.ready_callback = ready_callback
@@ -144,12 +148,65 @@ class SceneScheduler:
             and getattr(active.snapshot.pixel_environment, 'signature', None)
                 == getattr(demand.snapshot.pixel_environment, 'signature', None))
 
+    def _geometry_preview_bounded(self, demand):
+        snapshot = demand.snapshot
+        size = demand.preview_size
+        return (isinstance(snapshot, GeometrySceneSnapshot)
+            and demand.interaction_preview_owner is not None
+            and demand.interaction_preview_owner == snapshot.interaction_preview_owner
+            and snapshot.document.live_preview and not snapshot.document.contact_only
+            and snapshot.cache_spec is None and demand.consumer == 'canvas' and not demand.record
+            and demand.contact_preview_owner is None and not demand.feedback_only
+            and not demand.feedback_target and demand.feedback_requests is None
+            and demand.feedback_originals is None and demand.presentation_size is None
+            and demand.phases in ((None,), ('base', 'top')) and demand.visible is not None
+            and size is not None and len(size) == 2
+            and all(type(value) is int and value > 0 for value in size)
+            and size[0] * size[1] * (16 if snapshot.document.pixel_contract.floating else 4)
+                <= self.handoff_budget
+            and isinstance(getattr(snapshot.capture_lease, 'lease', None), CopyLease)
+            and snapshot.capture_lease.lease.admission is RENDER_ADMISSION
+            and snapshot.capture_lease.lease.scope is snapshot.interaction_preview_owner
+            and not snapshot.capture_lease.lease.released)
+
+    def _coalesces_geometry_preview(self, demand):
+        active = self.active_demand
+        if (active is None or self.future is None or self.cancelled.is_set() or self._transfers
+                or not self._geometry_preview_bounded(active) or not self._geometry_preview_bounded(demand)):
+            return False
+        return (active.interaction_preview_owner == demand.interaction_preview_owner
+            and active.serial <= demand.serial
+            and active.snapshot.document.revision <= demand.snapshot.document.revision
+            and replace(active.snapshot.document, revision=0) == replace(demand.snapshot.document, revision=0)
+            and active.requests == demand.requests and active.phases == demand.phases
+            and active.visible == demand.visible and active.preview_size == demand.preview_size
+            and getattr(active.snapshot.pixel_environment, 'signature', None)
+                == getattr(demand.snapshot.pixel_environment, 'signature', None))
+
+    def _visibility_preview_bounded(self, demand):
+        from comic_editor.render.scene import SceneSnapshot
+        snapshot, size = demand.snapshot, demand.preview_size
+        return (type(snapshot) is SceneSnapshot and demand.visibility_preview_owner is not None
+            and not snapshot.document.live_preview and not snapshot.document.contact_only
+            and not snapshot.document.pixel_contract.floating and not snapshot.document.overflow
+            and snapshot.document.underlay == ('', 0.) and snapshot.cache_spec is None
+            and demand.consumer == 'canvas' and not demand.record
+            and demand.contact_preview_owner is None and demand.interaction_preview_owner is None
+            and not demand.feedback_only and not demand.feedback_target
+            and demand.feedback_requests is None and demand.feedback_originals is None
+            and demand.presentation_size is None and demand.visible is not None
+            and demand.phases in ((None,), ('base', 'top'))
+            and size is not None and len(size) == 2
+            and all(type(value) is int and value > 0 for value in size)
+            and size[0]*size[1]*4 <= self.handoff_budget)
+
     def submit(self, demand, *, coalesce_active=False):
         # Only complete immutable native-contact snapshots take this exception.
         # Existing exact/export/materialization/other consumers still cancel.
         if demand.contact_preview_owner is not None and not self._contact_preview_bounded(demand):
             demand = replace(demand, contact_preview_owner=None)
-        if not coalesce_active or not self._coalesces_contact_preview(demand):
+        if not coalesce_active or not (self._coalesces_contact_preview(demand)
+                                      or self._coalesces_geometry_preview(demand)):
             self.cancel()
         self.pending = demand
         self._start()
@@ -217,7 +274,8 @@ class SceneScheduler:
                     else:
                         retained.append(previous)
                 self.ready = retained
-            contact_preview = (self._contact_preview_bounded(completion.demand)
+            contact_preview = ((self._contact_preview_bounded(completion.demand)
+                                or self._geometry_preview_bounded(completion.demand))
                 and completion.preview is not None and completion.done and not completion.error
                 and not completion.tiles and completion.materialized is None
                 and completion.overview is None and completion.feedback is None
@@ -235,6 +293,8 @@ class SceneScheduler:
                             and previous.demand.snapshot.document.revision <= completion.demand.snapshot.document.revision
                             and previous.demand.contact_preview_owner
                             == completion.demand.contact_preview_owner and not previous.tiles
+                            and previous.demand.interaction_preview_owner
+                            == completion.demand.interaction_preview_owner
                             and previous.materialized is None and previous.overview is None
                             and previous.feedback is None):
                         self.ready_bytes -= int(previous.preview.image.sizeInBytes())
@@ -305,25 +365,33 @@ class SceneScheduler:
 
     def _evaluate(self, demand, token):
         try:
-            if isinstance(demand.snapshot, ContactSceneSnapshot):
+            if demand.visibility_preview_owner is not None and not self._visibility_preview_bounded(demand):
+                raise ValueError('Visibility presentation requires its bounded isolated demand')
+            if isinstance(demand.snapshot, (ContactSceneSnapshot, GeometrySceneSnapshot)):
                 if token.is_set() or self.stopped.is_set():
                     return  # Retired work never inspects its released lease/context.
                 snapshot = demand.snapshot
                 holder = snapshot.capture_lease
                 copies = getattr(holder, 'lease', None)
-                if (not self._contact_preview_bounded(demand)
-                        or snapshot.contact_preview_owner != demand.contact_preview_owner
+                bounded = (self._contact_preview_bounded(demand) if isinstance(snapshot, ContactSceneSnapshot)
+                           else self._geometry_preview_bounded(demand))
+                if (not bounded
                         or snapshot.cache_spec is not None or snapshot.graphics_worker is not None
                             and getattr(snapshot.graphics_worker, 'closed', False)
                         or not isinstance(copies, CopyLease)
                         or copies.admission is not RENDER_ADMISSION or copies.released):
-                    raise ValueError('Private contact capture requires its live owned copy lease')
+                    raise ValueError('Private preview capture requires its live owned copy lease')
+                owner = (snapshot.contact_preview_owner if isinstance(snapshot, ContactSceneSnapshot)
+                         else snapshot.interaction_preview_owner)
+                if copies.scope is not owner:
+                    raise ValueError('Private preview copies require their actual interaction scope')
                 # Charge the complete unchanged worker estimate AND retained
                 # private copies; credit those exact already-reserved copies
                 # once through the existing admission implementation.
                 size = demand_working_bytes(demand) + copies.size
                 with RENDER_ADMISSION.reserve(demand.consumer, size, priority=0,
-                        cancelled=lambda: token.is_set() or self.stopped.is_set(), copies=copies):
+                        cancelled=lambda: token.is_set() or self.stopped.is_set(), copies=copies,
+                        own_copies=True):
                     return self._evaluate_admitted(demand, token)
             if self._background_cache(demand):
                 # A chapter warm/record request may contain hundreds of rows.
@@ -348,6 +416,9 @@ class SceneScheduler:
             cancelled=lambda: token.is_set() or self.stopped.is_set())
 
     def _evaluate_admitted(self, demand, token):
+        if demand.interaction_preview_owner != self._geometry_draft_owner:
+            self._geometry_draft_cache = None
+            self._geometry_draft_owner = demand.interaction_preview_owner
         try:
             if token.is_set() or self.stopped.is_set():
                 return
@@ -421,7 +492,12 @@ class SceneScheduler:
                 if demand.consumer == "canvas":
                     preview_backend.artwork_scale = 1.
                     preview_backend.native_preview = True
-                    if (snapshot.document.live_preview and not snapshot.document.contact_only
+                    if self._visibility_preview_bounded(demand):
+                        from comic_editor.render.live_canvas_preview import VisibilityCanvasPreviewPolicy
+                        preview_backend.live_canvas_preview_policy = VisibilityCanvasPreviewPolicy(
+                            snapshot.document.identity, snapshot.document.revision, demand.serial,
+                            lambda: token.is_set() or self.stopped.is_set())
+                    elif (snapshot.document.live_preview and not snapshot.document.contact_only
                             and not demand.record
                             and not snapshot.document.pixel_contract.floating
                             and not snapshot.document.overflow
@@ -438,6 +514,13 @@ class SceneScheduler:
                 # preview contracts keep their existing native cache adoption.
                 if getattr(preview_backend, 'live_canvas_preview_policy', None) is None:
                     preview_backend.scene.adopt_cache_state(backend.scene.cache_state())
+                elif (self._geometry_preview_bounded(demand)
+                        and demand.interaction_preview_owner == self._geometry_draft_owner
+                        and self._geometry_draft_cache is not None):
+                    # Transfer only this gesture's private draft/native-subset
+                    # semantic caches. No editor, source owner, or exact/disk
+                    # evaluator receives the transferred derived results.
+                    preview_backend.scene.adopt_cache_state(self._geometry_draft_cache)
                 preview_service = DocumentRenderService(preview_backend)
                 preview_service.projection.revision = snapshot.document.revision
                 try:
@@ -450,6 +533,10 @@ class SceneScheduler:
                                 or demand.consumer == 'navigator'
                                     and RENDER_ADMISSION.higher_priority_waiting(2)):
                         result = preview_service.render_region(snapshot.document, request)
+                    if (self._geometry_preview_bounded(demand) and not token.is_set()
+                            and not self.stopped.is_set() and not result.image.isNull()
+                            and result.status.value == 'provisional'):
+                        self._geometry_draft_cache = preview_backend.scene.cache_state()
                 finally:
                     preview_backend.close()
                 if demand.consumer == "navigator" and not result.image.isNull():
@@ -466,7 +553,7 @@ class SceneScheduler:
                     overview = exact_overview(demand, backend, service,
                         lambda: token.is_set() or self.stopped.is_set())
                     self._publish(SceneCompletion(demand, done=True, overview=overview), token)
-                if not snapshot.document.live_preview:
+                if not snapshot.document.live_preview and demand.visibility_preview_owner is None:
                     self._prepare_feedback(demand, backend, token)
                 return
             requests = list(demand.requests)
@@ -591,6 +678,7 @@ class SceneScheduler:
 
     def _close_backend(self):
         self._cache_state = None
+        self._geometry_draft_cache = self._geometry_draft_owner = None
         self._originals.clear()
         if self._backend is not None:
             self._backend.close()

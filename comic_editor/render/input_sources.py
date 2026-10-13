@@ -1,18 +1,21 @@
 """Capture only native source tiles required by an admitted input packet."""
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 import time
 
-from PySide6.QtGui import QImage
+from PySide6.QtGui import QImage, QImageReader
 
 from comic_editor.core.tile_backing import EditableTile, SnapshotBacking, prefetch_pins
-from comic_editor.render.scene import SceneSnapshot, SceneTileStore
+from comic_editor.render.admission import NATIVE_SOURCE_WORKSPACE
+from comic_editor.render.scene import SceneSnapshot, SceneTileStore, _SourcePreparation
 
 
 @dataclass(frozen=True)
 class InputSourceSnapshot:
     tiles: object
     pin_jobs: tuple
+    _source_preparation: object = field(default_factory=_SourcePreparation,
+                                        init=False, compare=False, repr=False)
 
     @property
     def state(self):
@@ -22,6 +25,89 @@ class InputSourceSnapshot:
         # Use the existing immutable source-pin resolver. This is input
         # preparation, not another rendering or durable caching pipeline.
         return SceneSnapshot.finish_sources(self)
+
+    _finish_sources = SceneSnapshot._finish_sources
+
+    def bounded_workspace(self, identifier, keys, handoff_budget, cancelled):
+        """Prove the complete native packet's payload and preparation scratch.
+
+        Only the detached worker calls this. Resolve the ordinary immutable
+        pins, then inspect resident/raw metadata or PNG headers without
+        decoding. Noncanonical or unknown sources keep ordinary admission.
+        Returned images borrow the same decoded source buffers; all packet
+        payloads remain charged together until the whole packet is ready.
+        """
+        self.finish_sources()
+        owner = self.tiles._tiles.get(identifier)
+        payload = scratch = 0
+        wide = {QImage.Format_RGBA64, QImage.Format_RGBA64_Premultiplied,
+            QImage.Format_RGBX64, QImage.Format_RGBA16FPx4,
+            QImage.Format_RGBA16FPx4_Premultiplied, QImage.Format_RGBX16FPx4,
+            QImage.Format_RGBA32FPx4, QImage.Format_RGBA32FPx4_Premultiplied,
+            QImage.Format_RGBX32FPx4}
+        narrow = {QImage.Format_ARGB32, QImage.Format_ARGB32_Premultiplied}
+        for key in keys:
+            if cancelled():
+                from comic_editor.render.admission import WorkCancelled
+                raise WorkCancelled()
+            if owner is None or key not in owner:
+                continue
+            resident = owner.residency.entries.get((owner, key))
+            if resident is not None:
+                image = resident[0]
+                width, height = image.width(), image.height()
+                byte_count, format = int(image.sizeInBytes()), image.format()
+            else:
+                value = owner.entries.get(key)
+                if isinstance(value, EditableTile):
+                    frozen = value.frozen
+                    if frozen is None:
+                        return None
+                    width, height = frozen.width, frozen.height
+                    byte_count, format = frozen.stride*height, frozen.format
+                elif isinstance(value, Path):
+                    value = owner.backing(key)  # Existing per-address immutable pin.
+                    reader = QImageReader(str(value))
+                    size = reader.size()
+                    if bytes(reader.format()) != b'png' or not size.isValid():
+                        return None
+                    width, height = size.width(), size.height()
+                    format = reader.imageFormat()
+                    # PNG stores at most four uint16 channels. Its Qt format
+                    # option may be unknown; use that complete native upper
+                    # bound rather than assuming an eight-bit saved original.
+                    byte_count = ((width*8+3)//4*4)*height
+                    if format in narrow:
+                        byte_count = ((width*4+3)//4*4)*height
+                else:
+                    return None
+            if (not 0 < width <= self.tiles.tile_size
+                    or not 0 < height <= self.tiles.tile_size or byte_count <= 0):
+                return None
+            pixels = width*height
+            if format in wide:
+                # native_rgba_pixels owns one float32 RGBA array, followed by
+                # an alpha occupancy array and small axis/coordinate arrays.
+                temporary = pixels*18+4096
+            elif format in narrow:
+                temporary = pixels*4+4096
+            elif format == QImage.Format_Grayscale16:
+                temporary = pixels*26+4096
+            elif format == QImage.Format_Invalid:
+                temporary = pixels*32+4096
+            else:
+                # Other packed formats can require Qt conversion and owned
+                # pixel/PIL buffers; the wide path may need two float arrays.
+                from comic_editor.core.pixel_arrays import image_has_high_precision
+                probe = QImage(1, 1, format)
+                temporary = pixels*(32 if image_has_high_precision(probe) else 12)+4096
+            payload += byte_count
+            # Restoring a frozen raw revision can temporarily retain its byte
+            # input while Qt copies it into the unchanged native QImage.
+            scratch = max(scratch, temporary, byte_count)
+            if payload > handoff_budget or payload+scratch > NATIVE_SOURCE_WORKSPACE:
+                return None
+        return payload+scratch
 
 
 class InputSourceCapture:

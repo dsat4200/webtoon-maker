@@ -97,11 +97,11 @@ class BrushPreview(QLabel):
 
 
 class BrushPresetCombo(QComboBox):
-    def __init__(self, settings, parent=None):
+    def __init__(self, settings, parent=None, *, thumbnail_source=None):
         super().__init__(parent)
         self.settings = settings
         from .brush_thumbnail_store import BrushThumbnailStore
-        self.thumbnails = BrushThumbnailStore(self)
+        self.thumbnails = BrushThumbnailStore(self, source_store=thumbnail_source)
         self.thumbnails.changed.connect(self._thumbnail_changed)
         # Grid tiles draw full thumbnails themselves; keep the closed field
         # at the normal text-control height inside the narrow sidebar.

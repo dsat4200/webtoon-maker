@@ -11,7 +11,7 @@ import math
 
 from PySide6.QtCore import QPoint, QPointF, QRect, QRectF, QSize, QSizeF
 from PySide6.QtGui import (QBrush, QColor, QFont, QImage, QPainter, QPainterPath,
-    QPen, QPolygon, QPolygonF, QRegion, QTransform)
+    QPen, QPicture, QPolygon, QPolygonF, QRegion, QTransform)
 
 from comic_editor.core.models import (BrightnessContrastModifier, CurvesModifier,
     HueSaturationLightnessModifier, OutlineModifier)
@@ -20,6 +20,8 @@ from comic_editor.render.raster_feedback import feedback_chain
 from comic_editor.render.scene import DetachedSceneBackend, detached_value
 from comic_editor.render.service import DocumentRenderService, RenderQuality
 from comic_editor.render.tile_effects import footprint
+from comic_editor.core.effect_geometry import outline_blur_padding
+from comic_editor.render.modifier_rendering import modifier_render_settings
 
 
 class FeedbackUnavailable(Exception):
@@ -30,7 +32,7 @@ class FeedbackUnavailable(Exception):
 FILTERED_PREPARED_BUDGET = 128 * 1024 * 1024
 
 _VALUES = (QPoint, QPointF, QRect, QRectF, QSize, QSizeF, QBrush, QColor, QFont,
-    QImage, QPainterPath, QPen, QPolygon, QPolygonF, QRegion, QTransform)
+    QImage, QPainterPath, QPen, QPicture, QPolygon, QPolygonF, QRegion, QTransform)
 _MUTATIONS = frozenset(('save', 'restore', 'setOpacity', 'setTransform', 'resetTransform',
     'setWorldTransform', 'translate', 'rotate', 'scale', 'shear', 'setRenderHint',
     'setRenderHints', 'setClipRect', 'setClipPath', 'setClipRegion', 'setClipping',
@@ -56,6 +58,16 @@ class NativePainterOperation:
         getattr(painter, self.name)(*self.args, **dict(self.kwargs))
 
 
+@dataclass(frozen=True)
+class NativeTextOperation:
+    """Owned Qt paint commands; no text document or layout crosses workers."""
+    picture: QPicture
+    name: str = 'native_text_document'
+
+    def apply(self, painter):
+        painter.drawPicture(QPointF(), self.picture)
+
+
 class _Payload:
     """Charge shared native storage once; bound command and geometry metadata."""
     def __init__(self, budget):
@@ -71,6 +83,8 @@ class _Payload:
         self.metadata += 64
         if isinstance(value, QImage):
             self.images[value.cacheKey()] = value.sizeInBytes()
+        elif isinstance(value, QPicture):
+            self.metadata += value.size()
         elif isinstance(value, QPen):
             self.own(value.brush())
         elif isinstance(value, QBrush):
@@ -118,6 +132,46 @@ class _Recorder:
         self.prefix = None
         self.boundary = None
 
+    def _draw_native_text_document(self, document, context):
+        """Let the ordinary Qt layout draw through a real native painter.
+
+        Prefix pixels already belong to the retained complete device. A suffix
+        retains Qt's ordered native text commands, rather than a transparent
+        raster plane or a mutable QObject from this preparation thread.
+        """
+        if self.cancelled():
+            raise FeedbackUnavailable('Native feedback preparation cancelled')
+        if self.phase == 'before' and not self.suppress_draws:
+            document.documentLayout().draw(self.painter, context)
+            return
+        picture = QPicture()
+        device = self.painter.device()
+        if (device.devicePixelRatioF() != 1.
+                or device.logicalDpiX() != picture.logicalDpiX()
+                or device.logicalDpiY() != picture.logicalDpiY()):
+            raise FeedbackUnavailable('Native text command device changed its DPI')
+        writer = QPainter(picture)
+        try:
+            # Placement and clipping remain the original ordered operations on
+            # the native scene device. Qt records untransformed text commands.
+            writer.setRenderHints(writer.renderHints(), False)
+            writer.setRenderHints(self.painter.renderHints())
+            writer.setPen(self.painter.pen())
+            writer.setBrush(self.painter.brush())
+            writer.setFont(self.painter.font())
+            writer.setOpacity(self.painter.opacity())
+            writer.setCompositionMode(self.painter.compositionMode())
+            document.documentLayout().draw(writer, context)
+        finally:
+            writer.end()
+        if len(self.operations) + len(self.selected_operations) >= 16384:
+            raise FeedbackUnavailable('Too many ordinary painter operations')
+        self.payload.metadata += 1024
+        operation = NativeTextOperation(self.payload.own(picture))
+        (self.selected_operations if self.phase == 'selected' else self.operations).append(operation)
+        if not self.suppress_draws:
+            document.documentLayout().draw(self.painter, context)
+
     def __getattr__(self, name):
         if name in _GETTERS:
             return getattr(self.painter, name)
@@ -139,6 +193,45 @@ class _Recorder:
 
 
 @dataclass(frozen=True)
+class NativeOutlineSampling:
+    """Witness for the unchanged ordinary parent-local byte outline route."""
+    complete_frame: tuple
+    window: tuple
+    effect_region: tuple
+    native_mapping: tuple
+    parent_mapping: tuple
+    stages: tuple
+
+
+def _outline_sampling(backend, obj, complete, window, parent, modifiers, image):
+    # This first route keeps the ordinary optimized single-outline kernel.
+    # Mask fields, outline blur and multiple-outline precision need separate
+    # native region proofs; they retain the existing ordinary fallback.
+    if (len(modifiers) != 1 or not isinstance(modifiers[0], OutlineModifier)
+            or modifiers[0].style != 'solid' or modifiers[0].parameter_masks
+            or outline_blur_padding(modifiers[0]) != 0):
+        raise FeedbackUnavailable('Unsupported ordinary outline source witness')
+    native = QTransform.fromTranslate(obj.x, obj.y) * backend.scene._drawing_object_transform(obj)
+    effect_region = backend.scene._modifier_viewport_region(QRectF())
+    values = (*complete.getRect(), *window.getRect(), *effect_region.getRect())
+    if (not all(math.isfinite(value) for value in values)
+            or complete != QRectF(complete.toAlignedRect())
+            or window != QRectF(window.toAlignedRect()) or window.isEmpty() or effect_region.isEmpty()
+            or not complete.contains(window)
+            or not native.isAffine() or not native.isInvertible()
+            or not parent.isAffine() or not parent.isInvertible()
+            or image.isNull() or image.devicePixelRatio() != 1.
+            or image.width() != int(window.width()) or image.height() != int(window.height())):
+        raise FeedbackUnavailable('Ordinary outline lost its native source grid')
+    mappings = tuple(tuple(getattr(mapping, f'm{i}{j}')() for i in range(1, 4) for j in range(1, 4))
+        for mapping in (native, parent))
+    if not all(math.isfinite(value) for mapping in mappings for value in mapping):
+        raise FeedbackUnavailable('Ordinary outline source mapping is nonfinite')
+    return NativeOutlineSampling(tuple(complete.getRect()), tuple(window.getRect()), tuple(effect_region.getRect()),
+        *mappings, tuple(repr(modifier_render_settings(modifier)) for modifier in modifiers))
+
+
+@dataclass(frozen=True)
 class NativeFeedbackRecipe:
     document: object
     identifier: str
@@ -148,7 +241,8 @@ class NativeFeedbackRecipe:
     operations: tuple
     image_index: int
     byte_count: int
-    source_sampling: tuple
+    source_sampling: tuple | None
+    outline_sampling: NativeOutlineSampling | None = None
 
     @property
     def source_origin(self):
@@ -233,6 +327,7 @@ def capture_native_feedback_recipe(snapshot, identifier, request, *,
     recorder = None
     payload = _Payload(budget)
     source_sampling = []
+    outline_sampling = []
     observed_source_kinds = []
     original_object, original_paint = backend.scene._render_object, backend.paint
 
@@ -266,6 +361,11 @@ def capture_native_feedback_recipe(snapshot, identifier, request, *,
 
     backend.scene._render_object = render_object
     backend.scene._filtered_native_frame_guard = source_frame
+    def outline_frame(obj, complete, window, parent, modifiers, image):
+        if recorder is not None and recorder.phase == 'selected' and obj.object_id == identifier:
+            outline_sampling.append(_outline_sampling(backend, obj, complete, window, parent, modifiers, image))
+    backend.scene._filtered_native_outline_identifier = identifier
+    backend.scene._filtered_native_outline_guard = outline_frame
     backend.paint = paint
     try:
         service = DocumentRenderService(backend)
@@ -275,8 +375,12 @@ def capture_native_feedback_recipe(snapshot, identifier, request, *,
                 or recorder.prefix is None or cancelled()):
             raise FeedbackUnavailable(result.error or 'Ordinary selected capture is unavailable')
         index, _origin, _image = _single_image(recorder.selected_operations)
-        if (len(source_sampling) != 1 or QRectF(*source_sampling[0][3])
-                != QRectF(_origin.x(), _origin.y(), _image.width(), _image.height())):
+        placement = QRectF(_origin.x(), _origin.y(), _image.width(), _image.height())
+        ordinary_outline = (len(outline_sampling) == 1 and not source_sampling
+            and QRectF(*outline_sampling[0].window) == placement)
+        ordinary_tile = (len(source_sampling) == 1 and not outline_sampling
+            and QRectF(*source_sampling[0][3]) == placement)
+        if not (ordinary_tile or ordinary_outline):
             raise FeedbackUnavailable('Selected source has no stable shared native output frame: '
                 + repr((observed_source_kinds, source_sampling, _origin, _image.size()))[:1200])
         operations = (*recorder.operations[:recorder.boundary], *recorder.selected_operations,
@@ -288,7 +392,9 @@ def capture_native_feedback_recipe(snapshot, identifier, request, *,
         if retained_bytes > budget:
             raise FeedbackUnavailable('Native feedback progress cannot fit its prepared byte budget')
         return NativeFeedbackRecipe(snapshot.document, identifier, request, recorder.prefix,
-            initial, operations, recorder.boundary + index, retained_bytes, source_sampling[0])
+            initial, operations, recorder.boundary + index, retained_bytes,
+            source_sampling[0] if ordinary_tile else None,
+            outline_sampling[0] if ordinary_outline else None)
     finally:
         backend.scene._render_object = original_object
         backend.paint = original_paint
@@ -394,9 +500,12 @@ def update_native_feedback_recipe(recipe, snapshot, dirty, *, previous_source=No
     composed = recipe.prefix.copy()
     payload = _Payload(64 * 1024 * 1024)
     source_frames = []
+    outline_frames = []
     def source_frame(source_identity, frame, required, mapping, float_pipeline):
         if source_identity[:3] != ('local-tile-source', 'object', recipe.identifier):
             return
+        if recipe.source_sampling is None:
+            raise FeedbackUnavailable('Ordinary outline changed its selected render route')
         original_required, original_mapping, original_float, original_output = recipe.source_sampling
         current_output = tuple(QRectF(frame.intersected(QRectF(*original_required)).toAlignedRect()).getRect())
         if (tuple(mapping) != original_mapping or bool(float_pipeline) != original_float
@@ -404,10 +513,27 @@ def update_native_feedback_recipe(recipe, snapshot, dirty, *, previous_source=No
             raise FeedbackUnavailable('The ordinary complete selected source frame changed')
         source_frames.append(current_output)
     backend.scene._filtered_native_frame_guard = source_frame
+    def outline_frame(obj, complete, window, parent, modifiers, image):
+        if obj.object_id != recipe.identifier:
+            return
+        original_sampling = recipe.outline_sampling
+        sampling = _outline_sampling(backend, obj, complete, window, parent, modifiers, image)
+        if (original_sampling is None
+                or sampling != original_sampling):
+            raise FeedbackUnavailable('The ordinary outline source frame or stage changed')
+        outline_frames.append(sampling)
+    backend.scene._filtered_native_outline_identifier = recipe.identifier
+    backend.scene._filtered_native_outline_guard = outline_frame
     try:
         with pixel_scope(snapshot.document.pixel_contract, environment=snapshot.pixel_environment):
-            with backend.capture(snapshot.document, full_request,
-                    dirty.adjusted(-2., -2., 2., 2.).intersected(snapshot.document.bounds)):
+            # The compatibility outline sampler keeps its original native
+            # source window. A smaller window changes Qt fractional-source
+            # rounding and its outer halo is not a valid replacement plane.
+            # Only the selected object is evaluated; prefix/suffix replay still
+            # avoids reevaluating unrelated scene objects.
+            effect_region = (QRectF(*recipe.outline_sampling.effect_region) if recipe.outline_sampling is not None
+                else dirty.adjusted(-2., -2., 2., 2.).intersected(snapshot.document.bounds))
+            with backend.capture(snapshot.document, full_request, effect_region):
                 painter = QPainter(composed)
                 try:
                     painter.setRenderHint(QPainter.Antialiasing, True)
@@ -419,8 +545,15 @@ def update_native_feedback_recipe(recipe, snapshot, dirty, *, previous_source=No
                 finally:
                     painter.end()
                 _index, origin, patch = _single_image(recorder.operations)
-                if len(source_frames) != 1:
+                ordinary_outline = (recipe.outline_sampling is not None and len(outline_frames) == 1
+                    and not source_frames)
+                ordinary_tile = (recipe.outline_sampling is None and len(source_frames) == 1
+                    and not outline_frames)
+                if not (ordinary_tile or ordinary_outline):
                     raise FeedbackUnavailable('The finite native patch lost its shared sampling frame')
+                if (ordinary_outline and QRectF(*outline_frames[0].window)
+                        != QRectF(origin.x(), origin.y(), patch.width(), patch.height())):
+                    raise FeedbackUnavailable('Ordinary outline output placement changed')
                 if (patch.format() != original.format() or patch.colorSpace() != original.colorSpace()
                         or patch.devicePixelRatio() != original.devicePixelRatio() or patch.devicePixelRatio() != 1.):
                     raise FeedbackUnavailable('Filtered native patch contract changed')
@@ -458,5 +591,7 @@ def update_native_feedback_recipe(recipe, snapshot, dirty, *, previous_source=No
         return NativeFeedbackUpdate(edited, composed, snapshot.document.revision, tuple(dirty.getRect()))
     finally:
         backend.scene.__dict__.pop('_filtered_native_frame_guard', None)
+        backend.scene.__dict__.pop('_filtered_native_outline_guard', None)
+        backend.scene.__dict__.pop('_filtered_native_outline_identifier', None)
         if owned_backend:
             backend.close()

@@ -2,6 +2,7 @@
 import json
 import threading
 from concurrent.futures import ThreadPoolExecutor
+from types import SimpleNamespace
 
 import pytest
 from PySide6.QtCore import QPointF, QRectF
@@ -11,6 +12,117 @@ from comic_editor.core.models import DistortModifier, OutlineModifier, RasterObj
 from comic_editor.ui import distort_pipeline, distort_rendering, modifier_rendering
 from comic_editor.ui.document_presentation import PresentationStats
 from test_performance_monitor_integration import editor, controller, _phases
+
+
+def test_dependency_pin_and_index_probes_require_owned_scope_and_restore(editor, controller, monkeypatch):
+    from comic_editor.core.tile_backing import PrefetchedPins, SnapshotBacking
+    from comic_editor.render.cache import PersistentRenderCache
+    from comic_editor.render.scene import DetachedSceneBackend
+    from comic_editor.render.scene_kernels import SceneKernels
+    from comic_editor.ui.cache_dependencies import RenderDependencies
+    probes = (
+        (SceneKernels, '_modifier_object_signature', 'scene.modifier_object_signature'),
+        (SceneKernels, '_modifier_layer_signature', 'scene.modifier_layer_signature'),
+        (RenderDependencies, 'tiles', 'scene.dependencies.tiles'),
+        (RenderDependencies, 'file_digest', 'scene.dependencies.file_digest'),
+        (PrefetchedPins, 'pin', 'scene.source_pin'),
+        (SnapshotBacking, 'pin', 'scene.backing_pin'),
+        (PersistentRenderCache, '__init__', 'scene.disk_cache_init'),
+        (PersistentRenderCache, '_committed_index', 'scene.disk_cache_committed_index'),
+        (PersistentRenderCache, '_reload_index', 'scene.disk_cache_reload_index'),
+        (DetachedSceneBackend, '__init__', 'scene.backend_init'),
+    )
+
+    class SemanticKey:
+        def __repr__(self):
+            raise AssertionError('Diagnostic inspected a semantic key')
+        __str__ = __repr__
+
+    sentinel, private_argument, calls = object(), SemanticKey(), []
+    originals = {}
+    for owner, name, label in probes:
+        def original(*args, _label=label, **kwargs):
+            calls.append((_label, args, kwargs))
+            return sentinel
+        monkeypatch.setattr(owner, name, original)
+        originals[owner, name] = original
+    controller.start()
+    from comic_editor.ui import performance_monitor
+    clocks = iter(i * .002 for i in range(100))
+    monkeypatch.setattr(performance_monitor, 'time', SimpleNamespace(
+        perf_counter=lambda: next(clocks), thread_time=performance_monitor.time.thread_time))
+    retained = {(owner, name): getattr(owner, name) for owner, name, _ in probes}
+    metadata = dict(ownership='monitored_editor', scope='detached_worker',
+        consumer='canvas', scheduler_role='canvas', demand_serial=17, document_revision=23)
+
+    def invoke(metadata=None):
+        if metadata is not None:
+            with controller._owned_scope(metadata):
+                invoke()
+            return
+        for owner, name, _ in probes:
+            assert getattr(owner, name)(private_argument, private_argument) is sentinel
+
+    # Unscoped and unrelated legacy work remains invisible even on a worker.
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        executor.submit(invoke).result()
+        executor.submit(invoke, dict(ownership='legacy_global_unattributed', scope='legacy_global')).result()
+        assert not any(label in _phases(controller) for _, _, label in probes)
+        executor.submit(invoke, metadata).result()
+    phases = _phases(controller)
+    for _, _, label in probes:
+        assert phases[label]['count'] == 1
+        assert phases[label + '.thread_cpu']['count'] == 1
+    rows = [row for row in controller.snapshot()['timeline']
+        if row['name'] in {label for _, _, label in probes}]
+    assert len(rows) == len(probes)
+    assert all(row['details']['thread'] == 'worker'
+        and row['details']['demand_serial'] == 17
+        and row['details']['document_revision'] == 23 for row in rows)
+    json.dumps(rows)  # No source argument or raw semantic representation escaped.
+    controller.stop()
+    for owner, name, label in probes:
+        assert getattr(owner, name) is originals[owner, name]
+        assert retained[owner, name](private_argument, private_argument) is sentinel
+        assert _phases(controller)[label]['count'] == 1
+    assert len(calls) == len(probes) * 4
+
+
+def test_filtered_owned_leaf_keeps_all_summaries_and_slow_error_pairs(editor, controller, monkeypatch):
+    from comic_editor.ui import performance_monitor
+
+    class Leaf:
+        def invoke(self, fail=False):
+            if fail:
+                raise ValueError('private exception message')
+            return 17
+
+    controller.start()
+    controller._patch_owned(Leaf, 'invoke', 'scene.new_leaf', cpu=True, timeline_min_ms=1.)
+    original_time = performance_monitor.time
+    walls = iter((0, .0002, .010, .012, .020, .0201))
+    cpus = iter((0, .0001, .020, .021, .040, .040))
+    monkeypatch.setattr(performance_monitor, 'time', SimpleNamespace(
+        perf_counter=lambda: next(walls), thread_time=lambda: next(cpus)))
+    metadata = dict(ownership='monitored_editor', scope='detached_worker', demand_serial=29)
+    def invoke():
+        with controller._owned_scope(metadata):
+            assert Leaf().invoke() == 17
+            assert Leaf().invoke() == 17
+            with pytest.raises(ValueError, match='private exception message'):
+                Leaf().invoke(True)
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        executor.submit(invoke).result()
+    monkeypatch.setattr(performance_monitor, 'time', original_time)
+    rows = [row for row in controller.snapshot()['timeline'] if row['name'].startswith('scene.new_leaf')]
+    assert [row['name'] for row in rows] == ['scene.new_leaf', 'scene.new_leaf.thread_cpu'] * 2
+    assert all(row['details']['thread'] == 'worker' and row['details']['demand_serial'] == 29 for row in rows)
+    assert rows[2]['details']['exception_type'] == rows[3]['details']['exception_type'] == 'ValueError'
+    assert 'private exception message' not in json.dumps(rows)
+    phases = _phases(controller)
+    assert phases['scene.new_leaf']['count'] == phases['scene.new_leaf.thread_cpu']['count'] == 3
+    assert phases['scene.new_leaf']['total_ms'] == pytest.approx(2.3)
+    assert phases['scene.new_leaf.thread_cpu']['total_ms'] == pytest.approx(1.1)
 
 
 def test_gpu_presentation_spans_require_owned_paint_and_restore(editor, controller, monkeypatch):
@@ -34,6 +146,140 @@ def test_gpu_presentation_spans_require_owned_paint_and_restore(editor, controll
     assert GpuTilePresenter._save_state is original
     retained()
     assert _phases(controller)['presentation.save_state']['count'] == 1
+
+
+def test_native_painter_boundaries_require_owned_gui_canvas_and_restore(editor, controller, monkeypatch):
+    canvas = editor[0].canvas
+    calls = []
+    begin = lambda painter: calls.append(('begin', painter))
+    end = lambda painter: calls.append(('end', painter))
+    monkeypatch.setattr(QPainter, 'beginNativePainting', begin)
+    monkeypatch.setattr(QPainter, 'endNativePainting', end)
+    gui = threading.get_ident()
+
+    class Painter:
+        def __init__(self, device, active=True):
+            self.owner, self.active = device, active
+
+        def isActive(self):
+            assert threading.get_ident() == gui, 'Worker probe inspected a Qt painter'
+            return self.active
+
+        def device(self):
+            assert threading.get_ident() == gui, 'Worker probe inspected a Qt device'
+            return self.owner
+
+    owned = Painter(canvas)
+    foreign = Painter(QImage(2, 2, QImage.Format_ARGB32_Premultiplied))
+    inactive = Painter(canvas, active=False)
+    controller.start()
+    QPainter.beginNativePainting(owned)
+    assert 'presentation.begin_native_painting' not in _phases(controller)
+    metadata = dict(ownership='monitored_editor', scope='gui_adapter')
+    with controller._owned_scope(metadata):
+        QPainter.beginNativePainting(foreign)
+        QPainter.endNativePainting(inactive)
+        QPainter.beginNativePainting(owned)
+        QPainter.endNativePainting(owned)
+    assert _phases(controller)['presentation.begin_native_painting']['count'] == 1
+    assert _phases(controller)['presentation.end_native_painting']['count'] == 1
+
+    def worker_call():
+        with controller._owned_scope(metadata):
+            QPainter.endNativePainting(owned)
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        executor.submit(worker_call).result()
+    assert _phases(controller)['presentation.end_native_painting']['count'] == 1
+    retained = QPainter.endNativePainting
+    controller.stop()
+    assert QPainter.beginNativePainting is begin and QPainter.endNativePainting is end
+    retained(owned)
+    assert _phases(controller)['presentation.end_native_painting']['count'] == 1
+    assert len(calls) == 7
+
+
+def test_border_split_probes_require_guarded_owner_and_restore(editor, controller, monkeypatch):
+    from comic_editor.ui import document_presentation
+    canvas = editor[0].canvas
+    builds, draws = [], []
+    build = lambda *args: builds.append(args) or []
+    draw = lambda *args: draws.append(args)
+    def border(painter):
+        patches = document_presentation._border_patches(object(), object(), 1.)
+        document_presentation._draw_document_border_patches(painter, patches)
+    monkeypatch.setattr(document_presentation, '_border_patches', build)
+    monkeypatch.setattr(document_presentation, '_draw_document_border_patches', draw)
+    monkeypatch.setattr(document_presentation, 'draw_document_border', border)
+    gui = threading.get_ident()
+    class Painter:
+        def __init__(self, device):
+            self.owner = device
+        def isActive(self):
+            assert threading.get_ident() == gui
+            return True
+        def device(self):
+            assert threading.get_ident() == gui
+            return self.owner
+    owned, foreign = Painter(canvas), Painter(None)
+    controller.start()
+    metadata = dict(ownership='monitored_editor', scope='gui_adapter')
+    document_presentation.draw_document_border(owned)
+    with controller._owned_scope(metadata):
+        document_presentation._border_patches(object(), object(), 1.)
+        document_presentation.draw_document_border(foreign)
+        document_presentation.draw_document_border(owned)
+    def worker():
+        with controller._owned_scope(metadata):
+            document_presentation.draw_document_border(owned)
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        executor.submit(worker).result()
+    for name in ('document_border', 'border_construction', 'border_draw_patches'):
+        assert _phases(controller)['presentation.' + name]['count'] == 1
+    rows = [row for row in controller.snapshot()['timeline']
+        if row['name'] == 'presentation.border_construction']
+    assert rows[0]['details']['presentation_owner'] == 'document_border'
+    retained = document_presentation.draw_document_border
+    controller.stop()
+    assert document_presentation._border_patches is build
+    assert document_presentation._draw_document_border_patches is draw
+    retained(owned)
+    assert _phases(controller)['presentation.border_construction']['count'] == 1
+    assert len(builds) == 6 and len(draws) == 5
+
+
+def test_postpresent_helpers_and_trim_require_current_canvas_owner(editor, controller, monkeypatch):
+    from comic_editor.render.projection import DocumentProjection
+    from comic_editor.ui import document_projection_features, raster_feedback
+    canvas = editor[0].canvas
+    calls = []
+    border = lambda *args, **kwargs: calls.append('border')
+    groups = lambda *args, **kwargs: calls.append('groups')
+    pending = lambda *args, **kwargs: calls.append('pending')
+    monkeypatch.setattr(document_projection_features, 'draw_document_border', border)
+    monkeypatch.setattr(document_projection_features, 'draw_document_tile_groups', groups)
+    monkeypatch.setattr(raster_feedback, 'present_pending_raster_gesture', pending)
+    owner = type('Painter', (), {'isActive': lambda self: True, 'device': lambda self: canvas})()
+    foreign = type('Painter', (), {'isActive': lambda self: True, 'device': lambda self: None})()
+    other_projection = DocumentProjection()
+    controller.start()
+    metadata = dict(ownership='monitored_editor', scope='gui_adapter')
+    with controller._owned_scope(metadata):
+        document_projection_features.draw_document_border(owner)
+        document_projection_features.draw_document_tile_groups(owner)
+        raster_feedback.present_pending_raster_gesture(canvas, owner, None)
+        canvas._document_projection._trim(set())
+        document_projection_features.draw_document_border(foreign)
+        raster_feedback.present_pending_raster_gesture(object(), owner, None)
+        other_projection._trim(set())
+    phases = _phases(controller)
+    for name in ('presentation.document_border', 'presentation.tile_groups',
+                 'presentation.pending_gesture', 'presentation.projection_trim'):
+        assert phases[name]['count'] == 1
+    controller.stop()
+    assert document_projection_features.draw_document_border is border
+    assert document_projection_features.draw_document_tile_groups is groups
+    assert raster_feedback.present_pending_raster_gesture is pending
+    assert len(calls) == 5
 
 
 @pytest.mark.parametrize("selected_promoted", [False, True])

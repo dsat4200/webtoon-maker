@@ -94,8 +94,9 @@ def radial_blur(original, center, angle, world_to_image, *, cancelled=None, spac
 
 
 _C_ABI = 0x5247424142490001
-_C_SOURCE_SHA256 = '877c58e04fd1b2976f4b77868158e06be136f16384807ae1292f58a80f7dcfa8'
-_C_BUILD_CONTRACT = 'scalar-double-separate-y-x-corners-00-01-10-11-channel-0-1-2-3-f32-unrolled-no-fastmath-v2'
+_C_SOURCE_SHA256 = 'a4115eadf1bf81b01ce5b40cd467b36cd8536bce76b43ad00eaf0584f8d240a8'
+_C_BUILD_CONTRACT = 'double-separate-y-x-corners-00-01-10-11-channel-independent-f32-no-fastmath-v3'
+_C_SCIPY_VERSIONS = frozenset({'1.17.1', '1.18.0'})
 _C_UNTRIED = object()
 _C_LIBRARY = _C_UNTRIED
 from threading import RLock as _C_RLock
@@ -150,7 +151,7 @@ def _sampler_library():
 
 def _shared_rgba_input(original):
     from scipy import __version__
-    if (__version__ != '1.18.0' or type(original) is not np.ndarray
+    if (__version__ not in _C_SCIPY_VERSIONS or type(original) is not np.ndarray
             or original.dtype != np.dtype(np.float32) or original.ndim != 3
             or original.shape[2] != 4 or min(original.shape[:2]) <= 0
             or max(original.shape[:2]) > 2147483647

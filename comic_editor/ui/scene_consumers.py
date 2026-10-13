@@ -7,7 +7,8 @@ import time
 
 from PySide6.QtCore import QObject, QTimer, Qt, Signal
 
-from comic_editor.render.admission import RENDER_ADMISSION, snapshot_working_bytes
+from comic_editor.render.admission import (NATIVE_SOURCE_WORKSPACE, RENDER_ADMISSION,
+    WorkCancelled, snapshot_working_bytes)
 
 
 @dataclass
@@ -30,7 +31,35 @@ class SceneConsumer:
     owned_source: bool = False
 
 
-def compute_snapshot(compute, snapshot, arguments, cancelled, stopped):
+def compute_snapshot(compute, snapshot, arguments, cancelled, stopped, *, native_source_budget=0):
+    if native_source_budget:
+        from comic_editor.render.input_sources import InputSourceSnapshot
+        from comic_editor.ui.tile_input import prepare_input_tiles
+        if (compute is prepare_input_tiles and type(snapshot) is InputSourceSnapshot
+                and len(arguments) == 2):
+            identifier, keys = arguments
+            # The complete packet retains its native payload while later
+            # one-key preparations run. Charge all of it with the largest
+            # unchanged decode/alpha-scan scratch in one independent ticket.
+            result_budget = min(int(native_source_budget), snapshot.tiles.residency.budget)
+            quantum = snapshot.bounded_workspace(identifier, keys, result_budget,
+                lambda: cancelled.is_set() or stopped.is_set())
+            if keys and quantum is not None and 0 < quantum <= NATIVE_SOURCE_WORKSPACE:
+                result = []
+                images = {}
+                with RENDER_ADMISSION.reserve('source-sampling', NATIVE_SOURCE_WORKSPACE, priority=0,
+                        cancelled=lambda: cancelled.is_set() or stopped.is_set(), native_source=True):
+                    for key in keys:
+                        records = compute(snapshot, identifier, (key,))
+                        if cancelled.is_set() or stopped.is_set():
+                            raise WorkCancelled()
+                        for _key,image,_bounds in records:
+                            images[image.cacheKey()] = int(image.sizeInBytes())
+                        if sum(images.values()) > result_budget or sum(images.values()) > quantum:
+                            raise RuntimeError('Native source exceeded its immutable workspace proof')
+                        result.extend(records)
+                        del records
+                    return tuple(result)
     estimate = getattr(compute, 'working_bytes', lambda *_a: 0)(snapshot, *arguments)
     snapshot_estimate = (getattr(compute, 'snapshot_working_bytes',
         lambda source, *_args: snapshot_working_bytes(source))(snapshot, *arguments)
@@ -166,8 +195,12 @@ class SceneConsumers(QObject):
         return self.canvas._scene_snapshot_compiler.capture(self.canvas, job.document)
 
     def _submit(self, job, snapshot):
+        options = {}
+        budget = self._native_source_budget(job, snapshot)
+        if budget:
+            options['native_source_budget'] = budget
         job.future = self.executor.submit(compute_snapshot, job.compute, snapshot,
-            job.captured_arguments or job.arguments, job.cancelled, self.stopped)
+            job.captured_arguments or job.arguments, job.cancelled, self.stopped, **options)
         signal = self.workerFinished
         def completed(_future):
             try:
@@ -177,6 +210,84 @@ class SceneConsumers(QObject):
                 # cancelled evaluator was finishing its current native block.
                 pass
         job.future.add_done_callback(completed)
+
+    def _native_source_budget(self, job, snapshot):
+        """Freeze authorization only for this current gate's native source job."""
+        from comic_editor.render.input_sources import InputSourceSnapshot
+        from comic_editor.ui.tile_input import TileInputGate, prepare_input_tiles
+        if (job.compute is not prepare_input_tiles or type(snapshot) is not InputSourceSnapshot
+                or not job.owned_source or not job.ordered or job.detached
+                or job.argument_capture is not None or job.captured_arguments is not None
+                or job.valid is None or len(job.arguments) != 2 or len(job.lane) != 2
+                or job.lane[0] != 'native-input' or self.active is not job or self.stopped.is_set()):
+            return 0
+        gates = getattr(self.canvas, '_native_input_gates', None)
+        if not callable(gates):
+            return 0
+        gate = next((gate for gate in gates()
+                     if isinstance(gate, TileInputGate) and gate.jobs is self
+                     and id(gate) == job.lane[1]), None)
+        if (gate is None or gate.canvas is not self.canvas or gate.chapter is not self.canvas.chapter
+                or gate.tiles is not self.canvas.tiles or gate.identifier != job.arguments[0]
+                or not gate.pending or not gate.current() or not self._valid(job, None)):
+            return 0
+        return min(gate.buffer_budget, snapshot.tiles.residency.budget)
+
+    def _native_first_quantum_current(self, job):
+        """Recognize only the current native gate's ordinary source capture."""
+        from comic_editor.render.input_sources import InputSourceCapture
+        from comic_editor.ui.tile_input import TileInputGate
+        capture = job.capture
+        if (not job.owned_source or not job.ordered or job.detached
+                or job.argument_capture is not None or job.valid is None
+                or getattr(job.compute, 'source_capture', None) is not InputSourceCapture
+                or type(capture) is not InputSourceCapture
+                or len(job.lane) != 2 or job.lane[0] != 'native-input'
+                or len(job.arguments) != 2 or capture.owner is not self.canvas
+                or self.active is not job or self.stopped.is_set()):
+            return False
+        gates = getattr(self.canvas, '_native_input_gates', None)
+        if not callable(gates):
+            return False
+        gate = next((gate for gate in gates()
+                     if isinstance(gate, TileInputGate) and gate.jobs is self
+                     and id(gate) == job.lane[1]), None)
+        return (gate is not None and gate.canvas is self.canvas
+                and gate.chapter is self.canvas.chapter and gate.tiles is self.canvas.tiles
+                and gate.identifier == job.arguments[0] == capture.identifier
+                and gate.pending and gate.current() and self._valid(job, None))
+
+    def _advance_capture(self, job, *, native_first=False):
+        error = None
+        try:
+            finished = job.capture.advance(.004)
+        except Exception as failure:
+            finished, error = False, failure
+        if native_first and not self._native_first_quantum_current(job):
+            # Capture can reenter an owner/version cancellation. Do not submit
+            # or publish an error for an input contact which has since retired.
+            self._discard(job)
+            if self.active is job:
+                self.active = None
+            return
+        if error is not None:
+            self.active = None
+            self._accept(job, None, error)
+            return
+        if self.active is None or not finished:
+            return
+        if job.capture.stale:
+            if job.owned_source and self._valid(job, self._document()):
+                # A released native packet keeps its original source guard
+                # across harmless presentation or unrelated edits.
+                job.document = self._document()
+                job.capture = self._capture_job(job)
+            else:
+                self._discard(job)
+                self.active = None
+        else:
+            snapshot, job.capture = job.capture.result, None
+            self._submit(job, snapshot)
 
     def advance(self):
         canvas = self.canvas
@@ -214,27 +325,8 @@ class SceneConsumers(QObject):
                 self.timer.start(8)
                 return
             else:
-                try:
-                    finished = job.capture.advance(.004)
-                except Exception as error:
-                    self.active = None
-                    self._accept(job, None, error)
-                    finished = False
+                self._advance_capture(job)
                 if self.active is not None:
-                    if finished:
-                        if job.capture.stale:
-                            if job.owned_source and self._valid(job, self._document()):
-                                # A released native packet keeps its original
-                                # source guard across harmless presentation or
-                                # unrelated edits. Retry only its staged view.
-                                job.document = self._document()
-                                job.capture = self._capture_job(job)
-                            else:
-                                self._discard(job)
-                                self.active = None
-                        else:
-                            snapshot, job.capture = job.capture.result, None
-                            self._submit(job, snapshot)
                     self.timer.start(8)
                     return
         if self.pending:
@@ -247,6 +339,11 @@ class SceneConsumers(QObject):
                     if job.owned_source:
                         job.document = self._document()
                     job.capture = self._capture_job(job)
+                    if self._native_first_quantum_current(job):
+                        # One metadata-only source quantum avoids a second
+                        # zero-timer hop before a cold native packet's worker.
+                        # Other consumers keep their existing staged capture.
+                        self._advance_capture(job, native_first=True)
                 else:
                     self._discard(job)
                     self.active = None

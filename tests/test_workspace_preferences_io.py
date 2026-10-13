@@ -3,6 +3,7 @@ from concurrent.futures import ThreadPoolExecutor
 import json
 from threading import Event, get_ident
 from types import SimpleNamespace
+from pathlib import Path
 
 import pytest
 
@@ -13,6 +14,49 @@ from comic_editor.core.viewport_state import MAX_SAVED_VIEWPORTS
 from comic_editor.core.workspace_preferences import WorkspacePreferencesWriter, workspace_snapshot
 from comic_editor.ui.main_window import MainWindow
 from test_brush_storage import library
+
+
+def test_open_series_recent_menu_does_not_serialize_brushes_on_gui(tmp_path, monkeypatch):
+    path = tmp_path / 'preferences.json'
+    monkeypatch.setattr(settings_module, 'settings_path', lambda: path)
+    settings = EditorSettings(brush_presets=[library().to_dict()])
+    settings.recent_series = ['old', 'new', *[str(index) for index in range(14)]]
+    save_settings(settings)
+    before = json.loads(path.read_text())
+    before['future_preserved_field'] = {'unchanged': True}
+    path.write_text(json.dumps(before), encoding='utf-8')
+    assets = {asset: asset.read_bytes() for asset in (tmp_path / 'brush-assets').glob('*.png')}
+    monkeypatch.setattr(settings, 'clamp', lambda: pytest.fail('Opening traversed live brushes'))
+    monkeypatch.setattr(brush_storage, 'encode_brush_assets',
+                        lambda *_a, **_k: pytest.fail('Opening encoded brush assets'))
+    writer = WorkspacePreferencesWriter()
+    entered, release = Event(), Event()
+    gui = get_ident()
+    write = preferences_io._write_workspace
+    def held(*args):
+        assert get_ident() != gui
+        entered.set()
+        assert release.wait(5.)
+        return write(*args)
+    monkeypatch.setattr(preferences_io, '_write_workspace', held)
+    menus = []
+    window = SimpleNamespace(settings=settings, _workspace_preferences=writer,
+        _rebuild_recent_menu=lambda: menus.append(list(settings.recent_series)))
+    try:
+        MainWindow._remember_series(window, Path('new'))
+        assert entered.wait(3.)
+        expected = ['new', 'old', *[str(index) for index in range(10)]]
+        assert menus == [expected]
+        # The worker owns the accepted recent list even if live preferences change.
+        settings.recent_series.append('later')
+    finally:
+        release.set()
+        writer.shutdown()
+    after = json.loads(path.read_text())
+    assert after['recent_series'] == expected
+    assert after['brush_presets'] == before['brush_presets']
+    assert after['future_preserved_field'] == before['future_preserved_field']
+    assert all(asset.read_bytes() == data for asset, data in assets.items())
 
 
 def _view(center):

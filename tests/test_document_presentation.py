@@ -17,7 +17,7 @@ from PySide6.QtGui import (
 from PySide6.QtOpenGL import QOpenGLFramebufferObject
 
 from comic_editor.ui.document_presentation import (
-    GpuTilePresenter, PresentedTile, _border_patches, draw_document_border,
+    GpuTilePresenter, PresentedTile, _border_patches, _draw_document_border_patches, draw_document_border,
     draw_document_tiles, tile_vertices,
 )
 
@@ -131,8 +131,7 @@ def test_border_patches_match_full_raster_coverage_without_overlapping_corners(r
         painter = QPainter(image)
         if patched:
             patches = _border_patches(camera.map(QPolygonF(chapter)), size, ratio)
-            for position, patch in patches:
-                painter.drawImage(position, patch)
+            _draw_document_border_patches(painter, patches)
         else:
             draw_document_border(painter, chapter, camera, size)
         painter.end()

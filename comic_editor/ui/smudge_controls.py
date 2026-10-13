@@ -104,6 +104,7 @@ class SmudgeControls(QWidget):
         form.addWidget(self.properties)
         self.properties_toggle.toggled.connect(self._toggle_properties)
         self.stroke_combo = _combo(self, 'smudgeSelectedStroke')
+        self._stroke_ids = None
         self.stroke_combo.setAccessibleName('Selected stroke')
         props.addWidget(self.stroke_combo)
         self.point_combo = _combo(self, 'smudgeSelectedPoint')
@@ -261,13 +262,19 @@ class SmudgeControls(QWidget):
             self.refresh_selection()
 
     def refresh_selection(self):
-        parameters = self._parameters() or {}
+        # Reading controls never edits the retained strokes. In particular,
+        # do not copy their complete pressure journals to display one point.
+        modifier = self.current_modifier()
+        parameters = modifier.parameters if modifier is not None else {}
         stroke, index = self.selected(parameters)
         previous = self.stroke_combo.blockSignals(True)
-        self.stroke_combo.clear()
-        self.stroke_combo.addItem('Select a stroke', '')
-        for number, item in enumerate(parameters.get('strokes', []), 1):
-            self.stroke_combo.addItem(f'Stroke {number}', item['id'])
+        identifiers = tuple(item['id'] for item in parameters.get('strokes', []))
+        if identifiers != self._stroke_ids:
+            self.stroke_combo.clear()
+            self.stroke_combo.addItem('Select a stroke', '')
+            for number, identifier in enumerate(identifiers, 1):
+                self.stroke_combo.addItem(f'Stroke {number}', identifier)
+            self._stroke_ids = identifiers
         self.stroke_combo.setCurrentIndex(self.stroke_combo.findData(stroke['id']) if stroke else 0)
         self.stroke_combo.blockSignals(previous)
         enabled = stroke is not None
@@ -281,7 +288,8 @@ class SmudgeControls(QWidget):
                 widget.set_value(point[key])
 
     def refresh_values(self):
-        parameters = self._parameters() or {}
+        modifier = self.current_modifier()
+        parameters = modifier.parameters if modifier is not None else {}
         settings = validate_tool_settings(parameters.get('tool_settings', {}))
         self.opacity.set_value(parameters.get('opacity', 100))
         for key, widget in self.tool_numbers.items():
@@ -291,6 +299,11 @@ class SmudgeControls(QWidget):
             _set(widget, 'setChecked', settings['pressure_' + key])
             widget.setEnabled(settings['pressure_enabled'])
             self.curve_buttons[key].setEnabled(settings['pressure_enabled'] and settings['pressure_' + key])
+
+    def sync_from_modifier(self):
+        """Reflect a committed edit or history replacement without new widgets."""
+        self.refresh_values()
+        self.refresh_selection()
 
     def edit_curve(self, key):
         modifier = self.current_modifier()

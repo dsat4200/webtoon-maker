@@ -7109,7 +7109,7 @@ class MainWindow(QMainWindow):
     def _remember_series(self, path: Path) -> None:
         paths = [str(path), *(self.settings.recent_series or [])]
         self.settings.recent_series = list(dict.fromkeys(paths))[:12]
-        save_settings(self.settings)
+        self._workspace_preferences.submit(settings_module.settings_path(), self.settings)
         self._rebuild_recent_menu()
 
     def _rebuild_recent_menu(self) -> None:

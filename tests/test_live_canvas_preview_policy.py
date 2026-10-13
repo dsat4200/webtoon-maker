@@ -1,6 +1,5 @@
-"""Proposed actual-owner/current-pixel regressions; unrun artifact payload.
+"""Actual-owner/current-pixel regressions for bounded live geometry evaluation.
 
-Install only in a root-reviewed isolated candidate. Original tests are unchanged.
 The 32768 distortion budget is nominal: ceil gives a conservative33217 pixels.
 Full native source, base and mask preparation is deliberately not capped here.
 """
@@ -468,7 +467,7 @@ def test_actual_generic_stack_policy_is_current_and_native_after_release(qapp, m
                 _close(owner)
 
 
-def test_latest_actual_live_demand_cancels_running_kernel_and_cannot_publish_old_pixels(qapp, monkeypatch):
+def test_camera_change_cancels_running_geometry_kernel_and_cannot_publish_old_pixels(qapp, monkeypatch):
     from comic_editor.ui import distort_rendering
     canvas, object_id, _rig_id = _make_scene("twirl", "translate", True)
     cold = None
@@ -510,6 +509,7 @@ def test_latest_actual_live_demand_cancels_running_kernel_and_cannot_publish_old
         assert entered.is_set() and scheduler.future is not None
         first_serial = canvas._scene_controller.serial
         _second_move(canvas, object_id)
+        canvas.center_x += 11.
         current = _wait(canvas, qapp, live=True)
         assert _pixels(current) != _pixels(original_draft)
         assert cancelled.is_set() and canvas._scene_controller.serial > first_serial
@@ -517,6 +517,7 @@ def test_latest_actual_live_demand_cancels_running_kernel_and_cannot_publish_old
         assert any(serial == canvas._scene_controller.serial and is_preview and accepted for serial, is_preview, accepted, _error in publications)
         assert canvas.chapter.to_dict() == before and tuple(canvas.command_stack._undo) == prior
         cold = _replica(canvas, before, object_id)
+        cold.center_x = canvas.center_x
         _start(cold, object_id, "translate")
         _second_move(cold, object_id)
         np.testing.assert_array_equal(np.frombuffer(_pixels(current), np.uint8),

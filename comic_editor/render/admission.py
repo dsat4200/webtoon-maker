@@ -6,7 +6,7 @@ texture caches retain their own byte LRUs; a ticket bounds concurrent work.
 """
 from contextlib import contextmanager
 from contextvars import ContextVar
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from itertools import count
 from threading import Condition
 import time
@@ -22,6 +22,14 @@ class WorkTicket:
     estimated_bytes: int
     priority: int
     oversized: bool
+    native_source: bool = False
+    cancelled: object = field(default=lambda: False, compare=False, repr=False)
+
+
+# One positively owned input source quantum may coexist with an ordinary
+# exclusive workspace. This is additional working storage, never a source
+# sampling exception, and is included in the aggregate accounting below.
+NATIVE_SOURCE_WORKSPACE = 2 * 1024 * 1024
 
 
 _active_ticket = ContextVar("native_render_ticket", default=None)
@@ -39,8 +47,9 @@ def check_scene_cancelled(scene):
 
 
 class CopyLease:
-    def __init__(self, admission, marker, size):
+    def __init__(self, admission, marker, size, scope=None):
         self.admission,self.marker,self.size = admission,marker,size
+        self.scope = scope
         self.released = False
 
     def release(self):
@@ -48,6 +57,7 @@ class CopyLease:
             if not self.released:
                 self.released = True
                 self.admission.copies.pop(self.marker,None)
+                self.admission.copy_scopes.pop(self.marker,None)
                 self.admission.condition.notify_all()
 
 
@@ -59,21 +69,38 @@ class WorkAdmission:
         self.waiters = {}
         self.running = {}
         self.copies = {}
+        self.copy_scopes = {}
         self.copy_credits = {}
+        self.owned_copy_markers = {}
         self.peak_bytes = 0
         self.admitted = 0
 
     @contextmanager
-    def reserve(self, owner, size, *, priority=0, cancelled=lambda: False, copies=None):
+    def reserve(self, owner, size, *, priority=0, cancelled=lambda: False, copies=None,
+                native_source=False, own_copies=False):
+        size = max(0, int(size))
+        if own_copies and (native_source or not isinstance(copies, CopyLease)
+                or copies.admission is not self or copies.released):
+            raise ValueError('An owned capture requires its live admission copy lease')
+        if native_source and (priority != 0 or not 0 < size <= NATIVE_SOURCE_WORKSPACE
+                              or copies is not None):
+            raise ValueError('Owned native source work requires a bounded independent workspace')
         existing = current_ticket()
         if existing is not None:
+            if existing.native_source and size > existing.estimated_bytes:
+                raise ValueError('Nested work exceeds its owned native source workspace')
+            if native_source:
+                with self.condition:
+                    owned = existing.native_source and any(
+                        ticket is existing for ticket in self.running.values())
+                if not owned:
+                    raise ValueError('Owned native source work cannot borrow a foreign ticket')
             yield existing
             return
-        size = max(0, int(size))
         marker = next(self.sequence)
         started = time.monotonic()
         with self.condition:
-            self.waiters[marker] = priority, started
+            self.waiters[marker] = priority, started, bool(native_source)
             try:
                 while True:
                     if cancelled():
@@ -81,19 +108,35 @@ class WorkAdmission:
                     # Aging prevents thumbnail/export starvation during long
                     # drawing sessions while visible work normally wins.
                     now = time.monotonic()
-                    first = min(self.waiters, key=lambda key:
+                    # The one bounded source lane does not wait behind an
+                    # ineligible ordinary reservation, nor does a waiting
+                    # second source quantum block eligible ordinary work.
+                    lane = [key for key,value in self.waiters.items()
+                            if value[2] == bool(native_source)]
+                    first = min(lane, key=lambda key:
                         (self.waiters[key][0] - int((now - self.waiters[key][1]) / 2), key))
                     occupied = self._occupied()
                     credit = (min(size,copies.size) if copies is not None and not copies.released else 0)
                     heavy = size >= 16 * 1024 * 1024
-                    eligible = (not self.running if size > self.budget else
-                        len(self.running) < 4 and occupied + size-credit <= self.budget and
-                        (not heavy or not any(ticket.estimated_bytes >= 16 * 1024 * 1024
-                                             for ticket in self.running.values())))
+                    ordinary = [ticket for ticket in self.running.values() if not ticket.native_source]
+                    source_bytes = sum(ticket.estimated_bytes for ticket in self.running.values()
+                                       if ticket.native_source)
+                    if native_source:
+                        eligible = source_bytes == 0
+                    elif size > self.budget:
+                        eligible = not ordinary
+                    else:
+                        eligible = (len(ordinary) < 4 and
+                            occupied-source_bytes + size-credit <= self.budget and
+                            (not heavy or not any(ticket.estimated_bytes >= 16 * 1024 * 1024
+                                                 for ticket in ordinary)))
                     if eligible and marker == first:
-                        ticket = WorkTicket(owner, size, priority, size > self.budget)
+                        ticket = WorkTicket(owner, size, priority, size > self.budget,
+                                            bool(native_source), cancelled)
                         self.running[marker] = ticket
                         self.copy_credits[marker] = credit
+                        if own_copies:
+                            self.owned_copy_markers[marker] = copies.marker
                         self.admitted += 1
                         self.peak_bytes = max(self.peak_bytes, occupied + size-credit)
                         break
@@ -108,6 +151,7 @@ class WorkAdmission:
             with self.condition:
                 self.running.pop(marker, None)
                 self.copy_credits.pop(marker,None)
+                self.owned_copy_markers.pop(marker,None)
                 self.condition.notify_all()
 
     def _occupied(self):
@@ -128,7 +172,7 @@ class WorkAdmission:
         with self.condition:
             return any(value[0] < priority for value in self.waiters.values())
 
-    def reserve_copies(self, size):
+    def reserve_copies(self, size, *, scope=None):
         """Nonblocking ownership of queued arrays and output buffers.
 
         A sole admitted parent may borrow one oversized workspace. Unadmitted
@@ -138,15 +182,28 @@ class WorkAdmission:
         parent = current_ticket()
         with self.condition:
             occupied = self._occupied()
-            exclusive = (parent is not None and len(self.running) == 1
-                and next(iter(self.running.values())) is parent
-                and all(ticket is parent for ticket,_ in self.copies.values()))
-            if occupied+size > self.budget and not exclusive:
+            ordinary = [ticket for ticket in self.running.values() if not ticket.native_source]
+            parent_marker = next((marker for marker, ticket in self.running.items()
+                                  if ticket is parent), None)
+            owned_copy = self.owned_copy_markers.get(parent_marker)
+            owned_scope = self.copy_scopes.get(owned_copy)
+            # A bounded scene capture was queued on the GUI, before this
+            # worker's ticket existed. Its positively owned credited lease is
+            # part of this sole parent's workspace. Treating it as foreign
+            # would make a nested graphics copy wait for its own caller.
+            exclusive = (parent is not None and not parent.native_source and len(ordinary) == 1
+                and ordinary[0] is parent
+                and all(size == 0 or ticket is parent or marker == owned_copy
+                        or owned_scope is not None and self.copy_scopes.get(marker) is owned_scope
+                        for marker, (ticket, size) in self.copies.items()))
+            if size and occupied+size > self.budget and not exclusive:
                 return None
             marker = next(self.sequence)
             self.copies[marker] = parent,size
+            if scope is not None:
+                self.copy_scopes[marker] = scope
             self.peak_bytes = max(self.peak_bytes,occupied+size)
-            return CopyLease(self,marker,size)
+            return CopyLease(self,marker,size,scope)
 
 
 RENDER_ADMISSION = WorkAdmission()

@@ -1,6 +1,7 @@
 """Raster history evicts losslessly and survives later edits and publication."""
 import gc
 from pathlib import Path
+from threading import Event
 
 import numpy as np
 import pytest
@@ -8,6 +9,7 @@ from PySide6.QtCore import QPoint
 from PySide6.QtGui import QColorSpace, QImage
 
 from comic_editor.core.commands import CommandStack, TilePatchCommand
+from comic_editor.core.tile_backing import _queue_retirement
 from comic_editor.core.tile_history import HistoryTileMap, TileHistoryCache
 from comic_editor.core.tiles import TileStore
 
@@ -75,6 +77,10 @@ def test_many_commands_share_one_budget_and_restore_exact_tiles(tmp_path):
     del command, before, after
     history.clear()
     gc.collect()
+    # The last pin releases private files on the retirement IO thread.
+    retired = Event()
+    _queue_retirement(retired.set)
+    assert retired.wait(3.)
     assert store._history_cache.bytes == 0 and not list(private_root.iterdir())
 
 

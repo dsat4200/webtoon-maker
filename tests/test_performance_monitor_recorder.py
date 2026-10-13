@@ -18,15 +18,19 @@ def test_disabled_recorder_has_no_thread_or_sampling(monkeypatch):
     monkeypatch.setattr("sys.setprofile", unexpected)
     recorder = PerformanceRecorder()
     recorder.record_event("ignored", 12)
+    recorder.record_event("ignored critical", critical=True)
     recorder.record_metrics({"cpu_percent": 17})
     recorder.update_context({"tool": "draw"})
     recorder.heartbeat()
     with recorder.measure("ignored span"):
         pass
+    with recorder.measure("ignored critical span", critical=True):
+        pass
     recorder.stop()
     report = recorder.snapshot()
     assert not report["enabled"]
     assert report["timeline"] == []
+    assert report["critical_events"] == []
     assert report["summary"] == []
     assert report["stack_hotspots"] == []
     assert report["metadata"]["sample_count"] == 0
@@ -86,6 +90,124 @@ def test_measure_records_exceptions_and_context_is_detached():
         assert recorder.snapshot()["context"]["selection"]["count"] == 5
         assert report["metrics"]["process_cpu_percent"] == 10
         assert "preserved" not in json.dumps(report)
+    finally:
+        recorder.stop()
+
+
+def test_summary_only_events_preserve_input_rows_and_every_duration():
+    recorder = PerformanceRecorder(max_events=4)
+    recorder.start()
+    try:
+        recorder.record_event('mouse.press')
+        for _ in range(1000):
+            recorder.record_event('new leaf', .1, category='phase', retain_timeline=False)
+            recorder.record_event('new leaf.thread_cpu', 0, category='worker_cpu', retain_timeline=False)
+        recorder.record_event('new leaf', 2, category='phase')
+        recorder.record_event('existing unfiltered', .01, category='phase')
+        report = recorder.snapshot()
+        assert [row['name'] for row in report['timeline']] == [
+            'mouse.press', 'new leaf', 'existing unfiltered']
+        phases = {row['name']: row for row in report['summary']}
+        assert phases['new leaf']['count'] == 1001
+        assert phases['new leaf']['total_ms'] == pytest.approx(102)
+        assert phases['new leaf']['max_ms'] == 2
+        assert phases['new leaf.thread_cpu']['count'] == 1000
+        assert phases['new leaf.thread_cpu']['total_ms'] == 0
+        assert report['dropped']['timeline_events'] == 0
+    finally:
+        recorder.stop()
+
+
+def test_explicit_critical_events_survive_ordinary_flood_without_changing_timeline():
+    recorder = PerformanceRecorder(max_events=4, max_critical_events=3)
+    recorder.start({'selection': {'count': 2}})
+    try:
+        # Semantic names alone never opt into this separate channel.
+        recorder.record_event('mouse.press', category='input')
+        with recorder.measure('canvas.begin_stroke'):
+            pass
+        assert recorder.snapshot()['critical_events'] == []
+
+        for index in range(5):
+            recorder.record_event(f'explicit.{index}', 1, category='input', critical=True)
+        recorder.record_event('summary only critical', 2, retain_timeline=False, critical=True)
+        for index in range(100):
+            recorder.record_event('ordinary phase', .1)
+        report = recorder.snapshot(timeline_limit=1)
+        assert [event['name'] for event in report['critical_events']] == [
+            'explicit.3', 'explicit.4', 'summary only critical']
+        assert report['bounds']['max_critical_events'] == 3
+        assert report['dropped']['critical_events'] == 3
+        assert report['timeline'][0]['name'] == 'ordinary phase'
+        assert len(recorder.snapshot()['timeline']) == 4
+        assert recorder.snapshot(include_timeline=False)['critical_events'] == report['critical_events']
+        assert next(row for row in report['summary'] if row['name'] == 'ordinary phase')['count'] == 100
+        report['critical_events'][0]['context']['selection']['count'] = 999
+        assert recorder.snapshot()['critical_events'][0]['context']['selection']['count'] == 2
+    finally:
+        recorder.stop()
+
+
+def test_critical_event_capacity_cannot_exceed_512():
+    recorder = PerformanceRecorder(max_critical_events=10000, max_events=1)
+    recorder.start()
+    try:
+        for index in range(515):
+            recorder.record_event(str(index), critical=True, retain_timeline=False)
+        report = recorder.snapshot()
+        assert report['bounds']['max_critical_events'] == 512
+        assert len(report['critical_events']) == 512
+        assert report['critical_events'][0]['name'] == '3'
+        assert report['dropped']['critical_events'] == 3
+        assert report['timeline'] == []
+    finally:
+        recorder.stop()
+
+
+def test_critical_measure_detaches_bounded_metadata_and_preserves_exception():
+    recorder = PerformanceRecorder()
+    recorder.start()
+    details = {'points': [1, 2], 'label': 'x' * 1000}
+    try:
+        with pytest.raises(ValueError, match='application error'):
+            with recorder.measure('explicit span', details=details, critical=True):
+                details['points'].append(3)
+                raise ValueError('application error')
+        report = recorder.snapshot()
+        event = report['critical_events'][0]
+        assert event == report['timeline'][0]
+        assert event['details'] == {'points': [1, 2], 'label': 'x' * 256,
+                                    'exception_type': 'ValueError'}
+        event['details']['points'].append(99)
+        assert recorder.snapshot()['critical_events'][0]['details']['points'] == [1, 2]
+        json.dumps(report, allow_nan=False)
+    finally:
+        recorder.stop()
+
+
+@pytest.mark.parametrize('boundary', ['clear', 'restart'])
+def test_critical_events_and_delayed_spans_cannot_cross_capture_epoch(boundary):
+    recorder = PerformanceRecorder()
+    recorder.start()
+    old_epoch = recorder.capture_epoch
+    delayed = recorder.measure('old delayed', capture_epoch=old_epoch, critical=True)
+    try:
+        with recorder.measure('old active', critical=True):
+            if boundary == 'clear':
+                recorder.clear()
+            else:
+                recorder.stop()
+                recorder.start()
+        recorder.record_event('old event', capture_epoch=old_epoch, critical=True)
+        with delayed:
+            pass
+        assert recorder.snapshot()['critical_events'] == []
+        recorder.record_event('current', critical=True)
+        assert [event['name'] for event in recorder.snapshot()['critical_events']] == ['current']
+        recorder.clear()
+        report = recorder.snapshot()
+        assert report['critical_events'] == []
+        assert report['dropped']['critical_events'] == 0
     finally:
         recorder.stop()
 
@@ -306,5 +428,43 @@ def test_snapshot_during_active_span_exception_keeps_detached_start_details():
         after = recorder.snapshot()
         assert after["timeline"][0]["details"]["exception_type"] == "RuntimeError"
         assert after["active_spans"] == []
+    finally:
+        recorder.stop()
+
+
+def test_internal_log_view_pins_immutable_records_and_copies_mutable_shells(monkeypatch):
+    import comic_editor.core.performance_monitor as module
+    recorder = PerformanceRecorder(sample_interval_ms=60000)
+    details = {'points': [1, 2]}
+    recorder.start({'selection': {'id': 'original'}})
+    try:
+        with recorder.measure('active', details=details):
+            recorder.record_event('before', details=details, critical=True)
+            expected = recorder.snapshot()
+            with monkeypatch.context() as patch:
+                patch.setattr(module.copy, 'deepcopy', lambda *a, **k:
+                    pytest.fail('Internal read-only log view traversed published records'))
+                report = recorder._snapshot_for_log()
+            assert 'duration_ms' not in next(iter(recorder._active_spans.values()))
+            assert report['active_spans'][0] is not next(iter(recorder._active_spans.values()))
+            assert report['timeline'] is not recorder._timeline
+            assert report['timeline'][0] is recorder._timeline[0]
+            # Both reports contain identical data apart from capture clocks.
+            for value in (report, expected):
+                value['metadata'].pop('snapshot_at')
+                value['metadata'].pop('capture_seconds')
+                value['active_spans'][0].pop('duration_ms')
+            assert report == expected
+            details['points'].append(3)
+            recorder.update_context({'selection': {'id': 'later'}})
+            recorder.record_event('after')
+        recorder.clear()
+        recorder.record_event('replacement')
+        assert report['context']['selection']['id'] == 'original'
+        assert [event['name'] for event in report['timeline']] == ['before']
+        assert report['timeline'][0]['details']['points'] == [1, 2]
+        assert report['active_spans'][0]['name'] == 'active'
+        assert report['critical_events'][0]['details']['points'] == [1, 2]
+        assert report['dropped'] == expected['dropped']
     finally:
         recorder.stop()

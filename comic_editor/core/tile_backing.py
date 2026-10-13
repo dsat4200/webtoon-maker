@@ -230,10 +230,11 @@ class DiskTileMap(MutableMapping):
     __hash__ = object.__hash__
     __eq__ = object.__eq__
 
-    def __init__(self, object_id, residency, changed):
+    def __init__(self, object_id, residency, changed, *, registered=None):
         self.object_id = object_id
         self.residency = residency
         self.changed = changed
+        self.registered = registered
         self.entries = {}
         self.versions = {}
         self.content_keys = {}
@@ -245,6 +246,8 @@ class DiskTileMap(MutableMapping):
         self.pending_snapshot_pins.pop(key, None)
         self.entries[key] = Path(path)
         self.versions[key] = 0
+        if self.registered is not None:
+            self.registered()
 
     def adopt_edit(self, key, image, original_key):
         content_key = int(image.cacheKey())

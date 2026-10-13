@@ -1127,6 +1127,12 @@ def _border_patches(polygon: QPolygonF, viewport: QSizeF, ratio: float):
     return patches
 
 
+def _draw_document_border_patches(painter: QPainter, patches) -> None:
+    """Present cached border images separately from their raster preparation."""
+    for position, image in patches:
+        painter.drawImage(position, image)
+
+
 def draw_document_border(painter: QPainter, chapter_rect: QRectF, camera: QTransform,
                          viewport_size: QSizeF, *, owner=None) -> None:
     """Keep the chapter decoration's raster AA on a non-multisampled GPU widget.
@@ -1156,7 +1162,6 @@ def draw_document_border(painter: QPainter, chapter_rect: QRectF, camera: QTrans
             cache = key, _border_patches(polygon, viewport, ratio)
             owner._document_border_cache = cache
         painter.setRenderHint(QPainter.SmoothPixmapTransform, False)
-        for position, image in cache[1]:
-            painter.drawImage(position, image)
+        _draw_document_border_patches(painter, cache[1])
     finally:
         painter.restore()

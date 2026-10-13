@@ -791,9 +791,13 @@ def _triangle_map(query, source, destination, faces):
         # the original face order.
         height, width = query.shape[:2]
         blocks, lows, highs = [], [], []
-        for top in range(0, height, 32):
-            for left in range(0, width, 32):
-                bottom, right = min(top + 32, height), min(left + 32, width)
+        # Dense tessellations in small draft devices otherwise inspect an
+        # entire 32px block for a face covering only a few pixels. Smaller
+        # blocks change candidate discovery only, never sampling/math/order.
+        edge = 8 if len(flat) <= 32768 and len(faces) > 512 else 32
+        for top in range(0, height, edge):
+            for left in range(0, width, edge):
+                bottom, right = min(top + edge, height), min(left + edge, width)
                 points = query[top:bottom, left:right].reshape(-1, 2)
                 lows.append(points.min(axis=0))
                 highs.append(points.max(axis=0))
@@ -807,13 +811,23 @@ def _triangle_map(query, source, destination, faces):
     face_lows, face_highs = triangles.min(axis=1), triangles.max(axis=1)
     candidate_faces = np.flatnonzero(~(np.any(face_highs < qlow, axis=1)
                                        | np.any(face_lows > qhigh, axis=1)))
-    for face_index in candidate_faces:
+    intersections = None
+    if blocks is not None and len(candidate_faces)*len(blocks) <= 2*1024*1024:
+        # Bound the comparison table; larger meshes keep the ordinary loop.
+        # These are the same per-column bounding comparisons and tolerance.
+        lo, hi = face_lows[candidate_faces], face_highs[candidate_faces]
+        intersections = ((highs[None,:,0] >= lo[:,None,0]-1e-8)
+            & (highs[None,:,1] >= lo[:,None,1]-1e-8)
+            & (lows[None,:,0] <= hi[:,None,0]+1e-8)
+            & (lows[None,:,1] <= hi[:,None,1]+1e-8))
+    for row, face_index in enumerate(candidate_faces):
         face, tri = faces[face_index], triangles[face_index]
         low, high = face_lows[face_index], face_highs[face_index]
         if blocks is None:
             selected = np.flatnonzero(_mesh_face_contains(flat, low, high))
         else:
-            intersecting = np.flatnonzero(np.all((highs >= low - 1e-8) & (lows <= high + 1e-8), axis=1))
+            intersecting = np.flatnonzero(intersections[row] if intersections is not None else
+                np.all((highs >= low - 1e-8) & (lows <= high + 1e-8), axis=1))
             if not len(intersecting):
                 continue
             candidates = np.concatenate([blocks[index] for index in intersecting])

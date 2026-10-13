@@ -10,18 +10,20 @@ from __future__ import annotations
 from collections import OrderedDict
 from collections.abc import MutableMapping
 from contextlib import contextmanager
-from dataclasses import dataclass, fields, is_dataclass
+from dataclasses import dataclass, field, fields, is_dataclass
 import copy
 from pathlib import Path
 import time
 import weakref
 from types import SimpleNamespace
+from threading import RLock
 
 from PySide6.QtCore import QPointF, QRect, QRectF, QSize
 from PySide6.QtGui import QImage, QPainterPath, QPolygonF, QTransform
 
 from comic_editor.core.changes import GROUP_KINDS
 from comic_editor.core.images import ImageStore
+from comic_editor.core.models import LayerNode
 from comic_editor.core.tile_backing import DiskTileMap, EditableTile, SnapshotBacking, prefetch_pins
 from comic_editor.core.tiles import TileStore
 from comic_editor.render.scene_kernels import SceneKernels
@@ -67,8 +69,58 @@ class SceneTileMap(DiskTileMap):
 class SceneTileStore(TileStore):
     def _object_tiles(self, identifier):
         if identifier not in self._tiles:
-            self._tiles[identifier] = SceneTileMap(identifier, self.residency, self._tile_changed)
+            self._tiles[identifier] = SceneTileMap(identifier, self.residency, self._tile_changed,
+                                                   registered=self._source_registered)
         return self._tiles[identifier]
+
+
+def native_source_key(store, identity, generation):
+    # Borrowed QImages can be edited in place before typed publication. Only
+    # bounded resident borrowers need version adoption; cold originals require
+    # neither a per-address walk nor file IO. Map ownership/counts also guard
+    # whole-source replacement independent of the renderer's notifications.
+    for owner, key in tuple(store.residency.entries):
+        owner.version(key)
+    return (identity, generation, store.tile_size, store._source_revision,
+            tuple((identifier, id(owner), len(owner)) for identifier, owner in store._tiles.items()))
+
+
+class NativeSourceHeaders:
+    """Pinned originals, with independent map/residency headers per consumer.
+
+    Geometry/visibility edits do not change original pixels. Retain the already
+    captured native address metadata rather than visiting every clean file on
+    every pointer packet. These are input owners, never rendered/cache entries.
+    Worker decode/spill/pin adoption must not mutate the retained headers.
+    """
+    def __init__(self, tiles, jobs, addresses):
+        self.tiles = tiles
+        self.jobs, self.addresses = tuple(jobs), frozenset(addresses)
+        self.edited = {identifier: tuple(key for key, value in owner.entries.items()
+                       if isinstance(value, EditableTile))
+                       for identifier, owner in tiles._tiles.items()}
+
+    def fork(self):
+        source = self.tiles
+        result = SceneTileStore(source.tile_size, cache_budget=source.residency.budget)
+        for identifier, owner in source._tiles.items():
+            target = result._object_tiles(identifier)
+            target.entries = owner.entries.copy()
+            target.versions = owner.versions.copy()
+            target.content_keys = owner.content_keys.copy()
+            target.snapshot_pins = owner.snapshot_pins.copy()
+            for key in self.edited[identifier]:
+                target.entries[key] = EditableTile(owner.entries[key].frozen)
+            result._alpha_bounds[identifier] = dict(source._alpha_bounds.get(identifier, {}))
+        # Only edited borrowers need a COW alias. Clean decoded residency is a
+        # worker cache, already transferred through ordinary ReadyOriginals.
+        for (owner, key), (image, _content) in source.residency.entries.items():
+            if isinstance(owner.entries.get(key), EditableTile):
+                target = result._tiles[owner.object_id]
+                result.residency.retain(target, key, QImage(image))
+        result._alpha_bounds_dirty = set(source._alpha_bounds_dirty)
+        result.dirty = set(source.dirty)
+        return result
 
 
 def _immutable_tuple(value):
@@ -153,6 +205,12 @@ def detached_slices(value):
     return result
 
 
+class _SourcePreparation:
+    def __init__(self):
+        self.lock = RLock()
+        self.ready = False
+
+
 @dataclass(frozen=True)
 class SceneSnapshot:
     document: object
@@ -166,9 +224,19 @@ class SceneSnapshot:
     graphics_worker: object = None
     pixel_environment: object = None
     cache_spec: tuple | None = None
+    _source_preparation: object = field(default_factory=_SourcePreparation,
+                                        init=False, compare=False, repr=False)
 
     def finish_sources(self):
         """Called only by a detached consumer, never by interactive paint."""
+        preparation = self._source_preparation
+        with preparation.lock:
+            if not preparation.ready:
+                self._finish_sources()
+                preparation.ready = True
+        return self
+
+    def _finish_sources(self):
         stores = (self.tiles, *(value for value in self.state.values() if isinstance(value, TileStore)))
         jobs = {}
         for job in self.pin_jobs:
@@ -177,7 +245,7 @@ class SceneSnapshot:
                 for store in stores:
                     owner = store._tiles.get(identifier)
                     if (owner is not None and (owner.versions.get(key,0),owner.content_keys.get(key,0)) == version
-                            and owner.entries.get(key) == path):
+                            and (owner.entries.get(key) is path or owner.entries.get(key) == path)):
                         # Reused batches also contain addresses captured by a
                         # newer job. Match each independently owned store's
                         # revision, including transient vector feedback.
@@ -209,8 +277,25 @@ class SceneSnapshotCompiler:
         self.stroke_generation = 0
         self.resource_identity = None
         self.resource_pins = {}
+        self.native_sources = None
+        self.source_generation = 0
+        self.native_source_key = None
 
     def invalidate(self, change=None):
+        # Only positively known metadata edits may reuse captured originals.
+        # Unknown object fields include vector/raster/source replacement and
+        # therefore conservatively retire this owner, as do resource/history
+        # or document changes. This follows ordinary typed invalidation.
+        metadata = {'name', 'expanded', 'saved', 'visible', 'opacity', 'x', 'y',
+                    'translation', 'translate_x', 'translate_y', 'transform_frame',
+                    'transform_quad', 'transform_preview', 'interaction_rect',
+                    'modifier_ids', 'opacity_mask', 'ignore_parent_mask', 'mask_only'}
+        if (change is None or change.conservative or change.structural
+                or change.resources or change.document_fields or change.orders
+                or any(item.entity[0] == 'object' and item.fields - metadata
+                       for item in change.entities)):
+            self.source_generation += 1
+            self.native_sources = self.native_source_key = None
         if change is None or change.conservative:
             self.conservative = True
         else:
@@ -359,7 +444,21 @@ class SceneCapture:
             yield
         source_keys = (None if self.source_objects is None else
             {identifier: tuple(owner.tiles._tiles.get(identifier, ())) for identifier in self.source_objects})
-        tiles, pins, addresses = yield from self._capture_tiles(owner.tiles, 'document', source_keys=source_keys)
+        source_key = native_source_key(owner.tiles, identity, self.compiler.source_generation)
+        if (self.source_objects is None and compiler.native_sources is not None
+                and compiler.native_source_key == source_key):
+            sources = compiler.native_sources
+            tiles = sources.fork()
+            pins, addresses = sources.jobs, sources.addresses
+            yield
+        else:
+            tiles, pins, addresses = yield from self._capture_tiles(owner.tiles, 'document', source_keys=source_keys)
+            if self.source_objects is None:
+                # Keep the capture owner private; give the evaluator its own
+                # headers before it can prepare pins, decode or spill originals.
+                sources = NativeSourceHeaders(tiles, tuple(dict.fromkeys(pins)), addresses)
+                compiler.native_sources, compiler.native_source_key = sources, source_key
+                tiles = sources.fork()
         jobs.extend(pins)
         active_resources.update(addresses)
         jobs = tuple(dict.fromkeys(jobs))
@@ -682,6 +781,49 @@ class EvaluatedScene(SceneKernels):
         self._render_modifier_sources = set()
         self._blend_capture_objects = set()
         self._persistent_render_cache = None
+        self._model_serializations = OrderedDict()
+        self._model_serialization_bytes = 0
+
+    def _owned_model_serialization(self, entity, group, identifier, variant, serialize):
+        """Reuse only the encoded settings of this snapshot's immutable record.
+
+        Dynamic source versions, preview poses, mask contributors and render
+        contexts still enter the complete ordinary semantic keys each time.
+        Preview-derived records are different owners and always serialize anew.
+        Nothing here transfers to another snapshot or a pixel/disk cache.
+        """
+        if (self.chapter is not self.snapshot.chapter
+                or getattr(self.snapshot.chapter, group).get(identifier) is not entity):
+            return serialize()
+        key = group, identifier, id(entity), variant
+        previous = self._model_serializations.pop(key, None)
+        if previous is not None:
+            self._model_serializations[key] = previous
+            return previous
+        value = serialize()
+        size = len(value) * 4  # Conservative Python Unicode storage, including wide text.
+        budget = 8 * 1024 * 1024
+        if size <= budget:
+            self._model_serializations[key] = value
+            self._model_serialization_bytes += size
+            while self._model_serialization_bytes > budget:
+                _, removed = self._model_serializations.popitem(last=False)
+                self._model_serialization_bytes -= len(removed) * 4
+        return value
+
+    def _modifier_entity_signature(self, entity, *, compact=False):
+        group = 'layers' if isinstance(entity, LayerNode) else 'objects'
+        identifier = entity.layer_id if group == 'layers' else entity.object_id
+        return self._owned_model_serialization(entity, group, identifier, compact,
+            lambda: super(EvaluatedScene, self)._modifier_entity_signature(entity, compact=compact))
+
+    def _modifier_settings_signature(self, modifier):
+        return self._owned_model_serialization(modifier, 'modifiers', modifier.modifier_id, None,
+            lambda: super(EvaluatedScene, self)._modifier_settings_signature(modifier))
+
+    def _tone_mask_settings_signature(self, mask):
+        return self._owned_model_serialization(mask, 'masks', mask.mask_id, None,
+            lambda: super(EvaluatedScene, self)._tone_mask_settings_signature(mask))
 
     # These compatibility metrics are role-local and can overlap. Reading the
     # live map avoids stale values after another role evicts a shared node.
@@ -899,6 +1041,11 @@ class DetachedSceneBackend:
         self.pixel_environment = snapshot.pixel_environment
         self.scene = EvaluatedScene(snapshot)
         if snapshot.cache_spec is not None:
+            # Source pixels/maps remain shared immutable capture inputs. These
+            # callbacks belong to this evaluator's cache, so keep their store
+            # headers private when multiple consumers evaluate one snapshot.
+            self.scene.tiles = copy.copy(self.scene.tiles)
+            self.scene.images = copy.copy(self.scene.images)
             from comic_editor.render.cache import PersistentRenderCache
             from comic_editor.ui.cache_dependencies import RenderDependencies
             root, contract, environment = snapshot.cache_spec[:3]
@@ -1023,6 +1170,10 @@ class DetachedSceneBackend:
         return document == self.snapshot.document
 
     def render_device(self, document, request):
+        from comic_editor.render.live_canvas_preview import VisibilityCanvasPreviewPolicy
+        policy = getattr(self, 'live_canvas_preview_policy', None)
+        if isinstance(policy, VisibilityCanvasPreviewPolicy) and policy.matches(self.snapshot, document, request):
+            return None  # This presentation is always explicitly provisional.
         from comic_editor.render.device_scene import try_device_region
         return try_device_region(self.scene, document, request)
 
@@ -1051,7 +1202,9 @@ class DetachedSceneBackend:
                 yield state
         finally:
             scene._live_canvas_preview_policy = previous_policy
-        state.provisional = (document.live_preview or scene._effect_provisional_revision != previous)
+        from comic_editor.render.live_canvas_preview import VisibilityCanvasPreviewPolicy
+        state.provisional = (document.live_preview or scene._effect_provisional_revision != previous
+            or isinstance(policy, VisibilityCanvasPreviewPolicy) and policy.matches(self.snapshot, document, request))
 
     def paint(self, painter, visible, *, phase=None, page_contents_only=False):
         self.scene._render_scene_layers(painter, visible, underlay=True,

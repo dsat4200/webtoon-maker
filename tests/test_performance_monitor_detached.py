@@ -225,7 +225,8 @@ def test_actual_detached_masked_effect_pixels_match_disabled_and_owned_spans(mak
         'scene.effects.stages', 'scene.effects.stack', 'scene.effects.opacity_mask'} <= names
     cpu = [event for event in events if event['category'] == 'worker_cpu']
     assert {event['name'] for event in cpu} == {
-        'scene.worker_envelope.thread_cpu', 'scene.worker_admitted.thread_cpu'}
+        'scene.worker_envelope.thread_cpu', 'scene.worker_admitted.thread_cpu',
+        'scene.backend_init.thread_cpu'}
     assert all(event['details']['clock'] == 'thread_cpu' and event['duration_ms'] >= 0 for event in cpu)
     assert all(event['details']['thread_id'] != gui and event['details']['thread'] == 'worker'
                for event in events)
